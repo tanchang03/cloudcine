@@ -1,0 +1,178 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../core/error/drive_error.dart';
+import '../../data/db/settings_store.dart';
+import '../../data/scrape/tmdb_client.dart';
+import '../../domain/entities/drive_provider.dart';
+import '../../domain/entities/scan_policy.dart';
+import '../../domain/services/scan_service.dart';
+import '../../domain/services/scraper.dart';
+import 'app_providers.dart';
+import 'library_providers.dart';
+
+/// 构造一次扫描用的 [ScanService]。
+///
+/// ## 为什么不做成常驻 Provider
+///
+/// 它的构造依赖**异步读出来的设置**（在线刮削开关、TMDB Key、节流间隔、
+/// 最大深度），而 Riverpod 的同步 `Provider` 拿不到这些值。硬塞一个
+/// 「启动时读一次的缓存快照」会让「改了设置但没生效」变成一个**静默** bug ——
+/// 用户改了 TMDB Key，扫描却还在用旧的那个。
+///
+/// 每次扫描重建的开销可以忽略（就是几个对象），而 `isRunning` /
+/// `lastProgress` 这类状态由 [ScanController] 自己持有，不依赖服务实例。
+Future<ScanService> buildScanService(Ref<Object?> ref) async {
+  final settings = ref.read(settingsStoreProvider);
+
+  // 一次批量读，避免四五个串行的 SQLite 往返。
+  final values = await settings.readAll(const [
+    SettingKeys.onlineScrape,
+    SettingKeys.tmdbApiKey,
+    SettingKeys.scanIntervalMs,
+    SettingKeys.scanMaxDepth,
+  ]);
+
+  final online = values[SettingKeys.onlineScrape] == 'true';
+  final apiKey = (values[SettingKeys.tmdbApiKey] ?? '').trim();
+  final intervalMs = int.tryParse(values[SettingKeys.scanIntervalMs] ?? '') ?? 350;
+  final maxDepth = int.tryParse(values[SettingKeys.scanMaxDepth] ?? '') ?? 12;
+
+  final scrapers = <MetadataScraper>[
+    if (online && apiKey.isNotEmpty)
+      TmdbScraper(http: ref.read(httpClientProvider), apiKey: apiKey),
+    // ⚠️ 本地解析**必须放最后**。它是兜底：没网、没 Key、被限流时
+    // 唯一还能给出片名的东西。放在前面会让在线结果永远拿不到机会。
+    const LocalFilenameScraper(),
+  ];
+
+  return ScanService(
+    registry: ref.read(adapterRegistryProvider),
+    library: ref.read(mediaRepositoryProvider),
+    scraper: ScraperPipeline(scrapers),
+    policy: ScanPolicy(
+      maxDepth: maxDepth,
+      minRequestInterval: Duration(milliseconds: intervalMs),
+      // ⚠️ **必须显式关掉**。`ScanPolicy` 的默认值是 `audioOnly: true`
+      // （那份配置继承自音频项目），开着会只索引音频文件，
+      // 视频库扫完会一条都不剩 —— 而且**不报错**。
+      audioOnly: false,
+    ),
+  );
+}
+
+/// 扫描状态快照。
+class ScanState {
+  const ScanState({
+    this.running = false,
+    this.progress,
+    this.outcome,
+    this.error,
+  });
+
+  final bool running;
+
+  /// 扫描中的实时进度。仅在 [running] 为真时有值。
+  final ScanProgress? progress;
+
+  /// 上一次扫描的结果。
+  final ScanOutcome? outcome;
+
+  /// 上一次扫描的失败原因（面向用户）。
+  final String? error;
+
+  /// 当前阶段。**没在扫描时是 `null`**，而不是硬塞一个 `idle` ——
+  /// `ScanPhase` 只描述「扫描中的哪一步」，给它加个 `idle` 会让
+  /// 「正在收尾」和「还没开始」在类型上无法区分。
+  ScanPhase? get phase => progress?.phase;
+
+  /// 是否已经跑过至少一次（决定空态显示「开始扫描」还是「上次结果」）。
+  bool get hasRun => outcome != null || error != null;
+
+  @override
+  String toString() => 'ScanState(running=$running, phase=${phase?.name ?? "-"}, '
+      'error=${error ?? "-"})';
+}
+
+/// 扫描控制器。
+///
+/// 只做三件事：**发起、转播进度、取消**。真正的扫描逻辑在
+/// [ScanService]（无 UI 依赖，可单测），进度落库在仓储层。
+class ScanController extends Notifier<ScanState> {
+  ScanCancellation? _cancel;
+  bool _disposed = false;
+
+  @override
+  ScanState build() {
+    // 重建时 `onDispose` 会先把上一轮的实例标记为已销毁，
+    // 所以这里必须**复位** —— 否则热重载/失效一次之后，
+    // 所有进度回调都会被 `_emit` 静默丢掉，进度条永远不动。
+    _disposed = false;
+    ref.onDispose(() => _disposed = true);
+    return const ScanState();
+  }
+
+  /// 请求停止。协作式：在目录/页边界生效，不会立刻中断。
+  void cancel() => _cancel?.cancel();
+
+  /// 开始一次扫描。
+  ///
+  /// [resume] 为真时从上次的续扫游标继续（上次已扫完会自动重新开始）。
+  /// [pruneStale] 为真时在**完整扫完**后清理网盘侧已删除的记录。
+  Future<void> start({
+    bool resume = true,
+    bool pruneStale = true,
+    bool scrape = true,
+  }) async {
+    if (state.running) return;
+
+    final token = ScanCancellation();
+    _cancel = token;
+    _emit(const ScanState(running: true));
+
+    try {
+      final service = await buildScanService(ref);
+      final outcome = await service.scan(
+        DriveProvider.quark,
+        resume: resume,
+        pruneStale: pruneStale,
+        scrape: scrape,
+        cancel: token,
+        onProgress: (p) => _emit(ScanState(running: true, progress: p)),
+      );
+      _emit(ScanState(outcome: outcome));
+      if (!_disposed) {
+        await ref
+            .read(settingsStoreProvider)
+            .writeDateTime(SettingKeys.lastScanAt, DateTime.now());
+      }
+    } on DriveException catch (e) {
+      _emit(ScanState(error: _explain(e)));
+    } catch (e) {
+      _emit(ScanState(error: '扫描失败：$e'));
+    } finally {
+      _cancel = null;
+      // 扫描改变了索引库，媒体库列表与统计必须重取。
+      // 放在 `finally` 里：**取消和失败也改过库**（每页都落盘了），
+      // 只刷新成功路径会让取消后列表停在旧数据上。
+      if (!_disposed) {
+        ref.invalidate(workListProvider);
+        ref.invalidate(libraryStatsProvider);
+      }
+    }
+  }
+
+  void _emit(ScanState next) {
+    if (_disposed) return;
+    state = next;
+  }
+
+  static String _explain(DriveException e) => switch (e.type) {
+        DriveErrorType.unauthorized => '登录已失效，请重新扫码登录夸克账号',
+        DriveErrorType.rateLimited => '请求过于频繁，被夸克限流了，请稍后再试',
+        DriveErrorType.network => '网络不可用，请检查网络连接',
+        _ => e.message,
+      };
+}
+
+final scanControllerProvider =
+    NotifierProvider<ScanController, ScanState>(ScanController.new);

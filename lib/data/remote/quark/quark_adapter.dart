@@ -1,0 +1,720 @@
+import 'dart:typed_data';
+
+import '../../../core/diagnostics/diag_log.dart';
+import '../../../core/error/drive_error.dart';
+import '../../../core/utils/redact.dart';
+import '../../../domain/adapters/cloud_drive_adapter.dart';
+import '../../../domain/adapters/credential_store.dart';
+import '../../../domain/entities/auth_credential.dart';
+import '../../../domain/entities/capabilities.dart';
+import '../../../domain/entities/cloud_account.dart';
+import '../../../domain/entities/drive_entry.dart';
+import '../../../domain/entities/drive_provider.dart';
+import '../../../domain/entities/quality_option.dart';
+import '../../../domain/entities/stream_ticket.dart';
+import '../../http/http_client.dart';
+import '../../http/token_bucket.dart';
+import '../../auth/quark_qr_login.dart' show parseSetCookieLines;
+import 'quark_endpoints.dart';
+import 'quark_error_mapper.dart';
+import 'quark_models.dart';
+import 'quark_play_routes.dart';
+
+/// 夸克网盘适配器。
+///
+/// 走 **PC 自用接口**（`drive-pc.quark.cn`），靠网页登录态 Cookie 鉴权。
+/// 全部字段语义与端点均按 PoC 实测校准，见 [QuarkMapper] 的表格。
+///
+/// 该类**只依赖 [HttpClientLike]**，不依赖 `dio`，因此可以在单元测试里
+/// 用假客户端把分页、错误映射、限流、**取流路由降级**、直链组装全部覆盖到，
+/// 不发一次网络请求。
+class QuarkAdapter implements CloudDriveAdapter {
+  QuarkAdapter({
+    required HttpClientLike http,
+    required CredentialStore credentialStore,
+    Capabilities? capabilities,
+    TokenBucket? listBucket,
+    TokenBucket? linkBucket,
+    String gateway = QuarkEndpoints.pcGateway,
+    DateTime Function()? clock,
+  })  : _http = http,
+        _store = credentialStore,
+        _gateway = gateway,
+        _clock = clock ?? DateTime.now,
+        _capabilities = capabilities ?? quarkCapabilities,
+        _listBucket = listBucket ??
+            TokenBucket(ratePerSecond: quarkCapabilities.listQps),
+        _linkBucket = linkBucket ??
+            TokenBucket(ratePerSecond: quarkCapabilities.linkQps);
+
+  /// 夸克的默认能力声明。
+  ///
+  /// ⚠️ **这里刻意不声明 [Capabilities.maxSingleFileBytes]**。
+  ///
+  /// 那条 50MiB 限制是 `/1/clouddrive/file/download`（PC 网页版取**下载**直链）
+  /// 的限制，而本适配器的播放取链走播放路由。2026-09-24 参考项目实测：
+  /// 音频播放路由**不受体积限制**（774.1MB 的整轨 WAV 照常返回原文件直链），
+  /// 库内 195 首「超限」曲目抽样 40 首全部可播。
+  ///
+  /// 把 download 的上限写进能力声明，会让**大批其实能播的文件被误判为
+  /// 不可播**，所以它只作为最后一条兜底路由存在（见 [resolveStream]）。
+  /// 真正取不到链时，由播放控制器在运行时标记 —— 那才是「真的播不了」。
+  static const Capabilities quarkCapabilities = Capabilities(
+    provider: DriveProvider.quark,
+    canListDirectory: true,
+    canSearch: true,
+    canResolveDirectLink: true,
+    directLinkNeedsHeaders: true,
+    supportsRangeRequests: true,
+    listQps: 3.0,
+    linkQps: 1.0,
+    defaultPageSize: 50,
+    authModes: {
+      // 主链路：夸克 App 扫码 → service_ticket 换账号 Cookie。
+      AuthMode.qrCode,
+      // 备选与兜底。
+      AuthMode.browserCookie,
+      AuthMode.manualCookie,
+    },
+  );
+
+  final HttpClientLike _http;
+  final CredentialStore _store;
+  final String _gateway;
+  final DateTime Function() _clock;
+  final Capabilities _capabilities;
+  final TokenBucket _listBucket;
+  final TokenBucket _linkBucket;
+
+  AuthCredential? _credential;
+  CloudAccount? _account;
+
+  @override
+  DriveProvider get provider => DriveProvider.quark;
+
+  @override
+  Capabilities get capabilities => _capabilities;
+
+  @override
+  String get rootId => QuarkEndpoints.rootId;
+
+  /// 当前会话的 `Cookie:` 头。未授权时为空串。
+  String get _cookieHeader => _credential?.cookieHeader ?? '';
+
+  /// 是否持有会话（不代表仍然有效）
+  bool get hasSession => _cookieHeader.isNotEmpty;
+
+  /// 当前账号（若已恢复/授权）
+  CloudAccount? get currentAccount => _account;
+
+  // -------------------------------------------------------------------
+  // 授权
+  // -------------------------------------------------------------------
+
+  @override
+  Future<CloudAccount?> restoreSession() async {
+    final stored = await _store.load(DriveProvider.quark);
+    if (stored == null || stored.isEmpty) {
+      diag.warn('会话', '恢复失败：凭证存储里没有可用凭证');
+      return null;
+    }
+
+    _credential = stored;
+    diag.info(
+      '会话',
+      '拿到凭证：模式=${stored.mode.name}，'
+      'Cookie ${maskCookieHeader(stored.cookieHeader)}，'
+      '捕获于 ${stored.capturedAt}',
+    );
+
+    final member = await _fetchMember();
+    _account = member;
+    diag.info('会话', '校验通过：${member.label}');
+    return member;
+  }
+
+  @override
+  Future<CloudAccount> authorize(AuthCredential credential) async {
+    if (credential.isEmpty) {
+      throw const DriveException(
+        type: DriveErrorType.unauthorized,
+        message: '授权凭证为空，请重新登录夸克账号',
+      );
+    }
+
+    _credential = credential;
+    diag.info(
+      '会话',
+      '提交凭证校验：模式=${credential.mode.name}，'
+      'Cookie ${maskCookieHeader(credential.cookieHeader)}',
+    );
+
+    CloudAccount account;
+    try {
+      // 先校验再落库：避免把废凭证写进钥匙串
+      account = await _fetchMember();
+    } catch (_) {
+      _credential = null;
+      _account = null;
+      diag.error('会话', '凭证校验失败，已丢弃');
+      rethrow;
+    }
+
+    _account = account;
+    await _store.save(credential);
+    diag.info('会话', '授权完成：${account.label}');
+    return account;
+  }
+
+  @override
+  Future<void> signOut() async {
+    _credential = null;
+    _account = null;
+    await _store.clear(DriveProvider.quark);
+    diag.info('会话', '已退出登录');
+  }
+
+  @override
+  Future<bool> ping() async {
+    if (!hasSession) return false;
+    try {
+      await _request(
+        () => _get(QuarkEndpoints.config),
+        context: '连接诊断',
+      );
+      return true;
+    } on DriveException catch (e) {
+      if (e.needsReauth) return false;
+      rethrow;
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // 遍历与搜索
+  // -------------------------------------------------------------------
+
+  @override
+  Future<DrivePage> listDirectory({
+    required String dirId,
+    String? pageToken,
+    int? pageSize,
+  }) async {
+    final size = pageSize ?? _capabilities.defaultPageSize;
+    final page = _parsePageToken(pageToken);
+
+    final result = await _listBucket.run(
+      () => _request(
+        () => _get(QuarkEndpoints.fileSort, {
+          'pdir_fid': dirId.isEmpty ? rootId : dirId,
+          '_page': page,
+          '_size': size,
+          // 实测：即便带 _fetch_total=1，PC 端也**不返回** data.total
+          // （data 里只有 list / last_view_list / recent_file_list）。
+          // 仍然带上，一是无害，二是官方接口若返回就能拿到更精确的总数。
+          '_fetch_total': 1,
+          '_sort': QuarkEndpoints.defaultSort,
+          '_is_hl': 1,
+        }),
+        context: '列目录',
+      ),
+    );
+
+    final entries = QuarkMapper.toEntries(result.dataListItems);
+    final total = result.dataTotal;
+
+    // 下一页判定。
+    // 主路径实际走的是「满页启发式」：实测 data.total 恒为 null，
+    // 但 _size=5 连续取 3 页各返回 5 条且互不重叠，说明
+    // 「返回条数 == 请求条数」即代表还有下一页。
+    String? nextToken;
+    if (total != null) {
+      if (page * size < total) nextToken = '${page + 1}';
+    } else if (entries.length >= size) {
+      nextToken = '${page + 1}';
+    }
+
+    return DrivePage(entries: entries, nextPageToken: nextToken, total: total);
+  }
+
+  @override
+  Future<List<DriveEntry>> search({
+    required String keyword,
+    int limit = 100,
+    int offset = 0,
+  }) async {
+    final trimmed = keyword.trim();
+    if (trimmed.isEmpty) return const [];
+
+    final page = offset <= 0 ? 1 : (offset ~/ limit) + 1;
+
+    final result = await _listBucket.run(
+      () => _request(
+        () => _get(QuarkEndpoints.fileSearch, {
+          '_key': trimmed,
+          '_page': page,
+          '_size': limit,
+          '_fetch_total': 1,
+          // 文件优先：实测 file_type:asc 时前 20 条全是目录
+          '_sort': QuarkEndpoints.searchSort,
+        }),
+        context: '搜索',
+      ),
+    );
+
+    return QuarkMapper.toEntries(result.dataListItems);
+  }
+
+  // -------------------------------------------------------------------
+  // 取流：多路由降级
+  // -------------------------------------------------------------------
+
+  /// 取播放直链（含清晰度档位）。
+  ///
+  /// 按「信息量从多到少」依次降级，任一条成功即返回：
+  ///
+  /// | # | 路由 | 能给什么 | 验证状态 |
+  /// |---|---|---|---|
+  /// | 1 | `batch/file/play/info` | **转码梯度** + 原画 | 未验证 |
+  /// | 2 | `file/v2/play` | 视频播放地址 | 未验证 |
+  /// | 3 | `file/audioplay` | 原文件（不限体积） | 已实测 |
+  /// | 4 | `file/download` | 原文件（≤50MiB） | 已实测 |
+  ///
+  /// **降级顺序的设计理由**：只有第 1 条能给出清晰度切换，所以它必须最先
+  /// 试；而第 3、4 条是已实测可用的，放后面当保险。这样「未验证的路由
+  /// 今天不通」只会让用户失去清晰度切换，**不会让视频播不了**。
+  ///
+  /// 短路规则：授权失效（`needsReauth`）与文件不存在（`notFound`）
+  /// **立即上抛**，换路由结果一样，再打只是白费一次取链配额。
+  @override
+  Future<StreamTicket> resolveStream(String fileId, {String? qualityId}) async {
+    diag.info(
+      '取链',
+      '开始取直链 fid=$fileId，'
+      '会话=${hasSession ? "有" : "无（会直接抛未授权）"}'
+      '${qualityId == null ? "" : "，指定档位=$qualityId"}',
+    );
+
+    final failures = <String>[];
+
+    for (final route in QuarkPlayRoute.values) {
+      try {
+        final ticket = await _resolveVia(route, fileId);
+        if (ticket == null) {
+          failures.add('${route.id}: 响应里没有可用地址');
+          continue;
+        }
+
+        // 指定了档位就切过去；档位不在这一轮结果里时保留原画（并记日志）。
+        final switched = _applyQuality(ticket, qualityId);
+        diag.info(
+          '取链',
+          '路由 ${route.id}（${route.label}）成功：'
+          '${ticket.redactedUrl}，档位=[${describeQualities(switched.qualities)}]',
+        );
+        return switched;
+      } on DriveException catch (e) {
+        if (e.needsReauth || e.type == DriveErrorType.notFound) {
+          diag.error('取链', '路由 ${route.id} 失败且不可降级，直接放弃',
+              error: _describe(e));
+          rethrow;
+        }
+        failures.add('${route.id}: ${e.type.name} ${e.message}');
+        diag.warn('取链', '路由 ${route.id}（${route.label}）失败，试下一条',
+            error: _describe(e));
+      }
+    }
+
+    diag.error('取链', '四条路由全部失败：${failures.join(" | ")}');
+    throw DriveException(
+      type: DriveErrorType.unknown,
+      message: '四条取链路由全部失败，无法播放该文件。'
+          '最后一条错误：${failures.isEmpty ? "无" : failures.last}',
+    );
+  }
+
+  /// 按路由取链。返回 `null` 表示「路由通了但响应里没有地址」——
+  /// 与抛异常区分开：前者值得继续降级，后者要看错误类型。
+  Future<StreamTicket?> _resolveVia(QuarkPlayRoute route, String fileId) {
+    return switch (route) {
+      QuarkPlayRoute.playInfo => _resolveViaPlayInfo(fileId),
+      QuarkPlayRoute.v2Play => _resolveViaSimpleGet(
+          route: route,
+          fileId: fileId,
+          path: QuarkEndpoints.fileV2Play,
+          context: '取视频播放直链',
+        ),
+      QuarkPlayRoute.audioPlay => _resolveViaSimpleGet(
+          route: route,
+          fileId: fileId,
+          path: QuarkEndpoints.fileAudioplay,
+          context: '取播放直链',
+        ),
+      QuarkPlayRoute.download => _resolveViaDownload(fileId),
+    };
+  }
+
+  /// 路由 1：播放信息预取。**唯一能拿到转码梯度的路由。**
+  ///
+  /// 响应形状没有落盘证据，所以用 [QuarkPlayInfoParser] 做**形状无关**的
+  /// 递归解析：把响应体里所有像播放地址的字段都收出来，按同层的分辨率
+  /// 字段命名。这样服务端换字段名时仍可能继续工作。
+  Future<StreamTicket?> _resolveViaPlayInfo(String fileId) async {
+    final result = await _linkBucket.run(
+      () => _request(
+        () => _post(
+          QuarkEndpoints.playInfo,
+          body: {
+            ...kQuarkPlayInfoBody,
+            'fids': [fileId],
+          },
+          params: {'uc_param_str': 'utfrpr'},
+        ),
+        context: '取播放信息',
+      ),
+    );
+
+    final qualities = QuarkPlayInfoParser.parseQualities(result.data);
+    if (qualities.isEmpty) {
+      diag.info('取链', 'play/info 通了但没有解析出任何档位（响应形状可能变了）');
+      return null;
+    }
+
+    final original = qualities.firstWhere(
+      (q) => q.isOriginal && q.url != null,
+      orElse: () => qualities.first,
+    );
+    final url = original.url;
+    if (url == null) return null;
+
+    final ticket = QuarkMapper.toStreamTicket(
+      url: url,
+      cookieHeader: _cookieHeader,
+      contentLength: original.estimatedBytes,
+      now: _clock(),
+    ).copyWithQualities(qualities);
+
+    _logTicket('play/info', ticket);
+    return ticket;
+  }
+
+  /// 路由 2/3：`GET ?fid=` 形态的简单播放接口。
+  ///
+  /// 响应形状与 download **不同**：`data` 是一个**扁平对象**
+  /// （`{audio_url, size, format_type, duration, ...}`），不是数组。
+  /// 所以这里读 [HttpResult.dataMap]。
+  ///
+  /// 另有一个实测怪癖（参考项目）：DSF 文件返回 `format_type=text/plain`、
+  /// `obj_category=doc`、`duration=0`（服务端不把它当音频），
+  /// **但仍会返回原文件字节**。因此这里只信 `size` 与地址，
+  /// 不拿 `format_type` / `duration` 做判定。
+  Future<StreamTicket?> _resolveViaSimpleGet({
+    required QuarkPlayRoute route,
+    required String fileId,
+    required String path,
+    required String context,
+  }) async {
+    final result = await _linkBucket.run(
+      () => _request(
+        () => _get(path, {'fid': fileId}),
+        context: context,
+      ),
+    );
+
+    final data = result.dataMap;
+    if (data == null) {
+      diag.info('取链', '${route.id}：data 不是对象，响应形状可能变了');
+      return null;
+    }
+
+    final url = QuarkMapper.parseDirectUrl(data);
+    if (url == null) return null;
+
+    final ticket = QuarkMapper.toStreamTicket(
+      url: url,
+      cookieHeader: _cookieHeader,
+      contentLength: _intOf(data['size']),
+      contentType: data['format_type'] as String?,
+      now: _clock(),
+    );
+    _logTicket(route.id, ticket);
+    return ticket;
+  }
+
+  /// 路由 4：下载直链接口。单文件 >50MiB 会返回 `code=23018`。
+  Future<StreamTicket?> _resolveViaDownload(String fileId) async {
+    final result = await _linkBucket.run(
+      () => _request(
+        () => _post(
+          QuarkEndpoints.fileDownload,
+          body: {
+            'fids': [fileId],
+          },
+        ),
+        context: '取播放直链',
+      ),
+    );
+
+    final items = result.dataListItems;
+    if (items.isEmpty) return null;
+
+    final first = items.first;
+    final url = QuarkMapper.parseDirectUrl(first);
+    if (url == null) return null;
+
+    final ticket = QuarkMapper.toStreamTicket(
+      url: url,
+      cookieHeader: _cookieHeader,
+      contentLength: _intOf(first['size']),
+      contentType: first['format_type'] as String?,
+      now: _clock(),
+    );
+    _logTicket('download', ticket);
+    return ticket;
+  }
+
+  /// 把票据切到指定档位。
+  ///
+  /// 档位不在票据里时**保留原画并记日志**，而不是抛错：
+  /// 用户点了「4K」但服务端这次没给 4K 流，播原画显然比报错好。
+  StreamTicket _applyQuality(StreamTicket ticket, String? qualityId) {
+    if (qualityId == null || qualityId.isEmpty) return ticket;
+    final q = ticket.qualityById(qualityId);
+    if (q == null) {
+      diag.warn(
+        '取链',
+        '指定档位 $qualityId 不在本次结果里'
+            '（可用=[${describeQualities(ticket.qualities)}]），保留原画',
+      );
+      return ticket;
+    }
+    if (!q.isAvailable) {
+      diag.warn('取链', '档位 $qualityId 没有地址，保留原画');
+      return ticket;
+    }
+    return ticket.withQuality(q);
+  }
+
+  /// 读取小文件的原始字节。
+  ///
+  /// **本应用的用途是读字幕**（`.srt` / `.ass` 通常几十 KB）：
+  /// 中文外挂字幕大量是 GBK，谁先把它解成字符串，非法字节就已经变成 `�`，
+  /// 编码判定再也做不了 —— 所以必须拿到**原始字节**，解码交给调用方
+  /// （见 `SubtitleResolver` 与 `decodeSubtitleBytes`）。
+  ///
+  /// 走 download 路由而不是 [resolveStream] 那条播放链：
+  ///   1. download 的 50MiB 上限对字幕完全不是问题；
+  ///   2. 这里要的是**字节**，不是播放直链。
+  ///
+  /// 两道体积闸门（声明体积 / 实际字节数）都保留：声明值可能缺失或不准，
+  /// 只信其中一道都可能把一个大文件拉进内存。
+  @override
+  Future<Uint8List> readFileBytes(
+    String fileId, {
+    int maxBytes = 512 * 1024,
+  }) async {
+    final ticket = await _resolveViaDownload(fileId);
+    if (ticket == null) {
+      throw const DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '读取文件内容失败：取链响应里没有下载地址',
+      );
+    }
+
+    final declared = ticket.contentLength;
+    if (declared != null && declared > maxBytes) {
+      throw DriveException(
+        type: DriveErrorType.fileTooLarge,
+        message: '文件声明体积 ${declared}B 超出读取上限 ${maxBytes}B，不按小文本文件读取',
+      );
+    }
+
+    diag.info('读文件', '开始读取 fid=$fileId，声明体积=${declared ?? "未知"}');
+    final bytes = await _http.getBytes(ticket.url.toString(), headers: ticket.headers);
+    if (bytes == null) {
+      throw const DriveException(
+        type: DriveErrorType.network,
+        message: '读取文件内容失败：网络层未返回响应',
+      );
+    }
+    if (bytes.length > maxBytes) {
+      throw DriveException(
+        type: DriveErrorType.fileTooLarge,
+        message: '文件实际体积 ${bytes.length}B 超出读取上限 ${maxBytes}B',
+      );
+    }
+
+    diag.info('读文件', '读取完成 fid=$fileId，实际 ${bytes.length}B');
+    return bytes;
+  }
+
+  @override
+  Future<void> dispose() async {
+    _credential = null;
+    _account = null;
+    _http.close();
+  }
+
+  // -------------------------------------------------------------------
+  // 内部
+  // -------------------------------------------------------------------
+
+  /// 把票据的关键事实写进诊断日志。
+  ///
+  /// **直链地址本身绝不能进日志** —— 查询串里带着可用的签名令牌。
+  /// 这里只留「协议+主机+路径」，足够看出是不是同一条 CDN 路由，
+  /// 又不至于把播放权限泄露到磁盘上。
+  static void _logTicket(String route, StreamTicket ticket) {
+    diag.info(
+      '取链',
+      '路由 $route 签发票据：${ticket.redactedUrl}，'
+      '声明体积=${ticket.contentLength ?? "未知"}，'
+      '随票据请求头=${ticket.headers.isEmpty ? "无" : ticket.headers.keys.join(",")}，'
+      '过期=${ticket.expiresAt ?? "未声明"}，'
+      '档位=[${describeQualities(ticket.qualities)}]',
+    );
+  }
+
+  /// 把 [DriveException] 拆成一行可读的诊断描述。
+  static String _describe(DriveException e) =>
+      'type=${e.type.name} needsReauth=${e.needsReauth} '
+      'http=${e.httpStatus ?? "-"} providerCode=${e.providerCode ?? "-"} '
+      'message=${e.message}'
+      '${e.rawMessage == null ? "" : " raw=${e.rawMessage}"}';
+
+  /// 拉取账号信息，顺带完成会话校验。
+  Future<CloudAccount> _fetchMember() async {
+    final result = await _request(
+      () => _get(QuarkEndpoints.member, {'uc_param_str': ''}),
+      context: '获取账号信息',
+    );
+
+    final base = CloudAccount(
+      provider: DriveProvider.quark,
+      authMode: _credential?.mode ?? AuthMode.browserCookie,
+      authorizedAt: _credential?.capturedAt ?? _clock(),
+    );
+
+    final data = result.dataMap;
+    if (data == null) return base;
+    return QuarkMapper.mergeAccountInfo(base, data);
+  }
+
+  /// 统一请求包装：注入公共参数与请求头，校验业务码，归一化异常。
+  Future<HttpResult> _request(
+    Future<HttpResult> Function() call, {
+    String? context,
+  }) async {
+    if (!hasSession) {
+      diag.error('接口', '${context ?? "请求"}：尚未授权（没有 Cookie）');
+      throw DriveException(
+        type: DriveErrorType.unauthorized,
+        message: '${context ?? "请求"}：尚未授权夸克账号',
+      );
+    }
+
+    final result = await call();
+    if (!isQuarkSuccess(result)) {
+      final e = quarkExceptionFrom(result, context: context);
+      diag.error('接口', '${context ?? "请求"} 业务失败', error: _describe(e));
+      throw e;
+    }
+    _absorbRotatedCookies(result);
+    return result;
+  }
+
+  /// 响应 Cookie 轮换回填（浏览器 cookie jar 的等价物）。
+  ///
+  /// 夸克服务端会在**每个** API 响应的 `Set-Cookie` 里轮换下发 `__puus`
+  ///（参考项目实测：`/member`、`/file/sort`、`/file/audioplay` 每响应必带）。
+  /// CDN 直链的防重放校验依赖**最新**的 `__puus` —— 缺它直链一律 412。
+  /// 浏览器里 cookie jar 自动完成这件事；我们手动管理 Cookie，必须在
+  /// 每个响应后把新值回填进内存凭证，下一个请求（尤其是直链）才能带上。
+  ///
+  /// ⚠️ 故意**不落库**：扫描时每页都轮换，逐次写钥匙串开销大且无意义 ——
+  /// 重启后首次 API 响应就会下发新 `__puus`，本方法会立刻补上。
+  void _absorbRotatedCookies(HttpResult result) {
+    final credential = _credential;
+    if (credential == null) return;
+
+    final lines = result.setCookieLines;
+    if (lines.isEmpty) return;
+
+    final fresh = parseSetCookieLines(lines);
+    if (fresh.isEmpty) return;
+
+    final current = credential.cookies;
+    final updates = <String, String>{};
+    for (final name in QuarkEndpoints.knownCookieNames) {
+      final v = fresh[name];
+      if (v == null || v.isEmpty) continue;
+      if (current[name] == v) continue;
+      updates[name] = v;
+    }
+    if (updates.isEmpty) return;
+
+    _credential = credential.copyWith(
+      cookies: {...current, ...updates},
+      capturedAt: DateTime.now(),
+    );
+    diag.debug('会话', '响应 Cookie 轮换回填：${updates.keys.toList()}');
+  }
+
+  Map<String, String> _headers() => {
+        'User-Agent': QuarkEndpoints.userAgent,
+        'Accept': QuarkEndpoints.accept,
+        'Accept-Language': QuarkEndpoints.acceptLanguage,
+        'Referer': QuarkEndpoints.referer,
+        'Origin': QuarkEndpoints.origin,
+        'Cookie': _cookieHeader,
+      };
+
+  Future<HttpResult> _get(String path, [Map<String, Object?>? params]) =>
+      _http.get(
+        '$_gateway$path',
+        query: {...QuarkEndpoints.commonParams, ...?params},
+        headers: _headers(),
+      );
+
+  Future<HttpResult> _post(
+    String path, {
+    Object? body,
+    Map<String, Object?>? params,
+  }) =>
+      _http.post(
+        '$_gateway$path',
+        body: body,
+        query: {...QuarkEndpoints.commonParams, ...?params},
+        headers: {..._headers(), 'Content-Type': 'application/json'},
+      );
+
+  /// 分页游标解析。非法值回落到第 1 页。
+  static int _parsePageToken(String? token) {
+    if (token == null || token.isEmpty) return 1;
+    final n = int.tryParse(token);
+    if (n == null || n < 1) return 1;
+    return n;
+  }
+
+  static int? _intOf(Object? v) {
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v);
+    return null;
+  }
+}
+
+/// 给 [StreamTicket] 补一个「带上档位」的复制方法。
+///
+/// 放在这里而不是实体里：实体不该知道「档位是适配器解析出来的」这件事，
+/// 而 `withQuality` 是播放期的行为。
+extension StreamTicketQualities on StreamTicket {
+  StreamTicket copyWithQualities(List<QualityOption> qualities) => StreamTicket(
+        url: url,
+        headers: headers,
+        expiresAt: expiresAt,
+        contentLength: contentLength,
+        supportsRange: supportsRange,
+        contentType: contentType,
+        qualities: qualities,
+      );
+}

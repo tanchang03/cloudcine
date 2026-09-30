@@ -1,0 +1,114 @@
+# 10.15 是**下限而不是偏好**：media_kit_video 依赖 wakelock_plus，
+# 而 wakelock_plus 的 podspec 要求 macOS >= 10.15。设成 10.14 会让
+# `pod install` 直接失败（"requires a higher minimum macOS deployment
+# version"），报错信息不会提到 media_kit，容易误判成插件本身有问题。
+platform :osx, '10.15'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'ephemeral', 'Flutter-Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure \"flutter pub get\" is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Flutter-Generated.xcconfig, then run \"flutter pub get\""
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_macos_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+
+  flutter_install_all_macos_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_macos_build_settings(target)
+
+    # ⚠️ 这一行不是冗余的。
+    #
+    # `platform :osx, '10.15'` 只作用于 **Runner** 目标；每个 pod 自己的
+    # 构建配置仍然沿用 podspec 里声明的版本（media_kit 写 10.9、
+    # flutter_inappwebview_macos 写 10.14…）。后果是 pod 的 Swift 代码
+    # 以 10.14 编译，而 `ASWebAuthenticationPresentationContextProviding`
+    # 要求 10.15 才能满足协议，于是报：
+    #   error: protocol 'ASWebAuthenticationPresentationContextProviding'
+    #          requires 'presentationAnchor(for:)' to be available in
+    #          macOS 10.14 and newer
+    # 报错指向的是 inappwebview，很容易误判成那个插件坏了。
+    # 统一抬到 10.15 即可（10.15 是 wakelock_plus 要求的硬下限）。
+    target.build_configurations.each do |config|
+      config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '10.15'
+    end
+  end
+
+  cloudcine_fix_media_kit_symlinks
+end
+
+# ---------------------------------------------------------------------------
+# 补齐 media_kit 的 mpv 框架符号链接
+#
+# 现象：
+#   ld: framework 'Mpv' not found
+#   warning: search path '.../media_kit_libs_macos_video/macos/Frameworks/.symlinks/mpv/macos' not found
+#
+# 原因链（三层，报错信息一层都没提到）：
+#   1. `media_kit_video` 的 podspec 用 `OTHER_LDFLAGS = -framework Mpv`
+#      加一条手写的 `FRAMEWORK_SEARCH_PATHS`，指向
+#      `media_kit_libs_macos_video/macos/Frameworks/.symlinks/mpv/macos`。
+#      也就是说 **Mpv.framework 必须能在这个路径下被找到**。
+#   2. 那条路径由 `media_kit_libs_macos_video` 的 Makefile 调
+#      `create_framework_symlinks.sh` 生成。而这个脚本在 pub 包里带
+#      **CRLF 行尾**，`sh` 一跑就报 `set: -: invalid option` 直接退出，
+#      一个链接都建不出来（目录是空的）。
+#   3. Makefile 里本来有一句 `sed 's/\r$//'` 负责去掉 CR，但构建期 PATH
+#      上的 `sed` 被工具链的 brokered shim 顶掉了，这一步静默失效。
+#
+# 所以这里用**纯 Ruby** 补上链接：不依赖 sed / make / sh，
+# 幂等，重复执行无害（已存在就跳过）。
+# ---------------------------------------------------------------------------
+def cloudcine_fix_media_kit_symlinks
+  frameworks = File.join(
+    File.dirname(File.realpath(__FILE__)),
+    'Flutter', 'ephemeral', '.symlinks', 'plugins',
+    'media_kit_libs_macos_video', 'macos', 'Frameworks'
+  )
+  return unless File.directory?(frameworks)
+
+  symlinks = File.join(frameworks, '.symlinks')
+  Dir.mkdir(symlinks) unless File.directory?(symlinks)
+
+  # 与 upstream 脚本的布局一致：`.symlinks/<框架名小写>/<平台切片>`
+  # 例：`.symlinks/mpv/macos -> ../../Mpv.xcframework/macos-arm64_x86_64`
+  Dir.glob(File.join(frameworks, '*.xcframework')).each do |xcframework|
+    name = File.basename(xcframework, '.xcframework')
+    Dir.glob(File.join(xcframework, 'macos-*')).each do |slice|
+      slice_name = File.basename(slice).split('-').first
+      root = File.join(symlinks, name.downcase)
+      Dir.mkdir(root) unless File.directory?(root)
+
+      link = File.join(root, slice_name)
+      next if File.exist?(link) || File.symlink?(link)
+
+      File.symlink(File.join('..', '..', "#{name}.xcframework", File.basename(slice)), link)
+    end
+  end
+end
