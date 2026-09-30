@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,6 +13,7 @@ import '../../domain/entities/media_item.dart';
 import '../../domain/entities/quality_option.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/services/playback_controller.dart';
+import '../../domain/services/playback_exit_policy.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
@@ -49,6 +51,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   String? _loadError;
   bool _ready = false;
 
+  /// 在 `initState` 就抓住控制器，而不是等到 `dispose` 再 `ref.read`。
+  ///
+  /// 页面销毁时再去读 provider 属于「已经要走的人还回头翻抽屉」：
+  /// provider 可能已经被销毁，行为不确定。
+  late final PlaybackController _controller;
+
   /// 沉浸模式：隐藏顶栏与控制栏，只剩画面。
   bool _immersive = false;
 
@@ -61,7 +69,25 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   @override
   void initState() {
     super.initState();
+    _controller = ref.read(playbackControllerProvider);
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
+  }
+
+  @override
+  void dispose() {
+    // 返回时要不要停播是**平台约定**，见 [PlaybackExitBehavior]：
+    //   - 桌面：保留播放（可以一边浏览一边听）；
+    //   - Android / Android TV：停止并释放解码器 —— 页面都走了，不该还占着
+    //     4K 解码器与网络连接，而那边也没有通知栏控件能停它。
+    //
+    // 挂在 `dispose` 而不是「返回按钮」上：返回按钮、系统返回键、手势返回、
+    // 以及从播放页跳到别的路由，全都经过这里 —— 只有一个入口，
+    // 不会漏掉某条退出路径。
+    if (PlaybackExitBehavior.forPlatform(defaultTargetPlatform) ==
+        PlaybackExitBehavior.stopAndRelease) {
+      unawaited(_controller.stop());
+    }
+    super.dispose();
   }
 
   Future<void> _bootstrap() async {
@@ -94,7 +120,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final volume = double.tryParse(values[SettingKeys.playerVolume] ?? '') ?? 100;
     final rate = double.tryParse(values[SettingKeys.playerRate] ?? '') ?? 1.0;
 
-    final controller = ref.read(playbackControllerProvider);
+    final controller = _controller;
     await controller.setVolume(volume);
     await controller.setRate(rate);
 
@@ -226,6 +252,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     }
 
     final error = controller.error;
+    final notice = controller.notice;
 
     return Stack(
       fit: StackFit.expand,
@@ -270,6 +297,21 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             message: error,
             onRetry: controller.retry,
             onBack: () => context.pop(),
+          ),
+
+        // 非致命提示：**贴顶的小条，不盖画面**。
+        // 「这条字幕没挂上」「这一档服务端没给地址」都不该让用户看不到视频。
+        if (notice != null && error == null)
+          Positioned(
+            top: 14,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: _NoticePill(
+                message: notice,
+                onDismiss: controller.clearNotice,
+              ),
+            ),
           ),
 
         // 沉浸模式下点画面任意处切回普通模式 —— 否则用户会「进去出不来」。
@@ -713,6 +755,67 @@ class _MenuRow extends StatelessWidget {
 /// 必须给出**可行动的**说明：夸克取链失败的原因分好几类
 /// （登录失效 / 文件被删 / 被所有路由拒绝），笼统写「播放失败」
 /// 会让用户以为是播放器的问题而去重装应用。
+/// 非致命提示条。
+///
+/// 刻意做成「贴顶的小药丸 + 可关闭」，而不是像 [_ErrorOverlay] 那样铺满画面：
+/// 它要报告的事（这条字幕没挂上、这一档切不过去）**都不影响视频继续播放**，
+/// 为此把画面挡住反而是更严重的故障 —— 实测就是这么翻的车。
+class _NoticePill extends StatelessWidget {
+  const _NoticePill({required this.message, required this.onDismiss});
+
+  final String message;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 460),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: AppTheme.panel2.withValues(alpha: 0.94),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: AppTheme.line),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 7, 4, 7),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.info_outline_rounded,
+                size: 15,
+                color: AppTheme.warn,
+              ),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  message,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    height: 1.4,
+                    color: AppTheme.text,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 2),
+              IconButton(
+                onPressed: onDismiss,
+                tooltip: '知道了',
+                iconSize: 15,
+                color: AppTheme.muted,
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.close_rounded),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ErrorOverlay extends StatelessWidget {
   const _ErrorOverlay({
     required this.message,

@@ -42,6 +42,27 @@ class PlaybackController extends ChangeNotifier {
   })  : _registry = registry,
         _subtitleResolver = subtitleResolver,
         _positionSaveInterval = positionSaveInterval {
+    // 渲染控制器**必须**绑定到上面那个 [player]，并且必须在任何 `open()`
+    // 之前就建出来。
+    //
+    // 这里曾经写的是 `VideoController(mk.Player())` —— 一个**新建的**实例。
+    // 于是「解码」和「出画面」落在两个互不相干的 mpv 实例上：`player` 照常
+    // 解码音频（**有声音、进度条正常**），但它从来没有视频输出端，
+    // 画面永远是空的，而且**不报任何错**。
+    // 实测症状：mp4 4K 只有声音没画面。
+    //
+    // 「在 `open()` 之前」同样是硬要求：mpv 要拿到视频输出端之后才会把画面
+    // 送过去，晚一步这一次播放就全程没画面。放在构造函数里是唯一不依赖
+    // 调用顺序的写法 —— 播放页是在 post-frame 回调里才 `open()` 的，
+    // 如果这里改成 `late` 惰性初始化，正确性就押在「UI 恰好先 build 过一次」
+    // 这种时序巧合上了。
+    videoController = VideoController(
+      player,
+      configuration: const VideoControllerConfiguration(
+        // 让 mpv 在已知有问题的驱动上自动退回软解，比强制硬解稳。
+        enableHardwareAcceleration: true,
+      ),
+    );
     _bindPlayerStreams();
   }
 
@@ -53,13 +74,10 @@ class PlaybackController extends ChangeNotifier {
   final mk.Player player = mk.Player();
 
   /// 渲染控制器，交给 `Video(controller: ...)`。
-  final VideoController videoController = VideoController(
-    mk.Player(),
-    configuration: const VideoControllerConfiguration(
-      // `auto-safe`：在已知有问题的驱动上自动退回软解，比强制硬解稳。
-      enableHardwareAcceleration: true,
-    ),
-  );
+  ///
+  /// 在构造函数体里赋值（见下），**不能**写成字段初始化器：Dart 的实例字段
+  /// 初始化器不允许访问 `this`，而它必须绑定到上面那个 [player]。
+  late final VideoController videoController;
 
   // -------------------------------------------------------------------
   // 对外状态
@@ -70,6 +88,14 @@ class PlaybackController extends ChangeNotifier {
   String? _activeQualityId;
   bool _loading = false;
   String? _error;
+
+  /// 非致命提示（字幕加载失败、选的档位服务端没给地址…）。
+  ///
+  /// **绝不能塞进 [_error]**：`error` 在播放页是一层 **88% 不透明的全屏遮罩**，
+  /// 会把画面整个盖住。「这条字幕没加载上」不该让用户看不到视频 ——
+  /// 实测踩过：自动选字幕失败 → 画面被「播放失败」遮住，声音却还在放，
+  /// 用户以为播放器坏了。
+  String? _notice;
 
   List<SubtitleTrack> _externalSubtitles = const [];
   List<SubtitleTrack> _embeddedSubtitles = const [];
@@ -98,6 +124,15 @@ class PlaybackController extends ChangeNotifier {
   bool get isLoading => _loading;
   String? get error => _error;
   bool get hasError => _error != null;
+
+  /// 非致命提示，UI 应当**不遮挡画面**地展示它（见 [_notice]）。
+  String? get notice => _notice;
+
+  void clearNotice() {
+    if (_notice == null) return;
+    _notice = null;
+    notifyListeners();
+  }
 
   /// 网盘外挂字幕（扫描期建立的引用）
   List<SubtitleTrack> get externalSubtitles => _externalSubtitles;
@@ -161,6 +196,7 @@ class PlaybackController extends ChangeNotifier {
   }) async {
     _item = item;
     _error = null;
+    _notice = null;
     _loading = true;
     _position = Duration.zero;
     _duration = Duration.zero;
@@ -229,24 +265,11 @@ class PlaybackController extends ChangeNotifier {
 
   /// 决定「当前应该用哪一档」。
   ///
-  /// 优先级：设置里的默认档 → 原画 → 第一档。
-  /// **原画优先**是刻意的：转码流会丢细节，而本应用的用户把片子放在网盘上
-  /// 就是想要原片质量。只有用户显式选了别的档位才用别的。
-  String? _pickActiveQualityId(StreamTicket ticket, String? preferred) {
-    if (ticket.qualities.isEmpty) return null;
-
-    if (preferred != null && preferred.isNotEmpty) {
-      final q = ticket.qualityById(preferred);
-      if (q != null && q.isAvailable) return q.id;
-    }
-    for (final q in ticket.qualities) {
-      if (q.isOriginal && q.isAvailable) return q.id;
-    }
-    for (final q in ticket.qualities) {
-      if (q.isAvailable) return q.id;
-    }
-    return ticket.qualities.first.id;
-  }
+  /// 规则本体在 [StreamTicket.pickActiveQualityId] —— **独立播放窗口那条路
+  /// 也要用同一套**（主窗口取到票据后据此决定把哪一档的地址发出去），
+  /// 所以判定不能留在这一层。这里只保留一个同名薄委托，让调用点不必改。
+  String? _pickActiveQualityId(StreamTicket ticket, String? preferred) =>
+      ticket.pickActiveQualityId(preferred);
 
   /// 切换清晰度。
   ///
@@ -263,7 +286,8 @@ class PlaybackController extends ChangeNotifier {
       return;
     }
     if (!q.isAvailable) {
-      _error = '「${q.label}」这一档服务端没有提供播放地址';
+      // 非致命：当前这一档还在正常播，切不过去只是没切。
+      _notice = '「${q.label}」这一档服务端没有提供播放地址';
       notifyListeners();
       return;
     }
@@ -278,6 +302,7 @@ class PlaybackController extends ChangeNotifier {
 
     _loading = true;
     _error = null;
+    _notice = null;
     notifyListeners();
 
     try {
@@ -345,7 +370,9 @@ class PlaybackController extends ChangeNotifier {
           // 内嵌轨：mpv 自己切轨。`id` 就是 mpv 的 `sid`。
           final id = track.embeddedTrackId;
           if (id == null) {
-            _error = '内嵌字幕缺少轨道号';
+            // 兜底分支。正常情况下 `_onTracksChanged` 已经把「没有轨道号」
+            // 的合成轨（media_kit 的 `auto` / `no`）过滤掉了，走不到这里。
+            _notice = '这条内嵌字幕没有轨道号，无法切换';
             notifyListeners();
             return;
           }
@@ -382,10 +409,12 @@ class PlaybackController extends ChangeNotifier {
       }
       _activeSubtitleId = track.id;
       _subtitlesEnabled = true;
-      _error = null;
+      _notice = null;
     } catch (e) {
-      _error = '加载字幕失败：$e';
-      diag.error('字幕', '加载失败（${track.displayLabel}）：$e');
+      // 字幕失败**不是播放失败**：视频照常放，只是这条字幕没挂上。
+      // 所以走 `_notice` 而不是 `_error` —— 后者会拉起全屏遮罩盖住画面。
+      _notice = '加载字幕失败：$e';
+      diag.warn('字幕', '加载失败（${track.displayLabel}）：$e');
     }
     notifyListeners();
   }
@@ -443,6 +472,39 @@ class PlaybackController extends ChangeNotifier {
   Future<void> play() => player.play();
 
   Future<void> pause() => player.pause();
+
+  /// 停止播放并**释放解码资源**。
+  ///
+  /// 与 [pause] 的区别是「页面已经离开」：
+  ///   - `pause` 假定用户还会回来，所以保留已打开的文件、解码器和缓冲；
+  ///   - `stop` 把它们全部交还给 mpv，并清掉票据与轨道状态。
+  ///
+  /// 移动端 / Android TV 上按返回必须走这条（见 `PlaybackExitBehavior`）——
+  /// 否则一个已经离开的页面还占着 4K 解码器和网络连接。
+  ///
+  /// **不清 `_item`**：播放页在退场动画期间还要显示标题，而 `open()`
+  /// 本来就会重置全部状态。
+  Future<void> stop() async {
+    try {
+      await player.stop();
+    } catch (e) {
+      // 停止失败不该把返回流程卡住 —— 用户已经要走了。
+      diag.warn('播放', '停止播放失败：$e');
+    }
+    _playing = false;
+    _buffering = false;
+    _position = Duration.zero;
+    _duration = Duration.zero;
+    _ticket = null;
+    _activeQualityId = null;
+    _activeSubtitleId = null;
+    _embeddedSubtitles = const [];
+    _embeddedAudio = const [];
+    _error = null;
+    _notice = null;
+    _subtitleResolver.clear();
+    notifyListeners();
+  }
 
   Future<void> playOrPause() => player.playOrPause();
 
@@ -551,30 +613,40 @@ class PlaybackController extends ChangeNotifier {
 
   void _onTracksChanged(mk.Tracks tracks) {
     final embeddedSubs = <SubtitleTrack>[];
-    for (var i = 0; i < tracks.subtitle.length; i++) {
-      final t = tracks.subtitle[i];
+    for (final t in realTracksOf(tracks.subtitle, (t) => t.id)) {
+      // 上面的过滤器已经保证 id 能解析成整数，这里用 `parse` 而不是 `tryParse`
+      // 是刻意的：真解析不了就应当炸出来，而不是静默产出一条没有轨道号的字幕。
+      final trackId = int.parse(t.id);
       embeddedSubs.add(
         SubtitleTrack(
-          id: 'embedded#${t.id}',
+          id: 'embedded#$trackId',
           origin: SubtitleOrigin.embedded,
-          label: _labelForEmbedded(t.title, t.language, '内嵌字幕 ${i + 1}'),
+          label: _labelForEmbedded(
+            t.title,
+            t.language,
+            '内嵌字幕 ${embeddedSubs.length + 1}',
+          ),
           format: SubtitleFormatDetector.of(t.title ?? ''),
-          embeddedTrackId: int.tryParse(t.id),
+          embeddedTrackId: trackId,
           language: _languageFromTag(t.language),
           isDefault: t.isDefault ?? false,
         ),
       );
     }
 
-    final changed = embeddedSubs.length != _embeddedSubtitles.length;
+    final embeddedAudio = realTracksOf(tracks.audio, (t) => t.id);
+    final videoCount = realTracksOf(tracks.video, (t) => t.id).length;
+
+    final changed = embeddedSubs.length != _embeddedSubtitles.length ||
+        embeddedAudio.length != _embeddedAudio.length;
     _embeddedSubtitles = embeddedSubs;
-    _embeddedAudio = tracks.audio;
+    _embeddedAudio = embeddedAudio;
     if (!changed) return;
 
     diag.info(
       '播放',
       '内嵌轨更新：字幕 ${embeddedSubs.length} 条、'
-      '音轨 ${tracks.audio.length} 条、视频 ${tracks.video.length} 条',
+      '音轨 ${embeddedAudio.length} 条、视频 $videoCount 条',
     );
     notifyListeners();
 
@@ -584,6 +656,26 @@ class PlaybackController extends ChangeNotifier {
       unawaited(_autoLoadSubtitle());
     }
   }
+
+  /// 只保留**真实存在的轨道**，剔除 media_kit 硬塞进来的合成轨。
+  ///
+  /// ⚠️ `tracks.video` / `tracks.audio` / `tracks.subtitle` 的**前两条是合成轨**：
+  /// media_kit 的 `real.dart` 里写死了 `[XxxTrack.auto(), XxxTrack.no()]`，
+  /// 它们的 `id` 是字符串 `'auto'` / `'no'`，**不是 mpv 的轨道号**。
+  ///
+  /// 把它们当真实轨道会踩两个坑：
+  ///   1. `int.tryParse('auto')` → `null` → 报「内嵌字幕缺少轨道号」；
+  ///   2. 它们永远排在最前面，而自动选字幕取的是「第一条」——
+  ///      于是**每次播放都会去选那条合成轨**，必错。
+  ///
+  /// 实测症状：一个根本没有内嵌字幕的 mp4，`tracks.subtitle.length` 也是 2，
+  /// 正好就是这两条合成轨（音轨、视频轨同样各 2 条）。
+  ///
+  /// 用泛型 + [idOf] 而不是 `T extends _Track`：media_kit 的轨道基类 `_Track`
+  /// 是**私有**的，外部没法拿它当类型约束，只能把「怎么取 id」传进来。
+  @visibleForTesting
+  static List<T> realTracksOf<T>(Iterable<T> tracks, String Function(T) idOf) =>
+      [for (final t in tracks) if (int.tryParse(idOf(t)) != null) t];
 
   static String _labelForEmbedded(
     String? title,

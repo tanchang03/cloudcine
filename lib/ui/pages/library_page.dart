@@ -340,6 +340,12 @@ class _KindFilter extends StatelessWidget {
 }
 
 /// 「库里什么都没有」的空态。
+///
+/// **必须区分两种空**：
+///   - 扫描正在跑：库里为空只是暂时的，要说「正在扫描、已发现 N 个」。
+///     实测踩过 —— 原先这里只有一句「点『扫描』把网盘里的视频全部找出来」，
+///     而用户明明已经在扫了，看到这句会以为扫描根本没生效；
+///   - 真没扫过：给「去扫描」。
 class _NeverScannedState extends ConsumerWidget {
   const _NeverScannedState();
 
@@ -347,6 +353,21 @@ class _NeverScannedState extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final auth = ref.watch(authControllerProvider).valueOrNull;
     final loggedIn = auth?.isAuthorized ?? false;
+    final scan = ref.watch(scanControllerProvider);
+
+    if (scan.running) {
+      final cursor = scan.progress?.cursor;
+      final found = cursor?.foundTracks ?? 0;
+      final dirs = cursor?.scannedDirs ?? 0;
+      return EmptyState(
+        icon: Icons.radar_rounded,
+        title: '正在扫描网盘…',
+        body: '已遍历 $dirs 个目录、发现 $found 个媒体文件。'
+            '作品会随着扫描陆续出现在这里，不用等它跑完。',
+        actionLabel: '查看进度',
+        onAction: () => context.go('/scan'),
+      );
+    }
 
     return EmptyState(
       icon: Icons.movie_filter_outlined,

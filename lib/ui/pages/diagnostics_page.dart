@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../../core/diagnostics/diag_log.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
+import '../windows/player_window_bridge.dart';
 
 /// 诊断日志页。
 ///
@@ -61,6 +62,14 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                         color: AppTheme.text,
                       ),
                     ),
+                    const SizedBox(width: 10),
+                    // 放在左组而不是右侧的日志操作组：它跟日志没关系，
+                    // 是「另开一个窗口看看」这类排查动作，语义上属于页面入口。
+                    TextButton.icon(
+                      onPressed: _openPlayerWindow,
+                      icon: const Icon(Icons.open_in_new_rounded, size: 15),
+                      label: const Text('播放器窗口'),
+                    ),
                     const Spacer(),
                     Text(
                       '${lines.length} 行',
@@ -105,12 +114,9 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
               ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(22, 0, 22, 10),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    diag.filePath ?? '日志文件不可写（仅内存）',
-                    style: AppTheme.mono,
-                  ),
+                child: LogPathRow(
+                  path: diag.filePath,
+                  onCopy: _copyLogPath,
                 ),
               ),
               Expanded(
@@ -142,12 +148,94 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
         l.contains('异常');
   }
 
+  /// 开一个 PC 端独立播放窗口。
+  ///
+  /// 这是阶段一的**验证入口**：真正接入播放流程（点片即开窗）在阶段二之后，
+  /// 现在需要一个人工按钮，好让「子窗口引擎能否起来」这类问题能被单独复现，
+  /// 不必依赖媒体库里恰好有一部能播的片子。
+  Future<void> _openPlayerWindow() async {
+    // 先取 messenger 再用：`await` 之后 context 可能已经失效。
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final controller = await const PlayerWindowLauncher().open();
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            controller == null
+                ? '当前平台不支持独立播放窗口'
+                : '播放窗口 ${controller.windowId} 已打开',
+          ),
+        ),
+      );
+    } catch (e, st) {
+      diag.error('窗口', '打开播放窗口失败', error: e, stackTrace: st);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('打开播放窗口失败：$e')));
+    }
+  }
+
   Future<void> _copy(List<String> lines) async {
     // 倒序复制：最新的在最上面，和页面上看到的一致。
     await copyToClipboard(lines.reversed.join('\n'));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('已复制 ${lines.length} 行日志')),
+    );
+  }
+
+  /// 复制日志文件的**绝对路径**（不是内容）。
+  ///
+  /// 这是排查链路里最常被卡住的一环：用户能看见日志、能全选复制，却没法把
+  /// 「文件在哪」告诉别人 —— 而路径正是让人自己去翻、或者把日志整份发出来的
+  /// 前提。只给路径不给内容是有意的：内容可能很长，粘贴到聊天窗口会被截断，
+  /// 而路径一定能完整送达。
+  Future<void> _copyLogPath(String path) async {
+    await copyToClipboard(path);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已复制日志文件路径')),
+    );
+  }
+}
+
+/// 日志文件路径那一行：路径 + 「复制路径」。
+///
+/// 抽成独立 widget 而不是直接写在页面里，是为了让它成为
+/// 「输入（[path]）→ 输出（界面）」的纯函数 —— 测试不必去启动那个全局日志
+/// 单例、也不必造一个真实文件，就能把「有路径 / 没路径」两种形态钉住。
+///
+/// 路径用 [SelectableText] 而不是普通 [Text]：即使不点按钮，也能用鼠标
+/// 划选带走。按钮只是让这一步更省事，不是唯一出口。
+class LogPathRow extends StatelessWidget {
+  const LogPathRow({super.key, required this.path, required this.onCopy});
+
+  /// 日志文件的绝对路径；null 表示写盘失败，本次只有内存日志。
+  final String? path;
+
+  /// 点「复制路径」时调用，参数就是该复制的文本。
+  final ValueChanged<String> onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = path;
+    return Row(
+      children: [
+        Expanded(
+          child: SelectableText(
+            p ?? '日志文件不可写（仅内存）',
+            style: AppTheme.mono,
+          ),
+        ),
+        const SizedBox(width: 8),
+        TextButton.icon(
+          // 没有路径时禁用而不是复制空串：静默复制一段空文本会让用户以为
+          // 「复制成功了但日志是空的」，比按钮灰掉更难查。
+          onPressed: p == null ? null : () => onCopy(p),
+          icon: const Icon(Icons.copy_rounded, size: 14),
+          label: const Text('复制路径'),
+        ),
+      ],
     );
   }
 }

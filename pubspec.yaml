@@ -36,6 +36,17 @@ dependencies:
   media_kit_libs_windows_video: ^1.0.10
   media_kit_libs_android_video: ^1.3.6
 
+  # PC 端播放器独立窗口。
+  #
+  # ⚠️ 它给每个窗口开**独立的 Flutter 引擎**（官方原文：*Each window created by this
+  # plugin has its own dedicated Flutter engine. Method channels cannot be shared
+  # between engines.*）。后果是 mpv 的 `Player` 跨不了引擎 —— 播放引擎必须整体
+  # 搬进播放器窗口。这是刻意的取舍，见 `lib/domain/services/player_host.dart`。
+  #
+  # 备选 `multiview_desktop`（单引擎多窗口，无需拆引擎）要求 Flutter ≥3.38.2，
+  # 当前 3.29 装不上。
+  desktop_multi_window: ^0.3.1
+
   # 浏览器授权（备选通道：登录后抓取 Cookie）
   flutter_inappwebview: ^6.1.5
 
@@ -57,3 +68,10 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  assets:
+    # 播放器窗口的「自检视频」：32 KB，H.264 baseline + AAC，3 秒。
+    # 用来把「mpv 在这个引擎里到底能不能出画」变成一个不受环境影响的
+    # 确定性结论 —— 走 asset 而不是让用户选本地文件，是因为 macOS 沙箱下
+    # 读用户选中的文件需要 `files.user-selected.read-only`，本应用没有申请。
+    - assets/player_selftest.mp4

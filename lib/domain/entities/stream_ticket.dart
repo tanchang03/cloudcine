@@ -73,6 +73,35 @@ class StreamTicket {
     );
   }
 
+  /// 决定「当前应该用哪一档」。
+  ///
+  /// 优先级：调用方给的默认档 → 原画 → 第一个可用档 → 第一档。
+  ///
+  /// **原画优先**是刻意的：转码流会丢细节，而本应用的用户把片子放在网盘上
+  /// 就是想要原片质量。只有用户显式选了别的档位才用别的。
+  ///
+  /// 返回 `null` 表示服务端没给转码梯度（[qualities] 为空），此时 [url]
+  /// 就是唯一可播的那条。
+  ///
+  /// 放在实体上而不是播放控制器里：**独立播放窗口那条路也要用同一套规则**
+  /// （主窗口取到票据后要据此决定把哪一档的地址发给播放窗口）。判定规则只能
+  /// 有一处 —— 两处各写一份的话，内置播放页和独立窗口选的档位迟早会不一样。
+  String? pickActiveQualityId([String? preferred]) {
+    if (qualities.isEmpty) return null;
+
+    if (preferred != null && preferred.isNotEmpty) {
+      final q = qualityById(preferred);
+      if (q != null && q.isAvailable) return q.id;
+    }
+    for (final q in qualities) {
+      if (q.isOriginal && q.isAvailable) return q.id;
+    }
+    for (final q in qualities) {
+      if (q.isAvailable) return q.id;
+    }
+    return qualities.first.id;
+  }
+
   /// 是否已过期。
   ///
   /// 提前 [earlyMargin] 判定，避免「刚取到就过期」导致播放中途断流。

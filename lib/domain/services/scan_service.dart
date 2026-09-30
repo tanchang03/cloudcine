@@ -255,6 +255,33 @@ class ScanService {
     /// 归组键 → 该组的代表信息（类型/标题/年份/文件数/体积）。
     final workSeeds = <String, _WorkSeed>{};
 
+    /// 已发现、但还没写成作品行的归组键。
+    ///
+    /// 存在的理由是「边扫边看」：作品行原先只在遍历**全部结束之后**才建，
+    /// 于是大库（几千个目录）在扫描的几十分钟里 `media_works` 一直是 0，
+    /// 媒体库页面显示的还是「媒体库还是空的，点『扫描』…」——与事实相反。
+    /// 现在每落一批媒体项，就把这一批涉及到的分组建成作品行。
+    final dirtyWorkKeys = <String>{};
+
+    /// 把 [dirtyWorkKeys] 里的分组写成作品行（元数据留空，刮削阶段再补）。
+    ///
+    /// 与阶段二走的是**同一个仓储入口**，所以 `mergeWorkForUpsert` 的
+    /// 「保护已有元数据」规则照样生效：先建空元数据的行，不会把后来
+    /// 刮削到的海报/简介顶掉（那条规则有单测覆盖）。
+    Future<void> flushWorks() async {
+      if (dirtyWorkKeys.isEmpty) return;
+      final works = <MediaWork>[];
+      for (final key in dirtyWorkKeys) {
+        final seed = workSeeds[key];
+        if (seed == null) continue;
+        works.add(
+          _buildWork(key: key, provider: provider, seed: seed, meta: null),
+        );
+      }
+      dirtyWorkKeys.clear();
+      await _library.upsertWorks(works, now: _clock());
+    }
+
     var indexed = 0;
     var removed = 0;
     var subtitlesIndexed = 0;
@@ -444,6 +471,7 @@ class ScanService {
               );
               seed.itemCount++;
               seed.totalBytes += entry.sizeBytes ?? 0;
+              dirtyWorkKeys.add(parsed.groupKey);
             }
           }
 
@@ -508,6 +536,10 @@ class ScanService {
           buffer.clear();
         }
 
+        // 目录边界：顺手把本目录新出现的分组建成作品行，
+        // 这样媒体库在扫描过程中就能一条条长出来。
+        await flushWorks();
+
         // 字幕匹配：**必须在本目录视频收齐之后**。
         //
         // 已知边界：若上次扫描是在本目录中途被杀的，续扫进来时前几页的
@@ -554,6 +586,9 @@ class ScanService {
         indexed += buffer.length;
         buffer.clear();
       }
+
+      // 遍历收尾：把最后一批分组也建成作品行。
+      await flushWorks();
 
       if (cancelled) {
         cursor = cursor.pause(_clock());

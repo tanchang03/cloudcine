@@ -8,6 +8,7 @@ import '../providers/library_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/poster_image.dart';
+import '../windows/desktop_play.dart';
 
 /// 作品详情页。
 ///
@@ -78,6 +79,18 @@ class WorkDetailPage extends ConsumerWidget {
   }
 }
 
+/// 「播这部片」。
+///
+/// 桌面端交给**独立播放窗口**；其余平台（以及窗口起不来时）跳内置播放页。
+///
+/// 降级是**静默**的 —— 用户点播放的意图是看片，不是体验多窗口，
+/// 所以「窗口开不出来」不该变成一个错误弹窗。降级原因会进诊断日志。
+Future<void> _play(BuildContext context, WidgetRef ref, MediaItem item) async {
+  if (await openInPlayerWindow(ref, item)) return;
+  if (!context.mounted) return;
+  await context.push('/play?item=${Uri.encodeComponent(item.id)}');
+}
+
 class _DetailBody extends ConsumerWidget {
   const _DetailBody({required this.detail});
 
@@ -138,14 +151,14 @@ class _DetailBody extends ConsumerWidget {
   }
 }
 
-class _InfoColumn extends StatelessWidget {
+class _InfoColumn extends ConsumerWidget {
   const _InfoColumn({required this.work, required this.detail});
 
   final MediaWork work;
   final WorkDetail detail;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final primary = detail.primary;
 
     return Column(
@@ -211,11 +224,8 @@ class _InfoColumn extends StatelessWidget {
         Row(
           children: [
             FilledButton.icon(
-              onPressed: primary == null
-                  ? null
-                  : () => context.push(
-                        '/play?item=${Uri.encodeComponent(primary.id)}',
-                      ),
+              onPressed:
+                  primary == null ? null : () => _play(context, ref, primary),
               style: FilledButton.styleFrom(
                 backgroundColor: AppTheme.accent,
                 padding: const EdgeInsets.symmetric(
@@ -281,7 +291,7 @@ class _SectionTitle extends StatelessWidget {
 }
 
 /// 一行文件。
-class _ItemRow extends StatelessWidget {
+class _ItemRow extends ConsumerWidget {
   const _ItemRow({required this.item, required this.index, this.dim = false});
 
   final MediaItem item;
@@ -291,7 +301,7 @@ class _ItemRow extends StatelessWidget {
   final bool dim;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final resolution = item.resolution;
 
     return Padding(
@@ -300,9 +310,7 @@ class _ItemRow extends StatelessWidget {
         color: AppTheme.panel,
         borderRadius: BorderRadius.circular(9),
         child: InkWell(
-          onTap: () => context.push(
-            '/play?item=${Uri.encodeComponent(item.id)}',
-          ),
+          onTap: () => _play(context, ref, item),
           borderRadius: BorderRadius.circular(9),
           hoverColor: AppTheme.panel2,
           child: Padding(
