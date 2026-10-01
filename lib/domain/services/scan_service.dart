@@ -1,10 +1,7 @@
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/drive_paths.dart';
 import '../../core/utils/filename_parser.dart';
-import '../../core/utils/image_formats.dart';
-import '../../core/utils/media_category.dart';
-import '../../core/utils/subtitle_formats.dart';
-import '../../core/utils/video_formats.dart';
 import '../adapters/cloud_drive_adapter.dart';
 import '../adapters/media_repository.dart';
 import '../entities/drive_entry.dart';
@@ -13,8 +10,11 @@ import '../entities/media_item.dart';
 import '../entities/media_work.dart';
 import '../entities/scan_cursor.dart';
 import '../entities/scan_policy.dart';
+import 'media_entry_classifier.dart';
+import 'request_throttle.dart';
 import 'scraper.dart';
 import 'subtitle_service.dart';
+import 'work_builder.dart';
 
 /// 扫描取消信号。
 ///
@@ -252,40 +252,24 @@ class ScanService {
     /// 本次运行**确实建立了字幕引用**的媒体项 id —— 字幕清理的白名单来源。
     final seenSubtitleItems = <String>{};
 
-    /// 归组键 → 刮削查询。遍历结束后统一跑。
-    ///
-    /// 用 Map 而不是 Set：同一部剧的每一集都会产出同一个 key，
-    /// 保留第一集的查询即可（片名/年份/季号一致），顺带天然去重。
-    final scrapeQueries = <String, ScrapeQuery>{};
+    /// 归组与作品行构造。**与局部发现共用同一份实现**（见 [WorkSeedBook]）——
+    /// 两处各写一遍的话，同一个文件走全盘扫描与走文件夹「发现」会得到不同的
+    /// 分组键 / 分类 / 封面，而这是静默的。
+    final book = WorkSeedBook();
 
-    /// 归组键 → 该组的代表信息（类型/标题/年份/文件数/体积）。
-    final workSeeds = <String, _WorkSeed>{};
-
-    /// 已发现、但还没写成作品行的归组键。
+    /// 已发现、但还没写成作品行的归组键由 [WorkSeedBook] 自己维护。
     ///
     /// 存在的理由是「边扫边看」：作品行原先只在遍历**全部结束之后**才建，
     /// 于是大库（几千个目录）在扫描的几十分钟里 `media_works` 一直是 0，
     /// 媒体库页面显示的还是「媒体库还是空的，点『扫描』…」——与事实相反。
     /// 现在每落一批媒体项，就把这一批涉及到的分组建成作品行。
-    final dirtyWorkKeys = <String>{};
-
-    /// 把 [dirtyWorkKeys] 里的分组写成作品行（元数据留空，刮削阶段再补）。
-    ///
-    /// 与阶段二走的是**同一个仓储入口**，所以 `mergeWorkForUpsert` 的
-    /// 「保护已有元数据」规则照样生效：先建空元数据的行，不会把后来
-    /// 刮削到的海报/简介顶掉（那条规则有单测覆盖）。
     Future<void> flushWorks() async {
-      if (dirtyWorkKeys.isEmpty) return;
-      final works = <MediaWork>[];
-      for (final key in dirtyWorkKeys) {
-        final seed = workSeeds[key];
-        if (seed == null) continue;
-        works.add(
-          _buildWork(key: key, provider: provider, seed: seed, meta: null),
-        );
-      }
-      dirtyWorkKeys.clear();
-      await _library.upsertWorks(works, now: _clock());
+      if (!book.hasDirty) return;
+      await _library.upsertWorks(
+        book.buildDirty(provider: provider, now: _clock()),
+        now: _clock(),
+      );
+      book.markClean();
     }
 
     var indexed = 0;
@@ -299,29 +283,13 @@ class ScanService {
     var pagesSinceCursorFlush = 0;
     var pagesSinceEmit = 0;
 
-    /// 上一次列目录请求的**发起时刻**，供 [throttleList] 计算剩余等待。
-    DateTime? lastListAt;
-
-    /// 节流：保证相邻两次列目录请求之间至少间隔 [ScanPolicy.minRequestInterval]。
-    ///
-    /// ⚠️ 必须在**每次请求之前**调用，并按「上次发起时刻」算剩余等待时间。
-    /// 早先参考项目的实现是在页尾固定 sleep 一次，但内层循环在
-    /// `pageToken == null` 时先 `break` 了 —— 于是「换目录」的那一次请求
-    /// 完全没被节流。对「每个目录都只有一页」的媒体库（很常见）等于
-    /// **全程不节流**：几千个目录会以网络往返速度一路打过去，3 QPS
-    /// 安全线形同虚设。
-    ///
-    /// 按请求**起点**而不是终点计时，才是「最小间隔」的正确语义。
-    Future<void> throttleList() async {
-      final interval = policy.minRequestInterval;
-      if (interval <= Duration.zero) return;
-      final last = lastListAt;
-      if (last != null) {
-        final wait = interval - _clock().difference(last);
-        if (wait > Duration.zero) await Future.delayed(wait);
-      }
-      lastListAt = _clock();
-    }
+    /// 列目录请求的节流器。**与局部发现共用同一个实现** —— 这段逻辑
+    /// 在本项目踩过两次坑（死配置、漏掉「换目录」那一次请求），
+    /// 留在两处各写一份就是让第二个入口有机会重犯一次。见 [RequestThrottle]。
+    final throttle = RequestThrottle(
+      minInterval: policy.minRequestInterval,
+      clock: _clock,
+    );
 
     void emit({
       bool running = true,
@@ -376,7 +344,7 @@ class ScanService {
         while (true) {
           // 节流放在请求**之前**：同目录翻页、换目录、续扫首请求
           // 走的都是同一条限速逻辑，不会再有漏网的请求。
-          await throttleList();
+          await throttle.wait();
 
           DrivePage page;
           try {
@@ -411,7 +379,7 @@ class ScanService {
               cursor = cursor.enqueueIfAbsent(
                 PendingDir(
                   id: entry.id,
-                  path: _joinPath(dir.path, entry.name),
+                  path: drivePathJoin(dir.path, entry.name),
                   depth: childDepth,
                 ),
                 _clock(),
@@ -421,82 +389,51 @@ class ScanService {
 
             newFiles++;
 
-            // 字幕：先收着，目录收齐后再配对。
-            if (SubtitleFormats.isSubtitleFile(entry.name)) {
-              dirSubtitles.add(entry);
-              continue;
-            }
-            // 图片与其它非视频文件直接跳过。
-            // ⚠️ 图片**不当媒体项**入库：一张 `cover.jpg` 变成「一个视频」
-            // 会让媒体库出现一堆点开就报错的条目。
-            if (isImageFile(entry.name, mimeType: entry.mimeType)) continue;
-            if (!VideoFormats.isVideoFile(entry.name, mimeType: entry.mimeType)) {
-              continue;
-            }
-            // 蓝光镜像不索引：mpv 播不了 BD 导航结构，索引了只会得到
-            // 一堆点了播不了的行。
-            if (VideoFormats.isDiscImage(entry.name)) {
-              diag.debug('扫描', '跳过镜像文件：${entry.name}');
-              continue;
-            }
+            // 「这个条目该不该进媒体库」的判据只有一份实现（[classifyEntry]），
+            // 与文件夹里的局部发现共用 —— 两处各写一遍迟早漂移，而漂移是
+            // 静默的：同一个文件走全盘扫描会入库、走文件夹发现不会。
+            switch (classifyEntry(entry)) {
+              case EntryRole.directory:
+                break; // 上面已经处理过
 
-            final parsed = parser.parse(
-              entry.name,
-              dirName: MediaFilenameParser.dirNameOf(dir.path),
-            );
-            final item = MediaItem.fromEntry(
-              entry: entry,
-              provider: provider,
-              dirPath: dir.path,
-              parsed: parsed,
-              now: _clock(),
-            );
-            buffer.add(item);
-            dirItems.add(item);
-            seenIds.add(item.id);
-            newItems++;
-            newBytes += entry.sizeBytes ?? 0;
+              case EntryRole.subtitle:
+                // 先收着，目录收齐后再配对。
+                dirSubtitles.add(entry);
 
-            // 刮削查询：同一组只留一条。
-            //
-            // 查询的构造走 `ScrapeQuery.fromParsed`，与详情页的「刮削」按钮
-            // 共用同一份逻辑 —— 两处各拼一遍的话，同一个作品在「扫描期」
-            // 与「点按钮」时会查出不同结果，而且**不会报错**。
-            final scrapeQuery = ScrapeQuery.fromParsed(parsed);
-            if (scrapeQuery != null) {
-              scrapeQueries.putIfAbsent(parsed.groupKey, () => scrapeQuery);
-              final seed = workSeeds.putIfAbsent(
-                parsed.groupKey,
-                () => _WorkSeed(
-                  kind: parsed.kind,
-                  title: parsed.title!,
-                  year: parsed.year,
-                  // 分类判定用「文件名 + 目录路径 + 片名」三处证据：
-                  // 网盘上「动漫」这类信息几乎总是写在目录名里
-                  // （`/动漫/进击的巨人/…`），只看片名会大面积漏判。
-                  category: MediaCategoryGuesser.guess(
-                    kind: parsed.kind,
-                    title: parsed.title,
-                    fileName: entry.name,
+              case EntryRole.image:
+              case EntryRole.other:
+                // 图片与其它非视频文件直接跳过。
+                // ⚠️ 图片**不当媒体项**入库：一张 `cover.jpg` 变成「一个视频」
+                // 会让媒体库出现一堆点开就报错的条目。
+                break;
+
+              case EntryRole.discImage:
+                // 蓝光镜像不索引：mpv 播不了 BD 导航结构，索引了只会得到
+                // 一堆点了播不了的行。
+                diag.debug('扫描', '跳过镜像文件：${entry.name}');
+
+              case EntryRole.video:
+                {
+                  final parsed = parser.parse(
+                    entry.name,
+                    dirName: MediaFilenameParser.dirNameOf(dir.path),
+                  );
+                  final item = MediaItem.fromEntry(
+                    entry: entry,
+                    provider: provider,
                     dirPath: dir.path,
-                  ),
-                ),
-              );
-              // 第一条没缩略图时用后面的补上（夸克对约 30% 的视频
-              // 还没生成预览图，而同一部剧里通常总有一集是有的）。
-              //
-              // ⚠️ 地址和锚点**必须在同一次赋值里一起写**：它们描述的是同一张图。
-              // 拆成两次写（先 `posterUrl ??=`、再 `posterFaceX ??=`）会在
-              // 「第一集有图但没人脸、第二集有人脸但没图」时拼出一对不匹配的
-              // 组合 —— 拿甲图的人脸位置去裁乙图。写成 `if` 而不是 `??=`，
-              // 就是为了让这两行在结构上无法分开。
-              if (seed.posterUrl == null && item.thumbUrl != null) {
-                seed.posterUrl = item.thumbUrl;
-                seed.posterFaceX = item.faceAnchorX;
-              }
-              seed.itemCount++;
-              seed.totalBytes += entry.sizeBytes ?? 0;
-              dirtyWorkKeys.add(parsed.groupKey);
+                    parsed: parsed,
+                    now: _clock(),
+                  );
+                  buffer.add(item);
+                  dirItems.add(item);
+                  seenIds.add(item.id);
+                  newItems++;
+                  newBytes += entry.sizeBytes ?? 0;
+
+                  // 归组 + 取种（刮削查询、分类、封面与锚点）走共用实现。
+                  book.add(parsed: parsed, item: item, dirPath: dir.path);
+                }
             }
           }
 
@@ -647,25 +584,24 @@ class ScanService {
       emit(
         running: true,
         phase: ScanPhase.scraping,
-        totalToScrape: scrapeQueries.length,
+        totalToScrape: book.queries.length,
         message: '正在刮削元数据…',
       );
-      for (final entry in scrapeQueries.entries) {
+      for (final entry in book.queries.entries) {
         if (cancel.isCancelled) {
           cancelled = true;
           break;
         }
-        final seed = workSeeds[entry.key];
-        if (seed == null) continue;
 
         try {
           final meta = await _scraper.scrape(entry.value);
-          final work = _buildWork(
-            key: entry.key,
+          final work = book.build(
+            entry.key,
             provider: provider,
-            seed: seed,
             meta: meta,
+            now: _clock(),
           );
+          if (work == null) continue;
           await _library.upsertWorks([work], now: _clock());
           if (meta != null && meta.source == ScrapeSource.online) worksScraped++;
         } catch (e) {
@@ -675,21 +611,20 @@ class ScanService {
         emit(
           running: true,
           phase: ScanPhase.scraping,
-          totalToScrape: scrapeQueries.length,
+          totalToScrape: book.queries.length,
           message: '正在刮削元数据…',
         );
       }
     } else if (!cancelled && error == null) {
       // 没开刮削时也要建作品行，否则媒体库是空的（只有文件没有作品）。
-      for (final entry in scrapeQueries.entries) {
-        final seed = workSeeds[entry.key];
-        if (seed == null) continue;
-        final work = _buildWork(
-          key: entry.key,
+      for (final key in book.queries.keys) {
+        final work = book.build(
+          key,
           provider: provider,
-          seed: seed,
           meta: null,
+          now: _clock(),
         );
+        if (work == null) continue;
         await _library.upsertWorks([work], now: _clock());
       }
     }
@@ -754,111 +689,4 @@ class ScanService {
       error: error,
     );
   }
-
-  /// 构造作品行。
-  ///
-  /// 刮削结果优先；没有就退到本地解析的标题与年份 —— 这样即使一个刮削器
-  /// 都没配，媒体库里也有正常的标题，而不是一串文件名。
-  ///
-  /// ## 海报的两级来源
-  ///
-  /// `TMDB 海报` → `网盘缩略图`。第二级是本项目「无刮削也要有画面」的关键：
-  /// 夸克给每个视频生成了服务端预览图（实测 640×360 WebP），
-  /// 直接拿它当作品封面，媒体库就不再是一墙灰块。
-  ///
-  /// 顺序不能反：TMDB 的海报是**竖版作品海报**（2:3），网盘缩略图是
-  /// **视频画面**（16:9）。有正规海报时用视频截图会显得很不专业。
-  ///
-  /// ⚠️ 两种来源的**比例不同**，所以换来源时必须同时换掉 `posterFaceX`
-  /// 锚点（见下）：锚点是「视频帧里人物在哪」，拿去裁 2:3 的作品海报是错的。
-  MediaWork _buildWork({
-    required String key,
-    required DriveProvider provider,
-    required _WorkSeed seed,
-    required ScrapedMetadata? meta,
-  }) {
-    // 取一次，避免下面两处各算一遍导致「地址用刮削的、锚点用网盘的」这种
-    // 只有视觉上才看得出来的错配。
-    final scrapedPoster = _nonEmpty(meta?.posterUrl);
-
-    return MediaWork(
-      key: key,
-      provider: provider,
-      kind: seed.kind,
-      category: seed.category,
-      title: meta?.title ?? seed.title,
-      originalTitle: meta?.originalTitle,
-      year: meta?.year ?? seed.year,
-      overview: meta?.overview,
-      posterUrl: scrapedPoster ?? seed.posterUrl,
-      // 锚点跟着**实际用的那张图**走：
-      //   - 用了刮削海报 → 它是 2:3 的竖版作品海报，铺满格子、不裁切，
-      //     不需要锚点（拿视频帧的人脸位置去裁它只会裁错地方）；
-      //   - 用了网盘缩略图 → 16:9 要裁成竖版，此时锚点才是「凸显人物」的依据。
-      posterFaceX: scrapedPoster == null ? seed.posterFaceX : null,
-      backdropUrl: meta?.backdropUrl,
-      rating: meta?.rating,
-      genres: meta?.genres ?? const [],
-      onlineId: meta?.onlineId,
-      source: meta?.source ?? ScrapeSource.local,
-      scrapedAt: meta?.source == ScrapeSource.online ? _clock() : null,
-      itemCount: seed.itemCount,
-      totalBytes: seed.totalBytes,
-      updatedAt: _clock(),
-    );
-  }
-
-  static String? _nonEmpty(String? v) =>
-      (v == null || v.trim().isEmpty) ? null : v.trim();
-
-  /// 拼接目录展示路径，保证以 `/` 开头、以 `/` 结尾。
-  static String _joinPath(String base, String name) {
-    if (base.isEmpty) return '/$name/';
-    if (base.endsWith('/')) return '$base$name/';
-    return '$base/$name/';
-  }
-}
-
-/// 作品种子：遍历期累积的、与刮削无关的那部分信息。
-class _WorkSeed {
-  _WorkSeed({
-    required this.kind,
-    required this.title,
-    required this.category,
-    this.year,
-  });
-
-  final MediaKind kind;
-  final String title;
-  final int? year;
-
-  /// 一级分类（电影 / 剧集 / 动漫 / 综艺 / 纪录片 / 其他）。
-  ///
-  /// 在**第一条**命中这个分组的文件上判定一次，之后不再改 —— 同一部剧的
-  /// 每一集文件名可能差异很大（`S01E01` 有季集号、`SP` 特别篇没有），
-  /// 逐集重判会让分类在「剧集」和「其他」之间跳。以第一条为准更稳定，
-  /// 而第一条通常是最规整的那一集。
-  final MediaCategory category;
-
-  /// 网盘服务端缩略图地址（**未刮削时的封面兜底**）。
-  ///
-  /// 只取分组里的**第一条**有缩略图的 —— 一部剧几十集，每集都存一份地址
-  /// 没有意义：作品海报只需要一张，而且用户认的是「这部剧」而不是「第 7 集
-  /// 的那一帧」。
-  ///
-  /// 它只在**没有在线刮削海报**时才被用上（见 [_buildWork]）。
-  ///
-  /// ⚠️ 它和 [posterFaceX] 是**一对**，只在 `_walkDirectory` 里那一处 `if`
-  /// 里一起赋值。构造函数故意不收这两个参数 —— 那样就会出现「构造时给了地址、
-  /// 循环里再补锚点」这种半截状态，而它们描述的是同一张图。
-  String? posterUrl;
-
-  /// [posterUrl] 那张图里**人物所在的水平位置**（0~1），来自夸克人脸框。
-  ///
-  /// ⚠️ 与 [posterUrl] 是**一对**，必须同进同退：它们描述的是同一张图。
-  /// 只换地址不换锚点 = 拿上一张图的人脸位置去裁这一张。
-  double? posterFaceX;
-
-  int itemCount = 0;
-  int totalBytes = 0;
 }

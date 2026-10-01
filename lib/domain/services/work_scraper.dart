@@ -1,5 +1,6 @@
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/filename_parser.dart';
+import '../../core/utils/media_category.dart';
 import '../adapters/media_repository.dart';
 import '../entities/media_item.dart';
 import '../entities/media_work.dart';
@@ -17,11 +18,49 @@ enum WorkScrapeStatus {
   noQuery,
 }
 
+/// 这次刮削是**谁发起的**。
+///
+/// ## 为什么它不是一个可有可无的装饰
+///
+/// [WorkScrapeStatus.notFound] 在两个通道里是**两件不同的事**，而它们一度
+/// 共用同一句文案 —— 于是手动对话框里会冒出一句讲自动流程的话
+/// （「在线源都没有找到匹配的条目，可能是片名解析不准」）。用户刚刚亲眼
+/// 看到了一列候选、亲手点了一条，被告知「没找到条目」，只会以为界面坏了。
+///
+///   - [auto]：**算法**拿着文件名解析出来的词去搜，没有找到信得过的条目。
+///     下一步是「换个词自己搜」，所以文案要把人引到旁边的「手动」按钮上。
+///   - [manual]：**用户亲手**从候选里挑了一条，但这一条解析不出完整元数据
+///     （条目被删、接口改版、详情返回了空对象）。下一步是「换一条候选」——
+///     这跟他敲的词没关系，叫他去改片名是误导。
+enum ScrapeChannel {
+  /// 详情页「刮削」按钮发起。
+  ///
+  /// ⚠️ 扫描期那条自动刮削（`ScanService`）走的是 `ScraperPipeline`，
+  /// **不产出** [WorkScrapeOutcome]，所以 `auto` 只有这一个来源。也正因为
+  /// 来源唯一、且详情页上「手动」按钮就并排放在「刮削」旁边，auto 那条
+  /// 文案才敢写死「点旁边的『手动』」。
+  auto,
+
+  /// 手动刮削对话框里用户选中候选后发起。
+  manual,
+}
+
 /// 刮一部作品的产物。
 class WorkScrapeOutcome {
-  const WorkScrapeOutcome({required this.status, this.work, this.metadata});
+  const WorkScrapeOutcome({
+    required this.status,
+    required this.channel,
+    this.work,
+    this.metadata,
+  });
 
   final WorkScrapeStatus status;
+
+  /// 谁发起的。决定 [message] 用哪一套说法，见 [ScrapeChannel]。
+  ///
+  /// **故意不给默认值**：两个通道的说法混用正是当初那个 bug，而默认值会让
+  /// 「漏填」这件事静默地编译通过。
+  final ScrapeChannel channel;
 
   /// 落库后的作品行（[WorkScrapeStatus.scraped] 时非空）。
   final MediaWork? work;
@@ -30,13 +69,19 @@ class WorkScrapeOutcome {
   final ScrapedMetadata? metadata;
 
   /// 面向用户的一句话结果。
-  String get message => switch (status) {
-        WorkScrapeStatus.scraped =>
+  ///
+  /// 按 `(状态, 通道)` **两个维度**取文案 —— 只按状态分是不够的，理由见
+  /// [ScrapeChannel]。成功那条两个通道共用（「已刮削：…」对谁说都一样）。
+  String get message => switch ((status, channel)) {
+        (WorkScrapeStatus.scraped, _) =>
           '已刮削：${metadata!.title}'
               '${metadata!.year == null ? "" : "（${metadata!.year}）"}',
-        WorkScrapeStatus.notFound => '在线源都没有找到匹配的条目，'
-            '可能是片名解析不准，或这个词在数据源里没有收录。',
-        WorkScrapeStatus.noQuery => '这个文件名解析不出可信的片名，无法刮削。',
+        (WorkScrapeStatus.notFound, ScrapeChannel.auto) =>
+          '在线源都没找到信得过的条目 —— 可能是片名解析不准，'
+              '或这个词在数据源里没有收录。点旁边的「手动」自己敲片名再搜。',
+        (WorkScrapeStatus.notFound, ScrapeChannel.manual) =>
+          '这一条解析不出完整信息（条目可能已被删除或改版），换一条候选再试。',
+        (WorkScrapeStatus.noQuery, _) => '这个文件名解析不出可信的片名，无法刮削。',
       };
 }
 
@@ -86,16 +131,27 @@ class WorkScraper {
   /// [WorkScrapeStatus.notFound] —— 这是给一个按钮用的，抛异常只会变成
   /// 一个红色的报错弹窗，而用户真正需要知道的是「没刮到」。
   Future<WorkScrapeOutcome> scrape(MediaWork work) async {
+    // 本方法产出的结果**全部**属于自动通道。写成方法头的局部常量、而不是
+    // 在每个 `return` 处内联，是为了让「这里不产出手动通道的结果」在方法头
+    // 一眼可见 —— 文案错配正是从「两处返回混在一起」开始的。
+    const channel = ScrapeChannel.auto;
+
     try {
       final items = await _library.itemsForWork(work.key);
       if (items.isEmpty) {
-        return const WorkScrapeOutcome(status: WorkScrapeStatus.noQuery);
+        return const WorkScrapeOutcome(
+          status: WorkScrapeStatus.noQuery,
+          channel: channel,
+        );
       }
 
       final query = _queryFor(items);
       if (query == null) {
         diag.info('刮削', '${work.key} 文件名解析不出可信片名，跳过');
-        return const WorkScrapeOutcome(status: WorkScrapeStatus.noQuery);
+        return const WorkScrapeOutcome(
+          status: WorkScrapeStatus.noQuery,
+          channel: channel,
+        );
       }
 
       final meta = await _pipeline.scrape(query);
@@ -105,7 +161,10 @@ class WorkScraper {
       // 用户会看到「已刮削」但海报简介一个都没有。
       if (meta == null || meta.source != ScrapeSource.online) {
         diag.info('刮削', '${work.key} 在线源未命中：$query');
-        return const WorkScrapeOutcome(status: WorkScrapeStatus.notFound);
+        return const WorkScrapeOutcome(
+          status: WorkScrapeStatus.notFound,
+          channel: channel,
+        );
       }
 
       final merged = _apply(work, meta);
@@ -113,12 +172,16 @@ class WorkScraper {
       diag.info('刮削', '${work.key} 已更新：${meta.title}');
       return WorkScrapeOutcome(
         status: WorkScrapeStatus.scraped,
+        channel: channel,
         work: merged,
         metadata: meta,
       );
     } catch (e) {
       diag.warn('刮削', '${work.key} 刮削失败，按未命中处理', error: e);
-      return const WorkScrapeOutcome(status: WorkScrapeStatus.notFound);
+      return const WorkScrapeOutcome(
+        status: WorkScrapeStatus.notFound,
+        channel: channel,
+      );
     }
   }
 
@@ -141,12 +204,102 @@ class WorkScraper {
     return null;
   }
 
+  // -------------------------------------------------------------------
+  // 手动刮削：用户自己敲片名，从候选里挑一条
+  // -------------------------------------------------------------------
+
+  /// 手动刮削对话框的**预填**查询 —— 从文件名重新解析一次。
+  ///
+  /// ## 为什么要有它
+  ///
+  /// 自动刮削的失败大多是**片名解析不准**，而对话框如果预填「库里已存的
+  /// 标题」，用户看到的会是上一次刮错的结果（`低俗小说`），他得先意识到
+  /// 「这个框里是错的」才会去改。预填**文件名解析出来的原始词**
+  /// （`超z级z马z力z欧z银z河z大z电影aa`）反而更有用：它诚实地展示了
+  /// 「自动刮削拿着这么个词去搜」，用户一眼就知道该删掉那些 `z`。
+  ///
+  /// 解析不出任何可信片名时返回 `null`，调用方退回用库里已有的标题。
+  Future<ScrapeQuery?> queryFor(MediaWork work) async {
+    try {
+      final items = await _library.itemsForWork(work.key);
+      if (items.isEmpty) return null;
+      return _queryFor(items);
+    } catch (e) {
+      diag.warn('刮削', '${work.key} 预填查询失败，改用手工输入', error: e);
+      return null;
+    }
+  }
+
+  /// 按用户输入搜候选。**永不抛异常**，失败就是空列表。
+  ///
+  /// 与 [scrape] 一样不设「结果为空」以外的失败信号：对话框那边
+  /// 无论哪种原因都只能说「换个词再试」，区分了对用户没有额外价值。
+  Future<List<ScrapeCandidate>> searchCandidates(ScrapeQuery query) async {
+    try {
+      final found = await _pipeline.search(query);
+      diag.info('刮削', '手动刮削搜 "${query.title}"：${found.length} 条候选');
+      return found;
+    } catch (e) {
+      diag.warn('刮削', '手动刮削搜索失败', error: e);
+      return const [];
+    }
+  }
+
+  /// 把用户选中的候选解析成完整元数据并落库。
+  ///
+  /// ## 与 [scrape] 的一处关键差别
+  ///
+  /// [scrape] 必须判 `meta.source != online`（因为流水线兜底是本地文件名
+  /// 解析，它永远成功）；这里**不用判** —— 候选只可能来自在线源，
+  /// 用户亲手点的那一条就是他要的。多判一次反而会挡掉将来可能出现的
+  /// 「本地候选」。
+  ///
+  /// 另外**这里不看匹配闸门**：闸门是替自动流程做判断的，用户已经做过
+  /// 判断了。目录名 `超z级z马z力z欧z银z河z大z电影aa` 正是被闸门拦下来的
+  /// 那类输入 —— 用户手动选中《超级马力欧银河大电影》时，闸门必须让路。
+  Future<WorkScrapeOutcome> applyCandidate(
+    MediaWork work,
+    ScrapeCandidate candidate,
+  ) async {
+    // 与 [scrape] 对称：本方法产出的结果全部属于**手动**通道。
+    const channel = ScrapeChannel.manual;
+
+    try {
+      final meta = await _pipeline.resolve(candidate);
+      if (meta == null) {
+        diag.info('刮削', '${work.key} 候选 ${candidate.source}/${candidate.sourceId} 解析失败');
+        return const WorkScrapeOutcome(
+          status: WorkScrapeStatus.notFound,
+          channel: channel,
+        );
+      }
+
+      final merged = _apply(work, meta);
+      await _library.upsertWorks([merged], now: _clock());
+      diag.info(
+        '刮削',
+        '${work.key} 手动选中 ${candidate.source}/${candidate.sourceId} → ${meta.title}',
+      );
+      return WorkScrapeOutcome(
+        status: WorkScrapeStatus.scraped,
+        channel: channel,
+        work: merged,
+        metadata: meta,
+      );
+    } catch (e) {
+      diag.warn('刮削', '${work.key} 应用候选失败，按未命中处理', error: e);
+      return const WorkScrapeOutcome(
+        status: WorkScrapeStatus.notFound,
+        channel: channel,
+      );
+    }
+  }
+
   /// 把刮削结果合并进作品行。
   ///
-  /// ## 三处必须显式处理的地方
+  /// ## 四处必须显式处理的地方
   ///
-  ///   - **分类不跟着变**。`category` 描述的是「这些文件是什么」（电影/剧集/
-  ///     动漫/综艺…），是**扫描期对文件**的判定；刮削只补标题海报那类元数据。
+  ///   - **分类只在 `genres` 给出结论时才覆盖**（见下面那段长注释）。
   ///   - **海报换了就必须清掉 `posterFaceX`**。刮削海报是 2:3 的竖版作品海报，
   ///     铺满格子、不裁切，压根不需要人脸锚点。这里写 `null` 是**结论**而不是
   ///     缺失 —— 留着旧的锚点，`PosterImage` 会拿视频帧的人脸位置去裁海报。
@@ -161,7 +314,7 @@ class WorkScraper {
       key: work.key,
       provider: work.provider,
       kind: work.kind,
-      category: work.category,
+      category: _categoryFor(work, meta),
       title: meta.title,
       originalTitle: meta.originalTitle ?? work.originalTitle,
       year: meta.year ?? work.year,
@@ -183,6 +336,51 @@ class WorkScraper {
       lastPlayedAt: work.lastPlayedAt,
       updatedAt: _clock(),
     );
+  }
+
+  /// 刮削之后这部作品该归到哪一栏。
+  ///
+  /// ## 为什么这里不能直接 `MediaCategoryGuesser.guess(...)`
+  ///
+  /// `guess` 的最后一步是「按 `kind` 落到电影 / 剧集」——那是**兜底**，
+  /// 只在前面所有证据都没命中时才走。而这里要的是「刮削**新增**了什么证据」，
+  /// 不是「从头再判一次」。
+  ///
+  /// 用 `guess` 会有一个很难查的后果：用户把综艺放在 `/综艺/奔跑吧/`
+  /// （扫描期靠目录路径正确地判成 [MediaCategory.variety]），而 TMDB 对国产
+  /// 综艺常常给不出「真人秀」这个类型 —— 于是 `guess` 走到 kind 兜底，
+  /// 把「综艺」**冲成「剧集」**。用户看到的是「我的综艺栏目空了」。
+  ///
+  /// ## 所以规则是：genres 说话才算，不说就闭嘴
+  ///
+  ///   - `fromGenres` 有结论（动画 / 纪录片 / 真人秀）→ 用它。这是 TMDB 的
+  ///     真实类型，比目录名和关键词都准 —— `MediaCategoryGuesser` 自己也是
+  ///     把 genres 排在第一优先级的，两边口径必须一致；
+  ///   - `fromGenres` 没结论（剧情 / 科幻 / 喜剧…这些不改变栏目）→
+  ///     **原样保留扫描期的判定**。
+  ///
+  /// ## 这条路径以前是死的
+  ///
+  /// 在加上这一行之前，`fromGenres` 在整个项目里**永远不会被执行**：
+  /// 扫描期调 `guess` 时不传 `genres`（那时还没刮削），而两个「分类回填」
+  /// 入口都只处理 `category` 为空串的老行 —— 刮削过的作品分类非空，
+  /// 永远轮不到。结果是：一部目录名里没有「动漫」二字的动画电影，
+  /// 刮到了 `genres: ['动画']`、落进了库，却始终留在「电影」栏。
+  ///
+  /// ⚠️ 改这里要同步改 `MediaRepositoryImpl.backfillWorkCategories` ——
+  /// 那边负责把**已经刮过**的作品按同一套规则修正过来，否则老库要等
+  /// 用户逐部重刮才生效。
+  MediaCategory _categoryFor(MediaWork work, ScrapedMetadata meta) {
+    final byGenre = MediaCategoryGuesser.fromGenres(meta.genres);
+    if (byGenre == null) return work.category;
+    if (byGenre != work.category) {
+      diag.info(
+        '刮削',
+        '${work.key} 分类 ${work.category.label} → ${byGenre.label}'
+            '（TMDB 类型 ${meta.genres.join("/")}）',
+      );
+    }
+    return byGenre;
   }
 
   static String? _nonEmpty(String? v) =>

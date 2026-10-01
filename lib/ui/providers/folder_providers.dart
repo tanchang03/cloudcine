@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../domain/services/folder_tree.dart';
 import 'app_providers.dart';
+import 'library_refresh_providers.dart';
 
 /// 媒体库的两种呈现方式。
 ///
@@ -30,46 +31,28 @@ final libraryViewProvider =
   LibraryViewController.new,
 );
 
-/// 目录视图当前所在的目录（归一化路径，根为 `/`）。
+/// **本地索引**重建出来的目录树。
 ///
-/// **只存一个路径字符串**，不存节点：目录树本身由 [folderTreeProvider] 提供，
-/// 重扫之后树会重建，而路径是个稳定的「坐标」—— 存节点就会拿着一份过期的
-/// 树去渲染（表现为翻着翻着突然一片空白）。
+/// ## 它现在的角色：叠加层，不是数据源
 ///
-/// 路径不存在时（重扫后目录没了）由 UI 兜底，这里不做校验。
-class FolderPathController extends Notifier<String> {
-  @override
-  String build() => FolderTree.rootPath;
-
-  void open(String path) {
-    final normalized = FolderTree.normalize(path);
-    if (normalized != state) state = normalized;
-  }
-
-  /// 回到上一层。已在根目录时不动 —— 否则会把自己又设一遍，白白重建界面。
-  void up() => open(FolderTree.parentOf(state));
-
-  void reset() {
-    if (state != FolderTree.rootPath) state = FolderTree.rootPath;
-  }
-}
-
-final currentFolderProvider =
-    NotifierProvider<FolderPathController, String>(FolderPathController.new);
-
-/// 网盘目录树。
+/// 目录视图的数据源是**网盘实时目录**（见 `drive_browse_providers.dart`）。
+/// 那棵树只回答「网盘上现在有什么」；而用户还需要知道「这里面哪些已经在
+/// 库里了」—— 那只能从本地索引读。这棵树就是这个用途：
+///
+///   - [FolderTree.fileIds]：某个网盘文件是否已入库；
+///   - [FolderTree.indexedCountAt]：某个目录里已入库多少个。
 ///
 /// ## 为什么一次读全量
 ///
-/// 目录树要给出**递归**的文件数与体积（「电影」这一行要显示它下面总共多少片），
-/// 那必须看到全部媒体项才能算。个人网盘量级（实测几百到几千条）下一次全表读
-/// 只要几十毫秒，而换成「每进一层查一次库」会带来两个新问题：递归计数还得
-/// 单独算，且每次点目录都要等一次 SQLite 往返。
+/// 目录行要显示**递归**的已入库数量（「电影」这一行要显示它下面总共有多少
+/// 片），那必须看到全部媒体项才能算。个人网盘量级（实测几百到几千条）下
+/// 一次全表读只要几十毫秒，而换成「每进一层查一次库」会带来两个新问题：
+/// 递归计数还得单独算，且每次点目录都要等一次 SQLite 往返。
 ///
-/// 全量读的代价是**切目录不再查库** —— 翻目录是纯内存操作，瞬时响应。
-///
-/// 刷新入口是媒体库页头的「刷新」按钮（它同时 invalidate 这个 provider）。
+/// 刷新入口是媒体库页头的「刷新」按钮，以及**任何一次写库之后**
+/// （[libraryWriteSignalProvider] 由扫描与发现两处推进）。
 final folderTreeProvider = FutureProvider<FolderTree>((ref) async {
+  ref.watch(libraryWriteSignalProvider);
   final items = await ref.watch(mediaRepositoryProvider).listItems();
   return FolderTree.build(items);
 });

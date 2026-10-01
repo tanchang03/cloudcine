@@ -164,6 +164,15 @@ class MediaWorks extends Table {
   IntColumn get itemCount => integer().withDefault(const Constant(0))();
   IntColumn get totalBytes => integer().withDefault(const Constant(0))();
 
+  /// 作品下所有文件的**网盘修改时间**最大值（`MediaItem.modifiedAt`）。
+  ///
+  /// 取最大值是因为一部剧有多集：新增一集时这个值会变大，
+  /// 整个作品在「最近修改」排序里就会浮到前面。
+  DateTimeColumn get lastModifiedAt => dateTime().nullable()();
+
+  /// 作品**首次入库**时间。决定「最近添加」排序，upsert 时必须保留旧值。
+  DateTimeColumn get firstSeenAt => dateTime().nullable()();
+
   DateTimeColumn get lastPlayedAt => dateTime().nullable()();
   DateTimeColumn get updatedAt => dateTime()();
 

@@ -7,7 +7,7 @@ import '../widgets/app_logo.dart';
 
 /// 启动页。
 ///
-/// 存在的唯一理由是**等授权状态解析完**。授权恢复要读钥匙串 + 打一次
+/// 存在的唯一理由是**等授权状态解析完**。授权恢复要读安全存储 + 打一次
 /// `account/info` 校验，是个真实的网络往返；这段时间里必须有个东西占位，
 /// 否则会先闪一下授权页再跳走。
 class SplashPage extends ConsumerWidget {

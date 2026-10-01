@@ -4,7 +4,8 @@ import 'drive_provider.dart';
 /// 已授权的云盘账号。
 ///
 /// 只承载**展示与状态**信息。真正的凭证（Cookie / token）不放在这里，
-/// 由 `CredentialStore` 落在系统钥匙串（Keychain / Keystore）。
+/// 由 `CredentialStore` 落在系统安全存储（macOS 是加密文件，
+/// 其它平台是 Keychain / Keystore / DPAPI）。
 class CloudAccount {
   const CloudAccount({
     required this.provider,

@@ -289,6 +289,109 @@ void main() {
     });
   });
 
+  group('分类与 genres：重扫不许把刮削修正过的分类冲回去', () {
+    // 2026-10-01 发现。时间线：
+    //   ① 扫描 → `guess(kind=movie)` → 「电影」
+    //   ② 刮削 → TMDB 类型 `['动画']` → 分类修正成「动漫」
+    //   ③ 用户往网盘里加了一集，**重扫**
+    //
+    // 重扫时 `_buildWork` 的分类仍然是 `guess(kind=movie)` —— 它**拿不到
+    // genres**（那时还没刮削）。而分类这条规则是「永远取新值」，
+    // 于是第 ③ 步会把分类退回「电影」，而库里的 `genres` 明明还是 `['动画']`。
+    //
+    // 用户看到的是「分类时好时坏」：刮完在动漫栏，扫一次又回电影栏。
+    // （下次启动的回填确实会再修正一次 —— 但那要等重启，中间这段时间
+    // 分类栏的角标和列表都是错的。）
+
+    test('重扫一部已刮削的动画 → 分类仍是「动漫」', () {
+      final existing = _work(
+        source: ScrapeSource.online,
+        kind: MediaKind.movie,
+        category: MediaCategory.anime,
+        genres: const ['动画', '冒险'],
+        onlineId: 'movie/1',
+      );
+      // 重扫的 incoming：只有 kind 可用，分类是按结构算的旧口径。
+      final incoming = _work(
+        source: ScrapeSource.local,
+        kind: MediaKind.movie,
+        category: MediaCategory.movie,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(
+        merged.category,
+        MediaCategory.anime,
+        reason: '`genres` 是比扫描期证据更强的证据（`MediaCategoryGuesser` '
+            '自己也是把它排在第一优先级的）。重扫不许把它冲掉。',
+      );
+      expect(merged.genres, ['动画', '冒险']);
+    });
+
+    test('重扫时 genres 给不出结论 → 分类跟着本次扫描走', () {
+      // 库里刮到的是 `['剧情']`（不改变栏目），而用户把片子挪进了 `/动漫/`
+      // 目录 —— 这时扫描期的新判定才是对的，「永远取新值」不能被削弱。
+      final existing = _work(
+        source: ScrapeSource.online,
+        category: MediaCategory.movie,
+        genres: const ['剧情'],
+      );
+      final incoming = _work(
+        source: ScrapeSource.local,
+        category: MediaCategory.anime,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.category, MediaCategory.anime);
+    });
+
+    test('本次就是刮削结果 → 按本次的 genres 折算', () {
+      final existing = _work(
+        source: ScrapeSource.local,
+        category: MediaCategory.movie,
+        genres: const [],
+      );
+      final incoming = _work(
+        source: ScrapeSource.online,
+        category: MediaCategory.movie,
+        genres: const ['纪录'],
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.category, MediaCategory.documentary);
+    });
+
+    test('分类与 genres 永远基于同一份输入（不会出现自相矛盾的行）', () {
+      // 保护模式下 `genres` 保留旧值；那么分类也必须按**旧值**折算 ——
+      // 否则会写出「genres 是 ['动画']、分类却按 ['剧情'] 算成电影」这种行，
+      // 而它不会报错，只会在下一次刮削时算出一个莫名其妙的分类。
+      final existing = _work(
+        source: ScrapeSource.online,
+        category: MediaCategory.anime,
+        genres: const ['动画'],
+      );
+      // 扫描期拿不到 genres，但万一将来某条路径带上了别的类型……
+      final incoming = _work(
+        source: ScrapeSource.local,
+        category: MediaCategory.movie,
+        genres: const ['剧情'],
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      // genres 保留了旧值 ['动画']，分类就必须是动漫。
+      expect(merged.genres, ['动画']);
+      expect(merged.category, MediaCategory.anime);
+    });
+  });
+
   group('封面人物锚点：必须和海报地址同进同退', () {
     // 锚点（`posterFaceX`）说的是「这张图里人物在哪个水平位置」，
     // 它和 `posterUrl` 描述的是**同一张图**。配错了一不会报错、二不会崩，

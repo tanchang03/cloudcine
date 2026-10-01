@@ -37,8 +37,13 @@ class AppDatabase extends _$AppDatabase {
   /// v3：`media_items.thumbUrl`（网盘缩略图）+ `media_works.category`（分类）。
   /// v4：`media_items.videoWidth` / `videoHeight`（网盘给的**实测**像素尺寸）。
   /// v5：`media_works.posterFaceX`（封面裁切用的人物锚点）。
+  /// v6：`media_works.lastModifiedAt`（作品下所有文件的网盘修改时间最大值，
+  ///     「最近修改」排序用）。
+  /// v7：`media_works.firstSeenAt`（作品首次入库时间，「最近添加」排序用）。
+  ///     之前这列隐式地由 `updatedAt` 兼任，但重扫时会刷新，导致「最近添加」
+  ///     变成「最近被扫到」。
   @override
-  int get schemaVersion => 5;
+  int get schemaVersion => 7;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -85,6 +90,29 @@ class AppDatabase extends _$AppDatabase {
             // 的画面宽度，所以双人对谈镜头会裁到两人之间的空隙。重扫一次即好。
             await m.addColumn(mediaWorks, mediaWorks.posterFaceX);
             diag.info('数据库', '索引库已升级到 v5（封面人物锚点）');
+          }
+          if (from < 6) {
+            await m.addColumn(mediaWorks, mediaWorks.lastModifiedAt);
+            // ⚠️ 这一列**必须回填**，不能像前几版那样「等下次扫描」。
+            //
+            // 原因：它是**默认排序**（`WorkSort.recentModified`）的唯一依据。
+            // 留成 NULL 的话，整个媒体库在这一列上没有可排序的值，
+            // 用户升级后打开就是一屏按 tie-breaker 排的乱序 —— 看起来
+            // 像「更新把这个功能做坏了」。而前面几列（`posterFaceX`、
+            // `videoWidth`…）只是显示上的细节，缺了不影响列表能不能用。
+            //
+            // 好在**能回填**：`media_items.modifiedAt` 里就存着每集的网盘
+            // 修改时间，取每个 group 的 MAX 即可，不需要碰网络。
+            // 口径与 `WorkSeed.add()` 一致：sample/extra 也计入。
+            await customStatement('''
+              UPDATE media_works
+              SET last_modified_at = (
+                SELECT MAX(mi.modified_at)
+                FROM media_items mi
+                WHERE mi.group_key = media_works.key
+              )
+            ''');
+            diag.info('数据库', '索引库已升级到 v6（最近修改时间，已从媒体项回填）');
           }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，

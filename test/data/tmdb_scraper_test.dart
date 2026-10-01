@@ -137,7 +137,7 @@ Map<String, Object?> _tvJson({
 
 void main() {
   group('TmdbScraper 结果形状', () {
-    test('从顶层 results 取第一条 —— 套夸克信封会静默返回空', () async {
+    test('从顶层 results 读结果 —— 套夸克信封会静默返回空', () async {
       final http = _server(search: () => <String, Object?>{
             'page': 1,
             'results': [_movieJson()],
@@ -267,9 +267,23 @@ void main() {
       final http = _server(search: () {
         n++;
         // 第一次（带年份）没结果，第二次（不带年份）命中。
+        //
+        // ⚠️ 第二次必须返回**真的那部片子**（年份差 ≤1、片名对得上）。
+        // 这里曾经直接返回默认的 `_movieJson()`（搏击俱乐部 / 1999），
+        // 而查询是「流浪地球2 / 2024」—— 靠的是旧代码 `results.first`
+        // 的「不校验」，那正是把《超级马力欧银河大电影》刮成
+        // 《低俗小说》的同一个洞。夹具必须符合真实数据源的行为。
         return n == 1
             ? const <String, Object?>{'results': <Object?>[]}
-            : <String, Object?>{'results': [_movieJson()]};
+            : <String, Object?>{
+                'results': [
+                  _movieJson(
+                    title: '流浪地球2',
+                    originalTitle: 'The Wandering Earth II',
+                    releaseDate: '2023-01-22',
+                  ),
+                ],
+              };
       });
       final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
 
@@ -552,6 +566,278 @@ void main() {
       down = false;
       expect(await scraper.scrape(q), isNull);
       expect(http.calls.length, 3);
+    });
+  });
+
+  group('TmdbScraper 匹配闸门（不再无条件取第一条）', () {
+    test('第一条不匹配、第二条匹配 → 取第二条，而不是 results.first', () async {
+      // TMDB 的 `/search/movie` 是**模糊搜索**：它返回「按相关度排序的猜测」。
+      // 这条夹具刻意把不匹配的放在前面，钉住「逐条过闸、取第一条通过的」。
+      final http = _server(
+        search: () => <String, Object?>{
+          'page': 1,
+          'results': [
+            _movieJson(
+              id: 680,
+              title: '低俗小说',
+              originalTitle: 'Pulp Fiction',
+              releaseDate: '1994-09-10',
+            ),
+            _movieJson(
+              id: 999999,
+              title: '超级马力欧银河大电影',
+              originalTitle: 'The Super Mario Galaxy Movie',
+              releaseDate: '2026-04-03',
+            ),
+          ],
+          'total_results': 2,
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          title: '超级马力欧银河大电影',
+          kind: MediaKind.movie,
+          year: 2026,
+        ),
+      );
+
+      expect(
+        md!.title,
+        '超级马力欧银河大电影',
+        reason: '旧代码 `results.first` 会把《低俗小说》照单全收 —— '
+            '查询里带着 year=2026，返回的是 1994 年的片子，差 32 年而毫无察觉。',
+      );
+      expect(md.onlineId, 'movie/999999');
+    });
+
+    test('全部候选都不过闸门 → null（宁可漏刮，也不刮错）', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'page': 1,
+          'results': [
+            _movieJson(
+              id: 680,
+              title: '低俗小说',
+              originalTitle: 'Pulp Fiction',
+              releaseDate: '1994-09-10',
+            ),
+          ],
+          'total_results': 1,
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          // 目录名被发布组插了 `z` 规避关键词过滤。
+          title: '超z级z马z力z欧z银z河z大z电影aa',
+          kind: MediaKind.movie,
+          year: 2026,
+        ),
+      );
+
+      expect(
+        md,
+        isNull,
+        reason: '这条查询在 TMDB 上**有**返回（模糊搜索永远有返回），'
+            '但一条都不该被采纳。自动刮削在这里正确认输，'
+            '决定权交给详情页的「手动」按钮。',
+      );
+    });
+
+    test('年份差 1 年不算错（发布年 vs 首映年）', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(
+              id: 1,
+              title: '流浪地球2',
+              originalTitle: 'The Wandering Earth II',
+              releaseDate: '2023-01-22',
+            ),
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(title: '流浪地球2', kind: MediaKind.movie, year: 2024),
+      );
+
+      expect(md, isNotNull);
+      expect(md!.year, 2023);
+    });
+  });
+
+  group('TmdbScraper 手动通道（search / resolve）', () {
+    test('search 不过闸门：不匹配的候选照样给出来', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(
+              id: 680,
+              title: '低俗小说',
+              originalTitle: 'Pulp Fiction',
+              releaseDate: '1994-09-10',
+            ),
+            _movieJson(
+              id: 999999,
+              title: '超级马力欧银河大电影',
+              releaseDate: '2026-04-03',
+            ),
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final found = await scraper.search(
+        const ScrapeQuery(title: '马力欧', kind: MediaKind.movie),
+      );
+
+      expect(found.length, 2, reason: '用户要自己挑，所以一条都不能替他筛掉。');
+      expect(found.map((c) => c.title), contains('低俗小说'));
+    });
+
+    test('search 的缩略图用 candidateSize（w154），不是海报的 w500', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [_movieJson(posterPath: '/abc.jpg')],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final found = await scraper.search(
+        const ScrapeQuery(title: '搏击俱乐部', kind: MediaKind.movie),
+      );
+
+      expect(
+        found.single.posterUrl,
+        contains('/${TmdbScraper.candidateSize}/'),
+        reason: '候选列表可能有十几条，每条都下 w500（~50KB）就是几百 KB '
+            '只为看一眼「是不是这部片子」。',
+      );
+      expect(found.single.posterUrl, isNot(contains('/w500/')));
+    });
+
+    test('search 的年份是用户填的才带（填错会把正主直接筛掉）', () async {
+      final http = _server(
+        search: () => <String, Object?>{'results': <Object?>[]},
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      await scraper.search(
+        const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+      );
+      expect(
+        http.searchCalls.single.query.containsKey('year'),
+        isFalse,
+        reason: 'TMDB 的 year 是**硬过滤**不是加权。用户记错年份时，'
+            '带上它会把正主直接筛掉，而用户只会看到「没有候选」。',
+      );
+
+      await scraper.search(
+        const ScrapeQuery(title: '某片', kind: MediaKind.movie, year: 2026),
+      );
+      expect(http.searchCalls.last.query['year'], 2026);
+    });
+
+    test('剧集走 /search/tv 与 first_air_date_year', () async {
+      final http = _server(
+        search: () => <String, Object?>{'results': [_tvJson()]},
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      await scraper.search(
+        const ScrapeQuery(
+          title: '权力的游戏',
+          kind: MediaKind.episode,
+          year: 2011,
+        ),
+      );
+
+      final call = http.searchCalls.single;
+      expect(call.path, '/3/search/tv');
+      expect(call.query['first_air_date_year'], 2011);
+      expect(call.query.containsKey('year'), isFalse);
+    });
+
+    test('resolve 复用候选里的原始条目 —— 不打详情接口', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(
+              id: 999999,
+              title: '超级马力欧银河大电影',
+              releaseDate: '2026-04-03',
+              posterPath: '/p.jpg',
+            ),
+          ],
+        },
+        genres: () => <String, Object?>{
+          'genres': [
+            {'id': 18, 'name': '剧情'},
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final found = await scraper.search(
+        const ScrapeQuery(title: '超级马力欧银河大电影', kind: MediaKind.movie),
+      );
+      final md = await scraper.resolve(found.single);
+
+      expect(md, isNotNull);
+      expect(md!.title, '超级马力欧银河大电影');
+      expect(md.year, 2026);
+      expect(md.onlineId, 'movie/999999');
+      expect(md.source, ScrapeSource.online);
+      expect(md.genres, ['剧情'], reason: '类型名走的是缓存的类型表。');
+      expect(
+        md.posterUrl,
+        contains('/${TmdbScraper.posterSize}/'),
+        reason: '落库的海报必须是 w500 —— 候选列表那张 w154 只是缩略图。',
+      );
+      expect(
+        http.searchCalls.length,
+        1,
+        reason: 'resolve 不该再搜一次：候选里已经带着完整条目（`raw`）。',
+      );
+    });
+
+    test('resolve 拿到没有 raw 的候选 → null', () async {
+      final http = _server(search: () => const <String, Object?>{});
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      expect(
+        await scraper.resolve(
+          const ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '某片'),
+        ),
+        isNull,
+      );
+    });
+
+    test('熔断后 search 直接返回空，不发请求', () async {
+      final http = _FakeHttp(
+        (_) async => const HttpResult.networkFailure('timeout'),
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      for (var i = 0; i < 3; i++) {
+        await scraper.scrape(
+          const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+        );
+      }
+      final before = http.calls.length;
+
+      expect(
+        await scraper.search(
+          const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+        ),
+        isEmpty,
+      );
+      expect(http.calls.length, before);
     });
   });
 }

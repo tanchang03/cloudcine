@@ -62,6 +62,7 @@ Future<void> main(List<String> args) async {
       overrides: [
         databaseProvider.overrideWithValue(db),
         posterCacheDirProvider.overrideWithValue(posterDir.path),
+        appSupportDirProvider.overrideWithValue(support.path),
       ],
       child: const CloudCineApp(),
     ),

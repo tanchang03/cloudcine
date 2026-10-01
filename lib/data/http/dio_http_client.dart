@@ -241,4 +241,51 @@ class DioHttpClient implements HttpClientLike {
 
   @override
   void close() => _dio.close(force: true);
+
+  /// PUT 字节到 OSS（见 [HttpClientLike.putBytes]）。
+  ///
+  /// 上传超时设 120 秒：分片可能达 16MB，弱网下需要足够的时间。
+  @override
+  Future<String> putBytes(
+    String url, {
+    required List<int> body,
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) async {
+    final label = 'PUT ${redactUrl(url)}';
+    diag.debug('HTTP', '$label 发起（${body.length}B）${_headerSummary(headers)}');
+
+    final started = DateTime.now();
+    try {
+      final resp = await _dio.put<String>(
+        url,
+        data: Stream.fromIterable([body]),
+        options: Options(
+          headers: {
+            ...?headers,
+            'Content-Length': body.length.toString(),
+          },
+          validateStatus: (s) => s != null && s >= 200 && s < 300,
+          sendTimeout: timeout ?? const Duration(seconds: 120),
+          receiveTimeout: timeout ?? const Duration(seconds: 30),
+        ),
+      );
+      final elapsed = DateTime.now().difference(started).inMilliseconds;
+      final status = resp.statusCode ?? 0;
+      final etag = resp.headers.value('etag') ?? '';
+      diag.info('HTTP', '$label → $status (${elapsed}ms, ETag="${etag.replaceAll('"', "")}")');
+      return etag.replaceAll('"', '');
+    } on DioException catch (e) {
+      final elapsed = DateTime.now().difference(started).inMilliseconds;
+      diag.error(
+        'HTTP',
+        '$label → 请求未完成 (${elapsed}ms)',
+        error: '${e.type.name}: ${e.message}',
+      );
+      throw Exception('PUT 失败：${e.type.name}: ${e.message}');
+    } catch (e, st) {
+      diag.error('HTTP', '$label → 抛出非 dio 异常', error: e, stackTrace: st);
+      rethrow;
+    }
+  }
 }

@@ -1,0 +1,30 @@
+// 本机签名配置模板。
+//
+// 用法：把本文件复制成同目录下的 Signing.local.xcconfig（去掉 .example 后缀），
+// 然后取消下面两行的注释并填上你自己的签名身份。
+//
+// Signing.local.xcconfig 已被 .gitignore 排除，**不会进仓库**，放心填。
+//
+// 查自己机器上有哪些可用证书：
+//   security find-identity -v -p codesigning ~/Library/Keychains/login.keychain-db
+// （⚠️ 必须显式指定 login 钥匙串：不指定时可能只列 System.keychain，报
+//   「0 valid identities found」，让人误以为本机没有证书。）
+//
+// ⚠️ 这个文件是给**分发**用的，不是给本地开发用的。
+//
+// 本地开发**不需要**它：凭证走的是应用支持目录下的**加密文件**
+// （`credentials.enc`，见 `lib/data/auth/secret_backend.dart`），
+// 完全不碰系统钥匙串 —— 与签名身份无关，ad-hoc 下零弹框。
+// 所以「为了凭证不弹框而换签名」这条路是**多余的**，别再走一遍。
+//
+// （两条岔路都已实测证伪，别重试：
+//   ① 换 Developer ID 能让钥匙串的「始终允许」长期生效，但本机环境签不动，
+//      会报 `errSecInternalComponent`；
+//   ② 自建钥匙串通道 + 写「任何程序都可访问」的 ACL —— 打包 .app 复测过，
+//      重建后 `read` 仍 `-128` 且阻塞 3.2 秒弹框。）
+//
+// 什么时候才需要它：要把 .app 分发给别人、过 Gatekeeper 的时候。
+// 那时填上 Developer ID，签名身份稳定，公证（notarization）也才有意义。
+//
+// CODE_SIGN_IDENTITY = Developer ID Application: Your Name (ABCDE12345)
+// DEVELOPMENT_TEAM = ABCDE12345

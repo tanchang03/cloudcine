@@ -1,6 +1,7 @@
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/filename_parser.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/scrape_match.dart';
 import '../../domain/services/scraper.dart';
 import '../http/http_client.dart';
 
@@ -60,11 +61,13 @@ class DoubanScraper implements MetadataScraper {
     String baseUrl = defaultBaseUrl,
     Duration timeout = const Duration(seconds: 12),
     Duration minRequestInterval = const Duration(seconds: 3),
+    DateTime Function()? clock,
   })  : _http = http,
         _cookie = cookie.trim(),
         _baseUrl = baseUrl,
         _timeout = timeout,
-        _minInterval = minRequestInterval;
+        _minInterval = minRequestInterval,
+        _clock = clock ?? DateTime.now;
 
   /// rexxar 接口的根。**没有版本号之外的前缀**，路径直接接在后面。
   static const String defaultBaseUrl = 'https://m.douban.com/rexxar/api/v2';
@@ -81,20 +84,60 @@ class DoubanScraper implements MetadataScraper {
   final Duration _timeout;
   final Duration _minInterval;
 
+  /// 取当前时间。**可注入** —— 冷却逻辑是纯时间函数，用真实时钟测就得
+  /// `await Future.delayed`，既慢又不稳（CI 上尤其）。
+  final DateTime Function() _clock;
+
   /// 上一次请求的时间，用于节流。
   DateTime? _lastRequestAt;
 
-  /// 连续网络失败次数；达到阈值后 [_unreachable] 置真。
+  /// 连续网络失败次数；达到阈值后进入 [_unreachableUntil] 冷却。
   ///
   /// 与 [TmdbScraper] 同一套判据：只认**网络层失败**，拿到任何 HTTP 响应
   /// 都算服务可达、计数归零 —— 否则「Cookie 过期」会被表现成「豆瓣连不上」，
   /// 用户会去查网络而不是去更新 Cookie。
   int _networkFailures = 0;
-  bool _unreachable = false;
+
+  /// 连续网络失败后的冷却截止时刻。`null` = 没被判定为不可达。
+  ///
+  /// 与 [_needLoginUntil] 一样**必须是会过期的**：用户「先开代理再回来刮」
+  /// 是很正常的操作，而一次性的永久熔断会让他在修好网络之后依然刮不到，
+  /// 且只有重启应用才恢复 —— 这正是「明明修好了却还是不行」的来源。
+  DateTime? _unreachableUntil;
+
   static const int _maxConsecutiveFailures = 3;
 
-  /// 是否已见到 `103 need_login`。熔断单向，本次进程内不恢复。
-  bool _needLogin = false;
+  /// 网络层失败的冷却时长。比额度冷却短：网络是用户自己能立刻修好的。
+  static const Duration unreachableBackoff = Duration(minutes: 2);
+
+  /// 见到 `103 need_login` 后的**冷却截止时刻**。`null` = 现在可以试。
+  ///
+  /// ## 为什么不是「一次性熔断，本次进程内不恢复」
+  ///
+  /// 早先的实现是见到 103 就置一个单向的 `_needLogin = true`。它的理由
+  /// （「额度耗尽后继续打只会被关得更久」）对**真的额度耗尽**成立，但
+  /// 103 还有另一个来源：**瞬时风控**。2026-10-01 实测到过这一串 ——
+  ///
+  ///   17:25:32  豆瓣 403 + code 103 → 熔断
+  ///   17:26:15  之后每一部作品都直接返回，**连请求都不发**
+  ///
+  /// 而同一个 Cookie、同一个出口 IP，几分钟后用同样的请求打回去是 **200**。
+  /// 也就是说：一次瞬时风控把豆瓣在本进程内**永久**关掉了，用户看到的是
+  /// 「豆瓣一条都刮不到」，而且只有重启应用才能恢复，界面上还什么都不说。
+  ///
+  /// 改成带**指数退避的冷却**之后两种情形都对：
+  ///   - 真的额度耗尽 → 每次重试都还是 103 → 退避翻倍，实际退化成「不再打」；
+  ///   - 瞬时风控 → 冷却结束后的那一次重试就成功，自动恢复。
+  DateTime? _needLoginUntil;
+
+  /// 下一次冷却的时长。每再吃到一次 103 就翻倍，封顶 [maxNeedLoginBackoff]。
+  Duration _needLoginBackoff = initialNeedLoginBackoff;
+
+  /// 首次冷却时长。够短，用户「等一会儿再点一次」就能恢复。
+  static const Duration initialNeedLoginBackoff = Duration(seconds: 60);
+
+  /// 冷却上限。**不是永久** —— 额度按天重置，留一个每天都会重试的口子。
+  static const Duration maxNeedLoginBackoff = Duration(minutes: 30);
 
   @override
   String get id => 'douban';
@@ -110,16 +153,53 @@ class DoubanScraper implements MetadataScraper {
   @override
   bool get isEnabled => _cookie.isNotEmpty;
 
-  /// 是否已判定连不上（网络层）。
-  bool get isUnreachable => _unreachable;
+  /// 是否已被判定「连不上」（网络层），仍在冷却期内。
+  bool get isUnreachable => _unreachableCooldown > Duration.zero;
 
-  /// 是否已因额度耗尽被要求登录。诊断与设置页用。
-  bool get isNeedLogin => _needLogin;
+  /// 网络层冷却还剩多久。未冷却时返回 [Duration.zero]。纯读，无副作用。
+  Duration get _unreachableCooldown {
+    final until = _unreachableUntil;
+    if (until == null) return Duration.zero;
+    final left = until.difference(_clock());
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  /// 网络层冷却是否仍生效。到点顺手清掉，让 [scrape] 放行。
+  bool get _unreachableActive {
+    if (_unreachableUntil == null) return false;
+    if (_unreachableCooldown > Duration.zero) return true;
+    _unreachableUntil = null;
+    _networkFailures = 0;
+    return false;
+  }
+
+  /// 是否正处于「额度 / 风控」冷却中。诊断与设置页用。
+  bool get isNeedLogin => needLoginCooldown > Duration.zero;
+
+  /// 冷却还剩多久。未冷却（含已到期）时返回 [Duration.zero]。
+  ///
+  /// 到点**不自动改写字段**，只按当前时间算 —— 这样它是纯读的，
+  /// 任何调用方（含界面每帧重画）都不会有副作用。
+  Duration get needLoginCooldown {
+    final until = _needLoginUntil;
+    if (until == null) return Duration.zero;
+    final left = until.difference(_clock());
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  /// 冷却是否仍然生效。到点就顺手清掉，让 [scrape] 放行。
+  bool get _coolingDown {
+    if (_needLoginUntil == null) return false;
+    if (needLoginCooldown > Duration.zero) return true;
+    _needLoginUntil = null;
+    // 冷却结束不代表额度恢复，退避档位保留到「真的成功一次」才归零。
+    return false;
+  }
 
   @override
   Future<ScrapedMetadata?> scrape(ScrapeQuery query) async {
     if (!isEnabled) return null;
-    if (_unreachable || _needLogin) return null;
+    if (_unreachableActive || _coolingDown) return null;
 
     // 候选词：中文优先，另一个作为「第一个词零命中」时的补救。
     final words = <String>[
@@ -144,11 +224,197 @@ class DoubanScraper implements MetadataScraper {
       final detail = await _detail(best.id);
       if (detail == null) continue;
 
-      final meta = _toMetadata(detail, query, word);
+      final meta = _toMetadata(detail, word);
       if (meta != null) return meta;
     }
     return null;
   }
+
+  // -------------------------------------------------------------------
+  // 手动刮削：候选列表
+  // -------------------------------------------------------------------
+
+  /// 按用户**重新输入的片名**搜一批候选，供手动挑选。
+  ///
+  /// ## 与 [scrape] 的三处刻意差别
+  ///
+  ///   1. **不过 [_pickBest]，也不打分。** 用户要看到尽可能多的候选自己判断 ——
+  ///      而 `_pickBest` 的全部意义就是「替用户选一个」，两者目标相反。
+  ///      实际被闸门拦下来的候选，往往正是用户想找的那一个：
+  ///      目录名 `超z级z马z力z欧z银z河z大z电影aa` 被插了 `z`，闸门判它
+  ///      与《超级马力欧银河大电影》不相似，自动刮削会正确地放弃 ——
+  ///      但用户手动搜「超级马力欧银河大电影」时，那条候选必须出现在列表里。
+  ///   2. **只搜一个词。** [scrape] 会在第一个词零命中时再花第二个词的额度
+  ///      （共 2 个搜索词）；手动通道一次点击只花 1 个，且用户看得见结果，
+  ///      不满意可以自己改了再搜。
+  ///   3. **只剔非影视条目**（书 / 音乐 / 游戏），不做任何其他过滤。
+  ///      `type=movie` 不是过滤器（见类文档坑 #2），不剔的话搜「繁花」
+  ///      前两条就是两本书，用户会以为豆瓣上没这部片子。
+  ///
+  /// 返回空列表 = 没搜到（或熔断中），**不区分** —— 对话框那边两种情况
+  /// 都只能说「换个词再试」，区分了对用户没有额外价值。
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async {
+    if (!isEnabled) return const [];
+    if (_unreachableActive || _coolingDown) return const [];
+
+    final word = query.title.trim();
+    if (word.isEmpty) return const [];
+
+    final candidates = await _search(word);
+    if (candidates == null) return const [];
+
+    final out = <ScrapeCandidate>[];
+    for (final c in candidates) {
+      if (c.targetType != 'movie' && c.targetType != 'tv') continue;
+      out.add(
+        ScrapeCandidate(
+          source: id,
+          sourceId: c.id,
+          title: c.title,
+          year: c.year,
+          // ⚠️ 只是**列表缩略图**：搜索结果的 `cover_url` 被服务端套了
+          // `imageView2/…/h/120/…`，是一条 120px 横条，不能当作品海报
+          // （见类文档坑 #3）。落库的海报一律来自 [resolve] 的详情接口。
+          posterUrl: c.coverUrl,
+          isEpisode: c.targetType == 'tv',
+          // 豆瓣的搜索结果里既没有完整海报也没有简介，`resolve` 必须现打
+          // 详情接口，所以这里没有可复用的原始条目。
+          raw: null,
+        ),
+      );
+    }
+    diag.debug('刮削', '豆瓣 "$word" 给出 ${out.length} 条手动候选');
+    return out;
+  }
+
+  /// 用户选中的候选 → 完整元数据。
+  ///
+  /// **必须打一次详情接口**：搜索结果里只有 id / 标题 / 年份，海报
+  /// （`cover_url` 是 120px 横条）和简介都得从 `/movie/{id}` 拿。
+  ///
+  /// `matchedQuery` 记的是候选自己的标题而不是用户输入的原词 ——
+  /// 这个字段是给排查「刮错了」用的，用户最终选中的是哪一个候选，
+  /// 比他在搜索框里敲了什么更重要。
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async {
+    if (!isEnabled) return null;
+    if (_unreachableActive || _coolingDown) return null;
+
+    final detail = await _detail(candidate.sourceId);
+    if (detail == null) return null;
+
+    return _toMetadata(detail, candidate.title);
+  }
+
+  // -------------------------------------------------------------------
+  // 探测（设置页的「测试连接」）
+  // -------------------------------------------------------------------
+
+  /// 探测用的搜索词。**必须选一个必定有结果的词**，否则区分不出
+  /// 「接口通但这个词零命中」与「接口不通」。
+  static const String probeWord = '流浪地球';
+
+  /// 打一次真实搜索，把「地址通不通 / Cookie 是不是登录态 / 有没有被限流」
+  /// 直接告诉用户。
+  ///
+  /// ## 为什么必须有它
+  ///
+  /// 用户填完 Cookie 之后，唯一能验证的方式是「刮一部看看」—— 而那要等
+  /// TMDB 先超时 20 秒，最后只给一个「未命中」。三种完全不同的原因
+  /// （地址不通 / Cookie 无效 / 被限流）在结果上长得一模一样。
+  ///
+  /// **不走 [_throttle]**：这是用户手动触发的单次请求，等 3 秒毫无意义。
+  Future<DoubanProbeResult> probe() async {
+    if (_cookie.isEmpty) {
+      return const DoubanProbeResult(
+        status: DoubanProbeStatus.noCookie,
+        message: '还没填 Cookie。豆瓣的匿名额度实测只有约 10 个搜索词，'
+            '全盘刮会中途耗尽 —— 所以这里要求先填。',
+      );
+    }
+
+    final res = await _http.get(
+      '$_baseUrl/search',
+      query: {'q': probeWord, 'type': 'movie', 'for_mobile': '1'},
+      headers: _headers,
+      timeout: _timeout,
+    );
+
+    if (res.isNetworkFailure) {
+      _noteNetworkFailure();
+      return DoubanProbeResult(
+        status: DoubanProbeStatus.unreachable,
+        message: '连不上 $_baseUrl —— 网络层失败（${res.rawBody}）。'
+            '豆瓣境内一般可直连；若开了系统代理，检查它是否把 m.douban.com '
+            '也一并劫持了。',
+      );
+    }
+
+    if (_isNeedLogin(res)) {
+      _latchNeedLogin();
+      return DoubanProbeResult(
+        status: DoubanProbeStatus.needLogin,
+        loggedIn: _looksLoggedIn,
+        message: '接口可达，但豆瓣回了 103 need_login（HTTP ${res.statusCode}）'
+            '—— 当前出口 IP 被限流，或这个 Cookie 已失效。'
+            '${_looksLoggedIn ? '你填的 Cookie 含 dbcl2，形状是对的，多半是被限流；'
+                : '你填的 Cookie 里没有 dbcl2，多半不是登录态。'}'
+            '等 ${needLoginCooldown.inSeconds} 秒后可再试。',
+      );
+    }
+
+    if (!res.isSuccessStatus) {
+      return DoubanProbeResult(
+        status: DoubanProbeStatus.httpError,
+        message: '接口可达，但返回 HTTP ${res.statusCode}。',
+      );
+    }
+
+    // 拿到了正常响应 = 服务可达、Cookie 没被拒。两套熔断都复位。
+    _resetBackoff();
+
+    final hits = <_Candidate>[
+      ..._candidatesOf(res.json?['subjects']),
+      ..._candidatesOf(res.json?['smart_box']),
+    ];
+
+    if (hits.isEmpty) {
+      return DoubanProbeResult(
+        status: DoubanProbeStatus.empty,
+        loggedIn: _looksLoggedIn,
+        message: '接口可达、Cookie 未被拒，但搜「$probeWord」零结果 —— '
+            '多半是接口改版了，请提 issue。',
+      );
+    }
+
+    return DoubanProbeResult(
+      status: DoubanProbeStatus.ok,
+      loggedIn: _looksLoggedIn,
+      candidateCount: hits.length,
+      message: '连接正常：搜「$probeWord」返回 ${hits.length} 条。'
+          '${_looksLoggedIn ? 'Cookie 含 dbcl2，是登录态，额度宽。'
+              : 'Cookie 里没有 dbcl2 —— 走的是匿名额度（约 10 个搜索词）。'}',
+    );
+  }
+
+  /// Cookie 里有没有登录态标志（`dbcl2`）。
+  bool get _looksLoggedIn => cookieHasLoginToken(_cookie);
+
+  /// Cookie 字符串的形状判断：是否含 `dbcl2=<uid>:<token>`。
+  ///
+  /// **只判形状，不验真伪** —— 真伪只有服务端说了算。它的价值是在用户
+  /// 贴错东西（只贴了 `bid`、或者把整个 `Cookie: xxx` 前缀也贴进来）时
+  /// 立刻给一句提示，而不是让他等一次刮削失败。
+  ///
+  /// 按「分号 + 可选空格」切分，所以 `ll="1";dbcl2=x` 与
+  /// `ll="1"; dbcl2=x` 都能认出来；而 `xdbcl2=` 不会误判。
+  static bool cookieHasLoginToken(String cookie) =>
+      RegExp(r'(^|;)\s*dbcl2=').hasMatch(cookie);
+
+  /// 用户把 `Cookie: ` 前缀一起贴进来是很常见的一种错法。
+  static bool looksLikeRawHeader(String cookie) =>
+      RegExp(r'^\s*cookie\s*:', caseSensitive: false).hasMatch(cookie);
 
   // -------------------------------------------------------------------
   // 搜索
@@ -233,6 +499,22 @@ class DoubanScraper implements MetadataScraper {
       // 就是两本书，不排掉会把它们当成候选去算分。
       if (c.targetType != 'movie' && c.targetType != 'tv') continue;
 
+      // 与 TMDB 同一道闸门（见 `scrape_match.dart`）：标题对不上、或年份差
+      // 得太多的候选**直接出局**，而不是靠打分把它压到第二名 ——
+      // 打分是「谁的分数高」，闸门是「配不配」。少了它，一个全是垃圾候选的
+      // 搜索结果里总会有个「第一名」被选中。
+      final match = ScrapeMatch.evaluate(
+        queryTitle: query.title,
+        queryAlternateTitle: query.alternateTitle,
+        queryYear: query.year,
+        resultTitle: c.title,
+        resultYear: c.year,
+      );
+      if (!match.accepted) {
+        diag.debug('刮削', '豆瓣跳过候选 "${c.title}"：${match.reason}');
+        continue;
+      }
+
       final score = c.scoreFor(query);
       if (score <= 0) continue;
       if (best == null || score > bestScore) {
@@ -264,9 +546,11 @@ class DoubanScraper implements MetadataScraper {
     return res?.json;
   }
 
+  /// 把详情响应映射成元数据。**响应不是一个条目时返回 `null`。**
+  ///
+  /// [matchedQuery] 是实际用于命中的查询词（排查「刮错了」时看它）。
   ScrapedMetadata? _toMetadata(
     Map<String, Object?> detail,
-    ScrapeQuery query,
     String matchedQuery,
   ) {
     final id = _stringOf(detail['id']);
@@ -275,8 +559,26 @@ class DoubanScraper implements MetadataScraper {
     final type = _stringOf(detail['type']) ?? 'movie';
     final isTv = type == 'tv';
 
-    final title = _stringOf(detail['title']) ?? query.title;
-    if (title.isEmpty) return null;
+    // ## 标题**只能**来自响应体，不许拿查询词兜底
+    //
+    // 曾经写成 `_stringOf(detail['title']) ?? query.title`。它看着更「健壮」，
+    // 实际是把「详情没拿到」伪装成「刮削成功」：服务端返回一个 HTTP 200 但
+    // 内容不是条目（错误对象、风控页、接口改版）时，兜底会把**用户搜的那个
+    // 词**当成结果写进库 —— 标题是有的、海报简介一个都没有，而且 `source`
+    // 记成 online。用户看到的是「已刮削」，与「刮削成功但没有封面」这类
+    // 现象完全一样，排查时最难想到根因在这里。
+    //
+    // 正常的 `/movie/{id}` 响应**一定有** `title`（实测 77 个顶层字段里
+    // `title` 是必有的），所以这个收紧不会误伤。
+    final title = _stringOf(detail['title']);
+    if (title == null || title.isEmpty) {
+      diag.warn(
+        '刮削',
+        '豆瓣详情响应里没有 title，判定为无效条目（id=$id）——'
+            '多半是接口改版或返回了错误对象，不是「这部片子没有标题」。',
+      );
+      return null;
+    }
 
     final cover = _stringOf(detail['cover_url']);
 
@@ -350,6 +652,10 @@ class DoubanScraper implements MetadataScraper {
       diag.warn('刮削', '豆瓣 $path HTTP ${res.statusCode}');
       return null;
     }
+
+    // 真的拿到一次正常响应 = 冷却与退避档位都该归零。
+    // 少了这一步，一次瞬时风控之后的退避会一直停在很长的档位上。
+    _resetBackoff();
     return res;
   }
 
@@ -362,27 +668,47 @@ class DoubanScraper implements MetadataScraper {
     return j['msg'] == 'need_login';
   }
 
+  /// 进入冷却，并把下一次冷却时长翻倍（封顶 [maxNeedLoginBackoff]）。
   void _latchNeedLogin() {
-    if (_needLogin) return;
-    _needLogin = true;
+    final wait = _needLoginBackoff;
+    _needLoginUntil = _clock().add(wait);
+
+    final doubled = wait * 2;
+    _needLoginBackoff =
+        doubled > maxNeedLoginBackoff ? maxNeedLoginBackoff : doubled;
+
     diag.warn(
       '刮削',
-      '豆瓣返回 $needLoginCode（need_login）：额度已耗尽或被风控，'
-          '本次不再尝试豆瓣。匿名额度实测约 10 个搜索词，'
-          '到「设置 → 刮削」里粘贴登录后的 Cookie 可继续。',
+      '豆瓣返回 $needLoginCode（need_login）：额度耗尽或触发风控，'
+          '冷却 ${wait.inSeconds}s 后再试（下次冷却 ${_needLoginBackoff.inSeconds}s）。'
+          '匿名额度实测约 10 个搜索词，到「设置 → 刮削」粘贴登录后的 Cookie 可继续。',
     );
   }
 
+  /// 探测成功后把两套熔断都复位。
+  ///
+  /// 「连点几次测试连接」不该把刮削的熔断打开，所以成功路径必须清计数。
+  void _resetBackoff() {
+    _networkFailures = 0;
+    _unreachableUntil = null;
+    _needLoginUntil = null;
+    _needLoginBackoff = initialNeedLoginBackoff;
+  }
+
   void _noteNetworkFailure() {
-    if (_unreachable) return;
+    if (_unreachableActive) return;
     _networkFailures++;
     if (_networkFailures < _maxConsecutiveFailures) return;
 
-    _unreachable = true;
+    _unreachableUntil = _clock().add(unreachableBackoff);
+    // 计数归零，让冷却到期后的下一轮从 0 开始重新数 —— 否则冷却一结束
+    // 就是「已经 3 次」，第一次失败又立刻进冷却。
+    _networkFailures = 0;
+
     diag.warn(
       '刮削',
       '豆瓣连续 $_maxConsecutiveFailures 次网络失败，判定为不可达，'
-          '本次不再尝试（接口地址=$_baseUrl）。',
+          '冷却 ${unreachableBackoff.inMinutes} 分钟后再试（接口地址=$_baseUrl）。',
     );
   }
 
@@ -461,6 +787,38 @@ class DoubanScraper implements MetadataScraper {
   }
 }
 
+/// [DoubanScraper.probe] 的结论分类。
+///
+/// 分这么细是因为**用户要据此采取不同的动作**：
+///   - [noCookie] / [unreachable] → 去改配置或网络；
+///   - [needLogin] → 要么等冷却，要么换 Cookie；
+///   - [httpError] / [empty] → 是服务端或接口改版，不是用户的错；
+///   - [ok] → 不用管。
+enum DoubanProbeStatus { ok, noCookie, unreachable, needLogin, httpError, empty }
+
+/// 一次豆瓣探测的结果。
+class DoubanProbeResult {
+  const DoubanProbeResult({
+    required this.status,
+    required this.message,
+    this.loggedIn = false,
+    this.candidateCount = 0,
+  });
+
+  final DoubanProbeStatus status;
+
+  /// 给用户看的一句话结论（已含下一步该做什么）。
+  final String message;
+
+  /// Cookie 是否**看起来**是登录态（含 `dbcl2`）。只判形状。
+  final bool loggedIn;
+
+  /// 探测词命中的候选数。只对 [DoubanProbeStatus.ok] 有意义。
+  final int candidateCount;
+
+  bool get ok => status == DoubanProbeStatus.ok;
+}
+
 /// 一条搜索候选。
 class _Candidate {
   const _Candidate({
@@ -469,6 +827,7 @@ class _Candidate {
     required this.targetType,
     this.year,
     this.ratingCount,
+    this.coverUrl,
   });
 
   final String id;
@@ -485,6 +844,13 @@ class _Candidate {
   /// 当成主权重会把「名字对但小众」的条目压掉。
   final int? ratingCount;
 
+  /// 搜索结果的 `cover_url`。
+  ///
+  /// ⚠️ 服务端在这条地址上套了 `imageView2/…/h/120/format/jpg`，它是一条
+  /// **120px 高的横条**（宽度随原图比例），不是 2:3 的竖版海报。
+  /// 所以它只能当候选列表的缩略图，**绝不能落库**（见类文档坑 #3）。
+  final String? coverUrl;
+
   static _Candidate? fromJson(Map<String, Object?> json, Object? targetType) {
     final id = DoubanScraper._stringOf(json['id']) ??
         DoubanScraper._intOf(json['id'])?.toString();
@@ -499,6 +865,7 @@ class _Candidate {
       targetType: targetType is String ? targetType : 'unknown',
       year: DoubanScraper._yearOf(DoubanScraper._stringOf(json['year'])),
       ratingCount: DoubanScraper._intOf(rating?['count']),
+      coverUrl: DoubanScraper._stringOf(json['cover_url']),
     );
   }
 

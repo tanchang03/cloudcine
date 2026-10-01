@@ -26,10 +26,14 @@ import 'window_launch.dart';
 
 /// 内置自检视频的 asset URI（32 KB，H.264 baseline + AAC，3 秒）。
 ///
-/// 用它而不是「让用户选一个本地文件」是刻意的：macOS 沙箱下读用户选中的文件
-/// 需要 `com.apple.security.files.user-selected.read-only` 权限，而本应用目前
-/// **没有**申请它（网盘应用本来也不需要）。走 asset 则零权限、零网络，
-/// 让「mpv 在这个引擎里到底能不能出画」变成一个不受环境影响的确定性结论。
+/// 用它而不是「让用户选一个本地文件」是刻意的：走 asset 零权限、零网络，
+/// 让「mpv 在这个引擎里到底能不能出画」变成一个不受环境影响的确定性结论 ——
+/// 自检要回答的是**解码链路**通不通，不该把「用户挑没挑文件」「沙箱给不给读」
+/// 这些变量混进来。
+///
+/// （应用确实已经申请了 `com.apple.security.files.user-selected.read-only`
+/// —— 播放器「加载本地字幕文件」要用，见两份 entitlements。但那是**功能**需要，
+/// 不是自检需要的。）
 const String kSelfTestAssetUri = 'asset:///assets/player_selftest.mp4';
 
 /// PC 端播放器独立窗口的根组件。
@@ -3282,6 +3286,65 @@ class _LocalSubtitle {
   @override
   int get hashCode => Object.hash(path, label);
 }
+
+/// 仅测试用：把两个菜单构件直接暴露出来。
+///
+/// ## 为什么非得开这个口子
+///
+/// 这两个菜单在测试环境里**点不开**：控制栏上那两个入口都写着
+/// `_player == null ? null : …`（见 `_buildButtonRow`），而 `Player()` 在
+/// `flutter test` 里根本建不出来 —— 它抛
+/// `Cannot find Mpv.framework … in the Frameworks folder`，因为 `flutter test`
+/// 跑在宿主 Dart VM 上，libmpv 不在 rpath 里。于是按钮永远是禁用的，
+/// 弹菜单那条路径**在测试里不可达**。
+///
+/// 但菜单里有两条**改错不报错**的规则，恰恰最需要钉住：
+///
+///   1. **有外挂字幕挂着时，内嵌轨一律不打勾。** mpv 认不出我们后挂上去的
+///      外挂字幕是哪一条，它只把「有字幕轨被选中」报成一个数字；靠那个数字
+///      去高亮，会在**错误的那条内嵌轨**上打勾。
+///   2. **「关闭字幕」永远第一项。** mpv 没有「上一条」的概念，想关掉字幕时
+///      必须有一条明确的退路。
+///
+/// 这两条坏了都不会抛异常，只会表现成「勾打在错的那一行」或「找不到关不掉字幕
+/// 的入口」。所以只能把构件抽出来单独渲染来断言。
+@visibleForTesting
+Widget buildAudioMenuForTest({
+  required List<AudioTrack> tracks,
+  String? activeId,
+}) =>
+    _AudioDialog(tracks: tracks, activeId: activeId);
+
+/// 仅测试用：字幕菜单。理由见 [buildAudioMenuForTest]。
+///
+/// `localPath` / `localLabel` 必须**同时**给或同时不给 —— 只给一个等于
+/// 「挑过文件但不知道叫什么」，那种状态不存在（见 [_LocalSubtitle]）。
+@visibleForTesting
+Widget buildSubtitleMenuForTest({
+  List<SubtitleTrack> tracks = const <SubtitleTrack>[],
+  List<SubtitleBrief> cloud = const <SubtitleBrief>[],
+  List<OnlineSubtitleBrief> online = const <OnlineSubtitleBrief>[],
+  bool searchingOnline = false,
+  String? localPath,
+  String? localLabel,
+  int? activeId,
+  String? activeCloudId,
+  int? activeOnlineId,
+  String? activeLocalPath,
+}) =>
+    _SubtitleDialog(
+      tracks: tracks,
+      cloud: cloud,
+      online: online,
+      searchingOnline: searchingOnline,
+      local: (localPath == null || localLabel == null)
+          ? null
+          : _LocalSubtitle(localPath, localLabel),
+      activeId: activeId,
+      activeCloudId: activeCloudId,
+      activeOnlineId: activeOnlineId,
+      activeLocalPath: activeLocalPath,
+    );
 
 /// 音轨菜单。
 ///

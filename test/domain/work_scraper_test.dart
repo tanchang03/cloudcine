@@ -45,6 +45,83 @@ class _Fixed implements MetadataScraper {
     queries.add(query);
     return result;
   }
+
+  // ⚠️ `implements` 不继承默认实现，这两个必须显式写出来（见接口文档）。
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async => const [];
+
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async => null;
+}
+
+/// 支持**手动通道**的假刮削器：给候选、并能把候选解析成元数据。
+class _Manual implements MetadataScraper {
+  _Manual(
+    this.id, {
+    this.candidates = const [],
+    this.resolvable = true,
+  });
+
+  @override
+  final String id;
+
+  final List<ScrapeCandidate> candidates;
+
+  /// `false` = 详情接口失败 / 响应不是条目，`resolve` 返回 `null`。
+  final bool resolvable;
+
+  @override
+  String get displayName => id;
+
+  @override
+  bool get isEnabled => true;
+
+  @override
+  Future<ScrapedMetadata?> scrape(ScrapeQuery query) async => null;
+
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async => candidates;
+
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async {
+    if (!resolvable) return null;
+    return ScrapedMetadata(
+      title: candidate.title,
+      year: candidate.year,
+      overview: '简介',
+      posterUrl:
+          'https://img3.doubanio.com/view/photo/m_ratio_poster/public/p1.jpg',
+      rating: 8.0,
+      genres: const ['动画'],
+      onlineId: '${candidate.source}/${candidate.sourceId}',
+      source: ScrapeSource.online,
+      matchedQuery: candidate.title,
+    );
+  }
+}
+
+/// 每次调用都抛 —— 钉住「一个源挂了不该让整个对话框空掉」。
+class _Throwing implements MetadataScraper {
+  @override
+  String get id => 'boom';
+
+  @override
+  String get displayName => 'boom';
+
+  @override
+  bool get isEnabled => true;
+
+  @override
+  Future<ScrapedMetadata?> scrape(ScrapeQuery query) async =>
+      throw StateError('boom');
+
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async =>
+      throw StateError('boom');
+
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async =>
+      throw StateError('boom');
 }
 
 void main() {
@@ -75,17 +152,21 @@ void main() {
       );
 
   /// 一部**还没刮过**的作品：封面是夸克的视频帧，带人脸锚点。
+  ///
+  /// [category] 可指定 —— 分类是**扫描期的产物**（靠目录名 / 关键词 / 结构
+  /// 判出来的），而刮削只应该在 TMDB 给出明确类型时才动它。
   MediaWork work({
     String? posterUrl = thumb,
     double? posterFaceX = 0.32,
     ScrapeSource source = ScrapeSource.local,
+    MediaCategory category = MediaCategory.anime,
   }) =>
       MediaWork(
         key: 'show',
         provider: DriveProvider.quark,
         kind: MediaKind.episode,
         title: 'Show',
-        category: MediaCategory.anime,
+        category: category,
         year: 2023,
         posterUrl: posterUrl,
         posterFaceX: posterFaceX,
@@ -101,6 +182,7 @@ void main() {
     String? posterUrl =
         'https://img3.doubanio.com/view/photo/m_ratio_poster/public/p1.jpg',
     double? rating = 8.0,
+    List<String> genres = const ['动画'],
   }) =>
       ScrapedMetadata(
         title: title,
@@ -108,7 +190,7 @@ void main() {
         overview: '简介',
         posterUrl: posterUrl,
         rating: rating,
-        genres: const ['动画'],
+        genres: genres,
         onlineId: 'douban/tv/35679839',
         source: ScrapeSource.online,
       );
@@ -311,6 +393,392 @@ void main() {
       expect(
         (await subject.scrape(work())).status,
         WorkScrapeStatus.notFound,
+      );
+    });
+  });
+
+  group('WorkScraper 手动通道', () {
+    test('queryFor 预填的是**文件名解析出来的词**，不是库里已存的标题', () async {
+      // 库里那个标题可能是上一次刮错的结果。预填它，用户得先意识到
+      // 「这个框里是错的」才会去改；预填解析原文则直接展示了
+      // 「自动刮削拿着这么个词去搜」。
+      final repo = await repoWith(
+        work(),
+        [item(name: '超z级z马z力z欧z银z河z大z电影aa.2026.2160p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      );
+
+      final q = await subject.queryFor(work());
+
+      expect(q, isNotNull);
+      expect(
+        q!.title,
+        contains('超z级z马z力z欧z银z河z大z电影aa'),
+        reason: '预填库里那个 `Show`（或上一次刮错的名字）会让用户以为'
+            '「框里是对的」，而他要改的恰恰是这个名字。',
+      );
+      expect(q.year, 2026);
+    });
+
+    test('queryFor 解析不出片名 → null，让对话框退回库里已有的标题', () async {
+      final repo = await repoWith(work(), [item(name: 'video.mkv')]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      );
+
+      expect(await subject.queryFor(work()), isNull);
+    });
+
+    test('searchCandidates 把各源候选汇总返回', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _Manual('tmdb', candidates: const [
+            ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+          ]),
+          _Manual('douban', candidates: const [
+            ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+          ]),
+        ]),
+        clock: () => now,
+      );
+
+      final found = await subject.searchCandidates(
+        const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+      );
+
+      expect(found.map((c) => c.title), ['甲', '乙']);
+    });
+
+    test('searchCandidates 在刮削器抛异常时返回空列表，不抛给对话框', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Throwing()]),
+        clock: () => now,
+      );
+
+      expect(
+        await subject.searchCandidates(
+          const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+        ),
+        isEmpty,
+      );
+    });
+
+    test('applyCandidate 用 resolve 的结果落库，并保留与刮削无关的字段', () async {
+      final repo = await repoWith(
+        work(),
+        [item(name: 'Show.S01E01.1080p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      final outcome = await subject.applyCandidate(
+        work(),
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '35679839',
+          title: '仙逆 第一季',
+        ),
+      );
+
+      expect(outcome.status, WorkScrapeStatus.scraped);
+      final w = repo.written.single;
+      expect(w.title, '仙逆 第一季');
+      expect(w.source, ScrapeSource.online);
+      expect(w.category, MediaCategory.anime);
+      expect(w.itemCount, 3);
+      expect(w.totalBytes, 12345);
+      expect(
+        w.posterFile,
+        isNull,
+        reason: '换了海报就必须清掉 posterFile —— 缓存文件名是按 URL 散列'
+            '出来的，不清的话详情页会继续显示上一版海报。',
+      );
+    });
+
+    test('applyCandidate **不看匹配闸门** —— 用户已经做过判断了', () async {
+      // 这正是手动通道存在的理由：目录名 `超z级z马z力z欧z银z河z大z电影aa`
+      // 会被闸门正确地拦下（自动刮削认输），但用户手动选中
+      // 《超级马力欧银河大电影》时，闸门必须让路。
+      final repo = await repoWith(
+        work(),
+        [item(name: '超z级z马z力z欧z银z河z大z电影aa.2026.2160p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      final outcome = await subject.applyCandidate(
+        work(),
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '35000001',
+          title: '超级马力欧银河大电影',
+          year: 2026,
+        ),
+      );
+
+      expect(outcome.status, WorkScrapeStatus.scraped);
+      expect(repo.written.single.title, '超级马力欧银河大电影');
+    });
+
+    test('applyCandidate 解析失败 → notFound，且**不写库**', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban', resolvable: false)]),
+        clock: () => now,
+      );
+
+      final outcome = await subject.applyCandidate(
+        work(),
+        const ScrapeCandidate(source: 'douban', sourceId: '1', title: '某片'),
+      );
+
+      expect(outcome.status, WorkScrapeStatus.notFound);
+      expect(
+        repo.written,
+        isEmpty,
+        reason: '写一行「只有标题、没有海报简介」的假成功，用户看到的是'
+            '「已刮削」但页面上什么都没变 —— 比明确报失败更难排查。',
+      );
+    });
+
+    test('候选来源不在流水线里 → notFound（不猜、不退回别的源）', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      final outcome = await subject.applyCandidate(
+        work(),
+        const ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '某片'),
+      );
+
+      expect(outcome.status, WorkScrapeStatus.notFound);
+      expect(repo.written, isEmpty);
+    });
+  });
+
+  group('刮削结果文案按通道分开', () {
+    // 这一组钉的是 2026-10-01 发现的一处文案错配：`notFound` 在两个通道里是
+    // **两件不同的事**（算法没搜到 vs 用户点的那条解析不出来），一度共用
+    // 同一句话，于是手动对话框里会冒出「在线源都没有找到匹配的条目，可能是
+    // 片名解析不准」—— 用户刚刚亲手点了一条候选，看到这句只会以为界面坏了。
+
+    Future<WorkScrapeOutcome> autoNotFound() async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      return WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _Fixed('online', null),
+          const LocalFilenameScraper(),
+        ]),
+        clock: () => now,
+      ).scrape(work());
+    }
+
+    Future<WorkScrapeOutcome> manualNotFound() async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      return WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban', resolvable: false)]),
+        clock: () => now,
+      ).applyCandidate(
+        work(),
+        const ScrapeCandidate(source: 'douban', sourceId: '1', title: '某片'),
+      );
+    }
+
+    test('自动通道失败 → 文案给出「手动」这个下一步', () async {
+      final outcome = await autoNotFound();
+
+      expect(outcome.channel, ScrapeChannel.auto);
+      expect(
+        outcome.message,
+        contains('手动'),
+        reason: '自动这条路救不回来时，用户唯一的出路是自己敲片名。'
+            '文案里不写这一步，用户只会得出「这个播放器刮削是坏的」。'
+            '⚠️ 这句话里的「旁边」写死了按钮的位置 —— '
+            '把「手动」藏进菜单就必须同步改这里。',
+      );
+    });
+
+    test('手动通道失败 → 文案说「换一条候选」，不提片名解析', () async {
+      final outcome = await manualNotFound();
+
+      expect(outcome.channel, ScrapeChannel.manual);
+      expect(
+        outcome.message,
+        contains('换一条'),
+        reason: '用户已经搜到并点了一条候选，失败的原因是**这一条**解析不出来，'
+            '下一步是换一条 —— 跟他敲的词没有关系。',
+      );
+      expect(
+        outcome.message,
+        isNot(contains('片名解析不准')),
+        reason: '「片名解析不准」讲的是自动流程。用户在候选列表里刚刚看到'
+            '十条结果，被告知「片名解析不准」会让他去改一个本来没错的词。',
+      );
+      expect(
+        outcome.message,
+        isNot(contains('在线源都没找到')),
+        reason: '同上：用户明明看到了候选，说「没找到条目」等于说界面坏了。',
+      );
+    });
+
+    test('两个通道的 notFound 文案确实不同（不是同一句）', () async {
+      expect(
+        (await autoNotFound()).message,
+        isNot((await manualNotFound()).message),
+      );
+    });
+
+    test('成功文案两个通道一致 —— 「已刮削：…」对谁说都一样', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final auto = await WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      ).scrape(work());
+
+      final repo2 = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final manual = await WorkScraper(
+        library: repo2,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      ).applyCandidate(
+        work(),
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '1',
+          title: '仙逆 第一季',
+          year: 2023,
+        ),
+      );
+
+      expect(auto.status, WorkScrapeStatus.scraped);
+      expect(manual.status, WorkScrapeStatus.scraped);
+      expect(auto.message, contains('已刮削'));
+      expect(
+        manual.message,
+        auto.message,
+        reason: '成功那条没有歧义：两个通道都说「已刮削：片名（年份）」。'
+            '给它也按通道分叉，只会多一处要维护的重复。',
+      );
+    });
+  });
+
+  group('刮削后分类跟着 TMDB 类型走', () {
+    // 2026-10-01：用户反馈「刮削完毕后并没有合理的将影片进行分类」。
+    // 根因是 `_apply` 把 `category` 原样抄了一遍，而 `MediaCategoryGuesser`
+    // 自己却把 genres 排在第一优先级 —— 两处口径相反，`fromGenres` 这条路径
+    // 在整个项目里**永远不会被执行**（扫描期调 guess 时不传 genres）。
+
+    test('TMDB 说是动画 → 分类从「电影」挪到「动漫」', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.1080p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _Fixed('fake', online(genres: const ['动画', '冒险', '喜剧'])),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.scrape(work(category: MediaCategory.movie));
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.anime,
+        reason: '目录名里没有「动漫」二字，扫描期只能按结构判成「电影」。'
+            'TMDB 的「动画」是更可信的证据 —— 不然这部动画片永远留在电影栏。',
+      );
+    });
+
+    test('genres 给不出结论 → 保留扫描期的判定，不许按 kind 冲掉', () async {
+      // 用户把综艺放在 /综艺/ 目录里，扫描期靠目录名判成了 variety；
+      // 而 TMDB 对国产综艺常常给不出「真人秀」，只给「剧情」。
+      final repo = await repoWith(
+        work(category: MediaCategory.variety),
+        [item(name: 'Show.S01E01.1080p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _Fixed('fake', online(genres: const ['剧情'])),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.scrape(work(category: MediaCategory.variety));
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.variety,
+        reason: '这里如果调完整的 `MediaCategoryGuesser.guess`，它的最后一步'
+            '「按 kind 落到电影 / 剧集」会按 kind=episode 把「综艺」冲成'
+            '「剧集」—— 用户看到的是「我的综艺栏目空了」。'
+            '`guess` 的兜底是替「没有任何证据」准备的，而这里已经有证据了。',
+      );
+    });
+
+    test('genres 为空（离线源）→ 分类不动', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.1080p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online(genres: const []))]),
+        clock: () => now,
+      );
+
+      await subject.scrape(work(category: MediaCategory.movie));
+
+      expect(repo.written.single.category, MediaCategory.movie);
+    });
+
+    test('手动通道同样折算分类', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        // `_Manual.resolve` 给的 genres 是 `['动画']`。
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.movie),
+        const ScrapeCandidate(source: 'douban', sourceId: '1', title: '某片'),
+      );
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.anime,
+        reason: '手动和自动走的是同一个 `_apply`，分类折算不能只在一条路上生效 '
+            '—— 那样「手动刮完分类不对、自动刮完才对」会变成一个玄学问题。',
       );
     });
   });

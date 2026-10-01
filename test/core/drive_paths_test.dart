@@ -115,4 +115,22 @@ void main() {
       expect(drivePathIsUnder('电影/科幻', '/电影/'), isTrue);
     });
   });
+
+  group('drivePathJoin', () {
+    // 它拼出来的形状必须与 `MediaItem.dirPath` 完全一致（带结尾斜杠），
+    // 否则目录视图按路径归并时同一个目录会裂成两个键 —— 表现是
+    // 「已入库」标记时有时无。
+    test('拼出来的子目录路径一律带结尾斜杠', () {
+      expect(drivePathJoin('/', '电影'), '/电影/');
+      expect(drivePathJoin('/电影', '科幻'), '/电影/科幻/');
+      expect(drivePathJoin('/电影/', '科幻'), '/电影/科幻/');
+      expect(drivePathJoin('电影', '科幻'), '/电影/科幻/');
+      expect(drivePathJoin(r'\电影\科幻', '2023'), '/电影/科幻/2023/');
+    });
+
+    test('父路径是根时不会拼出双斜杠', () {
+      expect(drivePathJoin('/', '电影'), isNot(contains('//')));
+      expect(drivePathJoin('//', '电影'), '/电影/');
+    });
+  });
 }

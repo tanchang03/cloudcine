@@ -66,7 +66,7 @@ class SettingKeys {
   /// ## 为什么只放 key、不放账号密码
   ///
   /// 登录能换来更高的下载额度，但**密码是凭证**，而这个项目的规矩是凭证必须进
-  /// 系统钥匙串（`SecureCredentialStore`），而钥匙串那一层目前是按
+  /// 系统安全存储（`SecureCredentialStore`），而那一层目前是按
   /// `DriveProvider` 索引的 —— 为了一个字幕站去改它，代价与收益不成比例。
   /// 所以先只支持 Api-Key（与 TMDB 同级，本来就在数据库里）。
   ///
@@ -114,13 +114,24 @@ class SettingKeys {
 
   /// 诊断日志级别（`debug` / `info` / `warn` / `error`）
   static const String logLevel = 'log_level';
+
+  /// 备份同步的网盘目录名。空串 = 用默认目录名「云影备份」。
+  static const String backupDirName = 'backup_dir_name';
+
+  /// 是否在扫描完成后自动上传备份到网盘。
+  /// 默认关闭 —— 自动上传可能消耗网盘配额，且用户可能不想频繁覆盖。
+  static const String autoBackupOnScan = 'auto_backup_on_scan';
+
+  /// 上次备份同步时间（ISO8601）。
+  static const String lastBackupAt = 'last_backup_at';
 }
 
 /// 通用键值设置存储。
 ///
 /// 放在数据库里而不是 `SharedPreferences`：设置与索引库是同一份应用数据，
 /// 分开存会出现「清了索引但设置还在」「备份了库但设置丢了」这类不一致。
-/// 唯一例外是凭证 —— 那个**必须**在系统钥匙串（见 `SecureCredentialStore`）。
+/// 唯一例外是凭证 —— 那个**必须**进系统安全存储（见 `SecureCredentialStore`：
+/// iOS/Android/Windows 走钥匙串/Keystore/DPAPI，macOS 走加密文件）。
 class SettingsStore {
   SettingsStore(this._db);
 

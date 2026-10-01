@@ -50,7 +50,7 @@ abstract class CloudDriveAdapter {
   /// 用一份新凭证授权并持久化。
   ///
   /// 实现应**先校验再落库**：校验失败抛 `DriveException(unauthorized)`，
-  /// 避免把废凭证写进钥匙串。
+  /// 避免把废凭证写进安全存储。
   Future<CloudAccount> authorize(AuthCredential credential);
 
   /// 清除本地凭证。不做服务端登出（自用接口也没有登出接口）。
@@ -172,6 +172,66 @@ abstract class CloudDriveAdapter {
   ///
   /// 默认返回空 —— 不需要鉴权的网盘直接不用管这个方法。
   Map<String, String> imageHeaders() => const <String, String>{};
+
+  // ---------------------------------------------------------------------
+  // 文件管理（上传 / 删除 / 创建目录）
+  // ---------------------------------------------------------------------
+
+  /// 在指定目录下创建一个文件夹。
+  ///
+  /// [parentId] 为 `'0'` 时表示根目录。
+  /// 同名文件夹重复创建应幂等（返回已存在的 fid）。
+  ///
+  /// 默认实现抛 `unsupported` —— 不是所有网盘都支持写操作。
+  /// 本应用用它在夸克网盘中建备份目录。
+  Future<String> createFolder({
+    required String parentId,
+    required String name,
+  }) {
+    throw const DriveException(
+      type: DriveErrorType.unsupported,
+      message: '该网盘不支持创建目录',
+    );
+  }
+
+  /// 删除文件/文件夹。
+  ///
+  /// [fileIds] 是要删除的 fid 列表。
+  /// 返回被删除的 fid 列表（供调用方核对）。
+  ///
+  /// ⚠️ 这是**不可逆**操作 —— 网盘的回收站策略由服务端决定。
+  /// 调用方必须在 UI 层做二次确认。
+  ///
+  /// 默认实现抛 `unsupported`。
+  Future<List<String>> deleteFiles({required List<String> fileIds}) {
+    throw const DriveException(
+      type: DriveErrorType.unsupported,
+      message: '该网盘不支持删除文件',
+    );
+  }
+
+  /// 上传一个本地文件到网盘指定目录。
+  ///
+  /// [parentId] 是目标目录的 fid；[fileName] 是上传后的文件名；
+  /// [bytes] 是文件内容；[onProgress] 可选回调（已传字节 / 总字节）。
+  ///
+  /// 返回上传成功后的文件 fid。
+  ///
+  /// 实现应先尝试秒传（哈希命中时服务端直接返回 fid），
+  /// 再回退到分片上传。
+  ///
+  /// 默认实现抛 `unsupported`。
+  Future<String> uploadFile({
+    required String parentId,
+    required String fileName,
+    required List<int> bytes,
+    void Function(int sent, int total)? onProgress,
+  }) {
+    throw const DriveException(
+      type: DriveErrorType.unsupported,
+      message: '该网盘不支持上传文件',
+    );
+  }
 
   // ---------------------------------------------------------------------
   // 生命周期

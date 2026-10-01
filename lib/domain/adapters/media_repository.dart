@@ -11,10 +11,13 @@ import '../entities/scan_cursor.dart';
 /// 媒体库列表的排序方式。
 ///
 /// 取值参考 VidHub 的排序菜单（按日期 / 评分 / 类型），并补上本项目
-/// 数据模型里现成可用的两档。**枚举顺序就是菜单顺序** ——
-/// 「最近添加」排第一是因为它是用户打开媒体库时最常想看的：
-/// 「我新存的那几部在哪儿」。
+/// 数据模型里现成可用的排序。**枚举顺序就是菜单顺序**。
+///
+/// 「最近修改」排第一因为它是默认：用户打开媒体库时最常想看的是
+/// 「我新存/替换的那几部在哪儿」—— 这比「入库时间」更能反映
+/// 「用户刚在网盘上动过」这件事。
 enum WorkSort {
+  recentModified('最近修改'),
   recentAdded('最近添加'),
   recentPlayed('最近播放'),
   rating('评分'),
@@ -106,31 +109,52 @@ abstract class MediaRepository {
   /// 「最近播放」那一栏。它与 [category] 是**正交**的两件事（一部电影既在
   /// 「电影」里，也在「最近播放」里），所以是一个独立的开关而不是分类的一个
   /// 取值 —— 理由见 `LibraryFilter.playedOnly`。
+  ///
+  /// [decades] 与 [genres] 是筛选面板里的两个条件，与上面几个**全部取交集**。
+  ///
+  ///   - [decades] 是**年代起始年**（`2020` 表示 2020–2029），不是具体年份。
+  ///     逐年列会把筛选面板撑成几十项，而用户想找的是「最近几年的片子」；
+  ///   - [genres] 是 TMDB / 豆瓣的类型名（`动画` / `科幻`…），**任一命中即可**
+  ///     （多选是「或」，不是「与」—— 一部片子只会有一两个类型，
+  ///     取交集几乎永远筛不出东西）。
+  ///
+  /// 两者为 `null` 或空集合都表示「这一维不限」。
   Future<List<MediaWork>> listWorks({
     MediaKind? kind,
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
-    WorkSort sort = WorkSort.recentAdded,
+    Set<int>? decades,
+    Set<String>? genres,
+    WorkSort sort = WorkSort.recentModified,
     int limit = 200,
     int offset = 0,
   });
 
-  /// 给 `category` 还是空串的作品补算分类，返回补算条数。
+  /// 把 `category` 列修正到当前规则下的正确值，返回修正条数。
   ///
-  /// ## 为什么需要它
+  /// ## 它管两件事
   ///
-  /// `category` 是 v3 才加的列，老库里的行全是空串。若不管它们，
-  /// 用户升级后点「动漫」栏会看到**空列表**，而库里明明有动漫 ——
-  /// 那看起来像分类功能坏了，而不是「需要重新扫描」。
+  ///   1. **老库回填**。`category` 是 v3 才加的列，老库里的行全是空串。
+  ///      若不管它们，用户升级后点「动漫」栏会看到**空列表**，而库里明明
+  ///      有动漫 —— 那看起来像分类功能坏了，而不是「需要重新扫描」。
+  ///   2. **让刮削的类型对老数据也生效**。`WorkScraper` 会把 TMDB 的
+  ///      `genres` 折算成栏目，但那只对**这次之后**的刮削有效；已经刮过的
+  ///      作品 `genres` 早就在库、`category` 却还是旧值。这一遍负责对齐，
+  ///      否则用户得逐部重刮才看得到分类变对。
+  ///
+  /// 两件事的判据不同：空串走完整的 `guessFromWork`；非空串**只看 `genres`**
+  /// （走完整 guess 会把靠目录名判出来的「综艺」按 kind 冲成「剧集」）。
+  /// 实现里的长注释解释了为什么不能合并。
   ///
   /// ## 为什么不让扫描器负责
   ///
-  /// 补算只需要「标题 + kind」，不必重新连网盘。放在这里意味着
+  /// 补算只需要「库里已有的列」，不必重新连网盘。放在这里意味着
   /// **升级后第一次打开媒体库就修好了**，用户不用为了一个展示字段
   /// 重扫几千个目录。
   ///
-  /// 幂等：没有空串行时是一次 `COUNT`，可以直接在列表查询前调用。
+  /// 幂等：只在结果**真的不同**时才写，所以修好之后每次调用都是
+  /// 「读一遍、零写入」，可以直接在列表查询前调用。
   Future<int> backfillWorkCategories();
 
   /// 各分类的作品数（分类栏角标）。
@@ -146,6 +170,45 @@ abstract class MediaRepository {
   /// 而「播过没有」是另一个维度 —— 一部电影同时算在「电影」和「最近播放」
   /// 两栏里，两边的数字本来就不该相加。
   Future<int> countPlayedWorks();
+
+  /// 各年代的作品数（筛选面板「年代」那一组的选项与角标）。
+  ///
+  /// 键是**年代起始年**（`2020` 表示 2020–2029）。只返回**库里真的有的**
+  /// 年代 —— 写死一张「2020s / 2010s / …」的表，会让用户点一个永远是 0 的
+  /// 选项，然后怀疑筛选坏了。
+  ///
+  /// ## 计数口径：等于「把年代 / 类型清空后，列表里的条数」
+  ///
+  /// 所以它跟着 [category] / [playedOnly] / [query] 收窄，但**不跟着
+  /// [decades] / [genres] 收窄**（那两维由调用方保证不传进来）。
+  /// 这条规则只有一个目的：**面板上出现的每一个选项，点下去至少有一条结果**。
+  /// 整库统计做不到这一点 —— 用户切到「综艺」栏再打开面板，会看到一堆
+  /// 综艺里根本不存在的类型，点下去是空列表。
+  ///
+  /// 副作用是切换分类 / 搜索时面板上的数字会变（标准的分面筛选行为）。
+  ///
+  /// `year` 为空的作品不进这个表（它们归不进任何年代），
+  /// 所以各年代之和**可能小于**作品总数。
+  Future<Map<int, int>> countWorksByDecade({
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  });
+
+  /// 各类型的作品数（筛选面板「类型」那一组的选项与角标）。
+  ///
+  /// 类型存在 `genres` 列里（JSON 数组文本），所以**数不出来就数不出来** ——
+  /// 这里只能把那**一列**读出来在 Dart 里拆。与 [countWorksByCategory] 的
+  /// 「一次 GROUP BY」不同，但代价仍然可控：只读一列、不反序列化整行。
+  ///
+  /// 计数口径与 [countWorksByDecade] 完全一致（见那里的说明）。
+  ///
+  /// 没有任何类型的作品（没刮过）不进这个表。
+  Future<Map<String, int>> countWorksByGenre({
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  });
 
   /// 某个作品下的全部媒体项，按「季 → 集 → 名称」排序。
   Future<List<MediaItem>> itemsForWork(String groupKey);
@@ -362,7 +425,13 @@ class InMemoryMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
-    WorkSort sort = WorkSort.recentAdded,
+    Set<int>? decades,
+    Set<String>? genres,
+    // ⚠️ 默认值必须与接口声明、drift 实现三处一致：接口默认值只是个
+    // 「文档」，真正生效的是**实现**上的默认值。这里漏改的话，调用方
+    // 不显式传 sort 时两个实现会给出不同顺序，而这类差异在单测里
+    // 看不出来（单测通常都会显式传 sort）。
+    WorkSort sort = WorkSort.recentModified,
     int limit = 200,
     int offset = 0,
   }) async {
@@ -374,6 +443,20 @@ class InMemoryMediaRepository implements MediaRepository {
     // 「播过没有」看的是作品行上的 `lastPlayedAt`，与分类无关。
     if (playedOnly) {
       list = list.where((w) => w.lastPlayedAt != null).toList();
+    }
+    // 年代：`decades` 存的是**年代起始年**（2020 = 2020–2029）。没有年份的
+    // 作品（`year == null`）归不进任何年代 —— 选了年代就等于把它排掉，
+    // 与 drift 实现里 `year >= d0 AND year < d0+10` 的口径一致。
+    if (decades != null && decades.isNotEmpty) {
+      list = list
+          .where((w) => w.year != null && decades.contains(w.year! ~/ 10 * 10))
+          .toList();
+    }
+    // 类型：**任一命中**（或，不是与）。与 drift 实现里 `LIKE '%"类型"%'`
+    // 的口径一致 —— 那边靠引号避免「动画」误命中「动画片」，这边本来就是
+    // 字符串精确比较，不需要额外处理。
+    if (genres != null && genres.isNotEmpty) {
+      list = list.where((w) => w.genres.any(genres.contains)).toList();
     }
     final q = query?.trim().toLowerCase();
     if (q != null && q.isNotEmpty) {
@@ -399,8 +482,24 @@ class InMemoryMediaRepository implements MediaRepository {
     }
 
     switch (sort) {
+      case WorkSort.recentModified:
+        final x = a.lastModifiedAt;
+        final y = b.lastModifiedAt;
+        // 没拿到网盘修改时间的一律垫底（与 SQL 侧 `OrderingTerm.desc`
+        // 的 NULL 行为对齐：NULL 被视为最小值，排最后）。
+        if (x == null && y == null) return tie();
+        if (x == null) return 1;
+        if (y == null) return -1;
+        final byModified = y.compareTo(x);
+        return byModified != 0 ? byModified : tie();
       case WorkSort.recentAdded:
-        final byAdded = b.updatedAt.compareTo(a.updatedAt);
+        final x = a.firstSeenAt;
+        final y = b.firstSeenAt;
+        // 没拿到入库时间的一律垫底（与 SQL 侧 NULL 行为对齐）。
+        if (x == null && y == null) return tie();
+        if (x == null) return 1;
+        if (y == null) return -1;
+        final byAdded = y.compareTo(x);
         return byAdded != 0 ? byAdded : tie();
       case WorkSort.recentPlayed:
         final x = a.lastPlayedAt;
@@ -429,6 +528,14 @@ class InMemoryMediaRepository implements MediaRepository {
     // **刻意不写成「把 other 重算一遍」**：`other` 是一个合法判定结果
     // （「判过了，就是认不出来」），重算会把它和「还没判」混为一谈，
     // 而真实实现正是靠这个区别避免反复重算的。
+    //
+    // ⚠️ 真实实现还多管一件事：把 `genres` 折算进分类（让刮削结果对
+    // **已经刮过**的作品也生效）。这个替身**刻意不复刻**它 —— 本文件的
+    // 合并/回填逻辑是简化版，规则的真源在 `DriftMediaRepository`
+    // （`mergeWorkForUpsert` + `backfillWorkCategories`），
+    // 覆盖它们的是 `test/data/media_work_merge_test.dart` 与
+    // `test/data/category_backfill_test.dart`（两个都跑真库）。
+    // 在替身里复制一份规则只会多出一份没有测试守着的实现。
     return 0;
   }
 
@@ -444,6 +551,59 @@ class InMemoryMediaRepository implements MediaRepository {
   @override
   Future<int> countPlayedWorks() async =>
       _works.values.where((w) => w.lastPlayedAt != null).length;
+
+  @override
+  Future<Map<int, int>> countWorksByDecade({
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  }) async {
+    // 直接复用 [listWorks] 的筛选，而不是把条件再抄一遍：口径要严格等于
+    // 「清空年代 / 类型后列表里的条数」，抄一遍就迟早会漂移。
+    final works = await listWorks(
+      category: category,
+      playedOnly: playedOnly,
+      query: query,
+      limit: _noLimit,
+    );
+    final out = <int, int>{};
+    for (final w in works) {
+      final y = w.year;
+      // 没有年份的作品不进表 —— 与 `listWorks` 的年代过滤口径一致，
+      // 否则面板上会冒出一个点了就空列表的年代。
+      if (y == null) continue;
+      final d = y ~/ 10 * 10;
+      out[d] = (out[d] ?? 0) + 1;
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<String, int>> countWorksByGenre({
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  }) async {
+    final works = await listWorks(
+      category: category,
+      playedOnly: playedOnly,
+      query: query,
+      limit: _noLimit,
+    );
+    final out = <String, int>{};
+    for (final w in works) {
+      // 一部片子的同一个类型只数一次（`genres` 理论上不会重复，
+      // 但去重能保证即使数据脏了，角标也不会大于作品数）。
+      for (final g in w.genres.toSet()) {
+        out[g] = (out[g] ?? 0) + 1;
+      }
+    }
+    return out;
+  }
+
+  /// 「不分页」。测试量级（几百条）下没有区别，写成一个有名字的常量
+  /// 是为了让调用点一眼看出这里**故意要全量**。
+  static const int _noLimit = 1 << 30;
 
   @override
   Future<List<MediaItem>> itemsForWork(String groupKey) async {

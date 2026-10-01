@@ -204,6 +204,17 @@ abstract class HttpClientLike {
     Duration? timeout,
   });
 
+  /// PUT 字节到指定 URL（用于文件上传到 OSS）。
+  ///
+  /// 返回 ETag 响应头（去掉引号后的值），
+  /// OSS 上传完成后必须用它组装 `upload_finish` 的请求体。
+  Future<String> putBytes(
+    String url, {
+    required List<int> body,
+    Map<String, String>? headers,
+    Duration? timeout,
+  });
+
   /// 释放底层连接池
   void close();
 }

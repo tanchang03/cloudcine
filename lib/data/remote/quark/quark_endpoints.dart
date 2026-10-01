@@ -39,6 +39,43 @@ class QuarkEndpoints {
   /// 搜索（全盘，不限目录）
   static const String fileSearch = '/1/clouddrive/file/search';
 
+  /// 创建文件/文件夹。
+  ///
+  /// 请求体：`{dir_init_lock, dir_path, file_name, pdir_fid}`。
+  /// `pdir_fid="0"` 为根目录；`file_name` 是文件夹名。
+  /// 同名重复创建幂等，返回已有目录 fid。
+  static const String fileCreate = '/1/clouddrive/file';
+
+  /// 删除文件/文件夹。
+  ///
+  /// 请求体：`{action_type, filelist, exclude_fids}`。
+  /// `action_type=2` 为永久删除；`filelist` 是 fid 列表。
+  static const String fileDelete = '/1/clouddrive/file/delete';
+
+  /// 上传预请求（秒传判定 + 分片地址分配）。
+  ///
+  /// 请求体含 `file_name`、`size`、`pdir_fid`、`format_type`、
+  /// `l_created_at` / `l_updated_at`（毫秒时间戳）。
+  /// 响应 `data.finish=1` 时秒传命中，直接返回 `fid`。
+  static const String uploadPre = '/1/clouddrive/file/upload/pre';
+
+  /// 上传完成（提交分片 ETag 列表）。
+  ///
+  /// 请求体：`{task_id, part_info_list: [{part_number, etag}]}`。
+  static const String uploadFinish = '/1/clouddrive/file/upload/finish';
+
+  /// 更新文件哈希（秒传判定）。
+  ///
+  /// 请求体：`{md5, sha1, task_id}`。
+  /// 响应 `data.finish=true` 且返回 `fid` → 秒传成功。
+  static const String uploadHash = '/1/clouddrive/file/update/hash';
+
+  /// 获取分片上传授权。
+  ///
+  /// 请求体：`{auth_info, auth_meta, task_id}`。
+  /// 响应 `data.auth_key` 为 OSS PUT 请求的 `Authorization` 头值。
+  static const String uploadAuth = '/1/clouddrive/file/upload/auth';
+
   /// 取下载直链。
   ///
   /// ⚠️ **单文件约 50MiB 硬上限**（超限返回 `code=23018`）。这是 PC 网页版

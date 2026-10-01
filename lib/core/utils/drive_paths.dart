@@ -50,6 +50,20 @@ String drivePathWithTrailingSlash(String path) {
   return p == driveRootPath ? driveRootPath : '$p/';
 }
 
+/// 拼一个子目录的展示路径：`<base>/<name>/`（**带结尾斜杠**）。
+///
+/// 这是扫描器与局部发现共同使用的口径 —— 它写出来的形状必须与
+/// `MediaItem.dirPath` 完全一致（`/电影/流浪地球2 (2023)/`），
+/// 否则目录视图按路径归并时，同一个目录会裂成两个键。
+///
+/// [base] 传什么都不影响结果（`/电影`、`/电影/`、`电影` 都归一成 `/电影`），
+/// 因为内部先过一道 [normalizeDrivePath]。根目录拼出来是 `/name/`。
+String drivePathJoin(String base, String name) {
+  final b = normalizeDrivePath(base);
+  if (b == driveRootPath) return '/$name/';
+  return '$b/$name/';
+}
+
 /// 父目录路径。**根的父亲是它自己** —— 调用方据此判断「已经在最上层」，
 /// 不需要额外判空。
 String drivePathParent(String path) {

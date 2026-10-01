@@ -23,6 +23,26 @@ abstract class MetadataScraper {
   /// 这个契约很重要：一部片子刮不到不该让整次扫描中断，而网络抖动、
   /// API 限流、条目不存在都属于「刮不到」。
   Future<ScrapedMetadata?> scrape(ScrapeQuery query);
+
+  /// 按关键词搜一批候选，供**用户手动挑选**。
+  ///
+  /// 与 [scrape] 的关键差别：这里**不做匹配校验、也不自动选第一条** ——
+  /// 用户要看到尽可能多的候选自己点。返回空列表表示「这个源给不出候选」
+  /// （离线源本来就没有），而不是「搜索失败」。
+  ///
+  /// ⚠️ 这里有默认实现，但**它只对 `extends` 生效**。本项目所有实现都是
+  /// `implements MetadataScraper`（见 `TmdbScraper` / `DoubanScraper` /
+  /// `LocalFilenameScraper`），而 `implements` **不继承任何实现体** ——
+  /// 新增一个带默认实现的方法，会让所有 `implements` 方**编译失败**。
+  /// 所以这两个方法（以及 [resolve]）在离线源和测试假实现里都要显式补上。
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async => const [];
+
+  /// 把用户选中的候选解析成完整元数据。取不到返回 `null`。
+  ///
+  /// 为什么不能直接用候选里的字段：豆瓣的搜索结果里既没有完整海报也没有
+  /// 简介，必须再打一次详情接口。TMDB 的搜索结果倒是够全，但类型名也要
+  /// 走一次缓存的类型表 —— 所以统一成「选中之后再解析」。
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async => null;
 }
 
 /// 文件名刮削器 —— **永远可用的那一层**。
@@ -62,6 +82,16 @@ class LocalFilenameScraper implements MetadataScraper {
       matchedQuery: title,
     );
   }
+
+  /// 离线源给不出候选 —— 它的「候选」就是文件名解析结果本身，
+  /// 而那是详情页里直接可改的字段，没必要再走一遍候选列表。
+  ///
+  /// ⚠️ 必须显式写出来：`implements` 不继承 [MetadataScraper] 的默认实现。
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async => const [];
+
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async => null;
 }
 
 /// 刮削流水线：**按优先级并发尝试，优先级最高的那个成功者胜出**。
@@ -142,6 +172,42 @@ class ScraperPipeline {
       return null;
     }
     return _attempt(fallback, query);
+  }
+
+  /// 向所有启用的源要候选，**按源的优先级拼接**，一个都不丢。
+  ///
+  /// 与 [scrape] 的跑法刻意不同：那个是「并发起跑、按优先级取第一个成功的」，
+  /// 因为自动刮削只需要一个答案；这里是「用户要自己挑」，所以必须把
+  /// 每个源的候选都给出来。串行而不是并发，是因为豆瓣的额度按搜索词计，
+  /// 没必要为了省几百毫秒让它和 TMDB 抢跑 —— 手动刮削一次点一下，量很小。
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async {
+    final out = <ScrapeCandidate>[];
+    for (final s in scrapers) {
+      if (!s.isEnabled) continue;
+      try {
+        final found = await s.search(query);
+        if (found.isNotEmpty) {
+          diag.info('刮削', '${s.id} 候选 ${found.length} 条（"${query.title}"）');
+          out.addAll(found);
+        }
+      } catch (e) {
+        // 一个源搜挂了不该让对话框整个空掉 —— 其他源的结果照样有用。
+        diag.warn('刮削', '${s.id} 候选搜索失败，跳过', error: e);
+      }
+    }
+    return out;
+  }
+
+  /// 用户选中的候选 → 完整元数据。**按来源找回对应的刮削器**。
+  ///
+  /// 不缓存刮削器实例、也不按 id 建表：来源就是 `scrapers` 里的 `id`，
+  /// 直接线性找。列表只有两三项，建表反而多一处要保持同步的状态。
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async {
+    for (final s in scrapers) {
+      if (s.id == candidate.source) return s.resolve(candidate);
+    }
+    diag.warn('刮削', '候选来源 ${candidate.source} 不在当前流水线里，忽略');
+    return null;
   }
 
   /// 跑一个刮削器，**把异常也归成「未命中」**。

@@ -7,7 +7,13 @@ import 'package:flutter_test/flutter_test.dart';
 
 /// 一个可编程的假刮削器。
 class _Fake implements MetadataScraper {
-  _Fake(this.id, {this.enabled = true, required this.run});
+  _Fake(
+    this.id, {
+    this.enabled = true,
+    required this.run,
+    this.onSearch,
+    this.onResolve,
+  });
 
   @override
   final String id;
@@ -15,7 +21,13 @@ class _Fake implements MetadataScraper {
   final bool enabled;
   final Future<ScrapedMetadata?> Function(ScrapeQuery query) run;
 
+  /// 手动通道：不传就是「这个源给不出候选」。
+  final Future<List<ScrapeCandidate>> Function(ScrapeQuery query)? onSearch;
+  final Future<ScrapedMetadata?> Function(ScrapeCandidate candidate)? onResolve;
+
   int calls = 0;
+  int searchCalls = 0;
+  int resolveCalls = 0;
 
   @override
   String get displayName => id;
@@ -27,6 +39,18 @@ class _Fake implements MetadataScraper {
   Future<ScrapedMetadata?> scrape(ScrapeQuery query) {
     calls++;
     return run(query);
+  }
+
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) {
+    searchCalls++;
+    return onSearch?.call(query) ?? Future.value(const []);
+  }
+
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) {
+    resolveCalls++;
+    return onResolve?.call(candidate) ?? Future.value(null);
   }
 }
 
@@ -247,6 +271,136 @@ void main() {
       final bad = await ScraperPipeline([local2, tmdb2]).scrape(_q);
       expect(bad!.title, 'LOCAL');
       expect(tmdb2.calls, 0);
+    });
+  });
+
+  group('ScraperPipeline.search（手动挑选用的候选）', () {
+    test('按优先级拼接**所有**源的候选，一个都不丢', () async {
+      // 与 scrape 的跑法刻意不同：那个是「并发起跑、取第一个成功的」，
+      // 因为自动刮削只要一个答案；这里是用户要自己挑，所以每个源的
+      // 候选都必须给出来。
+      final pipeline = ScraperPipeline([
+        _Fake(
+          'tmdb',
+          run: (_) async => null,
+          onSearch: (_) async => const [
+            ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+          ],
+        ),
+        _Fake(
+          'douban',
+          run: (_) async => null,
+          onSearch: (_) async => const [
+            ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+          ],
+        ),
+        _Fake('local', run: (_) async => _meta('LOCAL')),
+      ]);
+
+      final found = await pipeline.search(_q);
+
+      expect(found.map((c) => c.title), ['甲', '乙']);
+    });
+
+    test('一个源搜挂了，其他源的候选照常返回', () async {
+      final pipeline = ScraperPipeline([
+        _Fake(
+          'boom',
+          run: (_) async => null,
+          onSearch: (_) async => throw StateError('网络库没兜住'),
+        ),
+        _Fake(
+          'douban',
+          run: (_) async => null,
+          onSearch: (_) async => const [
+            ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+          ],
+        ),
+      ]);
+
+      expect(
+        (await pipeline.search(_q)).map((c) => c.title),
+        ['乙'],
+        reason: '让对话框整个空掉比少一个源糟糕得多 —— 用户会以为'
+            '「这个词在哪儿都搜不到」。',
+      );
+    });
+
+    test('未启用的源不参与搜索', () async {
+      final disabled = _Fake(
+        'off',
+        enabled: false,
+        run: (_) async => null,
+        onSearch: (_) async => const [
+          ScrapeCandidate(source: 'off', sourceId: '1', title: '甲'),
+        ],
+      );
+      final pipeline = ScraperPipeline([
+        disabled,
+        _Fake('local', run: (_) async => _meta('LOCAL')),
+      ]);
+
+      expect(await pipeline.search(_q), isEmpty);
+      expect(disabled.searchCalls, 0);
+    });
+
+    test('本地兜底源也给不出候选（它没有 search 能力）', () async {
+      final pipeline = ScraperPipeline([
+        _Fake('tmdb', run: (_) async => null),
+        const LocalFilenameScraper(),
+      ]);
+
+      expect(await pipeline.search(_q), isEmpty);
+    });
+  });
+
+  group('ScraperPipeline.resolve（用户选中之后）', () {
+    test('按候选的 source 找回对应刮削器', () async {
+      final tmdb = _Fake(
+        'tmdb',
+        run: (_) async => null,
+        onResolve: (c) async => _meta('TMDB:${c.sourceId}'),
+      );
+      final douban = _Fake(
+        'douban',
+        run: (_) async => null,
+        onResolve: (c) async => _meta('DOUBAN:${c.sourceId}'),
+      );
+      final pipeline = ScraperPipeline([tmdb, douban]);
+
+      final r = await pipeline.resolve(
+        const ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+      );
+
+      expect(r!.title, 'DOUBAN:2');
+      expect(douban.resolveCalls, 1);
+      expect(tmdb.resolveCalls, 0, reason: '不能拿别的源去解析这个候选。');
+    });
+
+    test('候选来源不在流水线里 → null（不猜、也不退回兜底）', () async {
+      final pipeline = ScraperPipeline([
+        _Fake('tmdb', run: (_) async => null),
+        const LocalFilenameScraper(),
+      ]);
+
+      expect(
+        await pipeline.resolve(
+          const ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+        ),
+        isNull,
+        reason: '用户换掉了设置（比如把豆瓣 Cookie 清空了），流水线重建后'
+            '对话框里那份候选就成了孤儿 —— 这时宁可说「找不到来源」，'
+            '也不能拿别的源的结果顶上。',
+      );
+    });
+
+    test('空流水线 → null，不抛', () async {
+      expect(
+        await ScraperPipeline(const []).resolve(
+          const ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+        ),
+        isNull,
+      );
     });
   });
 }

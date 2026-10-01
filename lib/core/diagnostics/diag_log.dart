@@ -86,7 +86,7 @@ class DiagLog {
   /// 这是「debug 能播、release 不能播」这类问题的**头号嫌疑**：
   /// 沙箱会把 `getApplicationSupportDirectory()` 重定向到
   /// `~/Library/Containers/<bundle-id>/Data/...`，于是两个 build 各有各的
-  /// 数据库、各有各的钥匙串访问组，行为自然不一样。
+  /// 数据库、各有各的凭证存储位置，行为自然不一样。
   bool get isSandboxed {
     final path = _supportPath;
     return path != null && path.contains('/Library/Containers/');

@@ -50,6 +50,8 @@ class MediaWork {
     this.scrapedAt,
     this.itemCount = 0,
     this.totalBytes = 0,
+    this.lastModifiedAt,
+    this.firstSeenAt,
     this.lastPlayedAt,
     required this.updatedAt,
   });
@@ -109,6 +111,16 @@ class MediaWork {
   /// 作品下的文件数（冗余字段，列表页避免 N+1 查询）
   final int itemCount;
   final int totalBytes;
+
+  /// 作品下所有文件的**网盘修改时间**最大值。
+  ///
+  /// 取 `MediaItem.modifiedAt` 的最大值：新增一集或替换一集时，
+  /// 这个值会变大，整个作品在「最近修改」排序里就会浮到前面。
+  final DateTime? lastModifiedAt;
+
+  /// 作品**首次入库**时间。决定「最近添加」排序，upsert 时必须保留旧值。
+  final DateTime? firstSeenAt;
+
   final DateTime? lastPlayedAt;
   final DateTime updatedAt;
 
@@ -152,6 +164,8 @@ class MediaWork {
     DateTime? scrapedAt,
     int? itemCount,
     int? totalBytes,
+    DateTime? lastModifiedAt,
+    DateTime? firstSeenAt,
     DateTime? lastPlayedAt,
     DateTime? updatedAt,
   }) =>
@@ -176,6 +190,8 @@ class MediaWork {
         scrapedAt: scrapedAt ?? this.scrapedAt,
         itemCount: itemCount ?? this.itemCount,
         totalBytes: totalBytes ?? this.totalBytes,
+        lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
+        firstSeenAt: firstSeenAt ?? this.firstSeenAt,
         lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );
@@ -222,6 +238,71 @@ class ScrapedMetadata {
   String toString() =>
       'ScrapedMetadata("$title", ${year ?? "-"}, src=${source.label}, '
       'poster=${posterUrl == null ? "无" : "有"})';
+}
+
+/// 一条**候选**条目 —— 用户手动指定片名时用来挑的那一批。
+///
+/// ## 与 [ScrapedMetadata] 的分工
+///
+/// 这个是「搜索结果里的一条」，信息可能不全：豆瓣的搜索结果连海报都只是
+/// 一张 120px 高的横条，简介也没有。它只够**展示给用户选**；
+/// 选中之后由刮削器的 `resolve()` 换成完整的 [ScrapedMetadata]。
+///
+/// ## 为什么需要它
+///
+/// 文件名不总是完整的片名 —— 发布组会把片名打散、插字符来规避关键词过滤
+/// （实测 `超z级z马z力z欧z银z河z大z电影aa`，真名《超级马力欧银河大电影》），
+/// 也可能只剩一个 `2026.2160p.WEB-DL.mkv`。这种输入**任何自动算法都救不回来**，
+/// 只能让用户自己敲一个词，然后从候选里点一个。
+class ScrapeCandidate {
+  const ScrapeCandidate({
+    required this.source,
+    required this.sourceId,
+    required this.title,
+    this.originalTitle,
+    this.year,
+    this.posterUrl,
+    this.overview,
+    this.isEpisode = false,
+    this.raw,
+  });
+
+  /// 来源 id（`tmdb` / `douban`）。`resolve()` 靠它找回对应的刮削器。
+  final String source;
+
+  /// 来源内的条目 id。
+  final String sourceId;
+
+  final String title;
+  final String? originalTitle;
+  final int? year;
+
+  /// **展示用**的小图。豆瓣给的是 120px 横条 —— 不要拿它当作品海报。
+  final String? posterUrl;
+
+  final String? overview;
+
+  /// 来源判定的类型（电影 / 剧集）。
+  final bool isEpisode;
+
+  /// 来源自己的原始条目。`resolve()` 直接用它，免得再搜一次
+  /// （豆瓣的额度是按搜索词计的，重复搜是实打实的浪费）。
+  final Map<String, Object?>? raw;
+
+  /// 列表里那行副标题。
+  String get subtitle => <String>[
+        if (year != null) '$year',
+        isEpisode ? '剧集' : '电影',
+        switch (source) {
+          'douban' => '豆瓣',
+          'tmdb' => 'TMDB',
+          _ => source,
+        },
+      ].join(' · ');
+
+  @override
+  String toString() =>
+      'ScrapeCandidate($source/$sourceId "$title" ${year ?? "-"})';
 }
 
 /// 刮削请求：从本地解析结果构造。

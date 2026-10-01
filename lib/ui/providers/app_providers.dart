@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../data/auth/quark_qr_login.dart';
+import '../../data/auth/secret_backend.dart';
 import '../../data/auth/secure_credential_store.dart';
 import '../../data/db/app_database.dart';
 import '../../data/db/media_repository_impl.dart';
@@ -17,6 +18,7 @@ import '../../data/scrape/poster_cache.dart';
 import '../../domain/adapters/credential_store.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/drive_provider.dart';
+import '../../domain/services/library_backup_service.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/subtitle_service.dart';
 import 'library_refresh_providers.dart';
@@ -44,9 +46,24 @@ final posterCacheDirProvider = Provider<String>(
   ),
 );
 
-/// 凭证存储。落系统钥匙串。
+/// 应用支持目录。与 [databaseProvider] 同理在 `main()` 里注入。
+///
+/// 凭证文件要落在它下面，所以必须和数据库、海报缓存用**同一个**目录 ——
+/// 各自调一次 `getApplicationSupportDirectory()` 虽然结果一样，
+/// 但会多一次平台通道往返，也让「数据都放哪」变得不好追。
+final appSupportDirProvider = Provider<String>(
+  (ref) => throw UnimplementedError(
+    'appSupportDirProvider 必须在 main() 里用 ProviderScope.overrides 注入',
+  ),
+);
+
+/// 凭证存储。落点按平台挑，理由见 [SecretBackend.forPlatform]。
 final credentialStoreProvider = Provider<CredentialStore>(
-  (ref) => SecureCredentialStore(),
+  (ref) => SecureCredentialStore(
+    backend: SecretBackend.forPlatform(
+      supportDirPath: ref.watch(appSupportDirProvider),
+    ),
+  ),
 );
 
 final httpClientProvider = Provider<HttpClientLike>((ref) => DioHttpClient());
@@ -173,4 +190,51 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
 /// 单元测试里换成假客户端就能覆盖全部状态分支。
 final qrLoginClientProvider = Provider<QuarkQrLoginClient>(
   (ref) => QuarkQrLoginClient(http: ref.watch(httpClientProvider)),
+);
+
+/// 本机设备唯一标识。
+///
+/// macOS 上用 `IOPlatformUUID`（硬件 UUID，不会变）。
+/// 用 `platform` 包取不到它（`Platform` 没有 UUID），所以走平台通道
+/// 或直接用 `ios_utils` —— 但为了不引入额外依赖，这里先用 `Platform.hostname`
+/// 加 `Platform.localHostname` 做拼接。不够完美但够用：同一台机器两次运行
+/// 拿到的值一定一样，不同机器大概率不一样。
+///
+/// ⚠️ macOS 上 `Platform.localHostname` 跟「电脑名称」走，
+/// 用户改名 → 标识变化 → 跨机同步可能误判为不同设备。
+/// 真正的 UUID 需要走 `IOPlatform.uuid` 或 `device_info_plus`。
+/// 这里先用它，因为备份同步的冲突判定只依赖 UUID 做设备区分，
+/// UUID 变了最坏后果是把「同设备先后备份」当成冲突交给用户 ——
+/// 不会丢数据。
+String _getDeviceId() {
+  // macOS 的机器标识
+  final hostname = Platform.localHostname;
+  final os = Platform.operatingSystem;
+  return '${hostname}_$os';
+}
+
+/// 设备名称（用户可读）。
+String _getDeviceName() {
+  return Platform.localHostname;
+}
+
+/// 备份同步服务。
+///
+/// 依赖 [adapterRegistryProvider]（网盘上传/下载）、[appSupportDirProvider]
+/// （数据库路径）、[posterCacheDirProvider]（海报缓存路径）。
+final libraryBackupServiceProvider = Provider<LibraryBackupService>(
+  (ref) {
+    final registry = ref.watch(adapterRegistryProvider);
+    final adapter = registry.adapterFor(DriveProvider.quark);
+    final supportDir = ref.watch(appSupportDirProvider);
+    final posterPath = ref.watch(posterCacheDirProvider);
+
+    return LibraryBackupService(
+      adapter: adapter,
+      databasePath: '$supportDir${Platform.pathSeparator}cloudcine.sqlite',
+      posterCachePath: posterPath,
+      deviceId: _getDeviceId(),
+      deviceName: _getDeviceName(),
+    );
+  },
 );

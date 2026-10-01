@@ -5,10 +5,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../data/remote/subtitle/opensubtitles_client.dart';
+import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/tmdb_client.dart';
 import '../../domain/entities/cloud_account.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/quality_option.dart';
+import '../../domain/services/library_backup_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
 import '../providers/library_providers.dart';
@@ -56,6 +58,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   String? _subsProbeResult;
   bool _subsProbeOk = false;
   bool _subsProbing = false;
+
+  /// 豆瓣的「测试连接」。同样独立一份状态，理由同上。
+  String? _doubanProbeResult;
+  bool _doubanProbeOk = false;
+  bool _doubanProbing = false;
 
   /// 海报缓存占用的字节数。`null` 表示还在算。
   int? _cacheBytes;
@@ -131,6 +138,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 _subtitleSection(current),
                 const SizedBox(height: 14),
                 _storageSection(stats),
+                const SizedBox(height: 14),
+                _backupSection(current),
                 const SizedBox(height: 14),
                 _aboutSection(),
               ],
@@ -320,19 +329,54 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
           ),
           const SizedBox(height: 12),
+          _cookieHelp(),
+          const SizedBox(height: 12),
           _savableField(
             controller: _doubanCookie,
             label: '豆瓣 Cookie',
-            hint: '在浏览器登录 movie.douban.com 后，复制请求头里的 Cookie',
+            hint: '从 `ll=` 或 `bid=` 开始那一段，必须含 dbcl2',
             saved: s.doubanCookie,
             onSave: () => ref
                 .read(settingsProvider.notifier)
                 .set(doubanCookie: _doubanCookie.text),
           ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              OutlinedButton.icon(
+                onPressed:
+                    _doubanProbing ? null : () => unawaited(_probeDouban()),
+                icon: _doubanProbing
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.wifi_tethering_rounded, size: 15),
+                label: const Text('测试连接'),
+              ),
+              const SizedBox(width: 12),
+              if (_doubanProbeResult != null)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _doubanProbeResult!,
+                      style: TextStyle(
+                        fontSize: 11,
+                        height: 1.6,
+                        color: _doubanProbeOk ? AppTheme.ok : AppTheme.warn,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
           const SizedBox(height: 10),
           const Text(
-            '只填 `bid` 或 `dbcl2` 那一段也能用。它存在本地数据库里，'
-            '不会外传，也**不会**用来下载海报（豆瓣图片只要 Referer）。',
+            '它存在本地数据库里，不会外传，也**不会**用来下载海报'
+            '（豆瓣图片只要 Referer）。',
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
           ),
 
@@ -343,6 +387,82 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 「豆瓣 Cookie 怎么拿、长什么样」的折叠说明。
+  ///
+  /// ## 为什么必须写这一段
+  ///
+  /// 豆瓣的 rexxar 接口不认「只填 dbcl2 就够了」这种简化说法：**少了 `bid`
+  /// 会退化成匿名额度**（约 10 个搜索词），而失败表现是服务端回 103 ——
+  /// 看起来跟「被限流」一模一样。用户拿不到正确的格式就只能靠猜，猜错的
+  /// 代价是「填了 Cookie 还是刮不到」。
+  ///
+  /// 折叠而不是直接铺开：这段有七八行，常驻会把「填哪、填完点哪」这两件
+  /// 正事埋掉。
+  Widget _cookieHelp() {
+    const step = TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: AppTheme.panel2,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppTheme.line, width: 0.5),
+      ),
+      child: Theme(
+        // ExpansionTile 默认给子节点加一条分隔线，在深色卡片里很脏。
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          iconColor: AppTheme.muted,
+          collapsedIconColor: AppTheme.muted,
+          title: const Text(
+            '怎么拿到 Cookie？格式是什么样？',
+            style: TextStyle(fontSize: 12, color: AppTheme.text),
+          ),
+          children: [
+            const Text(
+              '1. 浏览器登录 https://movie.douban.com\n'
+              '2. 按 F12 → Network（网络）→ 刷新页面\n'
+              '3. 点任意一条发往 douban.com 的请求 → '
+              'Request Headers（请求标头）→ 找到 `Cookie:` 那一行\n'
+              '4. 复制**冒号后面**的整段值，粘到上面的输入框',
+              style: step,
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              '必须包含 `dbcl2="数字:字母"`（登录令牌）。'
+              '**只贴 `bid` 是匿名态**，额度只有约 10 个搜索词。\n'
+              '`__utma` / `__utmb` / `__utmz` / `_vwo_uuid_v2` 是统计字段，'
+              '带不带都行。',
+              style: step,
+            ),
+            const SizedBox(height: 10),
+            const Text('示例（值已替换成假值）：', style: step),
+            const SizedBox(height: 6),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: AppTheme.bg,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.line, width: 0.5),
+              ),
+              child: Text(
+                'll="108304"; bid=AbCdEfGhIj; dbcl2="188770628:XyZ1234567"; '
+                'frodotk_db="17edbcbd7780692347c9363866813b69"',
+                style: AppTheme.mono.copyWith(
+                  fontSize: 11,
+                  height: 1.7,
+                  color: AppTheme.text,
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -460,6 +580,54 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       _probing = false;
       _probeOk = ok;
       _probeResult = message;
+    });
+  }
+
+  /// 探一次豆瓣，把「接口通不通 / Cookie 是不是登录态 / 有没有被限流」
+  /// 直接告诉用户。
+  ///
+  /// ## 为什么 TMDB 有按钮豆瓣却没有，是说不通的
+  ///
+  /// 2026-10-01 实测：用户填完 Cookie 之后唯一的验证方式是「刮一部看看」，
+  /// 而那要先等 TMDB 超时 20 秒，最后只给一句「未命中」。三种完全不同的
+  /// 原因 —— 地址不通、Cookie 不是登录态、出口 IP 被限流 —— 在结果上
+  /// 长得一模一样，用户只能反复试。
+  ///
+  /// 这里**直接用输入框里当前的值**（不读已保存的设置）：用户改完还没点
+  /// 「保存」就想先试试，是最自然的操作顺序。
+  Future<void> _probeDouban() async {
+    final cookie = _doubanCookie.text.trim();
+
+    setState(() {
+      _doubanProbing = true;
+      _doubanProbeResult = null;
+    });
+
+    var ok = false;
+    String message;
+    try {
+      // 常见的两种贴错方式，先拦下来 —— 它们都会让服务端回 103，
+      // 而 103 看起来像「被限流」，用户会往完全错误的方向查。
+      if (DoubanScraper.looksLikeRawHeader(cookie)) {
+        message = '看起来把 `Cookie: ` 这个前缀也一起贴进来了。'
+            '只要冒号后面的内容 —— 从 `ll=` 或 `bid=` 开始那一段。';
+      } else {
+        final result = await DoubanScraper(
+          http: ref.read(httpClientProvider),
+          cookie: cookie,
+        ).probe();
+        ok = result.ok;
+        message = result.message;
+      }
+    } catch (e) {
+      message = '测试失败：$e';
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _doubanProbing = false;
+      _doubanProbeOk = ok;
+      _doubanProbeResult = message;
     });
   }
 
@@ -810,6 +978,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       // 索引库清空后「最近播放」必然是空的 —— 不重取的话角标会一直挂着
       // 一个已经不存在的数字。
       ref.invalidate(playedCountProvider);
+      // 同理，筛选面板上的年代 / 类型也是从库里数出来的：清空之后
+      // 它们必须变成空列表，否则用户点一个「2020 年代 · 37 部」会发现
+      // 一部都没有。
+      ref.invalidate(decadeCountsProvider);
+      ref.invalidate(genreCountsProvider);
+      ref.invalidate(categoryCountsProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('索引库已清空')),
       );
@@ -844,6 +1018,145 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
     if (ok != true) return;
     await ref.read(authControllerProvider.notifier).signOut();
+  }
+
+  // -------------------------------------------------------------------
+  // 备份与同步
+  // -------------------------------------------------------------------
+
+  /// 备份同步的忙碌标记。
+  bool _backingUp = false;
+  bool _restoring = false;
+  bool _syncing = false;
+  String? _backupMessage;
+  bool _backupOk = false;
+
+  Widget _backupSection(AppSettings s) {
+    return SectionCard(
+      title: '备份与同步',
+      description: '将媒体库索引、刮削元数据、海报缓存和设置打包备份到'
+          '夸克网盘的指定目录，支持跨机同步。'
+          '⚠️ 网盘凭证不会备份 —— 新机器需要重新扫码登录。',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_backupMessage != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Text(
+                _backupMessage!,
+                style: TextStyle(
+                  fontSize: 11,
+                  height: 1.6,
+                  color: _backupOk ? AppTheme.ok : AppTheme.warn,
+                ),
+              ),
+            ),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _backingUp
+                    ? null
+                    : () => unawaited(_doBackup()),
+                icon: _backingUp
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.cloud_upload_rounded, size: 16),
+                label: Text(_backingUp ? '备份中…' : '上传备份'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _syncing
+                    ? null
+                    : () => unawaited(_doSync()),
+                icon: _syncing
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.sync_rounded, size: 16),
+                label: Text(_syncing ? '同步中…' : '同步'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            '「上传备份」会将当前媒体库完整打包上传到网盘的'
+            '「云影备份」目录，覆盖同名的旧备份。\n'
+            '「同步」会比对本地与远程备份的时间戳：'
+            '本地新则上传，远程新则下载恢复，相同则不操作。\n'
+            '两台设备在 60 秒内同时备份会触发冲突提示。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _doBackup() async {
+    setState(() {
+      _backingUp = true;
+      _backupMessage = null;
+    });
+
+    String message;
+    var ok = false;
+    try {
+      final service = ref.read(libraryBackupServiceProvider);
+      final bytes = await service.exportBackup(
+        includePosters: true,
+        includeSettings: true,
+      );
+      await service.uploadBackupToDrive(bytes);
+      ok = true;
+      message = '备份已上传到网盘「${LibraryBackupService.defaultBackupDir}」目录'
+          '（${(bytes.length / 1024 / 1024).toStringAsFixed(1)} MB）';
+    } catch (e) {
+      message = '备份失败：$e';
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _backingUp = false;
+      _backupOk = ok;
+      _backupMessage = message;
+    });
+  }
+
+  Future<void> _doSync() async {
+    setState(() {
+      _syncing = true;
+      _backupMessage = null;
+    });
+
+    String message;
+    var ok = false;
+    try {
+      final service = ref.read(libraryBackupServiceProvider);
+      final result = await service.sync();
+      ok = result.action != SyncAction.conflict;
+      message = result.message;
+
+      // 如果恢复了远程备份，需要刷新列表
+      if (result.action == SyncAction.restored) {
+        ref.invalidate(workListProvider);
+        ref.invalidate(libraryStatsProvider);
+      }
+    } catch (e) {
+      message = '同步失败：$e';
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _syncing = false;
+      _backupOk = ok;
+      _backupMessage = message;
+    });
   }
 
   // -------------------------------------------------------------------

@@ -9,6 +9,7 @@ import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/copy_button.dart';
+import '../widgets/manual_scrape_dialog.dart';
 import '../widgets/media_item_row.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
@@ -218,7 +219,13 @@ class _InfoColumn extends ConsumerWidget {
           ),
         ],
         const SizedBox(height: 18),
-        Row(
+        // 用 `Wrap` 而不是 `Row`：这一行现在有三个按钮（播放 / 刮削 / 手动），
+        // 主窗口没有最小宽度限制，用户把窗口拖窄时 `Row` 会直接溢出报黄条。
+        // `Wrap` 在空间不够时把「N 个文件」挤到下一行，按钮一个都不会变形。
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             FilledButton.icon(
               onPressed:
@@ -244,16 +251,13 @@ class _InfoColumn extends ConsumerWidget {
                 ),
               ),
             ),
-            const SizedBox(width: 10),
-            _ScrapeButton(workKey: work.key),
-            const SizedBox(width: 12),
-            Flexible(
-              child: Text(
-                '${detail.items.length} 个文件',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
-              ),
+            _ScrapeButton(work: work),
+            _ManualScrapeButton(work: work),
+            Text(
+              '${detail.items.length} 个文件',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
             ),
           ],
         ),
@@ -283,16 +287,16 @@ class _InfoColumn extends ConsumerWidget {
 ///   - **不用弹窗报结果**，只在按钮下面写一行。刮削是可以在墙上连点的小动作，
 ///     每次都弹一个「确定」会把「顺手补个海报」变成一件麻烦事。
 class _ScrapeButton extends ConsumerWidget {
-  const _ScrapeButton({required this.workKey});
+  const _ScrapeButton({required this.work});
 
-  final String workKey;
+  final MediaWork work;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider).valueOrNull;
     final state = ref.watch(workScrapeControllerProvider);
     final canScrape = settings?.canScrapeOnline ?? false;
-    final running = state.isRunning(workKey);
+    final running = state.isRunning(work.key);
 
     return Tooltip(
       message: canScrape
@@ -304,7 +308,7 @@ class _ScrapeButton extends ConsumerWidget {
             ? null
             : () => ref
                 .read(workScrapeControllerProvider.notifier)
-                .scrape(workKey),
+                .scrape(work.key),
         style: OutlinedButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           shape: RoundedRectangleBorder(
@@ -321,6 +325,58 @@ class _ScrapeButton extends ConsumerWidget {
         label: Text(
           running ? '刮削中…' : '刮削',
           style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
+/// 「手动指定片名」。
+///
+/// ## 为什么它必须和「刮削」并排出现
+///
+/// 自动刮削失败时用户看到的那句话里写死了「点旁边的『手动』自己敲片名再搜」
+/// （`WorkScrapeOutcome.message` 的 auto 分支）—— 说的就是这个按钮。片名被
+/// 发布组打散（`超z级z马z力z欧z银z河z大z电影aa`）或者只剩
+/// `2026.2160p.WEB-DL.mkv` 时，任何自动算法都救不回来，唯一可行的动作就是
+/// **人自己敲一个词**。
+///
+/// ⚠️ 这两处**必须一起改**：文案里写死了「旁边」，把这个按钮藏进菜单就等于
+/// 让文案撒谎 —— 用户会去找一个看不见的东西。反过来，把这句引导从文案里
+/// 删掉，这个按钮就变成「用户根本不知道它存在」。
+class _ManualScrapeButton extends ConsumerWidget {
+  const _ManualScrapeButton({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    final state = ref.watch(workScrapeControllerProvider);
+    final canScrape = settings?.canScrapeOnline ?? false;
+    // 与自动刮削共用 runningKey —— 两个入口不能同时跑。
+    final running = state.isRunning(work.key);
+
+    return Tooltip(
+      message: canScrape
+          ? '自动刮削认不出片名时（文件名被插字符、或只剩分辨率信息），'
+              '自己敲片名从候选里挑一条'
+          : '还没有可用的在线刮削源。到「设置 → 刮削」打开开关，'
+              '并填入 TMDB Key 或豆瓣 Cookie。',
+      child: OutlinedButton.icon(
+        onPressed: (!canScrape || running)
+            ? null
+            : () => ManualScrapeDialog.show(context, work),
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        icon: const Icon(Icons.manage_search_rounded, size: 16),
+        label: const Text(
+          '手动',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
         ),
       ),
     );

@@ -2,18 +2,41 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- 关闭沙箱。
+	     理由（2026-10-01 实测定位）：
+	     1) 本应用走的是网盘网页版的 Cookie 接口，不可能上 Mac App Store，
+	        沙箱在这里没有任何收益，只有副作用。
+	     2) 沙箱会把数据目录换成 ~/Library/Containers/...，
+	        导致 debug 与 release 各持一份媒体库。
+	     3) 沙箱下系统安全存储（钥匙串）写入会报 `-34018 A required
+	        entitlement isn't present`。macOS 侧现在**根本不用钥匙串**
+	        （凭证走加密文件，见 SecureCredentialStore），但这一条仍说明
+	        「开沙箱会额外惹麻烦」，别顺手打开。
+	     ⚠️ 改这里必须同步 DebugProfile.entitlements，两个 build 不许再分叉。 -->
 	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<false/>
+	<!-- 出站网络：调用网盘接口、拉取直链都依赖它。 -->
 	<key>com.apple.security.network.client</key>
 	<true/>
-	<!-- 读用户通过文件选择器挑中的文件（播放器里的「加载本地字幕」）。
-	     理由与 Debug 那份相同，两份必须一致。 -->
+	<!-- 入站网络（监听本地端口）：播放器给直链挂自定义请求头时会在
+	     127.0.0.1 起本地代理，需要它。沙箱已关闭，此处保留是为了
+	     「万一以后要重新开沙箱」时不再踩同一个坑。 -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- 读用户**通过文件选择器挑中**的文件（「加载本地字幕文件」）。
+	     沙箱已关闭，实际不再受此约束，保留以记录意图。 -->
 	<key>com.apple.security.files.user-selected.read-only</key>
 	<true/>
-	<!-- Data Protection Keychain 访问权限（理由同 Debug 那份）。 -->
-	<key>keychain-access-groups</key>
-	<array>
-		<string>$(AppIdentifierPrefix)com.cloudcine.cloudcine</string>
-	</array>
+	<!-- ⛔ 这里**不要**加 keychain-access-groups。
+	     它属于「需要描述文件的能力项」：一旦写上，签名就变成「受限签名」，
+	     ad-hoc 签名下 macOS 的 taskgated 会直接判定签名无效并把进程
+	     SIGKILL —— 报 `EXC_CRASH (SIGKILL (Code Signature Invalid))` /
+	     `Termination Reason: Namespace CODESIGNING, Code 1,
+	     Taskgated Invalid Signature`，而且崩溃报告里没有任何调用栈，
+	     极难定位。同一个 entitlement 还会让 Xcode 构建报
+	     `"Runner" requires a provisioning profile.`
+	     本项目在 macOS 上**根本不用钥匙串**（凭证走加密文件，见
+	     SecureCredentialStore），所以更加没有任何理由加它。
+	     DebugProfile.entitlements 同步。 -->
 </dict>
 </plist>

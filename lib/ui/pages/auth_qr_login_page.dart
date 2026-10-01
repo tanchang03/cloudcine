@@ -236,7 +236,7 @@ class _AuthQrLoginPageState extends ConsumerState<AuthQrLoginPage> {
     // 3. 组装凭证并触发登录。
     //
     // 只落库「已知 + 必需」的 Cookie（`filterQrCookiesForCredential`）：
-    // 兑换会顺带带回 `_UP_*` / `ctoken` 等无关项，全写进钥匙串是
+    // 兑换会顺带带回 `_UP_*` / `ctoken` 等无关项，全写进安全存储是
     // 把无关凭据长期留在本机。
     final credential = AuthCredential(
       provider: DriveProvider.quark,

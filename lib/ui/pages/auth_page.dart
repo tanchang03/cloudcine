@@ -60,7 +60,7 @@ class AuthPage extends ConsumerWidget {
                         icon: Icons.qr_code_2_rounded,
                         title: '扫码登录',
                         body: '用夸克 App 扫一下即可。全程不接触你的账号密码，'
-                            '凭证只存在本机系统钥匙串里。',
+                            '凭证只存在本机的安全存储里，不会上传。',
                       ),
                       const SizedBox(height: 14),
                       _Bullet(

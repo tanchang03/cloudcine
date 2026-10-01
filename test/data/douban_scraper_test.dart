@@ -68,6 +68,20 @@ class _Call {
   String toString() => 'GET $url $query';
 }
 
+/// 可拨动的假时钟。
+///
+/// 冷却 / 退避都是纯时间函数。用真实时钟测就得 `await Future.delayed(61s)`，
+/// 既慢又不稳（CI 上尤其）；拨表则是瞬时且确定的。
+class _Clock {
+  _Clock(this.now);
+
+  DateTime now;
+
+  DateTime call() => now;
+
+  void advance(Duration d) => now = now.add(d);
+}
+
 HttpResult _ok(Map<String, Object?> json) =>
     HttpResult(statusCode: 200, json: json, rawBody: '{}');
 
@@ -528,9 +542,11 @@ void main() {
     test('详情请求失败 → null，不抛（一部刮不到不能中断整批）', () async {
       final http = _FakeHttp((call) async {
         if (call.path.endsWith('/search')) {
+          // 片名必须与查询对得上，否则会被匹配闸门提前拦掉，
+          // 这条用例就测不到「详情失败」这条路径了。
           return _ok(_searchBody(
             subjects: [
-              _hit(id: '1', title: '某片', targetType: 'movie', year: '2023'),
+              _hit(id: '1', title: '流浪地球2', targetType: 'movie', year: '2023'),
             ],
           ));
         }
@@ -588,10 +604,14 @@ void main() {
           rawBody: '{"code":103}',
         ),
       );
+      // 注入时钟：冷却时长是「截止时刻 − 现在」，用真实时钟读出来会差
+      // 几十微秒，断言相等就会随机失败。
+      final clock = _Clock(DateTime(2026, 10, 1, 17, 25));
       final scraper = DoubanScraper(
         http: http,
         cookie: 'dbcl2=abc',
         minRequestInterval: Duration.zero,
+        clock: clock.call,
       );
 
       expect(await scraper.scrape(_qMovie), isNull);
@@ -602,6 +622,14 @@ void main() {
             '先看状态码会把 403 那次的熔断信号漏掉 —— 表现是「豆瓣时好时坏」。',
       );
       expect(http.calls.length, 1);
+      expect(
+        scraper.needLoginCooldown,
+        DoubanScraper.initialNeedLoginBackoff,
+        reason: '是**冷却**不是永久熔断。2026-10-01 实测：同一个 Cookie、'
+            '同一个出口 IP，吃到 403+103 之后几分钟再打是 200 —— 那次 403 '
+            '是瞬时风控。按永久熔断处理会把豆瓣在本进程内彻底关掉，'
+            '用户只能重启应用，界面上还什么都不说。',
+      );
     });
 
     test('连续 3 次网络失败熔断，之后不再发请求', () async {
@@ -772,6 +800,610 @@ void main() {
         reason: '必须按「.doubanio.com 结尾」判，不能用 contains —— '
             '否则一个叫 notdoubanio.com 的域名也会被当成豆瓣。',
       );
+    });
+  });
+
+  group('DoubanScraper 冷却可以恢复', () {
+    test('冷却到期 + 风控解除 → 自动恢复，不需要重启应用', () async {
+      final clock = _Clock(DateTime(2026, 10, 1, 17, 25));
+      var blocked = true;
+      final http = _FakeHttp((call) async {
+        if (call.path.endsWith('/search')) {
+          if (blocked) {
+            return const HttpResult(
+              statusCode: 403,
+              json: {'code': 103, 'msg': 'need_login'},
+              rawBody: '{"code":103}',
+            );
+          }
+          return _ok(_searchBody(
+            subjects: [
+              _hit(
+                id: '35267208',
+                title: '流浪地球2',
+                targetType: 'movie',
+                year: '2023',
+              ),
+            ],
+          ));
+        }
+        return _ok(_detailBody(
+          id: '35267208',
+          type: 'movie',
+          title: '流浪地球2',
+          year: '2023',
+        ));
+      });
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+        clock: clock.call,
+      );
+
+      expect(await scraper.scrape(_qMovie), isNull);
+      expect(scraper.isNeedLogin, isTrue);
+
+      // 冷却期内：一次请求都不发（省额度，也免得把 IP 关得更久）。
+      await scraper.scrape(_qMovie);
+      expect(http.calls.length, 1);
+
+      // 风控解除 + 拨过冷却时间。
+      blocked = false;
+      clock.advance(const Duration(seconds: 61));
+
+      expect(
+        await scraper.scrape(_qMovie),
+        isNotNull,
+        reason: '2026-10-01 实测：日志 17:25:32 吃到 403+103 之后，'
+            '17:26:15 与 17:27:07 两次刮削**连请求都没发**就返回了 —— '
+            '旧的单向熔断把豆瓣在本进程内永久关掉。'
+            '而同一 Cookie / 同一 IP 几分钟后打回去是 200。',
+      );
+      // 恢复后的那次刮削是「搜索 + 详情」两次请求，加上最初那次共 3 次。
+      expect(http.calls.length, 3);
+      expect(scraper.isNeedLogin, isFalse);
+    });
+
+    test('再吃一次 103 → 冷却时长翻倍', () async {
+      final clock = _Clock(DateTime(2026, 10, 1, 17, 0));
+      final http = _FakeHttp(
+        (_) async => _ok(const <String, Object?>{
+          'request': 'GET /v2/search',
+          'msg': 'need_login',
+          'code': 103,
+        }),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+        clock: clock.call,
+      );
+
+      await scraper.scrape(_qMovie);
+      expect(scraper.needLoginCooldown, DoubanScraper.initialNeedLoginBackoff);
+
+      clock.advance(const Duration(seconds: 61));
+      await scraper.scrape(_qMovie);
+
+      expect(
+        scraper.needLoginCooldown,
+        DoubanScraper.initialNeedLoginBackoff * 2,
+        reason: '退避必须翻倍。否则「额度真的耗尽」时会一直按 60 秒的节奏'
+            '反复白打 —— 那正是原实现想避免的事。',
+      );
+    });
+
+    test('冷却封顶：吃到多少次 103 都不会超过上限', () async {
+      final clock = _Clock(DateTime(2026, 10, 1, 17, 0));
+      final http = _FakeHttp(
+        (_) async => _ok(const <String, Object?>{'code': 103, 'msg': 'need_login'}),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+        clock: clock.call,
+      );
+
+      for (var i = 0; i < 10; i++) {
+        await scraper.scrape(_qMovie);
+        expect(
+          scraper.needLoginCooldown <= DoubanScraper.maxNeedLoginBackoff,
+          isTrue,
+        );
+        clock.advance(
+          DoubanScraper.maxNeedLoginBackoff + const Duration(seconds: 1),
+        );
+      }
+    });
+
+    test('网络失败熔断同样会过期 —— 用户先开代理再回来刮是常规操作', () async {
+      final clock = _Clock(DateTime(2026, 10, 1, 17, 0));
+      var offline = true;
+      final http = _FakeHttp((call) async {
+        if (offline) return const HttpResult.networkFailure('Connection timed out');
+        if (call.path.endsWith('/search')) {
+          return _ok(_searchBody(
+            subjects: [
+              _hit(
+                id: '35267208',
+                title: '流浪地球2',
+                targetType: 'movie',
+                year: '2023',
+              ),
+            ],
+          ));
+        }
+        return _ok(_detailBody(id: '35267208', type: 'movie'));
+      });
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+        clock: clock.call,
+      );
+
+      for (var i = 0; i < 3; i++) {
+        await scraper.scrape(_qMovie);
+      }
+      expect(scraper.isUnreachable, isTrue);
+
+      offline = false;
+      clock.advance(DoubanScraper.unreachableBackoff + const Duration(seconds: 1));
+
+      expect(
+        await scraper.scrape(_qMovie),
+        isNotNull,
+        reason: '永久熔断的代价是「用户修好了网络，豆瓣还是不动」。',
+      );
+      expect(scraper.isUnreachable, isFalse);
+    });
+  });
+
+  group('DoubanScraper.probe（设置页的「测试连接」）', () {
+    test('没填 Cookie → noCookie，一次请求都不发', () async {
+      final http = _FakeHttp((_) async => _ok(const <String, Object?>{}));
+      final r = await DoubanScraper(
+        http: http,
+        cookie: '   ',
+        minRequestInterval: Duration.zero,
+      ).probe();
+
+      expect(r.status, DoubanProbeStatus.noCookie);
+      expect(r.ok, isFalse);
+      expect(http.calls, isEmpty);
+    });
+
+    test('网络层失败 → unreachable', () async {
+      final http = _FakeHttp(
+        (_) async => const HttpResult.networkFailure('Connection timed out'),
+      );
+      final r = await DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      ).probe();
+
+      expect(r.status, DoubanProbeStatus.unreachable);
+      expect(r.message, contains('连不上'));
+    });
+
+    test('103 → needLogin，并指出 Cookie 里有没有 dbcl2', () async {
+      final http = _FakeHttp(
+        (_) async => const HttpResult(
+          statusCode: 403,
+          json: {'code': 103, 'msg': 'need_login'},
+          rawBody: '{"code":103}',
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'll="108304"; bid=VNskJTU3PRo',
+        minRequestInterval: Duration.zero,
+      );
+
+      final r = await scraper.probe();
+
+      expect(r.status, DoubanProbeStatus.needLogin);
+      expect(
+        r.loggedIn,
+        isFalse,
+        reason: '只贴 bid 是匿名态。探测必须把这件事说出来 —— '
+            '否则用户会一直以为「我填了 Cookie 啊」。',
+      );
+      expect(r.message, contains('没有 dbcl2'));
+      expect(
+        scraper.isNeedLogin,
+        isTrue,
+        reason: '探测吃到 103 也要进冷却，否则用户连点几次会把 IP 关得更久。',
+      );
+    });
+
+    test('正常返回 → ok，报出候选数并说明是登录态', () async {
+      final http = _FakeHttp(
+        (_) async => _ok(_searchBody(
+          subjects: [
+            _hit(id: '1', title: '流浪地球', targetType: 'movie', year: '2019'),
+            _hit(id: '2', title: '流浪地球2', targetType: 'movie', year: '2023'),
+          ],
+        )),
+      );
+      final r = await DoubanScraper(
+        http: http,
+        cookie: 'll="1"; bid=x; dbcl2="188770628:abc"',
+        minRequestInterval: Duration.zero,
+      ).probe();
+
+      expect(r.status, DoubanProbeStatus.ok);
+      expect(r.ok, isTrue);
+      expect(r.candidateCount, 2);
+      expect(r.loggedIn, isTrue);
+      expect(r.message, contains('登录态'));
+    });
+
+    test('接口通但零结果 → empty（区分「接口不通」与「接口改版」）', () async {
+      final http = _FakeHttp((_) async => _ok(_searchBody()));
+      final r = await DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      ).probe();
+
+      expect(r.status, DoubanProbeStatus.empty);
+      expect(r.ok, isFalse);
+    });
+
+    test('探测词必出结果，且不受节流影响', () async {
+      final http = _FakeHttp(
+        (_) async => _ok(_searchBody(
+          subjects: [
+            _hit(id: '1', title: '流浪地球', targetType: 'movie', year: '2019'),
+          ],
+        )),
+      );
+      await DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: const Duration(seconds: 3),
+      ).probe();
+
+      expect(
+        http.calls.single.query['q'],
+        DoubanScraper.probeWord,
+        reason: '探测词必须选一个必定有结果的，否则分不出'
+            '「接口通但这个词零命中」与「接口根本不通」。',
+      );
+    });
+
+    test('探测成功后清掉熔断 —— 修好了就该立刻能用', () async {
+      var blocked = true;
+      final http = _FakeHttp((_) async {
+        if (blocked) {
+          return const HttpResult(
+            statusCode: 403,
+            json: {'code': 103, 'msg': 'need_login'},
+            rawBody: '{"code":103}',
+          );
+        }
+        return _ok(_searchBody(
+          subjects: [
+            _hit(id: '1', title: '流浪地球', targetType: 'movie', year: '2019'),
+          ],
+        ));
+      });
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      await scraper.probe();
+      expect(scraper.isNeedLogin, isTrue);
+
+      blocked = false;
+      final r = await scraper.probe();
+
+      expect(r.status, DoubanProbeStatus.ok);
+      expect(scraper.isNeedLogin, isFalse);
+      expect(scraper.isUnreachable, isFalse);
+    });
+  });
+
+  group('Cookie 形状校验', () {
+    test('认出 dbcl2 —— 登录态的标志', () {
+      expect(
+        DoubanScraper.cookieHasLoginToken('ll="1"; bid=x; dbcl2="1:abc"'),
+        isTrue,
+      );
+      expect(DoubanScraper.cookieHasLoginToken('dbcl2="1:abc"'), isTrue);
+      expect(
+        DoubanScraper.cookieHasLoginToken('ll="1";dbcl2=x'),
+        isTrue,
+        reason: '分号后没空格也要认 —— 从浏览器复制出来的常常没有空格。',
+      );
+    });
+
+    test('只贴 bid 不算登录态', () {
+      expect(
+        DoubanScraper.cookieHasLoginToken('bid=VNskJTU3PRo'),
+        isFalse,
+        reason: '`bid` 只是匿名标识。只填它的额度仍是约 10 个搜索词，'
+            '而失败表现是 103 —— 看起来跟被限流一模一样，'
+            '用户会往完全错误的方向查。',
+      );
+    });
+
+    test('不把 xdbcl2= 误判成 dbcl2=', () {
+      expect(DoubanScraper.cookieHasLoginToken('xdbcl2=1'), isFalse);
+    });
+
+    test('认出「把 Cookie: 前缀一起贴进来」这种错法', () {
+      expect(DoubanScraper.looksLikeRawHeader('Cookie: ll="1"; bid=x'), isTrue);
+      expect(DoubanScraper.looksLikeRawHeader('cookie:ll="1"'), isTrue);
+      expect(DoubanScraper.looksLikeRawHeader('ll="1"; bid=x'), isFalse);
+    });
+  });
+
+  group('DoubanScraper 手动通道（search / resolve）', () {
+    test('search 不过闸门：被自动流程拒掉的候选照样给出来', () async {
+      // 这正是手动通道存在的理由。自动刮削拿目录名
+      // `超z级z马z力z欧z银z河z大z电影aa` 去搜，闸门会因为标题不相似
+      // 把它拦下（那是对的）；但用户手动搜「超级马力欧」时，
+      // 这条候选**必须**出现在列表里让他自己挑。
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(id: '1291561', title: '低俗小说', targetType: 'movie', year: '1994'),
+            _hit(
+              id: '35000001',
+              title: '超级马力欧银河大电影',
+              targetType: 'movie',
+              year: '2026',
+            ),
+          ],
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final found = await scraper.search(
+        const ScrapeQuery(
+          title: '超z级z马z力z欧z银z河z大z电影aa',
+          kind: MediaKind.movie,
+          year: 2026,
+        ),
+      );
+
+      expect(
+        found.map((c) => c.title),
+        containsAll(<String>['低俗小说', '超级马力欧银河大电影']),
+        reason: '手动通道的语义是「用户要自己挑」—— 在这里套闸门等于'
+            '把「自动没找对」的片子也一起藏起来，用户就永远纠不正了。',
+      );
+    });
+
+    test('search 剔掉书 / 音乐，且**不打详情接口**（额度按搜索词计）', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(id: '1', title: '繁花', targetType: 'book'),
+            _hit(id: '2', title: '繁花', targetType: 'music'),
+          ],
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final found = await scraper.search(
+        const ScrapeQuery(title: '繁花', kind: MediaKind.episode),
+      );
+
+      expect(found, isEmpty);
+      expect(
+        http.detailCalls,
+        isEmpty,
+        reason: '候选列表要的是「有哪些片子」，不是「每部片子的完整资料」。'
+            '每条候选都去打一次详情 = 一次点击烧掉十几个额度。',
+      );
+      expect(http.searchCalls.length, 1, reason: '手动搜一次只花 1 个搜索词。');
+    });
+
+    test('search 的缩略图是搜索结果的 cover_url（120px 横条），不是海报', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(id: '35000001', title: '某片', targetType: 'movie', year: '2026'),
+          ],
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final found = await scraper.search(
+        const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+      );
+
+      expect(found.single.posterUrl, contains('h/120'));
+      expect(found.single.source, 'douban');
+      expect(found.single.sourceId, '35000001');
+    });
+
+    test('resolve 必须打详情接口 —— 完整海报与简介只在详情里', () async {
+      final http = _server(
+        search: (_) => _searchBody(),
+        detail: (id) => _detailBody(
+          id: id,
+          type: 'movie',
+          title: '超级马力欧银河大电影',
+          year: '2026',
+          originalTitle: 'The Super Mario Galaxy Movie',
+          coverUrl: 'https://img3.doubanio.com/view/photo/m_ratio_poster/'
+              'public/p999.jpg',
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.resolve(
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '35000001',
+          title: '超级马力欧银河大电影',
+          year: 2026,
+          // 候选上挂的是 120px 横条；resolve **不能**拿它当海报。
+          posterUrl: 'https://qnmob3-sign.doubanio.com/x.jpg?h/120/format/jpg',
+        ),
+      );
+
+      expect(md, isNotNull);
+      expect(md!.title, '超级马力欧银河大电影');
+      expect(md.year, 2026);
+      expect(md.originalTitle, 'The Super Mario Galaxy Movie');
+      expect(
+        md.posterUrl,
+        contains('m_ratio_poster'),
+        reason: '落库的海报必须来自详情接口的 `cover_url`（`m_ratio_poster`，'
+            '实测 540×803 = 2:3）。搜索结果的 `cover_url` 是一条 120px 高的'
+            '横条，落库会让详情页显示一张被拉扁的图。',
+      );
+      expect(md.onlineId, 'douban/movie/35000001');
+      expect(md.source, ScrapeSource.online);
+      expect(http.detailCalls.single.path, contains('/movie/35000001'));
+    });
+
+    test('resolve 的类型读响应体：`/movie/{id}` 对剧集会 301 到 /tv/{id}', () async {
+      final http = _server(
+        search: (_) => _searchBody(),
+        detail: (id) => _detailBody(id: id, type: 'tv', title: '某剧'),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.resolve(
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '34874646',
+          title: '某剧',
+          isEpisode: true,
+        ),
+      );
+
+      expect(
+        md!.onlineId,
+        'douban/tv/34874646',
+        reason: '按请求路径判断会把**所有剧集都记成电影**。',
+      );
+    });
+
+    test('resolve 详情请求失败 → null（不是「用候选凑一个」）', () async {
+      final http = _FakeHttp((call) async {
+        if (call.path.endsWith('/search')) return _ok(_searchBody());
+        // 非 2xx：`_get` 直接返回 null。
+        return const HttpResult(statusCode: 500, rawBody: 'oops');
+      });
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.resolve(
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '1',
+          title: '某片',
+        ),
+      );
+
+      expect(
+        md,
+        isNull,
+        reason: '拿候选里那点信息（标题 + 年份，没有海报没有简介）落库，'
+            '会把作品标成「已刮削」而实际什么都没补上 —— '
+            '用户看到的是一个有标题、没海报、没简介的「刮削成功」。',
+      );
+    });
+
+    test('resolve 拿到 200 但内容不是条目 → null，不许拿查询词冒充标题', () async {
+      final http = _FakeHttp((call) async {
+        if (call.path.endsWith('/search')) return _ok(_searchBody());
+        // 200，但 body 是错误对象（接口改版 / 风控页 / 网关兜底都会这样）。
+        return _ok(const <String, Object?>{
+          'code': 500,
+          'msg': 'internal error',
+          'request': 'GET /v2/movie/1',
+        });
+      });
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.resolve(
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: '1',
+          title: '超级马力欧银河大电影',
+        ),
+      );
+
+      expect(
+        md,
+        isNull,
+        reason: '标题一旦允许用查询词兜底，这种响应就会产出「标题是对的、'
+            '海报简介全空、source 记成 online」的假成功 —— 和「刮削成功但'
+            '没有封面」这类现象一模一样，排查时最难想到根因在这里。',
+      );
+    });
+
+    test('冷却期内 search 直接返回空，不发请求', () async {
+      final clock = _Clock(DateTime(2026, 10, 1, 12));
+      final http = _server(
+        search: (_) => <String, Object?>{
+          'code': DoubanScraper.needLoginCode,
+          'msg': 'need_login',
+        },
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+        clock: clock.call,
+      );
+
+      // 先吃一次 103 把冷却打开。
+      await scraper.scrape(_qMovie);
+      final before = http.searchCalls.length;
+
+      expect(await scraper.search(_qMovie), isEmpty);
+      expect(
+        http.searchCalls.length,
+        before,
+        reason: '冷却期内发请求既没用（必然还是 103）又会让限流更久。',
+      );
+
+      // 冷却过期后重新放行 —— 这是「会过期的冷却」而不是单向开关。
+      clock.advance(DoubanScraper.initialNeedLoginBackoff);
+      await scraper.search(_qMovie);
+      expect(http.searchCalls.length, greaterThan(before));
     });
   });
 }

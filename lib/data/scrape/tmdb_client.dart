@@ -1,5 +1,7 @@
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/filename_parser.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/scrape_match.dart';
 import '../../domain/services/scraper.dart';
 import '../http/http_client.dart';
 
@@ -43,6 +45,16 @@ class TmdbScraper implements MetadataScraper {
 
   /// 海报尺寸档位。`w500` 对卡片墙足够清晰，且体积可控（~50KB）。
   static const String posterSize = 'w500';
+
+  /// **候选列表**里的小图档位。
+  ///
+  /// 与 [posterSize] 分开是有意的：手动刮削的候选列表可能有十几条，
+  /// 每条都下 `w500`（~50KB）就是几百 KB 只为看一眼「是不是这部片子」。
+  /// `w154` 约 100×150，在这个尺寸下足够辨认。
+  ///
+  /// ⚠️ 它**只能用于列表缩略图**：选中之后走 [resolve] → [_toMetadata]，
+  /// 那里会重新用 [posterSize] 拼地址，落库的永远是 `w500`。
+  static const String candidateSize = 'w154';
 
   /// 背景图尺寸档位。
   static const String backdropSize = 'w1280';
@@ -111,6 +123,83 @@ class TmdbScraper implements MetadataScraper {
     return null;
   }
 
+  /// 用户手动指定片名时的候选列表。
+  ///
+  /// ⚠️ 这里**不过匹配闸门** —— 闸门是给「自动选一个」用的；用户手动搜的时候
+  /// 要看到全部候选自己判断。年份也只在用户填了的时候才带（他的年份可能记错，
+  /// 而 TMDB 的 `year` 是硬过滤，带上错的年份会把正主直接筛掉）。
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async {
+    if (!isEnabled || _unreachable) return const [];
+    final title = query.title.trim();
+    if (title.isEmpty) return const [];
+
+    final isTv = query.isEpisode;
+    final params = <String, Object?>{
+      'query': title,
+      'language': _language,
+      'include_adult': 'false',
+      'page': 1,
+    };
+    final year = query.year;
+    if (year != null) {
+      params[isTv ? 'first_air_date_year' : 'year'] = year;
+    }
+
+    final res = await _get(isTv ? '/search/tv' : '/search/movie', params);
+    if (res == null) return const [];
+
+    final out = <ScrapeCandidate>[];
+    for (final item in _resultsOf(res)) {
+      final itemId = _intOf(item['id']);
+      final name = _stringOf(item['title']) ?? _stringOf(item['name']);
+      if (itemId == null || name == null) continue;
+
+      final posterPath = _stringOf(item['poster_path']);
+      out.add(
+        ScrapeCandidate(
+          source: id,
+          sourceId: '$itemId',
+          title: name,
+          originalTitle:
+              _stringOf(item['original_title']) ?? _stringOf(item['original_name']),
+          year: _yearOf(
+            _stringOf(item['release_date']) ?? _stringOf(item['first_air_date']),
+          ),
+          // 列表里的小图用 w154：约 100×150，够看清是哪部片子，
+          // 又比卡片墙的 w500 小一个数量级。
+          posterUrl: posterPath == null
+              ? null
+              : '$_imageBaseUrl/$candidateSize$posterPath',
+          overview: _stringOf(item['overview']),
+          isEpisode: isTv,
+          raw: item,
+        ),
+      );
+    }
+    return out;
+  }
+
+  /// 用户选中的候选 → 完整元数据。
+  ///
+  /// 搜索结果里已经有标题、年份、简介、海报、`genre_ids`，所以这里**不用再打
+  /// 详情接口** —— `_toMetadata` 会把 `genre_ids` 换成类型名（类型表是缓存的）。
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async {
+    final raw = candidate.raw;
+    if (raw == null) return null;
+    return _toMetadata(
+      raw,
+      ScrapeQuery(
+        title: candidate.title,
+        kind: candidate.isEpisode ? MediaKind.episode : MediaKind.movie,
+        year: candidate.year,
+      ),
+      candidate.title,
+      candidate.isEpisode,
+    );
+  }
+
   /// 用一个查询词搜一次。
   Future<ScrapedMetadata?> _searchOne(
     String title,
@@ -136,24 +225,78 @@ class TmdbScraper implements MetadataScraper {
     if (res == null) return null;
 
     final results = _resultsOf(res);
-    if (results.isEmpty) {
-      // 带年份搜不到时**去掉年份再试一次** —— 发布组标的年份经常是
-      // 「发行年」而 TMDB 记的是「首播年」，差一年就搜不到了。
-      if (year != null) {
-        diag.info('刮削', 'TMDB "$title" ($year) 无结果，去掉年份重试');
-        final retryParams = Map<String, Object?>.from(params)
-          ..remove('year')
-          ..remove('first_air_date_year');
-        final retry = await _get(path, retryParams);
-        if (retry == null) return null;
-        final items = _resultsOf(retry);
-        if (items.isEmpty) return null;
-        return _toMetadata(items.first, query, title, isTv);
-      }
+    if (results.isNotEmpty) {
+      final hit = await _pickVerified(results, query, title, isTv);
+      if (hit != null) return hit;
+      // 有结果、但一条都没过闸门 —— 这正是「刮错片子」被拦下来的现场，
+      // 必须留下痕迹，否则用户只会觉得「怎么什么都刮不到」。
+      diag.info(
+        '刮削',
+        'TMDB "$title" 返回 ${results.length} 条，全部未通过匹配闸门，按未命中处理',
+      );
       return null;
     }
 
-    return _toMetadata(results.first, query, title, isTv);
+    // 带年份搜不到时**去掉年份再试一次** —— 发布组标的年份经常是
+    // 「发行年」而 TMDB 记的是「首播年」，差一年就搜不到了。
+    if (year != null) {
+      diag.info('刮削', 'TMDB "$title" ($year) 无结果，去掉年份重试');
+      final retryParams = Map<String, Object?>.from(params)
+        ..remove('year')
+        ..remove('first_air_date_year');
+      final retry = await _get(path, retryParams);
+      if (retry == null) return null;
+      return _pickVerified(_resultsOf(retry), query, title, isTv);
+    }
+    return null;
+  }
+
+  /// 在结果里挑**第一条通过匹配闸门**的，返回它的元数据；都不通过则 `null`。
+  ///
+  /// ## 为什么不能是 `results.first`
+  ///
+  /// TMDB 的 `/search/movie` 是**模糊搜索** —— 它返回的是「按相关度排序的
+  /// 猜测」，不是精确命中，查询词再离谱也可能有返回。2026-10-01 实测：
+  /// 目录名 `超z级z马z力z欧z银z河z大z电影aa(2026)`（片名被插了 `z` 规避，
+  /// 真名《超级马力欧银河大电影》）被刮成了 **《低俗小说》(1994)**。
+  /// 查询里明明带着 `year=2026`，返回的却是 1994 年的片子，而旧代码
+  /// `results.first` 照单全收 —— 年份差 32 年，代码毫无察觉。
+  ///
+  /// 闸门判据见 [ScrapeMatch]。
+  Future<ScrapedMetadata?> _pickVerified(
+    List<Map<String, Object?>> items,
+    ScrapeQuery query,
+    String matchedQuery,
+    bool isTv,
+  ) async {
+    for (final item in items) {
+      final title = _stringOf(item['title']) ?? _stringOf(item['name']) ?? '';
+      final original =
+          _stringOf(item['original_title']) ?? _stringOf(item['original_name']);
+      final resultYear = _yearOf(
+        _stringOf(item['release_date']) ?? _stringOf(item['first_air_date']),
+      );
+
+      final match = ScrapeMatch.evaluate(
+        queryTitle: query.title,
+        queryAlternateTitle: query.alternateTitle,
+        queryYear: query.year,
+        resultTitle: title,
+        resultOriginalTitle: original,
+        resultYear: resultYear,
+      );
+
+      if (!match.accepted) {
+        diag.debug(
+          '刮削',
+          'TMDB 跳过候选 "$title"'
+              '${resultYear == null ? "" : " ($resultYear)"}：${match.reason}',
+        );
+        continue;
+      }
+      return _toMetadata(item, query, matchedQuery, isTv);
+    }
+    return null;
   }
 
   /// 取 TMDB 响应里的 `results` 数组。

@@ -92,6 +92,116 @@ void main() {
     });
   });
 
+  group('筛选面板（年代 / 类型）', () {
+    test('点一下选中，再点一下取消', () {
+      controller().toggleDecade(2020);
+      expect(filter().decades, {2020});
+
+      controller().toggleDecade(2020);
+      expect(
+        filter().decades,
+        isEmpty,
+        reason: '用户点错一个年代时应该只需要再点一下，而不是清掉整组条件重来',
+      );
+    });
+
+    test('年代与类型两组互不影响', () {
+      controller().toggleDecade(2020);
+      controller().toggleGenre('动画');
+
+      expect(filter().decades, {2020});
+      expect(filter().genres, {'动画'});
+
+      controller().toggleGenre('动画');
+      expect(filter().decades, {2020},
+          reason: '取消类型不该顺手把年代也清掉 —— 两组是两个独立的维度');
+    });
+
+    test('clearExtra 只清面板里的两组', () {
+      controller().setCategory(MediaCategory.anime);
+      controller().setQuery('魔法');
+      controller().toggleDecade(2020);
+      controller().toggleGenre('动画');
+
+      controller().clearExtra();
+
+      expect(filter().decades, isEmpty);
+      expect(filter().genres, isEmpty);
+      expect(filter().category, MediaCategory.anime,
+          reason: '分类栏与搜索框在面板之外、各有自己的清除入口。'
+              '面板上的「清空筛选」把它们一起抹掉，用户会莫名其妙地'
+              '丢掉刚打的搜索词');
+      expect(filter().query, '魔法');
+    });
+
+    test('hasExtra 只看这两组', () {
+      expect(filter().hasExtra, isFalse);
+
+      controller().setCategory(MediaCategory.movie);
+      expect(filter().hasExtra, isFalse, reason: '分类是分类栏的事，不是面板的');
+
+      controller().toggleDecade(2020);
+      expect(filter().hasExtra, isTrue);
+    });
+
+    test('面板里的条件也算「有筛选条件」', () {
+      controller().toggleGenre('动画');
+
+      expect(filter().isEmpty, isFalse,
+          reason: '它为 true 时页面会给出「媒体库还是空的，去扫描」——'
+              '而筛出来的空跟扫描完全无关');
+      expect(filter().isDefault, isFalse);
+    });
+
+    test('copyWith 传空集合能清空（不能像 category 那样用 null 表示不改）', () {
+      controller().toggleDecade(2020);
+      controller().toggleGenre('动画');
+
+      final cleared = filter().copyWith(decades: const <int>{});
+
+      expect(cleared.decades, isEmpty);
+      expect(cleared.genres, {'动画'},
+          reason: '只传了 decades 就不该动 genres');
+    });
+
+    test('相等性按集合**内容**比，不按引用', () {
+      // 故意用非 const 字面量：const 会被规范化成同一个对象，
+      // 那样连引用相等都能过，测不出真正想钉的东西。
+      final a = LibraryFilter(decades: {2020}, genres: {'动画'});
+      final b = LibraryFilter(decades: {2020}, genres: {'动画'});
+
+      expect(a == b, isTrue,
+          reason: 'Set 没重写 ==（默认是引用相等）。不比内容的话，'
+              'Riverpod 会把「内容一样的新实例」当成变化，'
+              '让整张海报墙白重建一次');
+      expect(a.hashCode, b.hashCode);
+
+      // 与顺序无关
+      expect(
+        LibraryFilter(decades: {2020, 2010}) ==
+            LibraryFilter(decades: {2010, 2020}),
+        isTrue,
+      );
+    });
+
+    test('clear() 把面板条件也复位', () {
+      controller().toggleDecade(2020);
+      controller().toggleGenre('动画');
+      controller().clear();
+
+      expect(filter(), const LibraryFilter());
+    });
+
+    test('toString 里看得出筛了哪些', () {
+      controller().toggleDecade(2020);
+      controller().toggleGenre('动画');
+      final text = filter().toString();
+
+      expect(text, contains('2020'));
+      expect(text, contains('动画'));
+    });
+  });
+
   group('播放记录变化的刷新信号', () {
     test('只有换条播放才推进版本号', () {
       final notifier = container.read(playbackLibraryLinkProvider.notifier);

@@ -422,7 +422,7 @@ Map<String, String> parseSetCookieLines(List<String> lines) {
 /// 过滤出可落库的 Cookie（与浏览器授权器一致的 known/essential 名单）。
 ///
 /// 兑换会顺带带回 `_UP_*` / `ctoken` 等无关 Cookie，落库只留已知 + 必需项，
-/// 避免把无关凭据带进钥匙串。
+/// 避免把无关凭据带进安全存储。
 Map<String, String> filterQrCookiesForCredential(Map<String, String> cookies) {
   final out = <String, String>{};
   for (final name in QuarkEndpoints.knownCookieNames) {

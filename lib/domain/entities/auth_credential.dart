@@ -5,8 +5,9 @@ import 'drive_provider.dart';
 
 /// 一次授权拿到的凭证。
 ///
-/// 这是**敏感数据**：只应存在于内存与系统钥匙串中，禁止写入普通文件、
-/// 日志、异常消息。需要展示或打印时走 [redacted]。
+/// 这是**敏感数据**：只应存在于内存与系统安全存储中 —— macOS 走**加密文件**
+/// （见 `data/auth/secret_backend.dart`），其它平台走钥匙串 / Keystore / DPAPI。
+/// 禁止写进**明文**文件、日志、异常消息。需要展示或打印时走 [redacted]。
 class AuthCredential {
   const AuthCredential({
     required this.provider,
@@ -101,7 +102,7 @@ class AuthCredential {
 
   /// 判断两条凭证是否指向同一会话（只比对凭证内容，不比对时间）。
   ///
-  /// 用于避免「重复授权」时无谓地覆盖钥匙串。
+  /// 用于避免「重复授权」时无谓地重写已存的凭证。
   bool isSameSessionAs(AuthCredential other) {
     if (provider != other.provider) return false;
     if (cookies.length != other.cookies.length) return false;

@@ -10,14 +10,89 @@ import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_work.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
+import '../providers/drive_browse_providers.dart';
 import '../providers/folder_providers.dart';
 import '../providers/library_providers.dart';
 import '../providers/scan_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/folder_browser.dart';
+import '../widgets/library_filter_panel.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
+
+/// 空列表时那个按钮**具体该清掉什么**。
+///
+/// 见 [libraryEmptyHint]。
+enum LibraryEmptyAction {
+  /// 只清筛选面板的两组（年代 / 类型）。
+  clearExtra,
+
+  /// 只清搜索词（连同输入框里的字）。
+  clearQuery,
+
+  /// 清掉搜索词**与**面板两组，但**保留分类**。
+  clearExtraAndQuery,
+
+  /// 全部复位 —— 分类、排序、搜索词、面板两组。
+  clearAll,
+}
+
+/// 列表为空时该说哪句话、给哪个行动按钮。
+///
+/// ## 为什么按钮必须与提示语指向同一件事
+///
+/// 原先这里是「提示语按条件分两种，按钮一律 `clear()`」。而 `clear()` 是
+/// **全部复位**：只打了搜索词的用户点下去，连分类栏选的位置和排序都一起
+/// 丢掉 —— 他不会把「我的栏目没了」和「我刚点了个清空按钮」联系起来。
+///
+/// ## 为什么要按「全部在用的条件」分派，而不是挑一个清
+///
+/// 按钮的用途是**让用户重新看到内容**。同时设了搜索词与年代时只清一个，
+/// 列表很可能还是空的 —— 用户会认为这个按钮坏了。所以：
+///
+///   1. 两组都在用 → 两个都清，保留分类；
+///   2. 只有年代 / 类型 → 清那两组，保留分类；
+///   3. 只有搜索词 → 清搜索词，保留分类；
+///   4. 都没有（只切了分类）→ 提示语本来就在说「换个分类看看」，
+///      按钮也就该是「回到全部」。
+///
+/// 抽成纯函数是为了能单测：这一段的分支写错不报错，只表现为「用户点完
+/// 丢了本来不想丢的东西」，事后才被发现。
+@visibleForTesting
+({String body, String actionLabel, LibraryEmptyAction action}) libraryEmptyHint(
+  LibraryFilter filter,
+) {
+  final query = filter.query.trim();
+  final hasQuery = query.isNotEmpty;
+
+  if (filter.hasExtra && hasQuery) {
+    return (
+      body: '没有同时匹配「$query」与所选年代 / 类型的作品。',
+      actionLabel: '清空筛选条件',
+      action: LibraryEmptyAction.clearExtraAndQuery,
+    );
+  }
+  if (filter.hasExtra) {
+    return (
+      body: '当前筛选条件下一条都没筛到。清掉年代 / 类型再看看。',
+      actionLabel: '清空筛选',
+      action: LibraryEmptyAction.clearExtra,
+    );
+  }
+  if (hasQuery) {
+    return (
+      body: '没有匹配「$query」的作品。',
+      actionLabel: '清空搜索',
+      action: LibraryEmptyAction.clearQuery,
+    );
+  }
+  return (
+    body: '这个分类下暂时没有作品。换个分类看看，或者重新扫描一次。',
+    actionLabel: '回到全部',
+    action: LibraryEmptyAction.clearAll,
+  );
+}
 
 /// 媒体库主页（海报墙）。
 ///
@@ -73,13 +148,21 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     ref.read(libraryFilterProvider.notifier).setQuery('');
   }
 
-  /// 重新读库。两种视图的数据来源不同（作品表 / 媒体项表），必须一起失效。
+  /// 重新读库。两种视图的数据来源不同（作品表 / 网盘目录），必须一起失效。
   void _refresh() {
     ref.invalidate(workListProvider);
     ref.invalidate(categoryCountsProvider);
     ref.invalidate(playedCountProvider);
+    // 筛选面板的两组选项也是从库里数出来的，一起失效 ——
+    // 否则手动改了库（比如在设置页清过数据）之后，面板上还列着
+    // 已经一部都不剩的年代 / 类型。
+    ref.invalidate(decadeCountsProvider);
+    ref.invalidate(genreCountsProvider);
     ref.invalidate(libraryStatsProvider);
+    // 目录视图：列表本身要重列网盘，叠加的「已入库」标记也要重算。
     ref.invalidate(folderTreeProvider);
+    ref.invalidate(indexedFileIdsProvider);
+    ref.invalidate(driveListingProvider);
   }
 
   @override
@@ -125,13 +208,19 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
             _SearchBox(
               controller: _search,
               onChanged: _onSearchChanged,
-              hint: posters ? '搜片名或文件名…' : '搜文件名或目录路径…',
+              // 两个视图搜的东西**不是一回事**，提示词必须说清：海报墙搜的是
+              // 库里已入库的作品/文件，目录视图筛的是**当前这一层网盘目录**。
+              hint: posters ? '搜片名或文件名…' : '筛当前目录…',
             ),
             // 排序只对海报墙有意义：目录视图按**目录结构**排（自然序），
             // 换排序方式在那里没有任何东西会变，摆着只会让人以为坏了。
             if (posters) ...[
               const SizedBox(width: 8),
               const _SortMenu(),
+              const SizedBox(width: 4),
+              // 年代 / 类型筛选同理：目录视图的列表是**文件**，
+              // 而年代 / 类型是作品的元数据，在那里没有可筛的东西。
+              const LibraryFilterButton(),
             ],
             IconButton(
               tooltip: '刷新',
@@ -165,20 +254,34 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
                   // **这一栏本来就该是空的**（还没看过任何片子）、
                   // **筛选没筛到**（该清条件）。给错行动按钮比不给更糟。
                   if (filter.playedOnly) return const _NoPlayHistoryState();
-                  return filter.isEmpty
-                      ? const _NeverScannedState()
-                      : EmptyState(
-                          icon: Icons.search_off_rounded,
-                          title: '这里还没有内容',
-                          body: filter.query.trim().isEmpty
-                              ? '这个分类下暂时没有作品。换个分类看看，'
-                                  '或者重新扫描一次。'
-                              : '换个关键词，或者清掉筛选条件。',
-                          actionLabel: '清空筛选',
-                          onAction: () => ref
-                              .read(libraryFilterProvider.notifier)
-                              .clear(),
-                        );
+                  if (filter.isEmpty) return const _NeverScannedState();
+                  // 提示语与按钮都由 `libraryEmptyHint` 按**当前实际存在的
+                  // 条件**分派 —— 按钮绝不能一律 `clear()`（那会连分类栏选的
+                  // 位置一起丢掉），理由见那个函数的文档。
+                  final hint = libraryEmptyHint(filter);
+                  return EmptyState(
+                    icon: Icons.search_off_rounded,
+                    title: '这里还没有内容',
+                    body: hint.body,
+                    actionLabel: hint.actionLabel,
+                    onAction: () {
+                      final notifier = ref.read(libraryFilterProvider.notifier);
+                      switch (hint.action) {
+                        case LibraryEmptyAction.clearExtra:
+                          notifier.clearExtra();
+                        case LibraryEmptyAction.clearQuery:
+                          // 走 `_clearSearch` 而不是 `setQuery('')`：输入框里
+                          // 还留着上一次打的字，只改状态会得到「列表已经不过滤
+                          // 了，但搜索框里还有词」这种自相矛盾的样子。
+                          _clearSearch();
+                        case LibraryEmptyAction.clearExtraAndQuery:
+                          notifier.clearExtra();
+                          _clearSearch();
+                        case LibraryEmptyAction.clearAll:
+                          notifier.clear();
+                      }
+                    },
+                  );
                 }
                 return _PosterGrid(works: list);
               },
@@ -190,17 +293,23 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     );
   }
 
-  /// 目录视图的副标题：整库规模 + 当前目录规模。
+  /// 目录视图的副标题：当前网盘目录 + 它这一层有什么。
   ///
-  /// 两者都要给：整库规模回答「这盘里有多少东西」，当前目录规模回答
-  /// 「我在的这一层有多少」—— 只有前者时，用户翻进一个空目录会以为库空了。
+  /// 副标题必须**跟着浏览位置变**：它回答的是「我现在在哪、这一层有多少」。
+  /// 只在页头显示一次整库规模的话，用户翻进一个空目录会以为整个盘空了。
+  ///
+  /// 数字来自网盘列表本身（而不是本地索引）：这个视图现在描述的是
+  /// 「网盘上有什么」，用一个本地索引算出来的数字会与列表里看到的对不上。
   static String? _folderSubtitle(WidgetRef ref) {
-    final tree = ref.watch(folderTreeProvider).valueOrNull;
-    if (tree == null) return null;
-    final node = tree.nodeAt(ref.watch(currentFolderProvider));
-    final head = '${tree.fileCount} 个视频 · ${tree.subfolderCount} 个文件夹';
-    if (node == null || node.isRoot) return head;
-    return '$head · 当前目录 ${node.itemCount} 个';
+    final crumb = ref.watch(currentCrumbProvider);
+    final listing = ref.watch(driveListingProvider(crumb)).valueOrNull;
+    final where = crumb.isRoot ? '根目录' : crumb.path;
+    if (listing == null) return where;
+    final extra = listing.otherFileCount > 0
+        ? ' · 另有 ${listing.otherFileCount} 个非视频文件'
+        : '';
+    return '$where · ${listing.folders.length} 个子目录 · '
+        '${listing.videos.length} 个视频$extra';
   }
 }
 

@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart' as crypto;
 
 import '../../../core/diagnostics/diag_log.dart';
 import '../../../core/error/drive_error.dart';
@@ -176,7 +179,7 @@ class QuarkAdapter implements CloudDriveAdapter {
 
     CloudAccount account;
     try {
-      // 先校验再落库：避免把废凭证写进钥匙串
+      // 先校验再落库：避免把废凭证写进安全存储
       account = await _fetchMember();
     } catch (_) {
       _credential = null;
@@ -718,6 +721,280 @@ class QuarkAdapter implements CloudDriveAdapter {
   }
 
   // -------------------------------------------------------------------
+  // 文件管理：创建目录 / 删除 / 上传
+  // -------------------------------------------------------------------
+
+  /// 在指定目录下创建文件夹。
+  ///
+  /// 同名重复创建幂等（夸克服务端返回已有 fid）。
+  @override
+  Future<String> createFolder({
+    required String parentId,
+    required String name,
+  }) async {
+    diag.info('文件', '创建目录「$name」于 parentId=$parentId');
+
+    final result = await _request(
+      () => _post(QuarkEndpoints.fileCreate, body: {
+        'dir_init_lock': false,
+        'dir_path': '',
+        'file_name': name,
+        'pdir_fid': parentId.isEmpty ? rootId : parentId,
+      }),
+      context: '创建目录',
+    );
+
+    final fid = QuarkMapper.parseFid(result.dataMap);
+    if (fid == null || fid.isEmpty) {
+      throw const DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '创建目录失败：响应中没有返回目录 ID',
+      );
+    }
+    diag.info('文件', '目录已创建/已存在「$name」→ fid=$fid');
+    return fid;
+  }
+
+  /// 删除文件/文件夹。
+  ///
+  /// ⚠️ 不可逆操作。调用方必须做 UI 二次确认。
+  @override
+  Future<List<String>> deleteFiles({required List<String> fileIds}) async {
+    if (fileIds.isEmpty) return const [];
+
+    diag.warn('文件', '删除 ${fileIds.length} 个文件：${fileIds.join(", ")}');
+
+    final result = await _request(
+      () => _post(QuarkEndpoints.fileDelete, body: {
+        'action_type': 2, // 永久删除
+        'filelist': fileIds,
+        'exclude_fids': [],
+      }),
+      context: '删除文件',
+    );
+
+    diag.info('文件', '已删除 ${fileIds.length} 个文件');
+    return fileIds;
+  }
+
+  /// 上传一个本地文件到夸克网盘。
+  ///
+  /// 流程（参考夸克 PC 客户端逆向 + quark-drive Python 实现）：
+  /// 1. `POST /file/upload/pre` —— 预上传（含文件名、大小、目录）。
+  ///    返回 `task_id` 与 COS 上传信息（`bucket`/`obj_key`/`upload_id`/`auth_info`）。
+  /// 2. 计算全文件 SHA1 + MD5，调 `POST /file/update/hash` 做秒传判定。
+  ///    `finish=1` → 秒传命中，直接返回 `fid`。
+  /// 3. 秒传未命中时，分片 PUT 到 COS，逐片获取 ETag。
+  /// 4. `POST /file/upload/finish` 提交 ETag 列表，服务端返回最终 `fid`。
+  ///
+  /// ⚠️ 小文件（<50MiB）走 `POST /file/download` 也能拿到直链，
+  /// 但**上传**必须走预上传流程 —— 那是唯一能往网盘写入文件的路径。
+  @override
+  Future<String> uploadFile({
+    required String parentId,
+    required String fileName,
+    required List<int> bytes,
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    final size = bytes.length;
+    final nowMs = _clock().millisecondsSinceEpoch;
+    final pdirFid = parentId.isEmpty ? rootId : parentId;
+
+    diag.info('上传', '开始上传「$fileName」（$size B）到 parentId=$pdirFid');
+
+    // ① 预上传
+    final preResult = await _request(
+      () => _post(QuarkEndpoints.uploadPre, body: {
+        'ccp_hash_update': true,
+        'dir_name': '',
+        'file_name': fileName,
+        'format_type': 'application/octet-stream',
+        'l_created_at': nowMs,
+        'l_updated_at': nowMs,
+        'pdir_fid': pdirFid,
+        'size': size,
+      }),
+      context: '上传预请求',
+    );
+
+    final preData = preResult.dataMap;
+    if (preData == null) {
+      throw const DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '上传预请求失败：响应中没有 data',
+      );
+    }
+
+    final taskId = preData['task_id'] as String? ?? '';
+    if (taskId.isEmpty) {
+      throw const DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '上传预请求失败：没有返回 task_id',
+      );
+    }
+
+    // ② 计算哈希，尝试秒传
+    final sha1 = _computeSha1(bytes);
+    final md5 = _computeMd5(bytes);
+
+    diag.debug('上传', '文件哈希：sha1=${sha1.substring(0, 16)}…, '
+        'md5=${md5.substring(0, 16)}…, task=$taskId');
+
+    // 复用 _request 包装做业务码校验
+    final hashResult = await _request(
+      () => _post(QuarkEndpoints.uploadHash, body: {
+        'md5': md5,
+        'sha1': sha1,
+        'task_id': taskId,
+      }),
+      context: '秒传判定',
+    );
+
+    final hashData = hashResult.dataMap;
+    if (hashData != null && hashData['finish'] == true) {
+      final fid = QuarkMapper.parseFid(hashData);
+      if (fid != null && fid.isNotEmpty) {
+        diag.info('上传', '秒传命中！「$fileName」→ fid=$fid');
+        onProgress?.call(size, size);
+        return fid;
+      }
+    }
+
+    // ③ 分片上传到 COS
+    //
+    // 预上传响应中应包含 COS 上传信息（bucket / obj_key / upload_id /
+    // auth_info / upload_url / part_size）。
+    // 夸克服务端返回的 `part_size` 通常为 4MB。
+    final partSize = _asInt(preData['part_size']) ??
+        preData['metadata']?['part_size'] as int? ??
+        4 * 1024 * 1024;
+
+    final bucket = preData['bucket'] as String? ?? '';
+    final objKey = preData['obj_key'] as String? ?? '';
+    final uploadId = preData['upload_id'] as String? ?? '';
+    final authInfo = preData['auth_info'];
+    final uploadUrlBase = preData['upload_url'] as String? ?? '';
+
+    if (bucket.isEmpty || objKey.isEmpty || uploadId.isEmpty) {
+      throw DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '上传预请求未返回 COS 信息（bucket/obj_key/upload_id 缺失）'
+            '—— 分片上传无法继续。响应键：${preData.keys.toList()}',
+      );
+    }
+
+    // 构造 OSS 基地址
+    final base = uploadUrlBase
+        .replaceAll('http://', '')
+        .replaceAll('https://', '');
+    final ossBase = 'https://$bucket.$base/$objKey';
+
+    final totalParts = (size / partSize).ceil();
+    final etags = <Map<String, Object?>>[];
+
+    diag.info('上传', '分片上传：$totalParts 片 × ${_formatBytes(partSize)}'
+        '（OSS: $bucket/$objKey）');
+
+    for (var pn = 1; pn <= totalParts; pn++) {
+      final offset = (pn - 1) * partSize;
+      final end = (offset + partSize > size) ? size : offset + partSize;
+      final partData = bytes.sublist(offset, end);
+
+      // 向夸克获取这片的上传授权
+      final ts = _ossTimestamp();
+      final metaStr = 'PUT\n\napplication/octet-stream\n$ts\n'
+          'x-oss-date:$ts\nx-oss-user-agent:aliyun-sdk-js/6.6.1\n'
+          '/$bucket/$objKey?partNumber=$pn&uploadId=$uploadId';
+
+      final authResult = await _request(
+        () => _post(QuarkEndpoints.uploadAuth, body: {
+          'auth_info': authInfo,
+          'auth_meta': metaStr,
+          'task_id': taskId,
+        }),
+        context: '分片授权($pn/$totalParts)',
+      );
+
+      final authKey = authResult.dataMap?['auth_key'] as String? ?? '';
+
+      // PUT 到 OSS
+      final partUrl = '$ossBase?partNumber=$pn&uploadId=$uploadId';
+      final etag = await _http.putBytes(
+        partUrl,
+        body: partData,
+        headers: {
+          'Authorization': authKey,
+          'Content-Type': 'application/octet-stream',
+          'Referer': QuarkEndpoints.referer,
+          'x-oss-date': ts,
+          'x-oss-user-agent': 'aliyun-sdk-js/6.6.1',
+        },
+      );
+
+      etags.add({
+        'part_number': pn,
+        'etag': etag.replaceAll('"', ''),
+      });
+
+      onProgress?.call(end, size);
+      diag.debug('上传', '分片 $pn/$totalParts 完成'
+          '（${_formatBytes(end)}/${_formatBytes(size)}）');
+    }
+
+    // ④ 完成上传
+    final finishResult = await _request(
+      () => _post(QuarkEndpoints.uploadFinish, body: {
+        'task_id': taskId,
+        'part_info_list': etags,
+      }),
+      context: '完成上传',
+    );
+
+    final fid = QuarkMapper.parseFid(finishResult.dataMap);
+    if (fid == null || fid.isEmpty) {
+      throw const DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '上传完成响应中没有返回文件 ID',
+      );
+    }
+
+    diag.info('上传', '「$fileName」上传完成 → fid=$fid');
+    return fid;
+  }
+
+  /// 计算 SHA1（hex 小写）。
+  ///
+  /// 用 `package:crypto`（Flutter SDK 传递依赖，已在 pubspec.lock 中）。
+  static String _computeSha1(List<int> bytes) {
+    return crypto.sha1.convert(bytes).toString();
+  }
+
+  /// 计算 MD5（hex 小写）。
+  static String _computeMd5(List<int> bytes) {
+    return crypto.md5.convert(bytes).toString();
+  }
+
+  static String _ossTimestamp() {
+    final now = DateTime.now().toUtc();
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    return '${days[now.weekday - 1]}, ${now.day.toString().padLeft(2, '0')} '
+        '${months[now.month - 1]} ${now.year} '
+        '${now.hour.toString().padLeft(2, '0')}:'
+        '${now.minute.toString().padLeft(2, '0')}:'
+        '${now.second.toString().padLeft(2, '0')} GMT';
+  }
+
+  static String _formatBytes(int n) {
+    if (n < 1024) return '${n}B';
+    if (n < 1024 * 1024) return '${(n / 1024).toStringAsFixed(1)}KB';
+    return '${(n / (1024 * 1024)).toStringAsFixed(1)}MB';
+  }
+
+  // -------------------------------------------------------------------
   // 内部
   // -------------------------------------------------------------------
 
@@ -793,7 +1070,7 @@ class QuarkAdapter implements CloudDriveAdapter {
   /// 浏览器里 cookie jar 自动完成这件事；我们手动管理 Cookie，必须在
   /// 每个响应后把新值回填进内存凭证，下一个请求（尤其是直链）才能带上。
   ///
-  /// ⚠️ 故意**不落库**：扫描时每页都轮换，逐次写钥匙串开销大且无意义 ——
+  /// ⚠️ 故意**不落库**：扫描时每页都轮换，逐次重写安全存储开销大且无意义 ——
   /// 重启后首次 API 响应就会下发新 `__puus`，本方法会立刻补上。
   void _absorbRotatedCookies(HttpResult result) {
     final credential = _credential;

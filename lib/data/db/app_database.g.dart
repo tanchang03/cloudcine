@@ -1947,6 +1947,18 @@ class $MediaWorksTable extends MediaWorks
     requiredDuringInsert: false,
     defaultValue: const Constant(0),
   );
+  static const VerificationMeta _lastModifiedAtMeta = const VerificationMeta(
+    'lastModifiedAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> lastModifiedAt =
+      GeneratedColumn<DateTime>(
+        'last_modified_at',
+        aliasedName,
+        true,
+        type: DriftSqlType.dateTime,
+        requiredDuringInsert: false,
+      );
   static const VerificationMeta _lastPlayedAtMeta = const VerificationMeta(
     'lastPlayedAt',
   );
@@ -1991,6 +2003,7 @@ class $MediaWorksTable extends MediaWorks
     scrapedAt,
     itemCount,
     totalBytes,
+    lastModifiedAt,
     lastPlayedAt,
     updatedAt,
   ];
@@ -2148,6 +2161,15 @@ class $MediaWorksTable extends MediaWorks
         totalBytes.isAcceptableOrUnknown(data['total_bytes']!, _totalBytesMeta),
       );
     }
+    if (data.containsKey('last_modified_at')) {
+      context.handle(
+        _lastModifiedAtMeta,
+        lastModifiedAt.isAcceptableOrUnknown(
+          data['last_modified_at']!,
+          _lastModifiedAtMeta,
+        ),
+      );
+    }
     if (data.containsKey('last_played_at')) {
       context.handle(
         _lastPlayedAtMeta,
@@ -2263,6 +2285,10 @@ class $MediaWorksTable extends MediaWorks
             DriftSqlType.int,
             data['${effectivePrefix}total_bytes'],
           )!,
+      lastModifiedAt: attachedDatabase.typeMapping.read(
+        DriftSqlType.dateTime,
+        data['${effectivePrefix}last_modified_at'],
+      ),
       lastPlayedAt: attachedDatabase.typeMapping.read(
         DriftSqlType.dateTime,
         data['${effectivePrefix}last_played_at'],
@@ -2330,6 +2356,12 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   /// 冗余计数，避免列表页为每个作品做一次 count 查询（N+1）。
   final int itemCount;
   final int totalBytes;
+
+  /// 作品下所有文件的**网盘修改时间**最大值（`MediaItem.modifiedAt`）。
+  ///
+  /// 取最大值是因为一部剧有多集：新增一集时这个值会变大，
+  /// 整个作品在「最近修改」排序里就会浮到前面。
+  final DateTime? lastModifiedAt;
   final DateTime? lastPlayedAt;
   final DateTime updatedAt;
   const MediaWorkRow({
@@ -2353,6 +2385,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     this.scrapedAt,
     required this.itemCount,
     required this.totalBytes,
+    this.lastModifiedAt,
     this.lastPlayedAt,
     required this.updatedAt,
   });
@@ -2401,6 +2434,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     }
     map['item_count'] = Variable<int>(itemCount);
     map['total_bytes'] = Variable<int>(totalBytes);
+    if (!nullToAbsent || lastModifiedAt != null) {
+      map['last_modified_at'] = Variable<DateTime>(lastModifiedAt);
+    }
     if (!nullToAbsent || lastPlayedAt != null) {
       map['last_played_at'] = Variable<DateTime>(lastPlayedAt);
     }
@@ -2458,6 +2494,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               : Value(scrapedAt),
       itemCount: Value(itemCount),
       totalBytes: Value(totalBytes),
+      lastModifiedAt:
+          lastModifiedAt == null && nullToAbsent
+              ? const Value.absent()
+              : Value(lastModifiedAt),
       lastPlayedAt:
           lastPlayedAt == null && nullToAbsent
               ? const Value.absent()
@@ -2492,6 +2532,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       scrapedAt: serializer.fromJson<DateTime?>(json['scrapedAt']),
       itemCount: serializer.fromJson<int>(json['itemCount']),
       totalBytes: serializer.fromJson<int>(json['totalBytes']),
+      lastModifiedAt: serializer.fromJson<DateTime?>(json['lastModifiedAt']),
       lastPlayedAt: serializer.fromJson<DateTime?>(json['lastPlayedAt']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
     );
@@ -2520,6 +2561,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'scrapedAt': serializer.toJson<DateTime?>(scrapedAt),
       'itemCount': serializer.toJson<int>(itemCount),
       'totalBytes': serializer.toJson<int>(totalBytes),
+      'lastModifiedAt': serializer.toJson<DateTime?>(lastModifiedAt),
       'lastPlayedAt': serializer.toJson<DateTime?>(lastPlayedAt),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
     };
@@ -2546,6 +2588,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     Value<DateTime?> scrapedAt = const Value.absent(),
     int? itemCount,
     int? totalBytes,
+    Value<DateTime?> lastModifiedAt = const Value.absent(),
     Value<DateTime?> lastPlayedAt = const Value.absent(),
     DateTime? updatedAt,
   }) => MediaWorkRow(
@@ -2570,6 +2613,8 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     scrapedAt: scrapedAt.present ? scrapedAt.value : this.scrapedAt,
     itemCount: itemCount ?? this.itemCount,
     totalBytes: totalBytes ?? this.totalBytes,
+    lastModifiedAt:
+        lastModifiedAt.present ? lastModifiedAt.value : this.lastModifiedAt,
     lastPlayedAt: lastPlayedAt.present ? lastPlayedAt.value : this.lastPlayedAt,
     updatedAt: updatedAt ?? this.updatedAt,
   );
@@ -2605,6 +2650,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       itemCount: data.itemCount.present ? data.itemCount.value : this.itemCount,
       totalBytes:
           data.totalBytes.present ? data.totalBytes.value : this.totalBytes,
+      lastModifiedAt:
+          data.lastModifiedAt.present
+              ? data.lastModifiedAt.value
+              : this.lastModifiedAt,
       lastPlayedAt:
           data.lastPlayedAt.present
               ? data.lastPlayedAt.value
@@ -2636,6 +2685,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('scrapedAt: $scrapedAt, ')
           ..write('itemCount: $itemCount, ')
           ..write('totalBytes: $totalBytes, ')
+          ..write('lastModifiedAt: $lastModifiedAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('updatedAt: $updatedAt')
           ..write(')'))
@@ -2664,6 +2714,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     scrapedAt,
     itemCount,
     totalBytes,
+    lastModifiedAt,
     lastPlayedAt,
     updatedAt,
   ]);
@@ -2691,6 +2742,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.scrapedAt == this.scrapedAt &&
           other.itemCount == this.itemCount &&
           other.totalBytes == this.totalBytes &&
+          other.lastModifiedAt == this.lastModifiedAt &&
           other.lastPlayedAt == this.lastPlayedAt &&
           other.updatedAt == this.updatedAt);
 }
@@ -2716,6 +2768,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<DateTime?> scrapedAt;
   final Value<int> itemCount;
   final Value<int> totalBytes;
+  final Value<DateTime?> lastModifiedAt;
   final Value<DateTime?> lastPlayedAt;
   final Value<DateTime> updatedAt;
   final Value<int> rowid;
@@ -2740,6 +2793,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.scrapedAt = const Value.absent(),
     this.itemCount = const Value.absent(),
     this.totalBytes = const Value.absent(),
+    this.lastModifiedAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.rowid = const Value.absent(),
@@ -2765,6 +2819,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.scrapedAt = const Value.absent(),
     this.itemCount = const Value.absent(),
     this.totalBytes = const Value.absent(),
+    this.lastModifiedAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
     required DateTime updatedAt,
     this.rowid = const Value.absent(),
@@ -2795,6 +2850,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<DateTime>? scrapedAt,
     Expression<int>? itemCount,
     Expression<int>? totalBytes,
+    Expression<DateTime>? lastModifiedAt,
     Expression<DateTime>? lastPlayedAt,
     Expression<DateTime>? updatedAt,
     Expression<int>? rowid,
@@ -2820,6 +2876,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (scrapedAt != null) 'scraped_at': scrapedAt,
       if (itemCount != null) 'item_count': itemCount,
       if (totalBytes != null) 'total_bytes': totalBytes,
+      if (lastModifiedAt != null) 'last_modified_at': lastModifiedAt,
       if (lastPlayedAt != null) 'last_played_at': lastPlayedAt,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (rowid != null) 'rowid': rowid,
@@ -2847,6 +2904,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<DateTime?>? scrapedAt,
     Value<int>? itemCount,
     Value<int>? totalBytes,
+    Value<DateTime?>? lastModifiedAt,
     Value<DateTime?>? lastPlayedAt,
     Value<DateTime>? updatedAt,
     Value<int>? rowid,
@@ -2872,6 +2930,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       scrapedAt: scrapedAt ?? this.scrapedAt,
       itemCount: itemCount ?? this.itemCount,
       totalBytes: totalBytes ?? this.totalBytes,
+      lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
       lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
       updatedAt: updatedAt ?? this.updatedAt,
       rowid: rowid ?? this.rowid,
@@ -2941,6 +3000,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     if (totalBytes.present) {
       map['total_bytes'] = Variable<int>(totalBytes.value);
     }
+    if (lastModifiedAt.present) {
+      map['last_modified_at'] = Variable<DateTime>(lastModifiedAt.value);
+    }
     if (lastPlayedAt.present) {
       map['last_played_at'] = Variable<DateTime>(lastPlayedAt.value);
     }
@@ -2976,6 +3038,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('scrapedAt: $scrapedAt, ')
           ..write('itemCount: $itemCount, ')
           ..write('totalBytes: $totalBytes, ')
+          ..write('lastModifiedAt: $lastModifiedAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('rowid: $rowid')
@@ -5642,6 +5705,7 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       Value<DateTime?> scrapedAt,
       Value<int> itemCount,
       Value<int> totalBytes,
+      Value<DateTime?> lastModifiedAt,
       Value<DateTime?> lastPlayedAt,
       required DateTime updatedAt,
       Value<int> rowid,
@@ -5668,6 +5732,7 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<DateTime?> scrapedAt,
       Value<int> itemCount,
       Value<int> totalBytes,
+      Value<DateTime?> lastModifiedAt,
       Value<DateTime?> lastPlayedAt,
       Value<DateTime> updatedAt,
       Value<int> rowid,
@@ -5779,6 +5844,11 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<int> get totalBytes => $composableBuilder(
     column: $table.totalBytes,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get lastModifiedAt => $composableBuilder(
+    column: $table.lastModifiedAt,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5902,6 +5972,11 @@ class $$MediaWorksTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<DateTime> get lastModifiedAt => $composableBuilder(
+    column: $table.lastModifiedAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<DateTime> get lastPlayedAt => $composableBuilder(
     column: $table.lastPlayedAt,
     builder: (column) => ColumnOrderings(column),
@@ -5994,6 +6069,11 @@ class $$MediaWorksTableAnnotationComposer
     builder: (column) => column,
   );
 
+  GeneratedColumn<DateTime> get lastModifiedAt => $composableBuilder(
+    column: $table.lastModifiedAt,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<DateTime> get lastPlayedAt => $composableBuilder(
     column: $table.lastPlayedAt,
     builder: (column) => column,
@@ -6054,6 +6134,7 @@ class $$MediaWorksTableTableManager
                 Value<DateTime?> scrapedAt = const Value.absent(),
                 Value<int> itemCount = const Value.absent(),
                 Value<int> totalBytes = const Value.absent(),
+                Value<DateTime?> lastModifiedAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
@@ -6078,6 +6159,7 @@ class $$MediaWorksTableTableManager
                 scrapedAt: scrapedAt,
                 itemCount: itemCount,
                 totalBytes: totalBytes,
+                lastModifiedAt: lastModifiedAt,
                 lastPlayedAt: lastPlayedAt,
                 updatedAt: updatedAt,
                 rowid: rowid,
@@ -6104,6 +6186,7 @@ class $$MediaWorksTableTableManager
                 Value<DateTime?> scrapedAt = const Value.absent(),
                 Value<int> itemCount = const Value.absent(),
                 Value<int> totalBytes = const Value.absent(),
+                Value<DateTime?> lastModifiedAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 required DateTime updatedAt,
                 Value<int> rowid = const Value.absent(),
@@ -6128,6 +6211,7 @@ class $$MediaWorksTableTableManager
                 scrapedAt: scrapedAt,
                 itemCount: itemCount,
                 totalBytes: totalBytes,
+                lastModifiedAt: lastModifiedAt,
                 lastPlayedAt: lastPlayedAt,
                 updatedAt: updatedAt,
                 rowid: rowid,

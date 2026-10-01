@@ -45,3 +45,33 @@ class PlaybackLibraryLink extends Notifier<int> {
 
 final playbackLibraryLinkProvider =
     NotifierProvider<PlaybackLibraryLink, int>(PlaybackLibraryLink.new);
+
+/// 「本地索引刚被写过」的**刷新信号**。
+///
+/// ## 为什么需要它
+///
+/// 现在有**两条**入口会往库里写：全盘扫描与文件夹里的「发现媒体」。而
+/// 目录视图的叠加层（`folderTreeProvider` 的「已入库」标记、列表里每个
+/// 文件行的「已在库」）读的正是这张表 —— 不主动说一声，用户发现完一部新片，
+/// 那一行还写着「加入媒体库」，看起来像什么都没发生。
+///
+/// ## 为什么是「版本号」而不是让写入方去 invalidate
+///
+/// 与 [PlaybackLibraryLink] 同一个理由：目录视图那几个 provider 住在
+/// `drive_browse_providers.dart`，而扫描控制器住在 `scan_providers.dart`。
+/// 让扫描去 `invalidate` 目录视图的 provider，两个文件就互相 import 了
+/// （`scan_providers → drive_browse_providers → scan_providers`）—— 而
+/// `drive_browse_providers` 还要用 `scan_providers` 的 `buildScanPolicy`。
+///
+/// 所以信号放在这个**谁都不依赖的叶子文件**里：写入方 `bump()`，
+/// 读取方自己 `watch`。方向永远是单向的。
+class LibraryWriteSignal extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  /// 报告「索引库刚被写入过」。
+  void bump() => state = state + 1;
+}
+
+final libraryWriteSignalProvider =
+    NotifierProvider<LibraryWriteSignal, int>(LibraryWriteSignal.new);

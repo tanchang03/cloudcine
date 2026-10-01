@@ -153,6 +153,16 @@ class DriftMediaRepository implements MediaRepository {
         incoming.posterUrl == existing.posterUrl;
     final keepBackdropFile = protect || incoming.backdropUrl == existing.backdropUrl;
 
+    // **生效后的类型列表**：保护模式下沿用库里的，否则用本次的。
+    //
+    // 抽出来只算一次，是为了让 `category` 与 `genres` 两列永远基于**同一份
+    // 输入** —— 各算各的会造出「分类是按 A 折算的、`genres` 存的却是 B」
+    // 这种自相矛盾的行，而它不会报错，只会在下一次刮削时算出一个莫名其妙的
+    // 分类。
+    final effectiveGenres = protect && existing.genres.isNotEmpty
+        ? existing.genres
+        : incoming.genres;
+
     // 海报地址**永不为空**：本次算不出新地址时保留旧的。
     //
     // 为什么不能让它变成 null：网盘缩略图地址是「扫描那一刻服务端有没有
@@ -168,11 +178,23 @@ class DriftMediaRepository implements MediaRepository {
       key: incoming.key,
       provider: incoming.provider,
       kind: incoming.kind,
-      // 分类**永远取新值**：它是本次扫描对「这些文件是什么」的判定，
-      // 而刮削结果只影响标题/海报那类元数据。放进 `protect` 分支会有一个
-      // 很难查的后果 —— 第一次扫描时判成「其他」的作品，之后无论怎么重扫
-      // 都修不回来（因为保护模式会一直保留那个旧的「其他」）。
-      category: incoming.category,
+      // 分类：**永远取新值，但新值要先把 `genres` 折算进去**。
+      //
+      // 「永远取新值」这条不能改：放进 `protect` 分支会有一个很难查的后果 ——
+      // 第一次扫描时判成「其他」的作品，之后无论怎么重扫都修不回来
+      // （保护模式会一直保留那个旧的「其他」）。
+      //
+      // 但**只看 `incoming.category` 也不够**：扫描期的
+      // `MediaCategoryGuesser.guess` 拿不到 `genres`（那时还没刮削），
+      // 所以重扫一部已刮削的作品时，incoming 那个分类是按目录名 / 结构
+      // 重算的**旧口径**。直接用它会把刮削刚修正过来的分类冲回去 ——
+      // 用户看到的是「刮削后进了动漫栏，加一集重扫又回电影栏」。
+      //
+      // 所以这里拿 [effectiveGenres] 再折算一次；`fromGenres` 给不出结论时
+      // （剧情 / 科幻这类不改变栏目）才退回 `incoming.category` ——
+      // 与 `WorkScraper._categoryFor` 是同一套口径。
+      category: MediaCategoryGuesser.fromGenres(effectiveGenres) ??
+          incoming.category,
       title: protect ? existing.title : incoming.title,
       originalTitle: _preferOld(protect, existing.originalTitle, incoming.originalTitle),
       year: _preferOld(protect, existing.year, incoming.year),
@@ -202,14 +224,18 @@ class DriftMediaRepository implements MediaRepository {
           ? (existing.backdropFile ?? incoming.backdropFile)
           : incoming.backdropFile,
       rating: _preferOld(protect, existing.rating, incoming.rating),
-      genres: protect && existing.genres.isNotEmpty
-          ? existing.genres
-          : incoming.genres,
+      genres: effectiveGenres,
       onlineId: _preferOld(protect, existing.onlineId, incoming.onlineId),
       source: protect ? existing.source : incoming.source,
       scrapedAt: protect ? existing.scrapedAt : incoming.scrapedAt,
       itemCount: incoming.itemCount,
       totalBytes: incoming.totalBytes,
+      // `lastModifiedAt` 永远取本次扫描的值：它是作品下所有文件
+      // `modifiedAt` 的最大值，重扫就是为了更新它。
+      lastModifiedAt: incoming.lastModifiedAt,
+      // `firstSeenAt` 保留旧值：它决定「最近添加」排序，被每次扫描刷新的话，
+      // 老片子会天天冒到列表最前。
+      firstSeenAt: existing.firstSeenAt ?? incoming.firstSeenAt,
       lastPlayedAt: existing.lastPlayedAt ?? incoming.lastPlayedAt,
       updatedAt: ts,
     );
@@ -344,73 +370,59 @@ class DriftMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
-    WorkSort sort = WorkSort.recentAdded,
+    Set<int>? decades,
+    Set<String>? genres,
+    WorkSort sort = WorkSort.recentModified,
     int limit = 200,
     int offset = 0,
   }) async {
     final q = _db.select(_db.mediaWorks);
 
-    if (kind != null) {
-      q.where((t) => t.kind.equals(kind.name));
-    }
+    // 分类 / 搜索 / 「播过没有」三件事走共用表达式 —— 两个计数查询要用
+    // 同一份条件（理由见 `_workConditions`）。
+    final base = _workConditions(
+      kind: kind,
+      category: category,
+      playedOnly: playedOnly,
+      query: query,
+    );
+    if (base != null) q.where((_) => base);
 
-    // 「最近播放」栏。判据是 `last_played_at IS NOT NULL` ——
-    // **不是**「比某个时间新」：后者会把「上个月看过」也算成没看过，
-    // 而这一栏的意思是「我看过的」，不是「我最近看的」（排序负责「最近」）。
-    if (playedOnly) {
-      q.where((t) => t.lastPlayedAt.isNotNull());
-    }
-
-    if (category != null) {
-      // 空串是「还没判定过」（v3 之前的行）。用 `_categoryOf` 的同一套口径
-      // 现算，等价于「空串时按 kind + 标题猜」。写进 SQL 而不是拉回来在
-      // Dart 里过滤，是为了让分类筛选仍然是索引上的一次范围扫描 ——
-      // 几千部作品在 Dart 侧过滤会让「点一下分类栏」卡住半秒。
-      //
-      // 判据与 `_categoryOf` 保持一致：**先看结构（kind），再看关键词**。
-      // 这里只能表达结构那一半（SQL 里做不了关键词匹配），
-      // 所以命中的是「电影 / 剧集 / 其他」这三档；关键词档（动漫/综艺/
-      // 纪录片）只认已经落库的值 —— 而落库由回填与扫描保证。
-      switch (category) {
-        case MediaCategory.movie:
-          q.where(
-            (t) =>
-                t.category.equals(category.name) |
-                (t.category.equals('') & t.kind.equals(MediaKind.movie.name)),
-          );
-        case MediaCategory.series:
-          q.where(
-            (t) =>
-                t.category.equals(category.name) |
-                (t.category.equals('') &
-                    t.kind.equals(MediaKind.episode.name)),
-          );
-        case MediaCategory.other:
-          q.where(
-            (t) =>
-                t.category.equals(category.name) |
-                (t.category.equals('') &
-                    t.kind.equals(MediaKind.unknown.name)),
-          );
-        case MediaCategory.anime:
-        case MediaCategory.variety:
-        case MediaCategory.documentary:
-          q.where((t) => t.category.equals(category.name));
-      }
-    }
-
-    final trimmed = query?.trim();
-    if (trimmed != null && trimmed.isNotEmpty) {
-      final like = '%$trimmed%';
+    // 年代：`decades` 里存的是**年代起始年**（2020 = 2020–2029），
+    // 每项展开成 `year >= d0 AND year < d0+10`，多项之间是「或」。
+    //
+    // `year IS NULL` 的行（还没解析出年份）在任何年代条件下都不命中 ——
+    // 这与 `InMemoryMediaRepository` 的口径一致（那边要求 `w.year != null`），
+    // 也和面板上的角标一致（`countWorksByDecade` 不统计它们）。
+    if (decades != null && decades.isNotEmpty) {
       q.where((t) {
-        // 标题命中，**或者**它下面任一文件的文件名命中。
-        // 后者是必须的：用户记得的往往是 `S02E05` 这种文件名，
-        // 而列表上显示的是作品名。
-        final sub = _db.selectOnly(_db.mediaItems)
-          ..addColumns([_db.mediaItems.id])
-          ..where(_db.mediaItems.groupKey.equalsExp(t.key) &
-              _db.mediaItems.name.like(like));
-        return t.title.like(like) | existsQuery(sub);
+        Expression<bool>? any;
+        for (final d0 in decades) {
+          final cond = t.year.isBiggerOrEqualValue(d0) &
+              t.year.isSmallerThanValue(d0 + 10);
+          any = any == null ? cond : (any | cond);
+        }
+        return any!;
+      });
+    }
+
+    // 类型：`genres` 列是 JSON 数组文本（`["动画","科幻"]`），
+    // 所以匹配串**必须带上引号** —— `LIKE '%动画%'` 会把「动画片」也捞进来，
+    // 而 `LIKE '%"动画"%'` 只在它确实是数组里一个独立元素时命中。
+    //
+    // 多项之间是「或」（任一命中即可）：一部片子只会有一两个类型，
+    // 取交集几乎永远筛不出东西 —— 这一点写进了接口文档。
+    if (genres != null && genres.isNotEmpty) {
+      q.where((t) {
+        Expression<bool>? any;
+        for (final g in genres) {
+          // 类型名里理论上不会出现引号，但真要出现（脏数据）就会把 LIKE
+          // 串截断。转义成本很低，顺手做掉。
+          final escaped = g.replaceAll('"', '""');
+          final cond = t.genres.like('%"$escaped"%');
+          any = any == null ? cond : (any | cond);
+        }
+        return any!;
       });
     }
 
@@ -420,6 +432,84 @@ class DriftMediaRepository implements MediaRepository {
 
     final rows = await q.get();
     return rows.map(_toWork).toList();
+  }
+
+  /// 作品列表的**基础筛选条件**（分类 / 搜索 / 「播过没有」/ 结构）。
+  ///
+  /// 返回 `null` 表示「一条都不限」—— 调用方可以据此完全跳过 `WHERE`，
+  /// 而不是塞一个恒真表达式进去。
+  ///
+  /// ## 为什么要抽出来
+  ///
+  /// [listWorks]、[countWorksByDecade]、[countWorksByGenre] 三处都要这一份
+  /// 条件，而其中两条判据都很微妙：
+  ///
+  ///   - **分类**要处理「空串 = 还没判定过」的历史行（见 [_categoryCondition]）；
+  ///   - **搜索**要同时命中标题与**文件名**（EXISTS 子查询）。
+  ///
+  /// 三处各写一遍迟早会漂移，而漂移的表现是「列表和面板角标对不上」——
+  /// 用户看得见，却完全猜不出是哪一处的问题。
+  Expression<bool>? _workConditions({
+    MediaKind? kind,
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  }) {
+    final t = _db.mediaWorks;
+    Expression<bool>? cond;
+
+    void add(Expression<bool> c) => cond = cond == null ? c : (cond! & c);
+
+    if (kind != null) add(t.kind.equals(kind.name));
+
+    // 「最近播放」栏。判据是 `last_played_at IS NOT NULL` ——
+    // **不是**「比某个时间新」：后者会把「上个月看过」也算成没看过，
+    // 而这一栏的意思是「我看过的」，不是「我最近看的」（排序负责「最近」）。
+    if (playedOnly) add(t.lastPlayedAt.isNotNull());
+
+    if (category != null) add(_categoryCondition(category));
+
+    final trimmed = query?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) {
+      final like = '%$trimmed%';
+      // 标题命中，**或者**它下面任一文件的文件名命中。
+      // 后者是必须的：用户记得的往往是 `S02E05` 这种文件名，
+      // 而列表上显示的是作品名。
+      final sub = _db.selectOnly(_db.mediaItems)
+        ..addColumns([_db.mediaItems.id])
+        ..where(_db.mediaItems.groupKey.equalsExp(t.key) &
+            _db.mediaItems.name.like(like));
+      add(t.title.like(like) | existsQuery(sub));
+    }
+
+    return cond;
+  }
+
+  /// 单个分类的 SQL 条件。
+  ///
+  /// 空串是「还没判定过」（v3 之前的行）。这里用与 `_categoryOf` 同一套口径
+  /// 现算，等价于「空串时按 kind 猜」。写进 SQL 而不是拉回来在 Dart 里过滤，
+  /// 是为了让分类筛选仍然是索引上的一次范围扫描 —— 几千部作品在 Dart 侧
+  /// 过滤会让「点一下分类栏」卡住半秒。
+  ///
+  /// 判据与 `_categoryOf` 保持一致：**先看结构（kind），再看关键词**。
+  /// 这里只能表达结构那一半（SQL 里做不了关键词匹配），所以命中的是
+  /// 「电影 / 剧集 / 其他」这三档；关键词档（动漫 / 综艺 / 纪录片）只认
+  /// 已经落库的值 —— 而落库由回填与扫描保证。
+  Expression<bool> _categoryCondition(MediaCategory category) {
+    final t = _db.mediaWorks;
+    return switch (category) {
+      MediaCategory.movie => t.category.equals(category.name) |
+          (t.category.equals('') & t.kind.equals(MediaKind.movie.name)),
+      MediaCategory.series => t.category.equals(category.name) |
+          (t.category.equals('') & t.kind.equals(MediaKind.episode.name)),
+      MediaCategory.other => t.category.equals(category.name) |
+          (t.category.equals('') & t.kind.equals(MediaKind.unknown.name)),
+      MediaCategory.anime ||
+      MediaCategory.variety ||
+      MediaCategory.documentary =>
+        t.category.equals(category.name),
+    };
   }
 
   /// 排序规则。
@@ -436,8 +526,16 @@ class DriftMediaRepository implements MediaRepository {
       (t) => OrderingTerm.asc(t.title),
     ];
     return switch (sort) {
+      WorkSort.recentModified => [
+          // `lastModifiedAt` 为 NULL 时（没拿到网盘修改时间），
+          // `OrderingTerm.desc` 会把它排最后 —— 正好是我们想要的效果。
+          (t) => OrderingTerm.desc(t.lastModifiedAt),
+          ...tie,
+        ],
       WorkSort.recentAdded => [
-          (t) => OrderingTerm.desc(t.updatedAt),
+          // `firstSeenAt` 为 NULL 时（老库 v6 之前没有这列），
+          // `OrderingTerm.desc` 会把它排最后。
+          (t) => OrderingTerm.desc(t.firstSeenAt),
           ...tie,
         ],
       WorkSort.recentPlayed => [
@@ -456,17 +554,42 @@ class DriftMediaRepository implements MediaRepository {
     };
   }
 
+  /// 把 `category` 列修正到当前规则下的正确值。
+  ///
+  /// ## 它现在管两件事（以前只管一件）
+  ///
+  ///   1. **老库回填**：v3 之前入库的行 `category` 是空串（那时还没有这一列），
+  ///      现算一次补上；
+  ///   2. **让刮削结果对老数据也生效**：`WorkScraper` 会把 TMDB 的类型
+  ///      （`genres`）折算成栏目，但那只对**这次之后**的刮削有效。用户已经
+  ///      刮过的那批作品里 `genres` 早就在库、`category` 却还是扫描期判的
+  ///      旧值 —— 这一遍负责对齐，否则用户得逐部重刮才看得到分类变对。
+  ///
+  /// ## 两件事的判据不同，别合并
+  ///
+  ///   - 空串 → 走完整的 [MediaCategoryGuesser.guessFromWork]（没有任何既往
+  ///     判定可保留，只能从头猜）；
+  ///   - 非空串 → **只看 `genres`**。绝不能走完整 `guess`：它的最后一步是
+  ///     「按 kind 落电影/剧集」，会把扫描期靠目录名判出来的「综艺」冲成
+  ///     「剧集」（理由见 `WorkScraper._categoryFor` 的长注释）。
+  ///
+  /// ## 为什么不再用 `where(category = '')` 缩小范围
+  ///
+  /// 加上第 2 件事之后，「哪些行需要修」取决于 `genres` 的内容，光看
+  /// `category` 已经判断不出来了。多读几列的开销可以忽略（几千行 × 5 个短
+  /// 文本列），而**只在真的要变时才写** —— 修好之后每次启动都是
+  /// 「读一遍、零写入」，会自然收敛。
   @override
   Future<int> backfillWorkCategories() async {
-    // 只取需要的三列：几千行作品表上做一次全列物化是浪费。
+    // 只取需要的五列：几千行作品表上做一次全列物化是浪费。
     final rows = await (_db.selectOnly(_db.mediaWorks)
           ..addColumns([
             _db.mediaWorks.key,
             _db.mediaWorks.kind,
             _db.mediaWorks.title,
             _db.mediaWorks.genres,
-          ])
-          ..where(_db.mediaWorks.category.equals('')))
+            _db.mediaWorks.category,
+          ]))
         .get();
 
     if (rows.isEmpty) return 0;
@@ -476,25 +599,40 @@ class DriftMediaRepository implements MediaRepository {
       for (final row in rows) {
         final key = row.read(_db.mediaWorks.key);
         if (key == null) continue;
-        final kind = MediaKind.values.firstWhere(
-          (k) => k.name == row.read(_db.mediaWorks.kind),
-          orElse: () => MediaKind.unknown,
-        );
-        final category = MediaCategoryGuesser.guessFromWork(
-          kind: kind,
-          title: row.read(_db.mediaWorks.title) ?? '',
-          genres: _stringList(row.read(_db.mediaWorks.genres) ?? '[]'),
-        );
+
+        final stored = row.read(_db.mediaWorks.category) ?? '';
+        final genres = _stringList(row.read(_db.mediaWorks.genres) ?? '[]');
+
+        final MediaCategory? target;
+        if (stored.isEmpty) {
+          target = MediaCategoryGuesser.guessFromWork(
+            kind: MediaKind.values.firstWhere(
+              (k) => k.name == row.read(_db.mediaWorks.kind),
+              orElse: () => MediaKind.unknown,
+            ),
+            title: row.read(_db.mediaWorks.title) ?? '',
+            genres: genres,
+          );
+        } else {
+          // 非空：只看 genres 能不能给出结论；给不出就**保留原值**
+          // （null 表示「这条证据没意见」，不是「归到其他」）。
+          target = MediaCategoryGuesser.fromGenres(genres);
+        }
+
+        if (target == null || target.name == stored) continue;
+
         batch.update(
           _db.mediaWorks,
-          MediaWorksCompanion(category: Value(category.name)),
+          MediaWorksCompanion(category: Value(target.name)),
           where: (t) => t.key.equals(key),
         );
         fixed++;
       }
     });
 
-    diag.info('数据库', '分类回填完成：$fixed 部作品（老库升级）');
+    if (fixed > 0) {
+      diag.info('数据库', '分类修正完成：$fixed 部作品（老库回填 + 刮削类型折算）');
+    }
     return fixed;
   }
 
@@ -527,6 +665,67 @@ class DriftMediaRepository implements MediaRepository {
           ..where(_db.mediaWorks.lastPlayedAt.isNotNull()))
         .getSingle();
     return row.read(expr) ?? 0;
+  }
+
+  @override
+  Future<Map<int, int>> countWorksByDecade({
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  }) async {
+    // 只读 `year` 一列：作品表有十几列，为了一组数字把整行物化是浪费。
+    //
+    // 不在 SQL 里 `GROUP BY year / 10 * 10`：那要靠 SQLite 的整数除法
+    // （两个 INTEGER 相除会截断），而 drift 的表达式类型是 `int`，
+    // 一旦哪次 `year` 的列类型变成 REAL 就会静默变成浮点分组 ——
+    // 在这里用 Dart 的 `~/` 算，行为是确定的，且与内存实现逐字一致。
+    final q = _db.selectOnly(_db.mediaWorks)
+      ..addColumns([_db.mediaWorks.year]);
+    // 与 `listWorks` 共用条件：角标必须严格等于「清空年代/类型后列表里的
+    // 条数」，否则用户会点到一个空列表（理由见接口文档）。
+    final cond = _workConditions(
+      category: category,
+      playedOnly: playedOnly,
+      query: query,
+    );
+    if (cond != null) q.where(cond);
+
+    final out = <int, int>{};
+    for (final row in await q.get()) {
+      final y = row.read(_db.mediaWorks.year);
+      // 没有年份的作品不进表 —— 与 `listWorks` 的年代过滤口径一致。
+      if (y == null) continue;
+      final d = y ~/ 10 * 10;
+      out[d] = (out[d] ?? 0) + 1;
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<String, int>> countWorksByGenre({
+    MediaCategory? category,
+    bool playedOnly = false,
+    String? query,
+  }) async {
+    // 类型存在 `genres` 列（JSON 数组文本）里，SQL 数不出来 ——
+    // 只能读出这一列在 Dart 里拆。好在仍然只读一列、不碰整行。
+    final q = _db.selectOnly(_db.mediaWorks)
+      ..addColumns([_db.mediaWorks.genres]);
+    final cond = _workConditions(
+      category: category,
+      playedOnly: playedOnly,
+      query: query,
+    );
+    if (cond != null) q.where(cond);
+
+    final out = <String, int>{};
+    for (final row in await q.get()) {
+      // 去重：`genres` 理论上不重复，但数据脏了时角标也不该大于作品数。
+      for (final g in _stringList(row.read(_db.mediaWorks.genres)).toSet()) {
+        out[g] = (out[g] ?? 0) + 1;
+      }
+    }
+    return out;
   }
 
   @override
@@ -798,6 +997,8 @@ class DriftMediaRepository implements MediaRepository {
         scrapedAt: Value(w.scrapedAt),
         itemCount: Value(w.itemCount),
         totalBytes: Value(w.totalBytes),
+        lastModifiedAt: Value(w.lastModifiedAt),
+        firstSeenAt: Value(w.firstSeenAt),
         lastPlayedAt: Value(w.lastPlayedAt),
         updatedAt: Value(w.updatedAt),
       );
@@ -894,6 +1095,8 @@ class DriftMediaRepository implements MediaRepository {
         scrapedAt: row.scrapedAt,
         itemCount: row.itemCount,
         totalBytes: row.totalBytes,
+        lastModifiedAt: row.lastModifiedAt,
+        firstSeenAt: row.firstSeenAt,
         lastPlayedAt: row.lastPlayedAt,
         updatedAt: row.updatedAt,
       );

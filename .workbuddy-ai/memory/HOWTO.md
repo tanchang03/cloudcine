@@ -169,6 +169,20 @@ c = QuarkClient("; ".join(f"{k}={v}" for k, v in cookies.items()))
   把 `MediaKit.ensureInitialized()` 加进测试也**没用**（实测仍然抛同一个异常）。
 - **不能用 `pumpAndSettle`**：缓冲指示里的 `CircularProgressIndicator` 是永不停止的动画，
   pumpAndSettle 会一直等到超时。显式 pump 几拍。
+  （菜单/对话框本身是静态的，那里用 `pumpAndSettle` 没问题。）
+- **菜单/对话框要单独渲染来测**：控制栏那两个入口（字幕 / 音轨）都写着
+  `_player == null ? null : …`，而 `_player` 在测试里恒为 null → 按钮永远禁用，
+  **弹菜单那条路径不可达**，怎么 pump 都点不开。所以 `player_window_app.dart` 开了
+  `@visibleForTesting` 的 `buildAudioMenuForTest` / `buildSubtitleMenuForTest` 直接构造，
+  回归 `test/ui/windows/player_track_menus_test.dart`（20 例）。
+- ⚠️ 同一个用例里**第二次 `pumpWidget` 要换根 key**：`pumpWidget` 遇到同类型的根组件是
+  「原地更新」不是重建，Navigator 连同栈上没关掉的 `DialogRoute` 会留下来 → 第二次
+  `tap('打开')` 落在上一个菜单上，报 `would not hit test`。`key: UniqueKey()` 解决。
+- ⚠️ 测菜单要把 `tester.view.physicalSize` 开大（`Size(900, 1600)`）：字幕菜单满配 14 行，
+  默认 800×600 会让 `AlertDialog` 溢出，而溢出在测试里是**报错**不是「看不全」。
+- 菜单 pop 出来的是私有类型 `_SubtitleChoice`。它的**类型名**测试库写不出，但**成员名是公开的**
+  （`kind` / `fileId` / `trackId` / `localPath`）→ `(choice as dynamic).kind` 取得到。
+  只读不构造，既能钉住「pop 了什么」又不用为测试公开类型。
 
 ## 构建诊断
 
@@ -237,7 +251,7 @@ c = QuarkClient("; ".join(f"{k}={v}" for k, v in cookies.items()))
   `720x1280` → 1080P，虚高 1~2 档。**短边在横竖屏下都是那条短轴**，所以两个方向能共用
   一套档位表，也就不需要 VidHub 那个 `isVertical` 字段。
 
-### macOS 三条坑的机理
+### macOS 四条坑的机理
 
 1. **`network.client` entitlements**：Flutter 模板只给 `app-sandbox` + `network.server`。
    缺 `network.client` 时应用**发不出任何网络请求**，而且报错不会指向权限 ——
@@ -256,6 +270,117 @@ c = QuarkClient("; ".join(f"{k}={v}" for k, v in cookies.items()))
    `set: -: invalid option` 退出 → 目录为空 → `ld: framework 'Mpv' not found`。
    Makefile 里本来有 `sed 's/\r$//'` 去 CR，但构建期 PATH 上的 `sed` 被工具链 brokered shim
    顶掉，静默失效 —— 所以只能**用纯 Ruby 自己补链接**，别改回 sed/make。
+4. **`keychain-access-groups` 是受限 entitlement，绝不要加**（详见下一节）。
+
+### 受限 entitlement 让 Release 包启动即崩（2026-10-01）
+
+**现象**：`flutter build macos --release` 构建成功（`✓ Built … cloudcine.app`），
+但 `open` 或双击都起不来，报「应用程序意外退出」。崩溃报告关键行：
+
+```
+Exception Type:  EXC_CRASH (SIGKILL (Code Signature Invalid))
+Termination Reason: Namespace CODESIGNING, Code 1, Taskgated Invalid Signature
+codeSigningID: ""   codeSigningTeamID: ""
+usedImages: /dyld_path_missing , /main_executable_path_missing
+```
+
+**读这份报告的三个要点**（不认识这三点会白查很久）：
+- `usedImages` 里出现 `dyld_path_missing` / `main_executable_path_missing`
+  表示**内核在 exec 阶段就把进程杀了**，dyld 根本没来得及映射可执行文件 ——
+  不是 Dart 崩溃、不是插件崩溃，是签名被拒。
+- `Taskgated Invalid Signature` 是 taskgated 守护进程的判决，与「app 内代码」无关。
+- `threads` 里**没有任何调用栈**（`frames: []`），所有寄存器为 0。这就是它的签名。
+
+**根因**：两份 `.entitlements` 里写了 `keychain-access-groups`。它属于
+**「需要描述文件的能力项」（restricted entitlement）** —— 只能由 provisioning
+profile 下发。而本项目刻意走 ad-hoc 签名（`CODE_SIGN_IDENTITY = "-"`、
+`DEVELOPMENT_TEAM` 为空），拿不到描述文件，于是：
+
+1. **ad-hoc 签名 + 受限 entitlement → 签名被判无效 → 启动即 SIGKILL。**
+2. 顺带地，同一份 entitlement 会让 Xcode 构建报
+   `"Runner" requires a provisioning profile.`（用 `CODE_SIGN_STYLE = Manual`
+   或 Automatic 都会报）。
+
+**验证手法（当时怎么确认的）**：不必重新构建，直接改签名试：
+
+```bash
+# 把 keychain-access-groups 去掉、sandbox 关掉，ad-hoc 重签（ad-hoc 不需要钥匙串，不会报错）
+codesign --force --deep --sign - --entitlements /tmp/test_ent.plist \
+  build/macos/Build/Products/Release/cloudcine.app
+open build/macos/Build/Products/Release/cloudcine.app   # 立刻就能起来
+```
+
+**正确做法**（与参考项目 `夸克音乐播放器` 的 entitlements 完全一致，两边不要分叉）：
+
+| 项 | 值 | 理由 |
+| --- | --- | --- |
+| `com.apple.security.app-sandbox` | **`false`** | 沙箱会把数据目录换成 `~/Library/Containers/…`，debug/release 各持一份媒体库；沙箱下系统安全存储写入还会报 `-34018` |
+| `keychain-access-groups` | **不写** | 受限 entitlement，ad-hoc 下启动即崩 |
+| `com.apple.security.network.client` | `true` | 出站请求 |
+| `com.apple.security.network.server` | `true` | 播放器给直链挂请求头时要在 127.0.0.1 起代理 |
+| `com.apple.security.files.user-selected.read-only` | `true` | 「加载本地字幕文件」（沙箱已关，保留以记录意图） |
+| `DebugProfile` 额外 `get-task-allow` | `true` | 否则 `flutter run` 连不上 Dart VM Service |
+
+**排查时踩过的两个假线索**（别再走一遍）：
+- 用 `Developer ID Application` 证书重签能解，但**本机签不动**。本机确实有可用证书
+  （`security find-identity -v -p codesigning /Users/tandy/Library/Keychains/login.keychain-db`，
+  **必须显式查 login 钥匙串**，沙箱 HOME 下会漏看），但 `codesign --force --deep` 签整包时
+  报 `errSecInternalComponent`（子组件里残留 `*.cstemp` 也会让重签报
+  `invalid or unsupported format for signature`）。⚠️ 注意：**兄弟项目用
+  `flutter build macos --release` 走 Developer ID 是成功的**（产物 `TeamIdentifier=7TXGZ3BSQC`），
+  所以「签不动」只对**手动 `codesign`** 成立，不等于 Xcode 构建那条路不行。
+- `open` 与双击都崩 ≠ 命令行直接跑二进制没崩。当时 `timeout 5 <binary>` 看着「退出码 0」，
+  其实是被 `|| true` 吞掉了 —— **别用 `|| true` 包住要判读退出码的命令**。
+
+### 钥匙串在 ad-hoc 签名下**必然**弹框（2026-10-01 定案，别再试了）
+
+原来这一节写过「关掉沙箱后并不会每次弹框」——**那是错的**。用户实测反馈
+「每次启动都要输钥匙串密码」，复测后确认无解。
+
+**机制**：钥匙串条目的 ACL 只认「创建它的那一份代码签名」。ad-hoc 的身份是
+**cdhash**（`codesign -d -r- cloudcine.app` 可见），每重新构建一次就变一次，
+ACL 永远对不上。
+
+**三条路全试过、全废**：
+
+| 方案 | 结果 |
+| --- | --- |
+| 加 `keychain-access-groups` entitlement | 启动即 SIGKILL（见上一节），且 `requires a provisioning profile` |
+| `useDataProtectionKeyChain: true`（`flutter_secure_storage` 默认） | 每次写入 `PlatformException(Code: -34018, A required entitlement isn't present.)` |
+| 自建原生通道 + 写入「任何程序都可访问」的 ACL | **仍弹框**，见下 |
+
+**第三条的实测数据**（这是最容易误判的一条，所以留全）：
+
+搭一个最小 `.app`（ad-hoc 签名），行为逐字复刻 `read`/`write`（先删后建）；
+建条目 → **原地重新构建**（cdhash `6c1d9c6e…` → `d61f0379…`，路径不变）→ 再启动：
+
+```
+[P1-create]        read -> 0
+[P2-after-rebuild] 17:32:42.792 启动
+[P2-after-rebuild] 17:32:46.014 read -> -128 User canceled the operation.   ← 阻塞 3.2 秒 = 弹框了
+[P2-after-rebuild] write.delete -> 0
+[P2-after-rebuild] write.add -> 0
+[P2-after-rebuild] read -> 0
+```
+
+两种受信程序写法都不行：`SecTrustedApplicationCreateFromPath(nil, …)`（「任意程序」）
+与 `SecTrustedApplicationCreateFromPath(bundlePath, …)`（app 自己的路径）。
+连 Apple 自带的 `/usr/bin/security find-generic-password -w` 去读也拿到 `-128`。
+
+**⚠️ 判断「到底弹没弹框」的办法**：看**耗时**。
+真弹模态框会阻塞到用户点；`-128` 立刻返回则多半是「需要授权但当前上下文弹不出 UI」。
+CLI 探针跑在非 GUI 会话里，**结论不可信** —— 必须打包成 `.app` 用 `open` 起。
+
+**唯一能零弹框的路**：**稳定的签名身份**（Developer ID）。
+兄弟项目 `夸克音乐播放器` 就是这么做的，`cloudtune.app` 实测不弹。
+本项目选择不给播放器签公司证书，所以 macOS 侧改成
+**加密文件**（`EncryptedFileSecretBackend` + `secret_cipher.dart`）：
+零弹框、零授权、零签名依赖。代价是「混淆级」保护 —— 密钥由本机+本用户派生，
+同机同用户的任何程序都能解开。
+
+**教训（最重要的一条）**：排查这类问题**不要在用户机器上跑会触发系统授权的探针**。
+授权框是系统级 UI，弹出来用户根本不知道是谁在要权限 —— 2026-10-01 就因此让用户
+看到一串「请输入钥匙串密码」的框并一头雾水。
 
 ### TMDB 响应形状那个 bug 的完整复盘
 
@@ -472,4 +597,310 @@ UTF-8 文本再交给 mpv。网盘/在线两路的字节在主窗口取（那边
 清空判据用 `itemId` 而不是「又来了一条请求」：刷新直链也会走 `_adoptRequest`，
 那条路换的只是 URL。用「有没有新请求」判，会让用户正在挑的在线字幕列表
 在一次自动刷新后凭空消失。
+
+## 刮削匹配闸门：宁可漏刮，也不刮错（2026-10-01）
+
+### 事故：查询带着 `year=2026`，结果返回 1994 年的片子
+
+网盘目录 `/来自：分享/超z级z马z力z欧z银z河z大z电影aa(2026) 4K HDR & Dv/`
+（真名《超级马力欧银河大电影》，发布组每个字之间插了个 `z` 规避关键词过滤）
+被刮成了 **《低俗小说》(1994)**。
+
+根因不是数据源错了，而是**代码从没校验过结果**：`TmdbScraper._searchOne`
+直接取 `results.first`。TMDB 的 `/search/movie` 是**模糊搜索** ——
+它返回「按相关度排序的猜测」，查询词再离谱也可能有返回。
+于是「查不到」被静默地变成了「查到了另一部片子」。
+
+最荒谬的地方是：查询里明明带了 `year=2026`，返回的是 1994 年的，
+**年份差 32 年而代码毫无察觉**。
+
+### 三道判据与它们的边界（都是实测算出来的数）
+
+`domain/services/scrape_match.dart` 的 `ScrapeMatch.evaluate`，顺序固定：
+
+1. **年份硬闸门**：两边都有年份且 `gap >= 2` → 淘汰。定 2 而不是 1：
+   发布组标「发行年」、数据源记「首播年」差一年是常态；而本次事故差 32 年，
+   离阈值远得很。**任一边没年份时这道闸门不生效**（否则「发布组没标年份」
+   的片子会被全判死），交给标题判。
+2. **相似度**（查询词 × `title`/`originalTitle` 两两取最高）：
+   - `== 1`：精确；
+   - 前缀 `0.65 + 0.35r`：`仙逆` × `仙逆 第一季` = **0.79**。
+     ⚠️ 这一档的下界是 **0.65 > strongSimilarity(0.6)**，所以**前缀档是
+     无条件接受、不靠年份的**。别以为「沾边才要年份」也适用于前缀 ——
+     同一部作品的分季命名全在这一档，给它们加年份要求会把分季条目全判死。
+   - 包含 `0.55 + 0.25r`：`地球` × `流浪地球2` = 0.65；
+     `联盟` × `复仇者联盟无限战争` = **0.6056**（刚好过 0.6，落到强档）。
+     只有 `r < 0.2` 时包含才会掉进沾边档。
+   - 否则 Dice bigram。
+3. **沾边档 `0.35 ~ 0.6`**：**必须有年份兜底**（`gap <= 1`）才接受，
+   否则淘汰。`Se7en` × `Seven` = **0.5** + 同年 → 接受（同一部片的两种写法）；
+   `无间道` × `无间行者` = **0.4** + 没年份 → 淘汰（两部不同的片子）。
+4. **跨书写系统**（一边有汉字另一边没有）且 `gap <= 1` → 接受。
+   中文查询词 × 英文结果时相似度天然为 0，只能靠年份；**没年份就淘汰**。
+
+实测数值备查（写测试时别再猜）：`蜘蛛侠英雄无归` × `蜘蛛侠平行宇宙` = 0.333
+（低于沾边档）、`流浪地球` × `流浪地球2` = 0.93、`海王` × `海王2` = 0.883、
+`阿凡达` × `阿凡达水之道` = 0.825。
+
+### ⚠️ Dice 兜底会被「偶然相邻的 bigram」命中，所以断言别写 0
+
+`超z级z马z力z欧z银z河z大z电影aa` × `超级马力欧银河大电影` 的相似度是
+**0.0714，不是 0** —— 因为那串乱码里 `电` 与 `影` 恰好是相邻的，
+撞上了结果标题里的 `电影` 这一个 bigram。
+
+判定不受影响（0.0714 远低于沾边档下界 0.35），但测试必须写
+`lessThan(ScrapeMatch.weakSimilarity)` 而不是 `0`：写 0 会在别人调整
+bigram 切法时莫名其妙地红，而且红得看不出原因。
+
+### 闸门只管自动路径，手动路径必须绕开
+
+`ScrapeMatch` 只接在 `TmdbScraper._pickVerified` 与 `DoubanScraper._pickBest`
+上（自动刮削）。`search()` / `resolve()` 那条**手动通道不过闸门** ——
+实际被闸门拦下来的候选，往往正是用户想找的那一个。见下一节。
+
+## 手动刮削通道（2026-10-01）
+
+`ui/widgets/manual_scrape_dialog.dart` + `WorkScraper.{queryFor,searchCandidates,applyCandidate}`
++ `MetadataScraper.{search,resolve}`。详情页「刮削」旁边那个「手动」按钮。
+
+### 三个交互决定（都有理由，别随手改）
+
+1. **预填的是「文件名解析出来的词」，不是库里已存的标题。**
+   库里那个可能是上一次刮错的结果（`低俗小说`）—— 用户得先意识到
+   「这个框里是错的」才会去改；而预填解析原文
+   （`超z级z马z力z欧z银z河z大z电影aa`）直接展示了「自动刮削拿着这么个
+   词去搜」，用户一眼就知道该删掉那些 `z`。
+2. **打开时不自带一次搜索。** 豆瓣额度按**搜索词**计，匿名只有约 10 个；
+   预填的那个词正是自动刮削刚搜失败的那一个，替他再花一次毫无价值。
+3. **点候选只是选中，还要再点一次「用这一条更新」。** 刮削会覆盖标题、
+   年份、海报、简介，不该在用户只是「看看有哪些候选」的时候发生 ——
+   这就是「确认」那一步。失败时**留在对话框里**（关掉的话用户还得重新
+   敲一遍片名，而他要做的只是换一条候选）。
+
+### `search()` 为什么只搜一个词、且不打详情接口
+
+- 只搜一个词：`scrape()` 会在第一个词零命中时再花第二个词的额度（共 2 个），
+  手动通道一次点击只花 1 个，且用户看得见结果、不满意可以自己改了再搜。
+- 不打详情接口：候选列表要的是「有哪些片子」，不是「每部片子的完整资料」。
+  豆瓣的 `search()` 只做 `_search` 一次请求；完整海报与简介留给
+  **用户选中之后**的 `resolve()`（那一步才必须打 `/movie/{id}`，
+  因为搜索结果的 `cover_url` 是 120px 横条，不能当海报）。
+- 只剔非影视条目（书 / 音乐 / 游戏）：`type=movie` **不是过滤器**，
+  不剔的话搜「繁花」前两条就是两本书。
+
+### 候选缩略图复用 `PosterCache`
+
+`_CandidateThumb` 走 `posterCacheProvider.pathFor(key: 'candidate-<source>-<id>', url:)`
+而不是 `Image.network`：豆瓣的图必须带 `Referer`，而那个头是缓存层的
+`headersFor` 回调按域名给的 —— 走 `Image.network` 就得把「哪家图要什么头」
+复制一份到 UI 层。
+
+### 结果文案必须按「通道」分，不能只按状态（2026-10-01 补）
+
+`WorkScrapeOutcome.message` 一开始只 `switch (status)`，于是
+`WorkScrapeStatus.notFound` 在两个通道里共用同一句话：
+
+> 在线源都没有找到匹配的条目，可能是片名解析不准，或这个词在数据源里没有收录。
+
+手动对话框把它原样显示出来 —— 用户**刚刚亲眼看到一列候选、亲手点了一条**，
+却被告知「没找到条目 / 片名解析不准」。他会以为界面坏了，或者去改一个
+本来没错的词。根因是 `notFound` 在两个通道里是**两件不同的事**：
+
+| | 谁搜的 | 为什么失败 | 下一步 |
+|---|---|---|---|
+| `auto` | 算法拿文件名解析出的词 | 没搜到信得过的条目 | **换个词自己搜** |
+| `manual` | 用户亲手从候选里挑 | 那一条解析不出完整元数据 | **换一条候选** |
+
+修法是给结果加 `ScrapeChannel` 维度，文案按 `(status, channel)` 取
+（成功那条两个通道共用，「已刮削：…」对谁说都一样）。`channel` **故意不给
+默认值** —— 默认值会让「漏填」静默编译通过，而漏填正是当初那个 bug。
+
+两处配套，改一处必须改另一处：
+- auto 那条文案末尾写死了「点旁边的『手动』自己敲片名再搜」。它成立的前提是
+  **`auto` 只有详情页「刮削」按钮这一个来源**（扫描期的自动刮削走
+  `ScraperPipeline`，根本不产出 `WorkScrapeOutcome`），而「手动」按钮就并排
+  在它旁边。把「手动」藏进菜单，这句文案就开始撒谎。
+- `_ManualScrapeButton` 的文档注释原先写着「自动失败时用户看到的是一句
+  **没有下一步**的话」—— 那是当时的实情，补上引导之后就成了错的描述。
+  **注释描述的行为改了，注释本身也要改。**
+
+测试钉了四条：auto 文案含「手动」；manual 文案含「换一条」且**不含**
+「片名解析不准」/「在线源都没找到」；两条 notFound 文案确实不同；
+成功文案两个通道一致。最后一条是防「顺手也给它分个叉」——
+分了只会多一处要维护的重复。
+
+### 审过但确认**不是** bug 的四处（2026-10-01 端到端复审）
+
+写下来是为了别让下一轮把它们当缺陷「修」掉。
+
+1. **`applyCandidate` 在 `runningKey != null` 时返回 `null`，对话框会显示
+   通用兜底「更新失败，请换一条候选再试」—— 这看着像「把并发当成候选错」，
+   但**实际不可达**：`ManualScrapeDialog` 是模态的
+   （`showDialog` + `barrierDismissible: false`），对话框开着的时候点不到
+   背后的「刮削」；而 `runningKey` 只有 `scrape()` / `applyCandidate()`
+   会写，扫描期的自动刮削走 `ScraperPipeline`、根本不碰控制器。
+   所以这条分支只是防御性代码，留着比删掉好（删了将来放宽并发就是真 bug）。
+2. **`DoubanScraper.search` 完全不看 `query.kind`**（只用 `query.title`），
+   而对话框里有个「电影 / 剧集」下拉。看着像「控件没接上」，但这是**对的**：
+   豆瓣的 `type=movie` 本来就不是过滤器，代码是按 `targetType` 本地剔
+   （只留 `movie` / `tv`，见类文档坑 #2），而手动搜索**本来就该两种都给**
+   —— 用户自己挑。`kind` 只对 TMDB 有效（`/search/movie` 与 `/search/tv`
+   是两个不同端点，`year` 也要换成 `first_air_date_year`）。
+3. **`_search()` 构造的 `ScrapeQuery` 不带 `season` / `episode`**。不影响：
+   这两个字段只有 TMDB 的剧集搜索路径关心，而 `resolve()` 根本不接
+   `ScrapeQuery`（它只用 `candidate`）—— 用户敲的词只作用于**搜索**，
+   选中之后落库靠的是候选自己的 id。这正是该有的设计。
+4. **年份预填 + TMDB 硬过滤这个组合不是 bug。** 对话框把文件名里的年份
+   （`…aa(2026) 4K HDR`）填进「年份」，而 TMDB 的 `year` 是**硬过滤**，
+   填错会把正主直接筛掉 —— 但预填的值来自**文件名**而不是库里那个可能已
+   刮错的年份（`q?.year ?? widget.work.year`），且输入框下面那行提示
+   「年份留空能搜到更多候选（TMDB 的年份是硬过滤…）」就是为这个失败模式写的。
+   预填 + 提示是刻意的一对，别只删其中一个。
+
+### 已知的粗糙边缘（接受，暂不改）
+
+手动应用**失败**后，控制器仍会把 manual 那条文案写进 `state`。对话框里显示
+没问题（就地说明），但如果用户接着**取消**对话框，详情页按钮下面会留着
+「…换一条候选再试」——而候选列表已经跟着对话框一起消失了。语义上没错
+（它确实描述了刚发生的事），只是那句「换一条候选」指向了一个不在场的东西。
+真要治就得给「失败」也带上来源标记、或者失败时干脆不写 `state`；
+当前判断是不值得为此加一层状态。
+
+## `implements MetadataScraper` **不继承**默认实现（2026-10-01）
+
+给 `MetadataScraper` 加了两个带默认实现的方法（`search` / `resolve`），
+结果 **`flutter analyze` 立刻红**：`Missing concrete implementations of
+'MetadataScraper.resolve' and 'MetadataScraper.search'`。
+
+原因：Dart 的默认实现**只对 `extends` 生效**，而本项目所有实现都是
+`implements MetadataScraper`（`TmdbScraper` / `DoubanScraper` /
+`LocalFilenameScraper`，以及测试里的 `_Fake` / `_Fixed`）。
+
+→ 给这个接口加方法时，**所有实现方都要显式补上**，包括测试假实现。
+我一开始在接口文档里写了「有默认实现，所以离线源与测试假实现都不用改」，
+那是错的，已改掉。想少改几处就拆一个独立的可选接口（`if (s is CandidateSearcher)`），
+但当前实现方只有 5 个，显式写更直白。
+
+## 详情响应必须自带 `title`，不许用查询词兜底（2026-10-01）
+
+`DoubanScraper._toMetadata` 原来写的是
+`_stringOf(detail['title']) ?? query.title`。它看着更「健壮」，实际是把
+「详情没拿到」伪装成「刮削成功」：
+
+服务端返回 HTTP 200 但内容不是条目（错误对象 / 风控页 / 接口改版）时，
+兜底会把**用户搜的那个词**当成结果写进库 —— 标题是有的、海报简介一个都没有，
+而且 `source` 记成 `online`。用户看到的是「已刮削」，
+**与「刮削成功但没有封面」这类现象完全一样，排查时最难想到根因在这里**。
+
+改成 `title` 只能来自响应体，拿不到就返回 `null`（并 `diag.warn` 一行）。
+正常的 `/movie/{id}` 响应**一定有** `title`（实测 77 个顶层字段里它是必有的），
+所以这个收紧不会误伤。顺带把不再需要的 `query` 参数从 `_toMetadata` 去掉了。
+
+测试钉了两条：非 2xx → `null`；**200 但 body 是 `{"code":500,...}` → 也是 `null`**。
+
+
+## 筛选面板：年代 / 类型（2026-10-01）
+
+`lib/ui/widgets/library_filter_panel.dart` + `LibraryFilter.decades` / `.genres`。
+
+### 为什么是浮层，为什么是 `MenuAnchor`
+
+分类栏（`_CategoryBar`）已经占了列表上方一整条，再摆两排类型 / 年代会把海报墙
+挤到屏幕下半部分 —— 而这两组条件绝大多数时候是不用的。做成浮层后，生效的条件
+以数字标在按钮上，所以「现在到底筛没筛」仍然随时可见。
+
+`MenuAnchor` 而不是自己搭 `OverlayEntry`：点外部关闭、Esc 关闭、屏幕边缘回弹、
+焦点管理它都做完了，而这几件恰恰是「菜单偶尔关不掉」这类难查问题的来源。
+
+两个容易踩的配套：
+
+- 面板里放**普通 `InkWell`** 而不是 `MenuItemButton` → 点一个 chip **不会**把
+  面板关掉。多选必须能连续点几下。
+- 面板内那个 `SingleChildScrollView` **必须 `primary: false`**。不关的话它会和
+  菜单自身那一层滚动抢同一个 `PrimaryScrollController`，Flutter 直接抛
+  「PrimaryScrollController is attached to more than one ScrollPosition」——
+  而这个错**只在打开面板那一刻**才炸。
+
+### 角标口径：**「把年代 / 类型清空后列表的条数」**
+
+这是整块功能唯一的承诺：**面板上每一个选项，点下去至少有一条结果**。
+
+所以计数要跟着 `category` / `playedOnly` / `query` 收窄，却**不能**跟着
+`decades` / `genres` 收窄 —— 否则用户每勾一个类型，剩下的类型角标就跟着变，
+勾到第二个时列表已经空了。
+
+代价（已告知用户）：面板选项会跟着当前分类 / 搜索词收窄。
+
+`countWorksByDecade` / `countWorksByGenre` 因此要收三个作用域参数；两个
+provider 用 `select((f) => (f.category, f.playedOnly, f.query))` 只盯这三个
+字段，否则「勾一个年代」也会白跑一遍全表扫描。三个查询（`listWorks` + 两个
+count）共用 `DriftMediaRepository._workConditions`，保证口径绝不漂移；
+`InMemoryMediaRepository` 的两个计数**委托 `listWorks`**，两边由
+`test/domain/media_repository_filter_test.dart` 逐条件比对。
+
+### SQL 侧的两个细节
+
+- 类型存在 `genres` 列（JSON 数组文本）里，匹配必须 **`LIKE '%"类型"%'`** ——
+  **引号是关键**：不带引号时「动画」会命中「动画片」。转义按 SQL 的
+  `"` → `""`。
+- 年代是 `year >= d0 AND year < d0+10` 的 OR 组；`year IS NULL` **不命中任何
+  年代**（所以面板会缺一项，而不是把没年份的算进 1970 年代）。
+- 多选之间一律**「或」**：一部片子只属于一个年代，取交集恒为空；类型同理。
+
+### 三条一致性陷阱（都踩过、都有测试钉住）
+
+**① 计数 provider 必须 `await categoryBackfillProvider`。**
+角标是按 `category` 收窄算的，而老库里那一列还是空串（v3 之前入库的行）。
+不等的话：`workListProvider` 已经按回填后的分类筛好了列表，面板上的数字却还是
+按回填前的分类算的 —— 两者对不上，而用户完全看不出为什么。
+这条依赖很反直觉（「数年代为什么会依赖分类？」），所以测试单独一个文件
+`test/ui/providers/library_facet_counts_test.dart` 钉住，免得下一轮有人觉得
+那个 `await` 是多余的顺手删掉。
+
+**② `scrape_providers._refreshAfter` 里「分类变了」要额外作废这两组角标。**
+原来的判据只有「`year` 变了没、`genres` 变了没」，盖不住：库里有一行
+「`genres` 已经是 TMDB 给的『动画』、`category` 却还停在『剧集』」（老版本写的
+行，或分类折算那行代码加上之前刮削入库的），用户点一次「刮削」—— `genres`
+一个字都没变、`year` 也没变，**只有 `category` 从「剧集」挪到了「动漫」**。
+此时作品已经离开「剧集」栏的统计范围，两组角标却都不作废。
+`test/ui/providers/scrape_refresh_test.dart` 用会数调用次数的仓储把
+「该重算」与「**不该**重算」两个方向都钉住。
+
+**③ 已选条件在切换分类后可能不在 `counts` 里 → 必须照样画出来。**
+`setCategory` **不碰** `decades` / `genres`（刻意：切回去时用户的勾还在）。
+于是「在电影栏选了 1990 年代 → 切到动漫栏（一部 90 年代都没有）」时，
+这一项不在 `counts` 里。只画 `counts` 里有的项的话，那颗 chip 会**整个消失**，
+而它仍然是生效的条件：用户看到按钮上写着「已选 2 项」、列表却是空的，却找不到
+那第二个条件在哪 —— 唯一的出路是「清空筛选」，把另外那个还想留的条件一起抹掉。
+
+修法：把这类项也画出来，标「无结果」（灰字 + 仍是打勾态），**照样可点**，
+所以能被**单独**取消。同时，有已选项时**不再**说「还没有带年份的作品」——
+两句话同时出现会自相矛盾（用户正看着一颗勾着的「1990 年代（无结果）」）。
+
+### 空态按钮必须与提示语指向同一件事
+
+`lib/ui/pages/library_page.dart` 的 `libraryEmptyHint()`（纯函数，可单测）
+把「列表为空时说什么、按钮清什么」按**当前实际在用的条件**分派：
+
+| 在用的条件 | 提示语 | 按钮 | 清掉什么 |
+|---|---|---|---|
+| 年代/类型 + 搜索词 | 没有同时匹配「X」与所选年代/类型的作品 | 清空筛选条件 | 两者，**保留分类** |
+| 只有年代/类型 | 当前筛选条件下一条都没筛到 | 清空筛选 | 面板两组，**保留分类** |
+| 只有搜索词 | 没有匹配「X」的作品 | 清空搜索 | 搜索词，**保留分类** |
+| 都没有（只切了分类） | 这个分类下暂时没有作品 | 回到全部 | 全部复位 |
+
+两个为什么：
+
+- **按钮不能一律 `clear()`**。`clear()` 是全部复位（分类、排序、搜索词、面板
+  两组）。只打了搜索词的用户点「清空筛选」，连分类栏选的位置和排序都一起丢掉，
+  而他不会把「我的栏目没了」和「我刚点了个清空按钮」联系起来。
+- **要清就清掉全部在用的条件**。按钮的用途是让用户重新看到内容；同时设了搜索词
+  与年代却只清一个，列表很可能还是空的 —— 用户会认为这个按钮坏了。
+
+判据用 `query.trim()`，与 `LibraryFilter.isEmpty` / `workListProvider` 保持一致；
+只判 `isNotEmpty` 的话，用户打了几个空格再删干净会走到「清空搜索」，
+而搜索框已经是空的了。
+
+`test/ui/pages/library_empty_hint_test.dart` 逐情形钉住。
+
 

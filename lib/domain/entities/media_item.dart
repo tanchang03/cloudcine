@@ -167,7 +167,16 @@ class MediaItem {
 
   /// 稳定主键。`provider` 前缀是必须的：接第二家网盘后，不同网盘的
   /// `fid` 完全可能撞车。
-  String get id => '${provider.id}:$fileId';
+  String get id => idFor(provider, fileId);
+
+  /// 主键的构造规则。**单独暴露出来**是给「还没入库的网盘条目」用的：
+  /// 目录视图要判断「网盘上的这个文件是不是已经在库里了」，而它手上只有
+  /// 一个 `DriveEntry`，没有 `MediaItem`。让调用方自己拼
+  /// `'${provider.id}:${entry.id}'` 就等于把主键格式抄了第二份 ——
+  /// 哪天格式变了，那处比对会**静默地**永远不命中（表现为「已入库」标记
+  /// 全部消失，而扫描、播放都正常）。
+  static String idFor(DriveProvider provider, String fileId) =>
+      '${provider.id}:$fileId';
 
   /// 展示名：片名 + 集号/年份，没有片名时退回文件名。
   String get displayTitle {

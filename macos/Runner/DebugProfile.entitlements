@@ -2,8 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- 关闭沙箱：与 Release.entitlements 保持一致。
+	     理由见 Release.entitlements 里的同一段注释。 -->
 	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<false/>
 	<!--
 	  允许调试器附加到本进程。macOS 的 taskgated 守护进程在收到
 	  task_for_pid 请求时会查这个权限——没有它，flutter run 构建成功
@@ -19,24 +21,22 @@
 	<key>com.apple.security.network.client</key>
 	<true/>
 	<!--
-	  读用户**通过文件选择器挑中**的文件。只读，不写。
-	  目前唯一的用途是播放器里「加载本地字幕文件」—— 沙箱下没有这一条时，
-	  选择器能弹出、也能返回路径，但紧接着的读取会失败，报的还是
-	  「Operation not permitted」这种不指向权限的错。
+	  读用户**通过文件选择器挑中**的文件（播放器里「加载本地字幕文件」）。
+	  沙箱已关闭，实际不再受此约束，保留以记录意图。
 	  ⚠️ Debug 与 Release 两个 entitlements 都要有，只加一个的表现是
 	  「开发时好好的，打包出来读不了」。
 	-->
 	<key>com.apple.security.files.user-selected.read-only</key>
 	<true/>
-	<!--
-	  Data Protection Keychain 访问权限。
-	  flutter_secure_storage 的 useDataProtectionKeyChain=true 需要这一条，
-	  否则报 -34018（errSecMissingEntitlement）。
-	  $(AppIdentifierPrefix) 在 ad-hoc 签名下解析为空串，正式签名下解析为 Team ID。
-	-->
-	<key>keychain-access-groups</key>
-	<array>
-		<string>$(AppIdentifierPrefix)com.cloudcine.cloudcine</string>
-	</array>
+	<!-- ⛔ 这里**不要**加 keychain-access-groups。
+	     它属于「需要描述文件的能力项」：一旦写上，签名就变成「受限签名」，
+	     ad-hoc 签名下 macOS 的 taskgated 会直接判定签名无效并把进程
+	     SIGKILL —— 报 `EXC_CRASH (SIGKILL (Code Signature Invalid))` /
+	     `Termination Reason: Namespace CODESIGNING, Code 1,
+	     Taskgated Invalid Signature`。同一个 entitlement 还会让 Xcode
+	     构建报 `"Runner" requires a provisioning profile.`
+	     本项目在 macOS 上**根本不用钥匙串**（凭证走加密文件，见
+	     SecureCredentialStore），所以更加没有任何理由加它。
+	     Release.entitlements 同步。 -->
 </dict>
 </plist>

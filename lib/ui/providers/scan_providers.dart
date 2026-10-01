@@ -7,8 +7,36 @@ import '../../domain/entities/scan_policy.dart';
 import '../../domain/services/scan_service.dart';
 import 'app_providers.dart';
 import 'library_providers.dart';
+import 'library_refresh_providers.dart';
 import 'scrape_providers.dart';
 import 'settings_providers.dart';
+
+/// 按用户设置构造扫描策略。
+///
+/// **全盘扫描与文件夹里的「发现媒体」共用这一份** —— 两处各读一遍设置的话，
+/// 用户把「请求间隔」从 350ms 调到 1000ms 只会对其中一条路径生效，
+/// 另一条会继续按旧值打网盘，而用户完全无从发现。
+Future<ScanPolicy> buildScanPolicy(Ref<Object?> ref) async {
+  final settings = ref.read(settingsStoreProvider);
+
+  // 一次批量读，避免几个串行的 SQLite 往返。
+  final values = await settings.readAll(const [
+    SettingKeys.scanIntervalMs,
+    SettingKeys.scanMaxDepth,
+  ]);
+
+  final intervalMs = int.tryParse(values[SettingKeys.scanIntervalMs] ?? '') ?? 350;
+  final maxDepth = int.tryParse(values[SettingKeys.scanMaxDepth] ?? '') ?? 12;
+
+  return ScanPolicy(
+    maxDepth: maxDepth,
+    minRequestInterval: Duration(milliseconds: intervalMs),
+    // ⚠️ **必须显式关掉**。`ScanPolicy` 的默认值是 `audioOnly: true`
+    // （那份配置继承自音频项目），开着会只索引音频文件，
+    // 视频库扫完会一条都不剩 —— 而且**不报错**。
+    audioOnly: false,
+  );
+}
 
 /// 构造一次扫描用的 [ScanService]。
 ///
@@ -28,29 +56,11 @@ import 'settings_providers.dart';
 /// 默认是关的，所以扫描多半根本不碰它们 —— 详情页那个按钮用的才是同一套
 /// 实例，熔断状态要在那里延续。
 Future<ScanService> buildScanService(Ref<Object?> ref) async {
-  final settings = ref.read(settingsStoreProvider);
-
-  // 一次批量读，避免几个串行的 SQLite 往返。
-  final values = await settings.readAll(const [
-    SettingKeys.scanIntervalMs,
-    SettingKeys.scanMaxDepth,
-  ]);
-
-  final intervalMs = int.tryParse(values[SettingKeys.scanIntervalMs] ?? '') ?? 350;
-  final maxDepth = int.tryParse(values[SettingKeys.scanMaxDepth] ?? '') ?? 12;
-
   return ScanService(
     registry: ref.read(adapterRegistryProvider),
     library: ref.read(mediaRepositoryProvider),
     scraper: ref.read(scraperPipelineProvider),
-    policy: ScanPolicy(
-      maxDepth: maxDepth,
-      minRequestInterval: Duration(milliseconds: intervalMs),
-      // ⚠️ **必须显式关掉**。`ScanPolicy` 的默认值是 `audioOnly: true`
-      // （那份配置继承自音频项目），开着会只索引音频文件，
-      // 视频库扫完会一条都不剩 —— 而且**不报错**。
-      audioOnly: false,
-    ),
+    policy: await buildScanPolicy(ref),
   );
 }
 
@@ -161,11 +171,20 @@ class ScanController extends Notifier<ScanState> {
       // 放在 `finally` 里：**取消和失败也改过库**（每页都落盘了），
       // 只刷新成功路径会让取消后列表停在旧数据上。
       if (!_disposed) {
+        // 推一下「库刚被写过」的信号：目录视图的「已入库」标记读的是同一张表，
+        // 不推的话用户扫完回到目录视图，看到的还是扫描前的标记。
+        ref.read(libraryWriteSignalProvider.notifier).bump();
         ref.invalidate(workListProvider);
         ref.invalidate(libraryStatsProvider);
         // 「最近播放」的角标也要跟着重取：清理陈旧条目会删掉一些播过的
         // 作品行（网盘侧已删除的文件）。
         ref.invalidate(playedCountProvider);
+        // 三个筛选角标同样会变：新扫进来的作品带着新的分类 / 年份 / 类型。
+        // 少一个的话，用户扫完 100 部电影，筛选面板上「电影」还是旧数字，
+        // 看起来像「筛选没生效」。
+        ref.invalidate(categoryCountsProvider);
+        ref.invalidate(decadeCountsProvider);
+        ref.invalidate(genreCountsProvider);
       }
     }
   }

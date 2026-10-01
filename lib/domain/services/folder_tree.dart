@@ -4,6 +4,16 @@ import '../entities/media_item.dart';
 
 /// 网盘目录树（只读）。
 ///
+/// ## ⚠️ 它现在的角色变了：叠加层，不是目录视图的数据源
+///
+/// 目录视图（`ui/widgets/folder_browser.dart`）现在**直接读网盘目录**
+/// （逐层列取，见 `drive_browse_providers.dart`）。原因很直接：本地索引
+/// 里没有的东西，用它重建出来的目录树里也看不见 —— 新上传的片子、上次扫描
+/// 漏掉的目录、中途取消没扫完的部分，用户翻到那个位置只会看到「空的」。
+///
+/// 这棵树退居为**叠加层**：回答「网盘上的这个文件是不是已经在库里了」。
+/// 目前实际被调用的只有 [fileIds] 与 [indexedCountAt] 两个入口。
+///
 /// ## 为什么能离线重建
 ///
 /// `MediaItem` 自带 [MediaItem.dirPath] —— 扫描期按遍历栈拼出来的展示路径
@@ -45,6 +55,23 @@ class FolderTree {
   /// 目录视图的搜索直接在这上面过滤 —— 搜索结果要能一眼看出文件在哪，
   /// 所以顺序必须按**路径**聚在一起，而不是按入库时间。
   final List<MediaItem> files;
+
+  Set<String>? _idCache;
+
+  /// 全部已入库文件的 id 集合。
+  ///
+  /// 现在的目录视图**不再**用这棵树当数据源（它读的是网盘实时目录），
+  /// 这棵树退居为**叠加层**：网盘上的某个文件「是不是已经在库里了」。
+  /// 那个判断在每个文件行上都要做一次，所以这里缓存成 Set ——
+  /// 每次现扫一遍 `files` 会把列表滚动变成 O(n²)。
+  Set<String> get fileIds =>
+      _idCache ??= Set.unmodifiable(files.map((f) => f.id));
+
+  /// 某个目录（含子目录）里已入库的文件数。目录行上的「已入库 N」用它。
+  ///
+  /// 路径不存在时返回 0 —— 网盘上的目录与库里扫到的目录本来就可能对不上
+  /// （新目录、被跳过的目录），返回 0 的含义是「这个目录里还没有已入库的」。
+  int indexedCountAt(String path) => nodeAt(path)?.itemCount ?? 0;
 
   /// 按路径取目录。不存在返回 `null`（例如重扫后目录没了）。
   FolderNode? nodeAt(String path) => _index[normalize(path)];

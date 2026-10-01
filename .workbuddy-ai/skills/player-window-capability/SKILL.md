@@ -153,7 +153,62 @@ PlatformException _asChannelError(OpenSubtitlesException e) => PlatformException
 1. **协议编解码** → `test/ui/windows/player_protocol_test.dart`。重点测：正常往返、**解不开时返回 null/空对象而不抛**、空 vs 失败的区分。
 2. **两侧 handler** → `test/ui/windows/player_window_bridge_test.dart`。直接 `await handlePlayerWindowCall(MethodCall(...))`。重点测：参数缺失、回调没装、失败时的形状（该抛的抛、该返回 null 的返回 null）。**`_resetGlobals` 里要把新回调也清掉**，否则测试之间互相污染。
 3. **纯函数**（文案、查询条件拼装）→ 单独文件。`track_labels.dart` 这类「文案生成」也要测，因为它是用户唯一能看到的东西。
-4. **UI 层测不了**：`Player()` 在测试环境建不出来，所以 `_AudioDialog` / `_SubtitleDialog` 只能靠预置状态字段来测（或者干脆不测，靠真机）。
+4. **菜单 / 对话框 UI 层能测**，但要先开一个口子 → `test/ui/windows/player_track_menus_test.dart`。
+   见下一节。
+
+## 测菜单 / 对话框：先开 `@visibleForTesting` 入口
+
+`Player()` 在 `flutter test` 里**建不出来**（`Cannot find Mpv.framework … in the Frameworks folder`，
+测试跑在宿主 Dart VM 上，libmpv 不在 rpath 里）。于是控制栏上那两个入口
+（`_player == null ? null : …`）**永远是禁用的** —— 弹菜单那条路径在测试里不可达，
+不管怎么 pump 都点不开。
+
+做法：在 `player_window_app.dart` 里为每个私有菜单类开一个 `@visibleForTesting` 的
+构造入口，直接 new 出来渲染。
+
+```dart
+@visibleForTesting
+Widget buildSubtitleMenuForTest({ /* 每个字段一个具名参数，都给默认值 */ }) =>
+    _SubtitleDialog(/* … */);
+```
+
+然后测试里把它挂进一个**真的 Navigator** 再渲染（菜单每一行都以
+`Navigator.of(context).pop(…)` 收尾，没有 Navigator 就会在点下去那一刻抛）：
+
+```dart
+await tester.pumpWidget(MaterialApp(
+  key: UniqueKey(),          // ← 见下面的坑
+  theme: AppTheme.dark(),
+  home: Builder(builder: (context) => Scaffold(body: TextButton(
+    onPressed: () async { popped = await Navigator.of(context).push<Object>(
+      DialogRoute<Object>(context: context, builder: (_) => menu)); },
+    child: const Text('打开'),
+  ))),
+));
+```
+
+三个实测踩到的坑：
+
+- ⚠️ **同一个用例里第二次 `pumpWidget` 必须换根 key。** `pumpWidget` 遇到**同类型**的根组件是
+  「原地更新」而不是重建，Navigator 连同栈上那条还没关掉的 `DialogRoute` 会留下来 ——
+  表现是「打开」按钮被上一个菜单盖住，`tap()` 报
+  `derived an Offset … that would not hit test`。`key: UniqueKey()` 一行解决。
+- ⚠️ **窗口要开大**（`tester.view.physicalSize = const Size(900, 1600)`）。字幕菜单满配 14 行，
+  默认 800×600 会让 `AlertDialog` 内容溢出，而溢出在测试里是**报错**，直接把用例带崩。
+- ⚠️ **读文案要限定在 `AlertDialog` 里**（`find.descendant(of: find.byType(AlertDialog), …)`），
+  否则会把测试脚手架自己那个「打开」按钮也读进来。
+
+菜单 pop 出来的是**私有类型**（`_SubtitleChoice`），测试库写不出它的名字。但它的**成员名是公开的**
+（`kind` / `fileId` / `trackId` / `localPath`），所以 `(choice as dynamic).kind` 取得到 ——
+只读、不构造，既能钉住「pop 了什么」又不用为测试把类型公开。
+
+值得钉住的断言（都是**改错不报错**的规则）：
+
+- 有外挂字幕挂着时**内嵌轨一律不打勾**（mpv 认不出后挂的是哪一条，轨号可能正好撞上）。
+- 「关闭字幕」永远第一项；`_nothingActive` 要四个来源一起判（漏判 `activeLocalPath`
+  → 本地字幕在生效、勾却打在「关闭字幕」上）。
+- 每个来源各点一次，核对 pop 回去的 `kind` + 关键字段（漏一种来源 = 「点了没反应」）。
+- 搜索中：文案变「搜索中…」且 `onTap == null`（连点会把额度连着花掉）。
 
 断言要写**「为什么这条规则重要」**，不要只写「返回了 X」：
 

@@ -12,3 +12,60 @@ PRODUCT_BUNDLE_IDENTIFIER = com.cloudcine.cloudcine
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 com.cloudcine. All rights reserved.
+
+// ── 代码签名 ──────────────────────────────────────────────────────────────
+// 本仓库**不提交任何真实签名身份**：公司主体名、Team ID、证书名一律不落库。
+// 默认走 ad-hoc 签名（"-"），任何人都能直接构建，不需要开发者证书。
+//
+// 实测（xcodebuild -showBuildSettings，Xcode 16）：本文件的设置**优先于**
+// project.pbxproj 里的同名 target 级设置。所以签名只在这里配一处就够，
+// pbxproj 里不要再写证书名 —— 写了也会被这里覆盖，只会白白泄露身份。
+//
+// ⚠️ 不要为了「让钥匙串不弹框」去改签名 —— 那条路已证伪，见
+// `lib/data/auth/secret_backend.dart` 里 EncryptedFileSecretBackend 的类文档：
+// ad-hoc 的身份是 cdhash、重建即变，ACL 永远对不上；换 Developer ID 理论上能
+// 让「始终允许」生效，但本机环境签不动（`errSecInternalComponent`）。
+// 自建钥匙串通道、建条目时写「任何程序都可访问」的 ACL **同样不行** ——
+// 打包成真正的 .app 复测过，重建后 `read` 仍返回 `-128` 且**阻塞 3.2 秒**弹框。
+//
+// 现在的解法是**根本不用钥匙串**：凭证落在应用支持目录下的加密文件
+// （`credentials.enc`），零弹框、零授权、**与签名身份完全无关**。
+// 所以：不要为了凭证去动这个文件里的签名设置。
+//
+// 需要 Developer ID 分发包时：把 Signing.local.xcconfig.example 复制成
+// Signing.local.xcconfig 并填自己的证书与 Team ID（该文件已被 .gitignore 排除）。
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+
+// ── 关掉 CocoaPods 的「并行签名」 ─────────────────────────────────────────
+// 这不是性能调优，是**构建正确性**的必需项，不要删。
+//
+// 起因：`[CP] Embed Pods Frameworks` 每次构建都会把 `BUILT_PRODUCTS_DIR` 里
+// **未签名**的 framework 用 `rsync` 覆盖进 `cloudcine.app/Contents/Frameworks`，
+// 然后靠脚本末尾的 `code_sign_if_enabled` 逐个补签。
+// 而该函数在 `COCOAPODS_PARALLEL_CODE_SIGN=true` 时会把命令改成
+// `codesign … &`（后台执行），**既不等它、也不看退出码** —— 脚本立刻返回，
+// Xcode 紧接着执行 app 本体的 CodeSign。
+//
+// 后果（已实测复现）：**只要 `Contents/Frameworks` 里存在未签名的嵌套代码，
+// codesign 就拒绝签 app 本体** —— 与 app 有没有旧签名无关（实测「重签」与
+// 「先 --remove-signature 再签」两条路径都失败，只差 `replacing existing
+// signature` 那一行），报：
+//   `…cloudcine.app: code object is not signed at all`
+//   `In subcomponent: …/Frameworks/media_kit_libs_macos_video.framework`
+//
+// 所以这是**竞态**：补签偶尔赶在 app 签名前跑完就过，赶不上就失败 ——
+// 表现为间歇性，且失败后 framework 只剩半个 `_CodeSignature/CodeResources`
+// （二进制仍是 linker-signed），很容易误判成「某个 pod 坏了」。
+// Flutter 会把这个变量写进 `macos/Flutter/ephemeral/Flutter-Generated.xcconfig`
+// （每次构建重新生成，改那里没用），所以在本文件里覆盖掉它。
+//
+// 改成 false 后 `eval` 变成同步等待：所有嵌套 framework 签完，脚本才返回，
+// 退出码也会如实反映问题（以前是静默吞掉）。
+COCOAPODS_PARALLEL_CODE_SIGN = false
+
+// 本机签名配置（已被 .gitignore 排除，不会进仓库）。
+// 没有 Signing.local.xcconfig 时走 ad-hoc；有了就用里面的证书与 Team ID。
+// 本项目**本机不需要它** —— 凭证走应用支持目录下的加密文件，不依赖签名身份。
+#include? "Signing.local.xcconfig"
