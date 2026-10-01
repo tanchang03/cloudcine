@@ -1,0 +1,154 @@
+import 'package:cloudcine/data/db/settings_store.dart';
+import 'package:cloudcine/ui/providers/settings_providers.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+/// 设置门控。
+///
+/// 「能不能联网刮」被合成**一个**判断（总开关 AND 至少一个数据源），
+/// 是因为它们对应的失败模式在用户眼里完全是同一件事：
+/// 「我明明开了刮削，怎么没海报」。拆开的话 UI 要各写一遍组合逻辑，
+/// 漏一处就会出现「按钮是亮的、点了什么都不发生」。
+void main() {
+  group('canScrapeOnline：总开关 × 至少一个源', () {
+    test('开关开 + 只有 TMDB Key → 可用', () {
+      const s = AppSettings(onlineScrape: true, tmdbApiKey: 'v3-key');
+      expect(s.canScrapeOnline, isTrue);
+    });
+
+    test('开关开 + 只有豆瓣 Cookie → 可用', () {
+      const s = AppSettings(onlineScrape: true, doubanCookie: 'bid=abc;ck=def');
+      expect(s.canScrapeOnline, isTrue,
+          reason: '只用豆瓣是**正当用法**：TMDB 在境内被 DNS 污染、'
+              '永远拿不到结果，此时唯一能用的源就是豆瓣');
+    });
+
+    test('开关开 + 一个源都没配 → 不可用', () {
+      const s = AppSettings(onlineScrape: true);
+      expect(s.canScrapeOnline, isFalse,
+          reason: '这是最常见的「我明明开了刮削」—— 只开总开关不填 Key。'
+              '若这里返回 true，UI 会亮着按钮让用户白点');
+    });
+
+    test('开关关 + 配了源 → 不可用（总开关优先）', () {
+      const s = AppSettings(
+        onlineScrape: false,
+        tmdbApiKey: 'v3-key',
+        doubanCookie: 'bid=abc',
+      );
+      expect(s.canScrapeOnline, isFalse,
+          reason: '总开关就是「我要完全离线」的意思，'
+              '不能被「之前填过 Key」越过');
+    });
+
+    test('源里只有空白字符 → 不算配了源', () {
+      const s = AppSettings(
+        onlineScrape: true,
+        tmdbApiKey: '   ',
+        doubanCookie: ' ',
+      );
+      expect(s.canScrapeOnline, isFalse,
+          reason: '输入框里留了几个空格就被当成配好了，总开关会形同虚设 —— '
+              '而用户看到的是「开关是开的、就是没海报」');
+    });
+  });
+
+  group('canAutoScrape：还要自动开关也打开', () {
+    test('两个开关都开 + 有源 → 会自动刮', () {
+      const s = AppSettings(
+        onlineScrape: true,
+        autoScrapeOnScan: true,
+        tmdbApiKey: 'v3-key',
+      );
+      expect(s.canAutoScrape, isTrue);
+    });
+
+    test('有源 + 总开关开，但自动开关关 → 不自动刮', () {
+      const s = AppSettings(onlineScrape: true, tmdbApiKey: 'v3-key');
+      expect(s.canAutoScrape, isFalse,
+          reason: '自动刮削**默认关**是产品决定：豆瓣匿名额度只有约 10 个搜索词，'
+              '一次全盘扫描（145 部作品 × 最多 2 个词）必然中途耗尽，'
+              '而耗尽后是 103 need_login —— 用户看到的是「豆瓣一条都刮不到」');
+    });
+
+    test('自动开关开但没配源 → 仍然不自动刮', () {
+      const s = AppSettings(onlineScrape: true, autoScrapeOnScan: true);
+      expect(s.canAutoScrape, isFalse,
+          reason: '避免「开关是开的但没源」这种看起来生效、实际什么都没发生的情况');
+    });
+
+    test('总开关关 → 自动刮跟着关', () {
+      const s = AppSettings(
+        onlineScrape: false,
+        autoScrapeOnScan: true,
+        doubanCookie: 'bid=abc',
+      );
+      expect(s.canAutoScrape, isFalse);
+    });
+  });
+
+  group('fromValues：缺失时的默认值', () {
+    test('全新安装（一个键都没有）', () {
+      final s = AppSettings.fromValues(const <String, String?>{});
+
+      expect(s.onlineScrape, isFalse);
+      expect(s.autoScrapeOnScan, isFalse,
+          reason: '自动刮削默认关，判据必须是「等于 true」而不是「不等于 false」');
+      expect(s.autoLoadSubtitles, isTrue,
+          reason: '字幕默认**加载**，与 PlaybackController 的缺省行为一致 —— '
+              '两处不一致会出现「设置页显示开、实际没加载」');
+      expect(s.rememberPosition, isTrue);
+      expect(s.playerVolume, 100);
+      expect(s.playerRate, 1);
+      expect(s.scanIntervalMs, 350);
+      expect(s.scanMaxDepth, 12);
+      expect(s.logLevel, 'info');
+      expect(s.tmdbApiKey, '');
+      expect(s.tmdbApiBase, '');
+      expect(s.doubanCookie, '');
+      expect(s.lastScanAt, isNull);
+    });
+
+    test('缺 autoScrapeOnScan 这个键，但其他键写了值，仍然不自动刮', () {
+      final s = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.onlineScrape: 'true',
+        SettingKeys.tmdbApiKey: 'v3-key',
+        SettingKeys.autoLoadSubtitles: 'false',
+      });
+
+      expect(s.onlineScrape, isTrue);
+      expect(s.autoLoadSubtitles, isFalse);
+      expect(s.canScrapeOnline, isTrue);
+      expect(s.autoScrapeOnScan, isFalse,
+          reason: '老版本数据库里根本没有这个键。缺键必须等价于「关」，'
+              '否则升级后会自动把整盘刮一遍');
+      expect(s.canAutoScrape, isFalse);
+    });
+
+    test('显式写入 true 才打开', () {
+      final s = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.onlineScrape: 'true',
+        SettingKeys.autoScrapeOnScan: 'true',
+      });
+
+      expect(s.autoScrapeOnScan, isTrue);
+      expect(s.canAutoScrape, isFalse,
+          reason: '两个开关都开了但一个源都没配，仍然什么都不该发生');
+    });
+
+    test('数值与日期解析失败时退回默认值', () {
+      final s = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.playerVolume: '很响',
+        SettingKeys.playerRate: '',
+        SettingKeys.scanIntervalMs: 'x',
+        SettingKeys.scanMaxDepth: '',
+        SettingKeys.lastScanAt: 'not-a-date',
+      });
+
+      expect(s.playerVolume, 100);
+      expect(s.playerRate, 1);
+      expect(s.scanIntervalMs, 350);
+      expect(s.scanMaxDepth, 12);
+      expect(s.lastScanAt, isNull);
+    });
+  });
+}
