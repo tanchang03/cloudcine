@@ -1,5 +1,371 @@
 import 'package:flutter/foundation.dart';
 
+/// 一档可选的清晰度。**只有元信息，没有地址。**
+///
+/// ## 为什么地址不跟着来
+///
+/// 取链留在主窗口是这套架构的硬边界（见 [PlayRequest] 的类文档）。所以
+/// 播放窗口的「画质」弹框不是「换一条 URL」，而是**把档位 id 报回主窗口**，
+/// 由主窗口重新取一条链回来 —— 走的就是 [TicketRefreshRequest] 那条路。
+///
+/// 这也顺带解决了「切档之后画质菜单要跟着变」：主窗口回来的新 [PlayRequest]
+/// 里带着新的 [PlayRequest.qualities]，弹框重新渲染即可。
+@immutable
+class QualityBrief {
+  const QualityBrief({required this.id, required this.label, this.detail});
+
+  /// 服务端档位标识（`origin` / `super` / `4k`…）。切档时原样带回。
+  final String id;
+
+  /// 展示名（`原画` / `超清 1080P`）。
+  final String label;
+
+  /// 补充说明（`1920×1080 · 4.2 Mbps`）。可能为空。
+  final String? detail;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'id': id,
+        'label': label,
+        'detail': detail,
+      };
+
+  /// 畸形输入返回 null —— 一档读不懂就丢一档，不该让整个请求解不开。
+  static QualityBrief? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final id = raw['id'];
+    if (id is! String || id.isEmpty) return null;
+    final label = raw['label'];
+    final detail = raw['detail'];
+    return QualityBrief(
+      id: id,
+      // label 缺失时退回 id：菜单上显示一个 `h265_1080` 也比显示空行强。
+      label: label is String && label.isNotEmpty ? label : id,
+      detail: detail is String && detail.isNotEmpty ? detail : null,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is QualityBrief &&
+          other.id == id &&
+          other.label == label &&
+          other.detail == detail;
+
+  @override
+  int get hashCode => Object.hash(id, label, detail);
+
+  @override
+  String toString() => 'QualityBrief($id, $label)';
+}
+
+/// 网盘上的一条字幕文件。**只有引用，不带正文。**
+///
+/// ## 为什么正文不跟着来
+///
+/// 与 [QualityBrief]「不带地址」是同一条边界：读网盘文件需要凭证与请求头
+/// （夸克直链缺 Cookie 一律 412），而那些东西**只存在于主窗口**。播放窗口
+/// 知道「有这条字幕」，真正要用时再让主窗口把正文取回来（
+/// `PlayerBridgeMethod.fetchSubtitleText`）。
+///
+/// 另一个理由是开销：扫描阶段就已经明确「不下载字幕正文」（见
+/// `SubtitleIndexer` 的类文档）—— 一个几千部片子的库会因此多出几千次请求，
+/// 而其中大部分字幕用户永远不会看。
+@immutable
+class SubtitleBrief {
+  const SubtitleBrief({
+    required this.fileId,
+    required this.label,
+    this.language,
+    this.fileName,
+  });
+
+  /// 字幕文件的网盘 id。取正文时原样报回主窗口。
+  final String fileId;
+
+  /// 展示名（`简体中文` / `英文`）
+  final String label;
+
+  /// 语言码（`zh` / `en`）。菜单排序用（中文优先）。
+  final String? language;
+
+  /// 原始文件名（`Movie.2023.chs.srt`）。菜单副标题与排错用。
+  final String? fileName;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'fileId': fileId,
+        'label': label,
+        'language': language,
+        'fileName': fileName,
+      };
+
+  /// 畸形输入返回 null —— 一条读不懂就丢一条，不该让整个请求解不开。
+  static SubtitleBrief? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final fileId = raw['fileId'];
+    if (fileId is! String || fileId.isEmpty) return null;
+    final label = raw['label'];
+    final language = raw['language'];
+    final fileName = raw['fileName'];
+    return SubtitleBrief(
+      fileId: fileId,
+      // 没有名字时退回文件名，再没有就退回 id —— 菜单上不能出现空行。
+      label: label is String && label.isNotEmpty
+          ? label
+          : (fileName is String && fileName.isNotEmpty ? fileName : fileId),
+      language: language is String && language.isNotEmpty ? language : null,
+      fileName: fileName is String && fileName.isNotEmpty ? fileName : null,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SubtitleBrief &&
+          other.fileId == fileId &&
+          other.label == label &&
+          other.language == language &&
+          other.fileName == fileName;
+
+  @override
+  int get hashCode => Object.hash(fileId, label, language, fileName);
+
+  @override
+  String toString() => 'SubtitleBrief($label)';
+}
+
+/// 在线字幕站点上搜到的一条候选。
+///
+/// 与 [SubtitleBrief] 的区别：那条是**网盘上已经存在的**字幕文件（有 fileId、
+/// 走我们自己的取链），这条是**第三方站点上的**（要换一条临时下载地址才拿得到，
+/// 而且有每日额度）。两者在菜单里是同一组选项，但**取正文的路径完全不同**。
+///
+/// 放在协议层而不是直接把 `OnlineSubtitleHit` 传过来：播放窗口不该为了显示
+/// 一条字幕而依赖某个字幕站的客户端。
+@immutable
+class OnlineSubtitleBrief {
+  const OnlineSubtitleBrief({
+    required this.fileId,
+    required this.fileName,
+    this.language,
+    this.title,
+    this.downloadCount = 0,
+  });
+
+  /// 在这家站点上的 `file_id`。下载时原样报回主窗口。
+  final int fileId;
+
+  final String fileName;
+  final String? language;
+  final String? title;
+  final int downloadCount;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'fileId': fileId,
+        'fileName': fileName,
+        'language': language,
+        'title': title,
+        'downloadCount': downloadCount,
+      };
+
+  static OnlineSubtitleBrief? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final fileId = raw['fileId'];
+    final id = fileId is int ? fileId : int.tryParse('$fileId');
+    if (id == null) return null;
+    final fileName = raw['fileName'];
+    final language = raw['language'];
+    final title = raw['title'];
+    final count = raw['downloadCount'];
+    return OnlineSubtitleBrief(
+      fileId: id,
+      fileName: fileName is String && fileName.isNotEmpty ? fileName : '字幕 $id',
+      language: language is String && language.isNotEmpty ? language : null,
+      title: title is String && title.isNotEmpty ? title : null,
+      downloadCount: count is int ? count : 0,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is OnlineSubtitleBrief &&
+          other.fileId == fileId &&
+          other.fileName == fileName &&
+          other.language == language &&
+          other.title == title &&
+          other.downloadCount == downloadCount;
+
+  @override
+  int get hashCode => Object.hash(fileId, fileName, language, title, downloadCount);
+
+  @override
+  String toString() => 'OnlineSubtitleBrief($fileName, ${language ?? "-"})';
+}
+
+/// 「去字幕站搜这部片」的请求。
+///
+/// ## 为什么参数是 `itemId` 而不是一句 `query`
+///
+/// 字幕站要的**不只是一句片名**：同一部剧的不同季/集是不同的字幕，电影还要
+/// 年份来排除同名翻拍。这几样东西都躺在主窗口的库里（`MediaItem`），而播放
+/// 窗口手里只有一个给人看的标题字符串 —— 让它去拆「指环王：力量之戒 S01E01」
+/// 再猜出季集号，就是把一个已经结构化的信息降级成字符串解析。
+///
+/// 与 [PlayerBridgeMethod.refreshTicket] 是同一个道理：凡是「要查库才知道」的
+/// 参数，一律由主窗口按 `itemId` 自己补全，播放窗口只负责说「搜这一条」。
+///
+/// [fallbackQuery] 服务没有库记录的场景（手输直链、内置自检视频）：那时没有
+/// `itemId`，只能拿显示标题凑合搜一次，搜不准是预期的。
+@immutable
+class SubtitleSearchRequest {
+  const SubtitleSearchRequest({this.itemId = '', this.fallbackQuery = ''});
+
+  /// 本地索引库里这一项的 id。空串 = 没有库记录。
+  final String itemId;
+
+  /// 没有 [itemId] 时用的兜底片名。
+  final String fallbackQuery;
+
+  /// 两样都没有就没得搜。主窗口据此**不发请求**（发出去只会白烧一次额度）。
+  bool get isEmpty => itemId.isEmpty && fallbackQuery.trim().isEmpty;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'itemId': itemId,
+        'fallbackQuery': fallbackQuery,
+      };
+
+  /// 解不开时返回**空请求**而不是 null —— 调用方只需要判 [isEmpty]，
+  /// 多一个 null 分支就多一处可能漏判的地方。
+  static SubtitleSearchRequest fromJson(Object? raw) {
+    if (raw is! Map) return const SubtitleSearchRequest();
+    final itemId = raw['itemId'];
+    final fallback = raw['fallbackQuery'];
+    return SubtitleSearchRequest(
+      itemId: itemId is String ? itemId : '',
+      fallbackQuery: fallback is String ? fallback : '',
+    );
+  }
+
+  @override
+  String toString() =>
+      'SubtitleSearchRequest(itemId=${itemId.isEmpty ? "-" : itemId}, '
+      'fallback="${fallbackQuery.trim()}")';
+}
+
+/// 剧集列表里的一项。
+///
+/// ## 为什么列表数据要跟着请求一起来
+///
+/// 播放窗口跑在**另一个引擎**里，碰不到主窗口的仓储（见 `PlayerWindowApp`
+/// 的类文档）。所以「这部剧还有哪几集」只能由主窗口在投递请求时一并给出。
+///
+/// ## 为什么续播点在这里是**原始值**
+///
+/// [resumePosition] 是库里存的原始位置，面板上用它画进度条（「这一集看到
+/// 一半」）。而真正切过去时的起点要过一遍「快看完了就从头」的取舍 ——
+/// 那一步由 `PlaybackResume.startFrom` 做，**由播放窗口在切集时算**：
+/// 它手里有 [resumePosition] 与 [duration]，算完把结果当位置报回主窗口。
+///
+/// 之所以不在主窗口算好塞进来：同一个字段要同时服务「显示」和「起播」两个
+/// 用途，而两者的口径不同 —— 混在一起会让进度条显示成 0（看着像没看过）。
+@immutable
+class PlaylistEntry {
+  const PlaylistEntry({
+    required this.itemId,
+    required this.title,
+    this.subtitle = '',
+    this.thumbnailUrl,
+    this.resumePosition = Duration.zero,
+    this.duration = Duration.zero,
+  });
+
+  /// 这一集的媒体项 id（`provider:fileId`）。切集时原样报回主窗口。
+  final String itemId;
+
+  /// 主标题。剧集是 `第 3 集`（多集连播是 `第 3-4 集`），否则是片名。
+  final String title;
+
+  /// 副标题（`2160P · MKV · H.265 · 12.3 GB`）。可能为空。
+  final String subtitle;
+
+  /// 缩略图地址。**是作品海报，不是这一集的截图** —— 网盘不给逐集预览图，
+  /// 我们也没有解码首帧的能力（那要在播放窗口里跑一次 seek，代价太大）。
+  /// `null` 时 UI 用集号占位。
+  final String? thumbnailUrl;
+
+  /// 库里存的续播点（原始值，见类文档）。
+  final Duration resumePosition;
+
+  /// 这一集的时长。未知时是 [Duration.zero]。
+  final Duration duration;
+
+  /// 有没有看过一点。面板据此决定要不要画那条细进度条。
+  bool get hasProgress => resumePosition > Duration.zero;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'itemId': itemId,
+        'title': title,
+        'subtitle': subtitle,
+        'thumbnailUrl': thumbnailUrl,
+        'resumePositionMs': resumePosition.inMilliseconds,
+        'durationMs': duration.inMilliseconds,
+      };
+
+  /// 畸形输入返回 null。**没有 itemId 的项没有意义** —— 点它也不知道该播什么。
+  static PlaylistEntry? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final itemId = raw['itemId'];
+    if (itemId is! String || itemId.isEmpty) return null;
+
+    final title = raw['title'];
+    final subtitle = raw['subtitle'];
+    final thumbnail = raw['thumbnailUrl'];
+    final resume = raw['resumePositionMs'];
+    final duration = raw['durationMs'];
+
+    return PlaylistEntry(
+      itemId: itemId,
+      title: title is String && title.isNotEmpty ? title : itemId,
+      subtitle: subtitle is String ? subtitle : '',
+      thumbnailUrl: thumbnail is String && thumbnail.isNotEmpty
+          ? thumbnail
+          : null,
+      resumePosition: Duration(
+        milliseconds: resume is int && resume > 0 ? resume : 0,
+      ),
+      duration: Duration(
+        milliseconds: duration is int && duration > 0 ? duration : 0,
+      ),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PlaylistEntry &&
+          other.itemId == itemId &&
+          other.title == title &&
+          other.subtitle == subtitle &&
+          other.thumbnailUrl == thumbnailUrl &&
+          other.resumePosition == resumePosition &&
+          other.duration == duration;
+
+  @override
+  int get hashCode => Object.hash(
+        itemId,
+        title,
+        subtitle,
+        thumbnailUrl,
+        resumePosition,
+        duration,
+      );
+
+  @override
+  String toString() =>
+      'PlaylistEntry($title, ${resumePosition.inSeconds}s/${duration.inSeconds}s)';
+}
+
 /// 主窗口 → 播放窗口的「播这个」请求。
 ///
 /// ## 为什么边界画在这里
@@ -28,6 +394,10 @@ class PlayRequest {
     this.qualityId,
     this.qualityLabel,
     this.startPosition = Duration.zero,
+    this.sizeBytes,
+    this.qualities = const <QualityBrief>[],
+    this.playlist = const <PlaylistEntry>[],
+    this.subtitles = const <SubtitleBrief>[],
   });
 
   /// 直链地址（含签名查询串）
@@ -62,11 +432,44 @@ class PlayRequest {
   /// 当前档位的人话标签（`4k(2160p)` 这类），仅用于显示
   final String? qualityLabel;
 
+  /// 整片文件的字节数。**可以为空**（自建条目、手输直链都没有它）。
+  ///
+  /// 存在的唯一用途是把「缓存速度」换算成人看得懂的单位：mpv 只会告诉我们
+  /// 「已经缓存到播放头前面多少**秒**」（`demuxer-cache-time`），
+  /// 想知道多少 KB/s 就得知道这一秒对应多少字节 —— 而
+  /// `字节 ÷ 时长 = 平均码率`，两者都在这里了。
+  ///
+  /// 换了清晰度之后它**不再准确**（不同档位码率不同），但缓冲指示要的只是
+  /// 一个数量级，够用。
+  final int? sizeBytes;
+
   /// 起播位置。切换清晰度后重建请求时用它续上，避免每次都从头开始。
   ///
   /// 刷新过期直链时也走这里：播放窗口把当前位置报上来，主窗口取到新链后
   /// 原样填回，于是刷新对用户表现为「卡一下接着播」而不是「从头开始」。
   final Duration startPosition;
+
+  /// 服务端给出的可选清晰度档位。**空列表是有意义的状态** ——
+  /// 表示这一条流没有转码梯度，画质入口应当置灰而不是弹一个只有一项的菜单。
+  ///
+  /// 列表里的 id 与 [qualityId] 同源：菜单上打勾的那一项就是 [qualityId]。
+  final List<QualityBrief> qualities;
+
+  /// 同一部作品下的其它可播条目。**空列表 = 没有列表可看**
+  /// （电影、自检视频、手输直链）。
+  ///
+  /// 由主窗口在投递时一并给出，理由见 [PlaylistEntry] 的类文档。
+  final List<PlaylistEntry> playlist;
+
+  /// 网盘上**同目录**的字幕文件。空列表 = 这部片子没扫到外挂字幕
+  /// （很常见：发布组没给、或者扫描时没开字幕索引）。
+  ///
+  /// 与 [qualities] 一样，空列表是**有意义的状态**而不是「还没加载」：
+  /// 是否显示「网盘字幕」那一组，就看它。
+  ///
+  /// 注意它与「内嵌字幕轨」是两回事：内嵌轨在播放窗口本地从 mpv 的
+  /// `stream.tracks` 读，这里的则是**视频文件之外**的独立文件。
+  final List<SubtitleBrief> subtitles;
 
   Map<String, Object?> toJson() => <String, Object?>{
         'url': url,
@@ -76,6 +479,10 @@ class PlayRequest {
         'qualityId': qualityId,
         'qualityLabel': qualityLabel,
         'startPositionMs': startPosition.inMilliseconds,
+        'sizeBytes': sizeBytes,
+        'qualities': qualities.map((q) => q.toJson()).toList(),
+        'playlist': playlist.map((e) => e.toJson()).toList(),
+        'subtitles': subtitles.map((s) => s.toJson()).toList(),
       };
 
   /// 从通道参数还原。**任何畸形输入都返回 null，不抛异常** ——
@@ -97,6 +504,35 @@ class PlayRequest {
       }
     }
 
+    // ⚠️ 列表里**逐项**容错：一项读不懂就丢一项，不能让整条请求解不开 ——
+    // 那会让「有一个畸形档位」变成「整部片都播不了」。
+    final qualities = <QualityBrief>[];
+    final rawQualities = raw['qualities'];
+    if (rawQualities is List) {
+      for (final item in rawQualities) {
+        final brief = QualityBrief.fromJson(item);
+        if (brief != null) qualities.add(brief);
+      }
+    }
+
+    final playlist = <PlaylistEntry>[];
+    final rawPlaylist = raw['playlist'];
+    if (rawPlaylist is List) {
+      for (final item in rawPlaylist) {
+        final entry = PlaylistEntry.fromJson(item);
+        if (entry != null) playlist.add(entry);
+      }
+    }
+
+    final subtitles = <SubtitleBrief>[];
+    final rawSubtitles = raw['subtitles'];
+    if (rawSubtitles is List) {
+      for (final item in rawSubtitles) {
+        final brief = SubtitleBrief.fromJson(item);
+        if (brief != null) subtitles.add(brief);
+      }
+    }
+
     final rawTitle = raw['title'];
     final rawItemId = raw['itemId'];
     final rawQualityId = raw['qualityId'];
@@ -113,6 +549,10 @@ class PlayRequest {
           : null,
       qualityLabel: rawLabel is String ? rawLabel : null,
       startPosition: Duration(milliseconds: ms is int && ms > 0 ? ms : 0),
+      sizeBytes: raw['sizeBytes'] is int ? raw['sizeBytes'] as int : null,
+      qualities: qualities,
+      playlist: playlist,
+      subtitles: subtitles,
     );
   }
 
@@ -135,7 +575,11 @@ class PlayRequest {
           other.qualityId == qualityId &&
           other.qualityLabel == qualityLabel &&
           other.startPosition == startPosition &&
-          mapEquals(other.headers, headers);
+          other.sizeBytes == sizeBytes &&
+          mapEquals(other.headers, headers) &&
+          listEquals(other.qualities, qualities) &&
+          listEquals(other.playlist, playlist) &&
+          listEquals(other.subtitles, subtitles);
 
   @override
   int get hashCode => Object.hash(
@@ -145,9 +589,13 @@ class PlayRequest {
         qualityId,
         qualityLabel,
         startPosition,
+        sizeBytes,
         Object.hashAllUnordered(
           headers.entries.map((e) => Object.hash(e.key, e.value)),
         ),
+        Object.hashAll(qualities),
+        Object.hashAll(playlist),
+        Object.hashAll(subtitles),
       );
 
   @override

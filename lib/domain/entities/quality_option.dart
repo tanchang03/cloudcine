@@ -1,3 +1,19 @@
+/// 原画档位的**标识**。
+///
+/// ## 为什么要提成常量
+///
+/// 它现在由**两个地方**共同产出，两边必须逐字一致：
+///   - `QuarkPlayInfoParser`：解析服务端响应时，无标识无分辨率线索的那一档
+///     会落成这个 id；
+///   - `QuarkAdapter.resolveStream`：从 `/file/audioplay` 取回**原文件**后，
+///     自己造出「原画」那一档（`play/info` 的 `video_list` 里没有它）。
+///
+/// 写错一个字符的后果**不报错**：`QualityLabels.isOriginal` 认不出来 →
+/// `sortWeight` 不再给哨兵值 → 原画按「没有高度」的权重 0 排到转码档后面 →
+/// 默认播的就成了转码流。用户看到的是「默认画质变差了」，
+/// 而不是任何一条可以查的异常。
+const String kOriginalQualityId = 'origin';
+
 /// 一个可选的「清晰度」。
 ///
 /// ## 为什么需要这个类型

@@ -13,6 +13,11 @@ class DriveEntry {
     this.parentId,
     this.path,
     this.durationMs,
+    this.thumbnailUrl,
+    this.previewImageUrl,
+    this.videoWidth,
+    this.videoHeight,
+    this.faceAnchorX,
   });
 
   /// 网盘侧节点 ID
@@ -45,11 +50,61 @@ class DriveEntry {
   /// 会让人以为是一首空文件，显示 `--:--` 才是诚实的「不知道」。
   final int? durationMs;
 
+  /// 服务端生成的**小缩略图**地址（夸克：`thumbnail`，实测 178×100 WebP）。
+  ///
+  /// 目录级展示（文件列表里的小图）用它就够了。
+  final String? thumbnailUrl;
+
+  /// 服务端生成的**大预览图**地址（夸克：`preview_url`，实测 640×360 WebP）。
+  ///
+  /// 海报墙用它：一个格子约 172 逻辑像素宽，2x 屏需要 344px，
+  /// 小缩略图那一档会明显发糊。
+  ///
+  /// ⚠️ 两者都**必须带 Cookie** 才能取到（实测裸链 401），而且夸克
+  /// 每次响应会轮换 `__puus`，用旧值同样 401 —— 下载时必须走适配器
+  /// 现取的请求头，不能把 Cookie 冻在地址里。
+  final String? previewImageUrl;
+
+  /// 网盘给出的**实测**视频宽度（像素）。夸克：`video_width`。
+  ///
+  /// 2026-10-01 实测：递归遍历 44 个目录、427 个视频，覆盖率 **100%**，
+  /// 没有 0 值。比文件名里的 `2160p` 可靠 —— 那是发布组自己标的，会错、
+  /// 会缺，而这是服务端读文件头得到的。
+  ///
+  /// 非视频、或服务端还没处理时为 `null`。
+  final int? videoWidth;
+
+  /// 网盘给出的**实测**视频高度（像素）。夸克：`video_height`。
+  ///
+  /// ⚠️ 归挡分辨率时**不要只看高度**：实测样本里宽银幕裁切占 40%
+  /// （`3840x1632`、`1920x804`…），按高度会整体低估一档。
+  /// 用 `VideoFormats.resolutionFromDimensions`，它按长边归挡。
+  final int? videoHeight;
+
+  /// 封面裁切用的**水平锚点**（归一化 0~1），来自夸克的人脸框
+  /// `cover_face_boundary`。
+  ///
+  /// 2026-10-01 探针实测覆盖率 **56/60（93%）**。它是把 16:9 的视频帧裁成
+  /// 竖版封面时唯一能锚住人物的依据 —— 按画面正中裁会在双人对谈镜头里
+  /// 裁到两个人中间的空隙，既没主体也认不出片子。
+  ///
+  /// 是「**锚点**」（人物在画面里的水平位置）而不是「裁切偏移」：
+  /// 具体偏移量取决于卡片比例，由 `FaceAnchor.alignmentX` 在渲染时换算，
+  /// 这样换卡片比例不需要重新扫描。
+  ///
+  /// 没有可用人脸框时为 `null`，渲染时退回画面正中。
+  final double? faceAnchorX;
+
   bool get isFile => !isDirectory;
 
   /// 目录大小视为 0，避免上层把 `null` 当成「未知体积」而误判可播性。
   int? get fileSizeBytes => isDirectory ? 0 : sizeBytes;
 
+  /// 只用来补上「扫描器才知道的两个字段」（展示路径、父目录）。
+  ///
+  /// ⚠️ 它必须把**全部**字段原样带过去。漏掉一个的后果不是编译错误，
+  /// 而是那个字段在「补路径」这一步之后静默变成 `null` ——
+  /// 例如时长会显示成 `--:--`、缩略图会整片消失。
   DriveEntry copyWith({String? path, String? parentId}) => DriveEntry(
         id: id,
         name: name,
@@ -59,6 +114,12 @@ class DriveEntry {
         modifiedAt: modifiedAt,
         parentId: parentId ?? this.parentId,
         path: path ?? this.path,
+        durationMs: durationMs,
+        thumbnailUrl: thumbnailUrl,
+        previewImageUrl: previewImageUrl,
+        videoWidth: videoWidth,
+        videoHeight: videoHeight,
+        faceAnchorX: faceAnchorX,
       );
 
   @override

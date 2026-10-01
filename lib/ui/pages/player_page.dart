@@ -168,9 +168,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             autofocus: true,
             child: Column(
               children: [
-                if (!_immersive) _buildTopBar(controller),
+                // ⚠️ 顶栏与控制栏整块 `ExcludeFocus`，这不是装饰，是上面那张
+                // 键位表能生效的**前提**。
+                //
+                // 按键从主焦点沿焦点链往上找、**最近的处理器赢**。控制栏里的
+                // 进度条滑块自带方向键处理 —— 实测（Flutter 3.29）把焦点给一个
+                // `value: 0.5` 的滑块再按 →，它的值会变成 `0.55`：方向键根本
+                // 轮不到我们。用户只要点过一次进度条，← / → 就再也不是
+                // 「跳 10 秒」了。这些控件本来就只该用鼠标操作。
+                //
+                // 关掉聚焦**不影响鼠标**：点击与拖拽走手势层，不经过焦点。
+                // 也不能因此把下面那个 `Focus(autofocus: true)` 一起去掉 ——
+                // `CallbackShortcuts` 只在自己处于焦点链上时才收得到按键，
+                // 少了它一条快捷键都不会触发，而且不报任何错。
+                if (!_immersive)
+                  ExcludeFocus(child: _buildTopBar(controller)),
                 Expanded(child: _buildStage(controller)),
-                if (!_immersive) _buildControlBar(controller),
+                if (!_immersive)
+                  ExcludeFocus(child: _buildControlBar(controller)),
               ],
             ),
           ),

@@ -2,13 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../providers/library_providers.dart';
+import '../providers/scrape_providers.dart';
+import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/copy_button.dart';
+import '../widgets/media_item_row.dart';
+import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
-import '../windows/desktop_play.dart';
 
 /// 作品详情页。
 ///
@@ -81,16 +84,8 @@ class WorkDetailPage extends ConsumerWidget {
 
 /// 「播这部片」。
 ///
-/// 桌面端交给**独立播放窗口**；其余平台（以及窗口起不来时）跳内置播放页。
-///
-/// 降级是**静默**的 —— 用户点播放的意图是看片，不是体验多窗口，
-/// 所以「窗口开不出来」不该变成一个错误弹窗。降级原因会进诊断日志。
-Future<void> _play(BuildContext context, WidgetRef ref, MediaItem item) async {
-  if (await openInPlayerWindow(ref, item)) return;
-  if (!context.mounted) return;
-  await context.push('/play?item=${Uri.encodeComponent(item.id)}');
-}
-
+/// 起播走 `playItem`（全应用唯一的起播入口），所以从这里点播与从海报墙
+/// 点播的行为**完全一致**：桌面端开独立窗口，其余平台跳内置播放页。
 class _DetailBody extends ConsumerWidget {
   const _DetailBody({required this.detail});
 
@@ -119,7 +114,9 @@ class _DetailBody extends ConsumerWidget {
               Expanded(child: _InfoColumn(work: work, detail: detail)),
             ],
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 18),
+          _NetdiskLocation(detail: detail),
+          const SizedBox(height: 22),
           if (features.isNotEmpty) ...[
             _SectionTitle(
               title: '文件',
@@ -136,14 +133,14 @@ class _DetailBody extends ConsumerWidget {
             ),
             const SizedBox(height: 8),
             for (var i = 0; i < features.length; i++)
-              _ItemRow(item: features[i], index: i),
+              MediaItemRow(item: features[i], index: i),
           ],
           if (extras.isNotEmpty) ...[
             const SizedBox(height: 22),
             _SectionTitle(title: '花絮 / 样片', count: extras.length),
             const SizedBox(height: 8),
             for (var i = 0; i < extras.length; i++)
-              _ItemRow(item: extras[i], index: i, dim: true),
+              MediaItemRow(item: extras[i], index: i, dim: true),
           ],
         ],
       ),
@@ -225,7 +222,7 @@ class _InfoColumn extends ConsumerWidget {
           children: [
             FilledButton.icon(
               onPressed:
-                  primary == null ? null : () => _play(context, ref, primary),
+                  primary == null ? null : () => playItem(context, ref, primary),
               style: FilledButton.styleFrom(
                 backgroundColor: AppTheme.accent,
                 padding: const EdgeInsets.symmetric(
@@ -247,20 +244,252 @@ class _InfoColumn extends ConsumerWidget {
                 ),
               ),
             ),
+            const SizedBox(width: 10),
+            _ScrapeButton(workKey: work.key),
             const SizedBox(width: 12),
-            Text(
-              '${detail.items.length} 个文件',
-              style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
+            Flexible(
+              child: Text(
+                '${detail.items.length} 个文件',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
+              ),
             ),
           ],
         ),
+        // 刮削结果。**只在属于这部作品时显示** —— 否则刮完 A 再打开 B，
+        // B 的页面上还挂着 A 的「已刮削：…」。
+        _ScrapeMessage(workKey: work.key),
       ],
     );
   }
 }
 
-class _SectionTitle extends StatelessWidget {
-  const _SectionTitle({required this.title, required this.count, this.trailing});
+/// 「刮削这一部」。
+///
+/// ## 为什么刮削要放在详情页，而不是跟着扫描跑
+///
+/// 豆瓣的匿名额度实测只有约 **10 个搜索词**，一次全盘扫描（上百部作品）
+/// 必然中途耗尽，而耗尽之后是 `103 need_login` —— 用户看到的是「豆瓣一条
+/// 都刮不到」，这个 IP 短时间内也不能用了。所以刮削改成**按需**：一次点击
+/// 最多花 2 个搜索词，用户自己决定刮哪几部。
+///
+/// 想恢复自动刮削就在设置里打开「扫描后自动刮削」（默认关）。
+///
+/// ## 交互上的两个决定
+///
+///   - **没有源时按钮是灰的，且 tooltip 说清去哪开**。直接藏起来的话，
+///     用户不会知道有这个功能，只会问「为什么别人的有海报」。
+///   - **不用弹窗报结果**，只在按钮下面写一行。刮削是可以在墙上连点的小动作，
+///     每次都弹一个「确定」会把「顺手补个海报」变成一件麻烦事。
+class _ScrapeButton extends ConsumerWidget {
+  const _ScrapeButton({required this.workKey});
+
+  final String workKey;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings = ref.watch(settingsProvider).valueOrNull;
+    final state = ref.watch(workScrapeControllerProvider);
+    final canScrape = settings?.canScrapeOnline ?? false;
+    final running = state.isRunning(workKey);
+
+    return Tooltip(
+      message: canScrape
+          ? '用在线源（TMDB / 豆瓣）重新查一次海报与简介'
+          : '还没有可用的在线刮削源。到「设置 → 刮削」打开开关，'
+              '并填入 TMDB Key 或豆瓣 Cookie。',
+      child: OutlinedButton.icon(
+        onPressed: (!canScrape || running)
+            ? null
+            : () => ref
+                .read(workScrapeControllerProvider.notifier)
+                .scrape(workKey),
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        icon: running
+            ? const SizedBox(
+                width: 13,
+                height: 13,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.auto_awesome_outlined, size: 16),
+        label: Text(
+          running ? '刮削中…' : '刮削',
+          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
+/// 刮削结果那一行。
+class _ScrapeMessage extends ConsumerWidget {
+  const _ScrapeMessage({required this.workKey});
+
+  final String workKey;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(workScrapeControllerProvider);
+    final message = state.messageFor(workKey);
+    if (message == null) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            state.okFor(workKey)
+                ? Icons.check_circle_outline_rounded
+                : Icons.info_outline_rounded,
+            size: 14,
+            color: state.okFor(workKey) ? AppTheme.ok : AppTheme.warn,
+          ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              message,
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.7,
+                color: state.okFor(workKey) ? AppTheme.muted : AppTheme.warn,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 「网盘位置」。
+///
+/// ## 为什么这个信息必须出现在详情页
+///
+/// 媒体库里的标题是**解析出来的**（`流浪地球2`），而网盘上真实的名字可能是
+/// `[高清影视之家发布] 流浪地球2.2023.2160p...mkv`。用户要做的很多事情都
+/// 得回到网盘：核对是不是同一部、分享给朋友、在夸克 App 里重命名、
+/// 或者干脆手动把文件挪个目录。
+///
+/// 没有这一块的话，用户只能靠猜 —— 而「猜路径」这件事在几千个目录里
+/// 基本等于做不到。
+///
+/// ## 复制的是**路径文本**，不是链接
+///
+/// 夸克确实有网页版目录链接，但它的格式没有公开文档、随版本变化，而且
+/// 拿到链接还得先登录才打得开。**路径文本**则是确定的：它能直接粘进
+/// 夸克客户端的搜索框，也能用来人工核对。宁给一个确定能用的，不给一个
+/// 看起来更"高级"但会失效的。
+class _NetdiskLocation extends StatelessWidget {
+  const _NetdiskLocation({required this.detail});
+
+  final WorkDetail detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final items = detail.items;
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    final dirs = items.map((i) => i.dirPath).toSet();
+    final singleDir = dirs.length == 1;
+
+    // 多目录时不展示「一个路径」：那时列出来的任何一条都只是**其中一部分**
+    // 文件的位置，而用户会以为那是整部剧的位置。改成说明 + 让他按行复制。
+    final value = singleDir ? dirs.first : '分布在 ${dirs.length} 个目录';
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 11, 10, 12),
+      decoration: BoxDecoration(
+        color: AppTheme.panel,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.line, width: 0.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.folder_outlined,
+                size: 14,
+                color: AppTheme.muted,
+              ),
+              const SizedBox(width: 7),
+              const Text(
+                '网盘位置',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.muted,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontFamily: 'Menlo',
+                    color: AppTheme.text,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              CopyTextButton(
+                // 多目录时复制**全部**目录（每行一个），而不是"第一个"——
+                // 复制一个不完整的结果比不给复制更糟。
+                text: dirs.join('\n'),
+                label: singleDir ? '复制路径' : '复制全部目录',
+                icon: Icons.folder_copy_outlined,
+              ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          // 文件 ID 是网盘侧的**稳定主键**。放在这里而不是藏进调试页：
+          // 用户报「这部剧扫不出来」时，有这个 ID 就能直接在网盘里定位。
+          // 用等宽字体 + 小字号压低视觉权重，它属于"需要时才找得到"的信息。
+          Row(
+            children: [
+              const SizedBox(width: 21),
+              Expanded(
+                child: Text(
+                  items.length == 1
+                      ? '文件 ID ${items.first.fileId}'
+                      : '文件 ID ${items.first.fileId} …（共 ${items.length} 个）',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 10.5,
+                    fontFamily: 'Menlo',
+                    color: AppTheme.dim,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              CopyTextButton(
+                text: items.length == 1
+                    ? items.first.fileId
+                    : items.map((i) => i.fileId).join('\n'),
+                label: '复制 ID',
+                icon: Icons.tag_rounded,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionTitle extends StatelessWidget {  const _SectionTitle({required this.title, required this.count, this.trailing});
 
   final String title;
   final int count;
@@ -286,95 +515,6 @@ class _SectionTitle extends StatelessWidget {
         const Spacer(),
         if (trailing != null) trailing!,
       ],
-    );
-  }
-}
-
-/// 一行文件。
-class _ItemRow extends ConsumerWidget {
-  const _ItemRow({required this.item, required this.index, this.dim = false});
-
-  final MediaItem item;
-  final int index;
-
-  /// 花絮行整体降一级视觉权重。
-  final bool dim;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final resolution = item.resolution;
-
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
-      child: Material(
-        color: AppTheme.panel,
-        borderRadius: BorderRadius.circular(9),
-        child: InkWell(
-          onTap: () => _play(context, ref, item),
-          borderRadius: BorderRadius.circular(9),
-          hoverColor: AppTheme.panel2,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 34,
-                  child: Text(
-                    '${index + 1}'.padLeft(2, '0'),
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontFamily: 'Menlo',
-                      color: dim ? AppTheme.dim : AppTheme.muted,
-                    ),
-                  ),
-                ),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        item.displayTitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w500,
-                          color: dim ? AppTheme.muted : AppTheme.text,
-                        ),
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        item.technicalSummary.isEmpty
-                            ? item.name
-                            : item.technicalSummary,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: AppTheme.dim,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (resolution != null) ...[
-                  const SizedBox(width: 10),
-                  TagChip(
-                    label: resolution.marketingLabel,
-                    color: AppTheme.resolutionColor(resolution),
-                  ),
-                ],
-                const SizedBox(width: 8),
-                const Icon(
-                  Icons.play_circle_outline_rounded,
-                  size: 19,
-                  color: AppTheme.muted,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
     );
   }
 }

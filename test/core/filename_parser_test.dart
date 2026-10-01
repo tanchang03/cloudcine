@@ -180,6 +180,35 @@ void main() {
     });
   });
 
+  group('dirNameOf：从路径取末级目录名', () {
+    // 扫描期与详情页的单片刮削**共用**它。两处对「什么算末级目录名」的理解
+    // 一旦不同（比如一处去了尾斜杠、一处没去），同一个文件在两处就会解析出
+    // 不同的片名 —— 而且两边都不报错。
+    test('去掉尾斜杠后取最后一段', () {
+      expect(
+        MediaFilenameParser.dirNameOf('/电影/流浪地球2 (2023)/'),
+        '流浪地球2 (2023)',
+      );
+    });
+
+    test('多余斜杠不影响结果', () {
+      expect(MediaFilenameParser.dirNameOf('a//b'), 'b');
+      expect(MediaFilenameParser.dirNameOf('/a/b'), 'b');
+    });
+
+    test('没有斜杠时整串就是目录名', () {
+      expect(MediaFilenameParser.dirNameOf('abc'), 'abc');
+    });
+
+    test('只有斜杠或空串 → null', () {
+      expect(MediaFilenameParser.dirNameOf('/'), isNull);
+      expect(MediaFilenameParser.dirNameOf('///'), isNull);
+      expect(MediaFilenameParser.dirNameOf(''), isNull,
+          reason: '返回空串而不是 null 的话，调用方 `dirName != null` 的判据会放行，'
+              '于是一个空目录名被当成兜底片名参与解析');
+    });
+  });
+
   group('退化情形', () {
     test('完全认不出片名时 kind=unknown，但分辨率仍被抽出来', () {
       final r = parser.parse('1080p.mkv');

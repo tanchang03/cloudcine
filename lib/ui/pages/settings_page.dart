@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../data/remote/subtitle/opensubtitles_client.dart';
+import '../../data/scrape/tmdb_client.dart';
 import '../../domain/entities/cloud_account.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/quality_option.dart';
@@ -32,8 +34,28 @@ class SettingsPage extends ConsumerStatefulWidget {
 
 class _SettingsPageState extends ConsumerState<SettingsPage> {
   final TextEditingController _tmdbKey = TextEditingController();
-  bool _keyLoaded = false;
-  bool _keyDirty = false;
+  final TextEditingController _tmdbApiBase = TextEditingController();
+  final TextEditingController _tmdbImageBase = TextEditingController();
+  final TextEditingController _doubanCookie = TextEditingController();
+  final TextEditingController _opensubtitlesKey = TextEditingController();
+  final TextEditingController _opensubtitlesBase = TextEditingController();
+
+  /// 输入框是否已经从设置里填过一次。
+  ///
+  /// 只填一次、之后**不再覆盖** —— 否则用户正在输入时，
+  /// 任何一次设置变更都会把输入框重置回去。
+  bool _fieldsLoaded = false;
+
+  /// 「测试连接」的结果文案与忙碌标记。
+  String? _probeResult;
+  bool _probeOk = false;
+  bool _probing = false;
+
+  /// 在线字幕那一个「测试连接」。**与 TMDB 那个分开**：两件事互不影响，
+  /// 共用一个状态会让「TMDB 探测失败」把字幕那边的结果也清掉。
+  String? _subsProbeResult;
+  bool _subsProbeOk = false;
+  bool _subsProbing = false;
 
   /// 海报缓存占用的字节数。`null` 表示还在算。
   int? _cacheBytes;
@@ -44,6 +66,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   @override
   void dispose() {
     _tmdbKey.dispose();
+    _tmdbApiBase.dispose();
+    _tmdbImageBase.dispose();
+    _doubanCookie.dispose();
+    _opensubtitlesKey.dispose();
+    _opensubtitlesBase.dispose();
     super.dispose();
   }
 
@@ -56,9 +83,14 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     // 设置读出来之后填一次输入框。之后**不再覆盖** ——
     // 否则用户正在输入时，任何一次设置变更都会把输入框重置回去。
     final s = settings.valueOrNull;
-    if (s != null && !_keyLoaded) {
-      _keyLoaded = true;
+    if (s != null && !_fieldsLoaded) {
+      _fieldsLoaded = true;
       _tmdbKey.text = s.tmdbApiKey;
+      _tmdbApiBase.text = s.tmdbApiBase;
+      _tmdbImageBase.text = s.tmdbImageBase;
+      _doubanCookie.text = s.doubanCookie;
+      _opensubtitlesKey.text = s.opensubtitlesApiKey;
+      _opensubtitlesBase.text = s.opensubtitlesBase;
     }
 
     if (settings.isLoading) {
@@ -95,6 +127,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 _scrapeSection(current),
                 const SizedBox(height: 14),
                 _playbackSection(current),
+                const SizedBox(height: 14),
+                _subtitleSection(current),
                 const SizedBox(height: 14),
                 _storageSection(stats),
                 const SizedBox(height: 14),
@@ -168,88 +202,265 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _ToggleRow(
+            label: '联网刮削',
+            hint: s.canScrapeOnline
+                ? '已启用。作品详情页会出现「刮削」按钮。'
+                : '未启用。打开后还需要至少配一个数据源（TMDB Key 或豆瓣 Cookie）。',
+            value: s.onlineScrape,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(onlineScrape: v),
+            ),
+          ),
+          const SizedBox(height: 4),
+          _ToggleRow(
+            label: '扫描后自动刮削',
+            hint: s.canAutoScrape
+                ? '扫描结束后会自动为还没刮过的作品查一遍。'
+                    '豆瓣匿名额度很小，全盘自动刮容易被限流。'
+                : '默认关闭。刮削改由作品详情页的「刮削」按钮按需触发 —— '
+                    '豆瓣匿名额度实测只有约 10 个搜索词，全盘自动刮会中途耗尽。',
+            value: s.autoScrapeOnScan,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(autoScrapeOnScan: v),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+          const Divider(height: 1, color: AppTheme.line),
+          const SizedBox(height: 14),
+
+          const Text(
+            'TMDB（首选）',
+            style: TextStyle(fontSize: 12.5, color: AppTheme.text),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            '元数据最全：简介、类型、原始标题都有。'
+            '境内直连 api.themoviedb.org 与 image.tmdb.org 通常会被 DNS 污染，'
+            '不通的话填一个可达的反代地址，或者只用下面的豆瓣。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 12),
+          _savableField(
+            controller: _tmdbKey,
+            label: 'TMDB API Key',
+            hint: 'v3 的 API Key，或 v4 的 Read Access Token',
+            saved: s.tmdbApiKey,
+            onSave: () => ref
+                .read(settingsProvider.notifier)
+                .set(tmdbApiKey: _tmdbKey.text),
+          ),
+          const SizedBox(height: 12),
+          _savableField(
+            controller: _tmdbApiBase,
+            label: 'API 地址',
+            hint: TmdbScraper.defaultBaseUrl,
+            saved: s.tmdbApiBase,
+            onSave: () => ref
+                .read(settingsProvider.notifier)
+                .set(tmdbApiBase: _tmdbApiBase.text),
+          ),
+          const SizedBox(height: 10),
+          _savableField(
+            controller: _tmdbImageBase,
+            label: '图片地址',
+            hint: TmdbScraper.defaultImageBaseUrl,
+            saved: s.tmdbImageBase,
+            onSave: () => ref
+                .read(settingsProvider.notifier)
+                .set(tmdbImageBase: _tmdbImageBase.text),
+          ),
+          const SizedBox(height: 12),
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      '联网刮削（TMDB）',
-                      style: TextStyle(fontSize: 12.5, color: AppTheme.text),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      s.canScrapeOnline
-                          ? '已启用。扫描结束后会为还没刮过的作品查询 TMDB。'
-                          : '未启用。开启后还需要填入 API Key。',
-                      style: const TextStyle(
+              OutlinedButton.icon(
+                onPressed: _probing ? null : () => unawaited(_probeTmdb()),
+                icon: _probing
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.wifi_tethering_rounded, size: 15),
+                label: const Text('测试连接'),
+              ),
+              const SizedBox(width: 12),
+              if (_probeResult != null)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _probeResult!,
+                      style: TextStyle(
                         fontSize: 11,
                         height: 1.6,
-                        color: AppTheme.dim,
+                        color: _probeOk ? AppTheme.ok : AppTheme.warn,
                       ),
                     ),
-                  ],
+                  ),
                 ),
-              ),
-              Switch(
-                value: s.onlineScrape,
-                activeColor: AppTheme.accent,
-                onChanged: (v) => unawaited(
-                  ref.read(settingsProvider.notifier).set(onlineScrape: v),
-                ),
-              ),
             ],
           ),
+
+          const SizedBox(height: 16),
+          const Divider(height: 1, color: AppTheme.line),
           const SizedBox(height: 14),
-          TextField(
-            controller: _tmdbKey,
-            onChanged: (_) => setState(() => _keyDirty = true),
-            style: AppTheme.mono.copyWith(color: AppTheme.text),
-            decoration: InputDecoration(
-              isDense: true,
-              labelText: 'TMDB API Key',
-              labelStyle: const TextStyle(fontSize: 12, color: AppTheme.muted),
-              hintText: 'v3 的 API Key，或 v4 的 Read Access Token',
-              hintStyle: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
-              suffixIcon: _keyDirty
-                  ? TextButton(
-                      onPressed: () {
-                        unawaited(
-                          ref
-                              .read(settingsProvider.notifier)
-                              .set(tmdbApiKey: _tmdbKey.text),
-                        );
-                        setState(() => _keyDirty = false);
-                      },
-                      child: const Text('保存'),
-                    )
-                  : null,
-              filled: true,
-              fillColor: AppTheme.panel2,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: const BorderSide(color: AppTheme.line, width: 0.5),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: const BorderSide(color: AppTheme.line, width: 0.5),
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: const BorderSide(color: AppTheme.accent, width: 0.8),
-              ),
-            ),
+
+          const Text(
+            '豆瓣（境内可达，补国产剧 / 国漫 / 综艺）',
+            style: TextStyle(fontSize: 12.5, color: AppTheme.text),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'TMDB 最弱的一块恰好是国产内容，而豆瓣两者都强、境内直连就能用。'
+            '但它的匿名额度实测只有约 10 个搜索词，耗尽后接口直接返回'
+            '「需要登录」，所以必须填登录后的 Cookie。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 12),
+          _savableField(
+            controller: _doubanCookie,
+            label: '豆瓣 Cookie',
+            hint: '在浏览器登录 movie.douban.com 后，复制请求头里的 Cookie',
+            saved: s.doubanCookie,
+            onSave: () => ref
+                .read(settingsProvider.notifier)
+                .set(doubanCookie: _doubanCookie.text),
           ),
           const SizedBox(height: 10),
           const Text(
-            'Key 存在本地数据库里（与索引库同一份数据），不会外传。'
-            '没有 Key 也能正常使用，只是没有海报。',
+            '只填 `bid` 或 `dbcl2` 那一段也能用。它存在本地数据库里，'
+            '不会外传，也**不会**用来下载海报（豆瓣图片只要 Referer）。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+
+          const SizedBox(height: 16),
+          const Text(
+            '两个源**同时**生效，按优先级取结果：TMDB 优先，它没命中才用豆瓣，'
+            '两个都没命中就退回文件名解析。',
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
           ),
         ],
       ),
     );
+  }
+
+  /// 「改了才出现保存按钮」的输入框。
+  ///
+  /// 抽出来是因为 Key / API 地址 / 图片地址三个字段长得完全一样 ——
+  /// 复制三份的话，以后改一次配色要改三处。
+  ///
+  /// 脏值判断直接拿 `controller.text` 与已保存的值比，**不另设标志位**：
+  /// 标志位需要在保存成功时手工复位，一旦漏了就会出现
+  /// 「明明保存过了、按钮还挂着」。
+  Widget _savableField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required String saved,
+    required VoidCallback onSave,
+  }) {
+    final dirty = controller.text.trim() != saved.trim();
+
+    return TextField(
+      controller: controller,
+      // 只为重算上面的 `dirty`。
+      onChanged: (_) => setState(() {}),
+      style: AppTheme.mono.copyWith(color: AppTheme.text, fontSize: 12),
+      decoration: InputDecoration(
+        isDense: true,
+        labelText: label,
+        labelStyle: const TextStyle(fontSize: 12, color: AppTheme.muted),
+        hintText: hint,
+        hintStyle: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
+        suffixIcon: dirty
+            ? TextButton(
+                onPressed: () {
+                  onSave();
+                  setState(() {});
+                },
+                child: const Text('保存'),
+              )
+            : null,
+        filled: true,
+        fillColor: AppTheme.panel2,
+        border: _fieldBorder(AppTheme.line, 0.5),
+        enabledBorder: _fieldBorder(AppTheme.line, 0.5),
+        focusedBorder: _fieldBorder(AppTheme.accent, 0.8),
+      ),
+    );
+  }
+
+  static OutlineInputBorder _fieldBorder(Color color, double width) =>
+      OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: BorderSide(color: color, width: width),
+      );
+
+  /// 探一次 TMDB，把「地址通不通、Key 对不对」直接告诉用户。
+  ///
+  /// ## 为什么必须有这个按钮
+  ///
+  /// 2026-10-01 实测：境内直连官方地址会被 DNS 污染，表现为请求一直挂到超时。
+  /// 没有它的话，用户填完地址只能「等下次扫描看有没有海报」—— 而扫描要跑几分钟，
+  /// 且「地址不通」与「Key 无效」两种失败混在一起，从结果上根本分不出来。
+  ///
+  /// 打的是 `/configuration`：它不需要任何查询词，只要地址与 Key 都对就返回 200，
+  /// 是能区分这两类失败的最小请求。
+  Future<void> _probeTmdb() async {
+    final key = _tmdbKey.text.trim();
+    final base = _tmdbApiBase.text.trim().isEmpty
+        ? TmdbScraper.defaultBaseUrl
+        : _tmdbApiBase.text.trim();
+
+    setState(() {
+      _probing = true;
+      _probeResult = null;
+    });
+
+    String message;
+    var ok = false;
+    try {
+      if (key.isEmpty) {
+        message = '请先填入 API Key。';
+      } else {
+        // v4 的 Read Access Token 是 JWT（`eyJ` 开头），走 Bearer 头；
+        // v3 的短 Key 走 `api_key` 查询参数。与 `TmdbScraper._get` 同一套判据。
+        final isJwt = key.startsWith('eyJ');
+        final res = await ref.read(httpClientProvider).get(
+              '$base/configuration',
+              headers: {
+                'Accept': 'application/json',
+                if (isJwt) 'Authorization': 'Bearer $key',
+              },
+              query: isJwt ? null : <String, Object?>{'api_key': key},
+              timeout: const Duration(seconds: 10),
+            );
+
+        if (res.isNetworkFailure) {
+          message = '连不上 $base —— 地址不可达。'
+              '境内直连官方地址多为 DNS 污染，请填一个可达的反代地址。';
+        } else if (res.isSuccessStatus) {
+          ok = true;
+          message = '连接正常，地址与 Key 都可用。';
+        } else if (res.statusCode == 401) {
+          message = '地址可达，但 Key 被拒绝（401）—— 检查 Key 是否填错或已失效。';
+        } else {
+          message = '地址可达，但返回 HTTP ${res.statusCode}。';
+        }
+      }
+    } catch (e) {
+      message = '测试失败：$e';
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _probing = false;
+      _probeOk = ok;
+      _probeResult = message;
+    });
   }
 
   // -------------------------------------------------------------------
@@ -332,6 +543,158 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     'normal',
     'low',
   ];
+
+  // -------------------------------------------------------------------
+  // 在线字幕
+  // -------------------------------------------------------------------
+
+  /// 字幕这一节。
+  ///
+  /// ## 为什么单独一节，而不是塞进「刮削」
+  ///
+  /// 它不是刮削源：刮削改的是**库里的元数据**（海报、简介），而这里配的是
+  /// 播放器里的「去网上搜一条字幕」。混在一起会让人以为「关了联网刮削就搜不到
+  /// 字幕」—— 而实际上两条路完全独立。
+  ///
+  /// 另外三路字幕（内嵌轨、网盘同目录、本地文件）**都不需要配置**，所以这一节
+  /// 在开头就写明它只管第四路，免得用户以为「不填这个就没有字幕」。
+  Widget _subtitleSection(AppSettings s) {
+    return SectionCard(
+      title: '在线字幕',
+      description: '内嵌字幕轨、网盘同目录的字幕**不需要任何配置**，'
+          '播放器的「字幕」菜单里直接就有。这里配的是第四路：'
+          '去互联网上的字幕站搜一条。',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'OpenSubtitles（api.opensubtitles.com）',
+            style: TextStyle(fontSize: 12.5, color: AppTheme.text),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            '在 opensubtitles.com 注册后，到账号设置里生成一个 Api-Key 填在这里。'
+            '**搜索不占额度**，只有「真的下载一条字幕」才消耗 —— 免费档的下载额度'
+            '很小（实测个位数 / 天），用完要等第二天。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 12),
+          _savableField(
+            controller: _opensubtitlesKey,
+            label: 'Api-Key',
+            hint: '留空 = 关闭在线字幕',
+            saved: s.opensubtitlesApiKey,
+            onSave: () => ref
+                .read(settingsProvider.notifier)
+                .set(opensubtitlesApiKey: _opensubtitlesKey.text),
+          ),
+          const SizedBox(height: 10),
+          _savableField(
+            controller: _opensubtitlesBase,
+            label: 'API 地址',
+            hint: OpenSubtitlesConfig.defaultBaseUrl,
+            saved: s.opensubtitlesBase,
+            onSave: () => ref
+                .read(settingsProvider.notifier)
+                .set(opensubtitlesBase: _opensubtitlesBase.text),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _subsProbing ? null : () => unawaited(_probeSubtitles()),
+                icon: _subsProbing
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.wifi_tethering_rounded, size: 15),
+                label: const Text('测试连接'),
+              ),
+              const SizedBox(width: 12),
+              if (_subsProbeResult != null)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _subsProbeResult!,
+                      style: TextStyle(
+                        fontSize: 11,
+                        height: 1.6,
+                        color: _subsProbeOk ? AppTheme.ok : AppTheme.warn,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            s.canSearchOnlineSubtitles
+                ? '已配置。播放器 →「字幕」→「搜索在线字幕…」即可。'
+                : '未配置：播放器里的「搜索在线字幕」会提示先来这里填 Api-Key。',
+            style: TextStyle(
+              fontSize: 11,
+              height: 1.7,
+              color: s.canSearchOnlineSubtitles ? AppTheme.ok : AppTheme.dim,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 探一次 OpenSubtitles。
+  ///
+  /// ## 为什么必须有这个按钮
+  ///
+  /// 这套接口的错误码**不能按常识读**（2026-10-01 实测）：
+  /// 不带 `User-Agent` 是 `403`，Key 填错**也是 `403`**，
+  /// 而 `/download` 对无效 Key 返回的却是 `503`。也就是说，用户从「搜不到」
+  /// 这个结果上完全分不出「Key 错了」和「服务不可用」——
+  /// 与 TMDB 那套熔断是同一个形状。
+  ///
+  /// 所以这里把两类原因分开报：地址不通 → 网络；能连上但被拒 → Key。
+  Future<void> _probeSubtitles() async {
+    final key = _opensubtitlesKey.text.trim();
+    final base = _opensubtitlesBase.text.trim().isEmpty
+        ? OpenSubtitlesConfig.defaultBaseUrl
+        : _opensubtitlesBase.text.trim();
+
+    setState(() {
+      _subsProbing = true;
+      _subsProbeResult = null;
+    });
+
+    String message;
+    var ok = false;
+    try {
+      if (key.isEmpty) {
+        message = '请先填入 Api-Key。';
+      } else {
+        await OpenSubtitlesClient(
+          http: ref.read(httpClientProvider),
+          config: OpenSubtitlesConfig(apiKey: key, baseUrl: base),
+        ).probe();
+        ok = true;
+        message = '连接正常，Api-Key 可用。';
+      }
+    } on OpenSubtitlesException catch (e) {
+      // `e.message` 已经是给用户看的中文（见 `_messageFor`），直接用。
+      message = '${e.message}${e.statusCode == null ? '' : '（HTTP ${e.statusCode}）'}';
+    } catch (e) {
+      message = '探测失败：$e';
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _subsProbing = false;
+      _subsProbeOk = ok;
+      _subsProbeResult = message;
+    });
+  }
 
   // -------------------------------------------------------------------
   // 存储
@@ -444,6 +807,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       if (!mounted) return;
       ref.invalidate(workListProvider);
       ref.invalidate(libraryStatsProvider);
+      // 索引库清空后「最近播放」必然是空的 —— 不重取的话角标会一直挂着
+      // 一个已经不存在的数字。
+      ref.invalidate(playedCountProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('索引库已清空')),
       );

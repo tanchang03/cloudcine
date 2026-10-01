@@ -10,7 +10,13 @@ import 'app_providers.dart';
 class AppSettings {
   const AppSettings({
     this.onlineScrape = false,
+    this.autoScrapeOnScan = false,
     this.tmdbApiKey = '',
+    this.tmdbApiBase = '',
+    this.tmdbImageBase = '',
+    this.doubanCookie = '',
+    this.opensubtitlesApiKey = '',
+    this.opensubtitlesBase = '',
     this.defaultQuality = '',
     this.autoLoadSubtitles = true,
     this.rememberPosition = true,
@@ -22,11 +28,59 @@ class AppSettings {
     this.logLevel = 'info',
   });
 
-  /// 是否启用在线刮削（TMDB）
+  /// 是否允许联网刮削（总开关）。
+  ///
+  /// 关掉之后**一条在线请求都不会发**：扫描期不刮，详情页的「刮削」按钮
+  /// 也是灰的。想做「完全离线」就关它。
   final bool onlineScrape;
+
+  /// 扫描结束后是否自动刮一遍。**默认关**，理由见
+  /// `SettingKeys.autoScrapeOnScan`（豆瓣额度小、耗尽后整批失败）。
+  final bool autoScrapeOnScan;
 
   /// TMDB API Key（v3 或 v4）。空串表示未配置。
   final String tmdbApiKey;
+
+  /// TMDB API 的 Base URL。空串 = 用官方地址。
+  ///
+  /// 2026-10-01 实测：境内直连 `api.themoviedb.org` 会被 DNS 污染
+  /// （HTTP 000、20s 超时），在线刮削永远拿不到结果。留这个口子给可达的反代。
+  /// 「空串 → 官方地址」的换算放在 `buildScanService` 里做，
+  /// 这样默认值只有 `TmdbScraper` 一个真源。
+  final String tmdbApiBase;
+
+  /// TMDB 图片 CDN 的 Base URL。空串 = 用官方地址。
+  ///
+  /// 与 [tmdbApiBase] **分开配置**：两者是不同域名
+  /// （`api.themoviedb.org` / `image.tmdb.org`），反代经常只覆盖其中一个。
+  final String tmdbImageBase;
+
+  /// 豆瓣登录后的 Cookie。空串 = 不启用豆瓣源。
+  ///
+  /// 实测匿名额度只有约 10 个搜索词，所以要求配 Cookie 才算可用
+  /// （见 `SettingKeys.doubanCookie`）。
+  final String doubanCookie;
+
+  /// OpenSubtitles 的 Api-Key。空串 = 在线字幕不可用。
+  ///
+  /// 与 TMDB / 豆瓣那两个源不同，它**不是刮削源**：它只服务播放器里的
+  /// 「在线字幕」。所以它不进 [canScrapeOnline] 的判据 —— 混进去会让
+  /// 「没填字幕站的 Key」表现成「刮削被关掉了」。
+  final String opensubtitlesApiKey;
+
+  /// OpenSubtitles 的 Base URL。空串 = 用官方地址。
+  ///
+  /// 与 [tmdbApiBase] 同一个理由：留一个口子给可达的反代。
+  /// 「空串 → 官方地址」的换算在 `player_bridge_host.dart` 里做，
+  /// 这样默认值只有 `OpenSubtitlesConfig.defaultBaseUrl` 一个真源。
+  final String opensubtitlesBase;
+
+  /// 在线字幕是否**真的**能用：填了 Api-Key 才算。
+  ///
+  /// 合成一个判断而不是让调用方各自判空串：没填 Key 时接口一律 403，
+  /// 而 403 的文案（「You cannot consume this service」）与「服务不可用」
+  /// 长得一样 —— 用户会去换地址而不是填 Key。
+  bool get canSearchOnlineSubtitles => opensubtitlesApiKey.trim().isNotEmpty;
 
   /// 默认清晰度档位标识。空串 = 原画优先。
   final String defaultQuality;
@@ -43,15 +97,31 @@ class AppSettings {
   final DateTime? lastScanAt;
   final String logLevel;
 
-  /// 在线刮削是否**真的**能用：开关打开 **且** 填了 Key。
+  /// 在线刮削是否**真的**能用：总开关打开 **且** 至少配了一个数据源。
   ///
-  /// 两个条件缺一不可，而 UI 上必须把它们合成一个判断 —— 只开开关不填 Key
-  /// 是最容易发生的一种「我明明开了刮削怎么没海报」。
-  bool get canScrapeOnline => onlineScrape && tmdbApiKey.trim().isNotEmpty;
+  /// 两个条件缺一不可，而 UI 上必须把它们合成一个判断 —— 只开开关不填
+  /// Key（或豆瓣 Cookie）是最容易发生的一种「我明明开了刮削怎么没海报」。
+  ///
+  /// 「至少一个源」而不是「TMDB 一定有」：TMDB 在境内不可达，只用豆瓣
+  /// 是完全正当的用法。
+  bool get canScrapeOnline =>
+      onlineScrape && (tmdbApiKey.trim().isNotEmpty || doubanCookie.trim().isNotEmpty);
+
+  /// 扫描结束后是否**真的**会自动刮：还要 [autoScrapeOnScan] 也打开。
+  ///
+  /// 与 [canScrapeOnline] 一样合成一个判断，避免「开关是开的但没源」
+  /// 这种看起来生效、实际什么都没发生的情况。
+  bool get canAutoScrape => canScrapeOnline && autoScrapeOnScan;
 
   AppSettings copyWith({
     bool? onlineScrape,
+    bool? autoScrapeOnScan,
     String? tmdbApiKey,
+    String? tmdbApiBase,
+    String? tmdbImageBase,
+    String? doubanCookie,
+    String? opensubtitlesApiKey,
+    String? opensubtitlesBase,
     String? defaultQuality,
     bool? autoLoadSubtitles,
     bool? rememberPosition,
@@ -64,7 +134,13 @@ class AppSettings {
   }) {
     return AppSettings(
       onlineScrape: onlineScrape ?? this.onlineScrape,
+      autoScrapeOnScan: autoScrapeOnScan ?? this.autoScrapeOnScan,
       tmdbApiKey: tmdbApiKey ?? this.tmdbApiKey,
+      tmdbApiBase: tmdbApiBase ?? this.tmdbApiBase,
+      tmdbImageBase: tmdbImageBase ?? this.tmdbImageBase,
+      doubanCookie: doubanCookie ?? this.doubanCookie,
+      opensubtitlesApiKey: opensubtitlesApiKey ?? this.opensubtitlesApiKey,
+      opensubtitlesBase: opensubtitlesBase ?? this.opensubtitlesBase,
       defaultQuality: defaultQuality ?? this.defaultQuality,
       autoLoadSubtitles: autoLoadSubtitles ?? this.autoLoadSubtitles,
       rememberPosition: rememberPosition ?? this.rememberPosition,
@@ -74,6 +150,47 @@ class AppSettings {
       scanMaxDepth: scanMaxDepth ?? this.scanMaxDepth,
       lastScanAt: lastScanAt ?? this.lastScanAt,
       logLevel: logLevel ?? this.logLevel,
+    );
+  }
+
+  /// 从数据库读出的原始键值对构造。
+  ///
+  /// ## 为什么值得抽成一个纯函数
+  ///
+  /// 这里有一组**刻意不对称**的默认值，而它们在代码里长得几乎一样：
+  ///
+  ///   - `autoScrapeOnScan` 缺失即 `false`（产品决定：默认**不**自动刮）
+  ///   - `autoLoadSubtitles` / `rememberPosition` 缺失即 `true`（与播放器
+  ///     的缺省行为一致）
+  ///
+  /// 判据因此必须写成两种形式（`== 'true'` 与 `!= 'false'`），写反了
+  /// **不报错**，只会表现成「新装用户字幕不加载」或者「没打开开关却自动
+  /// 刮了一整盘、豆瓣额度当场耗尽」。抽出来才钉得住。
+  factory AppSettings.fromValues(Map<String, String?> v) {
+    return AppSettings(
+      onlineScrape: v[SettingKeys.onlineScrape] == 'true',
+      // 缺失即 `false`：自动刮削**默认关**，这是产品决定而不是实现细节，
+      // 所以判据写成「等于 true」而不是「不等于 false」。
+      autoScrapeOnScan: v[SettingKeys.autoScrapeOnScan] == 'true',
+      tmdbApiKey: v[SettingKeys.tmdbApiKey] ?? '',
+      tmdbApiBase: v[SettingKeys.tmdbApiBase] ?? '',
+      tmdbImageBase: v[SettingKeys.tmdbImageBase] ?? '',
+      doubanCookie: v[SettingKeys.doubanCookie] ?? '',
+      // 空串 = 在线字幕不可用。**刻意没有默认值**：这是一项要用户自己去
+      // 申请的服务，塞一个占位值只会让第一次搜索得到一个 403。
+      opensubtitlesApiKey: v[SettingKeys.opensubtitlesApiKey] ?? '',
+      opensubtitlesBase: v[SettingKeys.opensubtitlesBase] ?? '',
+      defaultQuality: v[SettingKeys.defaultQuality] ?? '',
+      // 缺失时取 `true`：默认自动加载字幕，与 `PlaybackController` 的
+      // 缺省行为保持一致。两处不一致会出现「设置页显示开、实际没加载」。
+      autoLoadSubtitles: v[SettingKeys.autoLoadSubtitles] != 'false',
+      rememberPosition: v[SettingKeys.rememberPosition] != 'false',
+      playerVolume: double.tryParse(v[SettingKeys.playerVolume] ?? '') ?? 100,
+      playerRate: double.tryParse(v[SettingKeys.playerRate] ?? '') ?? 1,
+      scanIntervalMs: int.tryParse(v[SettingKeys.scanIntervalMs] ?? '') ?? 350,
+      scanMaxDepth: int.tryParse(v[SettingKeys.scanMaxDepth] ?? '') ?? 12,
+      lastScanAt: DateTime.tryParse(v[SettingKeys.lastScanAt] ?? ''),
+      logLevel: v[SettingKeys.logLevel] ?? 'info',
     );
   }
 }
@@ -89,7 +206,13 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     final store = ref.watch(settingsStoreProvider);
     final v = await store.readAll(const [
       SettingKeys.onlineScrape,
+      SettingKeys.autoScrapeOnScan,
       SettingKeys.tmdbApiKey,
+      SettingKeys.tmdbApiBase,
+      SettingKeys.tmdbImageBase,
+      SettingKeys.doubanCookie,
+      SettingKeys.opensubtitlesApiKey,
+      SettingKeys.opensubtitlesBase,
       SettingKeys.defaultQuality,
       SettingKeys.autoLoadSubtitles,
       SettingKeys.rememberPosition,
@@ -101,29 +224,19 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       SettingKeys.logLevel,
     ]);
 
-    return AppSettings(
-      onlineScrape: v[SettingKeys.onlineScrape] == 'true',
-      tmdbApiKey: v[SettingKeys.tmdbApiKey] ?? '',
-      defaultQuality: v[SettingKeys.defaultQuality] ?? '',
-      // 缺失时取 `true`：默认自动加载字幕，与 `PlaybackController` 的
-      // 缺省行为保持一致。两处不一致会出现「设置页显示开、实际没加载」。
-      autoLoadSubtitles: v[SettingKeys.autoLoadSubtitles] != 'false',
-      rememberPosition: v[SettingKeys.rememberPosition] != 'false',
-      playerVolume:
-          double.tryParse(v[SettingKeys.playerVolume] ?? '') ?? 100,
-      playerRate: double.tryParse(v[SettingKeys.playerRate] ?? '') ?? 1,
-      scanIntervalMs:
-          int.tryParse(v[SettingKeys.scanIntervalMs] ?? '') ?? 350,
-      scanMaxDepth: int.tryParse(v[SettingKeys.scanMaxDepth] ?? '') ?? 12,
-      lastScanAt: DateTime.tryParse(v[SettingKeys.lastScanAt] ?? ''),
-      logLevel: v[SettingKeys.logLevel] ?? 'info',
-    );
+    return AppSettings.fromValues(v);
   }
 
   /// 批量写。只处理传进来的字段。
   Future<void> set({
     bool? onlineScrape,
+    bool? autoScrapeOnScan,
     String? tmdbApiKey,
+    String? tmdbApiBase,
+    String? tmdbImageBase,
+    String? doubanCookie,
+    String? opensubtitlesApiKey,
+    String? opensubtitlesBase,
     String? defaultQuality,
     bool? autoLoadSubtitles,
     bool? rememberPosition,
@@ -139,8 +252,29 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     if (onlineScrape != null) {
       await store.writeBool(SettingKeys.onlineScrape, onlineScrape);
     }
+    if (autoScrapeOnScan != null) {
+      await store.writeBool(SettingKeys.autoScrapeOnScan, autoScrapeOnScan);
+    }
     if (tmdbApiKey != null) {
       await store.write(SettingKeys.tmdbApiKey, tmdbApiKey.trim());
+    }
+    if (tmdbApiBase != null) {
+      await store.write(SettingKeys.tmdbApiBase, tmdbApiBase.trim());
+    }
+    if (tmdbImageBase != null) {
+      await store.write(SettingKeys.tmdbImageBase, tmdbImageBase.trim());
+    }
+    if (doubanCookie != null) {
+      await store.write(SettingKeys.doubanCookie, doubanCookie.trim());
+    }
+    if (opensubtitlesApiKey != null) {
+      await store.write(
+        SettingKeys.opensubtitlesApiKey,
+        opensubtitlesApiKey.trim(),
+      );
+    }
+    if (opensubtitlesBase != null) {
+      await store.write(SettingKeys.opensubtitlesBase, opensubtitlesBase.trim());
     }
     if (defaultQuality != null) {
       await store.write(SettingKeys.defaultQuality, defaultQuality);
@@ -170,7 +304,13 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     state = AsyncData(
       current.copyWith(
         onlineScrape: onlineScrape,
+        autoScrapeOnScan: autoScrapeOnScan,
         tmdbApiKey: tmdbApiKey?.trim(),
+        tmdbApiBase: tmdbApiBase?.trim(),
+        tmdbImageBase: tmdbImageBase?.trim(),
+        doubanCookie: doubanCookie?.trim(),
+        opensubtitlesApiKey: opensubtitlesApiKey?.trim(),
+        opensubtitlesBase: opensubtitlesBase?.trim(),
         defaultQuality: defaultQuality,
         autoLoadSubtitles: autoLoadSubtitles,
         rememberPosition: rememberPosition,

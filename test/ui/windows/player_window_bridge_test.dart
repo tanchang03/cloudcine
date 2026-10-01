@@ -11,18 +11,9 @@ import 'package:flutter_test/flutter_test.dart';
 ///   - 进度回报没路由 → 「最近播放」永远不更新；
 ///   - 未实现的方法不抛 → 协议两边悄悄错位，没人发现。
 void main() {
-  setUp(() {
-    // 这三个都是**进程级全局**（见 bridge 里的说明），用例之间必须隔离。
-    debugSetPendingPlayRequest(null);
-    onPlaybackProgress = null;
-    onTicketRefresh = null;
-  });
+  setUp(_resetGlobals);
 
-  tearDown(() {
-    debugSetPendingPlayRequest(null);
-    onPlaybackProgress = null;
-    onTicketRefresh = null;
-  });
+  tearDown(_resetGlobals);
 
   group('handlePlayerWindowCall（主窗口侧）', () {
     test('ping → pong', () async {
@@ -81,7 +72,11 @@ void main() {
 
     test('reportProgress 把回报交给 UI 层装上的回调', () async {
       final received = <PlaybackProgressReport>[];
-      onPlaybackProgress = received.add;
+      // 回调是 async 的：切集时主窗口要「先写完库再取新链」，
+      // 回报必须能被 await（见 player_window_bridge.dart 的字段文档）。
+      onPlaybackProgress = (r) async {
+        received.add(r);
+      };
 
       final result = await handlePlayerWindowCall(
         MethodCall(
@@ -103,7 +98,9 @@ void main() {
 
     test('解不开的进度回报不回调、不抛异常', () async {
       var called = false;
-      onPlaybackProgress = (_) => called = true;
+      onPlaybackProgress = (_) async {
+        called = true;
+      };
 
       for (final raw in const <Object?>[
         null,
@@ -267,6 +264,254 @@ void main() {
     });
   });
 
+  group('fetchSubtitleText（网盘字幕正文）', () {
+    test('把 fileId 交给回调，正文原样交回去', () async {
+      String? asked;
+      onFetchSubtitleText = (fileId) async {
+        asked = fileId;
+        return '1\n00:00:01,000 --> 00:00:02,000\n你好\n';
+      };
+
+      final text = await handlePlayerWindowCall(
+        const MethodCall(
+          PlayerBridgeMethod.fetchSubtitleText,
+          <String, Object?>{'fileId': 'f1'},
+        ),
+      );
+
+      expect(asked, 'f1');
+      expect(text, contains('你好'));
+    });
+
+    test('没有 fileId 时不回调 —— 拿一个空 id 去取只会得到一次无谓的请求', () async {
+      var called = false;
+      onFetchSubtitleText = (_) async {
+        called = true;
+        return 'x';
+      };
+
+      for (final raw in const <Object?>[
+        null,
+        <String, Object?>{},
+        <String, Object?>{'fileId': ''},
+        <String, Object?>{'fileId': 42},
+      ]) {
+        expect(
+          await handlePlayerWindowCall(
+            MethodCall(PlayerBridgeMethod.fetchSubtitleText, raw),
+          ),
+          isNull,
+          reason: 'raw=$raw',
+        );
+      }
+
+      expect(called, isFalse);
+    });
+
+    test('取不到时返回 null —— 播放窗口要据此提示，不能假装成功', () async {
+      onFetchSubtitleText = (_) async => null;
+
+      expect(
+        await handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.fetchSubtitleText,
+            <String, Object?>{'fileId': 'f1'},
+          ),
+        ),
+        isNull,
+      );
+    });
+
+    test('没装上回调时返回 null，不抛异常', () async {
+      expect(
+        await handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.fetchSubtitleText,
+            <String, Object?>{'fileId': 'f1'},
+          ),
+        ),
+        isNull,
+      );
+    });
+  });
+
+  group('searchOnlineSubtitles（在线搜索）', () {
+    test('把整个 SubtitleSearchRequest 交给回调 —— 片名由主窗口按 itemId 补全', () async {
+      SubtitleSearchRequest? asked;
+      onSearchOnlineSubtitles = (request) async {
+        asked = request;
+        return const <OnlineSubtitleBrief>[
+          OnlineSubtitleBrief(
+            fileId: 12345,
+            fileName: 'Movie.chs.srt',
+            language: 'zh-cn',
+            downloadCount: 88,
+          ),
+        ];
+      };
+
+      final raw = await handlePlayerWindowCall(
+        const MethodCall(
+          PlayerBridgeMethod.searchOnlineSubtitles,
+          <String, Object?>{'itemId': '102', 'fallbackQuery': '银翼杀手'},
+        ),
+      );
+
+      expect(asked?.itemId, '102');
+      expect(asked?.fallbackQuery, '银翼杀手');
+
+      // 回给播放窗口的必须是**可解码的 JSON 形状**，不是 Dart 对象 ——
+      // 中间要过一趟方法通道的编解码。
+      final list = raw! as List<Object?>;
+      final brief = OnlineSubtitleBrief.fromJson(list.single)!;
+      expect(brief.fileId, 12345);
+      expect(brief.downloadCount, 88);
+    });
+
+    test('搜不到 = 空列表，**不是** null —— 与「请求失败」必须分开', () async {
+      onSearchOnlineSubtitles = (_) async => const <OnlineSubtitleBrief>[];
+
+      final raw = await handlePlayerWindowCall(
+        const MethodCall(
+          PlayerBridgeMethod.searchOnlineSubtitles,
+          <String, Object?>{'itemId': '102'},
+        ),
+      );
+
+      expect(raw, isEmpty);
+      expect(raw, isNotNull);
+    });
+
+    test('两个参数都空时不回调 —— 没什么可搜，发出去只会白烧一次额度', () async {
+      var called = false;
+      onSearchOnlineSubtitles = (_) async {
+        called = true;
+        return const <OnlineSubtitleBrief>[];
+      };
+
+      for (final raw in const <Object?>[
+        null,
+        <String, Object?>{},
+        <String, Object?>{'itemId': '', 'fallbackQuery': '   '},
+      ]) {
+        expect(
+          await handlePlayerWindowCall(
+            MethodCall(PlayerBridgeMethod.searchOnlineSubtitles, raw),
+          ),
+          isEmpty,
+          reason: 'raw=$raw',
+        );
+      }
+
+      expect(called, isFalse);
+    });
+
+    test('回调抛异常时**原样冒出去** —— 吞掉会变成「这部片没有字幕」', () async {
+      // 这是这条协议里最要紧的一条：搜索失败与搜不到必须能被区分开，
+      // 否则「Api-Key 没配对」会表现成「这部片没字幕」，排查方向完全不同。
+      // ⚠️ 异常类型是 `PlatformException` 而不是随便什么异常：跨引擎通道只认识
+      // 它那三段编码，别的异常到了对面会退化成一个 `code='error'`、
+      // `message=<整段 toString>` 的兜底错误 —— 用户看到的就是一坨内部类型名。
+      onSearchOnlineSubtitles = (_) async => throw PlatformException(
+            code: 'opensubtitles/badApiKey',
+            message: 'OpenSubtitles 的 Api-Key 不被接受，去设置页检查一下',
+          );
+
+      await expectLater(
+        handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.searchOnlineSubtitles,
+            <String, Object?>{'itemId': '102'},
+          ),
+        ),
+        throwsA(
+          isA<PlatformException>()
+              .having((e) => e.code, 'code', 'opensubtitles/badApiKey')
+              .having((e) => e.message, 'message', contains('Api-Key')),
+        ),
+      );
+    });
+
+    test('没装上回调时返回空列表，不抛异常', () async {
+      expect(
+        await handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.searchOnlineSubtitles,
+            <String, Object?>{'itemId': '102'},
+          ),
+        ),
+        isEmpty,
+      );
+    });
+  });
+
+  group('fetchOnlineSubtitle（在线字幕正文）', () {
+    test('fileId 是数字字符串时也能解析 —— 通道不保证把 int 原样送回来', () async {
+      int? asked;
+      onFetchOnlineSubtitle = (fileId) async {
+        asked = fileId;
+        return '字幕正文';
+      };
+
+      final text = await handlePlayerWindowCall(
+        const MethodCall(
+          PlayerBridgeMethod.fetchOnlineSubtitle,
+          <String, Object?>{'fileId': '12345'},
+        ),
+      );
+
+      expect(asked, 12345);
+      expect(text, '字幕正文');
+    });
+
+    test('没有 fileId 时不回调', () async {
+      var called = false;
+      onFetchOnlineSubtitle = (_) async {
+        called = true;
+        return 'x';
+      };
+
+      for (final raw in const <Object?>[
+        null,
+        <String, Object?>{},
+        <String, Object?>{'fileId': 'abc'},
+      ]) {
+        expect(
+          await handlePlayerWindowCall(
+            MethodCall(PlayerBridgeMethod.fetchOnlineSubtitle, raw),
+          ),
+          isNull,
+          reason: 'raw=$raw',
+        );
+      }
+
+      expect(called, isFalse);
+    });
+
+    test('额度用完之类的失败要冒出去 —— 那句话必须能显示给用户', () async {
+      onFetchOnlineSubtitle = (_) async => throw PlatformException(
+            code: 'opensubtitles/quotaExceeded',
+            message: 'OpenSubtitles 今天的下载额度用完了（HTTP 429）',
+          );
+
+      await expectLater(
+        handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.fetchOnlineSubtitle,
+            <String, Object?>{'fileId': 12345},
+          ),
+        ),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.message,
+            'message',
+            contains('额度用完'),
+          ),
+        ),
+      );
+    });
+  });
+
   group('supportsMultiWindow 平台闸', () {
     tearDown(() => debugDefaultTargetPlatformOverride = null);
 
@@ -292,4 +537,18 @@ void main() {
       }
     });
   });
+}
+
+/// 清掉 bridge 里的**进程级全局**。
+///
+/// 五个回调都是全局的（见 `player_window_bridge.dart` 的说明），漏清一个的表现
+/// 是「前一条用例装上的回调在后一条里还活着」—— 于是后一条明明没装回调却收到了
+/// 调用，或者更糟：它以为「没装回调」的路径被测过了，其实没有。
+void _resetGlobals() {
+  debugSetPendingPlayRequest(null);
+  onPlaybackProgress = null;
+  onTicketRefresh = null;
+  onFetchSubtitleText = null;
+  onSearchOnlineSubtitles = null;
+  onFetchOnlineSubtitle = null;
 }

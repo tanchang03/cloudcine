@@ -60,6 +60,20 @@ enum VideoResolution {
   /// 展示名，如 `1080P`
   final String label;
 
+  /// 该档在 16:9 下的**长边**像素数（480P→854、720P→1280、1080P→1920…）。
+  ///
+  /// 归挡实测尺寸时用长边而不是 [height]：宽银幕裁切（`3840x1632`）按高度会
+  /// 掉到 1440P，按长边才落在 2160P。实测依据见
+  /// `VideoFormats.resolutionFromDimensions`。
+  int get longSide => switch (this) {
+        VideoResolution.sd480 => 854,
+        VideoResolution.hd720 => 1280,
+        VideoResolution.fhd1080 => 1920,
+        VideoResolution.qhd1440 => 2560,
+        VideoResolution.uhd2160 => 3840,
+        VideoResolution.uhd4320 => 7680,
+      };
+
   /// 习惯叫法，用于 UI 上更口语化的位置，如 `4K`。
   String get marketingLabel => switch (this) {
         VideoResolution.uhd2160 => '4K',
@@ -162,19 +176,22 @@ class VideoFormats {
   static VideoResolution? resolutionFromName(String fileName) {
     final lower = fileName.toLowerCase();
 
-    // 先试「宽x高」这种最不含糊的写法。
+    // 先试「宽x高」这种最不含糊的写法。**取短边** —— 竖屏写法 `1080x1920` 的
+    // 第二个数不是「高」而是长边，直接拿它比档位会把 1080P 的竖屏片说成 1440P。
     final dim = RegExp(r'(\d{3,4})\s*[x×]\s*(\d{3,4})').firstMatch(lower);
     if (dim != null) {
-      final h = int.tryParse(dim.group(2)!);
-      final byHeight = _byHeight(h);
-      if (byHeight != null) return byHeight;
+      final a = int.tryParse(dim.group(1)!);
+      final b = int.tryParse(dim.group(2)!);
+      final short = (a == null || b == null) ? (a ?? b) : (a < b ? a : b);
+      final byShort = _byShortAxis(short);
+      if (byShort != null) return byShort;
     }
 
-    // `1080p` / `1080i` / `1080P50`
+    // `1080p` / `1080i` / `1080P50`（这个数本来就是档位数字，直接当短边比）
     final scan = RegExp(r'(?<!\d)(\d{3,4})\s*[pi](?!\w)').firstMatch(lower);
     if (scan != null) {
-      final byHeight = _byHeight(int.tryParse(scan.group(1)!));
-      if (byHeight != null) return byHeight;
+      final byShort = _byShortAxis(int.tryParse(scan.group(1)!));
+      if (byShort != null) return byShort;
     }
 
     // `4K` / `8K` / `2K`（注意 `2K` 在很多发布组里就是 1080P，这里按
@@ -192,15 +209,89 @@ class VideoFormats {
     return null;
   }
 
-  /// 高度 → 档位。取「不超过给定高度的最大档位」。
+  /// 从**实测像素尺寸**归挡分辨率。
   ///
-  /// 这样 `1920x800`（宽银幕裁切）会落到 720P 而不是 1080P —— 宁可标低一档，
-  /// 也不要把裁切过的画面说成 1080P。
-  static VideoResolution? _byHeight(int? height) {
-    if (height == null || height < 360) return null;
+  /// ## 为什么两个轴都要看，并且取较高的那一档
+  ///
+  /// 只按**高度**会低估宽银幕。2026-10-01 实测（递归遍历 44 个目录、427 个视频）：
+  /// **宽银幕裁切占 40%** —— `3840x1632`×59、`3840x1608`×31、`1920x804`×19、
+  /// `4096x1742`×17、`3840x1636`×14、`1280x536`×1 ……
+  /// 按高度归挡会把这 171 条**全部低估一档**：`3840x1632` → 1440P（它其实是
+  /// 2.35:1 的 4K 电影），`1920x804` → 720P，`1280x536` → 480P。
+  /// 后果不只是标签难看 —— 「同片多版本」的排序会把 4K 版排到 1080P 版**后面**，
+  /// 用户选清晰度时会挑错文件。
+  ///
+  /// 但只按**长边**会漏掉 4:3 的老内容。DVD 时代的 `720x576`（PAL）/ `720x480`
+  /// （NTSC）长边只有 720，**低于最低档 sd480 的长边 854** → 直接不成档返回
+  /// `null`，界面上一部老剧连分辨率角标都没有。4:3 的 `960x720` 更别扭：
+  /// 长边 960 落在 480P 档，但它是货真价实的 720 线。
+  ///
+  /// 所以两个轴各自算一遍，**取较高的一档**：长边兜住宽银幕，**短边**兜住 4:3。
+  ///
+  /// 第二个轴必须用**短边**，不能用「高」。竖屏的「高」是长边，拿它去比
+  /// 480/720/1080 那排档位会平白抬高两档：`1080x1920` 的「高」1920 落在 1440P、
+  /// `720x1280` 的 1280 落在 1080P。短边在横竖屏下都是那条短轴，两个方向共用
+  /// 一套档位表，于是 16:9 与竖屏在两条轴上结论一致（`1920x1080`、`1080x1920`、
+  /// `1440x2560` 都是同一个档），取较高的那档只在宽银幕和 4:3 两类内容上起作用。
+  ///
+  /// 长边这一路也与夸克自己的 `video_max_resolution` 分档一致（实测：
+  /// 3840~4096 宽 245 条 → `4k`，1920 宽 182 条 → `super`，1280 宽 1 条 → `high`）。
+  ///
+  /// 竖屏因此不需要像 VidHub 那样专门存一个 `isVertical` 字段 —— 长边和短边在
+  /// 横竖屏下都各是长边和短边，方向信息不需要单独记。
+  ///
+  /// 与 [resolutionFromName] 的关系：**实测优先**。文件名是发布组自己写的，
+  /// 会错会缺；尺寸是服务端读文件头得到的。
+  ///
+  /// 两边都拿不到时返回 `null`（表示「不知道」，UI 上不显示分辨率角标）。
+  static VideoResolution? resolutionFromDimensions(int? width, int? height) {
+    final w = (width ?? 0) > 0 ? width : null;
+    final h = (height ?? 0) > 0 ? height : null;
+    if (w == null && h == null) return null;
+
+    // 只给了一边时，把它当档位数字读（`1080` 就是 1080P）。
+    // 实战里夸克两边都给（实测 427/427），这条只是兜底。
+    if (w == null || h == null) return _byShortAxis(w ?? h);
+
+    final longSide = w > h ? w : h;
+    final shortSide = w < h ? w : h;
+
+    final byLongSide = _byLongSide(longSide);
+    final byShortSide = _byShortAxis(shortSide);
+
+    if (byLongSide == null) return byShortSide;
+    if (byShortSide == null) return byLongSide;
+    // enum 按档位升序声明，index 大即档位高。
+    return byLongSide.index >= byShortSide.index ? byLongSide : byShortSide;
+  }
+
+  /// 长边 → 档位。取「不超过给定长边的最大档位」，比的是 854/1280/1920/2560/3840。
+  ///
+  /// 只用于 [resolutionFromDimensions]（实测尺寸）。见那里的说明：它对宽银幕
+  /// 正确，但单独用会漏掉 4:3 老内容，所以要和 [_byShortAxis] 取较高的那个。
+  static VideoResolution? _byLongSide(int? longSide) {
+    if (longSide == null) return null;
     VideoResolution? best;
     for (final r in VideoResolution.values) {
-      if (r.height <= height) best = r;
+      if (r.longSide <= longSide) best = r;
+    }
+    return best;
+  }
+
+  /// 短边 → 档位。取「不超过给定像素数的最大档位」，比的是 480/720/1080/1440/2160。
+  ///
+  /// 名字里的「短边」是要紧的：**不要传「高」**（竖屏的高是长边，会抬高两档），
+  /// 也不要传长边（宽银幕会低估）。两个调用点都传短轴：
+  /// - [resolutionFromName] 传文件名里 `宽x高` 的较小值（`1920x800` → 800 → 720P）；
+  /// - [resolutionFromDimensions] 传实测宽高的较小值。
+  ///
+  /// 保守取向：宁可标低一档，也不要把裁切过的画面说成 1080P。这个取向
+  /// **正是解析文件名时想要的** —— 文件名里的数字是发布组自己写的、可能有水分。
+  static VideoResolution? _byShortAxis(int? pixels) {
+    if (pixels == null || pixels < 360) return null;
+    VideoResolution? best;
+    for (final r in VideoResolution.values) {
+      if (r.height <= pixels) best = r;
     }
     return best;
   }

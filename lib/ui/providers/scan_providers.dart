@@ -2,53 +2,47 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/error/drive_error.dart';
 import '../../data/db/settings_store.dart';
-import '../../data/scrape/tmdb_client.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_policy.dart';
 import '../../domain/services/scan_service.dart';
-import '../../domain/services/scraper.dart';
 import 'app_providers.dart';
 import 'library_providers.dart';
+import 'scrape_providers.dart';
+import 'settings_providers.dart';
 
 /// 构造一次扫描用的 [ScanService]。
 ///
 /// ## 为什么不做成常驻 Provider
 ///
-/// 它的构造依赖**异步读出来的设置**（在线刮削开关、TMDB Key、节流间隔、
-/// 最大深度），而 Riverpod 的同步 `Provider` 拿不到这些值。硬塞一个
-/// 「启动时读一次的缓存快照」会让「改了设置但没生效」变成一个**静默** bug ——
-/// 用户改了 TMDB Key，扫描却还在用旧的那个。
+/// 它的构造依赖**异步读出来的设置**（节流间隔、最大深度），而 Riverpod 的
+/// 同步 `Provider` 拿不到这些值。硬塞一个「启动时读一次的缓存快照」会让
+/// 「改了设置但没生效」变成一个**静默** bug。
 ///
 /// 每次扫描重建的开销可以忽略（就是几个对象），而 `isRunning` /
 /// `lastProgress` 这类状态由 [ScanController] 自己持有，不依赖服务实例。
+///
+/// ## 刮削器来自 [scraperPipelineProvider]（长期存活的那个）
+///
+/// 不在这里现 new 一套：`TmdbScraper` 的熔断与 `DoubanScraper` 的 `103`
+/// 熔断都挂在实例上，每次扫描重建会把它们清零。而「扫描期自动刮削」
+/// 默认是关的，所以扫描多半根本不碰它们 —— 详情页那个按钮用的才是同一套
+/// 实例，熔断状态要在那里延续。
 Future<ScanService> buildScanService(Ref<Object?> ref) async {
   final settings = ref.read(settingsStoreProvider);
 
-  // 一次批量读，避免四五个串行的 SQLite 往返。
+  // 一次批量读，避免几个串行的 SQLite 往返。
   final values = await settings.readAll(const [
-    SettingKeys.onlineScrape,
-    SettingKeys.tmdbApiKey,
     SettingKeys.scanIntervalMs,
     SettingKeys.scanMaxDepth,
   ]);
 
-  final online = values[SettingKeys.onlineScrape] == 'true';
-  final apiKey = (values[SettingKeys.tmdbApiKey] ?? '').trim();
   final intervalMs = int.tryParse(values[SettingKeys.scanIntervalMs] ?? '') ?? 350;
   final maxDepth = int.tryParse(values[SettingKeys.scanMaxDepth] ?? '') ?? 12;
-
-  final scrapers = <MetadataScraper>[
-    if (online && apiKey.isNotEmpty)
-      TmdbScraper(http: ref.read(httpClientProvider), apiKey: apiKey),
-    // ⚠️ 本地解析**必须放最后**。它是兜底：没网、没 Key、被限流时
-    // 唯一还能给出片名的东西。放在前面会让在线结果永远拿不到机会。
-    const LocalFilenameScraper(),
-  ];
 
   return ScanService(
     registry: ref.read(adapterRegistryProvider),
     library: ref.read(mediaRepositoryProvider),
-    scraper: ScraperPipeline(scrapers),
+    scraper: ref.read(scraperPipelineProvider),
     policy: ScanPolicy(
       maxDepth: maxDepth,
       minRequestInterval: Duration(milliseconds: intervalMs),
@@ -118,12 +112,24 @@ class ScanController extends Notifier<ScanState> {
   ///
   /// [resume] 为真时从上次的续扫游标继续（上次已扫完会自动重新开始）。
   /// [pruneStale] 为真时在**完整扫完**后清理网盘侧已删除的记录。
+  ///
+  /// ## 为什么没有 `scrape` 参数了
+  ///
+  /// 「扫描完要不要刮削」从「本次扫描的选项」变成了**全局设置**
+  /// （`autoScrapeOnScan`，默认关）。理由：豆瓣的匿名额度只有约 10 个搜索词，
+  /// 全盘自动刮必然中途耗尽并让这个 IP 短期不可用。刮削的默认入口因此改到
+  /// 详情页的「刮削」按钮，扫描只负责建索引。
+  ///
+  /// 由这里读设置而不是让页面传参，是为了让「重试」那条路径也自动遵循同一个
+  /// 决定 —— 页面传参时漏传一处就会静默地不刮（或反过来）。
   Future<void> start({
     bool resume = true,
     bool pruneStale = true,
-    bool scrape = true,
   }) async {
     if (state.running) return;
+
+    final settings = ref.read(settingsProvider).valueOrNull;
+    final autoScrape = settings?.canAutoScrape ?? false;
 
     final token = ScanCancellation();
     _cancel = token;
@@ -135,7 +141,7 @@ class ScanController extends Notifier<ScanState> {
         DriveProvider.quark,
         resume: resume,
         pruneStale: pruneStale,
-        scrape: scrape,
+        scrape: autoScrape,
         cancel: token,
         onProgress: (p) => _emit(ScanState(running: true, progress: p)),
       );
@@ -157,6 +163,9 @@ class ScanController extends Notifier<ScanState> {
       if (!_disposed) {
         ref.invalidate(workListProvider);
         ref.invalidate(libraryStatsProvider);
+        // 「最近播放」的角标也要跟着重取：清理陈旧条目会删掉一些播过的
+        // 作品行（网盘侧已删除的文件）。
+        ref.invalidate(playedCountProvider);
       }
     }
   }

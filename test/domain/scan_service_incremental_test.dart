@@ -64,9 +64,12 @@ void main() {
   ScanService buildService(
     MediaRepository library, {
     void Function(String dirId)? onList,
+    Map<String, List<DriveEntry>>? tree,
   }) =>
       ScanService(
-        registry: AdapterRegistry([_FakeDrive(buildTree(), onList: onList)]),
+        registry: AdapterRegistry([
+          _FakeDrive(tree ?? buildTree(), onList: onList),
+        ]),
         library: library,
         policy: const ScanPolicy(
           // ⚠️ 必须显式关掉：`ScanPolicy.audioOnly` 默认 `true`（继承自音频
@@ -202,6 +205,128 @@ void main() {
       isNotEmpty,
       reason: '取消不该把已经发现的作品丢掉 —— 那正是「边扫边看」的价值',
     );
+  });
+
+  /// 封面锚点（夸克人脸框 → 竖版裁切用）从条目一路带到作品上。
+  ///
+  /// 这一段是**遍历期的取种逻辑**，`FaceAnchor` 的单测覆盖不到它：
+  /// 单测只能证明「给定一个框能算出锚点」，证明不了「这个锚点会跟着
+  /// 正确的那张缩略图存进作品行」。
+  group('封面人物锚点：地址与锚点必须成对', () {
+    const thumbA = 'https://drive-pc.quark.cn/a.webp';
+    const thumbB = 'https://drive-pc.quark.cn/b.webp';
+
+    /// 一个目录、若干集，方便按顺序验证「第一条有图的说了算」。
+    Map<String, List<DriveEntry>> seriesTree(List<DriveEntry> episodes) => {
+          '0': const [
+            DriveEntry(id: 'd1', name: '剧甲', isDirectory: true),
+          ],
+          'd1': episodes,
+        };
+
+    DriveEntry episode(
+      String id,
+      String name, {
+      String? thumb,
+      double? faceX,
+    }) =>
+        DriveEntry(
+          id: id,
+          name: name,
+          isDirectory: false,
+          sizeBytes: 1000,
+          thumbnailUrl: thumb,
+          faceAnchorX: faceX,
+        );
+
+    Future<MediaWork> scanOne(
+      List<DriveEntry> episodes,
+    ) async {
+      final repo = InMemoryMediaRepository();
+      await buildService(repo, tree: seriesTree(episodes)).scan(
+        DriveProvider.quark,
+        resume: false,
+        pruneStale: false,
+        scrape: false,
+      );
+      return repo.works.values.single;
+    }
+
+    test('条目带人脸框 → 作品同时拿到缩略图地址和锚点', () async {
+      final work = await scanOne([
+        episode('f1', '剧甲.S01E01.1080p.mkv', thumb: thumbA, faceX: 0.42),
+      ]);
+
+      expect(work.posterUrl, thumbA);
+      expect(
+        work.posterFaceX,
+        0.42,
+        reason: '没有这一条，封面就永远退回「画面正中」裁切 —— '
+            '双人对谈镜头会正好裁在两个人中间的空隙上。',
+      );
+    });
+
+    test('条目没人脸框 → 锚点是 null，地址照常', () async {
+      // 夸克的人脸框覆盖率实测 93%，所以这是常态而不是异常。
+      final work = await scanOne([
+        episode('f1', '剧甲.S01E01.1080p.mkv', thumb: thumbA),
+      ]);
+
+      expect(work.posterUrl, thumbA);
+      expect(work.posterFaceX, isNull);
+    });
+
+    test('第一条有图没人脸、第二条有人脸 → 不许把两集的拼在一起', () async {
+      // 这是「地址和锚点必须一次写完」那个坑的回归测试。
+      // 写成两次 `??=`（先补地址、再补锚点）的话，这里会得到
+      // 「第一集的图 + 第二集的人脸位置」—— 一张图和它的人脸位置
+      // 来自不同的剧集，封面会裁到一个莫名其妙的角落，而且不报任何错。
+      final work = await scanOne([
+        episode('f1', '剧甲.S01E01.1080p.mkv', thumb: thumbA),
+        episode('f2', '剧甲.S01E02.1080p.mkv', thumb: thumbB, faceX: 0.72),
+      ]);
+
+      expect(work.posterUrl, thumbA, reason: '第一条有图的说了算');
+      expect(
+        work.posterFaceX,
+        isNull,
+        reason: '第一集没人脸框，就该退回画面正中；'
+            '绝不能借用第二集的人脸位置来裁第一集的图。',
+      );
+    });
+
+    test('第一条什么都没有 → 用第二条的地址和锚点（仍然是成对的）', () async {
+      final work = await scanOne([
+        episode('f1', '剧甲.S01E01.1080p.mkv', faceX: 0.9),
+        episode('f2', '剧甲.S01E02.1080p.mkv', thumb: thumbB, faceX: 0.2),
+      ]);
+
+      expect(work.posterUrl, thumbB);
+      expect(work.posterFaceX, 0.2);
+    });
+
+    test('媒体项自己也带着锚点（后续单集列表要用）', () async {
+      final repo = InMemoryMediaRepository();
+      await buildService(
+        repo,
+        tree: seriesTree([
+          episode('f1', '剧甲.S01E01.1080p.mkv', thumb: thumbA, faceX: 0.42),
+        ]),
+      ).scan(
+        DriveProvider.quark,
+        resume: false,
+        pruneStale: false,
+        scrape: false,
+      );
+
+      final item = repo.items.values.single;
+      expect(item.faceAnchorX, 0.42);
+      expect(
+        item.thumbUrl,
+        thumbA,
+        reason: '锚点说的是 thumbUrl 那张图 —— 谁提供缩略图，谁就提供锚点。',
+      );
+    });
   });
 }
 

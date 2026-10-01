@@ -30,8 +30,15 @@ class AppDatabase extends _$AppDatabase {
   /// 内存库（测试用）。
   AppDatabase.memory() : super(NativeDatabase.memory());
 
+  /// 当前 schema 版本。
+  ///
+  /// v1：首个版本（媒体项 / 作品 / 字幕引用 / 续扫游标 / 设置）。
+  /// v2：`media_items.resumePositionMs` —— 续播位置。
+  /// v3：`media_items.thumbUrl`（网盘缩略图）+ `media_works.category`（分类）。
+  /// v4：`media_items.videoWidth` / `videoHeight`（网盘给的**实测**像素尺寸）。
+  /// v5：`media_works.posterFaceX`（封面裁切用的人物锚点）。
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 5;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -40,10 +47,50 @@ class AppDatabase extends _$AppDatabase {
           diag.info('数据库', '索引库已创建（schema v$schemaVersion）');
         },
         onUpgrade: (m, from, to) async {
-          // v1 是首个版本，还没有需要迁移的历史。留一个显式的分支而不是
-          // 空实现：将来加列时这里就是唯一的落点，而空的 onUpgrade
-          // 会让「忘了写迁移」变成一个静默的数据损坏。
-          diag.warn('数据库', '未预期的 schema 升级：$from → $to');
+          if (from < 2) {
+            // 加列时旧行的值是 NULL，而这一列的 NULL 语义正好是
+            // 「没有可续的点」—— 所以**不需要回填**，也不需要默认值。
+            await m.addColumn(mediaItems, mediaItems.resumePositionMs);
+            diag.info('数据库', '索引库已升级到 v2（新增续播位置）');
+          }
+          if (from < 3) {
+            // `thumbUrl` 的 NULL 语义是「这个文件没有预览图」，不需要回填；
+            // 旧库会在下次扫描时自然补上。
+            await m.addColumn(mediaItems, mediaItems.thumbUrl);
+            // `category` 有 `DEFAULT ''`，SQLite 的 `ADD COLUMN` 会把旧行
+            // 一并填成空串 —— 而空串正好表示「还没判定过」，由
+            // `backfillWorkCategories()` 补算。**不做「默认成 other」**：
+            // 那会让老库在用户下一次扫描之前整库落进「其他」栏，
+            // 看起来像分类功能坏了。
+            await m.addColumn(mediaWorks, mediaWorks.category);
+            diag.info('数据库', '索引库已升级到 v3（缩略图地址 + 媒体分类）');
+          }
+          if (from < 4) {
+            // NULL 语义是「网盘还没给出实测尺寸」，不需要回填 ——
+            // 而且**没法**回填：旧库里根本没有这个信息，只能等下次扫描。
+            //
+            // 代价要说清楚：升级后旧库里那些**文件名里没写分辨率**的条目
+            // 仍然没有分辨率角标，直到用户重扫一次。这比「编一个值塞进去」
+            // 诚实 —— 编出来的值会让人以为分辨率是从文件里读的。
+            await m.addColumn(mediaItems, mediaItems.videoWidth);
+            await m.addColumn(mediaItems, mediaItems.videoHeight);
+            diag.info('数据库', '索引库已升级到 v4（实测视频尺寸）');
+          }
+          if (from < 5) {
+            // NULL 语义是「这张封面不需要锚点（不是视频帧）或没有可用人脸框」，
+            // 两种情况渲染时都退回画面正中，所以不需要回填。
+            //
+            // 同样**没法**回填：旧库里根本没存过人脸框，只能等下次扫描。
+            // 代价是升级后封面暂时按画面正中裁 —— 竖版裁切只会保留约 37.5%
+            // 的画面宽度，所以双人对谈镜头会裁到两人之间的空隙。重扫一次即好。
+            await m.addColumn(mediaWorks, mediaWorks.posterFaceX);
+            diag.info('数据库', '索引库已升级到 v5（封面人物锚点）');
+          }
+          if (to > schemaVersion) {
+            // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，
+            // 而空的 onUpgrade 会让「忘了写迁移」变成一个静默的数据损坏。
+            diag.warn('数据库', '未预期的 schema 升级：$from → $to');
+          }
         },
         beforeOpen: (details) async {
           // 外键在 SQLite 里默认是关的，必须每个连接显式打开。

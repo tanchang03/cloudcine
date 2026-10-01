@@ -48,6 +48,44 @@ abstract final class PlayerBridgeMethod {
   /// 请求时才暴露（最典型的是拖进度条触发 Range 请求），提前推一条新链既没有
   /// 触发时机，也会打断正在播的流。所以让它坏在哪、修在哪。
   static const String refreshTicket = 'refreshTicket';
+
+  /// 播放窗口 → 主窗口：「把这条网盘字幕的正文给我」。
+  ///
+  /// 参数是 `{'fileId': …}`，返回**已解码的 UTF-8 文本**，取不到时返回 null。
+  ///
+  /// ## 为什么必须过主窗口
+  ///
+  /// 两个硬约束，任何一个不解决都表现为「外挂字幕用不了」：
+  ///
+  ///   1. **请求头**。夸克直链缺 Cookie 一律 412，而 `media_kit` 的
+  ///      `SubtitleTrack.uri` / `.data` **都没有请求头参数**（视频可以用
+  ///      `Media(uri, httpHeaders:)`，字幕不行）。所以字节只能我们自己取。
+  ///   2. **编码**。中文外挂字幕大量是 GBK，mpv 的自动探测经常失败 —— 满屏乱码。
+  ///      正文在主窗口用 `decodeTextBytes`（先严格 UTF-8、失败再 GBK）解码成
+  ///      UTF-8 文本再过来，这一类问题才根治。
+  ///
+  /// 传**文本**而不是字节：跨引擎通道传的是 `Uint8List` 也能做到，但解码要在
+  /// 有 `fast_gbk` 的那一侧做，而播放窗口刻意不背这些依赖。
+  static const String fetchSubtitleText = 'fetchSubtitleText';
+
+  /// 播放窗口 → 主窗口：「去字幕站上搜一下」。
+  ///
+  /// 参数是 [SubtitleSearchRequest.toJson]，返回 [OnlineSubtitleBrief] 的
+  /// `toJson` 列表（没搜到时是**空列表**，不是 null —— 与「请求失败」区分开）。
+  ///
+  /// 走主窗口的理由与 [fetchSubtitleText] 一样：Api-Key 在设置里、HTTP 客户端
+  /// 在主窗口，而播放窗口不该为了一条字幕去背一个字幕站客户端。
+  ///
+  /// ⚠️ **搜索失败是抛异常，不是返回空列表**。这条区别是刻意的：返回空列表
+  /// 会被用户读成「这部片没有字幕」，而实际可能是 Api-Key 没配对 —— 两个
+  /// 完全不同的排查方向。异常里的 `code` 是失败种类（`opensubtitles/badApiKey`
+  /// 这种，给日志看），`message` 是一句能直接显示给用户的中文。
+  static const String searchOnlineSubtitles = 'searchOnlineSubtitles';
+
+  /// 播放窗口 → 主窗口：「把这条在线字幕的正文给我」。
+  ///
+  /// 参数是 `{'fileId': <int>}`，返回已解码的文本，失败返回 null。
+  static const String fetchOnlineSubtitle = 'fetchOnlineSubtitle';
 }
 
 /// 当前平台是否支持多窗口。
@@ -68,7 +106,11 @@ bool get supportsMultiWindow =>
 /// **必须由 UI 层装上**（见 `playerBridgeHostProvider`）：这个文件在
 /// `main()` 里就被调用，那时还没有 Riverpod 容器，拿不到仓储。
 /// 没装上时进度回报会被安静丢弃，只在日志里留一条 debug。
-void Function(PlaybackProgressReport report)? onPlaybackProgress;
+///
+/// 返回类型是 `Future` 而不是 `void`：调用方会 **await** 它（见
+/// [handlePlayerWindowCall]）。切集那一步要「先把当前位置写库，再读库算新一集的
+/// 续播点」，只靠「发完了消息」是排不出这个顺序的。
+Future<void> Function(PlaybackProgressReport report)? onPlaybackProgress;
 
 /// 播放窗口要求刷新直链时，主窗口该做什么。
 ///
@@ -78,6 +120,31 @@ void Function(PlaybackProgressReport report)? onPlaybackProgress;
 /// 播放窗口拿到 null 就应当**停在原地并如实告诉用户**，而不是反复重试 ——
 /// 重试由它自己的 `TicketRefreshGuard` 管，这里只负责一次成败。
 Future<PlayRequest?> Function(TicketRefreshRequest request)? onTicketRefresh;
+
+/// 播放窗口要一条网盘字幕的正文时，主窗口该做什么。
+///
+/// 与 [onPlaybackProgress] 同样的理由必须由 UI 层装上（需要适配器与凭证）。
+///
+/// 返回**已解码的 UTF-8 文本**；`null` 表示取不到（文件已删、取链失败、
+/// 平台不支持）。播放窗口拿到 null 应当**如实告诉用户**，不要静默什么都不做 ——
+/// 那会被读成「点了没反应」。
+Future<String?> Function(String fileId)? onFetchSubtitleText;
+
+/// 播放窗口要在字幕站上搜字幕时，主窗口该做什么。
+///
+/// 返回**空列表**表示「确实搜不到」；抛异常表示「这次请求没成」。
+/// 这两者绝不能混 —— 混了以后用户看到「搜不到」会以为这部片没有字幕，
+/// 而实际可能是 Api-Key 没配对。
+///
+/// 抛出的异常**必须是 [PlatformException]**：跨引擎通道只认识这一种错误
+/// 形状（框架按 `code`/`message`/`details` 三段编码），别的异常到了对面会
+/// 退化成一个 `code='error'`、`message=<整段 toString>` 的兜底错误 ——
+/// 那正是「用户看到一坨 OpenSubtitlesException(notConfigured, …)」的来源。
+Future<List<OnlineSubtitleBrief>> Function(SubtitleSearchRequest request)?
+    onSearchOnlineSubtitles;
+
+/// 播放窗口要一条在线字幕的正文时，主窗口该做什么。
+Future<String?> Function(int fileId)? onFetchOnlineSubtitle;
 
 /// 主窗口侧：还没被播放窗口取走的播放请求。
 ///
@@ -145,7 +212,15 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
         diag.debug('窗口', '收到进度回报但没有落库回调（UI 层还没装上）');
         return null;
       }
-      handler(report);
+      // ⚠️ **必须 await，不能 fire-and-forget。**
+      //
+      // 切集的顺序是：播放窗口先报「当前这一集看到哪了」，紧接着请求下一集的
+      // 新链；主窗口拿到请求后要**读库**算续播点。若这里不等写入完成，读到
+      // 的就是旧值 —— 症状是「切走再切回来，又从头开始」。
+      //
+      // 平时的 10 秒一次回报也走这条路，但它们对顺序没有要求，等一下（一次
+      // 本地 SQLite 写入）没有任何代价。
+      await handler(report);
       return null;
 
     case PlayerBridgeMethod.refreshTicket:
@@ -173,6 +248,68 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
         '已刷新直链 → ${fresh.describe()} @ ${fresh.startPosition.inSeconds}s',
       );
       return fresh.toJson();
+
+    case PlayerBridgeMethod.fetchSubtitleText:
+      final fileId = call.arguments is Map
+          ? (call.arguments as Map)['fileId']
+          : null;
+      if (fileId is! String || fileId.isEmpty) {
+        diag.warn('窗口', '收到没有 fileId 的取字幕请求，忽略');
+        return null;
+      }
+      final fetch = onFetchSubtitleText;
+      if (fetch == null) {
+        diag.warn('窗口', '播放窗口要字幕正文，但没有装上取字幕回调');
+        return null;
+      }
+      // 不打 fileId 之外的东西：字幕文件名可能含片子信息，但那不是秘密；
+      // 反过来**不要**打返回内容 —— 那是整份字幕正文。
+      diag.info('窗口', '播放窗口要字幕正文 fid=$fileId');
+      final text = await fetch(fileId);
+      if (text == null) {
+        diag.warn('窗口', '取字幕正文失败 fid=$fileId');
+        return null;
+      }
+      return text;
+
+    case PlayerBridgeMethod.searchOnlineSubtitles:
+      final request = SubtitleSearchRequest.fromJson(call.arguments);
+      if (request.isEmpty) {
+        diag.warn('窗口', '收到没有片名也没有条目的在线字幕搜索请求，忽略');
+        return const <Object?>[];
+      }
+      final search = onSearchOnlineSubtitles;
+      if (search == null) {
+        diag.warn('窗口', '播放窗口要搜在线字幕，但没有装上搜索回调');
+        return const <Object?>[];
+      }
+      diag.info('窗口', '播放窗口要搜在线字幕：$request');
+      // 不 catch：这里的异常要原样穿到播放窗口去（见回调的文档）。
+      final hits = await search(request);
+      diag.info('窗口', '在线字幕搜索返回 ${hits.length} 条');
+      return hits.map((h) => h.toJson()).toList();
+
+    case PlayerBridgeMethod.fetchOnlineSubtitle:
+      final fileId = call.arguments is Map
+          ? (call.arguments as Map)['fileId']
+          : null;
+      final id = fileId is int ? fileId : int.tryParse('$fileId');
+      if (id == null) {
+        diag.warn('窗口', '收到没有 fileId 的取在线字幕请求，忽略');
+        return null;
+      }
+      final fetchOnline = onFetchOnlineSubtitle;
+      if (fetchOnline == null) {
+        diag.warn('窗口', '播放窗口要在线字幕正文，但没有装上取字幕回调');
+        return null;
+      }
+      diag.info('窗口', '播放窗口要在线字幕正文 fileId=$id');
+      final text = await fetchOnline(id);
+      if (text == null) {
+        diag.warn('窗口', '取在线字幕正文失败 fileId=$id');
+        return null;
+      }
+      return text;
 
     default:
       throw MissingPluginException('主窗口未实现的通道方法：${call.method}');

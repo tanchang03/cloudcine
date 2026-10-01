@@ -4,11 +4,39 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
+	<!--
+	  允许调试器附加到本进程。macOS 的 taskgated 守护进程在收到
+	  task_for_pid 请求时会查这个权限——没有它，flutter run 构建成功
+	  但永远连不上 Dart VM Service，表现是「一直卡住、没有窗口」。
+	  **只在 DebugProfile 里加，Release 不加**（正式版不该允许调试）。
+	-->
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.network.server</key>
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!--
+	  读用户**通过文件选择器挑中**的文件。只读，不写。
+	  目前唯一的用途是播放器里「加载本地字幕文件」—— 沙箱下没有这一条时，
+	  选择器能弹出、也能返回路径，但紧接着的读取会失败，报的还是
+	  「Operation not permitted」这种不指向权限的错。
+	  ⚠️ Debug 与 Release 两个 entitlements 都要有，只加一个的表现是
+	  「开发时好好的，打包出来读不了」。
+	-->
+	<key>com.apple.security.files.user-selected.read-only</key>
+	<true/>
+	<!--
+	  Data Protection Keychain 访问权限。
+	  flutter_secure_storage 的 useDataProtectionKeyChain=true 需要这一条，
+	  否则报 -34018（errSecMissingEntitlement）。
+	  $(AppIdentifierPrefix) 在 ad-hoc 签名下解析为空串，正式签名下解析为 Team ID。
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.cloudcine.cloudcine</string>
+	</array>
 </dict>
 </plist>

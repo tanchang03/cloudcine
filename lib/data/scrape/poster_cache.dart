@@ -30,14 +30,34 @@ class PosterCache {
   PosterCache({
     required HttpClientLike http,
     required this.dirPath,
+    Map<String, String> Function(String url)? headersFor,
     Duration timeout = const Duration(seconds: 15),
   })  : _http = http,
+        _headersFor = headersFor,
         _timeout = timeout;
 
   final HttpClientLike _http;
 
   /// 缓存目录的绝对路径。
   final String dirPath;
+
+  /// 「这个图片地址要带什么请求头」。
+  ///
+  /// ## 为什么缓存层要知道请求头
+  ///
+  /// 海报来源不止一处：
+  ///   - TMDB 的图（`image.tmdb.org`）—— 裸链即可；
+  ///   - **网盘自己生成的缩略图**（夸克 `/file/video/preview?fid=…`）——
+  ///     实测**必须带 Cookie**，裸链 `401 auth not found`，而且夸克每次响应
+  ///     轮换 `__puus`，用旧值一样 401。
+  ///
+  /// 两种来源混在同一个缓存目录里，缓存层就得能按地址决定带不带鉴权头。
+  /// 交给回调而不是在这里判断域名，是为了让「哪家网盘、用什么头」这件事
+  /// 留在适配器里 —— 缓存层不该认识任何一家网盘。
+  ///
+  /// 回调在**每次真正发请求时**调用（不是在 `pathFor` 时），所以它总能拿到
+  /// 最新一轮的 Cookie。
+  final Map<String, String> Function(String url)? _headersFor;
 
   final Duration _timeout;
 
@@ -77,7 +97,28 @@ class PosterCache {
       final name = fileNameFor(key: key, url: url);
       final target = _absolute(name);
 
-      final bytes = await _http.getBytes(url, timeout: _timeout);
+      // 盘上已经有这张图就直接用 —— **不发请求**。
+      //
+      // ## 为什么这道判断必须有
+      //
+      // 缓存的「已命中」本来靠的是库里记着的 `posterFile`（`pathFor` 的
+      // `knownFile`），但**没有任何代码把下载结果写回那一列**：`pathFor`
+      // 返回的路径在 `PosterImage` 里用完就丢。于是每次启动应用、每张海报
+      // 都会重新下一遍。
+      //
+      // 对 TMDB 海报这只是慢；对**网盘缩略图**是实打实的浪费 ——
+      // 一千部作品就是启动后一千次带 Cookie 的请求（夸克还有 QPS 限制）。
+      //
+      // 用「文件是否存在」当缓存判据是安全的：文件名里带着 URL 的散列，
+      // 换了地址自然换文件名；而同一个地址的图片内容不会变
+      // （TMDB 的图是内容寻址的，夸克缩略图按 `fid` 固定）。
+      if (File(target).existsSync()) return target;
+
+      final bytes = await _http.getBytes(
+        url,
+        headers: _headersFor?.call(url),
+        timeout: _timeout,
+      );
       if (bytes == null || bytes.isEmpty) {
         diag.warn('海报', '下载失败（空响应）：$url');
         return null;
@@ -110,6 +151,12 @@ class PosterCache {
       '$dirPath${Platform.pathSeparator}$fileName';
 
   /// 缓存文件名：`{归一化键}_{URL 散列 8 位}.jpg`
+  ///
+  /// 扩展名固定 `.jpg` **不代表内容一定是 JPEG**：网盘生成的缩略图实测是
+  /// WebP。这里只当它是「一个图片文件」—— 解码由 Flutter 的
+  /// `instantiateImageCodec` 按**内容**嗅探，不看扩展名。
+  /// 之所以不按真实格式命名，是因为文件名在**下载之前**就得定下来
+  /// （它是幂等键），而那时还不知道响应是什么格式。
   static String fileNameFor({required String key, required String url}) {
     final safe = _sanitize(key);
     return '${safe}_${_hash8(url)}.jpg';

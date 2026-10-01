@@ -6,12 +6,16 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/playback_seek.dart';
+import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/subtitle_formats.dart';
+import '../../core/utils/track_labels.dart';
 import '../adapters/cloud_drive_adapter.dart';
 import '../entities/media_item.dart';
 import '../entities/quality_option.dart';
 import '../entities/stream_ticket.dart';
 import '../entities/subtitle_track.dart';
+import 'playback_media.dart';
 import 'subtitle_service.dart';
 
 /// 播放控制器 —— 本应用「能不能看」这件事的唯一裁决者。
@@ -64,6 +68,9 @@ class PlaybackController extends ChangeNotifier {
       ),
     );
     _bindPlayerStreams();
+    // 补 media_kit 构造参数管不到的 mpv 缓冲属性（demuxer-readahead-secs）。
+    // setProperty 内部等播放器初始化完成再设，不需要在 open() 之前同步等待。
+    unawaited(PlayerBufferConfig.apply(player));
   }
 
   final DriveAdapterRegistry _registry;
@@ -71,7 +78,15 @@ class PlaybackController extends ChangeNotifier {
   final Duration _positionSaveInterval;
 
   /// mpv 播放器实例。**只在本类内部使用**。
-  final mk.Player player = mk.Player();
+  ///
+  /// 缓冲上限 256 MB（media_kit 默认 32 MB 对高码率原画远远不够），
+  /// 预读目标在 [PlayerBufferConfig.apply] 里设。两个播放器（本类 +
+  /// 独立窗口 `player_window_app.dart`）共用同一份配置。
+  final mk.Player player = mk.Player(
+    configuration: const mk.PlayerConfiguration(
+      bufferSize: PlayerBufferConfig.bufferSize,
+    ),
+  );
 
   /// 渲染控制器，交给 `Video(controller: ...)`。
   ///
@@ -250,15 +265,27 @@ class PlaybackController extends ChangeNotifier {
   ///
   /// ⚠️ **请求头是必须的**。夸克直链缺 Cookie 一律返回 412，
   /// 表现是「能扫描、一播就报错」，而错误信息里看不出是缺头。
-  Future<void> _loadIntoPlayer(StreamTicket ticket) async {
+  ///
+  /// [startAt] 是起播位置，走 [PlaybackMedia]（也就是 `Media(start:)`）而不是
+  /// 「open 之后再 seek」—— 后者**无效**：`Player.open()` 不等文件加载完成，
+  /// 紧跟的那次 seek 会被丢掉。实测记录见 [PlaybackMedia] 的类文档。
+  Future<void> _loadIntoPlayer(
+    StreamTicket ticket, {
+    Duration startAt = Duration.zero,
+  }) async {
     diag.info(
       '播放',
       '交给播放器：${ticket.redactedUrl} '
       '请求头=${ticket.headers.keys.toList()} '
-      '档位=${_activeQualityId ?? "-"}',
+      '档位=${_activeQualityId ?? "-"} '
+      '起播=${startAt.inSeconds}s',
     );
     await player.open(
-      mk.Media(ticket.url.toString(), httpHeaders: ticket.headers),
+      PlaybackMedia.build(
+        ticket.url.toString(),
+        headers: ticket.headers,
+        startAt: startAt,
+      ),
       play: true,
     );
   }
@@ -309,13 +336,15 @@ class PlaybackController extends ChangeNotifier {
       final next = ticket.withQuality(q);
       _ticket = next;
       _activeQualityId = q.id;
-      await _loadIntoPlayer(next);
+      // 位置**必须**交给 `Media(start:)`：mpv 换源后位置归零，不恢复的话用户
+      // 每切一次清晰度就得自己拖回去。
+      //
+      // ⚠️ 这里原来写的是「open 之后 `player.seek(resumeAt)`」—— 那次 seek 会
+      // 被丢掉（`Player.open()` 不等文件加载完成），所以「切清晰度回片头」
+      // 是个已经存在的行为，只是没人把它和续播失败联系起来。实测见
+      // [PlaybackMedia] 的类文档。
+      await _loadIntoPlayer(next, startAt: resumeAt);
 
-      // 恢复位置。mpv 换源后位置归零，不恢复的话用户每切一次清晰度
-      // 就得自己拖回去。
-      if (resumeAt > Duration.zero) {
-        await player.seek(resumeAt);
-      }
       if (!wasPlaying) await player.pause();
 
       _loading = false;
@@ -513,11 +542,11 @@ class PlaybackController extends ChangeNotifier {
 
   /// 绝对跳转。自动夹在 `[0, duration]` 内 —— 越界的 seek 在 mpv 上
   /// 表现是「跳到一个不存在的位置然后卡住」，比不跳更糟。
+  ///
+  /// 夹取规则本体在 [clampSeekTarget]：**独立播放窗口也要用同一套**
+  /// （它跑在另一个 Flutter 引擎里，够不到本类），两处各写一遍会漂移。
   Future<void> seek(Duration target) async {
-    var t = target;
-    if (t < Duration.zero) t = Duration.zero;
-    if (_duration > Duration.zero && t > _duration) t = _duration;
-    await player.seek(t);
+    await player.seek(clampSeekTarget(target, _duration));
   }
 
   /// 按比例跳转（进度条点击用）。
@@ -673,9 +702,12 @@ class PlaybackController extends ChangeNotifier {
   ///
   /// 用泛型 + [idOf] 而不是 `T extends _Track`：media_kit 的轨道基类 `_Track`
   /// 是**私有**的，外部没法拿它当类型约束，只能把「怎么取 id」传进来。
+  ///
+  /// 实现委托给 `TrackLabels.realTracks` —— 独立播放窗口要用同一条规则
+  /// （它拿不到这个控制器），拆成两份必然走样。
   @visibleForTesting
   static List<T> realTracksOf<T>(Iterable<T> tracks, String Function(T) idOf) =>
-      [for (final t in tracks) if (int.tryParse(idOf(t)) != null) t];
+      TrackLabels.realTracks(tracks, idOf);
 
   static String _labelForEmbedded(
     String? title,

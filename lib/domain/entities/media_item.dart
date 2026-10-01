@@ -27,6 +27,8 @@ class MediaItem {
     this.episodeEnd,
     this.container = VideoContainer.other,
     this.resolution,
+    this.videoWidth,
+    this.videoHeight,
     this.sizeBytes,
     this.modifiedAt,
     this.durationMs,
@@ -36,6 +38,9 @@ class MediaItem {
     this.flags = const {},
     this.releaseGroup,
     this.isSampleOrExtra = false,
+    this.thumbUrl,
+    this.faceAnchorX,
+    this.lastPlayedAt,
     required this.firstSeenAt,
     required this.updatedAt,
   });
@@ -68,8 +73,31 @@ class MediaItem {
 
   final VideoContainer container;
 
-  /// 从文件名推断的分辨率。**不是实测值** —— 真实分辨率要等播放器解出来。
+  /// 该条目**已知最好**的分辨率档位。
+  ///
+  /// 来源有两级，**实测优先**：
+  ///   1. 网盘给的 [videoWidth] / [videoHeight]（走
+  ///      `VideoFormats.resolutionFromDimensions`，按长边归挡）；
+  ///   2. 退化到从文件名推断（`VideoFormats.resolutionFromName`）。
+  ///
+  /// ## 为什么不拆成「实测档位」和「文件名档位」两个字段
+  ///
+  /// UI 上只该显示一个「这片子多清晰」。实测存在时，文件名那点信息没有
+  /// 额外价值（它只会更不可靠）；而需要判断「这个值是不是实测的」时，
+  /// 看 [videoWidth] / [videoHeight] 是否为 `null` 就够了。
   final VideoResolution? resolution;
+
+  /// 网盘给出的**实测**视频宽度（像素）。夸克：`video_width`。
+  ///
+  /// 2026-10-01 实测：递归遍历 44 个目录、427 个视频，覆盖率 **100%**。
+  /// 比文件名里的 `2160p` 可靠 —— 那是发布组自己标的。
+  final int? videoWidth;
+
+  /// 网盘给出的**实测**视频高度（像素）。夸克：`video_height`。
+  ///
+  /// ⚠️ 别拿它单独归挡分辨率：实测样本里宽银幕裁切占 40%
+  /// （`3840x1632`、`1920x804`…），只看高度会整体低估一档。
+  final int? videoHeight;
 
   final int? sizeBytes;
   final DateTime? modifiedAt;
@@ -87,8 +115,55 @@ class MediaItem {
   /// 直接丢弃会让用户找不到它们，而它们确实在网盘上。
   final bool isSampleOrExtra;
 
+  /// 网盘**服务端生成**的视频缩略图地址。
+  ///
+  /// 夸克实测（2026-09-30）：列目录返回的每个视频项自带
+  /// `thumbnail` / `big_thumbnail` / `preview_url` 三个字段，
+  /// 形如 `https://drive-pc.quark.cn/1/clouddrive/file/video/thumbnail?fid=<fid>`，
+  /// 返回 WebP（178×100 / 533×300 / 640×360）。
+  ///
+  /// ## 为什么这条字段很关键
+  ///
+  /// 没有它，未刮削的媒体库就是一墙「片名首字」的灰块。有了它，
+  /// **即使一个刮削器都没配**（断网、没 TMDB Key），媒体库也有真实画面。
+  /// 这与「本地解析永远可用，在线刮削是增强」是同一条设计原则。
+  ///
+  /// ⚠️ 取这个地址**必须带 Cookie**，而且必须是**最新的** `__puus` ——
+  /// 与播放直链同一条规则（实测：旧 `__puus` 返回 `401 auth expired`）。
+  /// 所以这里只存地址，下载交给 `PosterCache` + 适配器提供的请求头。
+  final String? thumbUrl;
+
+  /// 这张缩略图里**人物所在的水平位置**（归一化 0~1），来自夸克的人脸框。
+  ///
+  /// 2026-10-01 探针实测覆盖率 **56/60（93%）**。
+  ///
+  /// 它和 [thumbUrl] 是**一对**：只有把 16:9 的帧裁成竖版封面时才有意义，
+  /// 所以「谁提供缩略图，就由谁提供锚点」。换封面来源（比如刮到了 TMDB
+  /// 的 2:3 海报）时必须一起换掉 —— 拿视频帧的锚点去裁海报是错的。
+  ///
+  /// 没有可用人脸框时为 `null`，渲染时退回画面正中。
+  final double? faceAnchorX;
+
+  /// 最近播放时刻。`null` 表示没播过。
+  ///
+  /// 它决定「点开一部剧该播哪一集」（见 `PlayTarget`）。与
+  /// [resumePositionMs] 的分工：这一列是「什么时候看的」，
+  /// 那一列是「看到哪儿了」—— 看完的一集前者还在、后者被清掉。
+  final DateTime? lastPlayedAt;
+
   final DateTime firstSeenAt;
   final DateTime updatedAt;
+
+  /// 网盘上的**完整路径**：`/电影/流浪地球2 (2023)/流浪地球2.2023.2160p.mkv`
+  ///
+  /// 展示路径在扫描时保证以 `/` 结尾（见 `ScanService._joinPath`），但这是
+  /// 扫描器的实现细节，不该让每个调用方都去假设它 —— 少了这个拼接，
+  /// 详情页上「复制网盘路径」会得到 `/目录/文件名` 少一个斜杠的畸形结果，
+  /// 粘进夸克搜索框里搜不到。
+  String get netdiskPath {
+    final dir = dirPath.isEmpty ? '/' : dirPath;
+    return dir.endsWith('/') ? '$dir$name' : '$dir/$name';
+  }
 
   /// 稳定主键。`provider` 前缀是必须的：接第二家网盘后，不同网盘的
   /// `fid` 完全可能撞车。
@@ -136,8 +211,13 @@ class MediaItem {
     int? episode,
     int? episodeEnd,
     VideoResolution? resolution,
+    int? videoWidth,
+    int? videoHeight,
     int? durationMs,
     bool? isSampleOrExtra,
+    String? thumbUrl,
+    double? faceAnchorX,
+    DateTime? lastPlayedAt,
     DateTime? updatedAt,
   }) =>
       MediaItem(
@@ -155,6 +235,8 @@ class MediaItem {
         episodeEnd: episodeEnd ?? this.episodeEnd,
         container: container,
         resolution: resolution ?? this.resolution,
+        videoWidth: videoWidth ?? this.videoWidth,
+        videoHeight: videoHeight ?? this.videoHeight,
         sizeBytes: sizeBytes,
         modifiedAt: modifiedAt,
         durationMs: durationMs ?? this.durationMs,
@@ -164,6 +246,9 @@ class MediaItem {
         flags: flags,
         releaseGroup: releaseGroup,
         isSampleOrExtra: isSampleOrExtra ?? this.isSampleOrExtra,
+        thumbUrl: thumbUrl ?? this.thumbUrl,
+        faceAnchorX: faceAnchorX ?? this.faceAnchorX,
+        lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
         firstSeenAt: firstSeenAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );
@@ -191,9 +276,21 @@ class MediaItem {
       episode: parsed.episode,
       episodeEnd: parsed.episodeEnd,
       container: VideoFormats.containerOf(entry.name, mimeType: entry.mimeType),
-      // 文件名里的分辨率优先，网盘元数据里没有更好的来源
-      resolution: parsed.resolution ??
+      // **实测优先**：网盘给的像素尺寸比文件名可靠 —— 文件名是发布组自己
+      // 标的，会标错也会缺；尺寸是服务端读文件头得到的（实测覆盖率 100%）。
+      // 拿不到实测值时才退回文件名解析。
+      //
+      // ⚠️ 必须用 `resolutionFromDimensions`（按**长边**归挡），不能用
+      // `_byHeight`（按高度）。实测样本里宽银幕裁切占 40%，按高度会把
+      // `3840x1632` 的 4K 片标成 1440P，进而让多版本排序把 4K 版排到后面。
+      resolution: VideoFormats.resolutionFromDimensions(
+            entry.videoWidth,
+            entry.videoHeight,
+          ) ??
+          parsed.resolution ??
           VideoFormats.resolutionFromName(entry.name),
+      videoWidth: entry.videoWidth,
+      videoHeight: entry.videoHeight,
       sizeBytes: entry.sizeBytes,
       modifiedAt: entry.modifiedAt,
       durationMs: entry.durationMs,
@@ -203,6 +300,13 @@ class MediaItem {
       flags: parsed.flags,
       releaseGroup: parsed.releaseGroup,
       isSampleOrExtra: parsed.isSampleOrExtra,
+      // 网盘给的缩略图优先用 `preview_url`（实测 640×360，三档里最大）——
+      // 海报墙上一个格子约 172 逻辑像素宽，2x 屏要 344px，
+      // 178×100 那一档明显糊。反正都是按需下载 + 落盘缓存，一次几 KB。
+      thumbUrl: entry.previewImageUrl ?? entry.thumbnailUrl,
+      // 锚点与缩略图**同源**：三档缩略图都是同一个 fid 的同一帧（只是尺寸
+      // 不同），所以人脸位置通用，不需要按档位分别取。
+      faceAnchorX: entry.faceAnchorX,
       firstSeenAt: ts,
       updatedAt: ts,
     );

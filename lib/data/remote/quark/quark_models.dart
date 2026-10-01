@@ -1,3 +1,4 @@
+import '../../../core/utils/face_anchor.dart';
 import '../../../domain/entities/cloud_account.dart';
 import '../../../domain/entities/drive_entry.dart';
 import '../../../domain/entities/drive_provider.dart';
@@ -61,7 +62,52 @@ class QuarkMapper {
       modifiedAt: parseTimestamp(json['updated_at'] ?? json['created_at']),
       parentId: _asString(json['pdir_fid']),
       durationMs: isDir ? null : parseDurationMs(json['duration']),
+      // 缩略图：目录没有；文件里也只有**视频**才有。
+      //
+      // 2026-09-30 实测（真实账号、PC 网关）：列目录返回的视频项带三个地址，
+      // 三档尺寸与体积如下 ——
+      //
+      // | 字段 | 端点 | 实测尺寸 | 实测体积 |
+      // |---|---|---|---|
+      // | `thumbnail` | `/file/video/thumbnail` | 178×100 | 1.9 KB |
+      // | `big_thumbnail` | `/file/video/quick` | 533×300 | 7.9 KB |
+      // | `preview_url` | `/file/video/preview` | 640×360 | 12.2 KB |
+      //
+      // 三档都是 WebP，**都必须带 Cookie**（裸链 `401 auth not found`，
+      // 旧 `__puus` 为 `401 auth expired`）。
+      //
+      // 字段缺失时**不自己拼 URL**：`thumbnail` 只在服务端已经为该文件
+      // 生成过预览图时才下发（实测视频搜索结果里 71/100 有），拼出来的
+      // 地址对剩下 29% 只会拿到 404/401，白费一次请求还拖慢海报墙。
+      thumbnailUrl: isDir ? null : _asString(json['thumbnail']),
+      previewImageUrl: isDir ? null : _asString(json['preview_url']),
+      // 实测分辨率（2026-10-01）：递归遍历 44 个目录、427 个视频的样本里，
+      // `video_width` / `video_height` 覆盖率 **100%**，且没有 0 值。
+      //
+      // 它比文件名里的 `2160p` 可靠 —— 文件名会撒谎（发布组标错档）、
+      // 会缺失（`[组名][片名][01][1080p]` 之外的命名），
+      // 而这是服务端读文件头得到的。
+      videoWidth: isDir ? null : _positive(json['video_width']),
+      videoHeight: isDir ? null : _positive(json['video_height']),
+      // 人脸框 → 竖版封面的裁切锚点。
+      //
+      // 2026-10-01 探针实测：覆盖率 **56/60（93%）**，每条 1~3 张脸。
+      // 它是「把 16:9 视频帧裁成竖版」时唯一能锚住人物的依据 ——
+      // 按画面正中裁会在双人对谈镜头里裁到两人之间的空隙。
+      // 字段格式（`[x1,y1,x2,y2]` 百分比，不是 `[x,y,w,h]`）的判定依据
+      // 写在 `FaceAnchor` 的文档注释里，**别改成直接相除百分比**。
+      faceAnchorX: isDir ? null : FaceAnchor.parseX(json['cover_face_boundary']),
     );
+  }
+
+  /// 正整数归一：`null` / `0` / 负数一律当「不知道」。
+  ///
+  /// 「0 = 网盘还没刮削到」是这家的惯用约定（`duration` 同样如此），
+  /// 所以分辨率也按同一口径处理 —— 把 `0` 传下去会让归挡算出一个
+  /// 荒唐的档位。
+  static int? _positive(Object? v) {
+    final n = _asInt(v);
+    return (n == null || n <= 0) ? null : n;
   }
 
   /// 批量映射，自动跳过脏数据。

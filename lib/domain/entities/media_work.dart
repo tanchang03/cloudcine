@@ -1,4 +1,5 @@
 import '../../core/utils/filename_parser.dart';
+import '../../core/utils/media_category.dart';
 import 'drive_provider.dart';
 
 /// 元数据来源。
@@ -33,11 +34,13 @@ class MediaWork {
     required this.provider,
     required this.kind,
     required this.title,
+    this.category = MediaCategory.other,
     this.originalTitle,
     this.year,
     this.overview,
     this.posterUrl,
     this.posterFile,
+    this.posterFaceX,
     this.backdropUrl,
     this.backdropFile,
     this.rating,
@@ -60,6 +63,14 @@ class MediaWork {
   /// 展示标题
   final String title;
 
+  /// 媒体库一级分类（电影 / 剧集 / 动漫 / 综艺 / 纪录片 / 其他）。
+  ///
+  /// **与 [kind] 是两个独立的维度**，理由见 [MediaCategory] 的类文档。
+  /// 它由 `MediaCategoryGuesser` 在扫描期算出并落库 —— 之所以要落库而不是
+  /// 每次查询时现算，是因为分类栏要能**在 SQL 里筛选**，几千部作品在
+  /// Dart 侧过滤会让「点一下分类」变成一次全表扫描。
+  final MediaCategory category;
+
   /// 原始标题（在线刮削返回的 `original_title`）
   final String? originalTitle;
 
@@ -71,6 +82,17 @@ class MediaWork {
 
   /// 海报本地缓存文件名（相对海报缓存目录）
   final String? posterFile;
+
+  /// 这张海报里**人物所在的水平位置**（归一化 0~1）。
+  ///
+  /// 只有海报来自**夸克的视频帧**（16:9）时才有值 —— 那时封面会被裁成
+  /// 竖版，需要锚住人物而不是裁到画面正中（双人对谈镜头的中点是两人
+  /// 之间的空隙）。来自 TMDB 的海报本身就是 2:3，不需要锚点，此处为 `null`。
+  ///
+  /// ⚠️ 它必须和 [posterUrl] **同步更新**：换了封面来源却没换锚点，
+  /// 就会拿视频帧的人脸位置去裁一张海报。`scan_service` 在写这两个字段时
+  /// 是成对处理的。
+  final double? posterFaceX;
 
   final String? backdropUrl;
   final String? backdropFile;
@@ -97,8 +119,13 @@ class MediaWork {
   String get yearLabel => year == null ? '年份未知' : '$year';
 
   /// 副标题：`剧集 · 2023 · 12 集 · 8.7`
+  ///
+  /// 第一段用 [category] 而不是 [kind]：动漫 / 综艺 / 纪录片都算「剧集」
+  /// 结构，用 kind 的话海报墙上看不出它们的区别 —— 而那正是分类栏想表达的
+  /// 信息。两者对电影和普通剧集的结果完全一致，所以这个替换不会让老用户
+  /// 觉得字变了。
   String get subtitleLine {
-    final parts = <String>[kind.label];
+    final parts = <String>[category.label];
     if (year != null) parts.add('$year');
     if (itemCount > 0) {
       parts.add(kind == MediaKind.episode ? '$itemCount 集' : '$itemCount 个文件');
@@ -109,11 +136,13 @@ class MediaWork {
 
   MediaWork copyWith({
     String? title,
+    MediaCategory? category,
     String? originalTitle,
     int? year,
     String? overview,
     String? posterUrl,
     String? posterFile,
+    double? posterFaceX,
     String? backdropUrl,
     String? backdropFile,
     double? rating,
@@ -131,11 +160,13 @@ class MediaWork {
         provider: provider,
         kind: kind,
         title: title ?? this.title,
+        category: category ?? this.category,
         originalTitle: originalTitle ?? this.originalTitle,
         year: year ?? this.year,
         overview: overview ?? this.overview,
         posterUrl: posterUrl ?? this.posterUrl,
         posterFile: posterFile ?? this.posterFile,
+        posterFaceX: posterFaceX ?? this.posterFaceX,
         backdropUrl: backdropUrl ?? this.backdropUrl,
         backdropFile: backdropFile ?? this.backdropFile,
         rating: rating ?? this.rating,
@@ -206,6 +237,38 @@ class ScrapeQuery {
     this.season,
     this.episode,
   });
+
+  /// 由文件名解析结果构造。解析不可信（片名空 / 类型未知）时返回 `null`。
+  ///
+  /// ## 为什么做成工厂而不是让调用方各拼各的
+  ///
+  /// 现在有**两个**地方要发刮削请求：扫描期（`ScanService`）与详情页的
+  /// 「刮削」按钮（`WorkScraper`）。两处只要有一处漏了 `alternateTitle`、
+  /// 或者年份的取值口径不同，同一个作品在两处就会**查出不同的结果** ——
+  /// 而这是静默的：用户只会觉得「这个按钮有时候不准」。
+  static ScrapeQuery? fromParsed(ParsedMediaName parsed) {
+    final title = parsed.title;
+    if (!parsed.isConfident || title == null || title.isEmpty) return null;
+    return ScrapeQuery(
+      title: title,
+      alternateTitle: _alternateOf(parsed),
+      kind: parsed.kind,
+      year: parsed.year,
+      season: parsed.season,
+      episode: parsed.episode,
+    );
+  }
+
+  /// 中英混排时把另一半作为备用查询词。
+  ///
+  /// 只在**两种文字都解析出来**时才有备用词：只有一个的时候它已经就是
+  /// [title] 了，再搜一遍是白花一次配额。
+  static String? _alternateOf(ParsedMediaName parsed) {
+    final cjk = parsed.cjkTitle;
+    final latin = parsed.latinTitle;
+    if (cjk == null || latin == null) return null;
+    return latin;
+  }
 
   final String title;
 

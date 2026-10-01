@@ -20,6 +20,12 @@ import 'quark_error_mapper.dart';
 import 'quark_models.dart';
 import 'quark_play_routes.dart';
 
+/// `play/info` / `v2/play` 的解析结果。
+///
+/// 两个字段必须一起用：票据给「能播什么」，元信息给「原画那一档怎么写副标题」
+/// （源文件的真实宽高/码率/容器只在这两个接口的 `meta` 里）。
+typedef _PlayInfoResult = ({StreamTicket ticket, SourceMeta? meta});
+
 /// 夸克网盘适配器。
 ///
 /// 走 **PC 自用接口**（`drive-pc.quark.cn`），靠网页登录态 Cookie 鉴权。
@@ -45,7 +51,26 @@ class QuarkAdapter implements CloudDriveAdapter {
         _listBucket = listBucket ??
             TokenBucket(ratePerSecond: quarkCapabilities.listQps),
         _linkBucket = linkBucket ??
-            TokenBucket(ratePerSecond: quarkCapabilities.linkQps);
+            TokenBucket(
+              ratePerSecond: quarkCapabilities.linkQps,
+              burst: linkBucketBurst,
+            );
+
+  /// 取链桶的突发容量。
+  ///
+  /// ## 为什么是 2，而不是 `TokenBucket` 默认的 1
+  ///
+  /// 一次播放要**两个**请求：`audioplay`（原画）与 `play/info`（转码梯度）。
+  /// 它们是一对「计划中的请求」，不是重试风暴 —— 而桶容量 1 意味着第二个
+  /// 必然等满 1 秒（`linkQps = 1.0`）。表现是「点了播放，先干等一秒多」，
+  /// 而且这一秒换来的是**零**保护价值。
+  ///
+  /// 2 仍然是保守的：瞬时最多 2 个请求，**持续速率依旧是 1/s**。
+  /// 参照系是列表桶 —— 它以 3.0 QPS **持续**跑着（参考项目实测约 3 QPS
+  /// 未触发风控），所以这个突发量严格低于已经在用的那档强度。
+  ///
+  /// 公开是为了让单测钉住它：调回 1 不会报错，只会让每次起播多等一秒。
+  static const int linkBucketBurst = 2;
 
   /// 夸克的默认能力声明。
   ///
@@ -270,21 +295,34 @@ class QuarkAdapter implements CloudDriveAdapter {
 
   /// 取播放直链（含清晰度档位）。
   ///
-  /// 按「信息量从多到少」依次降级，任一条成功即返回：
+  /// ## 原画与转码梯度是**两个不同的接口**，必须分别取
   ///
-  /// | # | 路由 | 能给什么 | 验证状态 |
-  /// |---|---|---|---|
-  /// | 1 | `batch/file/play/info` | **转码梯度** + 原画 | 未验证 |
-  /// | 2 | `file/v2/play` | 视频播放地址 | 未验证 |
-  /// | 3 | `file/audioplay` | 原文件（不限体积） | 已实测 |
-  /// | 4 | `file/download` | 原文件（≤50MiB） | 已实测 |
+  /// 2026-10-01 实测（指环王 S01E01 / 3.8 GB MKV，与無間道II 4K 交叉验证）：
   ///
-  /// **降级顺序的设计理由**：只有第 1 条能给出清晰度切换，所以它必须最先
-  /// 试；而第 3、4 条是已实测可用的，放后面当保险。这样「未验证的路由
-  /// 今天不通」只会让用户失去清晰度切换，**不会让视频播不了**。
+  /// | 来源 | 给什么 | 实测证据 |
+  /// |---|---|---|
+  /// | `POST /batch/file/play/info` | **只有转码梯度** | `video_list` = super/high/low，`meta` 才是源文件 |
+  /// | `GET /file/audioplay?fid=` | **原文件本身** | `Content-Type: video/x-matroska`，`Content-Range: bytes 0-4095/3828008839` |
+  /// | `POST /file/download` | 原文件，但 **>50 MiB 直接 `23018`** | 3.8 GB 被拒 |
+  /// | `POST /file/v2/play {"fid":…}` | 与 `play/info` 同构 | 与 play/info 交叉验证 |
+  ///
+  /// ⚠️ **以前这里是个坑**：`play/info` 的 `audio_list`（一条 `dolby_eac3`
+  /// 纯音频流）被解析器当成「原画」，而原画永远排最前 → 默认播的就是那条
+  /// **没有视频轨**的流：有声音、进度条在走、**没有画面**，且不报任何错。
+  /// 解析器现在跳过音轨子树（见 `QuarkPlayInfoParser.audioOnlyKeys`），
+  /// 真正的原画由这里从 `audioplay` 取。
+  ///
+  /// ## 为什么要两个都取，而不是「先原画、不行再梯度」
+  ///
+  /// 它们不是同一条链上的备选，而是**同时需要**的两份数据：
+  ///   - 原画决定「点开就能看到原片质量」；
+  ///   - 梯度决定画质菜单里有没有东西可选。
+  ///
+  /// 任一条失败都不影响另一条 —— 拿不到梯度只是菜单里没有转码档，
+  /// 拿不到原画还能退回最高那一档转码流。
   ///
   /// 短路规则：授权失效（`needsReauth`）与文件不存在（`notFound`）
-  /// **立即上抛**，换路由结果一样，再打只是白费一次取链配额。
+  /// **立即上抛**，换接口结果一样，再打只是白费一次取链配额。
   @override
   Future<StreamTicket> resolveStream(String fileId, {String? qualityId}) async {
     diag.info(
@@ -296,20 +334,60 @@ class QuarkAdapter implements CloudDriveAdapter {
 
     final failures = <String>[];
 
-    for (final route in QuarkPlayRoute.values) {
+    // ── ① 原画：原文件本身 ────────────────────────────────────────────
+    //
+    // 路由名字叫 audio，但它对**任意 fid 都返回原文件**（视频也一样，
+    // 实测回的是 `video/x-matroska` 而不是音频转码），且不受 50 MiB 限制。
+    final original = await _attempt(
+      'audio_play',
+      failures,
+      () => _resolveViaSimpleGet(
+        route: QuarkPlayRoute.audioPlay,
+        fileId: fileId,
+        path: QuarkEndpoints.fileAudioplay,
+        context: '取原文件直链',
+      ),
+    );
+
+    // ── ② 转码梯度：清晰度切换的唯一来源 ──────────────────────────────
+    final info = await _attempt(
+      'play_info',
+      failures,
+      () => _resolveViaPlayInfo(fileId),
+    );
+
+    final merged = _mergeOriginalAndLadder(original: original, info: info);
+    if (merged != null) {
+      final switched = _applyQuality(merged, qualityId);
+      diag.info(
+        '取链',
+        '取链成功：${switched.redactedUrl}，'
+        '档位=[${describeQualities(switched.qualities)}]'
+        '（原画=${original == null ? "无" : "有"}，'
+        '转码梯度=${info?.ticket.qualities.length ?? 0} 档）',
+      );
+      return switched;
+    }
+
+    // ── ③ 兜底：两条主来源都空了才走这里 ──────────────────────────────
+    //
+    // 两条都拿不到地址是极少见的（服务端改了响应形状 / 该 fid 两种形态都
+    // 不认）。这时按「信息量从多到少」再试一遍，任一条成功即返回。
+    for (final route in const [QuarkPlayRoute.v2Play, QuarkPlayRoute.download]) {
       try {
-        final ticket = await _resolveVia(route, fileId);
+        final ticket = route == QuarkPlayRoute.v2Play
+            ? await _resolveViaV2Play(fileId)
+            : await _resolveViaDownload(fileId);
         if (ticket == null) {
           failures.add('${route.id}: 响应里没有可用地址');
           continue;
         }
 
-        // 指定了档位就切过去；档位不在这一轮结果里时保留原画（并记日志）。
         final switched = _applyQuality(ticket, qualityId);
         diag.info(
           '取链',
-          '路由 ${route.id}（${route.label}）成功：'
-          '${ticket.redactedUrl}，档位=[${describeQualities(switched.qualities)}]',
+          '兜底路由 ${route.id}（${route.label}）成功：'
+          '${switched.redactedUrl}，档位=[${describeQualities(switched.qualities)}]',
         );
         return switched;
       } on DriveException catch (e) {
@@ -319,46 +397,123 @@ class QuarkAdapter implements CloudDriveAdapter {
           rethrow;
         }
         failures.add('${route.id}: ${e.type.name} ${e.message}');
-        diag.warn('取链', '路由 ${route.id}（${route.label}）失败，试下一条',
+        diag.warn('取链', '路由 ${route.id}（${route.label}）失败',
             error: _describe(e));
       }
     }
 
-    diag.error('取链', '四条路由全部失败：${failures.join(" | ")}');
+    diag.error('取链', '全部取链路由失败：${failures.join(" | ")}');
     throw DriveException(
       type: DriveErrorType.unknown,
-      message: '四条取链路由全部失败，无法播放该文件。'
+      message: '取链失败，无法播放该文件。'
           '最后一条错误：${failures.isEmpty ? "无" : failures.last}',
     );
   }
 
-  /// 按路由取链。返回 `null` 表示「路由通了但响应里没有地址」——
-  /// 与抛异常区分开：前者值得继续降级，后者要看错误类型。
-  Future<StreamTicket?> _resolveVia(QuarkPlayRoute route, String fileId) {
-    return switch (route) {
-      QuarkPlayRoute.playInfo => _resolveViaPlayInfo(fileId),
-      QuarkPlayRoute.v2Play => _resolveViaSimpleGet(
-          route: route,
-          fileId: fileId,
-          path: QuarkEndpoints.fileV2Play,
-          context: '取视频播放直链',
+  /// 试一条取链路径。失败记进 [failures] 并返回 `null`。
+  ///
+  /// 泛型是必要的：两条主来源的返回类型不同（`audioplay` 直接给票据，
+  /// `play/info` 给「票据 + 源文件元信息」）。写死成 `StreamTicket?`
+  /// 会把 `play/info` 那份元信息挤掉，原画那档就没有副标题了。
+  ///
+  /// 授权失效 / 文件不存在**直接上抛**（见 [resolveStream] 的短路规则）。
+  Future<T?> _attempt<T>(
+    String id,
+    List<String> failures,
+    Future<T?> Function() run,
+  ) async {
+    try {
+      final value = await run();
+      if (value == null) {
+        diag.warn('取链', '$id：接口通了但响应里没有可用地址');
+        failures.add('$id: 响应里没有可用地址');
+      }
+      return value;
+    } on DriveException catch (e) {
+      if (e.needsReauth || e.type == DriveErrorType.notFound) {
+        diag.error('取链', '$id 失败且不可降级，直接放弃', error: _describe(e));
+        rethrow;
+      }
+      failures.add('$id: ${e.type.name} ${e.message}');
+      diag.warn('取链', '$id 失败，另一条来源仍可独立工作', error: _describe(e));
+      return null;
+    }
+  }
+
+  /// 把「原画（原文件）」与「转码梯度」合成一张票据。两条都缺时返回 `null`。
+  ///
+  /// 原画**永远排最前**，于是 `StreamTicket.pickActiveQualityId` 在调用方没
+  /// 指定档位时自然选中它 —— 这正是「网盘媒体库播放器」该有的默认行为。
+  ///
+  /// 请求头与过期时间沿用各自票据的（夸克各条流走同一套签名参数，
+  /// 实测 `audioplay` 与转码 CDN 都只认 Cookie，不认额外头）。
+  StreamTicket? _mergeOriginalAndLadder({
+    required StreamTicket? original,
+    required _PlayInfoResult? info,
+  }) {
+    final ladder = info?.ticket;
+    final base = original ?? ladder;
+    if (base == null) return null;
+
+    final meta = info?.meta;
+    final qualities = <QualityOption>[
+      if (original != null)
+        QualityOption(
+          id: kOriginalQualityId,
+          label: '原画',
+          url: original.url,
+          isOriginal: true,
+          // 服务端给的体积（audioplay 的 `size`）比索引库里那份更权威：
+          // 索引库的值来自扫描时的目录列表，这里是读文件头得到的。
+          estimatedBytes: original.contentLength,
+          // 副标题取自 `play/info` 的 `meta` —— 转码档的副标题来自各自的
+          // `video_info`，两边口径要一致，否则原画那行会光秃秃的。
+          width: meta?.width,
+          height: meta?.height,
+          bitrate: meta?.bitrate,
+          detail: _originalDetail(meta),
         ),
-      QuarkPlayRoute.audioPlay => _resolveViaSimpleGet(
-          route: route,
-          fileId: fileId,
-          path: QuarkEndpoints.fileAudioplay,
-          context: '取播放直链',
-        ),
-      QuarkPlayRoute.download => _resolveViaDownload(fileId),
-    };
+      ...?ladder?.qualities,
+    ];
+
+    return StreamTicket(
+      url: base.url,
+      headers: base.headers,
+      expiresAt: base.expiresAt,
+      contentLength: base.contentLength,
+      supportsRange: base.supportsRange,
+      contentType: base.contentType,
+      qualities: qualities,
+    );
+  }
+
+  /// 原画那一档的副标题（`1920×800 · 7.6 Mbps · MKV`）。元信息缺失时返回 `null`。
+  static String? _originalDetail(SourceMeta? meta) {
+    if (meta == null) return null;
+    final text = QuarkPlayInfoParser.describeSourceMeta(meta);
+    return text.isEmpty ? null : text;
+  }
+
+  /// 路由 2：`v2/play`（单文件形态）。与 `play/info` 响应同构，实测交叉验证。
+  ///
+  /// ⚠️ **必须是 `POST {"fid": …}`**。以前这里写的是 `GET ?fid=`，
+  /// 实测返回 `405 Request method 'GET' not supported` —— 也就是这条路
+  /// 从来没通过，只是它排在降级链里，坏了也没人发现。详见
+  /// [QuarkPlayRoute.v2Play] 的文档。
+  Future<StreamTicket?> _resolveViaV2Play(String fileId) async {
+    final result = await _linkBucket.run(
+      () => _request(
+        () => _post(QuarkEndpoints.fileV2Play, body: {'fid': fileId}),
+        context: '取视频播放直链',
+      ),
+    );
+    return _parsePlayInfoLike(result, 'v2_play')?.ticket;
   }
 
   /// 路由 1：播放信息预取。**唯一能拿到转码梯度的路由。**
   ///
-  /// 响应形状没有落盘证据，所以用 [QuarkPlayInfoParser] 做**形状无关**的
-  /// 递归解析：把响应体里所有像播放地址的字段都收出来，按同层的分辨率
-  /// 字段命名。这样服务端换字段名时仍可能继续工作。
-  Future<StreamTicket?> _resolveViaPlayInfo(String fileId) async {
+  /// ⚠️ 它**不给原画** —— `video_list` 里只有转码档。原画走 `audioplay`。
+  Future<_PlayInfoResult?> _resolveViaPlayInfo(String fileId) async {
     final result = await _linkBucket.run(
       () => _request(
         () => _post(
@@ -372,29 +527,37 @@ class QuarkAdapter implements CloudDriveAdapter {
         context: '取播放信息',
       ),
     );
+    return _parsePlayInfoLike(result, 'play_info');
+  }
 
+  /// 把 `play/info` / `v2/play` 的响应解成「票据 + 源文件元信息」。
+  ///
+  /// 两者响应结构实测完全一致（`video_list` / `audio_list` / `meta`），
+  /// 所以共用一个解析入口。返回 `null` 表示响应里没有视频档位。
+  _PlayInfoResult? _parsePlayInfoLike(HttpResult result, String routeId) {
     final qualities = QuarkPlayInfoParser.parseQualities(result.data);
     if (qualities.isEmpty) {
-      diag.info('取链', 'play/info 通了但没有解析出任何档位（响应形状可能变了）');
+      diag.info('取链', '$routeId 通了但没有解析出任何视频档位（响应形状可能变了）');
       return null;
     }
 
-    final original = qualities.firstWhere(
-      (q) => q.isOriginal && q.url != null,
-      orElse: () => qualities.first,
-    );
-    final url = original.url;
+    // 排序后第一条 = 最高那一档。它只是**兜底**用的默认地址 ——
+    // 正常情况下票据的地址由「原画」决定（见 _mergeOriginalAndLadder）。
+    final url = qualities.first.url;
     if (url == null) return null;
 
     final ticket = QuarkMapper.toStreamTicket(
       url: url,
       cookieHeader: _cookieHeader,
-      contentLength: original.estimatedBytes,
+      contentLength: qualities.first.estimatedBytes,
       now: _clock(),
     ).copyWithQualities(qualities);
 
-    _logTicket('play/info', ticket);
-    return ticket;
+    _logTicket(routeId, ticket);
+    return (
+      ticket: ticket,
+      meta: QuarkPlayInfoParser.parseSourceMeta(result.data),
+    );
   }
 
   /// 路由 2/3：`GET ?fid=` 形态的简单播放接口。
@@ -667,6 +830,23 @@ class QuarkAdapter implements CloudDriveAdapter {
         'Origin': QuarkEndpoints.origin,
         'Cookie': _cookieHeader,
       };
+
+  /// 缩略图 / 预览图地址的归属判定。
+  ///
+  /// 夸克给的是绝对地址（`https://drive-pc.quark.cn/1/clouddrive/file/video/…`），
+  /// 也可能来自备用网关。两个域都认。
+  @override
+  bool ownsUrl(String url) =>
+      url.contains('quark.cn') || url.contains('drive-pc.quark.cn');
+
+  /// 取缩略图时带的请求头。
+  ///
+  /// **每次现取**，不复用、不缓存 —— 夸克在每个 API 响应里轮换 `__puus`，
+  /// 而 `_cookieHeader` 读的是内存里刚回填过的那份。实测用陈旧 Cookie 打
+  /// `/file/video/thumbnail` 会拿到 `401 auth expired`，表现是海报墙上一片
+  /// 灰块，且没有任何报错指向 Cookie。
+  @override
+  Map<String, String> imageHeaders() => _headers();
 
   Future<HttpResult> _get(String path, [Map<String, Object?>? params]) =>
       _http.get(

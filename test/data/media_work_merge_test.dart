@@ -1,19 +1,26 @@
 import 'package:cloudcine/core/utils/filename_parser.dart';
+import 'package:cloudcine/core/utils/media_category.dart';
 import 'package:cloudcine/data/db/media_repository_impl.dart';
 import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// 构造一个作品记录，只填关心的字段。
+///
+/// [category] 默认按 [kind] 推 —— 与 `MediaCategoryGuesser` 在没有任何关键词
+/// 命中时的结论一致。不这样默认的话，每个用例都得手写一个分类，
+/// 而绝大多数用例根本不关心分类。
 MediaWork _work({
   String key = 'movie#2023',
   ScrapeSource source = ScrapeSource.local,
   MediaKind kind = MediaKind.movie,
+  MediaCategory? category,
   String title = '标题',
   int? year,
   String? overview,
   String? posterUrl,
   String? posterFile,
+  double? posterFaceX,
   String? backdropUrl,
   String? backdropFile,
   double? rating,
@@ -28,11 +35,18 @@ MediaWork _work({
       key: key,
       provider: DriveProvider.quark,
       kind: kind,
+      category: category ??
+          switch (kind) {
+            MediaKind.movie => MediaCategory.movie,
+            MediaKind.episode => MediaCategory.series,
+            MediaKind.unknown => MediaCategory.other,
+          },
       title: title,
       year: year,
       overview: overview,
       posterUrl: posterUrl,
       posterFile: posterFile,
+      posterFaceX: posterFaceX,
       backdropUrl: backdropUrl,
       backdropFile: backdropFile,
       rating: rating,
@@ -216,6 +230,45 @@ void main() {
       expect(merged.posterFile, 'movie#2023_1a2b3c4d.jpg');
     });
 
+    test('分类永远取新值 —— 不受「保护刮削结果」影响', () {
+      // 为什么不能放进保护分支：第一次扫描时判成「其他」的作品，之后
+      // 无论重扫多少次都修不回来（保护模式会一直保留那个旧的「其他」），
+      // 而用户在分类栏里会永远找不到它。
+      final existing = _work(
+        source: ScrapeSource.online,
+        category: MediaCategory.other,
+      );
+      final incoming = _work(
+        source: ScrapeSource.local,
+        category: MediaCategory.anime,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      // 元数据被保护了（source 仍是 online），但分类跟着新扫描走。
+      expect(merged.source, ScrapeSource.online);
+      expect(merged.category, MediaCategory.anime);
+    });
+
+    test('本次算不出海报地址时保留旧的 —— 海报不会从墙上消失', () {
+      // 网盘缩略图地址是「扫描那一刻服务端有没有生成预览图」的快照
+      // （实测视频里约七成有）。某次扫描恰好没拿到就写 null 的话，
+      // 用户看到的是「昨天还有海报，今天变灰块了」。
+      final existing = _work(
+        posterUrl: 'https://drive-pc.quark.cn/1/clouddrive/file/video/preview?fid=a',
+        posterFile: 'movie#2023_1a2b3c4d.jpg',
+      );
+      final incoming = _work(); // posterUrl 为空
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterUrl, existing.posterUrl);
+      // 地址没变 → 本地缓存文件名也该跟着保留，两个字段不能互相矛盾。
+      expect(merged.posterFile, 'movie#2023_1a2b3c4d.jpg');
+    });
+
     test('清空刮削结果（source 回到 local）不会被保护挡住', () {
       final existing = scrapedExisting();
       final incoming = _work(source: ScrapeSource.local, title: '文件名标题');
@@ -236,6 +289,86 @@ void main() {
     });
   });
 
+  group('封面人物锚点：必须和海报地址同进同退', () {
+    // 锚点（`posterFaceX`）说的是「这张图里人物在哪个水平位置」，
+    // 它和 `posterUrl` 描述的是**同一张图**。配错了一不会报错、二不会崩，
+    // 只会让封面裁到一个莫名其妙的角落 —— 所以这几条都得钉住。
+    const quarkA = 'https://drive-pc.quark.cn/1/clouddrive/file/video/preview?fid=a';
+    const tmdbPoster = 'https://image.tmdb.org/t/p/w500/p.jpg';
+
+    test('地址换了 → 锚点跟着换；新图没有锚点时就是 null', () {
+      // 从「夸克视频帧（有人脸）」换成「TMDB 真海报」。
+      // 海报是 2:3 竖版、按 `contain` 画，根本不需要锚点；
+      // 此时留着旧锚点会让海报被「剧中某帧的人脸位置」裁一刀。
+      final existing = _work(posterUrl: quarkA, posterFaceX: 0.30);
+      final incoming = _work(posterUrl: tmdbPoster);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterUrl, tmdbPoster);
+      expect(
+        merged.posterFaceX,
+        isNull,
+        reason: '这里的 null 是**结论**（新图没有人物锚点），不是缺失，'
+            '所以不能像 posterUrl 那样「旧值兜底」。',
+      );
+    });
+
+    test('地址没变 → 锚点保留旧值（本次没解析出人脸框也不该丢）', () {
+      // 夸克的人脸框覆盖率实测 93%，也就是说同一张图某次扫描没带出人脸框
+      // 是正常的。那种时候把锚点写成 null，封面就会从「突出人物」
+      // 退回「画面正中」—— 而图根本没换。
+      final existing = _work(posterUrl: quarkA, posterFaceX: 0.30);
+      final incoming = _work(posterUrl: quarkA);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterFaceX, 0.30);
+    });
+
+    test('老库（v5 之前）锚点是空，地址没变时用本次的补上', () {
+      // `posterFaceX` 是 v5 才加的列，升级后旧行全是 NULL。
+      // 用户不重扫的话地址不会变，所以必须有这条 `?? incoming` 的补空路径。
+      final existing = _work(posterUrl: quarkA);
+      final incoming = _work(posterUrl: quarkA, posterFaceX: 0.72);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterFaceX, 0.72);
+    });
+
+    test('本次没算出海报地址（保护模式）→ 地址与锚点一起保留旧值', () {
+      final existing = _work(posterUrl: quarkA, posterFaceX: 0.30);
+      final incoming = _work(source: ScrapeSource.local, title: '文件名标题');
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterUrl, quarkA);
+      expect(
+        merged.posterFaceX,
+        0.30,
+        reason: '地址保留旧值 = 还是那张图，锚点就必须跟着保留。'
+            '只保留地址、锚点却写 null，封面会从「突出人物」悄悄退回正中。',
+      );
+    });
+
+    test('地址从无到有 → 锚点取本次的值', () {
+      // 老库没有封面，本次扫描拿到了夸克缩略图与人脸框。
+      final existing = _work();
+      final incoming = _work(posterUrl: quarkA, posterFaceX: 0.18);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterUrl, quarkA);
+      expect(merged.posterFaceX, 0.18);
+    });
+  });
+
   group('MediaWork 展示逻辑', () {
     test('副标题把类型/年份/数量/评分拼起来', () {
       final w = _work(
@@ -252,6 +385,24 @@ void main() {
     test('电影显示「个文件」而不是「集」', () {
       final w = _work(itemCount: 2, year: 2019);
       expect(w.subtitleLine, '电影 · 2019 · 2 个文件');
+    });
+
+    test('副标题第一段用**分类**而不是结构类型', () {
+      // 动漫、综艺、纪录片的文件结构都是「剧集」（有季集号），
+      // 用 kind 的话海报墙上看不出它们的区别 —— 而那正是分类栏想表达的。
+      final anime = _work(
+        kind: MediaKind.episode,
+        category: MediaCategory.anime,
+        itemCount: 24,
+      );
+      expect(anime.subtitleLine, '动漫 · 24 集');
+
+      final variety = _work(
+        kind: MediaKind.episode,
+        category: MediaCategory.variety,
+        itemCount: 12,
+      );
+      expect(variety.subtitleLine, '综艺 · 12 集');
     });
 
     test('hasPoster 认本地文件也认远程地址', () {

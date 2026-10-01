@@ -294,6 +294,50 @@ class $MediaItemsTable extends MediaItems
     type: DriftSqlType.dateTime,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _resumePositionMsMeta = const VerificationMeta(
+    'resumePositionMs',
+  );
+  @override
+  late final GeneratedColumn<int> resumePositionMs = GeneratedColumn<int>(
+    'resume_position_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _thumbUrlMeta = const VerificationMeta(
+    'thumbUrl',
+  );
+  @override
+  late final GeneratedColumn<String> thumbUrl = GeneratedColumn<String>(
+    'thumb_url',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _videoWidthMeta = const VerificationMeta(
+    'videoWidth',
+  );
+  @override
+  late final GeneratedColumn<int> videoWidth = GeneratedColumn<int>(
+    'video_width',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _videoHeightMeta = const VerificationMeta(
+    'videoHeight',
+  );
+  @override
+  late final GeneratedColumn<int> videoHeight = GeneratedColumn<int>(
+    'video_height',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
   @override
   List<GeneratedColumn> get $columns => [
     id,
@@ -323,6 +367,10 @@ class $MediaItemsTable extends MediaItems
     firstSeenAt,
     updatedAt,
     lastPlayedAt,
+    resumePositionMs,
+    thumbUrl,
+    videoWidth,
+    videoHeight,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -523,6 +571,36 @@ class $MediaItemsTable extends MediaItems
         ),
       );
     }
+    if (data.containsKey('resume_position_ms')) {
+      context.handle(
+        _resumePositionMsMeta,
+        resumePositionMs.isAcceptableOrUnknown(
+          data['resume_position_ms']!,
+          _resumePositionMsMeta,
+        ),
+      );
+    }
+    if (data.containsKey('thumb_url')) {
+      context.handle(
+        _thumbUrlMeta,
+        thumbUrl.isAcceptableOrUnknown(data['thumb_url']!, _thumbUrlMeta),
+      );
+    }
+    if (data.containsKey('video_width')) {
+      context.handle(
+        _videoWidthMeta,
+        videoWidth.isAcceptableOrUnknown(data['video_width']!, _videoWidthMeta),
+      );
+    }
+    if (data.containsKey('video_height')) {
+      context.handle(
+        _videoHeightMeta,
+        videoHeight.isAcceptableOrUnknown(
+          data['video_height']!,
+          _videoHeightMeta,
+        ),
+      );
+    }
     return context;
   }
 
@@ -653,6 +731,22 @@ class $MediaItemsTable extends MediaItems
         DriftSqlType.dateTime,
         data['${effectivePrefix}last_played_at'],
       ),
+      resumePositionMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}resume_position_ms'],
+      ),
+      thumbUrl: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}thumb_url'],
+      ),
+      videoWidth: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}video_width'],
+      ),
+      videoHeight: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}video_height'],
+      ),
     );
   }
 
@@ -710,6 +804,45 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
 
   /// 最近播放时间。`null` 表示没播过。
   final DateTime? lastPlayedAt;
+
+  /// 续播位置（毫秒）。`null` = 没有可续的点（没播过 / 已看完 / 用户关了
+  /// 「记住播放进度」）。
+  ///
+  /// ## 为什么是单独一列而不是复用 [lastPlayedAt]
+  ///
+  /// 两者**语义不同、更新频率差两个数量级**：`lastPlayedAt` 是「什么时候看的」
+  /// （决定「最近播放」排序），每 10 秒一次进度回报都会刷新它；而这一列是
+  /// 「看到哪儿了」，也每 10 秒写一次。合成一列就得塞 JSON，而那会让
+  /// 「最近播放」的排序查询变成字符串解析。
+  ///
+  /// ## 为什么存毫秒而不是秒
+  ///
+  /// 时长本身就是毫秒（[MediaItems.durationMs]），统一单位省掉一处换算；
+  /// 而换算正是这类字段最容易出错的地方（`inSeconds` 截断 vs 四舍五入）。
+  final int? resumePositionMs;
+
+  /// 网盘服务端生成的视频预览图地址（夸克 `preview_url` / `thumbnail`）。
+  ///
+  /// **只存地址，不存图片** —— 图片由 `PosterCache` 按需下载并落盘。
+  /// 扫描期下载几千张图会让一次扫描多出几千次请求（夸克有 QPS 限制），
+  /// 而用户可能根本不会翻到那些片子。
+  ///
+  /// 地址**不含 Cookie**（Cookie 在每次响应里轮换，冻进地址第二天就 401），
+  /// 取图时必须由适配器现给请求头。
+  final String? thumbUrl;
+
+  /// 网盘给出的**实测**视频像素尺寸（夸克 `video_width` / `video_height`）。
+  ///
+  /// 2026-10-01 实测：递归遍历 44 个目录、427 个视频，这两个字段覆盖率
+  /// **100%**，且没有 0 值。它们比文件名可靠，所以 [resolution] 那一列在
+  /// 它们存在时是**由它们归挡出来的**，而不是从文件名猜的。
+  ///
+  /// ## 为什么存原始像素，而不只存归挡结果
+  ///
+  /// 归挡规则将来可能调整（加档、改长边阈值），届时可以从原始值**重算**；
+  /// 只存档位就只能重扫全盘。两者代价差一个数量级。
+  final int? videoWidth;
+  final int? videoHeight;
   const MediaItemRow({
     required this.id,
     required this.provider,
@@ -738,6 +871,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     required this.firstSeenAt,
     required this.updatedAt,
     this.lastPlayedAt,
+    this.resumePositionMs,
+    this.thumbUrl,
+    this.videoWidth,
+    this.videoHeight,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -796,6 +933,18 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     map['updated_at'] = Variable<DateTime>(updatedAt);
     if (!nullToAbsent || lastPlayedAt != null) {
       map['last_played_at'] = Variable<DateTime>(lastPlayedAt);
+    }
+    if (!nullToAbsent || resumePositionMs != null) {
+      map['resume_position_ms'] = Variable<int>(resumePositionMs);
+    }
+    if (!nullToAbsent || thumbUrl != null) {
+      map['thumb_url'] = Variable<String>(thumbUrl);
+    }
+    if (!nullToAbsent || videoWidth != null) {
+      map['video_width'] = Variable<int>(videoWidth);
+    }
+    if (!nullToAbsent || videoHeight != null) {
+      map['video_height'] = Variable<int>(videoHeight);
     }
     return map;
   }
@@ -862,6 +1011,22 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           lastPlayedAt == null && nullToAbsent
               ? const Value.absent()
               : Value(lastPlayedAt),
+      resumePositionMs:
+          resumePositionMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(resumePositionMs),
+      thumbUrl:
+          thumbUrl == null && nullToAbsent
+              ? const Value.absent()
+              : Value(thumbUrl),
+      videoWidth:
+          videoWidth == null && nullToAbsent
+              ? const Value.absent()
+              : Value(videoWidth),
+      videoHeight:
+          videoHeight == null && nullToAbsent
+              ? const Value.absent()
+              : Value(videoHeight),
     );
   }
 
@@ -898,6 +1063,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       firstSeenAt: serializer.fromJson<DateTime>(json['firstSeenAt']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
       lastPlayedAt: serializer.fromJson<DateTime?>(json['lastPlayedAt']),
+      resumePositionMs: serializer.fromJson<int?>(json['resumePositionMs']),
+      thumbUrl: serializer.fromJson<String?>(json['thumbUrl']),
+      videoWidth: serializer.fromJson<int?>(json['videoWidth']),
+      videoHeight: serializer.fromJson<int?>(json['videoHeight']),
     );
   }
   @override
@@ -931,6 +1100,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       'firstSeenAt': serializer.toJson<DateTime>(firstSeenAt),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
       'lastPlayedAt': serializer.toJson<DateTime?>(lastPlayedAt),
+      'resumePositionMs': serializer.toJson<int?>(resumePositionMs),
+      'thumbUrl': serializer.toJson<String?>(thumbUrl),
+      'videoWidth': serializer.toJson<int?>(videoWidth),
+      'videoHeight': serializer.toJson<int?>(videoHeight),
     };
   }
 
@@ -962,6 +1135,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     DateTime? firstSeenAt,
     DateTime? updatedAt,
     Value<DateTime?> lastPlayedAt = const Value.absent(),
+    Value<int?> resumePositionMs = const Value.absent(),
+    Value<String?> thumbUrl = const Value.absent(),
+    Value<int?> videoWidth = const Value.absent(),
+    Value<int?> videoHeight = const Value.absent(),
   }) => MediaItemRow(
     id: id ?? this.id,
     provider: provider ?? this.provider,
@@ -990,6 +1167,13 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     firstSeenAt: firstSeenAt ?? this.firstSeenAt,
     updatedAt: updatedAt ?? this.updatedAt,
     lastPlayedAt: lastPlayedAt.present ? lastPlayedAt.value : this.lastPlayedAt,
+    resumePositionMs:
+        resumePositionMs.present
+            ? resumePositionMs.value
+            : this.resumePositionMs,
+    thumbUrl: thumbUrl.present ? thumbUrl.value : this.thumbUrl,
+    videoWidth: videoWidth.present ? videoWidth.value : this.videoWidth,
+    videoHeight: videoHeight.present ? videoHeight.value : this.videoHeight,
   );
   MediaItemRow copyWithCompanion(MediaItemsCompanion data) {
     return MediaItemRow(
@@ -1036,6 +1220,15 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           data.lastPlayedAt.present
               ? data.lastPlayedAt.value
               : this.lastPlayedAt,
+      resumePositionMs:
+          data.resumePositionMs.present
+              ? data.resumePositionMs.value
+              : this.resumePositionMs,
+      thumbUrl: data.thumbUrl.present ? data.thumbUrl.value : this.thumbUrl,
+      videoWidth:
+          data.videoWidth.present ? data.videoWidth.value : this.videoWidth,
+      videoHeight:
+          data.videoHeight.present ? data.videoHeight.value : this.videoHeight,
     );
   }
 
@@ -1068,7 +1261,11 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           ..write('isSampleOrExtra: $isSampleOrExtra, ')
           ..write('firstSeenAt: $firstSeenAt, ')
           ..write('updatedAt: $updatedAt, ')
-          ..write('lastPlayedAt: $lastPlayedAt')
+          ..write('lastPlayedAt: $lastPlayedAt, ')
+          ..write('resumePositionMs: $resumePositionMs, ')
+          ..write('thumbUrl: $thumbUrl, ')
+          ..write('videoWidth: $videoWidth, ')
+          ..write('videoHeight: $videoHeight')
           ..write(')'))
         .toString();
   }
@@ -1102,6 +1299,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     firstSeenAt,
     updatedAt,
     lastPlayedAt,
+    resumePositionMs,
+    thumbUrl,
+    videoWidth,
+    videoHeight,
   ]);
   @override
   bool operator ==(Object other) =>
@@ -1133,7 +1334,11 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           other.isSampleOrExtra == this.isSampleOrExtra &&
           other.firstSeenAt == this.firstSeenAt &&
           other.updatedAt == this.updatedAt &&
-          other.lastPlayedAt == this.lastPlayedAt);
+          other.lastPlayedAt == this.lastPlayedAt &&
+          other.resumePositionMs == this.resumePositionMs &&
+          other.thumbUrl == this.thumbUrl &&
+          other.videoWidth == this.videoWidth &&
+          other.videoHeight == this.videoHeight);
 }
 
 class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
@@ -1164,6 +1369,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
   final Value<DateTime> firstSeenAt;
   final Value<DateTime> updatedAt;
   final Value<DateTime?> lastPlayedAt;
+  final Value<int?> resumePositionMs;
+  final Value<String?> thumbUrl;
+  final Value<int?> videoWidth;
+  final Value<int?> videoHeight;
   final Value<int> rowid;
   const MediaItemsCompanion({
     this.id = const Value.absent(),
@@ -1193,6 +1402,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     this.firstSeenAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
+    this.resumePositionMs = const Value.absent(),
+    this.thumbUrl = const Value.absent(),
+    this.videoWidth = const Value.absent(),
+    this.videoHeight = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   MediaItemsCompanion.insert({
@@ -1223,6 +1436,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     required DateTime firstSeenAt,
     required DateTime updatedAt,
     this.lastPlayedAt = const Value.absent(),
+    this.resumePositionMs = const Value.absent(),
+    this.thumbUrl = const Value.absent(),
+    this.videoWidth = const Value.absent(),
+    this.videoHeight = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : id = Value(id),
        provider = Value(provider),
@@ -1260,6 +1477,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Expression<DateTime>? firstSeenAt,
     Expression<DateTime>? updatedAt,
     Expression<DateTime>? lastPlayedAt,
+    Expression<int>? resumePositionMs,
+    Expression<String>? thumbUrl,
+    Expression<int>? videoWidth,
+    Expression<int>? videoHeight,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -1290,6 +1511,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       if (firstSeenAt != null) 'first_seen_at': firstSeenAt,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (lastPlayedAt != null) 'last_played_at': lastPlayedAt,
+      if (resumePositionMs != null) 'resume_position_ms': resumePositionMs,
+      if (thumbUrl != null) 'thumb_url': thumbUrl,
+      if (videoWidth != null) 'video_width': videoWidth,
+      if (videoHeight != null) 'video_height': videoHeight,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -1322,6 +1547,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Value<DateTime>? firstSeenAt,
     Value<DateTime>? updatedAt,
     Value<DateTime?>? lastPlayedAt,
+    Value<int?>? resumePositionMs,
+    Value<String?>? thumbUrl,
+    Value<int?>? videoWidth,
+    Value<int?>? videoHeight,
     Value<int>? rowid,
   }) {
     return MediaItemsCompanion(
@@ -1352,6 +1581,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       firstSeenAt: firstSeenAt ?? this.firstSeenAt,
       updatedAt: updatedAt ?? this.updatedAt,
       lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
+      resumePositionMs: resumePositionMs ?? this.resumePositionMs,
+      thumbUrl: thumbUrl ?? this.thumbUrl,
+      videoWidth: videoWidth ?? this.videoWidth,
+      videoHeight: videoHeight ?? this.videoHeight,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -1440,6 +1673,18 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     if (lastPlayedAt.present) {
       map['last_played_at'] = Variable<DateTime>(lastPlayedAt.value);
     }
+    if (resumePositionMs.present) {
+      map['resume_position_ms'] = Variable<int>(resumePositionMs.value);
+    }
+    if (thumbUrl.present) {
+      map['thumb_url'] = Variable<String>(thumbUrl.value);
+    }
+    if (videoWidth.present) {
+      map['video_width'] = Variable<int>(videoWidth.value);
+    }
+    if (videoHeight.present) {
+      map['video_height'] = Variable<int>(videoHeight.value);
+    }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
     }
@@ -1476,6 +1721,10 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
           ..write('firstSeenAt: $firstSeenAt, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
+          ..write('resumePositionMs: $resumePositionMs, ')
+          ..write('thumbUrl: $thumbUrl, ')
+          ..write('videoWidth: $videoWidth, ')
+          ..write('videoHeight: $videoHeight, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -1516,6 +1765,18 @@ class $MediaWorksTable extends MediaWorks
     false,
     type: DriftSqlType.string,
     requiredDuringInsert: true,
+  );
+  static const VerificationMeta _categoryMeta = const VerificationMeta(
+    'category',
+  );
+  @override
+  late final GeneratedColumn<String> category = GeneratedColumn<String>(
+    'category',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(''),
   );
   static const VerificationMeta _titleMeta = const VerificationMeta('title');
   @override
@@ -1577,6 +1838,17 @@ class $MediaWorksTable extends MediaWorks
     aliasedName,
     true,
     type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _posterFaceXMeta = const VerificationMeta(
+    'posterFaceX',
+  );
+  @override
+  late final GeneratedColumn<double> posterFaceX = GeneratedColumn<double>(
+    'poster_face_x',
+    aliasedName,
+    true,
+    type: DriftSqlType.double,
     requiredDuringInsert: false,
   );
   static const VerificationMeta _backdropUrlMeta = const VerificationMeta(
@@ -1702,12 +1974,14 @@ class $MediaWorksTable extends MediaWorks
     key,
     provider,
     kind,
+    category,
     title,
     originalTitle,
     year,
     overview,
     posterUrl,
     posterFile,
+    posterFaceX,
     backdropUrl,
     backdropFile,
     rating,
@@ -1756,6 +2030,12 @@ class $MediaWorksTable extends MediaWorks
     } else if (isInserting) {
       context.missing(_kindMeta);
     }
+    if (data.containsKey('category')) {
+      context.handle(
+        _categoryMeta,
+        category.isAcceptableOrUnknown(data['category']!, _categoryMeta),
+      );
+    }
     if (data.containsKey('title')) {
       context.handle(
         _titleMeta,
@@ -1795,6 +2075,15 @@ class $MediaWorksTable extends MediaWorks
       context.handle(
         _posterFileMeta,
         posterFile.isAcceptableOrUnknown(data['poster_file']!, _posterFileMeta),
+      );
+    }
+    if (data.containsKey('poster_face_x')) {
+      context.handle(
+        _posterFaceXMeta,
+        posterFaceX.isAcceptableOrUnknown(
+          data['poster_face_x']!,
+          _posterFaceXMeta,
+        ),
       );
     }
     if (data.containsKey('backdrop_url')) {
@@ -1900,6 +2189,11 @@ class $MediaWorksTable extends MediaWorks
             DriftSqlType.string,
             data['${effectivePrefix}kind'],
           )!,
+      category:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}category'],
+          )!,
       title:
           attachedDatabase.typeMapping.read(
             DriftSqlType.string,
@@ -1924,6 +2218,10 @@ class $MediaWorksTable extends MediaWorks
       posterFile: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
         data['${effectivePrefix}poster_file'],
+      ),
+      posterFaceX: attachedDatabase.typeMapping.read(
+        DriftSqlType.double,
+        data['${effectivePrefix}poster_face_x'],
       ),
       backdropUrl: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
@@ -1988,12 +2286,32 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   final String key;
   final String provider;
   final String kind;
+
+  /// 媒体库一级分类（`MediaCategory.name`）。
+  ///
+  /// 默认空串而不是 `other`：空串表示**这一行还没被判定过**，需要回填；
+  /// 而 `other` 是一个**判定结果**（「判过了，就是认不出来」）。
+  /// 两者混在一起的话，回填逻辑会反复把 `other` 当成待判定的行重算，
+  /// 而真正的「其他」作品永远修不好（因为它本来就该是 other）。
+  final String category;
   final String title;
   final String? originalTitle;
   final int? year;
   final String? overview;
   final String? posterUrl;
   final String? posterFile;
+
+  /// 封面里**人物所在的水平位置**（归一化 0~1），来自夸克的人脸框。
+  ///
+  /// 只有封面来自夸克的**视频帧**（16:9）时才有值：那时封面会被裁成竖版，
+  /// 需要锚住人物，而不是裁到画面正中（双人对谈镜头的中点是两人之间的空隙）。
+  /// 来自 TMDB 的海报本身就是 2:3，不需要锚点，此列为 `NULL`。
+  ///
+  /// 存**锚点**而不是「裁切偏移」：偏移量取决于卡片比例，换算放在渲染时
+  /// （`FaceAnchor.alignmentX`），这样调整卡片比例不需要重新扫描。
+  ///
+  /// 与 `posterUrl` 是**成对**的 —— 换封面来源必须同时换锚点。
+  final double? posterFaceX;
   final String? backdropUrl;
   final String? backdropFile;
   final double? rating;
@@ -2018,12 +2336,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     required this.key,
     required this.provider,
     required this.kind,
+    required this.category,
     required this.title,
     this.originalTitle,
     this.year,
     this.overview,
     this.posterUrl,
     this.posterFile,
+    this.posterFaceX,
     this.backdropUrl,
     this.backdropFile,
     this.rating,
@@ -2042,6 +2362,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     map['key'] = Variable<String>(key);
     map['provider'] = Variable<String>(provider);
     map['kind'] = Variable<String>(kind);
+    map['category'] = Variable<String>(category);
     map['title'] = Variable<String>(title);
     if (!nullToAbsent || originalTitle != null) {
       map['original_title'] = Variable<String>(originalTitle);
@@ -2057,6 +2378,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     }
     if (!nullToAbsent || posterFile != null) {
       map['poster_file'] = Variable<String>(posterFile);
+    }
+    if (!nullToAbsent || posterFaceX != null) {
+      map['poster_face_x'] = Variable<double>(posterFaceX);
     }
     if (!nullToAbsent || backdropUrl != null) {
       map['backdrop_url'] = Variable<String>(backdropUrl);
@@ -2089,6 +2413,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       key: Value(key),
       provider: Value(provider),
       kind: Value(kind),
+      category: Value(category),
       title: Value(title),
       originalTitle:
           originalTitle == null && nullToAbsent
@@ -2107,6 +2432,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           posterFile == null && nullToAbsent
               ? const Value.absent()
               : Value(posterFile),
+      posterFaceX:
+          posterFaceX == null && nullToAbsent
+              ? const Value.absent()
+              : Value(posterFaceX),
       backdropUrl:
           backdropUrl == null && nullToAbsent
               ? const Value.absent()
@@ -2146,12 +2475,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       key: serializer.fromJson<String>(json['key']),
       provider: serializer.fromJson<String>(json['provider']),
       kind: serializer.fromJson<String>(json['kind']),
+      category: serializer.fromJson<String>(json['category']),
       title: serializer.fromJson<String>(json['title']),
       originalTitle: serializer.fromJson<String?>(json['originalTitle']),
       year: serializer.fromJson<int?>(json['year']),
       overview: serializer.fromJson<String?>(json['overview']),
       posterUrl: serializer.fromJson<String?>(json['posterUrl']),
       posterFile: serializer.fromJson<String?>(json['posterFile']),
+      posterFaceX: serializer.fromJson<double?>(json['posterFaceX']),
       backdropUrl: serializer.fromJson<String?>(json['backdropUrl']),
       backdropFile: serializer.fromJson<String?>(json['backdropFile']),
       rating: serializer.fromJson<double?>(json['rating']),
@@ -2172,12 +2503,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'key': serializer.toJson<String>(key),
       'provider': serializer.toJson<String>(provider),
       'kind': serializer.toJson<String>(kind),
+      'category': serializer.toJson<String>(category),
       'title': serializer.toJson<String>(title),
       'originalTitle': serializer.toJson<String?>(originalTitle),
       'year': serializer.toJson<int?>(year),
       'overview': serializer.toJson<String?>(overview),
       'posterUrl': serializer.toJson<String?>(posterUrl),
       'posterFile': serializer.toJson<String?>(posterFile),
+      'posterFaceX': serializer.toJson<double?>(posterFaceX),
       'backdropUrl': serializer.toJson<String?>(backdropUrl),
       'backdropFile': serializer.toJson<String?>(backdropFile),
       'rating': serializer.toJson<double?>(rating),
@@ -2196,12 +2529,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     String? key,
     String? provider,
     String? kind,
+    String? category,
     String? title,
     Value<String?> originalTitle = const Value.absent(),
     Value<int?> year = const Value.absent(),
     Value<String?> overview = const Value.absent(),
     Value<String?> posterUrl = const Value.absent(),
     Value<String?> posterFile = const Value.absent(),
+    Value<double?> posterFaceX = const Value.absent(),
     Value<String?> backdropUrl = const Value.absent(),
     Value<String?> backdropFile = const Value.absent(),
     Value<double?> rating = const Value.absent(),
@@ -2217,6 +2552,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     key: key ?? this.key,
     provider: provider ?? this.provider,
     kind: kind ?? this.kind,
+    category: category ?? this.category,
     title: title ?? this.title,
     originalTitle:
         originalTitle.present ? originalTitle.value : this.originalTitle,
@@ -2224,6 +2560,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     overview: overview.present ? overview.value : this.overview,
     posterUrl: posterUrl.present ? posterUrl.value : this.posterUrl,
     posterFile: posterFile.present ? posterFile.value : this.posterFile,
+    posterFaceX: posterFaceX.present ? posterFaceX.value : this.posterFaceX,
     backdropUrl: backdropUrl.present ? backdropUrl.value : this.backdropUrl,
     backdropFile: backdropFile.present ? backdropFile.value : this.backdropFile,
     rating: rating.present ? rating.value : this.rating,
@@ -2241,6 +2578,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       key: data.key.present ? data.key.value : this.key,
       provider: data.provider.present ? data.provider.value : this.provider,
       kind: data.kind.present ? data.kind.value : this.kind,
+      category: data.category.present ? data.category.value : this.category,
       title: data.title.present ? data.title.value : this.title,
       originalTitle:
           data.originalTitle.present
@@ -2251,6 +2589,8 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       posterUrl: data.posterUrl.present ? data.posterUrl.value : this.posterUrl,
       posterFile:
           data.posterFile.present ? data.posterFile.value : this.posterFile,
+      posterFaceX:
+          data.posterFaceX.present ? data.posterFaceX.value : this.posterFaceX,
       backdropUrl:
           data.backdropUrl.present ? data.backdropUrl.value : this.backdropUrl,
       backdropFile:
@@ -2279,12 +2619,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('key: $key, ')
           ..write('provider: $provider, ')
           ..write('kind: $kind, ')
+          ..write('category: $category, ')
           ..write('title: $title, ')
           ..write('originalTitle: $originalTitle, ')
           ..write('year: $year, ')
           ..write('overview: $overview, ')
           ..write('posterUrl: $posterUrl, ')
           ..write('posterFile: $posterFile, ')
+          ..write('posterFaceX: $posterFaceX, ')
           ..write('backdropUrl: $backdropUrl, ')
           ..write('backdropFile: $backdropFile, ')
           ..write('rating: $rating, ')
@@ -2301,16 +2643,18 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   }
 
   @override
-  int get hashCode => Object.hash(
+  int get hashCode => Object.hashAll([
     key,
     provider,
     kind,
+    category,
     title,
     originalTitle,
     year,
     overview,
     posterUrl,
     posterFile,
+    posterFaceX,
     backdropUrl,
     backdropFile,
     rating,
@@ -2322,7 +2666,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     totalBytes,
     lastPlayedAt,
     updatedAt,
-  );
+  ]);
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
@@ -2330,12 +2674,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.key == this.key &&
           other.provider == this.provider &&
           other.kind == this.kind &&
+          other.category == this.category &&
           other.title == this.title &&
           other.originalTitle == this.originalTitle &&
           other.year == this.year &&
           other.overview == this.overview &&
           other.posterUrl == this.posterUrl &&
           other.posterFile == this.posterFile &&
+          other.posterFaceX == this.posterFaceX &&
           other.backdropUrl == this.backdropUrl &&
           other.backdropFile == this.backdropFile &&
           other.rating == this.rating &&
@@ -2353,12 +2699,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<String> key;
   final Value<String> provider;
   final Value<String> kind;
+  final Value<String> category;
   final Value<String> title;
   final Value<String?> originalTitle;
   final Value<int?> year;
   final Value<String?> overview;
   final Value<String?> posterUrl;
   final Value<String?> posterFile;
+  final Value<double?> posterFaceX;
   final Value<String?> backdropUrl;
   final Value<String?> backdropFile;
   final Value<double?> rating;
@@ -2375,12 +2723,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.key = const Value.absent(),
     this.provider = const Value.absent(),
     this.kind = const Value.absent(),
+    this.category = const Value.absent(),
     this.title = const Value.absent(),
     this.originalTitle = const Value.absent(),
     this.year = const Value.absent(),
     this.overview = const Value.absent(),
     this.posterUrl = const Value.absent(),
     this.posterFile = const Value.absent(),
+    this.posterFaceX = const Value.absent(),
     this.backdropUrl = const Value.absent(),
     this.backdropFile = const Value.absent(),
     this.rating = const Value.absent(),
@@ -2398,12 +2748,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     required String key,
     required String provider,
     required String kind,
+    this.category = const Value.absent(),
     required String title,
     this.originalTitle = const Value.absent(),
     this.year = const Value.absent(),
     this.overview = const Value.absent(),
     this.posterUrl = const Value.absent(),
     this.posterFile = const Value.absent(),
+    this.posterFaceX = const Value.absent(),
     this.backdropUrl = const Value.absent(),
     this.backdropFile = const Value.absent(),
     this.rating = const Value.absent(),
@@ -2426,12 +2778,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<String>? key,
     Expression<String>? provider,
     Expression<String>? kind,
+    Expression<String>? category,
     Expression<String>? title,
     Expression<String>? originalTitle,
     Expression<int>? year,
     Expression<String>? overview,
     Expression<String>? posterUrl,
     Expression<String>? posterFile,
+    Expression<double>? posterFaceX,
     Expression<String>? backdropUrl,
     Expression<String>? backdropFile,
     Expression<double>? rating,
@@ -2449,12 +2803,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (key != null) 'key': key,
       if (provider != null) 'provider': provider,
       if (kind != null) 'kind': kind,
+      if (category != null) 'category': category,
       if (title != null) 'title': title,
       if (originalTitle != null) 'original_title': originalTitle,
       if (year != null) 'year': year,
       if (overview != null) 'overview': overview,
       if (posterUrl != null) 'poster_url': posterUrl,
       if (posterFile != null) 'poster_file': posterFile,
+      if (posterFaceX != null) 'poster_face_x': posterFaceX,
       if (backdropUrl != null) 'backdrop_url': backdropUrl,
       if (backdropFile != null) 'backdrop_file': backdropFile,
       if (rating != null) 'rating': rating,
@@ -2474,12 +2830,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<String>? key,
     Value<String>? provider,
     Value<String>? kind,
+    Value<String>? category,
     Value<String>? title,
     Value<String?>? originalTitle,
     Value<int?>? year,
     Value<String?>? overview,
     Value<String?>? posterUrl,
     Value<String?>? posterFile,
+    Value<double?>? posterFaceX,
     Value<String?>? backdropUrl,
     Value<String?>? backdropFile,
     Value<double?>? rating,
@@ -2497,12 +2855,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       key: key ?? this.key,
       provider: provider ?? this.provider,
       kind: kind ?? this.kind,
+      category: category ?? this.category,
       title: title ?? this.title,
       originalTitle: originalTitle ?? this.originalTitle,
       year: year ?? this.year,
       overview: overview ?? this.overview,
       posterUrl: posterUrl ?? this.posterUrl,
       posterFile: posterFile ?? this.posterFile,
+      posterFaceX: posterFaceX ?? this.posterFaceX,
       backdropUrl: backdropUrl ?? this.backdropUrl,
       backdropFile: backdropFile ?? this.backdropFile,
       rating: rating ?? this.rating,
@@ -2530,6 +2890,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     if (kind.present) {
       map['kind'] = Variable<String>(kind.value);
     }
+    if (category.present) {
+      map['category'] = Variable<String>(category.value);
+    }
     if (title.present) {
       map['title'] = Variable<String>(title.value);
     }
@@ -2547,6 +2910,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     }
     if (posterFile.present) {
       map['poster_file'] = Variable<String>(posterFile.value);
+    }
+    if (posterFaceX.present) {
+      map['poster_face_x'] = Variable<double>(posterFaceX.value);
     }
     if (backdropUrl.present) {
       map['backdrop_url'] = Variable<String>(backdropUrl.value);
@@ -2593,12 +2959,14 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('key: $key, ')
           ..write('provider: $provider, ')
           ..write('kind: $kind, ')
+          ..write('category: $category, ')
           ..write('title: $title, ')
           ..write('originalTitle: $originalTitle, ')
           ..write('year: $year, ')
           ..write('overview: $overview, ')
           ..write('posterUrl: $posterUrl, ')
           ..write('posterFile: $posterFile, ')
+          ..write('posterFaceX: $posterFaceX, ')
           ..write('backdropUrl: $backdropUrl, ')
           ..write('backdropFile: $backdropFile, ')
           ..write('rating: $rating, ')
@@ -4554,6 +4922,10 @@ typedef $$MediaItemsTableCreateCompanionBuilder =
       required DateTime firstSeenAt,
       required DateTime updatedAt,
       Value<DateTime?> lastPlayedAt,
+      Value<int?> resumePositionMs,
+      Value<String?> thumbUrl,
+      Value<int?> videoWidth,
+      Value<int?> videoHeight,
       Value<int> rowid,
     });
 typedef $$MediaItemsTableUpdateCompanionBuilder =
@@ -4585,6 +4957,10 @@ typedef $$MediaItemsTableUpdateCompanionBuilder =
       Value<DateTime> firstSeenAt,
       Value<DateTime> updatedAt,
       Value<DateTime?> lastPlayedAt,
+      Value<int?> resumePositionMs,
+      Value<String?> thumbUrl,
+      Value<int?> videoWidth,
+      Value<int?> videoHeight,
       Value<int> rowid,
     });
 
@@ -4729,6 +5105,26 @@ class $$MediaItemsTableFilterComposer
 
   ColumnFilters<DateTime> get lastPlayedAt => $composableBuilder(
     column: $table.lastPlayedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get resumePositionMs => $composableBuilder(
+    column: $table.resumePositionMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get thumbUrl => $composableBuilder(
+    column: $table.thumbUrl,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get videoWidth => $composableBuilder(
+    column: $table.videoWidth,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get videoHeight => $composableBuilder(
+    column: $table.videoHeight,
     builder: (column) => ColumnFilters(column),
   );
 }
@@ -4876,6 +5272,26 @@ class $$MediaItemsTableOrderingComposer
     column: $table.lastPlayedAt,
     builder: (column) => ColumnOrderings(column),
   );
+
+  ColumnOrderings<int> get resumePositionMs => $composableBuilder(
+    column: $table.resumePositionMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get thumbUrl => $composableBuilder(
+    column: $table.thumbUrl,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get videoWidth => $composableBuilder(
+    column: $table.videoWidth,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get videoHeight => $composableBuilder(
+    column: $table.videoHeight,
+    builder: (column) => ColumnOrderings(column),
+  );
 }
 
 class $$MediaItemsTableAnnotationComposer
@@ -4987,6 +5403,24 @@ class $$MediaItemsTableAnnotationComposer
     column: $table.lastPlayedAt,
     builder: (column) => column,
   );
+
+  GeneratedColumn<int> get resumePositionMs => $composableBuilder(
+    column: $table.resumePositionMs,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get thumbUrl =>
+      $composableBuilder(column: $table.thumbUrl, builder: (column) => column);
+
+  GeneratedColumn<int> get videoWidth => $composableBuilder(
+    column: $table.videoWidth,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get videoHeight => $composableBuilder(
+    column: $table.videoHeight,
+    builder: (column) => column,
+  );
 }
 
 class $$MediaItemsTableTableManager
@@ -5047,6 +5481,10 @@ class $$MediaItemsTableTableManager
                 Value<DateTime> firstSeenAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
+                Value<int?> resumePositionMs = const Value.absent(),
+                Value<String?> thumbUrl = const Value.absent(),
+                Value<int?> videoWidth = const Value.absent(),
+                Value<int?> videoHeight = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaItemsCompanion(
                 id: id,
@@ -5076,6 +5514,10 @@ class $$MediaItemsTableTableManager
                 firstSeenAt: firstSeenAt,
                 updatedAt: updatedAt,
                 lastPlayedAt: lastPlayedAt,
+                resumePositionMs: resumePositionMs,
+                thumbUrl: thumbUrl,
+                videoWidth: videoWidth,
+                videoHeight: videoHeight,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -5107,6 +5549,10 @@ class $$MediaItemsTableTableManager
                 required DateTime firstSeenAt,
                 required DateTime updatedAt,
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
+                Value<int?> resumePositionMs = const Value.absent(),
+                Value<String?> thumbUrl = const Value.absent(),
+                Value<int?> videoWidth = const Value.absent(),
+                Value<int?> videoHeight = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaItemsCompanion.insert(
                 id: id,
@@ -5136,6 +5582,10 @@ class $$MediaItemsTableTableManager
                 firstSeenAt: firstSeenAt,
                 updatedAt: updatedAt,
                 lastPlayedAt: lastPlayedAt,
+                resumePositionMs: resumePositionMs,
+                thumbUrl: thumbUrl,
+                videoWidth: videoWidth,
+                videoHeight: videoHeight,
                 rowid: rowid,
               ),
           withReferenceMapper:
@@ -5175,12 +5625,14 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       required String key,
       required String provider,
       required String kind,
+      Value<String> category,
       required String title,
       Value<String?> originalTitle,
       Value<int?> year,
       Value<String?> overview,
       Value<String?> posterUrl,
       Value<String?> posterFile,
+      Value<double?> posterFaceX,
       Value<String?> backdropUrl,
       Value<String?> backdropFile,
       Value<double?> rating,
@@ -5199,12 +5651,14 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<String> key,
       Value<String> provider,
       Value<String> kind,
+      Value<String> category,
       Value<String> title,
       Value<String?> originalTitle,
       Value<int?> year,
       Value<String?> overview,
       Value<String?> posterUrl,
       Value<String?> posterFile,
+      Value<double?> posterFaceX,
       Value<String?> backdropUrl,
       Value<String?> backdropFile,
       Value<double?> rating,
@@ -5243,6 +5697,11 @@ class $$MediaWorksTableFilterComposer
     builder: (column) => ColumnFilters(column),
   );
 
+  ColumnFilters<String> get category => $composableBuilder(
+    column: $table.category,
+    builder: (column) => ColumnFilters(column),
+  );
+
   ColumnFilters<String> get title => $composableBuilder(
     column: $table.title,
     builder: (column) => ColumnFilters(column),
@@ -5270,6 +5729,11 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<String> get posterFile => $composableBuilder(
     column: $table.posterFile,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<double> get posterFaceX => $composableBuilder(
+    column: $table.posterFaceX,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5353,6 +5817,11 @@ class $$MediaWorksTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<String> get category => $composableBuilder(
+    column: $table.category,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get title => $composableBuilder(
     column: $table.title,
     builder: (column) => ColumnOrderings(column),
@@ -5380,6 +5849,11 @@ class $$MediaWorksTableOrderingComposer
 
   ColumnOrderings<String> get posterFile => $composableBuilder(
     column: $table.posterFile,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<double> get posterFaceX => $composableBuilder(
+    column: $table.posterFaceX,
     builder: (column) => ColumnOrderings(column),
   );
 
@@ -5457,6 +5931,9 @@ class $$MediaWorksTableAnnotationComposer
   GeneratedColumn<String> get kind =>
       $composableBuilder(column: $table.kind, builder: (column) => column);
 
+  GeneratedColumn<String> get category =>
+      $composableBuilder(column: $table.category, builder: (column) => column);
+
   GeneratedColumn<String> get title =>
       $composableBuilder(column: $table.title, builder: (column) => column);
 
@@ -5476,6 +5953,11 @@ class $$MediaWorksTableAnnotationComposer
 
   GeneratedColumn<String> get posterFile => $composableBuilder(
     column: $table.posterFile,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<double> get posterFaceX => $composableBuilder(
+    column: $table.posterFaceX,
     builder: (column) => column,
   );
 
@@ -5555,12 +6037,14 @@ class $$MediaWorksTableTableManager
                 Value<String> key = const Value.absent(),
                 Value<String> provider = const Value.absent(),
                 Value<String> kind = const Value.absent(),
+                Value<String> category = const Value.absent(),
                 Value<String> title = const Value.absent(),
                 Value<String?> originalTitle = const Value.absent(),
                 Value<int?> year = const Value.absent(),
                 Value<String?> overview = const Value.absent(),
                 Value<String?> posterUrl = const Value.absent(),
                 Value<String?> posterFile = const Value.absent(),
+                Value<double?> posterFaceX = const Value.absent(),
                 Value<String?> backdropUrl = const Value.absent(),
                 Value<String?> backdropFile = const Value.absent(),
                 Value<double?> rating = const Value.absent(),
@@ -5577,12 +6061,14 @@ class $$MediaWorksTableTableManager
                 key: key,
                 provider: provider,
                 kind: kind,
+                category: category,
                 title: title,
                 originalTitle: originalTitle,
                 year: year,
                 overview: overview,
                 posterUrl: posterUrl,
                 posterFile: posterFile,
+                posterFaceX: posterFaceX,
                 backdropUrl: backdropUrl,
                 backdropFile: backdropFile,
                 rating: rating,
@@ -5601,12 +6087,14 @@ class $$MediaWorksTableTableManager
                 required String key,
                 required String provider,
                 required String kind,
+                Value<String> category = const Value.absent(),
                 required String title,
                 Value<String?> originalTitle = const Value.absent(),
                 Value<int?> year = const Value.absent(),
                 Value<String?> overview = const Value.absent(),
                 Value<String?> posterUrl = const Value.absent(),
                 Value<String?> posterFile = const Value.absent(),
+                Value<double?> posterFaceX = const Value.absent(),
                 Value<String?> backdropUrl = const Value.absent(),
                 Value<String?> backdropFile = const Value.absent(),
                 Value<double?> rating = const Value.absent(),
@@ -5623,12 +6111,14 @@ class $$MediaWorksTableTableManager
                 key: key,
                 provider: provider,
                 kind: kind,
+                category: category,
                 title: title,
                 originalTitle: originalTitle,
                 year: year,
                 overview: overview,
                 posterUrl: posterUrl,
                 posterFile: posterFile,
+                posterFaceX: posterFaceX,
                 backdropUrl: backdropUrl,
                 backdropFile: backdropFile,
                 rating: rating,

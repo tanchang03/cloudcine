@@ -174,6 +174,19 @@ class ParsedMediaName {
 class MediaFilenameParser {
   const MediaFilenameParser();
 
+  /// 从展示路径里取出末级目录名（作为 [parse] 的 `dirName` 兜底）。
+  ///
+  /// 放在这里而不是让调用方各写一遍：扫描期与详情页的单片刮削都要用它，
+  /// 两处对「什么算末级目录名」的理解一旦不同（比如一处去了尾斜杠、
+  /// 一处没去），同一个文件在两处就会解析出**不同的片名**。
+  static String? dirNameOf(String path) {
+    final trimmed = path.replaceAll(RegExp(r'/+$'), '');
+    if (trimmed.isEmpty) return null;
+    final idx = trimmed.lastIndexOf('/');
+    final name = idx < 0 ? trimmed : trimmed.substring(idx + 1);
+    return name.isEmpty ? null : name;
+  }
+
   /// 主入口。
   ///
   /// [dirName] 作为**兜底**：很多网盘目录是这样的结构

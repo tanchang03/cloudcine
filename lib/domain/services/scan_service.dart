@@ -2,6 +2,7 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
 import '../../core/utils/filename_parser.dart';
 import '../../core/utils/image_formats.dart';
+import '../../core/utils/media_category.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/video_formats.dart';
 import '../adapters/cloud_drive_adapter.dart';
@@ -167,11 +168,16 @@ class ScanService {
   /// [pruneStale] 为真时在**完整扫完**后清理网盘侧已删除的记录
   /// （中途取消/失败不清理，否则会误删还没扫到的部分）。
   /// [scrape] 为真时在遍历结束后跑在线刮削。
+  ///
+  /// **默认 `false`**：刮削的默认入口是详情页的「刮削」按钮。全盘自动刮削
+  /// 对额度小的源（豆瓣匿名约 10 个搜索词）是灾难性的 —— 中途耗尽会让整批
+  /// 作品一条都刮不到，且这个 IP 短时间内不可用。要自动刮就在设置里显式打开
+  /// （`autoScrapeOnScan`）。
   Future<ScanOutcome> scan(
     DriveProvider provider, {
     bool resume = true,
     bool pruneStale = true,
-    bool scrape = true,
+    bool scrape = false,
     ScanCancellation? cancel,
     void Function(ScanProgress progress)? onProgress,
   }) async {
@@ -434,7 +440,10 @@ class ScanService {
               continue;
             }
 
-            final parsed = parser.parse(entry.name, dirName: _dirName(dir.path));
+            final parsed = parser.parse(
+              entry.name,
+              dirName: MediaFilenameParser.dirNameOf(dir.path),
+            );
             final item = MediaItem.fromEntry(
               entry: entry,
               provider: provider,
@@ -449,26 +458,42 @@ class ScanService {
             newBytes += entry.sizeBytes ?? 0;
 
             // 刮削查询：同一组只留一条。
-            if (parsed.isConfident) {
-              scrapeQueries.putIfAbsent(
-                parsed.groupKey,
-                () => ScrapeQuery(
-                  title: parsed.title!,
-                  alternateTitle: _pickAlternate(parsed),
-                  kind: parsed.kind,
-                  year: parsed.year,
-                  season: parsed.season,
-                  episode: parsed.episode,
-                ),
-              );
+            //
+            // 查询的构造走 `ScrapeQuery.fromParsed`，与详情页的「刮削」按钮
+            // 共用同一份逻辑 —— 两处各拼一遍的话，同一个作品在「扫描期」
+            // 与「点按钮」时会查出不同结果，而且**不会报错**。
+            final scrapeQuery = ScrapeQuery.fromParsed(parsed);
+            if (scrapeQuery != null) {
+              scrapeQueries.putIfAbsent(parsed.groupKey, () => scrapeQuery);
               final seed = workSeeds.putIfAbsent(
                 parsed.groupKey,
                 () => _WorkSeed(
                   kind: parsed.kind,
                   title: parsed.title!,
                   year: parsed.year,
+                  // 分类判定用「文件名 + 目录路径 + 片名」三处证据：
+                  // 网盘上「动漫」这类信息几乎总是写在目录名里
+                  // （`/动漫/进击的巨人/…`），只看片名会大面积漏判。
+                  category: MediaCategoryGuesser.guess(
+                    kind: parsed.kind,
+                    title: parsed.title,
+                    fileName: entry.name,
+                    dirPath: dir.path,
+                  ),
                 ),
               );
+              // 第一条没缩略图时用后面的补上（夸克对约 30% 的视频
+              // 还没生成预览图，而同一部剧里通常总有一集是有的）。
+              //
+              // ⚠️ 地址和锚点**必须在同一次赋值里一起写**：它们描述的是同一张图。
+              // 拆成两次写（先 `posterUrl ??=`、再 `posterFaceX ??=`）会在
+              // 「第一集有图但没人脸、第二集有人脸但没图」时拼出一对不匹配的
+              // 组合 —— 拿甲图的人脸位置去裁乙图。写成 `if` 而不是 `??=`，
+              // 就是为了让这两行在结构上无法分开。
+              if (seed.posterUrl == null && item.thumbUrl != null) {
+                seed.posterUrl = item.thumbUrl;
+                seed.posterFaceX = item.faceAnchorX;
+              }
               seed.itemCount++;
               seed.totalBytes += entry.sizeBytes ?? 0;
               dirtyWorkKeys.add(parsed.groupKey);
@@ -734,21 +759,43 @@ class ScanService {
   ///
   /// 刮削结果优先；没有就退到本地解析的标题与年份 —— 这样即使一个刮削器
   /// 都没配，媒体库里也有正常的标题，而不是一串文件名。
+  ///
+  /// ## 海报的两级来源
+  ///
+  /// `TMDB 海报` → `网盘缩略图`。第二级是本项目「无刮削也要有画面」的关键：
+  /// 夸克给每个视频生成了服务端预览图（实测 640×360 WebP），
+  /// 直接拿它当作品封面，媒体库就不再是一墙灰块。
+  ///
+  /// 顺序不能反：TMDB 的海报是**竖版作品海报**（2:3），网盘缩略图是
+  /// **视频画面**（16:9）。有正规海报时用视频截图会显得很不专业。
+  ///
+  /// ⚠️ 两种来源的**比例不同**，所以换来源时必须同时换掉 `posterFaceX`
+  /// 锚点（见下）：锚点是「视频帧里人物在哪」，拿去裁 2:3 的作品海报是错的。
   MediaWork _buildWork({
     required String key,
     required DriveProvider provider,
     required _WorkSeed seed,
     required ScrapedMetadata? meta,
   }) {
+    // 取一次，避免下面两处各算一遍导致「地址用刮削的、锚点用网盘的」这种
+    // 只有视觉上才看得出来的错配。
+    final scrapedPoster = _nonEmpty(meta?.posterUrl);
+
     return MediaWork(
       key: key,
       provider: provider,
       kind: seed.kind,
+      category: seed.category,
       title: meta?.title ?? seed.title,
       originalTitle: meta?.originalTitle,
       year: meta?.year ?? seed.year,
       overview: meta?.overview,
-      posterUrl: meta?.posterUrl,
+      posterUrl: scrapedPoster ?? seed.posterUrl,
+      // 锚点跟着**实际用的那张图**走：
+      //   - 用了刮削海报 → 它是 2:3 的竖版作品海报，铺满格子、不裁切，
+      //     不需要锚点（拿视频帧的人脸位置去裁它只会裁错地方）；
+      //   - 用了网盘缩略图 → 16:9 要裁成竖版，此时锚点才是「凸显人物」的依据。
+      posterFaceX: scrapedPoster == null ? seed.posterFaceX : null,
       backdropUrl: meta?.backdropUrl,
       rating: meta?.rating,
       genres: meta?.genres ?? const [],
@@ -761,25 +808,8 @@ class ScanService {
     );
   }
 
-  /// 中英混排时把另一半作为备用查询词。
-  static String? _pickAlternate(ParsedMediaName parsed) {
-    final cjk = parsed.cjkTitle;
-    final latin = parsed.latinTitle;
-    final title = parsed.title;
-    if (title == null) return null;
-    if (cjk != null && latin != null && title == '$cjk $latin') return latin;
-    if (cjk != null && latin != null) return latin;
-    return null;
-  }
-
-  /// 从展示路径里取出末级目录名（作为文件名解析的兜底）。
-  static String? _dirName(String path) {
-    final trimmed = path.replaceAll(RegExp(r'/+$'), '');
-    if (trimmed.isEmpty) return null;
-    final idx = trimmed.lastIndexOf('/');
-    final name = idx < 0 ? trimmed : trimmed.substring(idx + 1);
-    return name.isEmpty ? null : name;
-  }
+  static String? _nonEmpty(String? v) =>
+      (v == null || v.trim().isEmpty) ? null : v.trim();
 
   /// 拼接目录展示路径，保证以 `/` 开头、以 `/` 结尾。
   static String _joinPath(String base, String name) {
@@ -791,11 +821,43 @@ class ScanService {
 
 /// 作品种子：遍历期累积的、与刮削无关的那部分信息。
 class _WorkSeed {
-  _WorkSeed({required this.kind, required this.title, this.year});
+  _WorkSeed({
+    required this.kind,
+    required this.title,
+    required this.category,
+    this.year,
+  });
 
   final MediaKind kind;
   final String title;
   final int? year;
+
+  /// 一级分类（电影 / 剧集 / 动漫 / 综艺 / 纪录片 / 其他）。
+  ///
+  /// 在**第一条**命中这个分组的文件上判定一次，之后不再改 —— 同一部剧的
+  /// 每一集文件名可能差异很大（`S01E01` 有季集号、`SP` 特别篇没有），
+  /// 逐集重判会让分类在「剧集」和「其他」之间跳。以第一条为准更稳定，
+  /// 而第一条通常是最规整的那一集。
+  final MediaCategory category;
+
+  /// 网盘服务端缩略图地址（**未刮削时的封面兜底**）。
+  ///
+  /// 只取分组里的**第一条**有缩略图的 —— 一部剧几十集，每集都存一份地址
+  /// 没有意义：作品海报只需要一张，而且用户认的是「这部剧」而不是「第 7 集
+  /// 的那一帧」。
+  ///
+  /// 它只在**没有在线刮削海报**时才被用上（见 [_buildWork]）。
+  ///
+  /// ⚠️ 它和 [posterFaceX] 是**一对**，只在 `_walkDirectory` 里那一处 `if`
+  /// 里一起赋值。构造函数故意不收这两个参数 —— 那样就会出现「构造时给了地址、
+  /// 循环里再补锚点」这种半截状态，而它们描述的是同一张图。
+  String? posterUrl;
+
+  /// [posterUrl] 那张图里**人物所在的水平位置**（0~1），来自夸克人脸框。
+  ///
+  /// ⚠️ 与 [posterUrl] 是**一对**，必须同进同退：它们描述的是同一张图。
+  /// 只换地址不换锚点 = 拿上一张图的人脸位置去裁这一张。
+  double? posterFaceX;
 
   int itemCount = 0;
   int totalBytes = 0;

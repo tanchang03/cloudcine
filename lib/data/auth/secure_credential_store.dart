@@ -13,12 +13,17 @@ import '../../domain/entities/drive_provider.dart';
 /// 落在 Keychain（macOS/iOS）/ Keystore（Android）/ DPAPI（Windows）——
 /// **绝不写进 SQLite、SharedPreferences 或普通文件**。
 ///
-/// ## macOS 上的一个必须的开关
+/// ## macOS 上的钥匙串选择
 ///
-/// `useDataProtectionKeyChain` 必须为 **false**。
-/// 参考项目在 macOS release 打包时踩过：为 true 时 ad-hoc 签名（本地构建、
-/// 未做正式签名）会报 `-34018`（`errSecMissingEntitlement`），
-/// 表现是「凭证存不进去，每次都要求重新登录」。
+/// `useDataProtectionKeyChain` 必须为 **true**。
+/// 这使用应用专属的 Data Protection Keychain，不需要每次弹框授权。
+///
+/// 早期版本曾设为 false（走旧版 login.keychain），但沙箱 + ad-hoc 签名下
+/// 每次启动都会弹「访问钥匙串」密码框——因为旧版钥匙串是系统共享的，
+/// macOS 按代码签名授权，ad-hoc 签名每次编译都变，「始终允许」记不住。
+///
+/// 设为 true 需要同时在两份 .entitlements 里声明 `keychain-access-groups`
+/// 权限，否则会报 `-34018`（`errSecMissingEntitlement`）。
 ///
 /// 另一个是 `first_unlock` 可访问性：用户还没解锁过机器时后台任务不该
 /// 拿到凭证，但**解锁后**必须能读 —— `first_unlock` 正好是这个语义。
@@ -27,8 +32,9 @@ class SecureCredentialStore implements CredentialStore {
       : _storage = storage ??
             const FlutterSecureStorage(
               mOptions: MacOsOptions(
-                // ⚠️ 见类文档：true 会让 ad-hoc 签名报 -34018
-                useDataProtectionKeyChain: false,
+                // ⚠️ 见类文档：true 用应用专属 Data Protection Keychain，
+                // 配合 keychain-access-groups entitlement，不再每次弹框。
+                useDataProtectionKeyChain: true,
               ),
               aOptions: AndroidOptions(encryptedSharedPreferences: true),
               iOptions: IOSOptions(

@@ -60,6 +60,28 @@ class TmdbScraper implements MetadataScraper {
   /// 为它多花一次请求失败就整条刮削失败是不划算的。
   Map<int, String>? _genreCache;
 
+  /// 连续网络失败次数；达到阈值后 [_unreachable] 置真。
+  ///
+  /// ## 为什么需要熔断
+  ///
+  /// 2026-10-01 实测：`api.themoviedb.org` 在境内被 DNS 污染，请求会一直挂到
+  /// 超时（[_timeout] = 12s）。而 `ScraperPipeline` 会对**每一部作品**都调一次
+  /// 刮削器，`scrape()` 里还会依次试最多 2 个候选词 —— 145 部作品最坏就是
+  /// **约 1 小时**的纯等待，而且结局必然是全部退回本地刮削，等于白等。
+  ///
+  /// 判据只认**网络层失败**（超时 / 连不上）。HTTP 4xx、5xx 之类的**不计入**：
+  /// 那说明服务是通的，只是 Key 无效或这个词没结果，熔断反而会掩盖真问题。
+  int _networkFailures = 0;
+  bool _unreachable = false;
+
+  /// 连续多少次网络失败就熔断。
+  static const int _maxConsecutiveFailures = 3;
+
+  /// 是否已判定「根本连不上」。
+  ///
+  /// 暴露出来只为诊断（日志/设置页），不参与刮削逻辑。
+  bool get isUnreachable => _unreachable;
+
   @override
   String get id => 'tmdb';
 
@@ -72,6 +94,8 @@ class TmdbScraper implements MetadataScraper {
   @override
   Future<ScrapedMetadata?> scrape(ScrapeQuery query) async {
     if (!isEnabled) return null;
+    // 已判定连不上：立即返回，不再为每一部作品白等一次超时。
+    if (_unreachable) return null;
 
     // 中英混排时两个名字都试：中文优先（TMDB 中文条目更可能带中文简介）
     final candidates = <String>{
@@ -111,7 +135,7 @@ class TmdbScraper implements MetadataScraper {
     final res = await _get(path, params);
     if (res == null) return null;
 
-    final results = res.dataListItems;
+    final results = _resultsOf(res);
     if (results.isEmpty) {
       // 带年份搜不到时**去掉年份再试一次** —— 发布组标的年份经常是
       // 「发行年」而 TMDB 记的是「首播年」，差一年就搜不到了。
@@ -122,7 +146,7 @@ class TmdbScraper implements MetadataScraper {
           ..remove('first_air_date_year');
         final retry = await _get(path, retryParams);
         if (retry == null) return null;
-        final items = retry.dataListItems;
+        final items = _resultsOf(retry);
         if (items.isEmpty) return null;
         return _toMetadata(items.first, query, title, isTv);
       }
@@ -130,6 +154,23 @@ class TmdbScraper implements MetadataScraper {
     }
 
     return _toMetadata(results.first, query, title, isTv);
+  }
+
+  /// 取 TMDB 响应里的 `results` 数组。
+  ///
+  /// ⚠️ **不能复用 [HttpResult.dataListItems]。** 那个读的是夸克那套
+  /// `data.list` 信封（`{code, message, data:{list:[…]}}`），而 TMDB 把结果
+  /// 直接挂在**顶层**：`{page, results:[…], total_pages, total_results}`
+  /// （已对照官方文档核对 `/3/search/movie` 与 `/3/search/tv`）。
+  ///
+  /// 混用**不会报错，只会静默返回空列表** —— 每一部作品都被判成「搜不到」，
+  /// 表现得像「TMDB 上没有这些片子」，实际是**永远搜不到任何片子**。
+  /// 日志里也看不出异常（`_get` 拿到的是 200，解析也没抛），所以这里刻意
+  /// 留了一条形状回归测试钉住它。
+  static List<Map<String, Object?>> _resultsOf(HttpResult res) {
+    final results = res.json?['results'];
+    if (results is! List) return const [];
+    return results.whereType<Map<String, Object?>>().toList();
   }
 
   /// 把一条 TMDB 结果映射成 [ScrapedMetadata]。
@@ -197,7 +238,9 @@ class TmdbScraper implements MetadataScraper {
     final out = <int, String>{};
     for (final kind in const ['movie', 'tv']) {
       final res = await _get('/genre/$kind/list', {'language': _language});
-      final genres = res?.dataMap?['genres'];
+      // 同样是**顶层** `genres`（`{genres:[{id,name}]}`），不是 `data.genres`。
+      // 理由与 [_resultsOf] 相同：套夸克信封会静默拿到空表，类型标签全丢。
+      final genres = res?.json?['genres'];
       if (genres is! List) continue;
       for (final g in genres) {
         if (g is! Map) continue;
@@ -236,13 +279,35 @@ class TmdbScraper implements MetadataScraper {
 
     if (res.isNetworkFailure) {
       diag.warn('刮削', 'TMDB $path 网络失败：${res.rawBody}');
+      _noteNetworkFailure();
       return null;
     }
+
+    // 拿到了 HTTP 响应就说明服务可达 —— 无论状态码是几，都清掉失败计数。
+    // 否则「前两次超时、第三次 401」会累积成熔断，把真问题（Key 无效）藏掉。
+    _networkFailures = 0;
+
     if (!res.isSuccessStatus) {
       diag.warn('刮削', 'TMDB $path HTTP ${res.statusCode}');
       return null;
     }
     return res;
+  }
+
+  /// 记一次网络失败，够了就熔断（只告警一次）。
+  void _noteNetworkFailure() {
+    if (_unreachable) return;
+    _networkFailures++;
+    if (_networkFailures < _maxConsecutiveFailures) return;
+
+    _unreachable = true;
+    diag.warn(
+      '刮削',
+      'TMDB 连续 $_maxConsecutiveFailures 次网络失败，判定为不可达，'
+          '本次扫描不再尝试在线刮削（API 地址=$_baseUrl）。'
+          '境内直连 api.themoviedb.org 通常会被 DNS 污染，'
+          '可在设置里填一个可达的 API 地址与图片地址。',
+    );
   }
 
   static int? _intOf(Object? v) {

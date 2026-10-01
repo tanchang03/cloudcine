@@ -99,41 +99,30 @@ void main() {
       expect(outgoing.single.arguments, true);
     });
 
-    test('锁窗口比例发 setAspectRatio + 数值', () async {
-      await setChildWindowAspectRatio(16 / 9);
+    test('开始拖动发 beginWindowDrag，且**不带**位移', () async {
+      await beginChildWindowDrag();
 
-      expect(outgoing.single.method, 'setAspectRatio');
-      expect(outgoing.single.arguments, closeTo(16 / 9, 1e-9));
-    });
-
-    test('传 null 表示解锁，也要真的发出去', () async {
-      // `null` 与「比例是 0」是两件事：前者是「让用户自由拖动窗口」，
-      // 后者在原生侧会算成除零 / 负尺寸。所以解锁必须显式发 null，
-      // 不能靠「不发」来省略 —— 那样上一次的比例会一直生效。
-      await setChildWindowAspectRatio(null);
-
-      expect(outgoing.single.method, 'setAspectRatio');
+      expect(outgoing.single.method, 'beginWindowDrag');
+      // ⚠️ 刻意不带参数。带位移回来就等于退回「逐帧累加位移」，而那是窗口抖动
+      // 的成因：Flutter 的坐标是**窗口内**的，窗口一移动它就反着变，而系统会
+      // 把这次变化当成新的拖动事件补发回来 —— 于是我们再加一次反向位移，
+      // 窗口就在两个位置之间高频来回（实测症状：拖拽时窗口抖得厉害）。
+      // 位移改由原生按鼠标的**屏幕**坐标算，见 `MainFlutterWindow.swift`。
       expect(outgoing.single.arguments, isNull);
     });
 
-    test('非正数 / 非有限值一律归一成解锁', () async {
-      for (final bad in const <double>[0, -1.5, double.nan, double.infinity]) {
-        await setChildWindowAspectRatio(bad);
-      }
+    test('继续拖动发 updateWindowDrag，同样不带参数', () async {
+      await updateChildWindowDrag();
 
-      expect(outgoing, hasLength(4));
-      expect(
-        outgoing.map((c) => c.arguments),
-        everyElement(isNull),
-        reason: '这些值在原生侧算不出宽高比，必须当成解锁而不是原样送过去',
-      );
+      expect(outgoing.single.method, 'updateWindowDrag');
+      expect(outgoing.single.arguments, isNull);
     });
 
-    test('原生没接上时设置比例不抛异常', () async {
+    test('原生没接上时拖动不抛异常 —— 拖不动只是观感问题', () async {
       mockNative(reply: (_) => throw MissingPluginException('原生侧没注册'));
 
-      await expectLater(setChildWindowAspectRatio(1.5), completes);
-      await expectLater(setChildWindowAspectRatio(null), completes);
+      await expectLater(beginChildWindowDrag(), completes);
+      await expectLater(updateChildWindowDrag(), completes);
     });
 
     test('原生没接上时返回 false，不抛异常', () async {

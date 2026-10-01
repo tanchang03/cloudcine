@@ -13,9 +13,12 @@ import '../widgets/common_widgets.dart';
 
 /// 扫描页。
 ///
-/// 三个开关都是**本次扫描**的参数，不是全局设置 —— 它们跟着「开始扫描」
-/// 一起传下去，跑完就忘。做成全局设置的话，用户为了「这次想快一点」
-/// 关掉在线刮削，下次就忘了打开，然后来问「怎么没海报」。
+/// 剩下的两个开关都是**本次扫描**的参数，不是全局设置 —— 它们跟着
+/// 「开始扫描」一起传下去，跑完就忘。做成全局设置的话，用户为了「这次想快
+/// 一点」关掉续扫，下次就忘了打开。
+///
+/// 「扫描后刮削」**不在这一页**：它是个全局设置（默认关），因为自动刮削会
+/// 烧掉额度小的数据源。刮削的默认入口是作品详情页的「刮削」按钮。
 class ScanPage extends ConsumerStatefulWidget {
   const ScanPage({super.key});
 
@@ -26,7 +29,6 @@ class ScanPage extends ConsumerStatefulWidget {
 class _ScanPageState extends ConsumerState<ScanPage> {
   bool _resume = true;
   bool _pruneStale = true;
-  bool _scrape = true;
 
   @override
   Widget build(BuildContext context) {
@@ -79,17 +81,9 @@ class _ScanPageState extends ConsumerState<ScanPage> {
                           enabled: !scan.running,
                           onChanged: (v) => setState(() => _pruneStale = v),
                         ),
-                        _SwitchRow(
-                          label: '联网刮削元数据',
-                          hint: settings == null
-                              ? '读取设置中…'
-                              : (settings.canScrapeOnline
-                                  ? '用 TMDB 补齐海报与简介。没刮到的作品退回文件名解析。'
-                                  : '未启用：需要在「设置」里打开开关并填入 TMDB API Key。'),
-                          value: _scrape && (settings?.canScrapeOnline ?? false),
-                          enabled: !scan.running &&
-                              (settings?.canScrapeOnline ?? false),
-                          onChanged: (v) => setState(() => _scrape = v),
+                        _ScrapeHint(
+                          canScrape: settings?.canScrapeOnline ?? false,
+                          autoScrape: settings?.canAutoScrape ?? false,
                         ),
                       ],
                     ),
@@ -105,7 +99,6 @@ class _ScanPageState extends ConsumerState<ScanPage> {
                                 .start(
                                   resume: _resume,
                                   pruneStale: _pruneStale,
-                                  scrape: _scrape,
                                 ),
                         style: FilledButton.styleFrom(
                           backgroundColor: AppTheme.accent,
@@ -239,6 +232,72 @@ class _SwitchRow extends StatelessWidget {
             value: value,
             onChanged: enabled ? onChanged : null,
             activeColor: AppTheme.accent,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 「刮削」在扫描页上的**只读**说明。
+///
+/// ## 为什么这里不再是一个开关
+///
+/// 原来这里有一个「联网刮削元数据」的勾选（默认勾上）。问题在于它对**额度小
+/// 的源**是有害的：豆瓣匿名额度实测只有约 10 个搜索词，一次全盘扫描必然中途
+/// 耗尽，而耗尽后是 `103 need_login` —— 用户看到的是「豆瓣一条都刮不到」，
+/// 这个 IP 短时间内也不能用了。
+///
+/// 所以刮削的默认入口改成了**作品详情页的「刮削」按钮**（按需、一次一部），
+/// 想省事的人在设置里打开「扫描后自动刮削」（默认关）。
+///
+/// 这一块保留成只读提示而不是直接删掉：用户会来这里找那个勾选，
+/// 找不到时会以为功能被删了。写清楚「去哪点」比什么都不给好。
+class _ScrapeHint extends StatelessWidget {
+  const _ScrapeHint({required this.canScrape, required this.autoScrape});
+
+  /// 是否配好了至少一个在线源（总开关 + Key/Cookie）。
+  final bool canScrape;
+
+  /// 扫描结束是否会自动刮。
+  final bool autoScrape;
+
+  @override
+  Widget build(BuildContext context) {
+    final String text;
+    if (!canScrape) {
+      text = '未启用。刮削是可选的：到「设置 → 刮削」打开开关并填入 '
+          'TMDB Key 或豆瓣 Cookie 后，作品详情页会出现「刮削」按钮。';
+    } else if (autoScrape) {
+      text = '扫描结束后会自动刮一遍（已在设置里打开）。'
+          '只想按需刮的话，把「扫描后自动刮削」关掉，改用详情页的按钮。';
+    } else {
+      text = '扫描只建索引，不会刮削。要补海报与简介，到作品详情页点「刮削」。';
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 1),
+            child: Icon(
+              Icons.auto_awesome_outlined,
+              size: 14,
+              color: AppTheme.dim,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 11,
+                height: 1.7,
+                color: AppTheme.dim,
+              ),
+            ),
           ),
         ],
       ),

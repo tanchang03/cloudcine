@@ -151,6 +151,139 @@ void main() {
     });
   });
 
+  group('字幕：PlayRequest.subtitles', () {
+    test('网盘字幕清单要往返 —— 丢了它播放器就只剩「内嵌轨」一种来源', () {
+      const original = PlayRequest(
+        url: 'https://a/b.mkv',
+        title: '指环王：力量之戒 S01E01',
+        subtitles: <SubtitleBrief>[
+          SubtitleBrief(
+            fileId: 'f1',
+            label: '简体中文',
+            language: 'zh',
+            fileName: 'a.chs.srt',
+          ),
+          SubtitleBrief(fileId: 'f2', label: '英文'),
+        ],
+      );
+
+      final restored = PlayRequest.fromJson(original.toJson())!;
+
+      expect(restored.subtitles, original.subtitles);
+      expect(restored.subtitles.first.fileName, 'a.chs.srt');
+      expect(restored.subtitles.first.language, 'zh');
+    });
+
+    test('字幕列表里混进畸形项只丢那一项，不整条请求作废', () {
+      // 与档位、剧集列表同一条规矩：一个读不懂的字幕不该让整部片播不了。
+      final restored = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mkv',
+        'title': 't',
+        'subtitles': <Object?>[
+          <String, Object?>{'fileId': 'f1', 'label': '简体中文'},
+          <String, Object?>{'label': '没有 fileId'},
+          'garbage',
+          <String, Object?>{'fileId': ''},
+        ],
+      })!;
+
+      expect(restored.subtitles, hasLength(1));
+      expect(restored.subtitles.single.fileId, 'f1');
+    });
+
+    test('字幕不同就不相等 —— 否则「换了一部片但字幕没变」会被判成同一条请求', () {
+      const a = PlayRequest(
+        url: 'u',
+        title: 't',
+        subtitles: <SubtitleBrief>[SubtitleBrief(fileId: 'f1', label: 'x')],
+      );
+      const b = PlayRequest(url: 'u', title: 't');
+
+      expect(a == b, isFalse);
+    });
+
+    test('SubtitleBrief 没有名字时退回文件名、再退回 id —— 菜单上不能出现空行', () {
+      expect(
+        SubtitleBrief.fromJson(const <String, Object?>{'fileId': 'f9'})!.label,
+        'f9',
+      );
+      expect(
+        SubtitleBrief.fromJson(
+          const <String, Object?>{'fileId': 'f9', 'fileName': 'a.srt'},
+        )!.label,
+        'a.srt',
+      );
+    });
+  });
+
+  group('OnlineSubtitleBrief', () {
+    test('fileId 允许是数字字符串 —— 通道不保证把 int 原样送回来', () {
+      final brief = OnlineSubtitleBrief.fromJson(const <String, Object?>{
+        'fileId': '12345',
+        'fileName': 'Movie.chs.srt',
+        'language': 'zh-cn',
+        'title': '银翼杀手',
+        'downloadCount': 42,
+      })!;
+
+      expect(brief.fileId, 12345);
+      expect(brief.downloadCount, 42);
+      expect(brief.language, 'zh-cn');
+    });
+
+    test('缺 fileId 就是解不开 —— 没有它连下载地址都换不到', () {
+      for (final raw in const <Object?>[
+        null,
+        'x',
+        42,
+        <String, Object?>{},
+        <String, Object?>{'fileId': 'abc'},
+      ]) {
+        expect(OnlineSubtitleBrief.fromJson(raw), isNull, reason: 'raw=$raw');
+      }
+    });
+
+    test('没有文件名时给一个能看的兜底，不能是空行', () {
+      final brief = OnlineSubtitleBrief.fromJson(const <String, Object?>{
+        'fileId': 7,
+      })!;
+
+      expect(brief.fileName, isNotEmpty);
+    });
+  });
+
+  group('SubtitleSearchRequest', () {
+    test('itemId 与兜底片名都要往返', () {
+      const original = SubtitleSearchRequest(itemId: '102', fallbackQuery: '指环王');
+      final restored = SubtitleSearchRequest.fromJson(original.toJson());
+
+      expect(restored.itemId, '102');
+      expect(restored.fallbackQuery, '指环王');
+      expect(restored.isEmpty, isFalse);
+    });
+
+    test('解不开时是**空请求**而不是 null —— 少一个 null 分支就少一处漏判', () {
+      for (final raw in const <Object?>[null, 'x', 42, <String>[]]) {
+        expect(SubtitleSearchRequest.fromJson(raw).isEmpty, isTrue, reason: 'raw=$raw');
+      }
+    });
+
+    test('只有空白也算空 —— 否则会拿一个空串去搜，白烧一次额度', () {
+      expect(const SubtitleSearchRequest(fallbackQuery: '   ').isEmpty, isTrue);
+      expect(const SubtitleSearchRequest(fallbackQuery: '\n\t').isEmpty, isTrue);
+      // 只要有一边有内容就不算空。
+      expect(const SubtitleSearchRequest(itemId: '102').isEmpty, isFalse);
+      expect(const SubtitleSearchRequest(fallbackQuery: 'x').isEmpty, isFalse);
+    });
+
+    test('toString 只出条目 id 与片名，不带任何凭证（本来也没有）', () {
+      const r = SubtitleSearchRequest(itemId: '102', fallbackQuery: '银翼杀手');
+
+      expect(r.toString(), contains('102'));
+      expect(r.toString(), contains('银翼杀手'));
+    });
+  });
+
   group('PlayRequest 值语义', () {
     test('字段相同即相等，请求头的键序不影响', () {
       const a = PlayRequest(

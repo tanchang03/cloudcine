@@ -85,9 +85,27 @@ final class ChildWindowController: NSObject, NSWindowDelegate {
   /// 建窗后的默认形态。
   private func applyDefaults() {
     guard let window = window else { return }
+
+    // 去掉标题栏，只留画面 —— 片名与控制栏由 Dart 侧画成浮层（鼠标移入才
+    // 显示，见 `PlayerWindowApp`）。
+    //
+    // 三件事必须一起做，少一件都会露馅：
+    //   - `.fullSizeContentView`：内容区铺到标题栏那一层，否则顶部会留下
+    //     一条纯色横条；
+    //   - `titleVisibility = .hidden`：藏掉标题**文字**（否则它压在画面上）；
+    //   - `titlebarAppearsTransparent = true`：标题栏背景透明。
+    //
+    // ⚠️ 红绿灯（关闭/最小化/缩放）**刻意保留**。它们浮在画面左上角，是唯一
+    // 不依赖我们自己代码的关窗路径 —— 隐藏掉之后，一旦 Dart 侧的「停止并
+    // 关闭」按钮因为某个 bug 没渲染出来，用户就只能强杀进程。
+    window.styleMask.insert(.fullSizeContentView)
+    window.titleVisibility = .hidden
+    window.titlebarAppearsTransparent = true
+
     window.title = "云影 · 播放器"
-    // 16:9。用 setContentSize 而不是 setFrame：setFrame 算的是含标题栏的
-    // 外框，直接给 1200×675 会让**画面区域**矮掉一个标题栏的高度。
+    // 16:9 的默认形状。**不锁比例** —— 窗口要能自由拖动缩放，画面靠
+    // `BoxFit.contain` 自己出黑边（见 `PlayerWindowApp._buildVideoSurface`）。
+    // 用 setContentSize 而不是 setFrame：setFrame 算的是含标题栏的外框。
     window.setContentSize(NSSize(width: 1200, height: 675))
     // 再小就既看不清也点不准控制栏了。
     window.minSize = NSSize(width: 640, height: 360)
@@ -125,58 +143,82 @@ final class ChildWindowController: NSObject, NSWindowDelegate {
       window?.level = want ? .floating : .normal
       result(nil)
 
-    case "setAspectRatio":
-      guard let window = window else {
-        result(nil)
-        return
-      }
-      // 全屏时不动尺寸：macOS 全屏窗口的 frame 归系统管，此刻 setContentSize
-      // 会被忽略或让画面闪一下；而全屏本来就铺满整屏，没有黑边问题。
-      guard !window.styleMask.contains(.fullScreen) else {
-        result(nil)
-        return
-      }
-      let aspect = (call.arguments as? NSNumber)?.doubleValue
-      guard let aspect = aspect, aspect.isFinite, aspect > 0 else {
-        // 解锁。`contentAspectRatio` 置零 = 不约束；`resizeIncrements` 也一并
-        // 归位，否则之前残留的增量限制会让窗口只能按步长缩放。
-        window.contentAspectRatio = NSSize(width: 0, height: 0)
-        window.resizeIncrements = NSSize(width: 1, height: 1)
-        result(nil)
-        return
-      }
-      window.contentAspectRatio = NSSize(width: aspect, height: 1)
-      // ⚠️ 只设 `contentAspectRatio` **不会**让窗口立刻变成那个形状 —— 它只
-      // 约束**以后**的拖拽。所以这里主动把内容区调成该比例：宽度沿用当前值，
-      // 高度按比例算出来。不然用户会看到「比例锁了，但窗口还是原来的形状」，
-      // 而那一瞬间画面仍然有黑边。
-      let content = window.contentRect(forFrameRect: window.frame)
-      let minSize = window.minSize
-      var width = max(content.width, minSize.width)
-      var height = width / aspect
-      if height < minSize.height {
-        // 极宽的片子（21:9 之类）按当前宽度算出的高度会撞到最小高度，
-        // 那样被 AppKit 夹住后比例就失真了。反过来以高度为准重算宽度。
-        height = minSize.height
-        width = height * aspect
-      }
-      // 竖屏片源（比例 < 1，手机拍的、部分演唱会录像）按当前宽度反算出的高度
-      // 会比屏幕还高 —— 那样标题栏被顶到可视区外，窗口拖不动也关不掉。以屏幕
-      // 可视高度封顶后反算宽度，比例照样是准的，只是窗口整体变小。
-      let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
-      if let visible = visible {
-        let maxHeight = visible.height * 0.9
-        if height > maxHeight {
-          height = maxHeight
-          width = height * aspect
-        }
-      }
-      window.setContentSize(NSSize(width: width.rounded(), height: height.rounded()))
+    case "beginWindowDrag":
+      beginWindowDrag()
+      result(nil)
+
+    case "updateWindowDrag":
+      updateWindowDrag()
       result(nil)
 
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+
+  // -------------------------------------------------------------------
+  // 拖动窗口
+  // -------------------------------------------------------------------
+
+  /// 拖动锚点：手势开始那一刻的鼠标屏幕位置，以及当时的窗口原点。
+  ///
+  /// 属性写在方法之后在 Swift 里是合法的 —— 放在紧挨着用它们的两个方法旁边，
+  /// 比丢到类顶部更容易看懂它们在服务谁。
+  private var dragAnchorMouse: NSPoint?
+  private var dragAnchorOrigin: NSPoint?
+
+  /// 开始一次拖动：记下锚点。
+  ///
+  /// ## 为什么是「锚点 + 绝对鼠标位置」而不是「逐帧累加位移」
+  ///
+  /// 累加位移在 macOS 上会**自激振荡**，实测症状就是「拖窗口时窗口抖得厉害」：
+  ///
+  ///   1. Flutter 的 `PointerMoveEvent.position` 是**窗口内**坐标；
+  ///   2. 我们按它的 `delta` 把窗口移走之后，同一个鼠标位置在窗口里的坐标
+  ///      反着变了 `-dx`；
+  ///   3. macOS 会把这个变化当成新的 `mouseDragged` 事件补发给窗口 —— 窗口在
+  ///      光标底下移动时系统必须补发事件，否则光标矩形与悬停态就永远是错的；
+  ///   4. 于是我们再加一次 `-dx` 的位移，窗口被推回原位；紧接着第 3 步再来一次
+  ///      —— 窗口就在两个位置之间高频来回。
+  ///
+  /// 绝对位置没有这个回路：`NSEvent.mouseLocation` 是**屏幕**坐标，窗口怎么动
+  /// 它都不变，所以「鼠标相对按下点走了多远」是唯一确定的量。
+  ///
+  /// 附带一个好处：即使通道消息被延迟或合并，窗口也会落到正确的位置 ——
+  /// 每次都是按当前鼠标位置重算的，**误差不累积**。
+  private func beginWindowDrag() {
+    guard let window = window else { return }
+    dragAnchorMouse = NSEvent.mouseLocation
+    dragAnchorOrigin = window.frame.origin
+  }
+
+  /// 把窗口移到「按当前鼠标位置它该在的地方」。
+  ///
+  /// 调用频率由 Flutter 的手势决定（每帧一次），但这里**不依赖调用次数**：
+  /// 多调少调只影响跟手的平滑度，不影响终点位置 —— 因为它算的是绝对位置，
+  /// 不是「在当前位置上再加一点」。
+  private func updateWindowDrag() {
+    guard let window = window,
+          let anchorMouse = dragAnchorMouse,
+          let anchorOrigin = dragAnchorOrigin else { return }
+
+    let now = NSEvent.mouseLocation
+    var origin = anchorOrigin
+    origin.x += now.x - anchorMouse.x
+    // 鼠标位置与窗口原点**同处一个坐标系**（屏幕坐标，y 向上），所以这里
+    // 不需要像「累加位移」那样把 y 取反 —— 那时要翻是因为 Flutter 的 y 向下。
+    origin.y += now.y - anchorMouse.y
+
+    // 非有限值会让原点变成 NaN，窗口直接飞到屏幕外再也拖不回来
+    // （红绿灯也点不到，只能强杀进程）。
+    guard origin.x.isFinite, origin.y.isFinite else { return }
+
+    // 位置没变就什么都不做。这不是省一次调用的优化：`setFrameOrigin` 会发
+    // `NSWindowDidMoveNotification`，而窗口「动了一下」又可能让系统再补发一次
+    // 鼠标事件 —— 那正是上面那段注释里那个振荡回路的燃料。鼠标没动就断在这里，
+    // 回路彻底闭合不了。
+    if origin == window.frame.origin { return }
+    window.setFrameOrigin(origin)
   }
 
   /// 全屏状态变化后回报给 Dart。

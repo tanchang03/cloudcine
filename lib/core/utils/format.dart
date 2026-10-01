@@ -42,6 +42,19 @@ String formatDuration(Duration? d) {
   return negative ? '-$text' : text;
 }
 
+/// 把码率（**bps**）格式化成 `320 kbps` / `7.8 Mbps`。
+///
+/// 单位是 bps —— 这一点必须显式写在函数上。项目里同一个量出现过三种单位：
+/// mpv 的 `demux-bitrate` 是 bps，夸克 `play/info` 的 `bitrate` 是 **kbps**，
+/// 而界面上要显示 Mbps。单位错了不报错，只是数字差一千倍，所以宁可多写一句。
+///
+/// `null` / 非正数返回「未知」而不是 `0 Mbps` —— 后者会被读成「码率真的是 0」。
+String formatBitrate(int? bps) {
+  if (bps == null || bps <= 0) return '未知';
+  if (bps < 1000000) return '${(bps / 1000).toStringAsFixed(0)} kbps';
+  return '${(bps / 1000000).toStringAsFixed(1)} Mbps';
+}
+
 /// 大数字缩写：`1234` → `1.2k`
 String formatCount(int n) {
   if (n < 1000) return '$n';

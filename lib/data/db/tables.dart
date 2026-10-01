@@ -62,6 +62,45 @@ class MediaItems extends Table {
   /// 最近播放时间。`null` 表示没播过。
   DateTimeColumn get lastPlayedAt => dateTime().nullable()();
 
+  /// 续播位置（毫秒）。`null` = 没有可续的点（没播过 / 已看完 / 用户关了
+  /// 「记住播放进度」）。
+  ///
+  /// ## 为什么是单独一列而不是复用 [lastPlayedAt]
+  ///
+  /// 两者**语义不同、更新频率差两个数量级**：`lastPlayedAt` 是「什么时候看的」
+  /// （决定「最近播放」排序），每 10 秒一次进度回报都会刷新它；而这一列是
+  /// 「看到哪儿了」，也每 10 秒写一次。合成一列就得塞 JSON，而那会让
+  /// 「最近播放」的排序查询变成字符串解析。
+  ///
+  /// ## 为什么存毫秒而不是秒
+  ///
+  /// 时长本身就是毫秒（[MediaItems.durationMs]），统一单位省掉一处换算；
+  /// 而换算正是这类字段最容易出错的地方（`inSeconds` 截断 vs 四舍五入）。
+  IntColumn get resumePositionMs => integer().nullable()();
+
+  /// 网盘服务端生成的视频预览图地址（夸克 `preview_url` / `thumbnail`）。
+  ///
+  /// **只存地址，不存图片** —— 图片由 `PosterCache` 按需下载并落盘。
+  /// 扫描期下载几千张图会让一次扫描多出几千次请求（夸克有 QPS 限制），
+  /// 而用户可能根本不会翻到那些片子。
+  ///
+  /// 地址**不含 Cookie**（Cookie 在每次响应里轮换，冻进地址第二天就 401），
+  /// 取图时必须由适配器现给请求头。
+  TextColumn get thumbUrl => text().nullable()();
+
+  /// 网盘给出的**实测**视频像素尺寸（夸克 `video_width` / `video_height`）。
+  ///
+  /// 2026-10-01 实测：递归遍历 44 个目录、427 个视频，这两个字段覆盖率
+  /// **100%**，且没有 0 值。它们比文件名可靠，所以 [resolution] 那一列在
+  /// 它们存在时是**由它们归挡出来的**，而不是从文件名猜的。
+  ///
+  /// ## 为什么存原始像素，而不只存归挡结果
+  ///
+  /// 归挡规则将来可能调整（加档、改长边阈值），届时可以从原始值**重算**；
+  /// 只存档位就只能重扫全盘。两者代价差一个数量级。
+  IntColumn get videoWidth => integer().nullable()();
+  IntColumn get videoHeight => integer().nullable()();
+
   @override
   Set<Column> get primaryKey => {id};
 }
@@ -74,6 +113,15 @@ class MediaWorks extends Table {
 
   TextColumn get provider => text()();
   TextColumn get kind => text()();
+
+  /// 媒体库一级分类（`MediaCategory.name`）。
+  ///
+  /// 默认空串而不是 `other`：空串表示**这一行还没被判定过**，需要回填；
+  /// 而 `other` 是一个**判定结果**（「判过了，就是认不出来」）。
+  /// 两者混在一起的话，回填逻辑会反复把 `other` 当成待判定的行重算，
+  /// 而真正的「其他」作品永远修不好（因为它本来就该是 other）。
+  TextColumn get category => text().withDefault(const Constant(''))();
+
   TextColumn get title => text()();
   TextColumn get originalTitle => text().nullable()();
   IntColumn get year => integer().nullable()();
@@ -81,6 +129,19 @@ class MediaWorks extends Table {
 
   TextColumn get posterUrl => text().nullable()();
   TextColumn get posterFile => text().nullable()();
+
+  /// 封面里**人物所在的水平位置**（归一化 0~1），来自夸克的人脸框。
+  ///
+  /// 只有封面来自夸克的**视频帧**（16:9）时才有值：那时封面会被裁成竖版，
+  /// 需要锚住人物，而不是裁到画面正中（双人对谈镜头的中点是两人之间的空隙）。
+  /// 来自 TMDB 的海报本身就是 2:3，不需要锚点，此列为 `NULL`。
+  ///
+  /// 存**锚点**而不是「裁切偏移」：偏移量取决于卡片比例，换算放在渲染时
+  /// （`FaceAnchor.alignmentX`），这样调整卡片比例不需要重新扫描。
+  ///
+  /// 与 `posterUrl` 是**成对**的 —— 换封面来源必须同时换锚点。
+  RealColumn get posterFaceX => real().nullable()();
+
   TextColumn get backdropUrl => text().nullable()();
   TextColumn get backdropFile => text().nullable()();
 

@@ -50,6 +50,16 @@ dependencies:
   # 浏览器授权（备选通道：登录后抓取 Cookie）
   flutter_inappwebview: ^6.1.5
 
+  # 文件选择器：播放器里的「加载本地字幕文件」。
+  #
+  # ⚠️ 它需要 macOS 的 `com.apple.security.files.user-selected.read-only`
+  # 权限（两份 entitlements 都已加）。没有那一条时，选择器**能**弹出、
+  # **能**返回路径，但紧接着的读取会失败 —— 报的还不是权限错。
+  #
+  # 选官方 `file_selector` 而不是 `file_picker`：前者是 flutter/packages 下的
+  # 官方实现，各平台的接口形状一致，也不需要额外的网络权限声明。
+  file_selector: ^1.0.3
+
   # 工具
   crypto: ^3.0.6
   uuid: ^4.5.1

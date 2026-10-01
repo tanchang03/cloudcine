@@ -2,7 +2,11 @@ import 'dart:convert';
 
 import 'package:drift/drift.dart';
 
+import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/drive_paths.dart';
+import '../../core/utils/file_names.dart';
 import '../../core/utils/filename_parser.dart';
+import '../../core/utils/media_category.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/video_formats.dart';
 import '../../domain/adapters/media_repository.dart';
@@ -141,18 +145,55 @@ class DriftMediaRepository implements MediaRepository {
 
     // 海报/背景图**换了 URL** 时必须丢掉本地缓存文件名：缓存是按内容
     // 命名的旧图，留着会让详情页一直显示上一版海报。
-    final keepPosterFile = protect || incoming.posterUrl == existing.posterUrl;
+    //
+    // `incoming.posterUrl == null` 也算「没换」：那种情况下上面保留了旧地址，
+    // 缓存文件名自然也该跟着保留（否则两个字段会互相矛盾）。
+    final keepPosterFile = protect ||
+        incoming.posterUrl == null ||
+        incoming.posterUrl == existing.posterUrl;
     final keepBackdropFile = protect || incoming.backdropUrl == existing.backdropUrl;
+
+    // 海报地址**永不为空**：本次算不出新地址时保留旧的。
+    //
+    // 为什么不能让它变成 null：网盘缩略图地址是「扫描那一刻服务端有没有
+    // 生成预览图」的快照（实测视频里约七成有）。某一次扫描恰好没拿到，
+    // 写 null 会让这张海报从墙上消失 —— 而盘上的缓存文件还在，
+    // 只是没人再去引用它。地址本身是稳定的（TMDB 内容寻址；
+    // 夸克按 fid 固定），所以「旧的留着」没有任何副作用。
+    final resolvedPosterUrl =
+        _preferOld(protect, existing.posterUrl, incoming.posterUrl) ??
+            existing.posterUrl;
 
     return MediaWork(
       key: incoming.key,
       provider: incoming.provider,
       kind: incoming.kind,
+      // 分类**永远取新值**：它是本次扫描对「这些文件是什么」的判定，
+      // 而刮削结果只影响标题/海报那类元数据。放进 `protect` 分支会有一个
+      // 很难查的后果 —— 第一次扫描时判成「其他」的作品，之后无论怎么重扫
+      // 都修不回来（因为保护模式会一直保留那个旧的「其他」）。
+      category: incoming.category,
       title: protect ? existing.title : incoming.title,
       originalTitle: _preferOld(protect, existing.originalTitle, incoming.originalTitle),
       year: _preferOld(protect, existing.year, incoming.year),
       overview: _preferOld(protect, existing.overview, incoming.overview),
-      posterUrl: _preferOld(protect, existing.posterUrl, incoming.posterUrl),
+      // 海报地址**永不为空**：本次算不出新地址时保留旧的。
+      //
+      // 为什么不能让它变成 null：网盘缩略图地址是「扫描那一刻服务端有没有
+      // 生成预览图」的快照（实测视频里约七成有）。某一次扫描恰好没拿到，
+      // 写 null 会让这张海报从墙上消失 —— 而盘上的缓存文件还在，
+      // 只是没人再去引用它。地址本身是稳定的（TMDB 内容寻址；
+      // 夸克按 fid 固定），所以「旧的留着」没有任何副作用。
+      posterUrl: resolvedPosterUrl,
+      // 锚点跟着地址走：地址没换（`resolvedPosterUrl == existing.posterUrl`）
+      // 就说明还是同一张图，旧的锚点继续有效 —— 用 `??` 兜一手老库里的
+      // null（`posterFaceX` 是 v5 才加的列，v5 之前入库的作品该列都是空）。
+      // 地址换了就必须取本次的锚点：新图可能是 2:3 的 TMDB 海报，
+      // 那种图根本没有锚点，本次算出来就是 null —— 这里的 null 是**结论**，
+      // 不是缺失，所以不能回退到旧值（否则会拿剧中帧的人脸位置去裁海报）。
+      posterFaceX: resolvedPosterUrl == existing.posterUrl
+          ? (existing.posterFaceX ?? incoming.posterFaceX)
+          : incoming.posterFaceX,
       posterFile: keepPosterFile
           ? (existing.posterFile ?? incoming.posterFile)
           : incoming.posterFile,
@@ -282,6 +323,17 @@ class DriftMediaRepository implements MediaRepository {
     }
   }
 
+  @override
+  Future<void> saveResumePosition(String itemId, Duration? position) async {
+    // 零 / 负位置与「没有」是同一件事：写 0 只会让 `resumePositions` 里多出
+    // 一个恒假的值，而 NULL 才是这一列真正的「没存过」。
+    final ms = (position == null || position <= Duration.zero)
+        ? null
+        : position.inMilliseconds;
+    await (_db.update(_db.mediaItems)..where((t) => t.id.equals(itemId)))
+        .write(MediaItemsCompanion(resumePositionMs: Value(ms)));
+  }
+
   // -------------------------------------------------------------------
   // 读取
   // -------------------------------------------------------------------
@@ -289,7 +341,10 @@ class DriftMediaRepository implements MediaRepository {
   @override
   Future<List<MediaWork>> listWorks({
     MediaKind? kind,
+    MediaCategory? category,
+    bool playedOnly = false,
     String? query,
+    WorkSort sort = WorkSort.recentAdded,
     int limit = 200,
     int offset = 0,
   }) async {
@@ -297,6 +352,51 @@ class DriftMediaRepository implements MediaRepository {
 
     if (kind != null) {
       q.where((t) => t.kind.equals(kind.name));
+    }
+
+    // 「最近播放」栏。判据是 `last_played_at IS NOT NULL` ——
+    // **不是**「比某个时间新」：后者会把「上个月看过」也算成没看过，
+    // 而这一栏的意思是「我看过的」，不是「我最近看的」（排序负责「最近」）。
+    if (playedOnly) {
+      q.where((t) => t.lastPlayedAt.isNotNull());
+    }
+
+    if (category != null) {
+      // 空串是「还没判定过」（v3 之前的行）。用 `_categoryOf` 的同一套口径
+      // 现算，等价于「空串时按 kind + 标题猜」。写进 SQL 而不是拉回来在
+      // Dart 里过滤，是为了让分类筛选仍然是索引上的一次范围扫描 ——
+      // 几千部作品在 Dart 侧过滤会让「点一下分类栏」卡住半秒。
+      //
+      // 判据与 `_categoryOf` 保持一致：**先看结构（kind），再看关键词**。
+      // 这里只能表达结构那一半（SQL 里做不了关键词匹配），
+      // 所以命中的是「电影 / 剧集 / 其他」这三档；关键词档（动漫/综艺/
+      // 纪录片）只认已经落库的值 —— 而落库由回填与扫描保证。
+      switch (category) {
+        case MediaCategory.movie:
+          q.where(
+            (t) =>
+                t.category.equals(category.name) |
+                (t.category.equals('') & t.kind.equals(MediaKind.movie.name)),
+          );
+        case MediaCategory.series:
+          q.where(
+            (t) =>
+                t.category.equals(category.name) |
+                (t.category.equals('') &
+                    t.kind.equals(MediaKind.episode.name)),
+          );
+        case MediaCategory.other:
+          q.where(
+            (t) =>
+                t.category.equals(category.name) |
+                (t.category.equals('') &
+                    t.kind.equals(MediaKind.unknown.name)),
+          );
+        case MediaCategory.anime:
+        case MediaCategory.variety:
+        case MediaCategory.documentary:
+          q.where((t) => t.category.equals(category.name));
+      }
     }
 
     final trimmed = query?.trim();
@@ -315,16 +415,118 @@ class DriftMediaRepository implements MediaRepository {
     }
 
     q
-      ..orderBy([
-        // 最近播放的排最前，其次是年份新的。
-        (t) => OrderingTerm.desc(t.lastPlayedAt),
-        (t) => OrderingTerm.desc(t.year),
-        (t) => OrderingTerm.asc(t.title),
-      ])
+      ..orderBy(_orderingFor(sort))
       ..limit(limit, offset: offset);
 
     final rows = await q.get();
     return rows.map(_toWork).toList();
+  }
+
+  /// 排序规则。
+  ///
+  /// 每一档都用「年份倒序 → 标题升序」收尾，保证**同一档内顺序稳定** ——
+  /// 否则评分相同的一批作品每次刷新都会换位置，看起来像列表在乱跳。
+  ///
+  /// `lastPlayedAt` 的 NULL 用 `OrderingTerm.desc` 时在 SQLite 里排最后
+  /// （NULL 被视为最小值），这正是「没播过的垫底」想要的效果，
+  /// 所以不需要额外的 `NULLS LAST`（SQLite 也不支持那个语法）。
+  List<OrderingTerm Function($MediaWorksTable)> _orderingFor(WorkSort sort) {
+    final tie = <OrderingTerm Function($MediaWorksTable)>[
+      (t) => OrderingTerm.desc(t.year),
+      (t) => OrderingTerm.asc(t.title),
+    ];
+    return switch (sort) {
+      WorkSort.recentAdded => [
+          (t) => OrderingTerm.desc(t.updatedAt),
+          ...tie,
+        ],
+      WorkSort.recentPlayed => [
+          (t) => OrderingTerm.desc(t.lastPlayedAt),
+          ...tie,
+        ],
+      WorkSort.rating => [
+          (t) => OrderingTerm.desc(t.rating),
+          ...tie,
+        ],
+      WorkSort.year => [
+          (t) => OrderingTerm.desc(t.year),
+          (t) => OrderingTerm.asc(t.title),
+        ],
+      WorkSort.title => [(t) => OrderingTerm.asc(t.title)],
+    };
+  }
+
+  @override
+  Future<int> backfillWorkCategories() async {
+    // 只取需要的三列：几千行作品表上做一次全列物化是浪费。
+    final rows = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([
+            _db.mediaWorks.key,
+            _db.mediaWorks.kind,
+            _db.mediaWorks.title,
+            _db.mediaWorks.genres,
+          ])
+          ..where(_db.mediaWorks.category.equals('')))
+        .get();
+
+    if (rows.isEmpty) return 0;
+
+    var fixed = 0;
+    await _db.batch((batch) {
+      for (final row in rows) {
+        final key = row.read(_db.mediaWorks.key);
+        if (key == null) continue;
+        final kind = MediaKind.values.firstWhere(
+          (k) => k.name == row.read(_db.mediaWorks.kind),
+          orElse: () => MediaKind.unknown,
+        );
+        final category = MediaCategoryGuesser.guessFromWork(
+          kind: kind,
+          title: row.read(_db.mediaWorks.title) ?? '',
+          genres: _stringList(row.read(_db.mediaWorks.genres) ?? '[]'),
+        );
+        batch.update(
+          _db.mediaWorks,
+          MediaWorksCompanion(category: Value(category.name)),
+          where: (t) => t.key.equals(key),
+        );
+        fixed++;
+      }
+    });
+
+    diag.info('数据库', '分类回填完成：$fixed 部作品（老库升级）');
+    return fixed;
+  }
+
+  @override
+  Future<Map<MediaCategory, int>> countWorksByCategory() async {
+    final count = _db.mediaWorks.key.count();
+    final query = _db.selectOnly(_db.mediaWorks)
+      ..addColumns([_db.mediaWorks.category, count])
+      ..groupBy([_db.mediaWorks.category]);
+
+    final out = <MediaCategory, int>{};
+    for (final row in await query.get()) {
+      final raw = row.read(_db.mediaWorks.category) ?? '';
+      final n = row.read(count) ?? 0;
+      // 空串（还没回填）不单独成栏 —— 归到「其他」，与 `_categoryOf` 的
+      // 兜底口径一致：界面上的角标之和应当等于作品总数，
+      // 多出一个「未分类」的隐藏桶只会让数字对不上。
+      final category =
+          raw.isEmpty ? MediaCategory.other : MediaCategory.fromName(raw);
+      out[category] = (out[category] ?? 0) + n;
+    }
+    return out;
+  }
+
+  @override
+  Future<int> countPlayedWorks() async {
+    final expr = _db.mediaWorks.key.count();
+    final row = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([expr])
+          ..where(_db.mediaWorks.lastPlayedAt.isNotNull()))
+        .getSingle();
+    return row.read(expr) ?? 0;
   }
 
   @override
@@ -348,12 +550,81 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<List<MediaItem>> listItems({
+    String? pathPrefix,
+    String? query,
+    int limit = 20000,
+    int offset = 0,
+  }) async {
+    final q = _db.select(_db.mediaItems);
+
+    final prefix = pathPrefix?.trim();
+    if (prefix != null && prefix.isNotEmpty) {
+      final normalized = normalizeDrivePath(prefix);
+      // 根就是「全部」，不必加条件 —— 加了反而会因为 `dir_path LIKE '/%'`
+      // 把根目录下的文件（`dir_path` 恰好是 `/`）漏掉。
+      if (normalized != driveRootPath) {
+        final withSlash = drivePathWithTrailingSlash(normalized);
+        // `dir_path` 一律带结尾斜杠，所以「自己 + 自己的子孙」就是
+        // 「等于前缀」或「以 前缀/ 开头」。用带斜杠的前缀做 LIKE 是关键：
+        // 不带的话 `/电影2` 会被当成 `/电影` 的子目录。
+        q.where(
+          (t) => t.dirPath.equals(withSlash) | t.dirPath.like('$withSlash%'),
+        );
+      }
+    }
+
+    final trimmed = query?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) {
+      final like = '%$trimmed%';
+      // 文件名与**展示路径**都要匹配：用户经常记得「在 /电影/科幻/ 下面」
+      // 却记不住片名。LIKE 对 ASCII 大小写不敏感，中文按字节比 —— 够用。
+      q.where((t) => t.name.like(like) | t.dirPath.like(like));
+    }
+
+    q
+      ..orderBy([(t) => OrderingTerm.asc(t.dirPath)])
+      ..limit(limit, offset: offset);
+
+    final rows = await q.get();
+    final items = rows.map(_toItem).toList();
+    // 文件名在 SQL 里只能按字节序排（`第10期` 会跑到 `第2期` 前面），
+    // 所以目录内再按自然序排一遍。行数受 [limit] 约束，这一遍很便宜。
+    items.sort((a, b) {
+      final byDir = a.dirPath.compareTo(b.dirPath);
+      return byDir != 0 ? byDir : naturalCompare(a.name, b.name);
+    });
+    return items;
+  }
+
+  @override
   Future<MediaItem?> itemById(String id) async {
     final row = await (_db.select(_db.mediaItems)
           ..where((t) => t.id.equals(id))
           ..limit(1))
         .getSingleOrNull();
     return row == null ? null : _toItem(row);
+  }
+
+  @override
+  Future<Map<String, Duration>> resumePositions(List<String> itemIds) async {
+    if (itemIds.isEmpty) return const <String, Duration>{};
+
+    // 用 `selectOnly` 只取两列：剧集列表可能一次问几十个 id，而
+    // `select(mediaItems)` 会把每一行（含 flags、路径等）全部物化一遍 ——
+    // 这一列在面板上只用来画一根细进度条。
+    final query = _db.selectOnly(_db.mediaItems)
+      ..addColumns([_db.mediaItems.id, _db.mediaItems.resumePositionMs])
+      ..where(_db.mediaItems.id.isIn(itemIds));
+
+    final out = <String, Duration>{};
+    for (final row in await query.get()) {
+      final ms = row.read(_db.mediaItems.resumePositionMs);
+      final id = row.read(_db.mediaItems.id);
+      if (id == null || ms == null || ms <= 0) continue;
+      out[id] = Duration(milliseconds: ms);
+    }
+    return out;
   }
 
   @override
@@ -486,6 +757,21 @@ class DriftMediaRepository implements MediaRepository {
         flags: Value(jsonEncode(item.flags.toList())),
         releaseGroup: Value(item.releaseGroup),
         isSampleOrExtra: Value(item.isSampleOrExtra),
+        // 更新路径上**只在有新值时写**：夸克对「还没生成预览图」的文件
+        // 不下发 `thumbnail` 字段，直接写 null 会把上一次扫描拿到的地址
+        // 抹掉（而那个地址是有效的，只是这次响应里没带）。
+        // 插入路径不受影响 —— 那时本来就没有旧值可丢。
+        thumbUrl: skipFirstSeen && item.thumbUrl == null
+            ? const Value.absent()
+            : Value(item.thumbUrl),
+        // 与 `thumbUrl` 同一条规则、同一个理由：夸克对「还没处理完」的文件
+        // 不下发尺寸字段，直接写 null 会把上一次扫描拿到的实测值抹掉。
+        videoWidth: skipFirstSeen && item.videoWidth == null
+            ? const Value.absent()
+            : Value(item.videoWidth),
+        videoHeight: skipFirstSeen && item.videoHeight == null
+            ? const Value.absent()
+            : Value(item.videoHeight),
         firstSeenAt: skipFirstSeen ? const Value.absent() : Value(firstSeenAt),
         updatedAt: Value(item.updatedAt),
       );
@@ -495,12 +781,14 @@ class DriftMediaRepository implements MediaRepository {
         key: Value(w.key),
         provider: Value(w.provider.id),
         kind: Value(w.kind.name),
+        category: Value(w.category.name),
         title: Value(w.title),
         originalTitle: Value(w.originalTitle),
         year: Value(w.year),
         overview: Value(w.overview),
         posterUrl: Value(w.posterUrl),
         posterFile: Value(w.posterFile),
+        posterFaceX: Value(w.posterFaceX),
         backdropUrl: Value(w.backdropUrl),
         backdropFile: Value(w.backdropFile),
         rating: Value(w.rating),
@@ -554,7 +842,16 @@ class DriftMediaRepository implements MediaRepository {
           (c) => c.name == row.container,
           orElse: () => VideoContainer.other,
         ),
-        resolution: _resolutionFromLabel(row.resolution),
+        // **实测优先**：库里存着原始像素时现算一遍，而不是直接信 `resolution`
+        // 那一列。这样归挡规则改进后老数据不用重扫就能受益，也顺便让
+        // 「列里存的是文件名猜的、像素却是实测的」这类历史行自动纠正过来。
+        resolution: VideoFormats.resolutionFromDimensions(
+              row.videoWidth,
+              row.videoHeight,
+            ) ??
+            _resolutionFromLabel(row.resolution),
+        videoWidth: row.videoWidth,
+        videoHeight: row.videoHeight,
         sizeBytes: row.sizeBytes,
         modifiedAt: row.modifiedAt,
         durationMs: row.durationMs,
@@ -564,6 +861,8 @@ class DriftMediaRepository implements MediaRepository {
         flags: _stringSet(row.flags),
         releaseGroup: row.releaseGroup,
         isSampleOrExtra: row.isSampleOrExtra,
+        thumbUrl: row.thumbUrl,
+        lastPlayedAt: row.lastPlayedAt,
         firstSeenAt: row.firstSeenAt,
         updatedAt: row.updatedAt,
       );
@@ -575,12 +874,14 @@ class DriftMediaRepository implements MediaRepository {
           (k) => k.name == row.kind,
           orElse: () => MediaKind.unknown,
         ),
+        category: _categoryOf(row),
         title: row.title,
         originalTitle: row.originalTitle,
         year: row.year,
         overview: row.overview,
         posterUrl: row.posterUrl,
         posterFile: row.posterFile,
+        posterFaceX: row.posterFaceX,
         backdropUrl: row.backdropUrl,
         backdropFile: row.backdropFile,
         rating: row.rating,
@@ -597,8 +898,27 @@ class DriftMediaRepository implements MediaRepository {
         updatedAt: row.updatedAt,
       );
 
-  SubtitleTrack _toSubtitle(SubtitleRefRow row) => SubtitleTrack(
-        id: row.id,
+  /// 读出一个作品的分类。
+  ///
+  /// 库里存的是**判定结果**，空串表示「还没判定过」（v3 之前入库的行）。
+  /// 后者在这里现算一次，而不是等回填 —— 这样即使用户从没触发过回填，
+  /// 海报墙上也不会出现一整栏「其他」。
+  ///
+  /// 现算结果**不写回**：读路径里写库会让「打开媒体库」变成一次批量写，
+  /// 而回填有专门的入口（`backfillWorkCategories`），职责分明。
+  MediaCategory _categoryOf(MediaWorkRow row) {
+    if (row.category.isNotEmpty) return MediaCategory.fromName(row.category);
+    return MediaCategoryGuesser.guessFromWork(
+      kind: MediaKind.values.firstWhere(
+        (k) => k.name == row.kind,
+        orElse: () => MediaKind.unknown,
+      ),
+      title: row.title,
+      genres: _stringList(row.genres),
+    );
+  }
+
+  SubtitleTrack _toSubtitle(SubtitleRefRow row) => SubtitleTrack(        id: row.id,
         origin: SubtitleOrigin.values.firstWhere(
           (o) => o.name == row.origin,
           orElse: () => SubtitleOrigin.cloudFile,

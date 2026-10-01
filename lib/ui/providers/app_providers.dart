@@ -12,12 +12,14 @@ import '../../data/http/dio_http_client.dart';
 import '../../data/http/http_client.dart';
 import '../../data/registry/adapter_registry.dart';
 import '../../data/remote/quark/quark_adapter.dart';
+import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/poster_cache.dart';
 import '../../domain/adapters/credential_store.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/subtitle_service.dart';
+import 'library_refresh_providers.dart';
 
 /// 组合根。
 ///
@@ -79,10 +81,35 @@ final settingsStoreProvider = Provider<SettingsStore>(
 /// 做成 Provider 而不是让每个 widget 自己 new 一个：缓存对象内部持有
 /// 「正在下载中」的表，共用一个实例才能让同一张海报的并发请求合成一次。
 final posterCacheProvider = Provider<PosterCache>(
-  (ref) => PosterCache(
-    http: ref.watch(httpClientProvider),
-    dirPath: ref.watch(posterCacheDirProvider),
-  ),
+  (ref) {
+    final registry = ref.watch(adapterRegistryProvider);
+    return PosterCache(
+      http: ref.watch(httpClientProvider),
+      dirPath: ref.watch(posterCacheDirProvider),
+      // 海报有三个来源：
+      //   - TMDB（`image.tmdb.org`）—— 裸链即可；
+      //   - **网盘自己生成的视频缩略图**（夸克 `/file/video/preview?fid=…`）——
+      //     实测必须带 Cookie，且夸克每次响应轮换 `__puus`；
+      //   - **豆瓣**（`img*.doubanio.com`）—— 实测缺 `Referer` 一律 418。
+      //
+      // 回调在发请求时才求值，所以拿到的永远是当前会话的 Cookie。
+      //
+      // 用 `ownsUrl` 反查归属而不是写死「夸克」：接第二家网盘时只要它
+      // 实现了那两个方法，海报缓存不用改一行。豆瓣不是网盘、没有适配器，
+      // 所以它单独判一次 —— 但把判断交给 `DoubanScraper` 自己（而不是在这里
+      // 写 `endsWith('doubanio.com')`），是为了让「豆瓣的图要带什么头」
+      // 这件事留在豆瓣那个文件里。
+      headersFor: (url) {
+        for (final adapter in registry.all) {
+          if (adapter.ownsUrl(url)) return adapter.imageHeaders();
+        }
+        if (DoubanScraper.ownsImageUrl(url)) {
+          return DoubanScraper.imageHeaders();
+        }
+        return const <String, String>{};
+      },
+    );
+  },
 );
 
 /// 字幕内容的取用与解码。
@@ -115,6 +142,15 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
   controller.onPositionTick = (position) {
     final item = controller.item;
     if (item == null) return;
+
+    // 播放记录一变，「最近播放」那一栏就得重取。**换条时才真的重取**
+    // （`report` 自己判）—— 这个回调每 10 秒来一次，每次都刷的话，
+    // 用户在主窗口看海报墙时它会每 10 秒重建一遍。
+    //
+    // 独立播放窗口那条路不经过这里（它的播放发生在另一个引擎里），
+    // 由 `playerBridgeHostProvider` 在落库的同一处报告。
+    ref.read(playbackLibraryLinkProvider.notifier).report(item.id);
+
     unawaited(
       ref
           .read(mediaRepositoryProvider)

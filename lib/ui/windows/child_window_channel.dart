@@ -80,30 +80,47 @@ Future<bool> setChildWindowAlwaysOnTop(bool on) async {
   }
 }
 
-/// 锁定本窗口的**内容区**宽高比。传 `null` 解锁。
+/// 开始一次窗口拖动。
 ///
-/// ## 为什么要有这个
+/// ## 为什么是「锚点 + 绝对鼠标位置」而不是「逐帧报位移」
 ///
-/// 播放窗口里控制栏是**浮在画面底部**的（见 `PlayerWindowApp._buildPlayer`），
-/// 所以内容区形状 == 视频形状。把窗口锁成视频比例之后，画面正好铺满窗口，
-/// 上下不再留黑边 —— 这也顺带解释了「控制按钮只露一半」那个 bug：窗口按
-/// 16:9 建出来，而片源是别的比例时，画面缩进去、控制栏却还贴在窗口底边，
-/// 于是被挤到看不见的地方。
+/// 原来报的是位移（`PointerMoveEvent.delta`），在 macOS 上会**自激振荡**：
+/// Flutter 的 `position` 是**窗口内**坐标，窗口一移动，同一个鼠标位置在窗口里
+/// 的坐标就反着变了 —— 而窗口在光标底下移动时系统会补发 `mouseDragged` 事件
+/// （不补发的话光标矩形与悬停态就永远是错的），于是我们收到一个反向 delta，
+/// 再加一次反向位移…… 窗口就在两个位置之间高频抖动。
+/// **实测症状：拖拽时窗口抖得厉害。**
 ///
-/// ## 为什么参数是 `double?` 而不是 `double`
+/// 现在 Dart 侧只报「开始」与「继续」两件事，位移由原生按**鼠标的屏幕坐标**
+/// 算（见 `MainFlutterWindow.swift` 的 `beginWindowDrag`）：窗口怎么动都不影响
+/// 那个量，回路被彻底切断，而且误差不累积。
 ///
-/// `null` 是**解锁**的语义，与「比例是 0」完全不同。换片源、停止播放、
-/// 窗口销毁时都要解锁，否则用户拖不动窗口 —— 一个锁死的比例在窄窗口里
-/// 会变得又高又瘦，比留黑边更糟。
-Future<void> setChildWindowAspectRatio(double? aspect) async {
-  // 非正数在原生侧算不出宽高比（除零 / 负尺寸），当作解锁处理。
-  if (aspect != null && (!aspect.isFinite || aspect <= 0)) {
-    aspect = null;
-  }
+/// ## 为什么不干脆用 `NSWindow.performDrag(with:)`
+///
+/// 它要求调用时手上有一个 `NSEvent`，而跨通道调用发生在事件派发之外，
+/// `NSApp.currentEvent` 多半是 nil —— 拖起来会时灵时不灵。而且它会吞掉后续的
+/// 鼠标事件，Flutter 侧的「单击暂停 / 双击全屏」就再也收不到 mouseUp。
+///
+/// ## 两者都吞异常
+///
+/// 拖不动窗口只是观感问题，不该影响一个正在出画的播放窗口。
+Future<void> beginChildWindowDrag() async {
   try {
-    await childWindowChannel.invokeMethod<void>('setAspectRatio', aspect);
+    await childWindowChannel.invokeMethod<void>('beginWindowDrag');
   } catch (e) {
-    diag.debug('播放窗口', '设置窗口比例失败：$e');
+    diag.debug('播放窗口', '开始拖动窗口失败：$e');
+  }
+}
+
+/// 继续拖动：让窗口跟到当前鼠标位置。
+///
+/// **不带参数**是刻意的（理由见 [beginChildWindowDrag]）。参数没有了，
+/// 「非有限值会让窗口飞到屏幕外」那道守卫也就一并搬到了原生侧。
+Future<void> updateChildWindowDrag() async {
+  try {
+    await childWindowChannel.invokeMethod<void>('updateWindowDrag');
+  } catch (e) {
+    diag.debug('播放窗口', '拖动窗口失败：$e');
   }
 }
 
