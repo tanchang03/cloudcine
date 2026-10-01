@@ -5,6 +5,15 @@ Flutter 3.29.0 / Dart 3.7.0 的 macOS 网盘媒体库播放器，对接夸克网
 - 本机环境通用事实（gvm/代理/沙箱/`ps` 不可用改 `pgrep`/同文件不能同消息发两个 Edit）见 `~/.workbuddy-ai/MEMORY.md`。
 - **每条规则的来龙去脉、实测证据、踩坑复盘都在 `HOWTO.md`**；改下面任何一条前先读那一节。
 
+## 版本控制：必须及时 commit
+仓库只有 2 个 commit（`920bb19 init` / `b9db70e nil`），而媒体库优化 + 播放器字幕音轨两轮的
+新文件**几乎全是 untracked**。2026-10-01 用户误跑一次 `git clean -df` 就删掉 34 项，
+而 untracked 文件的内容从没进过对象库 → **`git fsck`/`stash`/`reflog` 一律救不回来**
+（实测 `--dangling` 只有 20 个更早的 blob，一个都不对）。
+本次靠 `~/.workbuddy-ai/file-history`（逐版本原文）+ `changes-detail`（完整 diff）救回，
+方法见用户级技能 `~/.workbuddy-ai/skills/git-clean-recovery/`。
+→ **攒够一小轮就 commit**；跑 `git clean` 前先 `git clean -nd` 干跑看一眼。
+
 ## 目录与依赖方向
 `core/` 纯工具 · `domain/` 实体+服务+适配器抽象（**不 import Flutter/drift**）· `data/` 夸克适配器/HTTP/drift/刮削器/凭证 · `ui/` Riverpod 组合根（`providers/`）、go_router、页面。
 组合根 `providers/app_providers.dart` 被依赖；跨层信号（播放→刷新媒体库）放叶子文件 `library_refresh_providers.dart`，**别让组合根 invalidate feature provider（成环）**。
