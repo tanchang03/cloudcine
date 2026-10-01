@@ -309,7 +309,10 @@ class QuarkMapper {
   // 基础类型转换（网盘返回值类型不稳定，一律宽容处理）
   // ------------------------------------------------------------------
 
-  static int? _asInt(Object? v) {
+  static int? _asInt(Object? v) => asInt(v);
+
+  /// 公开的宽容整数转换。
+  static int? asInt(Object? v) {
     if (v is int) return v;
     if (v is num) return v.toInt();
     if (v is String) return int.tryParse(v);

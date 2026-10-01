@@ -322,10 +322,13 @@ class InMemoryMediaRepository implements MediaRepository {
 
   @override
   Future<void> upsertWorks(List<MediaWork> works, {DateTime? now}) async {
+    final ts = now ?? DateTime.now();
     for (final w in works) {
       final existing = _works[w.key];
       if (existing == null) {
-        _works[w.key] = w;
+        _works[w.key] = w.firstSeenAt == null
+            ? w.copyWith(firstSeenAt: ts)
+            : w;
         continue;
       }
       // 刮削结果不能被「本地解析」的标题覆盖；反之可以。
@@ -347,9 +350,14 @@ class InMemoryMediaRepository implements MediaRepository {
               onlineId: existing.onlineId,
               source: existing.source,
               scrapedAt: existing.scrapedAt,
+              // `firstSeenAt` 保留旧值：它决定「最近添加」排序。
+              firstSeenAt: existing.firstSeenAt,
               updatedAt: now ?? w.updatedAt,
             )
-          : w.copyWith(updatedAt: now ?? w.updatedAt);
+          : w.copyWith(
+              firstSeenAt: existing.firstSeenAt,
+              updatedAt: now ?? w.updatedAt,
+            );
     }
   }
 

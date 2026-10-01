@@ -136,7 +136,14 @@ class DriftMediaRepository implements MediaRepository {
     MediaWork? existing,
     DateTime ts,
   ) {
-    if (existing == null) return incoming.copyWith(updatedAt: ts);
+    if (existing == null) {
+      return incoming.copyWith(
+        // 新作品首次入库时补 firstSeenAt：WorkSeedBook.build 没传这列，
+        // 但「最近添加」排序需要它。用 ts（本次扫描时刻）兜底。
+        firstSeenAt: incoming.firstSeenAt ?? ts,
+        updatedAt: ts,
+      );
+    }
 
     // 「保护模式」：本次是文件名解析，而库里已有的是刮削结果
     // （`manual` 也算 —— 用户手工改过的当然更不能被文件名顶掉）。

@@ -359,5 +359,14 @@ class _FakeHttp implements HttpClientLike {
       null;
 
   @override
+  Future<String> putBytes(
+    String url, {
+    required List<int> body,
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) =>
+      throw UnimplementedError();
+
+  @override
   void close() {}
 }

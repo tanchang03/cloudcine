@@ -186,8 +186,11 @@ class LibraryBackupService {
     }
 
     // 2. 解析 manifest
-    final manifestBytes =
-        bytes.sublist(_magic.length + 4, _magic.length + 4 + manifestLen);
+    final manifestStart = _magic.length + 4;
+    if (manifestStart + manifestLen > bytes.length) {
+      throw const FormatException('备份包格式错误：manifest 长度超出包范围');
+    }
+    final manifestBytes = bytes.sublist(manifestStart, manifestStart + manifestLen);
     final manifest = BackupManifest.fromBytes(
       Uint8List.fromList(manifestBytes),
     );
@@ -524,7 +527,8 @@ class LibraryBackupService {
       output.add(dataHeader.buffer.asUint8List());
       output.add(data);
     }
-    output.add(ByteData(4)..setUint32(0, 0).buffer.asUint8List());
+    final terminator = ByteData(4)..setUint32(0, 0);
+    output.add(terminator.buffer.asUint8List());
     return output.toBytes();
   }
 

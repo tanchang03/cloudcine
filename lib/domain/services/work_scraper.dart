@@ -333,6 +333,7 @@ class WorkScraper {
       // `upsertWorks` 的合并分支原样保留它们 —— 传 0 会把库里的数字抹掉。
       itemCount: work.itemCount,
       totalBytes: work.totalBytes,
+      firstSeenAt: work.firstSeenAt,
       lastPlayedAt: work.lastPlayedAt,
       updatedAt: _clock(),
     );

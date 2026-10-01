@@ -13,12 +13,14 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/format.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
+import '../../core/utils/player_buffer_progress.dart';
 import '../../core/utils/text_encoding.dart';
 import '../../core/utils/track_labels.dart';
 import '../../domain/services/cache_speed_meter.dart';
 import '../../domain/services/playback_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../theme/app_theme.dart';
+import '../widgets/buffered_slider.dart';
 import 'child_window_channel.dart';
 import 'player_protocol.dart';
 import 'player_window_bridge.dart';
@@ -2715,52 +2717,43 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
             builder: (context, positionSnapshot) {
               final maxMs = total.inMilliseconds.toDouble();
               final hasDuration = maxMs > 0;
-              final current =
-                  _seekPreview ?? positionSnapshot.data ?? Duration.zero;
+              // 真实的播放头。**不能**用 [_seekPreview]：那是拖拽预览，
+              // mpv 的缓存并不会跟着预览值走。
+              final played = positionSnapshot.data ?? Duration.zero;
+              final current = _seekPreview ?? played;
 
               return Row(
                 children: [
                   _buildTimeLabel(current),
                   Expanded(
-                    child: SliderTheme(
-                      data: SliderThemeData(
-                        trackHeight: 3,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 6,
-                        ),
-                        overlayShape: const RoundSliderOverlayShape(
-                          overlayRadius: 12,
-                        ),
-                        activeTrackColor: AppTheme.accent,
-                        inactiveTrackColor: Colors.white24,
-                        thumbColor: AppTheme.accent,
+                    child: BufferedSlider(
+                      value: hasDuration
+                          ? (current.inMilliseconds / maxMs).clamp(0.0, 1.0)
+                          : 0,
+                      // 「已经缓存到这儿了」那一层。见 [_cacheAhead]：它是
+                      // 播放头**前面**的秒数，换算成进度的规则在
+                      // [PlayerBufferProgress]；时长未知时返回 null（不画）。
+                      buffered: PlayerBufferProgress.fraction(
+                        position: played,
+                        cacheAhead: _cacheAhead,
+                        duration: total,
                       ),
-                      child: Slider(
-                        value: hasDuration
-                            ? current.inMilliseconds
-                                .clamp(0, total.inMilliseconds)
-                                .toDouble()
-                            : 0,
-                        max: hasDuration ? maxMs : 1,
-                        // 时长还不知道时（还在解文件头）不给拖：拖了也没意义，
-                        // 而且滑块会在真时长到达时突然跳一下。
-                        onChanged: hasDuration
-                            ? (v) => setState(() {
-                                  _seekPreview =
-                                      Duration(milliseconds: v.round());
-                                })
-                            : null,
-                        // 拖拽过程中不 seek —— 那会把 mpv 拖垮，而且中间那些
-                        // 位置本来就没有意义。松手才真的跳。
-                        onChangeEnd: hasDuration
-                            ? (v) async {
-                                setState(() => _seekPreview = null);
-                                await player.seek(
-                                  Duration(milliseconds: v.round()),
-                                );
-                              }
-                            : null,
-                      ),
+                      // 时长还不知道时（还在解文件头）不给拖：拖了也没意义，
+                      // 而且滑块会在真时长到达时突然跳一下。
+                      enabled: hasDuration,
+                      onChanged: (v) => setState(() {
+                            _seekPreview = Duration(
+                              milliseconds: (v * maxMs).round(),
+                            );
+                          }),
+                      // 拖拽过程中不 seek —— 那会把 mpv 拖垮，而且中间那些
+                      // 位置本来就没有意义。松手才真的跳。
+                      onChangeEnd: (v) async {
+                        setState(() => _seekPreview = null);
+                        await player.seek(
+                          Duration(milliseconds: (v * maxMs).round()),
+                        );
+                      },
                     ),
                   ),
                   _buildTimeLabel(total),

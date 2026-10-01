@@ -10,7 +10,7 @@ import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// 索引库 v5 → v6 迁移：`media_works.lastModifiedAt`。
+/// 索引库 v5 → v6 → v7 迁移：`media_works.lastModifiedAt` + `firstSeenAt`。
 ///
 /// ## 为什么值得一个文件
 ///
@@ -54,10 +54,13 @@ void main() {
     await repo.upsertWorks(works, now: now);
     addTearDown(seed.close);
 
-    // 第二步：降回 v5 —— 删掉这一列 + 改版本号。
+    // 第二步：降回 v5 —— 删掉 v6/v7 才有的列 + 改版本号。
     // 此后这个文件对 drift 来说就是一个「还没升级过的老库」。
     await seed.customStatement(
       'ALTER TABLE media_works DROP COLUMN last_modified_at',
+    );
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN first_seen_at',
     );
     await seed.customStatement('PRAGMA user_version = 5');
     await seed.close();

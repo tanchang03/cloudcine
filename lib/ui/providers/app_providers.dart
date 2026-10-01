@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -225,7 +226,7 @@ String _getDeviceName() {
 final libraryBackupServiceProvider = Provider<LibraryBackupService>(
   (ref) {
     final registry = ref.watch(adapterRegistryProvider);
-    final adapter = registry.adapterFor(DriveProvider.quark);
+    final adapter = registry.requireAdapter(DriveProvider.quark);
     final supportDir = ref.watch(appSupportDirProvider);
     final posterPath = ref.watch(posterCacheDirProvider);
 

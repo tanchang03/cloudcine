@@ -45,6 +45,7 @@ Flutter 3.29.0 / Dart 3.7.0 的 macOS 网盘媒体库播放器，对接夸克网
 
 ## 播放器（两个播放器各一份，别只改一个）
 macOS 点播放走**独立窗口** `player_window_app.dart`，内置播放页 `player_page.dart` 是另一份。**键位表、字幕菜单、音轨菜单都要改两处**（键位见 §416），只改一个=用户看到「功能没做」。
+**进度条**：两个播放器共用 `ui/widgets/buffered_slider.dart`（三层轨道），都是 **0..1 比例**。算法只在 `core/utils/player_buffer_progress.dart`：`demuxer-cache-time` 是播放头**前面**的秒数 → 缓冲位置 = 播放头 + 它（直接除总时长 = 1% 死线）；时长未知返回 **null** 不画。
 音轨数据源 `player.stream.tracks`（**持续听**）必须过 `TrackLabels.realTracks` 剔掉 media_kit 的 `auto`/`no` 合成轨；**选中态一律以 `player.stream.track` 回报为准，不做乐观更新**。字幕四路（embedded/cloud/online/local）枚举穷举，漏一种=「点了没反应」；外挂字幕挂着时内嵌轨一律不打勾。搜索走 `subtitle_query.dart`：**绝不能拿 `displayTitle` 去搜**（带 `S01E01` → 归零且不报错）。**跨引擎错误只认 `PlatformException`**。在线字幕（OpenSubtitles）**搜索不占额度、下载才占**。
 
 ## 媒体库三轴（不能互相推导/合并）

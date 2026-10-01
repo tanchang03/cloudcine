@@ -114,6 +114,27 @@ class AppDatabase extends _$AppDatabase {
             ''');
             diag.info('数据库', '索引库已升级到 v6（最近修改时间，已从媒体项回填）');
           }
+          if (from < 7) {
+            await m.addColumn(mediaWorks, mediaWorks.firstSeenAt);
+            // 这一列也**必须回填**：它决定「最近添加」排序。
+            //
+            // 留成 NULL 的话，选了「最近添加」排序的作品会全部垫底，
+            // 而用户看不出是「新列还没值」还是「排序坏了」。
+            //
+            // 回填口径：取作品下所有文件的 `first_seen_at` 最小值
+            // （最早入库的那一集）。一部剧可能分多次入库（先存了第一季、
+            // 一个月后存第二季），取最小值能反映「这部作品最早什么时候
+            // 出现在库里」。
+            await customStatement('''
+              UPDATE media_works
+              SET first_seen_at = (
+                SELECT MIN(mi.first_seen_at)
+                FROM media_items mi
+                WHERE mi.group_key = media_works.key
+              )
+            ''');
+            diag.info('数据库', '索引库已升级到 v7（入库时间，已从媒体项回填）');
+          }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，
             // 而空的 onUpgrade 会让「忘了写迁移」变成一个静默的数据损坏。

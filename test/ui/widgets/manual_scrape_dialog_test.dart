@@ -49,6 +49,15 @@ class _NoImageHttp implements HttpClientLike {
       const HttpResult(statusCode: 404, rawBody: '');
 
   @override
+  Future<String> putBytes(
+    String url, {
+    required List<int> body,
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) =>
+      throw UnimplementedError();
+
+  @override
   void close() {}
 }
 

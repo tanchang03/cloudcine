@@ -16,6 +16,7 @@ import '../../domain/services/playback_controller.dart';
 import '../../domain/services/playback_exit_policy.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
+import '../widgets/buffered_slider.dart';
 import '../widgets/common_widgets.dart';
 
 /// 播放页。
@@ -368,8 +369,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                 style: AppTheme.mono.copyWith(color: AppTheme.muted),
               ),
               Expanded(
-                child: Slider(
+                child: BufferedSlider(
                   value: fraction,
+                  // 「已经缓存到这儿了」那一层。时长未知时是 null（不画）。
+                  //
+                  // ⚠️ 用的是**真实播放头**，不是 [_dragFraction]：拖拽只是预览，
+                  // mpv 的缓存并不会跟着预览值走，按预览算会画出一段假的缓冲。
+                  buffered: controller.bufferedFraction,
                   onChangeStart: (v) => setState(() => _dragFraction = v),
                   onChanged: (v) => setState(() => _dragFraction = v),
                   onChangeEnd: (v) {

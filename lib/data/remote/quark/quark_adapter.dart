@@ -865,8 +865,10 @@ class QuarkAdapter implements CloudDriveAdapter {
     // 预上传响应中应包含 COS 上传信息（bucket / obj_key / upload_id /
     // auth_info / upload_url / part_size）。
     // 夸克服务端返回的 `part_size` 通常为 4MB。
-    final partSize = _asInt(preData['part_size']) ??
-        preData['metadata']?['part_size'] as int? ??
+    final partSize = QuarkMapper.asInt(preData['part_size']) ??
+        QuarkMapper.asInt(preData['metadata'] is Map
+            ? (preData['metadata'] as Map)['part_size']
+            : null) ??
         4 * 1024 * 1024;
 
     final bucket = preData['bucket'] as String? ?? '';

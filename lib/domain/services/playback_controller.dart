@@ -8,6 +8,7 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
+import '../../core/utils/player_buffer_progress.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/track_labels.dart';
 import '../adapters/cloud_drive_adapter.dart';
@@ -122,6 +123,13 @@ class PlaybackController extends ChangeNotifier {
   bool _playing = false;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
+
+  /// 已缓存在播放头**前面**的秒数（mpv 的 `demuxer-cache-time`）。
+  ///
+  /// ⚠️ 它不是「从头一共下了多少秒」：mpv 的缓存有上限，填满之后这个数就
+  /// 不再增长，而播放头还在往前走。进度条那层「已缓冲」必须按
+  /// `播放头 + 这个数` 算，规则在 [PlayerBufferProgress]。
+  Duration _bufferedAhead = Duration.zero;
   double _volume = 100;
   double _rate = 1.0;
 
@@ -171,6 +179,19 @@ class PlaybackController extends ChangeNotifier {
   bool get isPlaying => _playing;
   Duration get position => _position;
   Duration get duration => _duration;
+
+  /// 已缓存在播放头前面的秒数。见 [_bufferedAhead]。
+  Duration get bufferedAhead => _bufferedAhead;
+
+  /// 进度条上「已缓冲」那一层（0..1）。
+  ///
+  /// **时长未知时返回 null**，UI 收到 null 就不该画这一层 —— 那时长下画什么
+  /// 都是编的。
+  double? get bufferedFraction => PlayerBufferProgress.fraction(
+        position: _position,
+        cacheAhead: _bufferedAhead,
+        duration: _duration,
+      );
 
   /// 音量（0..100，与 mpv 口径一致）
   double get volume => _volume;
@@ -280,6 +301,17 @@ class PlaybackController extends ChangeNotifier {
       '档位=${_activeQualityId ?? "-"} '
       '起播=${startAt.inSeconds}s',
     );
+    // 换源 = 缓存作废：mpv 是从零重新攒的，旧值属于上一条 URL。不清的话
+    // 新流一开播，进度条上就挂着上一条流（可能是另一个码率）的缓冲量 ——
+    // 而 [_position] 这时已经被恢复成续播点了，两者相加会把缓冲层画到
+    // 一个根本没缓存到的地方去。
+    //
+    // ⚠️ 必须放在**这个**入口上，不能只放在 `open()` 里：`switchQuality`
+    // 换的是同一部片子的另一档转码，走的是本方法而不是 `open()`，
+    // 只清 open() 的话「切清晰度」这条路的缓冲层就会残留。
+    _bufferedAhead = Duration.zero;
+    notifyListeners();
+
     await player.open(
       PlaybackMedia.build(
         ticket.url.toString(),
@@ -524,6 +556,7 @@ class PlaybackController extends ChangeNotifier {
     _buffering = false;
     _position = Duration.zero;
     _duration = Duration.zero;
+    _bufferedAhead = Duration.zero;
     _ticket = null;
     _activeQualityId = null;
     _activeSubtitleId = null;
@@ -594,6 +627,16 @@ class PlaybackController extends ChangeNotifier {
     _subs.add(player.stream.duration.listen((v) {
       if (v == _duration) return;
       _duration = v;
+      notifyListeners();
+    }));
+
+    // 缓冲量。进度条上那层「已经缓存到这儿了」用它。
+    //
+    // 比 `position` 稀疏得多（mpv 只在缓存量变化时报，而缓存是切片式增长的），
+    // 所以不必像位置那样节流。
+    _subs.add(player.stream.buffer.listen((v) {
+      if (v == _bufferedAhead) return;
+      _bufferedAhead = v;
       notifyListeners();
     }));
 
