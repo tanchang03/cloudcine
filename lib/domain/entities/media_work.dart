@@ -1,7 +1,9 @@
 import '../../core/utils/filename_parser.dart';
 import '../../core/utils/format.dart';
 import '../../core/utils/media_category.dart';
+import '../services/intro_marker.dart';
 import 'drive_provider.dart';
+import 'work_poster.dart';
 
 /// 元数据来源。
 ///
@@ -54,6 +56,9 @@ class MediaWork {
     this.itemCount = 0,
     this.totalBytes = 0,
     this.seasonCount = 0,
+    this.mergedInto,
+    this.introStartMs,
+    this.introEndMs,
     this.lastModifiedAt,
     this.firstSeenAt,
     this.lastPlayedAt,
@@ -140,6 +145,51 @@ class MediaWork {
   /// 老库都是这个值。只有 `>= 2` 才有信息量（「只有一季」写在卡片上是废话）。
   final int seasonCount;
 
+  /// 这一行**已被折叠进**哪一部作品（目标作品的 [key]）；`null` = 它自己
+  /// 就是一部独立的作品。
+  ///
+  /// ## 它不是「删除标记」，是「别名」
+  ///
+  /// 非空时这一行从列表与所有角标里消失，但**行本身与它下面的文件全部
+  /// 原样保留**：`itemsForWork(目标.key)` 会把它们一起查出来。所以
+  /// 撤销只是把这一列改回 `null`，不丢任何东西。
+  ///
+  /// ## 两个必须守住的不变量
+  ///
+  ///   1. **`media_items.group_key` 永不改写** —— item 永远指向自己那行
+  ///      work，`PlayTarget` / 续播点 / 字幕引用都不需要知道「合并」存在。
+  ///   2. **不允许链式**：`mergedInto` 指向的一定是一个 `mergedInto == null`
+  ///      的根。源行**永远不会**成为别人的目标。
+  ///
+  /// ## 扫描不许把它清掉
+  ///
+  /// 重扫时 `WorkSeed.build` 造出来的新行 `mergedInto` 是 `null`，如果
+  /// `mergeWorkForUpsert` 照抄新值，**每次扫描都会把所有合并悄悄拆开**，
+  /// 而用户只看到「合过的片子又变回两个格子了」。所以这一列走
+  /// 「旧值优先」的受保护通道。
+  final String? mergedInto;
+
+  /// 是否是「已被折叠走」的别名行 —— 列表 / 角标一律不认它。
+  bool get isMergedAway => (mergedInto ?? '').isNotEmpty;
+
+  /// 用户手标的**片头**起点 / 终点（毫秒）；`null` = 没标过。
+  ///
+  /// 作品级而不是文件级：同一部剧每集片头位置几乎一样，让用户给 24 集
+  /// 各标一次是不可接受的（见 `MediaWorks.introStartMs`）。
+  ///
+  /// 它与**文件自带的章节标记**是两条独立的路，优先级由播放器定：
+  /// 章节优先（那是发布者给的准确信息），这一对是兜底 ——
+  /// 网盘上的剧集绝大多数没有章节。
+  final int? introStartMs;
+  final int? introEndMs;
+
+  /// 手标片头区间；半条标记（只标了起点或只标了终点）当没有。
+  ///
+  /// 用 [IntroMarker.fromMilliseconds] 而不是在这里各判一次：那个函数
+  /// 还要挡住「终点早于起点」这类脏数据，规则只能有一份。
+  IntroMarker? get introRange =>
+      IntroMarker.fromMilliseconds(introStartMs, introEndMs);
+
   /// 作品下所有文件的**网盘修改时间**最大值。
   ///
   /// 取 `MediaItem.modifiedAt` 的最大值：新增一集或替换一集时，
@@ -216,6 +266,9 @@ class MediaWork {
     int? itemCount,
     int? totalBytes,
     int? seasonCount,
+    String? mergedInto,
+    int? introStartMs,
+    int? introEndMs,
     DateTime? lastModifiedAt,
     DateTime? firstSeenAt,
     DateTime? lastPlayedAt,
@@ -245,6 +298,10 @@ class MediaWork {
         itemCount: itemCount ?? this.itemCount,
         totalBytes: totalBytes ?? this.totalBytes,
         seasonCount: seasonCount ?? this.seasonCount,
+        // ⚠️ 传 `null` 是「不改」而不是「拆开合并」—— `copyWith` 清不掉
+        // 这一列。撤销合并走 `MediaRepository.unmergeWorks`（一条直接
+        // UPDATE），不要在这里绕。
+        mergedInto: mergedInto ?? this.mergedInto,
         lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
         firstSeenAt: firstSeenAt ?? this.firstSeenAt,
         lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
@@ -273,9 +330,11 @@ class MediaWork {
   ///     拿文件名解析出的标题**覆盖掉用户刚敲进去的片名**。`manual` 才落进
   ///     那边的保护分支（那条注释写的就是「用户手工改过的当然更不能被
   ///     文件名顶掉」）；
-  ///   - **[categoryManual] 置 `true`**：分类是用户在对话框里选的，后续
-  ///     重扫 / 重刮都不许用 `fromGenres` 改写它 —— 与 `setWorkCategory`
-  ///     同一条规则；
+  ///   - **[categoryManual] 只在用户真的改了分类时才锁**：对话框预填的是
+  ///     当前分类，用户若没动它（只想清在线信息），就**不新加锁** —— 否则
+  ///     一次「清空刮削数据」会把当时那个（很可能是刮错的）分类冻死，之后
+  ///     连手动重刮都改不动。改了分类才置 `true`（与 `setWorkCategory`
+  ///     同一条规则：显式指定即锁定），此前已有的锁原样保留；
   ///   - **`genres` 只清「刮来的」那一份**：类型标签现在是可手敲、可锁的
   ///     （`genresManual`，详情页「编辑类型」那个 chip），而
   ///     `mergeWorkForUpsert` 早就立过规矩 —— 用户手敲的类型连**重刮削**
@@ -292,30 +351,57 @@ class MediaWork {
   ///
   ///   - `year`：下次重扫时由文件名解析补回（`_preferOld` 在旧值为 `null`
   ///     时取新值）；
-  ///   - `posterUrl` / `posterFaceX`：下次重扫时回落到**网盘缩略图**
-  ///     （夸克的服务端视频帧），成对恢复。
+  ///   - `posterUrl` / `posterFaceX`：由 [drivePoster] **当场**回落到网盘
+  ///     缩略图，或下次重扫时经 `WorkSeed` 成对恢复。
   ///
   /// 而在线源那张**刮错了的海报**不会回来：`mergeWorkForUpsert` 里有一条
   /// 针对 `manual` 的守卫，扫描期的自动刮削碰不到这一行。
+  ///
+  /// ## [drivePoster]：清掉在线海报之后，封面回落到网盘缩略图
+  ///
+  /// 「清除刮削」要抹掉的是**刮错的那张图**，不是「这部作品从此没有封面」。
+  /// 纯粹清空的话，用户点完「自定义」会看到一墙灰块 —— 而网盘给每个视频
+  /// 生成的服务端预览图**一直都在**（`MediaItem.thumbUrl`，扫描时就存了）。
+  /// 这与「本地解析永远可用，在线刮削是增强」是同一条原则：刮削是**增强**，
+  /// 撤掉增强之后应该退回本地那一级，不是退回空。
+  ///
+  /// 由调用方（`MediaRepository.customizeWork`）从这部作品的媒体项里挑好
+  /// 再传进来：本类不认识仓储，也没法自己查文件。
   MediaWork customized({
     required String title,
     required MediaCategory category,
     required DateTime updatedAt,
+    WorkPoster? drivePoster,
   }) =>
       MediaWork(
         key: key,
         provider: provider,
         kind: kind,
         category: category,
-        categoryManual: true,
+        // B：只有用户**真的改了**分类才新加锁。只清在线信息（分类没动）时
+        // 不锁 —— 否则「清空刮削数据」会顺手把当时那个（很可能是错的）分类
+        // 冻死，之后连手动重刮都改不动（原 bug 现场）。此前已有的锁原样保留：
+        // 那是用户更早的明确指定，不该被一次「只为清数据」的操作悄悄解锁。
+        categoryManual: category != this.category || categoryManual,
         title: title,
         // ---- 以下全部是在线刮削的产物，逐项清空 ----
         originalTitle: null,
         year: null,
         overview: null,
-        posterUrl: null,
-        posterFile: null,
-        posterFaceX: null,
+        // 有网盘缩略图就用它（**清的是刮错的那张，不是「从此不要封面」**）；
+        // 没有才真的留空。
+        posterUrl: drivePoster?.url,
+        // 缓存文件名只对**同一张图**有效：地址没变（清之前用的本来就是
+        // 网盘缩略图）时留着，省一次下载；换了图必须清 —— 留着的话
+        // `PosterCache.pathFor` 会因为 `knownFile` 存在而直接返回旧文件，
+        // 封面显示成前一张。
+        posterFile:
+            drivePoster?.url != null && drivePoster!.url == posterUrl
+                ? posterFile
+                : null,
+        // 锚点与地址**同进同退**：它由 drivePoster 一起带来，
+        // 不会出现「拿视频帧的人脸位置去裁刮削海报」。
+        posterFaceX: drivePoster?.faceX,
         backdropUrl: null,
         backdropFile: null,
         rating: null,
@@ -331,6 +417,13 @@ class MediaWork {
         itemCount: itemCount,
         totalBytes: totalBytes,
         seasonCount: seasonCount,
+        // 「自定义」改的是元数据，跟「这一行是不是被折叠走了」没关系 ——
+        // 漏抄会顺手把合并拆掉。
+        mergedInto: mergedInto,
+        // 同理：片头区间是**用户标的播放偏好**，与刮削无关。漏抄的表现是
+        // 「点一下自定义，跳片头就再也不生效了」，而且没有任何提示。
+        introStartMs: introStartMs,
+        introEndMs: introEndMs,
         lastModifiedAt: lastModifiedAt,
         firstSeenAt: firstSeenAt,
         lastPlayedAt: lastPlayedAt,

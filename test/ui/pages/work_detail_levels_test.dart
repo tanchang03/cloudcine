@@ -33,16 +33,18 @@ void main() {
     int? episode,
     int? part,
     String? partLabel,
+    String? name,
+    String? title,
   }) =>
       MediaItem(
         provider: DriveProvider.quark,
         fileId: id,
-        name: '$id.mkv',
+        name: name ?? '$id.mkv',
         dirId: 'd1',
         dirPath: '/动漫/进击的巨人/',
         groupKey: 'aot',
         kind: MediaKind.episode,
-        title: '进击的巨人',
+        title: title ?? '进击的巨人',
         season: season,
         episode: episode,
         part: part,
@@ -56,6 +58,7 @@ void main() {
     WidgetTester tester, {
     required List<MediaItem> items,
     String workKey = 'aot',
+    String workTitle = '进击的巨人',
   }) async {
     final db = AppDatabase.memory();
     addTearDown(db.close);
@@ -65,7 +68,7 @@ void main() {
         key: workKey,
         provider: DriveProvider.quark,
         kind: MediaKind.episode,
-        title: '进击的巨人',
+        title: workTitle,
         updatedAt: now,
       ),
     ], now: now);
@@ -178,5 +181,32 @@ void main() {
     expect(find.text('第 1 部'), findsNothing);
     // 但集还是要列出来。
     expect(find.text('进击的巨人 S01E01'), findsOneWidget);
+  });
+
+  testWidgets('未标季里提不出集号的行显示「剧名-文件名」', (tester) async {
+    // 真实样本：`/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4` / `01.粤语.mp4`…
+    // 解析不出片名也解析不出集号，被「目录名作为系列名」那条规则顶成目录名
+    // —— 退回 `displayTitle` 的话 12 行主标题一模一样，用户看不出是哪个文件，
+    // 而这是「未标季」这一格里唯一能区分它们的信息。
+    await pumpDetail(
+      tester,
+      workTitle: '飞常日志',
+      items: [
+        ep('a', name: '01.国语.mp4', title: 'F飞CC日 志2'),
+        ep('b', name: '01.粤语.mp4', title: 'F飞CC日 志2'),
+        // 有集号的**仍要保留片名**：同一集常有多个版本（翡翠台 / MyTVSuper），
+        // 版本之间只有片名不同，写成「第 1 集」会让两个版本变成一样的行。
+        ep('c', title: '飛常日誌', episode: 1),
+      ],
+    );
+
+    expect(find.text('飞常日志-01.国语'), findsOneWidget);
+    expect(find.text('飞常日志-01.粤语'), findsOneWidget);
+    expect(find.text('飛常日誌 E01'), findsOneWidget);
+    expect(
+      find.text('F飞CC日 志2'),
+      findsNothing,
+      reason: '条目自己那个目录名不该再出现在列表里 —— 它正是「分不出哪一行」的来源',
+    );
   });
 }

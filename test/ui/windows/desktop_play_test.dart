@@ -359,6 +359,165 @@ void main() {
         <String>['第 1 集', 'S2 · 第 3 集'],
       );
     });
+
+    test('提不出集号时退回「剧名-文件名」—— 否则整列都是同一个剧名', () async {
+      // 「目录名作为系列名」那条规则会**刻意清掉**从单个文件解析出的季集号
+      // （事故现场 `182.格力空调显示E6如何维修.mp4`：那个 `E6` 是故障代码、
+      // 不是第 6 集，见 `MediaFilenameParser.parse` 的目录级归组）。
+      // 代价就是这类目录下每一项都没有集号 —— 退回 `displayTitle` 的话，
+      // 面板里几十行全是一模一样的剧名，用户认不出哪一行是哪一集。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', title: '家电维修', name: '182.格力空调显示E6如何维修.mp4'),
+        _episode(fileId: 'f2', title: '家电维修', name: '183.空调不制冷的检修.mp4'),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work(title: '姜松家电维修教程')]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(
+        request.playlist.map((e) => e.title).toList(),
+        <String>[
+          // 前缀取的是**作品行**上的标题（刮削后的剧名），不是条目自己的
+          // `title` —— 后者只是单个文件解析出来的东西。
+          '姜松家电维修教程-182.格力空调显示E6如何维修',
+          '姜松家电维修教程-183.空调不制冷的检修',
+        ],
+      );
+    });
+
+    test('文件名自己就带剧名时不再重复拼一遍', () async {
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', name: '姜松家电维修教程 182.mp4'),
+        _episode(fileId: 'f2', name: '姜松家电维修教程 183.mp4'),
+      ];
+      await harness.repository.upsertItems(items);
+      // 剧名来自**目录名**、带着书名号，文件名却不带 —— 实测里最常见的一对，
+      // 比对时不折掉标点的话这条去重永远不生效。
+      await harness.repository.upsertWorks(<MediaWork>[_work(title: '姜松《家电维修教程》')]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(
+        request.playlist.map((e) => e.title).toList(),
+        <String>['姜松家电维修教程 182', '姜松家电维修教程 183'],
+      );
+    });
+
+    test('没有作品行时用条目自己的解析片名兜底 —— 不能拼出一个空前缀', () async {
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', title: '家电维修', name: '182.格力空调.mp4'),
+        _episode(fileId: 'f2', title: '家电维修', name: '183.空调检修.mp4'),
+      ];
+      await harness.repository.upsertItems(items);
+      // 故意不写作品行（还没扫到、或者那一行被删了）。
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(request.playlist[0].title, '家电维修-182.格力空调');
+      expect(request.playlist[1].title, '家电维修-183.空调检修');
+    });
+
+    test('同一集有多个版本时补上片名 —— 否则面板里是两行一模一样的字', () async {
+      // 真实样本：同一个作品的「翡翠台 粤语版」（无季号）与「MyTVSuper」
+      // （第 1 季），episode 都是 1、2，**只有解析出的片名不同**。
+      // 短口径下两组都写成「第 1 集 / 第 2 集」，用户根本分不出哪行是哪版。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'c1', title: '飛常日誌', episode: 1),
+        _episode(fileId: 'c2', title: '飛常日誌', episode: 2),
+        _episode(
+          fileId: 'm1',
+          title: 'The Airport Diary',
+          season: 1,
+          episode: 1,
+        ),
+        _episode(
+          fileId: 'm2',
+          title: 'The Airport Diary',
+          season: 1,
+          episode: 2,
+        ),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work(title: '飞常日志')]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(
+        request.playlist.map((e) => e.title).toSet(),
+        <String>{
+          '飛常日誌 E01',
+          '飛常日誌 E02',
+          'The Airport Diary S01E01',
+          'The Airport Diary S01E02',
+        },
+        reason: '四条必须互不相同；只要有一条撞名，用户就分不出该点哪一行',
+      );
+      expect(request.playlist, hasLength(4));
+    });
+
+    test('没撞名的那些仍然是短标题 —— 不为一个重名把整列都拉长', () async {
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', title: '飛常日誌', episode: 1),
+        _episode(fileId: 'f2', title: '飛常日誌', episode: 2),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work(title: '飞常日志')]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(
+        request.playlist.map((e) => e.title).toList(),
+        <String>['第 1 集', '第 2 集'],
+        reason: '没有重名就该保持最省空间的写法，别一律加片名',
+      );
+    });
+
+    test('连片名也分不开时退回文件名 —— 面板里出现两行一样的字是底线', () async {
+      // 同一集的两个压制/码率：season/episode/片名全都一样。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(
+          fileId: 'f1',
+          title: '飞常日志',
+          episode: 1,
+          name: '飞常日志.S01E01.1080p.mkv',
+        ),
+        _episode(
+          fileId: 'f2',
+          title: '飞常日志',
+          episode: 1,
+          name: '飞常日志.S01E01.2160p.mkv',
+        ),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work(title: '飞常日志')]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(
+        request.playlist.map((e) => e.title).toSet(),
+        <String>{'飞常日志.S01E01.1080p', '飞常日志.S01E01.2160p'},
+        reason: '片名那一级也撞了，只有文件名能把这两条分开',
+      );
+    });
   });
 
   // -------------------------------------------------------------------
@@ -601,11 +760,11 @@ MediaItem _episode({
   );
 }
 
-MediaWork _work() => MediaWork(
+MediaWork _work({String title = '流浪地球2'}) => MediaWork(
       key: 'movie:流浪地球2:2023',
       provider: DriveProvider.quark,
       kind: MediaKind.movie,
-      title: '流浪地球2',
+      title: title,
       source: ScrapeSource.local,
       posterUrl: 'https://img.example.com/p.jpg',
       itemCount: 3,

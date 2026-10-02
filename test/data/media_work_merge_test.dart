@@ -31,6 +31,7 @@ MediaWork _work({
   int itemCount = 0,
   int totalBytes = 0,
   int seasonCount = 0,
+  String? mergedInto,
   DateTime? lastPlayedAt,
 }) =>
     MediaWork(
@@ -60,6 +61,7 @@ MediaWork _work({
       itemCount: itemCount,
       totalBytes: totalBytes,
       seasonCount: seasonCount,
+      mergedInto: mergedInto,
       lastPlayedAt: lastPlayedAt,
       updatedAt: DateTime(2020),
     );
@@ -396,6 +398,92 @@ void main() {
     });
   });
 
+  group('用户显式重刮（overrideManual）：本次算出的分类必须落库', () {
+    // 2026-10-02 用户报的 bug 现场（《黑暗荣耀》）：
+    //   ① 自动刮削把它判成「纪录片」；
+    //   ② 用户点「自定义」清空刮削数据 → 库里 `category_manual = 1`；
+    //   ③ 用户在手动对话框里选了「剧集」重刮。
+    //
+    // `WorkScraper._categoryFor` 已经算出「剧集」，日志里写着
+    // 「分类判定：纪录片 → 剧集（对话框手选 override=剧集）」—— 但库里那一行
+    // 仍然是 `documentary`。根因在**合并这一步**：无条件认旧锁，把刚算对的
+    // 结论原地扔掉。界面弹的是「已刮削：黑暗荣耀 · 类型：剧集」，用户回头
+    // 一看纪录片栏里它还在，而日志里查不出任何异常（因为判定那一步是对的）。
+    MediaWork lockedDoc() => _work(
+          source: ScrapeSource.online,
+          category: MediaCategory.documentary,
+          categoryManual: true,
+          onlineId: 'tv/136283',
+        );
+
+    /// 手动重刮产出的 incoming —— 形状与 `WorkScraper._apply` 一致：
+    /// 分类是这次算出来的「剧集」，锁沿用（用户这次也选了类型）。
+    MediaWork rescraped() => _work(
+          source: ScrapeSource.online,
+          category: MediaCategory.series,
+          categoryManual: true,
+          onlineId: 'tv/136283',
+          genres: const ['剧情', '悬疑'],
+        );
+
+    test('分类赢过旧锁', () {
+      final merged = DriftMediaRepository.mergeWorkForUpsert(
+        rescraped(),
+        lockedDoc(),
+        ts,
+        overrideManual: true,
+      );
+
+      expect(
+        merged.category,
+        MediaCategory.series,
+        reason: '`overrideManual` 是「用户亲手点了这个按钮」的标记，而 '
+            '`_categoryFor` 已经按完整优先级算过一遍（含「手动通道忽略旧锁、'
+            '按本次刮削重判」）。这里再认一次旧锁 = 用户重刮多少次都停在旧分类上。',
+      );
+      expect(merged.categoryManual, isTrue, reason: '这次也选了类型，锁必须还在。');
+    });
+
+    test('不传 overrideManual（扫描期自动刮削）→ 锁照样挡住', () {
+      final merged = DriftMediaRepository.mergeWorkForUpsert(
+        rescraped(),
+        lockedDoc(),
+        ts,
+      );
+
+      expect(
+        merged.category,
+        MediaCategory.documentary,
+        reason: '锁的本意就是挡**无人值守**的自动刮削 —— 否则用户手动指定的分类'
+            '会被 TMDB 的 genres 悄悄改写。让路的只有用户显式发起的那一次。',
+      );
+    });
+
+    test('原本没锁、手动选了类型 → 这一次要把锁置上', () {
+      final unlocked = _work(
+        source: ScrapeSource.online,
+        category: MediaCategory.documentary,
+        onlineId: 'tv/136283',
+      );
+
+      final merged = DriftMediaRepository.mergeWorkForUpsert(
+        rescraped(),
+        unlocked,
+        ts,
+        overrideManual: true,
+      );
+
+      expect(merged.category, MediaCategory.series);
+      expect(
+        merged.categoryManual,
+        isTrue,
+        reason: '`_apply` 把「用户这次选了类型」写进了 `incoming.categoryManual`。'
+            '合并只取旧值会把这个动作丢掉：分类当场是对的，但没锁上 —— '
+            '下一次自动刮削就能把它冲回去，用户看到「改好的分类又变回去了」。',
+      );
+    });
+  });
+
   group('封面人物锚点：必须和海报地址同进同退', () {
     // 锚点（`posterFaceX`）说的是「这张图里人物在哪个水平位置」，
     // 它和 `posterUrl` 描述的是**同一张图**。配错了一不会报错、二不会崩，
@@ -693,6 +781,80 @@ void main() {
         isNot(contains('季')),
         reason: '0 表示「电影 / 老库还没回填」，同样不该出现。',
       );
+    });
+  });
+
+  group('折叠标记（mergedInto）', () {
+    test('重扫不许把它清掉 —— 它是「已并入」而不是「本次扫描的产物」', () {
+      // 本次扫描造出来的行 `mergedInto` 恒为 null（`WorkSeed.build` 不填
+      // 这一列）。照抄新值 = 每次重扫都把所有合并悄悄拆开，而用户什么都
+      // 没做，只看到「合过的片子又变回两个格子」。
+      final existing = _work(
+        source: ScrapeSource.local,
+        title: 'The Wandering Earth II',
+        mergedInto: '流浪地球2#2023',
+      );
+      final incoming = _work(
+        source: ScrapeSource.local,
+        title: 'The Wandering Earth II',
+        itemCount: 2,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.mergedInto, '流浪地球2#2023');
+    });
+
+    test('重刮削（保护模式关闭）同样不许清掉 —— 它跟刮削无关', () {
+      // ⚠️ 这条与上一条**必须分开测**：合并那行如果写成
+      // `_preferOld(protect, ...)`，保护模式下是对的、重刮削时会挂。
+      final existing = _work(
+        source: ScrapeSource.local,
+        mergedInto: 'target',
+      );
+      final incoming = _work(
+        source: ScrapeSource.online,
+        title: '刮来的片名',
+        onlineId: 'movie/1',
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.mergedInto, 'target');
+      expect(merged.title, '刮来的片名', reason: '元数据照常被覆盖。');
+    });
+
+    test('「自定义」过的行（manual 保护分支）也保留折叠标记', () {
+      final existing = _work(
+        source: ScrapeSource.manual,
+        mergedInto: 'target',
+      );
+      final incoming = _work(source: ScrapeSource.online);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.mergedInto, 'target');
+    });
+
+    test('库里没有这一行时，新行就是独立的（null）', () {
+      final merged = DriftMediaRepository.mergeWorkForUpsert(
+        _work(source: ScrapeSource.local),
+        null,
+        ts,
+      );
+
+      expect(merged.mergedInto, isNull);
+    });
+
+    test('isMergedAway：空串也算「没折走」', () {
+      // 空串理论上不该出现（写库只写 key 或 null），但它一旦出现，
+      // 按「非 null 即折走」判会让一整行**从列表里静默消失**。
+      expect(_work(mergedInto: 'a').isMergedAway, isTrue);
+      expect(_work(mergedInto: null).isMergedAway, isFalse);
+      expect(_work(mergedInto: '').isMergedAway, isFalse);
     });
   });
 }

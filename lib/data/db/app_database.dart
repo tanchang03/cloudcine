@@ -48,8 +48,18 @@ class AppDatabase extends _$AppDatabase {
   ///     `特别篇`）。与「季」构成两级细分，详情页据此画层级选择器。
   /// v10：`media_works.seasonCount` —— 作品下已标季号的季数，列表页卡片
   ///     显示「N 季」用（冗余列，避免每个作品一次 COUNT DISTINCT 子查询）。
+  /// v11：`media_works.mergedInto` —— 跨目录归一的「已折叠进」标记。
+  ///     非空的行在列表 / 角标里**不出现**，但行本身与它的文件原样保留，
+  ///     所以撤销只是把这一列改回 `NULL`。
+  /// v12：`media_works.introStartMs` / `introEndMs` —— 用户手标的「片头」
+  ///     区间（毫秒，作品级）。文件自带章节（MKV 的 `Opening`）优先，
+  ///     这一对是**兜底**：网盘上的剧集大多没有章节。
+  /// v13：`media_items.faceAnchorX` —— **文件级**的封面人物锚点，与
+  ///     `thumbUrl` 同源成对。作品级那份（`posterFaceX`）在刮到在线海报
+  ///     时会被清掉，所以「清掉刮削 → 封面回落到网盘缩略图」那一刻，
+  ///     锚点只能从文件行找回。
   @override
-  int get schemaVersion => 10;
+  int get schemaVersion => 13;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -189,6 +199,38 @@ class AppDatabase extends _$AppDatabase {
             ''');
             diag.info('数据库', '索引库已升级到 v10（季数，已从媒体项回填）');
           }
+          if (from < 11) {
+            // 新列 nullable，旧行的值是 NULL —— 而 NULL 的语义正好是
+            // 「这一行没有被折叠进别处」，所以**不需要回填**，也不需要
+            // 默认值：升级完所有作品都还是各自独立的，与升级前一致。
+            await m.addColumn(mediaWorks, mediaWorks.mergedInto);
+            diag.info('数据库', '索引库已升级到 v11（作品折叠标记）');
+          }
+          if (from < 12) {
+            // 两列 nullable，旧行的值是 NULL —— 而 NULL 的语义正好是
+            // 「这一部还没有片头标记」，**不需要回填**，也**没法**回填：
+            // 片头是用户看片时手标的，旧库里根本没有这个信息。
+            // 升级后的表现与升级前完全一致（只是多了一次「没有标记」的判定）。
+            await m.addColumn(mediaWorks, mediaWorks.introStartMs);
+            await m.addColumn(mediaWorks, mediaWorks.introEndMs);
+            diag.info('数据库', '索引库已升级到 v12（手标片头区间）');
+          }
+          if (from < 13) {
+            // 与 v3 的 `thumbUrl` 同一条理由：nullable，旧行的 NULL 语义
+            // 正好是「没有可用人脸框」，渲染时退回画面正中，不需要回填。
+            //
+            // 也**没法**回填：人脸框是网盘列目录时随响应下发的（`DriveEntry`
+            // 那一层），旧库里从没存过。代价是升级后老条目暂时按画面正中裁，
+            // 重扫一次即好 —— 这比编一个 0.5 塞进去诚实（那会让人以为
+            // 人脸真的在正中间）。
+            //
+            // 为什么文件级也要存一份：`posterFaceX`（作品级，v5）在刮到在线
+            // 海报时会被**清成 NULL**（不同图不能共用锚点），而「自定义 →
+            // 清掉刮削」之后封面要回落到网盘缩略图 —— 那一刻只能从**文件行**
+            // 把锚点找回来。
+            await m.addColumn(mediaItems, mediaItems.faceAnchorX);
+            diag.info('数据库', '索引库已升级到 v13（文件级封面人物锚点）');
+          }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，
             // 而空的 onUpgrade 会让「忘了写迁移」变成一个静默的数据损坏。
@@ -198,7 +240,18 @@ class AppDatabase extends _$AppDatabase {
         beforeOpen: (details) async {
           // 外键在 SQLite 里默认是关的，必须每个连接显式打开。
           await customStatement('PRAGMA foreign_keys = ON');
-          diag.debug('数据库', '索引库已打开（v${details.versionNow}）');
+          // ⚠️ 这里的耗时**不是**「打开数据库花了多久」，而是「从申请打开到
+          // 真正打开」—— `NativeDatabase.createInBackground` 是**懒**的，
+          // 迁移与 `beforeOpen` 都发生在**第一次查询**时。所以这条记录要
+          // 和紧随其后的第一条查询（启动时是 `backfillWorkCategories`）
+          // 对着看，才能分清「开库+迁移」与「查询本身」各占多少。
+          final since = _openRequestedAt;
+          final extra = since == null
+              ? ''
+              : '：从申请打开起 '
+                  '${DateTime.now().difference(since).inMilliseconds}ms'
+                  '（含迁移，由第一次查询触发）';
+          diag.debug('数据库', '索引库已打开（v${details.versionNow}）$extra');
         },
       );
 
@@ -216,11 +269,21 @@ class AppDatabase extends _$AppDatabase {
   }
 }
 
+/// `openAppDatabase()` 被调用的时刻。
+///
+/// 用来在 `beforeOpen` 里算出「从申请到真正打开」的耗时 —— 库是**懒**打开的，
+/// 这个差值才是用户等的那一段（含迁移），而它发生在第一次查询时。
+DateTime? _openRequestedAt;
+
 /// 打开（必要时创建）应用数据库文件。
 ///
 /// 路径放在 `getApplicationSupportDirectory()` 下：那是 macOS/Windows/Linux
 /// 上「应用自己的数据」的标准位置，且**不会被系统清理**（临时目录会）。
+///
+/// ⚠️ 这里**只申请、不真开**：`NativeDatabase.createInBackground` 是懒的，
+/// 真正的打开/迁移要等第一次查询（见 `beforeOpen` 里那条日志）。
 Future<AppDatabase> openAppDatabase() async {
+  _openRequestedAt = DateTime.now();
   final dir = await getApplicationSupportDirectory();
   if (!await dir.exists()) await dir.create(recursive: true);
   final file = File(p.join(dir.path, 'cloudcine.sqlite'));

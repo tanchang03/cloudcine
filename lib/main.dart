@@ -14,6 +14,10 @@ import 'ui/windows/player_window_bridge.dart';
 import 'ui/windows/window_launch.dart';
 
 Future<void> main(List<String> args) async {
+  // 启动计时的**零点**。放在最前面（连 `ensureInitialized` 都算进去）——
+  // 用户感受到的「启动慢」就是从进程起来到看见东西为止，中间的每一段都该计入。
+  final t0 = DateTime.now();
+
   WidgetsFlutterBinding.ensureInitialized();
 
   // ⚠️ 必须在任何 `Player()` 构造之前调用。漏掉的表现是
@@ -31,31 +35,51 @@ Future<void> main(List<String> args) async {
   // 解析器会退回主窗口。
   final launch = parseWindowLaunch(args);
   if (launch.isPlayer) {
-    await _startPlayerWindow(launch);
+    await _startPlayerWindow(launch, t0);
     return;
   }
 
+  // 每一段都单独计时：启动慢的时候，第一件要知道的事是**慢在哪一段**。
+  // 直接打一个总数没有用 —— 网络、开库、插件注册的量级差着两个数量级。
+  var sw = Stopwatch()..start();
   final support = await getApplicationSupportDirectory();
+  final supportMs = sw.elapsedMilliseconds;
 
   // 日志要在 runApp 之前起 —— 否则启动阶段的日志会丢，
   // 而启动阶段恰恰是最需要日志的时候。
+  sw = Stopwatch()..start();
   await diag.start(supportDirPath: support.path);
+  final diagMs = sw.elapsedMilliseconds;
 
   // 跨引擎通道必须在**任何播放窗口可能发出 ping 之前**注册好，
   // 否则播放窗口的自检会拿到 `CHANNEL_UNREGISTERED`。
   // 放在 diag 之后，是为了让「注册成功/失败」这条记录能落进日志文件。
+  sw = Stopwatch()..start();
   await registerPlayerWindowBridge();
+  final bridgeMs = sw.elapsedMilliseconds;
 
+  // ⚠️ 这一步**只申请、不真开**（drift 是懒打开，见 `openAppDatabase` 的文档），
+  // 所以这里的数字几乎一定是 0 —— 真正的开库 + 迁移记在 `beforeOpen` 那条里。
+  sw = Stopwatch()..start();
   final db = await openAppDatabase();
+  final dbMs = sw.elapsedMilliseconds;
 
   // 海报缓存目录。和数据库一样在启动时准备好：塞进同步 Provider 里
   // 就得在每次读海报时重新 await 一次平台通道。
+  sw = Stopwatch()..start();
   final posterDir = Directory('${support.path}${Platform.pathSeparator}posters');
   if (!posterDir.existsSync()) {
     posterDir.createSync(recursive: true);
   }
+  final posterMs = sw.elapsedMilliseconds;
 
   diag.info('启动', '数据目录 ${support.path}');
+  diag.info(
+    '启动',
+    '主窗口就绪：总 ${DateTime.now().difference(t0).inMilliseconds}ms ｜ '
+        '支持目录 ${supportMs}ms、日志 ${diagMs}ms、跨窗口通道 ${bridgeMs}ms、'
+        '申请开库 ${dbMs}ms、海报目录 ${posterMs}ms',
+  );
 
   runApp(
     ProviderScope(
@@ -67,6 +91,17 @@ Future<void> main(List<String> args) async {
       child: const CloudCineApp(),
     ),
   );
+
+  // 「首帧已绘制」才是用户眼里的「启动完成」。它比 `runApp` 返回晚得多
+  // （要等布局 + 光栅化），所以必须单独记一条 —— 否则「就绪 300ms」会让人
+  // 以为启动只要 300ms，而实际白屏可能有两秒。
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    diag.info(
+      '启动',
+      '首帧已绘制：从进程启动 ${DateTime.now().difference(t0).inMilliseconds}ms'
+      '（此后才是媒体库列表自己的查询时间）',
+    );
+  });
 }
 
 /// 播放器窗口引擎的启动路径。
@@ -80,12 +115,24 @@ Future<void> main(List<String> args) async {
 /// 是安全的 —— [DiagLog] 每行都是一次 `FileMode.append` + flush，单行写入
 /// 不会互相覆盖；两边的时间戳交织在一起，反而能看出
 /// 「主窗口开窗 → 播放窗口失败」的因果顺序。
-Future<void> _startPlayerWindow(WindowLaunch launch) async {
+Future<void> _startPlayerWindow(WindowLaunch launch, DateTime t0) async {
   try {
+    final sw = Stopwatch()..start();
     final support = await getApplicationSupportDirectory();
+    final supportMs = sw.elapsedMilliseconds;
+    sw.reset();
     await diag.start(supportDirPath: support.path);
+    final diagMs = sw.elapsedMilliseconds;
     // 两个引擎都会写一行「会话开始」，这行用来区分是谁写的。
     diag.section('播放器窗口会话开始（windowId=${launch.windowId}）');
+    // 播放窗口的启动耗时要和主窗口的分开看：它不做媒体库那套（不开库、
+    // 不建海报缓存），所以这里的数字应该**明显更小**；一样大就说明
+    // 分流没生效，播放窗口白背了主窗口的启动成本。
+    diag.info(
+      '启动',
+      '播放器窗口就绪：总 ${DateTime.now().difference(t0).inMilliseconds}ms ｜ '
+          '支持目录 ${supportMs}ms、日志 ${diagMs}ms',
+    );
   } catch (e) {
     // 日志起不来不该挡住播放 —— 它只是让这次排查少一份材料。
     diag.warn('窗口', '播放器窗口无法启动日志：$e');

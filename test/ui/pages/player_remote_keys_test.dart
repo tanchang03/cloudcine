@@ -1,4 +1,5 @@
 import 'package:cloudcine/ui/pages/player_page.dart';
+import 'package:cloudcine/ui/widgets/player_keys.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -153,6 +154,42 @@ void main() {
         );
       }
     });
+
+    test('数字键在任何位置都跳到 N% —— 它是「明确的意图」，不像 OK 那样有歧义', () {
+      // 为什么「不挑焦点」是对的：焦点停在字幕按钮上时按 5，用户要的仍然是
+      // 「跳到一半」，而不是「激活字幕按钮」。反过来若在这里放行，TV 用户就
+      // 只剩方向键可用 —— 而方向键拖不动进度条（§5.5）。
+      for (final focused in [onStage, onWidget]) {
+        for (final entry in seekDigitKeys.entries) {
+          expect(
+            resolveRemoteKey(
+              key: entry.key,
+              immersive: false,
+              stageFocused: focused,
+            ),
+            RemoteKeyAction.seekPercent,
+            reason: '${entry.key}（数字 ${entry.value}）没路由到 seekPercent '
+                '(stageFocused=$focused)',
+          );
+        }
+      }
+    });
+
+    test('比例由键本身算 —— 0 → 0.0、5 → 0.5、9 → 0.9（不能跳结尾）', () {
+      // `resolveRemoteKey` 只回答「该干什么」，「是哪个数字」由这张共享表回答。
+      // 分开的原因：两个播放器都要用同一个枚举，而比例是纯数据。
+      expect(seekFractionForKey(LogicalKeyboardKey.digit0), 0.0);
+      expect(seekFractionForKey(LogicalKeyboardKey.digit5), 0.5);
+      expect(seekFractionForKey(LogicalKeyboardKey.digit9), 0.9);
+      expect(seekFractionForKey(LogicalKeyboardKey.numpad7), 0.7);
+      // 不提供「跳到结尾」：用户真正想按的是「不看了」，入口是返回键。
+      expect(
+        seekDigitKeys.values,
+        everyElement(lessThan(10)),
+        reason: '表里不该有 10 —— 跳到结尾会立刻触发播完退出，看起来像崩了',
+      );
+      expect(seekFractionForKey(LogicalKeyboardKey.keyA), isNull);
+    });
   });
 
   group('沉浸模式不能是单向门', () {
@@ -173,6 +210,23 @@ void main() {
           RemoteKeyAction.showControls,
           reason: 'TV 上没有 Esc。原来只有 Esc 能退出沉浸，'
               '进了沉浸模式就等于画面被锁死（$key）',
+        );
+      }
+    });
+
+    test('沉浸模式里数字键也是先叫回控制栏 —— 漏掉就是「按 5 没反应」', () {
+      // 判据是「认不认得这个键」（`_remoteKeys`）。数字键漏出这张表的话，
+      // 沉浸模式下按 5 不会跳转、也不会叫回控制栏 —— 表现是「数字键时灵时不灵」，
+      // 而它其实只是少了一行。
+      for (final entry in seekDigitKeys.entries) {
+        expect(
+          resolveRemoteKey(
+            key: entry.key,
+            immersive: true,
+            stageFocused: onStage,
+          ),
+          RemoteKeyAction.showControls,
+          reason: '${entry.key} 不在「认识的键」里 —— 沉浸模式下它会被吞掉',
         );
       }
     });

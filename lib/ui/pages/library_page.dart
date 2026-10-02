@@ -8,13 +8,16 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/media_category.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
 import '../providers/drive_browse_providers.dart';
 import '../providers/folder_providers.dart';
 import '../providers/library_providers.dart';
+import '../providers/library_selection_providers.dart';
 import '../providers/scan_providers.dart';
 import '../theme/app_theme.dart';
+import '../widgets/batch_merge_dialog.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/folder_browser.dart';
 import '../widgets/library_filter_panel.dart';
@@ -38,6 +41,52 @@ enum LibraryEmptyAction {
 
   /// 全部复位 —— 分类、排序、搜索词、面板两组。
   clearAll,
+}
+
+/// 点一部作品：解析「该播哪一条」然后开播。
+///
+/// 封面视图与列表视图**共用这一份**。两边各写一份的话，「列表里点了不动」
+/// 或「列表里点了却播错一集」只是时间问题 —— 而这两处的行为必须一致，
+/// 因为用户换来换去的是同一个「点片子就播」的预期。
+///
+/// [onBusy] 由调用方用来转圈：解析要打两次 SQLite，期间不给反馈的话用户
+/// 会觉得点了没反应，然后再点一次。
+Future<void> playWork({
+  required BuildContext context,
+  required WidgetRef ref,
+  required MediaWork work,
+  required void Function(bool busy) onBusy,
+}) async {
+  onBusy(true);
+  try {
+    final item = await resolvePlayTarget(
+      ref.read(mediaRepositoryProvider),
+      work.key,
+    );
+    if (!context.mounted) return;
+    if (item == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('这部作品下没有可播放的文件'),
+        ),
+      );
+      return;
+    }
+    diag.info('媒体库', '列表直开：${work.title} → ${item.displayTitle}');
+    await playItem(context, ref, item);
+  } catch (e, st) {
+    diag.error('媒体库', '列表直开失败', error: e, stackTrace: st);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text('打开失败：$e'),
+      ),
+    );
+  } finally {
+    onBusy(false);
+  }
 }
 
 /// 列表为空时该说哪句话、给哪个行动按钮。
@@ -174,69 +223,94 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     final stats = ref.watch(libraryStatsProvider).valueOrNull;
     final filter = ref.watch(libraryFilterProvider);
     final scanning = ref.watch(scanControllerProvider).running;
-    final posters = view == LibraryView.posters;
+
+    // 封面与列表列的是**同一批作品**（只是排布不同），所以排序 / 筛选 /
+    // 多选在这两个视图里完全共用；目录视图列的是网盘文件，那些控件在那里
+    // 没有任何可作用的东西。判据统一走 [LibraryView.showsWorks]。
+    final showsWorks = view.showsWorks;
+
+    // 多选只对作品列表有意义。目录视图下即使状态还残留（比如刚从封面切过来）
+    // 也不该把整页换成批量操作条 —— 那里没有「一部作品」可以勾。
+    final selecting = showsWorks && ref.watch(librarySelectionProvider).active;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        PageHeader(
-          title: '媒体库',
-          subtitle: posters
-              ? (stats == null
-                  ? null
-                  : '${stats.items} 个视频 · ${stats.works} 部作品')
-              : _folderSubtitle(ref),
-          actions: [
-            if (scanning)
-              const Padding(
-                padding: EdgeInsets.only(right: 8),
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: 13,
-                      height: 13,
-                      child: CircularProgressIndicator(strokeWidth: 1.6),
-                    ),
-                    SizedBox(width: 7),
-                    Text(
-                      '正在扫描',
-                      style: TextStyle(fontSize: 11.5, color: AppTheme.accent),
-                    ),
-                  ],
+        if (selecting)
+          _SelectionHeader(onRefresh: _refresh)
+        else
+          PageHeader(
+            title: '媒体库',
+            subtitle: showsWorks
+                ? (stats == null
+                    ? null
+                    : '${stats.items} 个视频 · ${stats.works} 部作品')
+                : _folderSubtitle(ref),
+            actions: [
+              if (scanning)
+                const Padding(
+                  padding: EdgeInsets.only(right: 8),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 13,
+                        height: 13,
+                        child: CircularProgressIndicator(strokeWidth: 1.6),
+                      ),
+                      SizedBox(width: 7),
+                      Text(
+                        '正在扫描',
+                        style: TextStyle(fontSize: 11.5, color: AppTheme.accent),
+                      ),
+                    ],
+                  ),
+                ),
+              const _ViewSwitch(),
+              const SizedBox(width: 8),
+              _SearchBox(
+                controller: _search,
+                onChanged: _onSearchChanged,
+                // 作品视图与目录视图搜的东西**不是一回事**，提示词必须说清：
+                // 作品视图搜的是库里已入库的作品 / 文件，目录视图筛的是
+                // **当前这一层网盘目录**。
+                hint: showsWorks ? '搜片名或文件名…' : '筛当前目录…',
+              ),
+              // 排序只对作品列表有意义：目录视图按**目录结构**排（自然序），
+              // 换排序方式在那里没有任何东西会变，摆着只会让人以为坏了。
+              if (showsWorks) ...[
+                const SizedBox(width: 8),
+                const _SortMenu(),
+                const SizedBox(width: 4),
+                // 年份 / 类型筛选同理：目录视图的列表是**文件**，
+                // 而年份 / 类型是作品的元数据，在那里没有可筛的东西。
+                const LibraryFilterButton(),
+                const SizedBox(width: 4),
+                // 「选择」是一个**模式开关**，不是一次动作：点它进入多选，
+                // 之后点卡片才是勾选。做成常驻按钮而不是长按 / 右键才出的
+                // 隐藏入口，是因为电视上既没有右键也没有可靠的长按。
+                TvIconLabel(
+                  label: '选择',
+                  child: IconButton(
+                    tooltip: '多选（批量合并）',
+                    onPressed: () =>
+                        ref.read(librarySelectionProvider.notifier).enter(),
+                    icon: const Icon(Icons.checklist_rounded, size: 17),
+                  ),
+                ),
+              ],
+              // 「刷新」是个纯图标按钮：桌面上悬停会出 tooltip，电视上没有
+              // hover —— 所以 TV 上补一个看得见的「刷新」标签。
+              TvIconLabel(
+                label: '刷新',
+                child: IconButton(
+                  tooltip: '刷新',
+                  onPressed: _refresh,
+                  icon: const Icon(Icons.refresh_rounded, size: 17),
                 ),
               ),
-            const _ViewSwitch(),
-            const SizedBox(width: 8),
-            _SearchBox(
-              controller: _search,
-              onChanged: _onSearchChanged,
-              // 两个视图搜的东西**不是一回事**，提示词必须说清：海报墙搜的是
-              // 库里已入库的作品/文件，目录视图筛的是**当前这一层网盘目录**。
-              hint: posters ? '搜片名或文件名…' : '筛当前目录…',
-            ),
-            // 排序只对海报墙有意义：目录视图按**目录结构**排（自然序），
-            // 换排序方式在那里没有任何东西会变，摆着只会让人以为坏了。
-            if (posters) ...[
-              const SizedBox(width: 8),
-              const _SortMenu(),
-              const SizedBox(width: 4),
-              // 年份 / 类型筛选同理：目录视图的列表是**文件**，
-              // 而年份 / 类型是作品的元数据，在那里没有可筛的东西。
-              const LibraryFilterButton(),
             ],
-            // 「刷新」是个纯图标按钮：桌面上悬停会出 tooltip，电视上没有
-            // hover —— 所以 TV 上补一个看得见的「刷新」标签。
-            TvIconLabel(
-              label: '刷新',
-              child: IconButton(
-                tooltip: '刷新',
-                onPressed: _refresh,
-                icon: const Icon(Icons.refresh_rounded, size: 17),
-              ),
-            ),
-          ],
-        ),
-        if (posters) ...[
+          ),
+        if (showsWorks) ...[
           const _CategoryBar(),
           Expanded(
             child: works.when(
@@ -290,7 +364,10 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
                     },
                   );
                 }
-                return _PosterGrid(works: list);
+                // 封面与列表读的是同一个 `list`，只有排布不同。
+                return view == LibraryView.posters
+                    ? _PosterGrid(works: list)
+                    : _WorkList(works: list);
               },
             ),
           ),
@@ -347,11 +424,21 @@ class _ViewSwitch extends ConsumerWidget {
           for (final option in LibraryView.values)
             _ViewSegment(
               label: option.label,
-              icon: option == LibraryView.posters
-                  ? Icons.grid_view_rounded
-                  : Icons.folder_rounded,
+              icon: switch (option) {
+                LibraryView.posters => Icons.grid_view_rounded,
+                LibraryView.list => Icons.view_list_rounded,
+                LibraryView.folders => Icons.folder_rounded,
+              },
               selected: view == option,
-              onTap: () => ref.read(libraryViewProvider.notifier).set(option),
+              onTap: () {
+                ref.read(libraryViewProvider.notifier).set(option);
+                // 切到目录视图时**顺带退出多选**：那里列的是网盘文件，没有
+                // 「一部作品」可以勾，留着选择状态再切回来会看到「刚回来就
+                // 莫名其妙选着几部」，而那几部还是上一次的老选择。
+                if (!option.showsWorks) {
+                  ref.read(librarySelectionProvider.notifier).exit();
+                }
+              },
             ),
         ],
       ),
@@ -652,36 +739,14 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
 
   Future<void> _play() async {
     if (_resolving) return;
-    setState(() => _resolving = true);
-    try {
-      final item = await resolvePlayTarget(
-        ref.read(mediaRepositoryProvider),
-        widget.work.key,
-      );
-      if (!mounted) return;
-      if (item == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            behavior: SnackBarBehavior.floating,
-            content: Text('这部作品下没有可播放的文件'),
-          ),
-        );
-        return;
-      }
-      diag.info('媒体库', '卡片直开：${widget.work.title} → ${item.displayTitle}');
-      await playItem(context, ref, item);
-    } catch (e, st) {
-      diag.error('媒体库', '卡片直开失败', error: e, stackTrace: st);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          behavior: SnackBarBehavior.floating,
-          content: Text('打开失败：$e'),
-        ),
-      );
-    } finally {
-      if (mounted) setState(() => _resolving = false);
-    }
+    await playWork(
+      context: context,
+      ref: ref,
+      work: widget.work,
+      onBusy: (busy) {
+        if (mounted) setState(() => _resolving = busy);
+      },
+    );
   }
 
   void _openDetail() => context.push(
@@ -691,6 +756,9 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
   @override
   Widget build(BuildContext context) {
     final work = widget.work;
+    final selection = ref.watch(librarySelectionProvider);
+    final selecting = selection.active;
+    final selected = selection.contains(work.key);
 
     final card = MouseRegion(
       cursor: SystemMouseCursors.click,
@@ -698,7 +766,19 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
       onExit: (_) => setState(() => _hovered = false),
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
-        onTap: _play,
+        // **多选模式下点卡片 = 勾选，不是开播**。这是这个开关唯一改变的事，
+        // 但它必须彻底：一边勾一边顺手播出去一部片子，比不能多选更糟。
+        onTap: selecting
+            ? () => ref
+                .read(librarySelectionProvider.notifier)
+                .toggle(work.key)
+            : _play,
+        // 长按 = 「我要选这部」的快捷进入方式（桌面右键在这里没有对应物，
+        // 而触摸设备上长按是唯一自然的入口）。必须**连按的那一下一起生效**。
+        onLongPress: selecting
+            ? null
+            : () =>
+                ref.read(librarySelectionProvider.notifier).enter(work.key),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -707,9 +787,34 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
                 fit: StackFit.expand,
                 children: [
                   PosterImage(work: work),
+                  if (selecting)
+                    // 勾选框**压在海报上**而不是替掉它：多选时用户判断「这是
+                    // 不是我要的那部」靠的仍然是封面，把图换成方框等于让他
+                    // 盲选。
+                    Positioned(
+                      left: 6,
+                      top: 6,
+                      child: _SelectionTick(selected: selected),
+                    ),
+                  if (selecting && selected)
+                    // 选中的整张压一层淡蓝：小方框在深色海报上不够显眼，
+                    // 勾了 8 部之后用户需要一眼看出哪几部是勾上的。
+                    IgnorePointer(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: AppTheme.accent.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: AppTheme.accent.withValues(alpha: 0.55),
+                            width: 1,
+                          ),
+                        ),
+                      ),
+                    ),
                   // 悬停时压一层暗罩 + 播放图标：把「点这张卡片会直接播」
-                  // 这件事在点下去**之前**就说清楚。
-                  if (_hovered && !_resolving)
+                  // 这件事在点下去**之前**就说清楚。多选时不画 —— 那时点下去
+                  // 是勾选，画个播放图标是在骗人。
+                  if (_hovered && !_resolving && !selecting)
                     IgnorePointer(
                       child: DecoratedBox(
                         decoration: BoxDecoration(
@@ -863,6 +968,373 @@ class _DetailButton extends StatelessWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 多选时压在封面 / 缩略图角上的那个圈。
+///
+/// 两种视图**共用这一个**：勾的状态如果一边是蓝圈一边是蓝框，用户换到
+/// 列表视图就会怀疑自己刚才是不是没勾上。
+class _SelectionTick extends StatelessWidget {
+  const _SelectionTick({required this.selected, this.size = 20});
+
+  final bool selected;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: selected
+            ? AppTheme.accent
+            : Colors.black.withValues(alpha: 0.55),
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: selected ? AppTheme.accent : Colors.white70,
+          width: 1.4,
+        ),
+      ),
+      child: selected
+          ? Icon(Icons.check_rounded, size: size - 6, color: Colors.white)
+          : null,
+    );
+  }
+}
+
+/// 列表视图：一行一部作品。
+///
+/// ## 它存在的理由
+///
+/// 封面视图是「扫一眼找片子」，但库一大（几百部）就没有「扫一眼」这回事了
+/// —— 用户要的是**按片名找**、是**一眼看到 N 部连续排下来**。列表一屏能放
+/// 的条数是封面的三到四倍，而且片名完整不截断。
+///
+/// ## 刻意与封面视图保持的四个一致
+///
+/// 点整行 = **开播**（不是进详情）、长按 = 进入多选并勾上这一行、副标题用的
+/// 是同一条 `subtitleLine`、「简介」按钮同样常驻。两边只要有一处不同，用户
+/// 换视图时就会踩空 —— 而他换视图往往正是因为想更快地把片子点开。
+class _WorkList extends StatelessWidget {
+  const _WorkList({required this.works});
+
+  final List<MediaWork> works;
+
+  @override
+  Widget build(BuildContext context) {
+    final list = ListView.separated(
+      padding: const EdgeInsets.fromLTRB(22, 4, 22, 28),
+      itemCount: works.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, i) => _WorkListRow(work: works[i]),
+    );
+
+    // 与封面视图同一档处理：TV 上放大文字，但**不动**行密度（列表的价值
+    // 就是「一屏能看到更多」，为了字号牺牲条数是本末倒置）。
+    return AppTheme.tvTextScaler(context, list);
+  }
+}
+
+class _WorkListRow extends ConsumerStatefulWidget {
+  const _WorkListRow({required this.work});
+
+  final MediaWork work;
+
+  @override
+  ConsumerState<_WorkListRow> createState() => _WorkListRowState();
+}
+
+class _WorkListRowState extends ConsumerState<_WorkListRow> {
+  bool _hovered = false;
+
+  /// 正在解析「该播哪一条」。解析要打两次 SQLite，期间给个转圈 ——
+  /// 否则用户会觉得点了没反应，然后再点一次。
+  bool _resolving = false;
+
+  Future<void> _play() async {
+    if (_resolving) return;
+    await playWork(
+      context: context,
+      ref: ref,
+      work: widget.work,
+      onBusy: (busy) {
+        if (mounted) setState(() => _resolving = busy);
+      },
+    );
+  }
+
+  void _openDetail() => context.push(
+        '/work?key=${Uri.encodeComponent(widget.work.key)}',
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final work = widget.work;
+    final selection = ref.watch(librarySelectionProvider);
+    final selecting = selection.active;
+    final selected = selection.contains(work.key);
+
+    return TvFocusable(
+      borderRadius: BorderRadius.circular(8),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          // 与封面卡片**同一套**口径：多选时点 = 勾选，其余时候点 = 开播。
+          onTap: selecting
+              ? () => ref
+                  .read(librarySelectionProvider.notifier)
+                  .toggle(work.key)
+              : _play,
+          onLongPress: selecting
+              ? null
+              : () => ref.read(librarySelectionProvider.notifier).enter(work.key),
+          child: Container(
+            decoration: BoxDecoration(
+              color: selected
+                  ? AppTheme.accent.withValues(alpha: 0.13)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 42,
+                  height: 63,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      PosterImage(work: work, borderRadius: 5),
+                      if (selecting)
+                        Positioned(
+                          left: 3,
+                          top: 3,
+                          child: _SelectionTick(
+                            selected: selected,
+                            size: 17,
+                          ),
+                        ),
+                      if (_resolving)
+                        const DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: Color(0x66000000),
+                          ),
+                          child: Center(
+                            child: SizedBox(
+                              width: 15,
+                              height: 15,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 1.8,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        work.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: AppTheme.text,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        work.subtitleLine,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 11, color: AppTheme.dim),
+                      ),
+                      if (work.metaLine.isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          work.metaLine,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 10.5,
+                            color: AppTheme.muted,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                if (!work.isScraped)
+                  const TagChip(label: '文件名', color: AppTheme.dim),
+                const SizedBox(width: 8),
+                // 多选时**不画**「简介」：那时整行都是勾选区，右下角再挂一个
+                // 会跳页的按钮，误触代价是把刚勾好的 8 部丢掉。
+                if (!selecting)
+                  _DetailButton(
+                    highlighted: _hovered,
+                    onTap: _openDetail,
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 多选模式下**替换页头**的那条操作栏。
+///
+/// ## 为什么要换掉整个页头，而不是在下面加一条
+///
+/// 多选是一个**模式**，不是一个面板：进去之后搜索框、排序、筛选这些控件
+/// 全都没有意义（勾完 8 部再去改排序，选择会被列表重建冲得七零八落）。
+/// 把它们留在屏幕上，用户会去点，然后发现选择莫名其妙变了。换掉页头是
+/// 唯一能把这个「现在是另一种状态」讲清楚的做法。
+///
+/// ## 「全选」选的是**当前列表里可见的**
+///
+/// 不是全库。`workListProvider` 给的就是当前分类 / 搜索 / 筛选下的结果，
+/// 而用户说「全选」时指的一定是「把屏幕上这些全勾上」—— 全库全选会把他
+/// 根本没看见的几百部一起并进某一部里，那是不可逆的灾难（虽然能撤销，
+/// 但没人会在乎一个自己没见过的数字）。
+class _SelectionHeader extends ConsumerWidget {
+  const _SelectionHeader({required this.onRefresh});
+
+  /// 合并 / 撤销之后让列表与角标重取。
+  final VoidCallback onRefresh;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final selection = ref.watch(librarySelectionProvider);
+    final visible = ref.watch(workListProvider).valueOrNull ?? const [];
+    final allSelected =
+        visible.isNotEmpty && visible.every((w) => selection.contains(w.key));
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 22, 12),
+      decoration: const BoxDecoration(
+        color: AppTheme.panel,
+        border: Border(bottom: BorderSide(color: AppTheme.line, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          IconButton(
+            tooltip: '退出多选',
+            iconSize: 18,
+            onPressed: () =>
+                ref.read(librarySelectionProvider.notifier).exit(),
+            icon: const Icon(Icons.close_rounded),
+          ),
+          const SizedBox(width: 4),
+          Text(
+            selection.isEmpty
+                ? '勾选要管理的作品'
+                : '已选 ${selection.count} 部',
+            style: const TextStyle(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.text,
+            ),
+          ),
+          const SizedBox(width: 14),
+          TextButton(
+            onPressed: visible.isEmpty || allSelected
+                ? null
+                : () => ref
+                    .read(librarySelectionProvider.notifier)
+                    .addAll(visible.map((w) => w.key)),
+            child: Text(
+              allSelected ? '已全选' : '全选 ${visible.length} 部',
+              style: const TextStyle(fontSize: 12.5),
+            ),
+          ),
+          TextButton(
+            onPressed: selection.isEmpty
+                ? null
+                : () =>
+                    ref.read(librarySelectionProvider.notifier).clearKeys(),
+            child: const Text('取消选择', style: TextStyle(fontSize: 12.5)),
+          ),
+          const Spacer(),
+          FilledButton.icon(
+            onPressed: selection.isEmpty
+                ? null
+                : () => _mergeSelected(context, ref),
+            style: FilledButton.styleFrom(
+              backgroundColor: AppTheme.accent,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            icon: const Icon(Icons.merge_type_rounded, size: 15),
+            label: const Text(
+              '合并到…',
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 把当前勾选的这一批并到某一部上。
+  ///
+  /// 作品对象**重新从库里读**（而不是拿 `workListProvider` 里那几行）：
+  /// 用户勾完之后列表可能因为后台扫描 / 播放落库重建过，手上那几行有可能是
+  /// 旧的 —— 拿旧行去合并，`mergedInto` 的校验会用到过期的 `mergedInto`
+  /// 值，出现「明明能合却说合不了」。
+  Future<void> _mergeSelected(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final repo = ref.read(mediaRepositoryProvider);
+    final keys = ref.read(librarySelectionProvider).keys;
+
+    final all = await repo.allWorks();
+    final byKey = {for (final w in all) w.key: w};
+    final sources = [for (final k in keys) if (byKey[k] != null) byKey[k]!];
+    if (sources.isEmpty) return;
+    if (!context.mounted) return;
+
+    final result = await BatchMergeDialog.show(context, sources);
+    if (result == null) return;
+
+    // 合并完立刻退出多选：留在模式里的话，列表里那几部已经消失（成了别名
+    // 行），而顶栏还写着「已选 5 部」—— 一个指向不存在的东西的计数。
+    ref.read(librarySelectionProvider.notifier).exit();
+    onRefresh();
+
+    messenger.showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(result.message),
+        action: SnackBarAction(
+          label: '撤销',
+          onPressed: () async {
+            final n = await WorkMergeService(library: repo)
+                .undo(result.plan.sourceKeys);
+            onRefresh();
+            messenger.showSnackBar(
+              SnackBar(
+                behavior: SnackBarBehavior.floating,
+                content: Text('已撤销，$n 部作品恢复为独立条目。'),
+              ),
+            );
+          },
         ),
       ),
     );

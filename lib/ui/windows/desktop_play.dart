@@ -1,10 +1,12 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/error/drive_error.dart';
 import '../../data/db/settings_store.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/subtitle_track.dart';
+import '../../domain/services/missing_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../providers/app_providers.dart';
 import 'player_protocol.dart';
@@ -41,6 +43,19 @@ Future<bool> openInPlayerWindow(
     final request = await buildPlayRequest(ref.read, item, qualityId: qualityId);
     final controller = await const PlayerWindowLauncher().open(request);
     return controller != null;
+  } on DriveException catch (e, st) {
+    diag.error('窗口', '开独立播放窗口失败，退回内置播放页', error: e, stackTrace: st);
+    // 「文件已经不在网盘上」**不退回内置页**。
+    //
+    // 内置页会拿同一个 fid 再取一次链，必然以同样的方式失败：白烧一次
+    // 请求，还把用户晾在一个注定打不开的播放页上，而那里能给的只有一句
+    // 「文件不存在」。真正该问的是「这条索引还有没有用」—— 那是调用方
+    // （`playItem`）的活，所以抛给它。
+    //
+    // 其它失败种类（登录失效、限流、网络）照旧退回：那些情况下文件还在，
+    // 内置页的重试按钮是有意义的。
+    if (isMissingFileError(e)) rethrow;
+    return false;
   } catch (e, st) {
     diag.error('窗口', '开独立播放窗口失败，退回内置播放页', error: e, stackTrace: st);
     return false;
@@ -79,11 +94,19 @@ Future<PlayRequest> buildPlayRequest(
   final values = await settings.readAll(const [
     SettingKeys.defaultQuality,
     SettingKeys.rememberPosition,
+    SettingKeys.autoPlayNext,
+    SettingKeys.skipIntro,
   ]);
   final preferred = qualityId ?? _nonEmpty(values[SettingKeys.defaultQuality]);
   // 设置里缺这一项时按「记住」处理：与 `AppSettings.rememberPosition` 的
   // 缺省值保持一致，两处不一致会出现「设置页显示开、实际没记住」。
   final remember = values[SettingKeys.rememberPosition] != 'false';
+  // 连播与跳片头必须**随请求投过去**：播放窗口在另一个引擎里，读不到设置库
+  // （见 `PlayRequest.autoPlayNext` 的类文档）。判据与 `AppSettings.fromValues`
+  // 一致（缺失即开）—— 写成 `== 'true'` 会让「主窗口某次漏带」表现成
+  // 「这两项在设置页开着却完全不生效」。
+  final autoPlayNext = values[SettingKeys.autoPlayNext] != 'false';
+  final skipIntro = values[SettingKeys.skipIntro] != 'false';
 
   // 剧集列表与续播位置一起取：它们来自同一批兄弟条目，分两次查会多一次
   // 往返，也容易漏掉「当前这一集」本身（它不是从 `siblings` 里挑出来的，
@@ -120,11 +143,14 @@ Future<PlayRequest> buildPlayRequest(
     diag.info('窗口', '续播：${item.displayTitle} 从 ${start.inSeconds}s 开始');
   }
 
+  // 作品行读一次，供三处用：剧集列表的缩略图、手标的片头区间。
+  // 分两次读会多一次往返，而且两处拿到的可能是不同版本的行。
+  final work = await repository.workByKey(item.groupKey);
+
   // 海报只查一次：剧集列表里每一集的缩略图都是**同一张作品海报**
   // （网盘不给逐集预览图，理由见 `PlaylistEntry.thumbnailUrl`）。
-  final posterUrl = siblings.length < 2
-      ? null
-      : _nonEmpty((await repository.workByKey(item.groupKey))?.posterUrl);
+  final posterUrl =
+      siblings.length < 2 ? null : _nonEmpty(work?.posterUrl);
 
   return PlayRequest(
     url: picked.url.toString(),
@@ -158,8 +184,19 @@ Future<PlayRequest> buildPlayRequest(
       siblings: siblings,
       resume: resume,
       thumbnailUrl: posterUrl,
+      // 刮削后的剧名（没刮过就是本地解析出的片名）。**必须用作品行上的
+      // 那个**，不是条目自己的 `title`：列表里一行一行扫的时候用户认的是
+      // 「这部剧叫什么」，而条目上的 title 只是单个文件解析出来的东西。
+      // 作品行缺失时 `listLabel` 会自己退回条目的 `title`。
+      workTitle: work?.title,
     ),
     subtitles: await _buildSubtitles(repository, item.id),
+    autoPlayNext: autoPlayNext,
+    skipIntro: skipIntro,
+    // 手标的片头区间。文件章节那一份由播放窗口自己从 mpv 读（它手里就有），
+    // 这一对只能随请求过去 —— 库在主窗口。
+    introStartMs: work?.introStartMs,
+    introEndMs: work?.introEndMs,
   );
 }
 
@@ -197,37 +234,76 @@ List<PlaylistEntry> _buildPlaylist({
   required List<MediaItem> siblings,
   required Map<String, Duration> resume,
   required String? thumbnailUrl,
+  String? workTitle,
 }) {
   if (siblings.length < 2) return const <PlaylistEntry>[];
+  final labels = _playlistLabels(siblings, workTitle: workTitle);
   return <PlaylistEntry>[
-    for (final s in siblings)
+    for (var i = 0; i < siblings.length; i++)
       PlaylistEntry(
-        itemId: s.id,
-        title: _episodeLabel(s),
-        subtitle: s.technicalSummary,
+        itemId: siblings[i].id,
+        title: labels[i],
+        subtitle: siblings[i].technicalSummary,
         thumbnailUrl: thumbnailUrl,
         // 原始值（不套「看完就从片头」）—— 面板上要用它画进度条。
         // 真正切过去时的起点由播放窗口算，见 `PlaylistEntry` 的类文档。
-        resumePosition: resume[s.id] ?? Duration.zero,
-        duration: _durationOf(s),
+        resumePosition: resume[siblings[i].id] ?? Duration.zero,
+        duration: _durationOf(siblings[i]),
+        // 花絮 / 预告 / 样片。自动连播要跳过它们而不是撞上就停 ——
+        // 判据取自扫描期的结果，不在这里重算（见 `PlaylistEntry.isExtra`）。
+        isExtra: siblings[i].isSampleOrExtra,
       ),
   ];
 }
 
-/// 剧集列表上的主标题。
+/// 列表里每一行的标题 —— **先短，撞名才补信息**。
 ///
-/// 不用 `displayTitle`：它带着片名（`剧名 S01E03`），而列表里每一行都是
-/// 同一部剧，片名是纯噪音 —— 用户扫的是集号。多季时补一个季前缀，
-/// 否则第二季的「第 3 集」会跟第一季的撞在一起分不清。
-String _episodeLabel(MediaItem item) {
-  final e = item.episode;
-  if (e == null) return item.displayTitle;
+/// ## 为什么要这一步（不能直接用 `compact`）
+///
+/// 同一部剧的同一集常常有多个版本（翡翠台 / MyTVSuper、国语 / 粤语），它们的
+/// `season`/`episode` 一模一样，`compact` 口径下**全写成 `第 1 集`** ——
+/// 面板里就会出现两行一模一样的字。窄面板放不下版本名，但「撞名」是可以
+/// 检测出来的：只给撞了的那几条加信息，其余保持短标题，不白白浪费本来就
+/// 只有 320px 的宽度。
+///
+/// ## 逐级退让（每一级都只在**还撞着**的时候才用）
+///
+///   1. `第 3 集` —— 常态，最省空间；
+///   2. `剧名 S01E03` —— 补片名，两个版本之间只有它不同；
+///   3. `剧名-文件名` —— 连片名也分不开的两条（同一集的两个压制/码率），
+///      只有文件名保证互不相同。
+///
+/// ⚠️ 递进去的是**作品行**的标题（刮削后的剧名）：用户认的是「这部剧叫什么」，
+/// 而条目自己的 `title` 只是单个文件解析出来的东西
+/// （`/来自：分享/F飞CC日  志2/01.国语.mp4` 解析出的是 `F飞CC日 志2`）。
+List<String> _playlistLabels(List<MediaItem> items, {String? workTitle}) {
+  var labels = <String>[
+    for (final it in items)
+      it.rowLabel(RowLabelStyle.compact, workTitle: workTitle),
+  ];
 
-  final season = item.season;
-  final end = item.episodeEnd;
-  final range = (end != null && end != e) ? '$e-$end' : '$e';
-  final prefix = (season == null || season <= 1) ? '' : 'S$season · ';
-  return '$prefix第 $range 集';
+  // 两级退让，最多各跑一次：先 `withTitle`，还撞就 `fileName`。
+  for (final style in const [RowLabelStyle.withTitle, RowLabelStyle.fileName]) {
+    final clashing = _clashingLabels(labels);
+    if (clashing.isEmpty) break;
+    labels = <String>[
+      for (var i = 0; i < items.length; i++)
+        clashing.contains(labels[i])
+            ? items[i].rowLabel(style, workTitle: workTitle)
+            : labels[i],
+    ];
+  }
+  return labels;
+}
+
+/// 出现次数大于 1 的那些标题。**必须按「值」统计** —— 这正是要检测的东西。
+Set<String> _clashingLabels(List<String> labels) {
+  final seen = <String>{};
+  final clashing = <String>{};
+  for (final l in labels) {
+    if (!seen.add(l)) clashing.add(l);
+  }
+  return clashing;
 }
 
 Duration _durationOf(MediaItem item) {

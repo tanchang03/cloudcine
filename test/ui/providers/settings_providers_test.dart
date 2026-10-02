@@ -93,10 +93,21 @@ void main() {
       expect(s.onlineScrape, isFalse);
       expect(s.autoScrapeOnScan, isFalse,
           reason: '自动刮削默认关，判据必须是「等于 true」而不是「不等于 false」');
+      expect(s.autoMergeByOnlineId, isTrue,
+          reason: '自动归一默认**开**，判据必须是「不等于 false」而不是「等于 true」'
+              '—— 这两项刻意相反。写反的后果不是报错，而是「新装用户永远不合库」');
       expect(s.autoLoadSubtitles, isTrue,
           reason: '字幕默认**加载**，与 PlaybackController 的缺省行为一致 —— '
               '两处不一致会出现「设置页显示开、实际没加载」');
       expect(s.rememberPosition, isTrue);
+      expect(s.autoPlayNext, isTrue,
+          reason: '连播默认**开**：它只在 completed 事件到来时动一下播放列表游标，'
+              '不发请求、不改库，没有任何代价。默认关的话用户看剧时每集结束'
+              '都要拿起遥控器 —— 而这个功能的意义恰恰是躺着看完一整季');
+      expect(s.skipIntro, isTrue,
+          reason: '跳片头默认**开**的前提是「没有标识就什么都不做」：'
+              '区间只有文件章节 / 手标两路来源，两路都没有时这条规则空转，'
+              '所以开着它不会出现「看的好好的忽然跳了 90 秒」');
       expect(s.playerVolume, 100);
       expect(s.playerRate, 1);
       expect(s.scanIntervalMs, 350);
@@ -133,6 +144,57 @@ void main() {
       expect(s.autoScrapeOnScan, isTrue);
       expect(s.canAutoScrape, isFalse,
           reason: '两个开关都开了但一个源都没配，仍然什么都不该发生');
+    });
+
+    test('自动归一只认「显式 false」才关掉', () {
+      // 缺键 = 开（与 `autoScrapeOnScan` 相反）。判据写成 `== 'true'` 的话，
+      // 老库升级上来会**静默地关掉**归一，而用户在设置页看到开关是开的。
+      expect(
+        AppSettings.fromValues(const <String, String?>{})
+            .autoMergeByOnlineId,
+        isTrue,
+      );
+      expect(
+        AppSettings.fromValues(const <String, String?>{
+          SettingKeys.autoMergeByOnlineId: 'false',
+        }).autoMergeByOnlineId,
+        isFalse,
+      );
+      expect(
+        AppSettings.fromValues(const <String, String?>{
+          SettingKeys.autoMergeByOnlineId: 'true',
+        }).autoMergeByOnlineId,
+        isTrue,
+      );
+    });
+
+    test('连播与跳片头也只认「显式 false」才关掉', () {
+      // 与 `autoMergeByOnlineId` 同一族：判据写成 `== 'true'` 的话，
+      // 老库升级上来会**静默地**把两项都关掉，而设置页的开关是**开着**的
+      // —— 用户看到的是「开关明明打开了，怎么不连播 / 不跳片头」，
+      // 一个没人会想到去查的默认值问题。
+      final fresh = AppSettings.fromValues(const <String, String?>{});
+      expect(fresh.autoPlayNext, isTrue);
+      expect(fresh.skipIntro, isTrue);
+
+      final off = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.autoPlayNext: 'false',
+        SettingKeys.skipIntro: 'false',
+      });
+      expect(off.autoPlayNext, isFalse);
+      expect(off.skipIntro, isFalse);
+    });
+
+    test('关掉「记住播放进度」不影响连播', () {
+      // 两者在代码里是独立的。绑在一起（`rememberPosition && autoPlayNext`）
+      // 看着省事，实际会造出「关了记住进度就再也不连播」这种没人预料得到的
+      // 联动 —— 而设置页的两条提示文案里**都没有**提到对方。
+      final s = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.rememberPosition: 'false',
+      });
+      expect(s.rememberPosition, isFalse);
+      expect(s.autoPlayNext, isTrue,
+          reason: '连播的触发条件是 completed 事件，与「有没有存续播点」无关');
     });
 
     test('数值与日期解析失败时退回默认值', () {

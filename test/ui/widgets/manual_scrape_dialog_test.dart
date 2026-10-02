@@ -519,6 +519,93 @@ void main() {
       expect(find.text('改好片名，点「搜索」看候选。'), findsOneWidget);
     });
   });
+
+  group('刮削结果里的媒体类型（可手工修改）', () {
+    testWidgets('选中候选后才出现，默认是「自动」', (tester) async {
+      await open(tester);
+
+      expect(
+        find.text('媒体类型：'),
+        findsNothing,
+        reason: '没选候选时它没有对象 —— 摆在底部只会占地方。',
+      );
+
+      await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('超级马力欧银河大电影'));
+      await tester.pump();
+
+      expect(find.text('媒体类型：'), findsOneWidget);
+      expect(find.text('自动'), findsOneWidget);
+      expect(
+        find.textContaining('自动 = 按本次刮削结果判定'),
+        findsOneWidget,
+        reason: '「自动」不是「保持不变」：它意味着按本次刮削结果判定。'
+            '不写清楚的话，用户会以为不动它就是「类型不变」。',
+      );
+      expect(
+        find.textContaining('之前若被锁过分类，手动重刮也会按本次结果重判'),
+        findsOneWidget,
+        reason: '这条特别要说清：作品之前被「自定义」锁过分类时，「自动」'
+            '照样按本次结果重判 —— 否则用户会以为「我明明重刮了，怎么没变」。',
+      );
+    });
+
+    testWidgets('不动它 → 类型按刮削结果判定，且不锁', (tester) async {
+      final (_, repo) = await open(tester);
+
+      await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('超级马力欧银河大电影'));
+      await tester.pump();
+      await tester.tap(applyButton());
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.anime,
+        reason: '假源给的类型标签是「动画」→ 按既有规则落「动漫」。',
+      );
+      expect(
+        repo.written.single.categoryManual,
+        isFalse,
+        reason: '用户没动那个选择框 —— 别顺手把分类锁住。',
+      );
+    });
+
+    testWidgets('点「纪录片」→ 落库为该类型并锁住', (tester) async {
+      final (_, repo) = await open(tester);
+
+      await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('超级马力欧银河大电影'));
+      await tester.pump();
+
+      await tester.tap(find.text('纪录片'));
+      await tester.pump();
+
+      expect(find.textContaining('已指定为「纪录片」'), findsOneWidget);
+
+      await tester.tap(applyButton());
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.documentary,
+        reason: '用户亲手选的类型是结论，优先于类型标签的折算。',
+      );
+      expect(
+        repo.written.single.categoryManual,
+        isTrue,
+        reason: '他在「用这一条更新」那一步看过这个选择 —— 之后不该被自动流程改写。',
+      );
+    });
+  });
 }
 
 /// 搜得出候选、但解析永远失败。

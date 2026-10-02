@@ -1,5 +1,9 @@
 import 'package:flutter/foundation.dart';
 
+import '../../core/utils/filename_parser.dart';
+import '../../domain/services/intro_marker.dart';
+import '../../domain/services/missing_media.dart';
+
 /// 一档可选的清晰度。**只有元信息，没有地址。**
 ///
 /// ## 为什么地址不跟着来
@@ -278,12 +282,16 @@ class PlaylistEntry {
     this.thumbnailUrl,
     this.resumePosition = Duration.zero,
     this.duration = Duration.zero,
+    this.isExtra = false,
   });
 
   /// 这一集的媒体项 id（`provider:fileId`）。切集时原样报回主窗口。
   final String itemId;
 
-  /// 主标题。剧集是 `第 3 集`（多集连播是 `第 3-4 集`），否则是片名。
+  /// 主标题。有集号时是 `第 3 集`（多集连播是 `第 3-4 集`）；**提不出集号时
+  /// 是 `剧名-文件名`** —— 那一支不能用片名，否则「目录名作为系列名」的
+  /// 目录（整目录归一部剧、季集号被刻意清掉）下列表里每一行都是同一个剧名，
+  /// 完全分不出是哪一集。组装规则见 `desktop_play.dart` 的 `_episodeLabel`。
   final String title;
 
   /// 副标题（`2160P · MKV · H.265 · 12.3 GB`）。可能为空。
@@ -300,6 +308,18 @@ class PlaylistEntry {
   /// 这一集的时长。未知时是 [Duration.zero]。
   final Duration duration;
 
+  /// 这一条是不是**花絮 / 预告 / 样片**。
+  ///
+  /// 自动连播必须跳过它们，而不是撞上就停（见 `EpisodeQueue.nextAfter`
+  /// 第 2 条）：网盘上的剧集目录里经常混着 `S01E01.预告.mp4` / `Sample.mkv`，
+  /// 而且顺序不固定 —— 不跳的话，第 2 集播完会开始播一个 30 秒的预告片，
+  /// 而用户刚把遥控器放下。
+  ///
+  /// 判据来自扫描期的 `MediaItem.isSampleOrExtra`（唯一实现在
+  /// `media_entry_classifier.dart`），**不在播放窗口里重算** —— 它拿不到
+  /// 文件名以外的信息，重算必然与库里的口径漂移。
+  final bool isExtra;
+
   /// 有没有看过一点。面板据此决定要不要画那条细进度条。
   bool get hasProgress => resumePosition > Duration.zero;
 
@@ -310,6 +330,7 @@ class PlaylistEntry {
         'thumbnailUrl': thumbnailUrl,
         'resumePositionMs': resumePosition.inMilliseconds,
         'durationMs': duration.inMilliseconds,
+        'isExtra': isExtra,
       };
 
   /// 畸形输入返回 null。**没有 itemId 的项没有意义** —— 点它也不知道该播什么。
@@ -323,6 +344,10 @@ class PlaylistEntry {
     final thumbnail = raw['thumbnailUrl'];
     final resume = raw['resumePositionMs'];
     final duration = raw['durationMs'];
+    // 缺这一项时按「不是花絮」处理：老版本主窗口投过来的请求里没有它，
+    // 而把每一集都当成花絮的后果是**自动连播整个失效**（一直往后扫到结尾），
+    // 比偶尔播一个预告片严重得多。
+    final isExtra = raw['isExtra'];
 
     return PlaylistEntry(
       itemId: itemId,
@@ -337,6 +362,7 @@ class PlaylistEntry {
       duration: Duration(
         milliseconds: duration is int && duration > 0 ? duration : 0,
       ),
+      isExtra: isExtra is bool && isExtra,
     );
   }
 
@@ -349,7 +375,8 @@ class PlaylistEntry {
           other.subtitle == subtitle &&
           other.thumbnailUrl == thumbnailUrl &&
           other.resumePosition == resumePosition &&
-          other.duration == duration;
+          other.duration == duration &&
+          other.isExtra == isExtra;
 
   @override
   int get hashCode => Object.hash(
@@ -359,11 +386,13 @@ class PlaylistEntry {
         thumbnailUrl,
         resumePosition,
         duration,
+        isExtra,
       );
 
   @override
   String toString() =>
-      'PlaylistEntry($title, ${resumePosition.inSeconds}s/${duration.inSeconds}s)';
+      'PlaylistEntry($title, ${resumePosition.inSeconds}s/${duration.inSeconds}s'
+      '${isExtra ? ", 花絮" : ""})';
 }
 
 /// 主窗口 → 播放窗口的「播这个」请求。
@@ -398,6 +427,10 @@ class PlayRequest {
     this.qualities = const <QualityBrief>[],
     this.playlist = const <PlaylistEntry>[],
     this.subtitles = const <SubtitleBrief>[],
+    this.autoPlayNext = true,
+    this.skipIntro = true,
+    this.introStartMs,
+    this.introEndMs,
   });
 
   /// 直链地址（含签名查询串）
@@ -471,6 +504,48 @@ class PlayRequest {
   /// `stream.tracks` 读，这里的则是**视频文件之外**的独立文件。
   final List<SubtitleBrief> subtitles;
 
+  /// 一集播完是否自动播下一集。来自设置 `SettingKeys.autoPlayNext`。
+  ///
+  /// ## 为什么这个开关必须**跟着请求过来**
+  ///
+  /// 播放窗口跑在另一个引擎里，**读不到设置库**（设置存在主窗口的 SQLite 里，
+  /// 见 `SettingsStore` 的类文档）。它自己也没有「设置」这个概念 ——
+  /// 想让它知道这一项，只有两条路：每次判断时回主窗口问一次（为一个布尔值
+  /// 多一次跨引擎往返，而且要在播完那一刻同步拿到），或者随请求一起带过来。
+  /// 后者显然更省，代价只是「播到一半去改设置不生效」—— 那本来也该下次生效。
+  ///
+  /// ⚠️ 缺省值是 **true**：与 `AppSettings.fromValues` 的判据
+  /// （`!= 'false'`）一致。缺省 false 的话，主窗口某次忘了带这个字段就会
+  /// 表现成「自动连播整个失效」，而没有任何报错。
+  final bool autoPlayNext;
+
+  /// 有片头标识时是否自动跳过片头。来自设置 `SettingKeys.skipIntro`。
+  ///
+  /// 与 [autoPlayNext] 同样必须随请求过来，缺省值同样是 **true**。
+  final bool skipIntro;
+
+  /// 用户**手标**的片头区间（毫秒）。`null` = 没标过。
+  ///
+  /// ## 为什么手标区间要传过来，而文件章节不用
+  ///
+  /// 文件章节是播放窗口**自己从 mpv 读**的（`chapter-list`，见
+  /// `Mp4Chapters` 那套工具），它手里就有，不必传。
+  ///
+  /// 手标的那一份存在库里（`MediaWork.introStartMs`），而库在主窗口 ——
+  /// 播放窗口拿不到。所以只能随请求过来。
+  ///
+  /// 优先级：**文件章节优先**（那是发布者给的、与这一集严格对应），
+  /// 这一对是兜底（网盘上的剧集绝大多数没有章节）。
+  final int? introStartMs;
+  final int? introEndMs;
+
+  /// 手标区间；半条标记（只标了起点或终点）当没有。
+  ///
+  /// 用 `IntroMarker.fromMilliseconds` 而不是在这里各判一次：那个函数还要
+  /// 挡住「终点早于起点」这类脏数据，规则只能有一份。
+  IntroMarker? get introRange =>
+      IntroMarker.fromMilliseconds(introStartMs, introEndMs);
+
   Map<String, Object?> toJson() => <String, Object?>{
         'url': url,
         'title': title,
@@ -483,6 +558,10 @@ class PlayRequest {
         'qualities': qualities.map((q) => q.toJson()).toList(),
         'playlist': playlist.map((e) => e.toJson()).toList(),
         'subtitles': subtitles.map((s) => s.toJson()).toList(),
+        'autoPlayNext': autoPlayNext,
+        'skipIntro': skipIntro,
+        'introStartMs': introStartMs,
+        'introEndMs': introEndMs,
       };
 
   /// 从通道参数还原。**任何畸形输入都返回 null，不抛异常** ——
@@ -538,6 +617,10 @@ class PlayRequest {
     final rawQualityId = raw['qualityId'];
     final rawLabel = raw['qualityLabel'];
     final ms = raw['startPositionMs'];
+    final rawAutoNext = raw['autoPlayNext'];
+    final rawSkipIntro = raw['skipIntro'];
+    final rawIntroStart = raw['introStartMs'];
+    final rawIntroEnd = raw['introEndMs'];
 
     return PlayRequest(
       url: url,
@@ -553,6 +636,18 @@ class PlayRequest {
       qualities: qualities,
       playlist: playlist,
       subtitles: subtitles,
+      // 只有**显式 false** 才关掉（判据与 `AppSettings.fromValues` 一致）。
+      // 写成 `rawAutoNext is bool && rawAutoNext` 的话，主窗口某次漏带这个
+      // 字段就会静默关掉连播与跳片头 —— 而这两项在设置页上是**开着**的。
+      autoPlayNext: rawAutoNext != false,
+      skipIntro: rawSkipIntro != false,
+      // 非正数当没有：0 秒的片头没有意义，而写进去会让 `IntroMarker`
+      // 的 `isValid` 之外多一条隐式规则。
+      introStartMs: rawIntroStart is int && rawIntroStart > 0
+          ? rawIntroStart
+          : null,
+      introEndMs:
+          rawIntroEnd is int && rawIntroEnd > 0 ? rawIntroEnd : null,
     );
   }
 
@@ -576,6 +671,10 @@ class PlayRequest {
           other.qualityLabel == qualityLabel &&
           other.startPosition == startPosition &&
           other.sizeBytes == sizeBytes &&
+          other.autoPlayNext == autoPlayNext &&
+          other.skipIntro == skipIntro &&
+          other.introStartMs == introStartMs &&
+          other.introEndMs == introEndMs &&
           mapEquals(other.headers, headers) &&
           listEquals(other.qualities, qualities) &&
           listEquals(other.playlist, playlist) &&
@@ -590,6 +689,10 @@ class PlayRequest {
         qualityLabel,
         startPosition,
         sizeBytes,
+        autoPlayNext,
+        skipIntro,
+        introStartMs,
+        introEndMs,
         Object.hashAllUnordered(
           headers.entries.map((e) => Object.hash(e.key, e.value)),
         ),
@@ -738,6 +841,119 @@ class TicketRefreshRequest {
   @override
   String toString() =>
       'TicketRefreshRequest($itemId, ${qualityId ?? "-"}, ${position.inSeconds}s)';
+}
+
+/// 播放窗口 → 主窗口的「把这部作品的片头区间存下来」请求。
+///
+/// ## 为什么标记要回主窗口写
+///
+/// 片头区间存在 `MediaWork.introStartMs` —— 库在主窗口。播放窗口刻意不碰
+/// 数据库（见 `PlayerWindowApp` 的类文档），所以它只能把「标了什么」报回来。
+///
+/// ## 为什么用 `itemId` 而不是 `groupKey`
+///
+/// 与 [TicketRefreshRequest] 同一条：播放窗口手里只有 [PlaylistEntry.itemId]
+/// （它连 `groupKey` 这个概念都没有）。**由主窗口按 itemId 查库补全** ——
+/// 让播放窗口去拼一个它不认识的键，就是把一个已经结构化的信息降级成字符串。
+///
+/// ## 三个动作，与仓储的三个方法一一对应
+///
+///   - [clear] 为 true → 清掉整个手标区间（**优先于**另两个字段）；
+///   - [startMs] / [endMs] 非空 → 各写各的。允许只写一半 —— 用户是先标起点、
+///     播一段、再标终点的，中间那段时间库里存着「半条标记」是正常状态
+///     （`IntroMarker.fromMilliseconds` 会把半条当没有，所以不会误跳）。
+@immutable
+class IntroRangeSaveRequest {
+  const IntroRangeSaveRequest({
+    required this.itemId,
+    this.startMs,
+    this.endMs,
+    this.clear = false,
+  });
+
+  /// 本地索引库里这一项的 id（`provider:fileId`）。
+  final String itemId;
+
+  /// 新的片头起点（毫秒）。`null` = 不改这一半。
+  final int? startMs;
+
+  /// 新的片头终点（毫秒）。`null` = 不改这一半。
+  final int? endMs;
+
+  /// 清掉整个手标区间（文件里的章节不受影响）。
+  final bool clear;
+
+  /// 三个字段全空 = 什么都不用做。主窗口据此**直接返回**，不白跑一次写库。
+  bool get isEmpty => !clear && startMs == null && endMs == null;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'itemId': itemId,
+        'startMs': startMs,
+        'endMs': endMs,
+        'clear': clear,
+      };
+
+  /// 畸形输入返回 null。**没有 itemId 就不知道往哪一行写**。
+  static IntroRangeSaveRequest? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final itemId = raw['itemId'];
+    if (itemId is! String || itemId.isEmpty) return null;
+
+    final start = raw['startMs'];
+    final end = raw['endMs'];
+    return IntroRangeSaveRequest(
+      itemId: itemId,
+      // 非正数当没给：0 秒的片头没有意义（与 `PlayRequest.fromJson` 同口径）。
+      startMs: start is int && start > 0 ? start : null,
+      endMs: end is int && end > 0 ? end : null,
+      clear: raw['clear'] == true,
+    );
+  }
+
+  @override
+  String toString() =>
+      'IntroRangeSaveRequest($itemId, ${clear ? "清除" : "$startMs~$endMs"})';
+}
+
+/// 主窗口回答 [IntroRangeSaveRequest] 时给出的**落库之后的真实值**。
+///
+/// 为什么不回一个 bool：播放窗口拿到 `true` 之后仍然不知道「现在到底存的是
+/// 什么」，只能自己照着请求猜 —— 而它猜不出「只标了起点」这种半条状态在库里
+/// 是被接受还是被拒。把值回给它，界面就能显示真相。
+@immutable
+class IntroRangeSnapshot {
+  const IntroRangeSnapshot({this.startMs, this.endMs});
+
+  final int? startMs;
+  final int? endMs;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'introStartMs': startMs,
+        'introEndMs': endMs,
+      };
+
+  static IntroRangeSnapshot fromJson(Object? raw) {
+    if (raw is! Map) return const IntroRangeSnapshot();
+    final start = raw['introStartMs'];
+    final end = raw['introEndMs'];
+    return IntroRangeSnapshot(
+      startMs: start is int && start > 0 ? start : null,
+      endMs: end is int && end > 0 ? end : null,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IntroRangeSnapshot &&
+          other.startMs == startMs &&
+          other.endMs == endMs;
+
+  @override
+  int get hashCode => Object.hash(startMs, endMs);
+
+  @override
+  String toString() => 'IntroRangeSnapshot(${startMs ?? "-"}~${endMs ?? "-"})';
 }
 
 /// 进度回报的节流器。
@@ -974,6 +1190,123 @@ bool isHttp4xxLog(String text) => _http4xxPattern.hasMatch(text);
 
 /// URL 匹配：`http://` 或 `https://` 起，一直吃到空白字符。
 ///
+/// 播放窗口问「这一条是不是已经没了」，主窗口的答复。
+///
+/// ## 为什么它得把**文案要用的字段**都带过来
+///
+/// 播放窗口跑在另一个引擎里，没有 `MediaItem`、也没有 `MediaWork`（库与仓储
+/// 都装在主窗口）。而「只移除这一集 / 移除整部剧《X》（24 个文件）」这几个
+/// 按钮的措辞由这两个实体算出来 —— 让播放窗口自己拼一份，两个入口的措辞
+/// 迟早分叉，用户会觉得这个移除功能时灵时不灵。
+///
+/// 所以主窗口把算好的**字段**送过来，播放窗口拿它们组装同一个
+/// [MissingMediaPlan]，渲染同一个对话框。规则仍然只有一份。
+@immutable
+class MissingMediaBrief {
+  const MissingMediaBrief({
+    required this.itemId,
+    required this.itemTitle,
+    required this.itemPath,
+    required this.workTitle,
+    required this.kind,
+    required this.fileCount,
+  });
+
+  /// 本地索引库里这一项的 id。移除时原样报回主窗口。
+  final String itemId;
+
+  final String itemTitle;
+  final String itemPath;
+  final String workTitle;
+
+  /// `MediaKind.name`。认不出来时退回 `unknown` —— 那只会让按钮写
+  /// 「这部作品」，比解不开整条消息强。
+  final String kind;
+
+  final int fileCount;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'itemId': itemId,
+        'itemTitle': itemTitle,
+        'itemPath': itemPath,
+        'workTitle': workTitle,
+        'kind': kind,
+        'fileCount': fileCount,
+      };
+
+  /// 畸形输入返回 null —— 播放窗口拿到 null 就当成「主窗口也不知道」，
+  /// 如实提示而不是弹一个字段全空的对话框。
+  static MissingMediaBrief? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final itemId = raw['itemId'];
+    if (itemId is! String || itemId.isEmpty) return null;
+    final itemTitle = raw['itemTitle'];
+    final workTitle = raw['workTitle'];
+    if (itemTitle is! String || workTitle is! String) return null;
+    final count = raw['fileCount'];
+    final kindName = raw['kind'];
+    return MissingMediaBrief(
+      itemId: itemId,
+      itemTitle: itemTitle,
+      itemPath: raw['itemPath'] is String ? raw['itemPath'] as String : '',
+      workTitle: workTitle,
+      kind: kindName is String ? kindName : MediaKind.unknown.name,
+      fileCount: count is int ? count : 1,
+    );
+  }
+
+  MissingMediaPlan toPlan() => MissingMediaPlan(
+        itemTitle: itemTitle,
+        itemPath: itemPath,
+        workTitle: workTitle,
+        kind: MediaKind.values.firstWhere(
+          (k) => k.name == kind,
+          orElse: () => MediaKind.unknown,
+        ),
+        fileCount: fileCount,
+      );
+
+  @override
+  String toString() =>
+      'MissingMediaBrief($itemId, $itemTitle, $fileCount 个文件)';
+}
+
+/// 播放窗口 → 主窗口：「按这个范围把它从媒体库里删掉」。
+@immutable
+class MissingMediaRemoval {
+  const MissingMediaRemoval({
+    required this.itemId,
+    required this.scope,
+  });
+
+  final String itemId;
+  final MediaRemovalScope scope;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'itemId': itemId,
+        'scope': scope.name,
+      };
+
+  /// 畸形输入返回 null。**没有 itemId 就不知道删哪一行**；`scope` 认不出来
+  /// 时退回「只删这一个」—— 那是**代价更小**的那一种，猜错也比整部删掉强。
+  static MissingMediaRemoval? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final itemId = raw['itemId'];
+    if (itemId is! String || itemId.isEmpty) return null;
+    final scopeName = raw['scope'];
+    return MissingMediaRemoval(
+      itemId: itemId,
+      scope: MediaRemovalScope.values.firstWhere(
+        (s) => s.name == scopeName,
+        orElse: () => MediaRemovalScope.singleItem,
+      ),
+    );
+  }
+
+  @override
+  String toString() => 'MissingMediaRemoval($itemId, ${scope.name})';
+}
+
 /// `\S+` 会把结尾的句号一起吃掉 —— 换掉就好，见 [redactUrls] 里的补回。
 final RegExp _urlPattern = RegExp(r'https?://\S+', caseSensitive: false);
 

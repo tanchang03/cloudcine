@@ -86,6 +86,53 @@ abstract final class PlayerBridgeMethod {
   ///
   /// 参数是 `{'fileId': <int>}`，返回已解码的文本，失败返回 null。
   static const String fetchOnlineSubtitle = 'fetchOnlineSubtitle';
+
+  /// 播放窗口 → 主窗口：「把这部作品的片头区间存下来」。
+  ///
+  /// 参数是 [IntroRangeSaveRequest.toJson]，返回 [IntroRangeSnapshot.toJson]
+  /// （**落库之后的真实值**，不是一个 bool —— 理由见那个类的文档）。
+  ///
+  /// ## 为什么标记必须回主窗口写
+  ///
+  /// 片头区间落在 `MediaWork.introStartMs` 上，而库与仓储都装在主窗口。
+  /// 播放窗口刻意不碰数据库（它跑在另一个引擎里，连 `groupKey` 都不知道）。
+  /// 所以「标记片头」这个动作在那边只是**把值报回来**。
+  static const String saveIntroRange = 'saveIntroRange';
+
+  /// 播放窗口 → 主窗口：「这一条是不是已经没了？能删到哪一层？」
+  ///
+  /// 参数是 `{'itemId': …}`，返回 [MissingMediaBrief.toJson]，或 `null`
+  /// （主窗口查不到这一条 —— 那时播放窗口应当如实提示，不要弹对话框）。
+  ///
+  /// ## 为什么要有这一条，而不是让播放窗口自己查
+  ///
+  /// 走的是 [refreshTicket] 失败之后的第二步：那一步只能告诉播放窗口
+  /// 「取链失败了」，而「失败是不是因为文件没了、以及能删到哪一层」要读库
+  /// 才知道。库在主窗口，播放窗口连 `groupKey` 都没有。
+  static const String queryMissingMedia = 'queryMissingMedia';
+
+  /// 播放窗口 → 主窗口：「按这个范围把它删掉」。
+  ///
+  /// 参数是 [MissingMediaRemoval.toJson]，返回 `bool`（是否真的动了库）。
+  ///
+  /// 删除**必须由主窗口执行**：它要删的是 `media_items` 与 `media_works`
+  /// 两行，而播放窗口刻意不碰数据库 —— 与 [saveIntroRange] 同一条边界。
+  static const String removeMissingMedia = 'removeMissingMedia';
+}
+
+/// 跨引擎通道上的**错误码**。
+///
+/// 通道只认 `PlatformException` 的 `code` / `message` 三段，所以「失败的种类」
+/// 只能靠 `code` 传。集中在同一个地方是必须的：主窗口抛、播放窗口判，
+/// 两边各写一个字符串字面量的话，改一处就会**静默**失去那个分支 ——
+/// 表现为「文件没了，但没人问我要不要删」，而没有任何报错。
+abstract final class PlayerBridgeError {
+  /// 网盘上已经没有这个文件了（见 `player_bridge_host.dart` 里
+  /// `_asMissingFileError`）。
+  ///
+  /// 收到它意味着「这条索引已经失效」，播放窗口应当给用户一个
+  /// 「从媒体库移除」的出口；其它错误码都只是「这次没取到」。
+  static const String missingFile = 'drive/notFound';
 }
 
 /// 当前平台是否支持多窗口。
@@ -145,6 +192,28 @@ Future<List<OnlineSubtitleBrief>> Function(SubtitleSearchRequest request)?
 
 /// 播放窗口要一条在线字幕的正文时，主窗口该做什么。
 Future<String?> Function(int fileId)? onFetchOnlineSubtitle;
+
+/// 播放窗口要保存片头区间时，主窗口该做什么。
+///
+/// 与 [onPlaybackProgress] 同样的理由必须由 UI 层装上（需要仓储）。
+///
+/// 返回**落库之后的真实值**；`null` 表示写不了（条目不在库里、平台不支持）——
+/// 播放窗口拿到 null 应当如实告诉用户「标记没保存」，不要静默什么都不做，
+/// 那会被读成「点了没反应」。
+Future<IntroRangeSnapshot?> Function(IntroRangeSaveRequest request)?
+    onSaveIntroRange;
+
+/// 播放窗口问「这一条是不是已经没了」时，主窗口该做什么。
+///
+/// 返回 `null` 表示库里查不到这一条（它已经被删了、或 id 变了）—— 播放窗口
+/// 拿到 null 应当**如实提示**而不是弹一个字段全空的对话框。
+Future<MissingMediaBrief?> Function(String itemId)? onQueryMissingMedia;
+
+/// 播放窗口要求移除一条已经失效的索引时，主窗口该做什么。
+///
+/// 返回是否真的动了库。删完之后媒体库的所有列表都要重取 —— 那是主窗口自己的
+/// 事（`MissingMediaController`），播放窗口不需要知道。
+Future<bool> Function(MissingMediaRemoval request)? onRemoveMissingMedia;
 
 /// 主窗口侧：还没被播放窗口取走的播放请求。
 ///
@@ -237,6 +306,11 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
         return null;
       }
       diag.info('窗口', '播放窗口要求刷新直链：$refresh');
+      // 不 catch：「文件已经不在网盘上」是以 [PlatformException] 的形式抛
+      // 过来的（见 `player_bridge_host.dart`），播放窗口要靠它的 `code`
+      // 决定接下来是「刷新重试」还是「问用户要不要删掉这条索引」。
+      // 在这里吞掉会让那一步退化成静默失败 —— 而静默失败在自动连播时表现
+      // 为「播完一集就没动静了」，最难查的那一类。
       final fresh = await refreshHandler(refresh);
       if (fresh == null) {
         diag.warn('窗口', '刷新直链失败：$refresh');
@@ -310,6 +384,67 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
         return null;
       }
       return text;
+
+    case PlayerBridgeMethod.saveIntroRange:
+      final save = IntroRangeSaveRequest.fromJson(call.arguments);
+      if (save == null) {
+        diag.warn('窗口', '收到解不开的片头保存请求，忽略');
+        return null;
+      }
+      if (save.isEmpty) {
+        // 三个字段全空 = 用户点了菜单但什么都没选。不当作错误，
+        // 只是不白跑一次写库。
+        diag.debug('窗口', '片头保存请求没有内容，忽略');
+        return const IntroRangeSnapshot().toJson();
+      }
+      final saveHandler = onSaveIntroRange;
+      if (saveHandler == null) {
+        diag.warn('窗口', '播放窗口要保存片头区间，但没有装上保存回调');
+        return null;
+      }
+      diag.info('窗口', '播放窗口要保存片头区间：$save');
+      final snapshot = await saveHandler(save);
+      if (snapshot == null) {
+        diag.warn('窗口', '保存片头区间失败：$save');
+        return null;
+      }
+      return snapshot.toJson();
+
+    case PlayerBridgeMethod.queryMissingMedia:
+      final itemId = call.arguments is Map
+          ? (call.arguments as Map)['itemId']
+          : null;
+      if (itemId is! String || itemId.isEmpty) {
+        diag.warn('窗口', '收到没有 itemId 的失效查询，忽略');
+        return null;
+      }
+      final query = onQueryMissingMedia;
+      if (query == null) {
+        diag.warn('窗口', '播放窗口查询失效媒体，但没有装上查询回调');
+        return null;
+      }
+      final brief = await query(itemId);
+      if (brief == null) {
+        diag.warn('窗口', '库里查不到 $itemId，无法给出移除选项');
+        return null;
+      }
+      return brief.toJson();
+
+    case PlayerBridgeMethod.removeMissingMedia:
+      final removal = MissingMediaRemoval.fromJson(call.arguments);
+      if (removal == null) {
+        diag.warn('窗口', '收到解不开的移除请求，忽略');
+        return false;
+      }
+      final remove = onRemoveMissingMedia;
+      if (remove == null) {
+        diag.warn('窗口', '播放窗口要移除失效媒体，但没有装上移除回调');
+        return false;
+      }
+      diag.info('窗口', '播放窗口要求移除失效媒体：$removal');
+      final removed = await remove(removal);
+      diag.info('窗口', '移除结果：$removed');
+      return removed;
 
     default:
       throw MissingPluginException('主窗口未实现的通道方法：${call.method}');

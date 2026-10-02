@@ -12,17 +12,26 @@ import 'package:path_provider/path_provider.dart';
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/format.dart';
 import '../../core/utils/mpv_cache_state.dart';
+import '../../core/utils/mpv_chapters.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
+import '../../core/utils/seek_acceleration.dart';
 import '../../core/utils/text_encoding.dart';
 import '../../core/utils/track_labels.dart';
 import '../../domain/services/cache_speed_meter.dart';
+import '../../domain/services/episode_queue.dart';
+import '../../domain/services/intro_marker.dart';
+import '../../domain/services/intro_session.dart';
 import '../../domain/services/playback_media.dart';
 import '../../domain/services/playback_resume.dart';
+import '../../domain/services/missing_media.dart';
 import '../theme/app_theme.dart';
 import '../widgets/anchored_menu.dart';
 import '../widgets/buffered_slider.dart';
+import '../widgets/player_keys.dart';
+import '../widgets/tv_text.dart';
+import '../widgets/missing_media_dialog.dart';
 import 'child_window_channel.dart';
 import 'player_protocol.dart';
 import 'player_window_bridge.dart';
@@ -73,6 +82,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   Player? _player;
   VideoController? _controller;
 
+  /// 片头跳过状态机。两个播放器（内置播放页、独立窗口）共用 [IntroSession]，
+  /// 状态转移只在它里面写一份 —— 否则会漂移成「内置页跳得对、独立窗口跳得怪」，
+  /// 而它们跑在不同的 Flutter 引擎里，用户根本不会想到这是两套代码。
+  final IntroSession _introSession = IntroSession();
+
   List<_SelfCheck> _checks = const <_SelfCheck>[];
   String? _nowPlaying;
   bool _busy = false;
@@ -108,6 +122,22 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 停在画面中间看片 —— 那时他并不需要控制栏挡着画面。
   Timer? _hideTimer;
 
+  /// 当前有几个 anchored 菜单浮层开着（画质 / 字幕 / 音轨 / 片头）。
+  ///
+  /// ## 为什么需要它
+  ///
+  /// 菜单挂在 **Overlay** 上（`showAnchoredMenu` → `PopupRoute`），位置在播放页
+  /// 那个 `MouseRegion` **之外**。而菜单就贴着按钮正上方划出来 —— 用户点开画质
+  /// 之后必然把鼠标移到菜单上去选，那一刻 `MouseRegion.onExit` 判定「指针离开了
+  /// 窗口内容」，走到 [_hideChrome]：菜单还开着，底部控制栏先没了。用户看到的
+  /// 是「点了画质，播放控制栏整体消失」，而菜单孤零零浮在画面上。
+  ///
+  /// [_cancelHide] 挡不住这条路径：它只取消**倒计时**，而 `onExit` 是即时调用。
+  /// 所以用一个计数器把「菜单存续期」标出来，[_hideChrome] 和倒计时回调见到
+  /// 它就退回去。用**计数**而不是 bool：字幕菜单会重开（搜完在线字幕 / 挑完
+  /// 本地文件都会把同一个菜单再弹一次），嵌套期间必须仍然算「开着」。
+  int _menuDepth = 0;
+
   /// 右侧剧集列表是否展开。
   bool _playlistOpen = false;
 
@@ -133,7 +163,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 剧集列表每一项的高度。
   ///
   /// 写成常量而不是让 `ListView` 自己量：自动定位要用它算滚动偏移。
-  static const double _episodeTileHeight = 84;
+  ///
+  /// ⚠️ 它同时是**上限**（`itemExtent` 会把每一项强制成这么高），所以必须
+  /// 比「最高的那一项」还高，否则内容溢出去画到面板外面 —— 真机表现成
+  /// 「开剧集列表后底部按钮乱飞／被裁」（见 `_buildEpisodeTile` 上方的说明）。
+  ///
+  /// 按现在的内容算：上下内边距 16 + 两行标题约 30 + 副标题约 15 + 进度条约 8
+  /// ≈ 69；缩略图那一支是 54 + 16 = 70。取 96 是给它们留出余量（字体度量
+  /// 随平台/字号缩放会变，实测里这几像素的差就是溢出与不溢出的分界）。
+  /// 原来是 84（标题只画一行），放开到两行后一起上调。
+  static const double _episodeTileHeight = 96;
 
   /// 剧集列表面板的宽度。
   static const double _playlistWidth = 320;
@@ -765,6 +804,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
     // 当前选中的轨。切轨成功与否只能由 mpv 说了算（见 [_activeAudioId]）。
     _subs.add(player.stream.track.listen(_onTrackSelection));
+
+    // 一集播完（EOF）。自动连播的触发信号：订阅它、在回调里找下一集。
+    //
+    // ⚠️ 必须在 `_ensurePlayer` 里注册，而不是在 `open()` 之后读一次
+    // `state.completed` —— 那样只会拿到「上一条流是不是播完了」的旧值，新流
+    // 刚开时它往往还是 true（media_kit 不会自动归零），于是会**立刻**触发一次
+    // 「连播」，把用户刚点开的这集秒切到下一集。
+    _subs.add(
+      player.stream.completed.listen((completed) {
+        if (completed) unawaited(_onCompleted());
+      }),
+    );
   }
 
   /// 轨道清单变了。只存真实的那些（合成轨见 [TrackLabels.realTracks]）。
@@ -810,6 +861,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _hideTimer = Timer(_chromeIdleTimeout, () {
       // 倒计时到点时窗口可能已经关了。
       if (!mounted) return;
+      // 菜单开着时也不收：鼠标移到菜单上会让倒计时重新起算，而此刻用户正在
+      // 菜单里挑，把按钮藏掉只会让人以为界面坏了（见 [_menuDepth]）。
+      if (_menuDepth > 0) return;
       setState(() => _chromeVisible = false);
     });
   }
@@ -823,9 +877,29 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 立刻隐藏浮层（单击画面、鼠标移出窗口）。
   void _hideChrome() {
+    // 菜单浮层开着时**绝不隐藏**。菜单挂在 Overlay 上、在播放页 `MouseRegion`
+    // 之外，鼠标移到菜单上会被判成「移出窗口」走到这里 —— 真隐藏了，用户看到
+    // 的就是「点了画质，菜单还在、控制栏先没了」（见 [_menuDepth]）。
+    if (_menuDepth > 0) return;
     _hideTimer?.cancel();
     _hideTimer = null;
     if (_chromeVisible) setState(() => _chromeVisible = false);
+  }
+
+  /// 弹一个 anchored 菜单，存续期间压住控制栏的自动隐藏。
+  ///
+  /// 只做两件事：把 [_menuDepth] 加减一，以及开弹前 [_cancelHide]。
+  /// **不负责**菜单关闭后重新计时 —— 那是调用方的事：各菜单拿到结果后要按
+  /// 自己的时机 `_pokeChrome()`（有的还要接着 await 一次切档 / 落库，提前
+  /// 起计时会在那段时间里把按钮收走）。
+  Future<T?> _pinnedMenu<T>(Future<T?> Function() open) async {
+    _menuDepth++;
+    _cancelHide();
+    try {
+      return await open();
+    } finally {
+      _menuDepth--;
+    }
   }
 
   /// 播放 / 暂停。单击画面与控制栏那个按钮都走这里。
@@ -848,12 +922,69 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 两件事挂在同一个流上是有意的 —— 它们共用同一个「播到哪了」的真相：
   /// 刷新闸要判断「重开之后位置有没有真的往前走」，那正是这个值。
   Future<void> _onPosition(Duration position) async {
+    // 片头探测必须在**任何 await 之前**完成「判定 + 置位」：位置流每 ~100ms
+    // 一条，不先置位会让同一帧的两条都各自起一次探测，把 `chapter-list` 读上
+    // 十几次。判定本体在 [IntroSession.shouldProbe]。
+    if (_introSession.shouldProbe(position)) {
+      _introSession.markProbed();
+      unawaited(_probeIntro());
+    }
+    // 进了片头区间就跳。判定 + 置位收在 [IntroSession.takeSkipTarget]：
+    // `seek` 是异步往返，晚置位会连发几次 seek（画面往前窜、进度条乱跳）。
+    final skipTo = _introSession.takeSkipTarget(position);
+    if (skipTo != null) {
+      unawaited(_player?.seek(skipTo));
+      _toast('已跳过片头');
+    }
+
     // 刷新后能连续播过一段，说明这次刷新是有效的 —— 把自动重试计数清零。
     // 不这么做的话，一部长片里撞上两三次过期就把额度用满了。
     if (_refreshGuard.observe(position, now: DateTime.now())) {
       diag.info('播放窗口', '直链刷新有效，自动刷新计数已清零');
     }
     await _reportProgress(position);
+  }
+
+  /// 探测一次文件章节里的片头区间。
+  ///
+  /// 结果晚到时（`detectIntro` 是异步的）用户可能已经换集 —— 那时
+  /// `_currentRequest` 的 itemId 已经变了，写进去会让**下一集**顶着这一集的
+  /// 片头区间跳。所以用 itemId 挡一下竞态（与内置播放页同一处判断）。
+  Future<void> _probeIntro() async {
+    final player = _player;
+    if (player == null) return;
+    final itemId = _currentRequest?.itemId;
+    final marker = await MpvChapters.detectIntro(
+      player,
+      label: _currentRequest?.title ?? '',
+    );
+    if (!mounted || _currentRequest?.itemId != itemId) return;
+    _introSession.setChapter(marker);
+  }
+
+  /// 一集播完：自动切到同作品的下一集（若设置允许、且确实有下一集）。
+  ///
+  /// 触发点是 `player.stream.completed`。与剧集列表里的「下一集」共用
+  /// [EpisodeQueue.nextAfter] —— 那条规则是两处共用的一份纯函数：当前项不在
+  /// 列表里不从头开始、跳过花絮而不是撞上就停、到尾不循环。
+  Future<void> _onCompleted() async {
+    final request = _currentRequest;
+    if (request == null || !request.autoPlayNext) return;
+
+    final playlist = request.playlist;
+    final next = EpisodeQueue.nextAfter(
+      entries: playlist,
+      idOf: (e) => e.itemId,
+      currentId: request.itemId,
+      isExtra: (e) => e.isExtra,
+    );
+    if (next == null) {
+      diag.info('播放窗口', '已是最后一集（或没有可连播的下一集），不自动连播');
+      return;
+    }
+    diag.info('播放窗口', '自动连播下一集 → ${next.title}');
+    _toast('自动播放下一集');
+    await _openEpisode(next);
   }
 
   /// 把播放位置回报给主窗口，由它落库。
@@ -1076,9 +1207,79 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         return null;
       }
       return fresh;
+    } on WindowChannelException catch (e) {
+      // 「文件已经不在网盘上」：这不是「这次没取到」，而是「这条索引已经
+      // 失效」—— 必须给用户一个「从媒体库移除」的出口，否则自动连播时只会
+      // 看到「播完一集就没动静了」。其余错误码（登录失效、限流、网络）是
+      // 临时的，不该拿去问用户要不要删片。
+      if (e.code == PlayerBridgeError.missingFile) {
+        if (await _handleMissingFile(itemId)) {
+          // 文件没了且用户已移除，窗口没有内容可放 → 关掉它。
+          await closeChildWindow();
+        }
+        return null;
+      }
+      diag.error('播放窗口', '取新直链失败（$reason）', error: e);
+      _toast('直链刷新失败：${e.message}');
+      return null;
     } catch (e, st) {
       diag.error('播放窗口', '取新直链失败（$reason）', error: e, stackTrace: st);
       _toast('直链刷新失败：$e');
+      return null;
+    }
+  }
+
+  /// 播放窗口撞上「文件已经不在网盘上」之后的完整处置。
+  ///
+  /// 取链这一步在**主窗口**发生（`player_bridge_host.dart` 的
+  /// `_asMissingFileError`），播放窗口手里只有一句 `drive/notFound`，且连
+  /// `groupKey` 都没有。所以「能删到哪一层」要回主窗口查
+  /// （[PlayerBridgeMethod.queryMissingMedia]），删除本身也只能由主窗口
+  /// 执行（[PlayerBridgeMethod.removeMissingMedia]）—— 库与仓储都装在那边。
+  ///
+  /// 返回用户是否真的移除了（调用方据此关掉窗口）。
+  Future<bool> _handleMissingFile(String itemId) async {
+    if (!_channelReady) {
+      _toast('文件不存在或已被删除（跨窗口通道不可用）');
+      return false;
+    }
+    final plan = await _queryMissingPlan(itemId);
+    if (plan == null) return false;
+    if (!mounted) return false;
+    final scope = await MissingMediaDialog.show(context, plan);
+    if (scope == null) return false;
+    if (!mounted) return false;
+    final removed = await playerWindowChannel.invokeMethod<bool>(
+      PlayerBridgeMethod.removeMissingMedia,
+      MissingMediaRemoval(itemId: itemId, scope: scope).toJson(),
+    );
+    if (removed == true) {
+      _toast(plan.removedMessage(scope));
+      return true;
+    }
+    _toast('移除失败：库里找不到这条记录');
+    return false;
+  }
+
+  /// 回主窗口查「这一条是不是真没了、能删到哪一层」。
+  ///
+  /// 返回 `null` 表示查不到（主窗口那边库里没有这一行）—— 那时如实提示，
+  /// 不要弹一个字段全空的对话框。
+  Future<MissingMediaPlan?> _queryMissingPlan(String itemId) async {
+    try {
+      final raw = await playerWindowChannel.invokeMethod<Object?>(
+        PlayerBridgeMethod.queryMissingMedia,
+        <String, Object?>{'itemId': itemId},
+      );
+      final brief = MissingMediaBrief.fromJson(raw);
+      if (brief == null) {
+        _toast('文件不存在或已被删除');
+        return null;
+      }
+      return brief.toPlan();
+    } on WindowChannelException catch (e) {
+      diag.error('播放窗口', '查询失效媒体失败', error: e);
+      _toast('文件不存在或已被删除（查询失败）');
       return null;
     }
   }
@@ -1262,6 +1463,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     });
     try {
       _ensurePlayer();
+      // 片头状态机随每条新流归零。读 `_currentRequest` 拿这次的开关与手标区间：
+      // 换集 / 换清晰度 / 刷新直链都走 `_openStream`，且它们都先把 `_currentRequest`
+      // 更新成新请求（新请求带着从主窗口重新读出来的设置与手标区间）。
+      // 漏了归零的后果是「只有第一集跳片头」—— `_probed` 留着 true，换集后
+      // 永远不再读章节，而第一集恰好最不需要跳。
+      final req = _currentRequest;
+      _introSession.reset(
+        manual: req == null
+            ? null
+            : IntroMarker.fromMilliseconds(req.introStartMs, req.introEndMs),
+        enabled: req?.skipIntro ?? false,
+      );
       // 输入速率从换源那一刻起重新采（上一条流的数字不能带过来）。
       //
       // ⚠️ 必须放在 `_ensurePlayer()` **之后**：播放器建不出来时
@@ -1397,8 +1610,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   // 键盘快捷键
   // -------------------------------------------------------------------
 
-  /// 方向键的跳转步长。与内置播放页一致。
-  static const Duration _seekStep = Duration(seconds: 10);
+  /// 方向键的步长累加（10 秒 → 30 → 60 → 5 分钟）。
+  ///
+  /// 与内置播放页共用 [SeekRepeatTracker] 的算法，但**状态各一份** ——
+  /// 这个窗口跑在另一个 Flutter 引擎里，够不到播放页那个实例。
+  ///
+  /// ⚠️ 这张键位表走 `CallbackShortcuts`，**收不到 key-up**，所以「这一串
+  /// 结束了没有」只能靠 [seekHoldGap] 的间隔超时判断（那边走
+  /// `Focus.onKeyEvent`，松手时能显式复位）。代价是「手快连点两下」的第二下
+  /// 会跳 30 秒而不是 10 秒 —— 只是不精确，不会出错。
+  final SeekRepeatTracker _seekRepeat = SeekRepeatTracker();
 
   /// 播放页的键位表。
   ///
@@ -1425,10 +1646,17 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   Map<ShortcutActivator, VoidCallback> get _playbackShortcuts =>
       <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.space): _onPlayPauseKey,
+        // 长按 ←/→ 会连续触发（`SingleActivator` 默认 `includeRepeats: true`），
+        // 步长交给累加器：按一下 10 秒，按住不放会涨到 5 分钟。
         const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
-            _seekBy(-_seekStep),
+            _seekBy(-_seekRepeat.step(-1)),
         const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
-            _seekBy(_seekStep),
+            _seekBy(_seekRepeat.step(1)),
+        // 数字键跳百分比。遥控器那套（内置播放页）也有，键表在
+        // `widgets/player_keys.dart` 里共享 —— 两边「哪个键算数字几」必须一致。
+        for (final entry in seekDigitKeys.entries)
+          SingleActivator(entry.key): () =>
+              _seekToFraction(entry.value / 10),
         // 与桌面播放器的通行习惯一致：F 切换全屏、Esc 退出。
         const SingleActivator(LogicalKeyboardKey.keyF): () =>
             _setFullScreen(!_fullScreen),
@@ -1469,6 +1697,31 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     );
     unawaited(player.seek(target));
     // 同 [_onPlayPauseKey]：让用户看见时间码跳到了哪儿。
+    _pokeChrome();
+  }
+
+  /// 数字键：跳到片子的 [fraction]（`0.0`–`0.9`）。
+  ///
+  /// ## 为什么时长未知时**什么都不做**
+  ///
+  /// 还在探测容器（或直播流）时 `duration` 是 0。拿它当分母的话目标恒为 0，
+  /// 于是「按 5 跳到一半」变成「跳回开头」—— 用户会以为自己按错了键，
+  /// 然后反复按，每次都回到开头。宁可这一下不生效。
+  ///
+  /// ## 为什么也要 `_pokeChrome()`
+  ///
+  /// 与 [_seekBy] 同一个理由：跳完必须让用户看见时间码落到哪儿了。
+  void _seekToFraction(double fraction) {
+    final player = _player;
+    if (player == null) return;
+    final duration = player.state.duration;
+    if (duration <= Duration.zero) return;
+
+    final target = clampSeekTarget(
+      Duration(milliseconds: (duration.inMilliseconds * fraction).round()),
+      duration,
+    );
+    unawaited(player.seek(target));
     _pokeChrome();
   }
 
@@ -1923,127 +2176,204 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     final index = _currentEpisodeIndex(playlist);
     final hasPlaylist = playlist.length > 1;
     final qualities = _currentRequest?.qualities ?? const <QualityBrief>[];
+    final hasLibrary =
+        _currentRequest != null && _currentRequest!.itemId.isNotEmpty;
 
-    return Row(
-      children: [
-        IconButton(
-          onPressed: _player == null ? null : _togglePlay,
-          // 键位写进 tooltip：播放器上没有任何东西提示「空格能暂停」，
-          // 而这是用户最常按的一个键。
-          tooltip: _playing ? '暂停（空格）' : '播放（空格）',
-          visualDensity: VisualDensity.compact,
-          icon: Icon(
-            _playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-            size: 22,
-            color: Colors.white,
+    // 控制栏拆成两簇：**左簇**播控（播放 / 上下集 / 片头标记），**右簇**设置
+    // （画质 / 字幕 / 音轨 / 刷新 / 置顶 / 自检 / 全屏 / 关闭）。
+    //
+    // ⚠️ 两簇各自包一层横向滚动、中间用 `Spacer` 撑开 —— 这是「窄窗不溢出」
+    // 的唯一稳法，三条理由缺一不可：
+    //   1. 剧集面板展开时画面区被挤到 ~480px（见 [_buildPlayer] 里 `Expanded`
+    //      让位 320px 面板），一排按钮放不下就溢出，debug 下变 RenderFlex
+    //      overflow 异常，真机表现成「开剧集列表后底部按钮乱飞／被裁」。
+    //   2. 横向滚动的视口在**滚动方向**给子 `Row` 的是**无界宽度**，所以
+    //      `Spacer` / `Expanded` 这种「占剩余空间」的控件**不能**放进滚动
+    //      内部的 `Row`（无界里没法算），必须放到**外层这条有界 `Row`** 上。
+    //   3. 视口的交叉轴（这里是垂直）也必须拿到有界高度，否则报 `hasSize`；
+    //      外层 `Row` 被 `SizedBox(height: 44)` 钉死后，两个滚动视图的垂直
+    //      约束就都有界了（44 = 紧凑密度下图标按钮标称高度 48 − 2×2）。
+    //
+    // 宽窗（不溢出）时：左簇是非 flex 子项，取内容宽度（~180px，永远放得下）；
+    // 右簇在 `Flexible` 里拿剩余全部宽度，`mainAxisAlignment.end` 让它贴右边缘
+    // —— 视觉与改前完全一致。只有真正放不下时右簇才在 44 高、受限宽度的盒子里
+    // 横向滚动，且所有按钮仍在树上（tooltip 找得到、点得到）。
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          // 左簇：播控。非 flex → 取内容宽度，不挤占右簇空间。
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                IconButton(
+                  onPressed: _player == null ? null : _togglePlay,
+                  // 键位写进 tooltip：播放器上没有任何东西提示「空格能暂停」，
+                  // 而这是用户最常按的一个键。
+                  tooltip: _playing ? '暂停（空格）' : '播放（空格）',
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(
+                    _playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                    size: 22,
+                    color: Colors.white,
+                  ),
+                ),
+                // 上一集 / 下一集只在真有列表时出现。电影上挂两个永远灰着的
+                // 按钮，只会把控制栏撑得更长。
+                if (hasPlaylist) ...[
+                  _buildBarIcon(
+                    icon: Icons.skip_previous_rounded,
+                    tooltip: '上一集',
+                    onPressed: index > 0
+                        ? () => unawaited(_openEpisode(playlist[index - 1]))
+                        : null,
+                  ),
+                  _buildBarIcon(
+                    icon: Icons.skip_next_rounded,
+                    tooltip: '下一集',
+                    onPressed: index >= 0 && index < playlist.length - 1
+                        ? () => unawaited(_openEpisode(playlist[index + 1]))
+                        : null,
+                  ),
+                ],
+                // 片头标记。只有**有库记录**的片子才显示：自检视频 / 手输直链
+                // 没有可写的那一行，点了也只是报错。这个按钮 = 「这部剧的片头
+                // 在哪，帮我跳过」，与自动跳片头共用 [IntroSession]。
+                if (hasLibrary)
+                  Builder(
+                    builder: (buttonContext) => _buildBarIcon(
+                      icon: Icons.fast_forward_rounded,
+                      tooltip: '片头标记',
+                      onPressed: _player == null
+                          ? null
+                          : () => unawaited(_showIntroMenu(buttonContext)),
+                    ),
+                  ),
+              ],
+            ),
           ),
-        ),
-        // 上一集 / 下一集只在真有列表时出现。电影上挂两个永远灰着的按钮，
-        // 只会把控制栏撑得更长。
-        if (hasPlaylist) ...[
-          _buildBarIcon(
-            icon: Icons.skip_previous_rounded,
-            tooltip: '上一集',
-            onPressed:
-                index > 0 ? () => unawaited(_openEpisode(playlist[index - 1])) : null,
-          ),
-          _buildBarIcon(
-            icon: Icons.skip_next_rounded,
-            tooltip: '下一集',
-            onPressed: index >= 0 && index < playlist.length - 1
-                ? () => unawaited(_openEpisode(playlist[index + 1]))
-                : null,
+          // 右簇：设置。`Expanded` 拿全部剩余宽度，`Align` 负责把它贴到右边缘；
+          // 放不下时在 44 高、受限宽度的盒子里横向滚动，绝不溢出外层 `Row`。
+          //
+          // ⚠️ 这里**不能**用 `Spacer` + `Flexible`（曾经的写法，实测不贴右）：
+          // 两者各是 flex 1，剩余宽度被对半分；而 `SingleChildScrollView` 在主轴
+          // 上是收缩的（宽 = 内容宽）、`Flexible` 又是 loose fit —— 分到的那一半
+          // 填不满的部分会留在末尾。1280 宽的窗口里右簇右沿离右边框还差 ~150px，
+          // 用户看到的就是「底部按钮没右对齐」。`Expanded` 是 tight fit，视口撑满
+          // 分配宽度，`Align` 再把内容贴到右边缘；内容真放不下时视口宽度即可用
+          // 宽度，横向滚动照常生效。
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    // 画质：**文字按钮**而不是图标。用户要看的是「现在是多少」，
+                    // 而不是「这里有个设置入口」—— 夸克播放器也是这么做的。
+                    //
+                    // 按钮外面套一层 `Builder`：菜单要锚在**这个按钮**的正上方，
+                    // 就得拿到按钮自己的 `BuildContext` 去量它的位置
+                    // （见 [globalRectOf] 与 [_showQualityMenu]）。
+                    Builder(
+                      builder: (buttonContext) => TextButton(
+                        onPressed: qualities.isEmpty
+                            ? null
+                            : () => unawaited(_showQualityMenu(buttonContext)),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          disabledForegroundColor: Colors.white38,
+                          minimumSize: const Size(0, 32),
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                        child: Text(
+                          _currentRequest?.qualityLabel ?? '画质',
+                          style: const TextStyle(fontSize: 12.5),
+                        ),
+                      ),
+                    ),
+                    // 字幕与音轨。
+                    //
+                    // 这两个入口**常驻，不按「有没有轨」决定显不显示**：轨道清单
+                    // 要等 mpv 解析完容器才填出来，起播前一直是空的。按有无来隐藏
+                    // 的话，控制栏会在开播那一瞬间突然多出两个图标，把右边一排
+                    // 整体挤动一下 —— 看起来像界面抖了一下。一个灰着的按钮比一个
+                    // 会跳动的布局好。
+                    Builder(
+                      builder: (buttonContext) => _buildBarIcon(
+                        icon: Icons.subtitles_outlined,
+                        tooltip: '字幕',
+                        onPressed: _player == null
+                            ? null
+                            : () => unawaited(_showSubtitleMenu(buttonContext)),
+                      ),
+                    ),
+                    Builder(
+                      builder: (buttonContext) => _buildBarIcon(
+                        icon: Icons.audiotrack_rounded,
+                        tooltip: '音轨',
+                        onPressed: _player == null
+                            ? null
+                            : () => unawaited(_showAudioMenu(buttonContext)),
+                      ),
+                    ),
+                    // 剧集列表的入口**不在这里**。原来它是控制栏上的一个图标，
+                    // 但它要跟一个展开后面板走，放在底部控制栏里，展开后会出现
+                    // 「按钮在这儿、面板在右上角」的割裂感 —— 现在挪到画面右边缘
+                    // 那条竖长条上（见 [_buildPlaylistEdgeTab]），点它面板就从
+                    // 那边滑出来。
+                    _buildBarIcon(
+                      icon: Icons.refresh_rounded,
+                      tooltip: _currentRequest == null
+                          ? '重新取链（当前片源没有库记录，无从刷新）'
+                          : '重新取链并续播',
+                      onPressed: _busy || _currentRequest == null
+                          ? null
+                          : () => unawaited(
+                              _refreshTicket(
+                                reason: '用户手动触发',
+                                manual: true,
+                              ),
+                            ),
+                    ),
+                    _buildBarIcon(
+                      icon: _alwaysOnTop
+                          ? Icons.push_pin_rounded
+                          : Icons.push_pin_outlined,
+                      tooltip: _alwaysOnTop ? '取消置顶' : '窗口置顶',
+                      onPressed: () => _setAlwaysOnTop(!_alwaysOnTop),
+                    ),
+                    _buildBarIcon(
+                      icon: Icons.monitor_heart_outlined,
+                      tooltip: '环境自检 / 出画验证',
+                      onPressed: () => setState(() => _showDiagnostics = true),
+                    ),
+                    _buildBarIcon(
+                      icon: _fullScreen
+                          ? Icons.fullscreen_exit_rounded
+                          : Icons.fullscreen_rounded,
+                      tooltip: _fullScreen ? '退出全屏（Esc）' : '全屏（F）',
+                      onPressed: () => _setFullScreen(!_fullScreen),
+                    ),
+                    // 全屏下红绿灯被系统收走，这是唯一能确定性地「停掉声音并
+                    // 关窗」的地方（先释放再关，不依赖关窗通知的时序）。
+                    _buildBarIcon(
+                      icon: Icons.close_rounded,
+                      tooltip: '停止并关闭',
+                      onPressed: _busy ? null : () => unawaited(_stopAndClose()),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ],
-        const Spacer(),
-        // 画质：**文字按钮**而不是图标。用户要看的是「现在是多少」，
-        // 而不是「这里有个设置入口」—— 夸克播放器也是这么做的。
-        //
-        // 按钮外面套一层 `Builder`：菜单要锚在**这个按钮**的正上方，
-        // 就得拿到按钮自己的 `BuildContext` 去量它的位置（见 [globalRectOf]
-        // 与 [_showQualityMenu]）。
-        Builder(
-          builder: (buttonContext) => TextButton(
-            onPressed: qualities.isEmpty
-                ? null
-                : () => unawaited(_showQualityMenu(buttonContext)),
-            style: TextButton.styleFrom(
-              foregroundColor: Colors.white,
-              disabledForegroundColor: Colors.white38,
-              minimumSize: const Size(0, 32),
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-            child: Text(
-              _currentRequest?.qualityLabel ?? '画质',
-              style: const TextStyle(fontSize: 12.5),
-            ),
-          ),
-        ),
-        // 字幕与音轨。
-        //
-        // 这两个入口**常驻，不按「有没有轨」决定显不显示**：轨道清单要等 mpv
-        // 解析完容器才填出来，起播前一直是空的。按有无来隐藏的话，控制栏会在
-        // 开播那一瞬间突然多出两个图标，把右边一排整体挤动一下 —— 看起来像
-        // 界面抖了一下。一个灰着的按钮比一个会跳动的布局好。
-        Builder(
-          builder: (buttonContext) => _buildBarIcon(
-            icon: Icons.subtitles_outlined,
-            tooltip: '字幕',
-            onPressed: _player == null
-                ? null
-                : () => unawaited(_showSubtitleMenu(buttonContext)),
-          ),
-        ),
-        Builder(
-          builder: (buttonContext) => _buildBarIcon(
-            icon: Icons.audiotrack_rounded,
-            tooltip: '音轨',
-            onPressed: _player == null
-                ? null
-                : () => unawaited(_showAudioMenu(buttonContext)),
-          ),
-        ),
-        // 剧集列表的入口**不在这里**。原来它是控制栏上的一个图标，但它要跟
-        // 着一个展开后面板走，放在底部控制栏里，展开后会出现「按钮在这儿、
-        // 面板在右上角」的割裂感 —— 现在挪到画面右边缘那条竖长条上
-        // （见 [_buildPlaylistEdgeTab]），点它面板就从那边滑出来。
-        _buildBarIcon(
-          icon: Icons.refresh_rounded,
-          tooltip: _currentRequest == null
-              ? '重新取链（当前片源没有库记录，无从刷新）'
-              : '重新取链并续播',
-          onPressed: _busy || _currentRequest == null
-              ? null
-              : () => unawaited(_refreshTicket(reason: '用户手动触发', manual: true)),
-        ),
-        _buildBarIcon(
-          icon: _alwaysOnTop
-              ? Icons.push_pin_rounded
-              : Icons.push_pin_outlined,
-          tooltip: _alwaysOnTop ? '取消置顶' : '窗口置顶',
-          onPressed: () => _setAlwaysOnTop(!_alwaysOnTop),
-        ),
-        _buildBarIcon(
-          icon: Icons.monitor_heart_outlined,
-          tooltip: '环境自检 / 出画验证',
-          onPressed: () => setState(() => _showDiagnostics = true),
-        ),
-        _buildBarIcon(
-          icon: _fullScreen
-              ? Icons.fullscreen_exit_rounded
-              : Icons.fullscreen_rounded,
-          tooltip: _fullScreen ? '退出全屏（Esc）' : '全屏（F）',
-          onPressed: () => _setFullScreen(!_fullScreen),
-        ),
-        // 全屏下红绿灯被系统收走，这是唯一能确定性地「停掉声音并关窗」的地方
-        // （先释放再关，不依赖关窗通知的时序）。
-        _buildBarIcon(
-          icon: Icons.close_rounded,
-          tooltip: '停止并关闭',
-          onPressed: _busy ? null : () => unawaited(_stopAndClose()),
-        ),
-      ],
+      ),
     );
   }
 
@@ -2199,7 +2529,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                 children: [
                   Text(
                     entry.title,
-                    maxLines: 1,
+                    // ⚠️ **两行**，不是一行。提不出集号的那些条目标题是
+                    // `剧名-文件名`（见 `desktop_play.dart` 的 `_episodeLabel`），
+                    // 而这一行只有约 194px（面板 320 − 缩略图 96 − 间距与内边距）
+                    // ≈ 中文 15 个字 —— 长剧名一前缀就把文件名挤没了，而那正是
+                    // 用户用来分辨「这是哪一集」的唯一信息。放开一行等于这个
+                    // 修复没做。
+                    maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: 12.5,
@@ -2316,7 +2652,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       return;
     }
 
-    // 菜单开着别让浮层自己收起来 —— 用户看不到按钮会以为界面卡住了。
+    // 菜单存续期间压住控制栏的自动隐藏 —— 含「鼠标移到菜单上被判成移出窗口」
+    // 那条**即时**隐藏路径（见 [_menuDepth]）。
     _cancelHide();
 
     if (!buttonContext.mounted) {
@@ -2330,18 +2667,152 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       return;
     }
 
-    final picked = await showAnchoredMenu<QualityBrief>(
-      navigator: navigator,
-      anchor: anchor,
-      builder: (context) => _QualityMenuPanel(
-        qualities: qualities,
-        activeId: request.qualityId,
+    final picked = await _pinnedMenu(
+      () => showAnchoredMenu<QualityBrief>(
+        navigator: navigator,
+        anchor: anchor,
+        builder: (context) => _QualityMenuPanel(
+          qualities: qualities,
+          activeId: request.qualityId,
+        ),
       ),
     );
     if (!mounted) return;
     _pokeChrome();
     if (picked == null) return;
     await _switchQuality(picked);
+  }
+
+  /// 片头标记菜单。
+  ///
+  /// 与 [PlayerWindowApp] 顶部说明一致：独立窗口不碰数据库，所以这个菜单只把
+  /// 「标了什么」报回主窗口（见 [PlayerBridgeMethod.saveIntroRange]），
+  /// 落库由主窗口的 [onSaveIntroRange] 完成 —— 那里能拿到 `groupKey` 与仓储。
+  Future<void> _showIntroMenu(BuildContext buttonContext) async {
+    final request = _currentRequest;
+    if (request == null || request.itemId.isEmpty) return;
+
+    _cancelHide();
+    if (!buttonContext.mounted) {
+      _pokeChrome();
+      return;
+    }
+    final navigator = Navigator.of(buttonContext, rootNavigator: true);
+    final anchor = globalRectOf(buttonContext);
+    if (anchor == null) {
+      _pokeChrome();
+      return;
+    }
+
+    final marker = _introSession.marker;
+    final hasManual = _introSession.manual != null;
+    final positionMs = _player?.state.position.inMilliseconds ?? 0;
+
+    final action = await _pinnedMenu(
+      () => showAnchoredMenu<_IntroAction>(
+        navigator: navigator,
+        anchor: anchor,
+        builder: (context) => _IntroMenuPanel(
+          hasMarker: marker != null,
+          hasManual: hasManual,
+          positionLabel: _fmtPosition(Duration(milliseconds: positionMs)),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    _pokeChrome();
+    if (action == null) return;
+    await _applyIntroAction(action, positionMs);
+  }
+
+  /// 把用户在片头菜单里选的动作落库，并同步进 [IntroSession]。
+  Future<void> _applyIntroAction(_IntroAction action, int positionMs) async {
+    final request = _currentRequest;
+    if (request == null || request.itemId.isEmpty) return;
+
+    switch (action) {
+      case _IntroAction.setStart:
+      case _IntroAction.setEnd:
+        // 0 秒没意义：用户还没让画面播起来就点「标起点」，会标成一个永远不跳的 0。
+        if (positionMs <= 0) {
+          _toast('先让画面播起来，再标片头起点 / 终点');
+          return;
+        }
+        final snapshot = await _saveIntroRange(
+          request.itemId,
+          startMs: action == _IntroAction.setStart ? positionMs : null,
+          endMs: action == _IntroAction.setEnd ? positionMs : null,
+        );
+        if (snapshot == null) {
+          _toast('片头标记没保存（库里找不到这部片）');
+          return;
+        }
+        // 落库成功：把最新值同步进状态机，紧接着那次播放就该跳 —— 否则用户会
+        // 以为标记没生效，于是再标一次。
+        _introSession.setManual(
+          IntroMarker.fromMilliseconds(snapshot.startMs, snapshot.endMs),
+        );
+        _toast(
+          action == _IntroAction.setStart
+              ? '片头起点已记为 ${_fmtPosition(Duration(milliseconds: positionMs))}'
+              : '片头终点已记为 ${_fmtPosition(Duration(milliseconds: positionMs))}',
+        );
+        // 标完若区间还不成立（只标了一半 / 起终点反了），必须说一声：
+        // 否则用户看到的是「标了两个点，可是还是不跳」。
+        if (_introSession.marker == null) {
+          _toast('还差一半：片头要同时有起点和终点，且起点在终点之前');
+        }
+
+      case _IntroAction.jump:
+        final marker = _introSession.marker;
+        if (marker == null) return;
+        unawaited(_player?.seek(marker.start));
+
+      case _IntroAction.clear:
+        final snapshot = await _saveIntroRange(request.itemId, clear: true);
+        if (snapshot == null) {
+          _toast('清除片头标记失败（库里找不到这部片）');
+          return;
+        }
+        _introSession.setManual(null);
+        _toast('已清除片头标记');
+    }
+  }
+
+  /// 把片头区间（起点 / 终点 / 清除）报回主窗口落库，返回落库后的真实值。
+  Future<IntroRangeSnapshot?> _saveIntroRange(
+    String itemId, {
+    int? startMs,
+    int? endMs,
+    bool clear = false,
+  }) async {
+    if (!_channelReady) {
+      _toast('跨窗口通道不可用，标记存不了');
+      return null;
+    }
+    try {
+      final raw = await playerWindowChannel.invokeMethod<Object?>(
+        PlayerBridgeMethod.saveIntroRange,
+        IntroRangeSaveRequest(
+          itemId: itemId,
+          startMs: startMs,
+          endMs: endMs,
+          clear: clear,
+        ).toJson(),
+      );
+      return IntroRangeSnapshot.fromJson(raw);
+    } catch (e) {
+      diag.error('播放窗口', '保存片头区间失败', error: e);
+      return null;
+    }
+  }
+
+  /// `m:ss`（时长 < 1 小时）或 `h:mm:ss`。
+  String _fmtPosition(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
   /// 音轨选择菜单。
@@ -2369,12 +2840,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       return;
     }
 
-    final picked = await showAnchoredMenu<AudioTrack>(
-      navigator: navigator,
-      anchor: anchor,
-      builder: (context) => _AudioMenuPanel(
-        tracks: _audioTracks,
-        activeId: _activeAudioId,
+    final picked = await _pinnedMenu(
+      () => showAnchoredMenu<AudioTrack>(
+        navigator: navigator,
+        anchor: anchor,
+        builder: (context) => _AudioMenuPanel(
+          tracks: _audioTracks,
+          activeId: _activeAudioId,
+        ),
       ),
     );
     if (!mounted) return;
@@ -2448,20 +2921,24 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     NavigatorState navigator,
     Rect anchor,
   ) {
-    _cancelHide();
-    return showAnchoredMenu<_SubtitleChoice>(
-      navigator: navigator,
-      anchor: anchor,
-      builder: (context) => _SubtitleMenuPanel(
-        tracks: _embeddedSubtitles,
-        cloud: _currentRequest?.subtitles ?? const <SubtitleBrief>[],
-        online: _onlineSubtitles,
-        searchingOnline: _searchingOnlineSubtitles,
-        local: _localSubtitle,
-        activeId: _activeSubtitleId,
-        activeCloudId: _activeCloudSubtitleId,
-        activeOnlineId: _activeOnlineSubtitleId,
-        activeLocalPath: _activeLocalPath,
+    // 走 [_pinnedMenu] 而不是直接 `showAnchoredMenu`：这个菜单会**重开**
+    // （搜完在线字幕 / 挑完本地文件都再来一次），每次重开都重新压住控制栏的
+    // 自动隐藏；中间那段搜索时间里调用方自己也没起计时（见 [_showSubtitleMenu]）。
+    return _pinnedMenu(
+      () => showAnchoredMenu<_SubtitleChoice>(
+        navigator: navigator,
+        anchor: anchor,
+        builder: (context) => _SubtitleMenuPanel(
+          tracks: _embeddedSubtitles,
+          cloud: _currentRequest?.subtitles ?? const <SubtitleBrief>[],
+          online: _onlineSubtitles,
+          searchingOnline: _searchingOnlineSubtitles,
+          local: _localSubtitle,
+          activeId: _activeSubtitleId,
+          activeCloudId: _activeCloudSubtitleId,
+          activeOnlineId: _activeOnlineSubtitleId,
+          activeLocalPath: _activeLocalPath,
+        ),
       ),
     );
   }
@@ -3159,7 +3636,7 @@ class _SelfCheckRow extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: SelectableText(
+            child: TvSelectableText(
               check.detail,
               style: TextStyle(
                 fontFamily: 'Menlo',
@@ -3221,6 +3698,87 @@ class _QualityMenuPanel extends StatelessWidget {
                 : null,
             onTap: () => Navigator.of(context).pop(q),
           ),
+      ],
+    );
+  }
+}
+
+/// 片头菜单里的动作。与内置播放页的 [_IntroAction] 同一套语义，但**不共享类型**：
+/// 两个播放器是不同文件、不同引擎，共用类型反而会逼出一个谁都不该依赖的
+/// 跨文件符号。
+enum _IntroAction {
+  /// 把当前位置记为片头起点。
+  setStart,
+
+  /// 把当前位置记为片头终点。
+  setEnd,
+
+  /// 跳到片头起点（区间已成立时）。
+  jump,
+
+  /// 清除手标的片头区间（文件章节不受影响）。
+  clear,
+}
+
+/// 片头标记菜单的面板。
+class _IntroMenuPanel extends StatelessWidget {
+  const _IntroMenuPanel({
+    required this.hasMarker,
+    required this.hasManual,
+    required this.positionLabel,
+  });
+
+  /// 当前是否已有生效的片头区间（章节或手标任一成立）。
+  final bool hasMarker;
+
+  /// 是否已有**手标**区间（决定「清除」这一项显不显示）。
+  final bool hasManual;
+
+  /// 当前播放位置，给「标记起点 / 终点」做提示用。
+  final String positionLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnchoredMenuPanel(
+      title: '片头标记',
+      maxWidth: 260,
+      children: [
+        ListTile(
+          dense: true,
+          visualDensity: VisualDensity.compact,
+          leading: const Icon(Icons.flag_rounded, size: 18),
+          title: const Text('标记片头起点', style: TextStyle(fontSize: 13)),
+          subtitle: Text('当前 $positionLabel', style: const TextStyle(fontSize: 11)),
+          onTap: () => Navigator.of(context).pop(_IntroAction.setStart),
+        ),
+        ListTile(
+          dense: true,
+          visualDensity: VisualDensity.compact,
+          leading: const Icon(Icons.flag_outlined, size: 18),
+          title: const Text('标记片头终点', style: TextStyle(fontSize: 13)),
+          subtitle: Text('当前 $positionLabel', style: const TextStyle(fontSize: 11)),
+          onTap: () => Navigator.of(context).pop(_IntroAction.setEnd),
+        ),
+        ListTile(
+          dense: true,
+          visualDensity: VisualDensity.compact,
+          enabled: hasMarker,
+          leading: const Icon(Icons.fast_forward_rounded, size: 18),
+          title: const Text('跳到片头', style: TextStyle(fontSize: 13)),
+          onTap: hasMarker
+              ? () => Navigator.of(context).pop(_IntroAction.jump)
+              : null,
+        ),
+        ListTile(
+          dense: true,
+          visualDensity: VisualDensity.compact,
+          enabled: hasManual,
+          leading: const Icon(Icons.delete_outline_rounded, size: 18),
+          title: const Text('清除片头标记', style: TextStyle(fontSize: 13)),
+          onTap: hasManual
+              ? () => Navigator.of(context).pop(_IntroAction.clear)
+              : null,
+        ),
       ],
     );
   }

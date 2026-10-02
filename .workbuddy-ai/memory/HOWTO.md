@@ -790,6 +790,112 @@ bigram 切法时莫名其妙地红，而且红得看不出原因。
 真要治就得给「失败」也带上来源标记、或者失败时干脆不写 `state`；
 当前判断是不值得为此加一层状态。
 
+## 手动刮削：刮完自动归一 + 媒体类型（2026-10-02）
+
+用户在「用这一条更新」之后要看到三件事：**类型对不对**、**库里是不是已经有同一部**、
+**如果合了，合到哪去了**。四处改动：
+
+### 1. 结果文案带上落库后的类型
+
+`WorkScrapeOutcome.message` 的 `scraped` 分支末尾加 `· 类型：${work!.category.label}`。
+
+必须写出来：对话框里那个「媒体类型」选择框可能**没赢** —— 类型标签给出
+「动画 / 纪录片 / 综艺」时优先级更高（见下）。不写的话用户会以为「我选的没生效」。
+
+### 2. 对话框里加「媒体类型」chip 行（刮削结果可手工改）
+
+`manual_scrape_dialog.dart` 的 `_categoryOverride`：**默认 `null` = 「自动」**，
+落库时交给 `WorkScraper._categoryFor` 按刮削结果判定；用户点了某一枚 = **结论**，
+直接落库并置 `categoryManual = true`（与「自定义」同一条规则）。
+
+- 版式抄上面的「来源」chip 行（`null` 对应「自动」那一枚）——**别用下拉**：
+  下拉要表达「不指定」得塞一个非枚举的哨兵值，chip 行天然能表达。
+- 只在**选中候选之后**才出现：它描述的是「这一条会怎么落库」，没选候选时没有对象。
+- 提示语必须写清「自动 ≠ 不变」：「自动 = 按**本次**刮削结果判定…」，并补一句
+  「之前若被锁过分类，手动重刮也会按本次结果重判」。
+
+### 3. 手动通道的「自动」= 按本次刮削重判（`manualChannel`）
+
+`_apply` / `_categoryFor` 的参数 `manualChannel`（旧名 `structuralCategoryFallback`）
+一个开关管两件事 —— 手动通道（`applyCandidate` 发起）与自动通道（`scrape`）的
+**全部**差别都集中在这里：
+
+1. **忽略分类锁**（`_categoryFor` 第 ② 步）：`if (work.categoryManual && !manualChannel)`。
+   锁的本意是挡**无人值守的自动刮削**，而手动重刮是用户明确要求「现在重判一次」；
+   若这里也认锁，「清空刮削数据」之后手动重刮会一直卡在旧分类上（2026-10-02 的
+   bug 现场）。
+2. **允许用条目结构证据**（第 ④ 步）：TMDB `movie/…` / `tv/…`，豆瓣
+   `douban/movie/…` / `douban/tv/…`（按**段**匹配 —— `startsWith('movie/')`
+   会漏掉豆瓣那层前缀）。**自动通道刻意不开它**：文件名把综艺解析成 `unknown`
+   时按结构会判成「剧集」，而用户明明放在 `/综艺/` 里 —— 那就是
+   「我的综艺栏目空了」。它救的是这一类：文件名只剩 `2026.2160p.WEB-DL.mkv`
+   （`kind == unknown` → 「其他」），用户在候选里确认了这是一部剧 → 落到「剧集」。
+
+⚠️ **第 ④ 步不再检查 `_isSemantic(work.category)`**（旧版有，现已删除）。
+这是 2026-10-02 明确取舍的代价：**手动重刮连语义档也会被结构证据改写** ——
+放在 `/综艺/` 而 TMDB 没给「真人秀」的片子，手动重刮会被判成「剧集」。
+**没有中间道路**：`_categoryFor` 的输入里「被自动刮错的纪录片」与「靠目录名
+判出的综艺」**完全同形**（`category` 都是语义档、`genres` 都说不出结论、
+`onlineId` 都是 `tv/…`），没有任何信号能把两者区分开。兜底 = 对话框
+「媒体类型」点一下（原「语义档不被冲掉」那条测试已按此改写）。
+- ⚠️ `applyCandidate` 传 `true`、`scrape` 不传 —— 这个不对称**是故意的**，
+  `work_scraper_test.dart` 有两条用例钉它（自动通道仍认锁 / 手动通道才按结构）。
+- ⚠️ 它**不进 `backfillWorkCategories`**：那个回填只读 `genres`，不会拿老库的
+  `online_id` 去改分类。结构档只对**这次之后**的刮削生效，老作品要重刮一次才跟上。
+
+### 3.5 「自定义」只在真的改了分类时才加锁
+
+`MediaWork.customized()` 的 `categoryManual`：旧版无条件 `true` → 改成
+`category != this.category || categoryManual`。
+
+对话框**预填当前分类**，用户「只想清在线信息」时不会动那个下拉 —— 旧版会顺手
+把当时那个（很可能是刮错的）分类**冻死**，之后连手动重刮都改不动（bug 的上游）。
+改了分类才锁；没改则保留原有锁（不新增、也不解锁）。
+
+### 4. 刮完立刻查「库里是不是已经有同一部」（`_mergeClauseAfterScrape`）
+
+`WorkScrapeController` 里那个方法返回**附加到结果后面的一句话**，三种情形：
+
+| 情形 | 结果 |
+|------|------|
+| 库里没有同一部 | `null`（绝大多数刮削，不加噪音） |
+| 有，且开着 `autoMergeByOnlineId` | `WorkMergeResult.message`（「已把…并入…」） |
+| 有，但**没开**（或归一没做成） | 「媒体库里已经有同一部《X》…可在任一部的详情页用「合并到…」…」 |
+
+第三行是这次新加的：以前只有「合了」才有话，**没开开关时用户什么都看不到** ——
+而他刚手动刮完、库里明明早就有同一部，正是最需要被告知的时候。
+
+⚠️ **判据必须复用 `WorkMergePlanner`**：新增的 `WorkMergePlanner.siblingOf(work, all)`
+内部走 `planFor`，与归一用的是同一套分组规则。另写一套「按 `onlineId` 找一行」
+的筛法一旦漂移，就会出现「提示说库里已经有一部、归一却一个都没合」——
+用户看到的是「它明明说并了，列表里却还是两个格子」。
+
+⚠️ **传 `outcome.work` 而不是 `work`**：判兄弟用的是 `onlineId`，而它正是这次
+刮削刚写进去的。传刮削前那一行会**永远找不到兄弟**（静默地退化成「没有」）。
+
+**「合理规划所属部或季」不需要额外代码**：归一只是给源行打 `merged_into` 标记，
+`itemsForWork` 取并集，`WorkLevels.of(items)` 从**全部条目**现算季 / 部层级 ——
+所以把两部「进击的巨人」合起来之后，第三季 / 第四季自然出现在同一个选择器里。
+
+### 一个已知的粗糙边缘（接受，暂不改）
+
+`WorkMergeResult.message` 用的是**源行当时的片名**，而手动刮削会先把源行标题
+改成在线标题 —— 于是同一部片子的两个条目合起来时，那句话可能读成
+「已把《流浪地球2》并入《流浪地球2》」。自动归一那边同样如此（两条都是刮完
+才合，标题当然一样）。语义没错，只是读着像 bug。要治就得在
+`WorkMergeResult.message` 里做「源标题 == 目标标题」的特判，而那个 getter
+有自己的一组测试 —— 不在这次范围内。
+
+### 测试
+
+`work_merge_planner_test.dart`（`siblingOf` 六条：有 / 只有自己 / 空 onlineId /
+kind 不同 / 别名行 / manual 源）、`work_scraper_test.dart`（结构档两条 + A 四条：
+genres 给了真人秀才保住综艺 / genres 说不出语义时按结构重判（含语义档）/ 被锁时
+手动重刮照样重判 / 自动通道仍认锁 + 自动·手动对照 + 用户手选锁住 + 没选不锁 +
+文案带类型）、`media_work_customized_test.dart`（B 三条：没改不锁 / 改了才锁 /
+原有锁保留）、`scrape_merge_prompt_test.dart`（控制器三条路各自的文案）、
+`manual_scrape_dialog_test.dart`（chip 行出现时机 / 不动它 / 点纪录片）。
+
 ## `implements MetadataScraper` **不继承**默认实现（2026-10-01）
 
 给 `MetadataScraper` 加了两个带默认实现的方法（`search` / `resolve`），
@@ -1347,3 +1453,497 @@ _isStandaloneRelease = 片名里含字母/汉字  且  (自带年份 或 kind==e
 2. **「≥2 个」阈值没有显式实现** —— 解析器逐文件调用，数不到兄弟个数。
    阈值实际由 `WorkSeedBook` 的归组承担（同目录条目片名相同 → 同一 `groupKey` → 1 个作品）。
    副作用：一个目录里**只有 1 个视频且提不出片名**时，现在会用目录名当作品名（原来是「不归组」）。
+
+## 季 / 部 / 跨目录归一（2026-10-02）
+
+### 数据模型
+
+| 层 | 实体 | 新增 |
+|----|------|------|
+| 文件 | `MediaItem` | `season`/`episode`（已有）、**`part`/`partLabel`**（v9） |
+| 作品 | `MediaWork` | **`seasonCount`**（v10）、**`mergedInto`**（v11） |
+
+- `part` 的解析面在 `filename_parser.dart` 的 `_partOf`：`第X部/第X篇`、`特别篇|剧场版`、
+  `上部|下部|前篇|后篇`、`CD|Disc|Disk|Part|DVD N`。⚠️ 分隔符必须是 `[\s._-]*` ——
+  只写 `\s*` 的话最常见的 `Part.2` 认不出来。
+- `MediaItem.partOrder`：`part` 有值用它；只有 `partLabel` 用 `specialPartOrder = 9999`
+  （特别篇排在所有编号部之后）；都没有 = 0。
+- 层级**不落库**，每次由 `WorkLevels.of(items)` 现算（`domain/services/work_levels.dart`）：
+  **季在外、部在内**；某一层**少于 2 个选项就不画**（一个选项的选择器是噪音）；
+  某季下只有一个 `partOrder == 0` 的桶 → 这一季没有部层（别画一个孤零零的「未标部」）。
+
+### 归一为什么是「打标记」而不是「删行」
+
+原设计是「改 `media_items.group_key` + 删源作品行」。**落地时改了**，因为那条路
+**合并错了回不去**：用户看到两个格子变成一个，既不知道发生了什么，也没有任何
+按钮能还原 —— 他只会从此关掉自动归一。
+
+现在的做法：
+
+```
+media_works.merged_into = <目标 key>     # 只写这一列
+```
+
+| 事 | 怎么办 |
+|----|--------|
+| 列表 / 角标 | `WHERE merged_into IS NULL`（`_workConditions` 里加一次，`listWorks`/两个计数查询共用） |
+| 详情页文件 | `itemsForWork` 并集：`group_key = ? OR group_key IN (SELECT key FROM works WHERE merged_into = ?)` |
+| 撤销 | 把 `merged_into` 改回 `NULL`，一条 UPDATE |
+| 源行的元数据 | **原样留着** —— 撤销之后它要能自己站住 |
+
+### 六条硬约束（做错全是静默坏数据）
+
+1. **只认 `onlineId` 完全相同**，且 `source == online`、`kind` 相同。
+   本地片名相似度**绝不**参与自动合并（`182.格力空调` 事故形态）。
+2. **`source == manual` 的行不参与**（用户手写过的东西不许被算法动）。
+3. **不允许链式**：`merged_into` 指向的一定是根；源行永不当目标。
+   规划器与仓储各挡一次（`mergeWorksInto` 里 `target.mergedInto != null → 0`）。
+4. **目标选择必须确定**：`itemCount` 最大 → `firstSeenAt` 最早 → `key` 升序。
+   最后一层不是「锦上添花」：没有它两次运行可能选出不同目标，用户看到海报在
+   两部片子之间来回跳。
+5. ⛔ **`mergeWorkForUpsert` 里 `mergedInto` 无条件取旧值，且不受 `protect` 影响**。
+   本次扫描造出来的行 `mergedInto` 恒为 `null`，照抄 = 每次重扫把所有合并拆开；
+   而走 `protect` 也不行 —— 重刮削时 `protect == false`，照样拆。
+6. ⛔ **`copyWith(mergedInto: null)` 清不掉这一列**（`??` 语义 = 「不改」）。
+   撤销必须整行重建或直接 UPDATE，否则**静默失败而返回值还说是成功**。
+
+### 两个踩过的坑
+
+- **搜索穿透折叠时内层作品表必须起别名**。内层要引用外层那一行的 `key`，但它自己
+  也从 `media_works` 查 —— 不起别名时 SQLite 把 `media_works.key` 解析成内层自己，
+  生成 `merged_into = key` 这种恒假条件，于是「搜源作品里的文件名」**永远搜不到且
+  不报错**。修法：`_db.mediaWorks.createAlias('merged_src')`（`package:drift` 的顶层
+  `alias()` 在这个版本里不在作用域）。
+- **`MediaKind` 不在 `media_work.dart`，在 `core/utils/filename_parser.dart`**。
+
+### 手动归一「合并到…」（P4）
+
+自动归一**只认 `onlineId` 完全相同**，覆盖不了三种真会遇到的形态：本地片名差得远、
+压根没刮到、刮到两个不同条目其实是同一部。这三类只能人来判。
+
+- 入口：详情页「合并到…」按钮（`_MergeButton`，**无 `canScrapeOnline` 门槛**，
+  与「自定义」同理 —— 没网也该能整理本地库）。
+- 对话框 `MergeWorkDialog`（骨架抄 `manual_scrape_dialog.dart`：`Dialog` +
+  `ConstrainedBox(560×620)` + `_header/_body/_footer`）。一次 `allWorks()` 读全，
+  之后**纯内存过滤**，不发任何请求。
+- **方向 = 留下选中的那一部**，按钮写「合并**到**」。确认行写死
+  `《当前》→《目标》，列表里保留后者。`，别指望用户从按钮措辞里推方向。
+- 实现完全复用 P3 的打标记：`WorkMergePlan.manual`（`onlineId = ''`，
+  `bool get isManual => onlineId.isEmpty`）→ `WorkMergeService.mergeInto` → `_execute`
+  → 撤销仍是 `unmergeWorks`。**没有第二套合并机制**。
+- 文案分两路，判据只有 `plan.isManual`：手动 = 「已把《X》并入《Y》。」；
+  自动 = 「…（识别为同一条目）。」。**别在 UI 里自己拼这句话**。
+
+**三条拦截写在纯函数 `WorkMergePlanner.manualBlocker`，UI 与 `mergeInto` 调的是同一个
+函数** —— 两边各写一遍，迟早出现「按钮亮着、点了却没反应」。①自己并自己；
+②目标已是别名行；③**源自己还折着别的作品**（真会撞上：自动归一刚把两部合到《X》，
+用户又想把《X》并进《Y》）。
+
+第③条**刻意不做「连坐迁移」**（把 X 的源一起改指 Y）：那样撤销无法精确还原 ——
+X 的那些源原本指向 X，撤完却会变成独立的根。正确动作是先「拆开」再合，提示语里
+直接写这句话。「目标已经有源」**不拦**：只是多一个兄弟，不成链。
+
+四个交互决定与「手动刮削」**刻意相反**，别照抄那边：①搜索框**预填当前片名且一打开就过滤**
+（那边不预搜是因为每次搜索花一次豆瓣额度，这里是零成本本地过滤）；②零匹配不说「没找到」，
+说「把上面的搜索框清空，可以看到全部 N 部作品」（这条通道最常见的用法恰恰是
+「两个片名完全不一样」）；③点候选**只是选中**，再点「合并」才生效；④不能合的行
+`onTap: null` + 原因写在行上 + 确认按钮同时变灰。
+
+### 列表卡片上的三个计数是**并集**
+
+归一后出过一个静默不一致：卡片写「25 集」、点进详情页有 37 个文件 —— 因为
+`itemCount`/`totalBytes`/`seasonCount` 在库里存的是「**自己名下**的文件」。
+现在 `listWorks` 读时现算并集（真库 `_withUnionStats` + `_unionStats` 一条裸 SQL，
+`JOIN ... ON i.group_key = t.key OR i.group_key IN (SELECT key ... WHERE merged_into = t.key)`；
+InMemory 替身用 owners map 同口径）。
+
+三条别改错：
+
+1. ⛔ **不写回库**。`mergeWorkForUpsert` 对 `item_count` 是「永远取新值」，
+   一旦写回，下次重扫就把并集冲成自己名下的数。
+2. **只碰「真有源折进来」的行**（SQL 里的 `AND EXISTS(...)`）。老库里
+   `item_count` 与真实行数本就可能不一致，全表重算会把老数据也一起改掉。
+3. ⚠️ **`seasonCount` 是 `COUNT(DISTINCT CASE WHEN i.season > 0 THEN i.season END)`**
+   —— 绝对值，**不能相加**（两季 + 两季 ≠ 四季）。`itemCount`/`totalBytes` 才是求和。
+   同一口径要保证 `CASE WHEN` 里也排掉 `season = 0`（「未标季」不算一季）。
+
+`allWorks` / `workByKey` **仍是存值**（不做列表展示，别顺手也改成并集）。
+
+### 触发点与开关
+
+| 时机 | 入口 |
+|------|------|
+| 扫描结束（未取消、无错） | `ScanService` 阶段二点五，`merger.mergeAll()` |
+| 详情页「刮削」/「手动」成功 | `WorkScrapeController._mergeAfterScrape` → `mergeFor(key)` |
+
+设置项 `autoMergeByOnlineId` **默认开**（判据 `!= 'false'`，与 `autoScrapeOnScan`
+的 `== 'true'` **刻意相反** —— 它不发请求、只动本地库，且误合可一键撤销）。
+组合根（`buildScanService` / `_mergeAfterScrape`）按设置决定**传不传**
+`WorkMergeService`，领域层不读设置。
+
+### 测试
+
+`work_merge_planner_test.dart`（纯函数 + `manualBlocker`）、`work_merge_service_test.dart`
+（服务 + 内存库口径 + `mergeInto`）、`work_merge_test.dart`（真库，含「三个计数是并集」）、
+`work_detail_merged_test.dart`（详情页提示条）、`merge_work_dialog_test.dart`（对话框整条链路：
+按钮 → 对话框 → 落库 → 跳页 → 撤销）。
+
+⚠️ **`find.byType` 是精确类型匹配**，而 `OutlinedButton.icon` / `FilledButton.icon` 造的是
+这两个类的**私有子类** → 按钮明明画在屏幕上却报「找不到 OutlinedButton」。用
+`find.ancestor(of: find.text(label), matching: find.byWidgetPredicate((w) => w is T))`。
+断言对话框里的候选时还要限定 `find.descendant(of: find.byType(Dialog), matching: …)`
+—— 详情页背后的大标题和候选片名**是同一个字符串**。
+⚠️ 加了 `media_works` 新列之后，`db_migration_last_modified_test.dart` 里要**补一行
+DROP** —— 那个用例是「拿当前 schema 建库、删掉新列、把 user_version 调回 5」来伪造
+老库的，漏删会在 `addColumn` 上撞 `duplicate column name`，而报错完全指不到它。
+
+---
+
+## `SelectableText` 在 TV 上是**焦点陷阱**（2026-10-02，P2-4）
+
+### 症状与判据
+
+**症状**：TV 上 D-pad 走进一段可划选的文本就**出不来**。按 OK 毫无反应、方向键也不动，
+用户只会得出「遥控器坏了」。这几处恰好都在**诊断页 / 登录页** —— 用户是在出问题的时候
+才来这里的，所以坏法格外致命。
+
+**实测**（`test/ui/tv_remote_probe_test.dart`）：在 `SelectableText` 上下各放一个按钮，
+从上面那个按钮连按 **4 次 ↓**：
+
+| 组件 | ↓ 轨迹 |
+|---|---|
+| 裸 `SelectableText` | `[text, text, text, text]` —— 停在原地，**永远到不了下面那个按钮** |
+| `TvSelectableText` | `[after]` —— 一下就穿过去了 |
+
+`focusNode.canRequestFocus` 实测为 `true`。
+
+### 机理
+
+`SelectableText` 内部是 `EditableText(readOnly: true)`，而 `EditableText` **自带一个
+`FocusNode`**（为了支持划选/光标），所以它天然参与焦点遍历。`readOnly` 只管「能不能改」，
+不管「能不能聚焦」。
+
+### 修法与不可动摇的三条
+
+`lib/ui/widgets/tv_text.dart` 的 `TvSelectableText`：TV 上返回 `Text`，
+**其余平台原样返回 `SelectableText`**。
+
+1. ⛔ **非 TV 分支不许也换成 `Text`**。桌面/手机上划选是刻意的设计
+   （`LogPathRow` 注释：「即使不点按钮，也能用鼠标划选带走」）。这不是「统一简化」，
+   是**按平台分工**。`tv_text_test.dart` 有 4 例钉住它，含「桌面 + 960 宽也不算 TV」。
+2. **探针要同时钉两件事**：裸 `SelectableText` **确实**卡住（这是包装存在的唯一理由）
+   ＋ `TvSelectableText` **确实**不卡（修复没白写）。只钉后者的话，
+   「为什么要有这个包装」就只存在于注释里了。哪天 Flutter 改了 `EditableText` 的焦点行为，
+   前一条会红，那时才该考虑能不能删掉这个包装。
+3. **`focusNode` 只在非 TV 上透传** —— TV 上**故意**不给焦点系统留任何落点。
+
+### 方法论：这类判断必须探针说话
+
+动手前我的判断是「TV 上它只是**没用**（划选不了），换了收益≈0」——**这个判断是错的**，
+它其实**有害**。「没用」和「有害」的处理完全不同：前者换不换都行，后者必须换。
+
+同一条教训在本项目已经出现过三次（`Tooltip` 在 TV 上等于不存在、`focusColor` 被
+海报盖住、`Slider` 吃掉方向键）——**共同点是「错了不会报错」，只表现为用户觉得
+「遥控器/功能坏了」**。所以凡是「这个控件在 TV 上有没有意义」的问题，一律先写探针跑一遍。
+
+### 顺带记下的两个探针写法坑
+
+* **TV 尺寸用 `MediaQuery` 显式给，不用 `tester.binding.setSurfaceSize`。**
+  `AppTheme.isTvLayout` 看的是 `MediaQuery.sizeOf(context).width`，
+  而本项目的 TV 用例统一走 `MediaQuery(data: MediaQueryData(size: Size(960, 540)))`
+  （见 `test/ui/theme/tv_layout_test.dart`）。用 `setSurfaceSize` 那次实测**没生效** ——
+  `TvSelectableText` 仍走了非 TV 分支，表现为「两条轨迹一模一样」，很容易误判成「修复没起作用」。
+* **`debugDefaultTargetPlatformOverride` 的复位只能写在测试体里**（`try/finally`），
+  `tearDown` / `addTearDown` 都排在 Flutter 的 `_verifyInvariants` **后面**，
+  用错会得到一条与业务毫无关系的「foundation debug variable was changed by the test」。
+
+---
+
+## 手动重刮改了类型却「没生效」：根因在**写入**那一步，不在判定（2026-10-02）
+
+用户现场：《黑暗荣耀》被自动刮成「纪录片」→「自定义」清空 → 手动刮削选「剧集」→
+成功提示也弹了，**纪录片栏里它还在**。
+
+### 两层根因（只修第一层不够，这正是「A+B 没修好」的原因）
+
+| 层 | 位置 | 症状 |
+|---|---|---|
+| ① 判定 | `WorkScraper._categoryFor` 第 ② 步 | 旧版认 `categoryManual` 的锁 → 手动通道的「自动」也卡在旧分类。**A 已修**（手动通道忽略锁） |
+| ② **写入** | `mergeWorkForUpsert` 的 `category:` | `existing.categoryManual ? existing.category : …` **无条件认旧锁**，把①刚算对的结论原地扔掉 |
+
+判据（一眼分辨卡在哪一层）：日志里 `分类判定：纪录片 → 剧集（对话框手选 override=剧集）`
+**写着对的结论**，而库里 `category` 还是 `documentary` → 一定是第 ② 层。
+
+### 修法：`overrideManual` 时分类与锁都取 `incoming`
+
+`overrideManual == true` 的语义就是「**用户亲手点了这个按钮**」（详情页「刮削」/「手动」
+两个按钮）。那时 `_categoryFor` 已经按完整优先级算过一遍，合并层**照抄**即可：
+
+```dart
+category: overrideManual ? incoming.category
+    : (existing.categoryManual ? existing.category
+       : (MediaCategoryGuesser.fromGenres(effectiveGenres) ?? incoming.category)),
+categoryManual: overrideManual
+    ? (incoming.categoryManual || existing.categoryManual)  // 只增不减
+    : existing.categoryManual,
+```
+
+* **自动通道不受影响**：扫描期那条根本不传 `overrideManual`，仍然被锁挡住 —— 锁的本意
+  就是挡无人值守的自动刮削。详情页「刮削」按钮虽传 `overrideManual: true`，但它的
+  `_categoryFor` 认锁，所以 `incoming.category == existing.category`，行为不变。
+* `categoryManual` 用 `||`（只增不减）：本项目**没有解锁入口**，锁只由用户的显式操作置上。
+  写成纯 `incoming.categoryManual` 会在某个调用方漏抄该字段时**静默解锁**。
+* ⚠️ **`InMemoryMediaRepository.upsertWorks` 必须同步改**（它复刻了同一套合并规则，
+  两边不一致 = 「用内存库跑过的用例在真库上失败」）。
+* ⚠️ 已落库的旧行**不会自动修**（`categoryManual` 的行被 `backfillWorkCategories` 跳过）——
+  用户要重刮一次。
+
+回归用例：`test/data/media_work_merge_test.dart`「用户显式重刮（overrideManual）」
+三条 + `test/domain/work_scraper_test.dart`「A：锁着的分类要**真的落库**」（后者读回
+`repo.workByKey`，才照得出第 ② 层）。
+
+## 媒体库列表「显示特别慢」：并集统计里 JOIN 条件的一个 `OR`（2026-10-02）
+
+### 怎么量的（这个手法值得复用）
+
+把真实库**复制**到 `/tmp`，用 `AppDatabase.openFile(File(copy))` + 真 `DriftMediaRepository`
+逐条计时 —— 走的是产品代码本身，不是另写一份 SQL 猜：
+
+```dart
+final tmp = File('${Directory.systemTemp.path}/cloudcine_perf.sqlite');
+src.copySync(tmp.path);                       // src = ~/Library/Application Support/…
+final db = AppDatabase.openFile(tmp);
+final repo = DriftMediaRepository(db);
+await repo.listWorks(limit: 500);             // 计时
+```
+
+（临时用例放 `test/` 下跑完就删；**别留在仓库里**。）
+
+### 数字（172 部作品 / 2886 个文件）
+
+| 查询 | 耗时 |
+|---|---|
+| `backfillWorkCategories`（首屏前必跑） | 8ms |
+| **`listWorks(limit:500)`** | **340ms** ← 全部在这里 |
+| ├ 只 `select media_works` + 映射 | 5ms |
+| └ `_unionStats` 那条 SQL | **336ms** |
+| `countWorksByCategory/Year/Genre/Played` | 0 / 2 / 4 / 0ms |
+| `countItems` + `countWorks` | 0ms |
+
+顺带排除了两个猜测：**海报不是瓶颈** —— 170/170 命中磁盘缓存、首屏 **0 次联网下载**
+（`poster_file` 列全空，但 `PosterCache._download` 的 `existsSync()` 兜住了）。
+
+### 根因：`JOIN` 的 `ON` 里写了 `OR`
+
+```sql
+JOIN media_items i ON i.group_key = t.key
+  OR i.group_key IN (SELECT s.key FROM media_works s WHERE s.merged_into = t.key)
+```
+
+`OR` 让连接条件**用不上任何索引**（`media_items.group_key` 上也没有索引，只有 PK 自动索引），
+SQLite 只能对每个目标键把 `media_items` 整表扫一遍。实测拆解：
+
+* 只留等值 JOIN（去掉 OR 分支）：**37ms**
+* 去掉 `EXISTS` 的 OR-JOIN：**6381ms**（参与 OR 的目标从 9 个涨到 172 个）
+  → 可见 `AND EXISTS (…)` 一直在**救**这条查询，删了它直接 6 秒。
+
+### 修法：拆成两段 `UNION ALL` 的等值连接（336ms → **3ms**）
+
+```sql
+WITH src AS (
+  SELECT t.key AS tgt, t.key AS src FROM media_works t
+   WHERE t.key IN ($marks)
+     AND EXISTS (SELECT 1 FROM media_works s WHERE s.merged_into = t.key)
+  UNION ALL
+  SELECT s.merged_into AS tgt, s.key AS src FROM media_works s
+   WHERE s.merged_into IS NOT NULL)
+SELECT s.tgt, COUNT(i.id), COALESCE(SUM(i.size_bytes),0),
+       COUNT(DISTINCT CASE WHEN i.season > 0 THEN i.season END)
+FROM src s JOIN media_items i ON i.group_key = s.src
+GROUP BY s.tgt
+```
+
+* 第一段那个 `EXISTS` **不能删**：它保证「没有源折进来的目标一行都不出」—— 这是
+  **正确性**要求（老库 `item_count` 与真实行数可能不一致，顺手重算会改掉一批与归一
+  无关的作品）。验证方式：跑一遍 `listWorks`，比对返回的 `itemCount` 与库里存的值，
+  被改动的行**必须**全部是 `merged_into` 指向的目标。
+* 第二段刻意**不加**「目标在本页」的过滤：源行只有个位数（当前 11 条），多算出的目标
+  调用方按 key 查表时自然忽略，少一个 `IN` 就少一份绑定参数。
+* **等价性验证**：同一份真实数据、同一批 key，旧 SQL 与新 SQL 的
+  `(items, bytes, seasons)` **逐键比对 0 处不一致**；新 SQL 会多出本页之外的
+  目标（当前 1 个），`_withUnionStats` 按 key 查表，多余的无影响。
+
+### 与「类型设置没生效」那条**无关**
+
+那条改的是**写**路径（`WorkScraper._apply` / `mergeWorkForUpsert` / `customized`），
+`listWorks` / 计数查询一行没碰。列表慢是**归一**（`merged_into`，v11）那条功能引入的读路径开销。
+
+### 还没做、但值得考虑的
+
+`media_items.group_key` 与 `media_works.merged_into` 上**没有索引**（只有 PK 自动索引）。
+当前量级下重写已经够快（3ms），但若作品数涨到几千、或 `_unionStats` 再次变慢，
+加这两个索引是正解 —— 那要动 schema（v13）+ `build_runner`，别只改 SQL 就以为完事。
+
+### 目录视图（「文件夹」）的慢是**另一回事**
+
+日志里 19:09:59–19:10:28 有 8 次 `GET /1/clouddrive/file/sort`，每次 300ms–1.6s ——
+那是**网盘实时列目录**（`driveListingProvider`，每进一层一次请求；`_listPageSize = 100`、
+`_listMaxEntries = 3000`，所以一个大目录最多 30 次串行请求）。与本地库无关，别往 SQL 上查。
+
+## 「自定义」清刮削后封面回落到网盘缩略图（2026-10-02）
+
+### 现象
+详情页「自定义」（清掉在线刮削、改片名/分类）之后，整墙封面变成片名首字的灰块。
+根因：`MediaWork.customized()` 把 `posterUrl`/`posterFaceX`/`posterFile` 一律清 `null`，
+而网盘缩略图只存在**文件行**（`media_items.thumbUrl`），作品行没有留底 —— 清完就没有任何来源。
+
+### 修复形态
+- 新增纯函数 `WorkPoster.fromItems(items)`（`domain/entities/work_poster.dart`）：
+  挑一张网盘缩略图，**正片优先、跳过空地址、花絮兜底**；返回 `{url, faceX}` 成对值。
+- `MediaWork.customized({..., WorkPoster? drivePoster})`：有它就用它的 `url` 当 `posterUrl`、
+  `faceX` 当 `posterFaceX`；其余在线痕迹照旧清空。**只有没找到任何缩略图时才真的留空**（不造地址）。
+- `posterFile` 只在「地址没变」时保留（清之前用的本来就是网盘缩略图），换了图必须清 ——
+  否则 `PosterCache` 见 `knownFile` 存在就返回旧文件，封面显示成前一张。
+- 两个 repo 实现（`DriftMediaRepository.customizeWork`、`InMemoryMediaRepository.customizeWork`）
+  **都要**先 `itemsForWork(key)` 取 `WorkPoster` 再传进去；漏一个就是「替身比真身弱」。
+
+### ⚠️ 锚点必须落在文件行（这就是 v13 的来由）
+作品级 `posterFaceX` 在**刮到在线海报时会被清成 null**（不同图不能共用锚点）。
+于是「清刮削 → 封面回落网盘缩略图」那一刻，锚点只能从**文件行**取回 —— 所以 **v13 加了
+`media_items.faceAnchor_x` 列**（`tables.dart` + `app_database.dart` 迁移 `from < 13`）。
+
+写入 `_toCompanion` 与扫描同步规则：**锚点与地址同进同退**
+（只在该次「既没图也没锚点」时才 `Value.absent` 保留旧的一对）；`_toItem` 读回 `faceAnchorX`。
+
+### ⚠️ 改了 `tables.dart` 加列，必须同步迁移测试
+`test/data/db_migration_last_modified_test.dart` 是「拿当前 schema 建库、再 DROP 掉新列、
+把 `user_version` 调回 5」来伪造老库的。漏了 DROP → reopen 时 `onUpgrade` 的 `ADD COLUMN`
+撞 `duplicate column name: face_anchor_x`，而报错完全指不到这个用例。
+（本会话已补 `media_items` 的 DROP 行。）
+
+### ⛔ 抢占提示
+本节用掉了 schema **v13**。HOWTO 1785 行预留的「`group_key`/`merged_into` 加索引」若真要做，
+请用 **v14**，别再写 v13（否则两个迁移同号、且 build_runner 生成会冲突）。
+
+## 提不出集号的行标题**不能**退回片名（2026-10-02，播放列表 + 详情页文件列表）
+
+### 现象
+剧集播到一半打开右侧剧集列表，几十行**全是一模一样的剧名**，分不出哪一行是哪一集。
+用户原话：「有些文件名不符合集数命名规则的文件名，无法解析出集数」。
+
+### 根因（两层，别只看到第一层）
+1. `desktop_play.dart` 的 `_episodeLabel` 在 `item.episode == null` 时**退回
+   `displayTitle`**，而 `displayTitle` = 片名 + 集号 —— 没有集号时就只剩片名。
+2. 更关键：这批条目不是「解析器没认出来」，而是**被刻意清掉的**。
+   `MediaFilenameParser.parse` 的目录级归组（「目录名作为系列名」，见本文件同名章节）
+   在把整目录归成一部剧时会执行 `season = null; episode = null; episodeEnd = null;`
+   —— 事故现场 `182.格力空调显示E6如何维修.mp4`，那个 `E6` 是**故障代码**，
+   当成第 6 集是错的。代价就是这类目录下**每一项都没有集号**。
+
+所以「让它解析出集数」这条路是走不通的（清了才是对的），只能换**展示**口径。
+
+### 修复形态
+`_episodeLabel(item, {workTitle})`：
+
+- 有集号 → 原样 `第 3 集` / `S2 · 第 3 集`（这支逻辑没动）。
+- **没集号 → `剧名-文件名`**（文件名过 `baseNameOf` 去扩展名；副标题那行已经在报容器格式）。
+  - `workTitle` 取**作品行** `MediaWork.title`（刮削后的名字），由 `buildPlayRequest`
+    在已经读过 `work` 之后传进 `_buildPlaylist`；作品行缺失时退回条目自己的 `title`，
+    **不会拼出空前缀**。
+  - 文件名自己已含剧名时不再重复拼（折叠掉标点后 `startsWith`，见 `_foldForCompare`）——
+    否则 `姜松《家电维修视频教程》` 目录下的 `姜松家电维修视频教程 182.mp4` 会变成
+    「剧名-剧名 182」。**折标点是有意的**：剧名来自目录名（带书名号）、文件名不带，
+    不折这条判据永远不成立。
+  - 顺带修好另一处：同一部电影的多个版本以前都显示 `流浪地球2 (2023)`，
+    现在显示 `流浪地球2.2023.1080p` / `…2160p`。
+
+### ⚠️ 标题必须给**两行**，否则这个修复等于没做
+面板宽 320、缩略图 96、内边距与间距 20+10 → 标题那行只有约 **194px ≈ 中文 15 字**，
+而 `姜松《家电维修视频教程》-182.格力空调显示E6如何维修` 是 28 字。
+只给一行的话被省略号吃掉的全是**后半段的文件名** —— 那正是用来分辨集数的信息。
+故 `_buildEpisodeTile` 里 `maxLines: 2`，并把 `_episodeTileHeight` **84 → 96**。
+
+⚠️ `_episodeTileHeight` 同时是 `itemExtent` 的**上限**：内容比它高就会画到面板外面
+（真机表现成「开剧集列表后底部按钮乱飞／被裁」，见 `player_window_app.dart` 里那条注释）。
+按现在的内容算 ≈ 69（缩略图那支 54 + 内边距 16 = 70），96 是留给字体度量/字号缩放的余量。
+`_revealCurrentEpisode` 的滚动偏移读的是同一个常量，所以调它不会让「自动定位当前集」错位。
+
+### 测试
+- `desktop_play_test.dart`：前缀取作品行（不是条目的 `title`）／文件名自带剧名去重／
+  无作品行兜底，共 3 例。
+- `player_window_app_test.dart`：长标题那一条要 `maxLines == 2`，并且
+  `tester.takeException()` 为 null（溢出在 widget 测试里是一条 RenderFlex 异常）。
+- `media_item_test.dart`：`rowLabel` 的两支口径 + 提不出集号那一支，共 11 例。
+
+## 同一份规则要服务两个列表 —— 但**有集号那一支必须分开**（2026-10-02）
+
+规则本体收在 `MediaItem.rowLabel(RowLabelStyle, {workTitle})`（`domain/entities/media_item.dart`）。
+两处调用点：
+
+| 调用点 | 口径 | 有集号时 | 提不出集号时 |
+| --- | --- | --- | --- |
+| 播放器剧集面板 `desktop_play.dart` | `compact` → 撞名时 `withTitle` → 还撞 `fileName` | `第 3 集`（多季 `S2 · 第 3 集`） | `剧名-文件名` |
+| 详情页「文件」列表 `media_item_row.dart` | `withTitle` | **`剧名 S01E03`**（= `displayTitle`） | `剧名-文件名` |
+
+### 为什么有集号那一支不能统一（这是实测撞出来的，不是笔误）
+
+详情页那一侧用 `第 N 集` 会把**同一集的多个版本显示成两行一模一样的字**。
+真实数据（`f飞cc日志2` / 标题「飞常日志」，合并 2 个源）：
+
+- `/来自：分享/F飞CC日  志2/` — 12 个 `01.国语.mp4` / `01.粤语.mp4`…：**season/episode 全为 null**；
+- `…/第一季/翡翠台 粤语版/` — 10 个 `飛常日誌 EP01..EP10`：episode 1–10、**season 为 null**；
+- `…/第一季/MyTVSuper/` — 10 个 `The.Airport.Diary.S01E01..E10`：season 1、episode 1–10。
+
+按 `WorkLevels` 分桶：**未标季 = 前两组共 22 行**，第 1 季 = 第三组 10 行。
+`withTitle` 口径下未标季显示 `飛常日誌 E01…E10` + `飞常日志-01.国语…`（22 行全可区分）；
+若用 `compact`，那 10 行会变成 `第 1 集…第 10 集`，**跟第 1 季那一格一模一样** ——
+用户点来点去看到的是同一批字。
+
+### 播放列表：**先短，撞名才补信息**（逐级退让）
+
+`_buildPlaylist` 不是直接调 `compact`，而是走 `_playlistLabels`：
+
+1. `第 3 集` —— 常态，最省空间；
+2. 撞名的（出现次数 > 1）改成 `剧名 S01E03` —— 上面那两组的 episode 都是 1–10，
+   于是第 2 组补成 `飛常日誌 E01`、第 3 组补成 `The Airport Diary S01E01`；
+3. 还撞的改成 `剧名-文件名` —— 同一集的两个压制/码率，只有文件名保证互不相同。
+
+「没撞名的保持短标题」这条也要钉住：一律加片名会把本来 320px 就紧张的面板拉长。
+检测按**字符串值**统计（`_clashingLabels`），不是按 item 相等 —— 要检测的正是
+「两行显示成一样的字」。
+
+### 查真实数据的办法（只读，别写）
+
+```sh
+DB="$HOME/Library/Application Support/com.cloudcine.cloudcine/cloudcine.sqlite"
+sqlite3 -header -column "file:$DB?mode=ro" \
+  "select group_key, name, dir_path, season, episode, title from media_items where group_key in (...)"
+```
+`dir_path` 里是**归一化后**的路径（`/来自：分享/F飞CC日  志2/`，带尾斜杠），
+所以 `like '%日志%'` 这类模糊匹配对不上 —— 要按 `group_key` 或 `title` 查。
+
+### 验证展示规则：导出 TSV + 纯 Dart 探针（**比手推可靠，2026-10-02 实测有效**）
+
+改动「某一行该显示成什么」之后，别靠脑补，拿真实行跑一遍：
+
+```sh
+# 1. 导成 TSV（-noheader -separator 用制表符）
+sqlite3 -noheader -separator $'\t' "file:$DB?mode=ro" \
+  "select file_id,name,ifnull(title,''),ifnull(season,''),ifnull(episode,''),ifnull(episode_end,''),dir_path
+     from media_items where group_key in (...) order by season, episode, name;" > /tmp/probe.tsv
+# 2. 写一个 tool/_probe.dart（`dart run tool/_probe.dart /tmp/probe.tsv <作品标题>`），跑完即删
+```
+
+**为什么能直接 `dart run` 而不用起 Flutter**：`domain/entities/media_item.dart` 这条
+依赖链（`file_names` / `filename_parser` / `video_formats` / `directory_title` /
+`drive_entry` / `drive_provider`）**全是纯 Dart**，没有任何 Flutter import。
+纯 Dart 侧拿不到 sqlite，所以才先导 TSV。
+⚠️ 探针里的规则是**抄**的，只用来核**输出**；规则的唯一实现仍在 `MediaItem.rowLabel`，
+所以别把探针留下的结论当成「代码已验证」，撞名那类逻辑还是要靠单测钉。
+
+实测结果（`f飞cc日志2`，32 行）：未标季 22 行 → 22 个不同标题；第 1 季 10 行 → 10 个不同；
+播放列表 `compact` 起步有 **10 行重名**，逐级退让后 **32/32 唯一**。
+
+
+
+

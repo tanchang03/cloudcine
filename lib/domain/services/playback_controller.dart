@@ -6,6 +6,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/mpv_chapters.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
@@ -16,6 +17,9 @@ import '../entities/media_item.dart';
 import '../entities/quality_option.dart';
 import '../entities/stream_ticket.dart';
 import '../entities/subtitle_track.dart';
+import 'intro_marker.dart';
+import 'intro_session.dart';
+import 'missing_media.dart';
 import 'playback_media.dart';
 import 'subtitle_service.dart';
 
@@ -105,6 +109,20 @@ class PlaybackController extends ChangeNotifier {
   bool _loading = false;
   String? _error;
 
+  /// 这次失败是不是「网盘上已经没有这个文件」。
+  ///
+  /// ## 为什么 UI 需要它，而不只是看 [error] 那句话
+  ///
+  /// [error] 是给人读的一行字，UI 拿它只能做「显示出来」这一件事。而
+  /// 「文件确实没了」这个结论还意味着**有一件事可以做**——把这条已经失效
+  /// 的索引从媒体库里删掉。要让播放页长出那个「从媒体库移除」的按钮，
+  /// 就得有一个机器可读的信号，靠解析中文文案是做不到的（而且文案一改就断）。
+  ///
+  /// 判据本体在 `missing_media.dart` 的 `isMissingFileError`（独立窗口那条
+  /// 路也用它）。这里只是记下本次 `open()` 的结论：它在每次 `open()` 开头
+  /// 归零，所以「重试成功」会自动把它清掉。
+  bool _fileMissing = false;
+
   /// 非致命提示（字幕加载失败、选的档位服务端没给地址…）。
   ///
   /// **绝不能塞进 [_error]**：`error` 在播放页是一层 **88% 不透明的全屏遮罩**，
@@ -123,6 +141,9 @@ class PlaybackController extends ChangeNotifier {
   bool _playing = false;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
+
+  /// 本次打开的文件是否已经播到结尾。见 [onCompleted]（只在上升沿触发）。
+  bool _completed = false;
 
   /// 已缓存在播放头**前面**的秒数（mpv 的 `demuxer-cache-time`）。
   ///
@@ -148,13 +169,44 @@ class PlaybackController extends ChangeNotifier {
   String? get error => _error;
   bool get hasError => _error != null;
 
+  /// 这次打不开是不是因为「网盘上已经没有这个文件」。见 [_fileMissing]。
+  ///
+  /// UI 据此决定要不要给「从媒体库移除」这个出口 —— 其它失败种类（登录
+  /// 失效、网络断了、限流）都不该给，那些情况下文件还在。
+  bool get isFileMissing => _fileMissing;
+
   /// 非致命提示，UI 应当**不遮挡画面**地展示它（见 [_notice]）。
   String? get notice => _notice;
 
+  /// 自动消失的提示的定时器（跳片头那条）。
+  ///
+  /// 为什么需要它：跳片头是**我们主动把画面往前推了 90 秒**，而用户什么都没按。
+  /// 不给一句提示的话，这件事在用户眼里与「播放器抽风跳帧」没有区别 ——
+  /// 而这类「莫名其妙」的投诉最难查，因为它不留任何痕迹。
+  Timer? _noticeTimer;
+
   void clearNotice() {
+    _noticeTimer?.cancel();
+    _noticeTimer = null;
     if (_notice == null) return;
     _notice = null;
     notifyListeners();
+  }
+
+  /// 显示一条 [duration] 后自己消失的提示。
+  ///
+  /// 与 [notice] 共用同一个字段，所以**必须防覆盖**：期间如果字幕加载失败
+  /// 又设了 `_notice`，定时器到点时不能把那条新提示一起清掉。
+  void _showTransientNotice(String message, {Duration? duration}) {
+    _noticeTimer?.cancel();
+    _notice = message;
+    notifyListeners();
+    _noticeTimer = Timer(duration ?? const Duration(seconds: 5), () {
+      _noticeTimer = null;
+      if (_notice != message) return;
+      _notice = null;
+      notifyListeners();
+    });
   }
 
   /// 网盘外挂字幕（扫描期建立的引用）
@@ -216,6 +268,54 @@ class PlaybackController extends ChangeNotifier {
   /// 这样播放控制器可以在单元测试里独立构造。
   void Function(Duration position)? onPositionTick;
 
+  /// **一集播完了**。自动连播由接这个回调的人决定「下一集是谁」。
+  ///
+  /// ## 为什么是回调而不是控制器自己切集
+  ///
+  /// 「下一集是哪一条」需要**播放列表**，而两个播放器拿到的列表形状不同
+  /// （内置页是 `List<MediaItem>`，独立窗口是 `List<PlaylistEntry>`，
+  /// 跑在另一个引擎里）。规则本体在 `EpisodeQueue.nextAfter`，这里只负责
+  /// 把「播完了」这个事实播出去 —— 控制器一旦开始自己找下一集，就必然
+  /// 要在这一层引入对列表形状的假设，两个播放器又会各长一套。
+  ///
+  /// ⚠️ 只在**上升沿**触发（`false → true`）。media_kit 的 `completed` 是
+  /// 状态流，一次播完可能重复报同一个值；不过滤的话「最后一集播完」
+  /// 会反复触发自动连播逻辑，而那时它已经找不到下一集了。
+  void Function()? onCompleted;
+
+  /// 一集播完了（供 UI 显示「下一集」按钮之类的状态）。
+  bool get isCompleted => _completed;
+
+  // -------------------------------------------------------------------
+  // 片头（自动跳过）
+  // -------------------------------------------------------------------
+
+  /// 片头状态机。状态与转移全部在 [IntroSession] 里 —— 独立播放窗口用的是
+  /// **同一个类**，两边只负责「取数据 + 按回答去 seek」。
+  final IntroSession _intro = IntroSession();
+
+  /// 当前生效的片头区间。**章节优先、手标兜底**（见 [IntroSession.marker]）。
+  IntroMarker? get introMarker => _intro.marker;
+
+  /// 片头区间是从文件章节来的吗（UI 用它区分「这是压制者标的」与
+  /// 「这是你手标的」，两者的提示文案不同）。
+  bool get introFromChapters => _intro.fromChapters;
+
+  bool get introSkipped => _intro.skipped;
+
+  /// 用户手标了片头区间（或取消标记）后同步给控制器。
+  ///
+  /// **不落库**：写库由 UI 层走 `MediaRepository.setWorkIntro*` 完成 ——
+  /// 控制器不认识仓储（见 [onPositionTick] 的同一条理由）。
+  ///
+  /// [marker] 传 `null` 表示取消标记。章节区间不受影响（它是文件里的
+  /// 事实，不该被用户的标记清掉）。
+  void applyManualIntro(IntroMarker? marker) {
+    if (_intro.manual == marker) return;
+    _intro.setManual(marker);
+    notifyListeners();
+  }
+
   // -------------------------------------------------------------------
   // 打开与取链
   // -------------------------------------------------------------------
@@ -224,14 +324,19 @@ class PlaybackController extends ChangeNotifier {
   ///
   /// [subtitles] 是扫描期建立的字幕引用（可为空）。
   /// [preferredQualityId] 是设置里的默认档位（可为空 = 原画优先）。
+  /// [introMarker] 是**库里手标**的片头区间（兜底，可为空）。
+  /// [skipIntro] 来自设置；`false` 时连章节也不读（省一次属性查询）。
   Future<void> open(
     MediaItem item, {
     List<SubtitleTrack> subtitles = const [],
     String? preferredQualityId,
     bool autoLoadSubtitles = true,
+    IntroMarker? introMarker,
+    bool skipIntro = true,
   }) async {
     _item = item;
     _error = null;
+    _fileMissing = false;
     _notice = null;
     _loading = true;
     _position = Duration.zero;
@@ -241,6 +346,11 @@ class PlaybackController extends ChangeNotifier {
     _embeddedAudio = const [];
     _activeSubtitleId = null;
     _subtitlesEnabled = autoLoadSubtitles;
+    // 片头状态**每次打开都要归零**。漏了「已探测」标志的后果很隐蔽：
+    // 换集之后永远不再读章节，于是「只有第一集跳片头」—— 而第一集恰好
+    // 是最不需要跳的那一集（用户是从头开始看的）。
+    _intro.reset(manual: introMarker, enabled: skipIntro);
+    _completed = false;
     _subtitleResolver.clear();
     notifyListeners();
 
@@ -272,6 +382,10 @@ class PlaybackController extends ChangeNotifier {
     } on DriveException catch (e) {
       _loading = false;
       _error = _explain(e);
+      // 只有 `notFound` 才算「文件没了」：登录失效、限流、网络断了都只是
+      // 这次没取到，文件本身还在 —— 拿它们去问用户「要不要从媒体库移除」
+      // 是最糟的一类误报。
+      _fileMissing = isMissingFileError(e);
       diag.error('播放', '取链失败：$e');
       notifyListeners();
     } catch (e) {
@@ -398,6 +512,10 @@ class PlaybackController extends ChangeNotifier {
       subtitles: _externalSubtitles,
       preferredQualityId: _activeQualityId,
       autoLoadSubtitles: _subtitlesEnabled,
+      // 重试用的是**手标**那一份：章节那份会重新探测（票据可能换了一条流，
+      // 但同一个文件章节不会变，重探一次没有坏处，还能顺带刷诊断日志）。
+      introMarker: _intro.manual,
+      skipIntro: _intro.enabled,
     );
   }
 
@@ -562,7 +680,13 @@ class PlaybackController extends ChangeNotifier {
     _activeSubtitleId = null;
     _embeddedSubtitles = const [];
     _embeddedAudio = const [];
+    // 片头状态跟着一起清。**手标区间与开关不清**：它们是这一部作品的播放
+    // 偏好，与「这次播放结束了」无关 —— 清了会让「退出播放页再进来」
+    // 第一次不跳片头。下一次 `open()` 会拿到 UI 传来的新值覆盖它们。
+    _intro.endStream();
+    _completed = false;
     _error = null;
+    _fileMissing = false;
     _notice = null;
     _subtitleResolver.clear();
     notifyListeners();
@@ -622,6 +746,11 @@ class PlaybackController extends ChangeNotifier {
       _position = v;
       notifyListeners();
       _maybeTickPosition(v);
+      // 章节探测与跳片头都挂在位置流上，且**必须在 `_position = v` 之后**：
+      // 两者都要用「流已经解析到哪儿了」这个事实（读早了章节是空的、
+      // 位置为 0 时 seek 会被丢掉）。
+      _probeChaptersOnce(v);
+      _maybeSkipIntro(v);
     }));
 
     _subs.add(player.stream.duration.listen((v) {
@@ -655,6 +784,20 @@ class PlaybackController extends ChangeNotifier {
     // 内嵌轨列表：mpv 解完文件头之后才可用，因此这是**流**而不是一次性查询。
     _subs.add(player.stream.tracks.listen(_onTracksChanged));
 
+    // 播完了。自动连播的触发信号。
+    //
+    // ⚠️ 只在**上升沿**触发：`completed` 是状态流（mpv 的 `END_FILE` 事件
+    // 之后一直为 true，直到下一次 `loadfile` 才复位）。不过滤的话，
+    // 每来一次重复回报都会调一遍「找下一集」——最后一集播完时那是空转，
+    // 而中间集数则会在 open 生效前被调两次（第二次数到的「当前集」还是旧的，
+    // 于是同一集被连播两遍的错觉）。
+    _subs.add(player.stream.completed.listen((v) {
+      if (v == _completed) return;
+      _completed = v;
+      notifyListeners();
+      if (v) onCompleted?.call();
+    }));
+
     // 播放错误。mpv 的报错很笼统（`Failed to open ...`），
     // 但对用户来说「播不了」这个结论是准确的 —— 具体原因看诊断日志。
     _subs.add(player.stream.error.listen((msg) {
@@ -681,6 +824,48 @@ class PlaybackController extends ChangeNotifier {
     if (second == _lastTickSecond) return;
     _lastTickSecond = second;
     onPositionTick?.call(v);
+  }
+
+  /// 探测一次文件章节（认出片头就存起来）。
+  ///
+  /// ## 触发条件是 `position > 0`，不是 `open()` 返回
+  ///
+  /// `open()` 只把 `loadfile` 投进 mpv 的命令队列，**不等文件加载完成**。
+  /// 那一刻读 `chapter-list` 拿到的是 `[]` —— 与「这个文件没章节」
+  /// 完全无法区分（见 [MpvChapters] 的类文档）。`position` 变成正数说明
+  /// 解复用器已经跑起来了，容器头一定解析完了。
+  ///
+  /// 判据本体在 [IntroSession.shouldProbe]（两个播放器共用），这里只负责
+  /// 「先置位、再起异步任务」这个顺序。
+  void _probeChaptersOnce(Duration position) {
+    if (!_intro.shouldProbe(position)) return;
+    // 先置位再 await：见 `IntroSession.markProbed` 的文档。
+    _intro.markProbed();
+    unawaited(_probeChapters());
+  }
+
+  Future<void> _probeChapters() async {
+    final label = _item?.displayTitle ?? '';
+    final marker = await MpvChapters.detectIntro(player, label: label);
+    if (marker == null) return;
+    // 探测期间用户可能已经换集 / 退出（`open` 会把章节清成 null 并换掉
+    // `_item`）。晚到的结果写进去会让**下一集**顶着这一集的片头区间跳 ——
+    // 一个只有网络慢时才复现的怪 bug。
+    if (_item?.displayTitle != label) return;
+    _intro.setChapter(marker);
+    notifyListeners();
+  }
+
+  /// 播放头进了片头区间就跳过去。判定本体在 [IntroSession.takeSkipTarget]。
+  void _maybeSkipIntro(Duration position) {
+    final target = _intro.takeSkipTarget(position);
+    if (target == null) return;
+    diag.info('片头', '跳过片头：${position.inSeconds}s → ${target.inSeconds}s');
+    _showTransientNotice('已跳过片头 ${(target - position).inSeconds} 秒');
+    // 用 `player.seek` 而不是 `seek()`：后者会再走一遍 `clampSeekTarget`，
+    // 而区间的终点已经由 `IntroMarkerDetector` 的时长上界保证落在片内
+    // （见 `maxLength`），再夹一次只是多一层没必要的不透明性。
+    unawaited(player.seek(target));
   }
 
   void _onTracksChanged(mk.Tracks tracks) {
@@ -795,6 +980,8 @@ class PlaybackController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _noticeTimer?.cancel();
+    _noticeTimer = null;
     for (final s in _subs) {
       s.cancel();
     }

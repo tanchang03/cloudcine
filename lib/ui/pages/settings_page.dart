@@ -238,6 +238,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ref.read(settingsProvider.notifier).set(autoScrapeOnScan: v),
             ),
           ),
+          const SizedBox(height: 4),
+          _ToggleRow(
+            label: '自动归一同一部影片',
+            hint: s.autoMergeByOnlineId
+                ? '刮到同一条目（同一个 TMDB / 豆瓣条目）的几部作品会自动合成一部。'
+                    '它不发网络请求，而且详情页里能一键撤销。'
+                : '已关闭。不同目录刮到同一条目的作品会各自占一个格子；'
+                    '仍可在详情页手动合并。',
+            value: s.autoMergeByOnlineId,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(autoMergeByOnlineId: v),
+            ),
+          ),
 
           const SizedBox(height: 16),
           const Divider(height: 1, color: AppTheme.line),
@@ -698,6 +711,37 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             value: s.rememberPosition,
             onChanged: (v) => unawaited(
               ref.read(settingsProvider.notifier).set(rememberPosition: v),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Divider(height: 1, color: AppTheme.line),
+          const SizedBox(height: 14),
+          // 这两项与上面三项的关系是「播放过程中发生什么」，而不是「打开时
+          // 用哪个参数」，所以用一条分隔线分开。
+          //
+          // ⚠️ 连播的提示文案里刻意**不写**「需要打开『记住播放进度』」：
+          // 两者在代码里是独立的（见 `AppSettings.fromValues` 里那条注释），
+          // 文案绑在一起会让人以为有关，然后按这个误解去排查问题。
+          _ToggleRow(
+            label: '自动连播下一集',
+            hint: s.autoPlayNext
+                ? '一集播完自动接着播同一部作品的下一集；'
+                    '跳过花絮，最后一集播完就停。'
+                : '已关闭。一集播完会停在片尾。',
+            value: s.autoPlayNext,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(autoPlayNext: v),
+            ),
+          ),
+          _ToggleRow(
+            label: '自动跳过片头',
+            hint: s.skipIntro
+                ? '认出片头就自动跳过去。片头来自文件内章节名；'
+                    '没有章节时用你在播放器里标的区间。都没有就什么都不做。'
+                : '已关闭。片头标识仍可在播放器里标记，只是不会自动跳。',
+            value: s.skipIntro,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(skipIntro: v),
             ),
           ),
         ],

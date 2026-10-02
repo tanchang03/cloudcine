@@ -10,8 +10,8 @@
 > `genre_edit_dialog.dart`），已把这三个也纳入 §5.4。
 >
 > ✅ **§0–§5 描述的是「改造前」的状态，原样保留作为基线。**
-> P0 四项、P1-2、P1-4 已实施完毕，实施记录、验收数据、「实施中改了主意的三处」
-> 与「P1-4 的三个更正」见 **§6.0**。
+> **P0 四项、P1 五项、P2 五项已实施完毕**，实施记录、验收数据、「实施中改了主意的三处」
+> 与「P1-4 的三个更正」见 **§6.0**。未做的只剩 P2-3 / P2-5 与 §7 里那 6 件真机项。
 
 ---
 
@@ -55,45 +55,72 @@
 
 ---
 
-## 1. 构建与运行：本机现在跑不起来（以及怎么跑起来）
+## 1. 构建与运行
 
-### 1.1 实测环境（2026-10-02）
+> ✅ **2026-10-02 14:53 更新：已经打通。** `flutter build apk --release` 成功产出
+> `build/app/outputs/flutter-apk/app-release.apk`（53.8 MB、`arm64-v8a/armeabi-v7a/x86/x86_64`
+> 四个 ABI、debug 签名）。**先看下面的 §1.0**；§1.1 的表是 12:55 的历史快照（保留作基线），
+> 其中「SDK 不存在 / 装不了 SDK / 拉不到 Flutter 引擎产物」三条已被证伪。
+
+### 1.0 实际卡住的三件事（报错位置与真因差得很远）
+
+| 表面报错 | 真因 | 修法 |
+|---|---|---|
+| `[CXX1300] CMake '3.22.1' was not found in SDK, PATH, or by cmake.dir property` | **不是 CMake**。沙箱里 `HOME` 不是 `/Users/tandy`，Flutter 的 SDK 定位一路掉到兜底 `which adb`，把 `/opt/homebrew/Caskroom/android-platform-tools/35.0.2`（**只有 adb**）当成 SDK 写回 `local.properties`；`validSdkDirectory()` 只要求 `platform-tools/` **或** `licenses/` 存在其一，所以它过得去 → AGP 在**错的根**下找 CMake | 命令里显式 `ANDROID_HOME=/Users/tandy/Library/Android/sdk`（`ANDROID_SDK_ROOT` 一起） |
+| `Unable to delete directory '<flutter_sdk>/packages/flutter_tools/gradle/build/…'` + `Operation not permitted` | **沙箱**，不是权限 / TCC。Flutter 在 **SDK 目录内部**编译它自己的 Gradle 插件，该路径在工作区之外 → 子进程的 `file-write-unlink` 被拒（同一路径我自己的 shell 能删，**只有 JVM 子进程被拒**） | `dangerouslyDisableSandbox: true` **且前台运行**；后台运行该标记会被**静默忽略**，判据是 stderr 出现 `[sandbox] 命令被沙箱拦截` |
+| `'void KotlinAndroidProjectExtension.compilerOptions(Function1)'` | Kotlin Gradle Plugin **1.8.22** 对不上 `screen_brightness_android-2.1.6` 用的 KGP 2.x DSL | `android/settings.gradle.kts` 升到 **2.1.0** |
+
+一并修掉的两处：`android/app/build.gradle.kts` 的 `ndkVersion` 从 `flutter.ndkVersion`（26.3.x）
+改为钉死 **27.0.12077973**（12 个插件都声明依赖它 → **本机 / CI 需装 `ndk;27.0.12077973`**）；
+`android/local.properties`（gitignore 内，不进版本库）同时钉 `sdk.dir` 与 `cmake.dir`。
+
+⚠️ 顺带澄清一条**假的线索**：项目里**没有任何 `externalNativeBuild` / `CMakeLists.txt`**
+（全仓 + pub-cache 都搜过），所以别去 `app/build.gradle.kts` 里找 CMake 配置。
+
+**产物自检**（别只看 `BUILD SUCCESSFUL`）：`aapt2 dump badging <apk>` 应出现
+`leanback-launchable-activity` 与 `application: … banner='res/xx.png'`；
+`apksigner verify --print-certs` 看签名者（无 `android/key.properties` 时是 debug 签名）。
+
+### 1.1 实测环境（2026-10-02 12:55 快照，**已被 §1.0 取代**）
 
 | 项 | 结果 |
 |---|---|
 | Flutter | 3.29.0 stable / Dart 3.7.0 ✅ |
-| JDK | 17.0.2 ✅（Gradle 8.10.2 支持 8–22） |
-| Android SDK | ❌ **不存在**。`android/local.properties` 指向 `~/Library/Android/sdk`，该目录不存在 |
-| `flutter doctor` 报的 SDK 路径 | `/opt/homebrew/Caskroom/android-platform-tools/35.0.2` —— 这只是 homebrew 的 `adb` 包，不是 SDK |
-| `cmdline-tools` | ❌ 缺（doctor 明确报 `cmdline-tools component is missing`） |
-| `platforms;android-36` | ❌ 未安装（`build.gradle.kts` 里 `compileSdk = maxOf(flutter.compileSdkVersion, 36)` 要求它） |
-| build-tools / NDK | ❌ 未安装 |
-| `~/.gradle` | 0 字节 —— 没有任何依赖缓存 |
-| Android 设备 / 模拟器 | ❌ 无（`flutter devices` 只有 macOS / Chrome） |
+| JDK | 本机默认是 **21**（`/usr/libexec/java_home`）；Gradle 8.10.2 支持 8–22 |
+| Android SDK | ~~❌ 不存在~~ → 实际在 `/Users/tandy/Library/Android/sdk`（含 `platforms/{34,35,36}`、`build-tools/{34.0.0,36.1.0}`、`cmake/3.22.1`、`ndk/{26.3.11579264,27.0.12077973}`） |
+| `flutter doctor` 报的 SDK 路径 | `/opt/homebrew/Caskroom/android-platform-tools/35.0.2` —— 确实只是 homebrew 的 `adb` 包；**但它是被 Flutter 的兜底逻辑误认成 SDK 的**，见 §1.0 |
+| `cmdline-tools` | ✅ 已有 `latest` |
+| `platforms;android-36` | ✅ 已装 |
+| build-tools / NDK | ✅ 已装 |
+| `~/.gradle` | 已有依赖缓存 |
+| Android 设备 / 模拟器 | ❌ 仍无（`flutter devices` 只有 macOS / Chrome）→ 目前只能**构建**，真机交互仍待验 |
 | `maven.google.com` | ❌ 代理 502 `CONNECT tunnel failed` |
-| `download.flutter.io` | ❌ 000（带代理、不带代理都失败）—— **Flutter Android embedding 的 maven 源** |
+| `download.flutter.io` | ~~❌ 000~~ → **这条结论是错的**：构建时 Flutter 的 `io.flutter:*` 依赖正常解析了 |
 | `dl.google.com/dl/android/maven2/` | ✅ 200（AGP 实际走这个，不是 maven.google.com） |
 | `repo.maven.apache.org` / `services.gradle.org` / `plugins.gradle.org` | ✅ 200 |
 
-**结论：本机现在既装不了 SDK，也拉不到 Flutter 的 Android 引擎产物，`flutter build apk` 会在依赖解析阶段失败。**
-另外**没有任何 Android 设备或 TV 模拟器**，所以「运行」这一步也无从谈起。
+**原结论（已作废，保留作教训）**：「本机现在既装不了 SDK，也拉不到 Flutter 的 Android 引擎产物，
+`flutter build apk` 会在依赖解析阶段失败。」—— 实测**能装、能拉、能构建**；
+真正卡住的是 §1.0 那三件事。
 
-### 1.2 要跑起来需要补的三步
+### 1.2 要跑起来需要补的步骤（1、2 已完成；3 仍待做）
 
 ```bash
-# 1) 装 SDK 组件（走 dl.google.com，本机可达）
-#    需要一份 cmdline-tools；装好后：
+# 1) 装 SDK 组件（走 dl.google.com，本机可达）—— ✅ 已完成
 sdkmanager --install "platform-tools" "platforms;android-36" \
-                     "build-tools;36.0.0" "ndk;<flutter.ndkVersion>"
-# 2) 让 local.properties 指向真实 SDK
-#    android/local.properties: sdk.dir=/绝对路径/android-sdk
-# 3) TV 模拟器（Apple Silicon 用 arm64 镜像）
+                     "build-tools;36.1.0" "ndk;27.0.12077973"
+# 2) 让 local.properties 指向真实 SDK —— ✅ 已完成（并额外钉了 cmake.dir）
+#    android/local.properties: sdk.dir=/Users/tandy/Library/Android/sdk
+#    ⚠️ 但 `flutter build` 会按「它自己定位到的 SDK」重写 sdk.dir，
+#       所以命令里务必同时给 ANDROID_HOME，否则又会被写回 homebrew 那条路径（§1.0）
+# 3) TV 模拟器（Apple Silicon 用 arm64 镜像）—— ❌ 仍待做
 sdkmanager --install "system-images;android-34;android-tv;arm64-v8a"
 avdmanager create avd -n tv34 -k "system-images;android-34;android-tv;arm64-v8a" -d "tv_1080p"
 emulator -avd tv34
 ```
 
-`download.flutter.io` 若仍不通，需要在代理里放行该域名（否则 Flutter 的 `io.flutter:*` 依赖解析不了）。
+⚠️ `sdkmanager` 也要**无沙箱**运行，否则 NDK 解压到一半 `Operation not permitted`，
+留下 `ndk/<ver>` + `ndk/<ver>.backup` 两个半成品目录，重装前得先把它们 `mv` 走。
 
 ### 1.3 遥控器怎么验（上了模拟器之后）
 
@@ -285,6 +312,17 @@ escape                                              →  DismissIntent
 | 58 | 媒体键（⏯ / ⏪ / ⏩） | ❌ 未绑 | 键码 85/89/90 已能送进 Flutter（`keyboard_maps.g.dart`），但两张键位表都没有它们 —— **零成本的改进** |
 | 59 | 屏幕常亮 | ⚠️ 待验 | 全项目没有 `SystemChrome`/wakelock。TV 上播放时通常系统不会休眠，但**必须真机确认**（否则看到一半黑屏） |
 
+> **改造后回看这张表**（细节见 §6）：
+> * #42 / #45 / #50–#54 由 **P0-2** 解决 —— 控制栏不再整块 `ExcludeFocus`（只摘掉两条滑块），
+>   键位表改用 `Focus.onKeyEvent` 并认 `select`；
+> * #46 由 **P2-2** 增强（长按加速，10s → 30s → 60s → 300s）；
+> * #49 仍然「不可达」，但**换了思路**：不放开滑块，而是由 **P2-1** 用数字键直接跳到 N%
+>   —— 「拖不动」这个前提没变，能变的是「有没有别的一步到位的手段」；
+> * #54 由 **P1-5** 解决（TV 上任何认识的键，第一下都先把控制栏叫回来）；
+> * #47 / #48（音量）**故意不动** —— 遥控器音量键走 CEC 到电视/功放，应用内滑块在 TV 上是无效控件；
+> * #58（媒体键）**P0-2 已顺带绑上**（`mediaPlayPause` / `mediaRewind` / `mediaFastForward`）；
+> * #59 仍待真机（§7 第 3 条），未做。
+
 ### 5.6 扫描
 
 | # | 功能点 | 遥控器判定 | 问题 |
@@ -336,9 +374,9 @@ escape                                              →  DismissIntent
 
 ### 6.0 实施进度（2026-10-02 更新）
 
-**P0 四项已全部落地；P1 已完成 P1-2、P1-4 两项。**
-验收：`flutter analyze` → No issues found；
-`flutter test` → **1171 例全过**（其中 26 例是本次为 TV 新增的）。
+**P0 四项、P1 五项全部落地；P2 已完成 P2-1 / P2-2 / P2-4 / P2-6 / P2-7 五项。**
+验收：`flutter analyze lib test` → No issues found；
+`flutter test` → **1358 例全过**（P2-1/P2-2 那次的全量数；P2-4 的 5 例见下表）。
 
 | 项 | 状态 | 改了哪些文件 | 怎么验的 |
 |---|---|---|---|
@@ -346,8 +384,26 @@ escape                                              →  DismissIntent
 | P0-2 播放页遥控器化 | ✅ | `lib/ui/pages/player_page.dart` | 新增 13 例纯函数测试 + 1 例对照探针 |
 | P0-3 焦点可见化 | ✅ | `lib/ui/theme/app_theme.dart`、`lib/ui/pages/library_page.dart`、新增 `lib/ui/widgets/tv_focus.dart` | 新增 3 例（含「环必须画在子节点之后」的结构断言） |
 | P0-4 尺寸与安全边距 | ✅ | `lib/ui/theme/app_theme.dart`、`lib/ui/shell/app_shell.dart`、`lib/ui/pages/library_page.dart` | 新增 3 例（TV 判据的三条分支） |
+| P1-1 Tooltip 的出路 | ✅ | 新增 `lib/ui/widgets/tv_affordance.dart`（`TvIconLabel` + `TvNote`）、`lib/ui/widgets/copy_button.dart`（新增 `tvLabel`），接线到 `app_shell` / `library_page` / `folder_browser` / `work_detail_page` / `diagnostics_page` / `auth_qr_login_page` | 两个组件在非 TV 上原样返回（桌面排版与既有 `find` 结果不变），TV 分支由 `AppTheme.isTvLayout` 单测覆盖 |
 | P1-2 筛选面板关得掉 | ✅ | `lib/ui/widgets/library_filter_panel.dart` | 新增 3 例（显式「关闭」按钮 / 系统返回键 / `PopScope.canPop`） |
+| P1-3 一屏多看几行海报 | ✅ | `lib/ui/theme/app_theme.dart`（新增 `tvPosterAspect = 0.8`）、`lib/ui/pages/library_page.dart` | TV 分支由 TV 判据那 3 例覆盖；`0.8` 只在 TV 上生效，桌面仍是 `2/3` |
 | P1-4 文字配置逃生通道 | ✅ | `lib/ui/widgets/common_widgets.dart`（新增 `TvTypingNotice`）、`lib/ui/pages/settings_page.dart` | 新增 5 例（见下方「P1-4 的三个更正」） |
+| P1-5 播放页 OSD | ✅ | `lib/ui/pages/player_page.dart`（新增 `shouldAutoHideControls` 纯函数 + 定时器只负责倒计时） | 新增 4 例（`test/ui/pages/player_controls_autohide_test.dart`，覆盖三条不该藏的分支） |
+| P2-1 数字键跳 N% | ✅ | 新增 `lib/ui/widgets/player_keys.dart`（**两播放器共享**）、`lib/ui/pages/player_page.dart`、`lib/ui/windows/player_window_app.dart` | 新增 6 例：键表内容 / `resolveRemoteKey` 不挑焦点 / 沉浸模式先唤回控制栏 / 桌面键位表 20 个键全在 |
+| P2-2 长按加速 | ✅ | 新增 `lib/core/utils/seek_acceleration.dart`（`SeekRepeatTracker` + `seekStepFor`，**注入时钟**）、两个播放器各接一遍 | 新增 11 例（步长表单调性 / 同串判定 / 换方向 / `reset`） |
+| P2-4 无意义的东西 | ✅ | 新增 `lib/ui/widgets/tv_text.dart`（`TvSelectableText`），接线到 `common_widgets` / `diagnostics_page`（2 处）/ `auth_qr_login_page` / `player_window_app`；`copy_button.dart` 的 `tvLabel` 是上一轮做的 | 新增 5 例：探针 1 例（裸 `SelectableText` **卡住** vs `TvSelectableText` **放行**）+ `tv_text_test.dart` 4 例（按平台分工） |
+| P2-6 二维码放大到 320 | ✅ | `lib/ui/pages/auth_qr_login_page.dart`（新增纯函数 `qrEdgeFor` + `qrAreaKey`） | 新增 6 例（4 纯函数 + 2 widget） |
+| P2-7 「去登录」按钮不渲染 | ✅ | `lib/ui/pages/scan_page.dart`、`lib/ui/widgets/common_widgets.dart`（`EmptyState` 新增 `actionLabel`/`onAction` **成对**断言） | `common_widgets_test.dart` 改成断言两种「只给一半」都抛断言 |
+
+**⚠️ 关于 P2-2 的一个已知不精确**：独立播放窗口走 `CallbackShortcuts`，**收不到 key-up**，
+所以「这一串结束了没有」只能靠 `seekHoldGap`（700ms）的间隔超时判断。代价是
+「手快连点两下」的第二下会跳 30 秒而不是 10 秒 —— 只是不精确，不会出错。
+内置播放页走 `Focus.onKeyEvent`，松手时能显式 `reset()`，没有这个偏差。
+
+**⚠️ P2-4 的一个方法论教训**：动手前我先判断「`SelectableText` 在 TV 上只是没用，
+换了收益≈0」，**这个判断是错的**。写探针跑一遍才知道它是**焦点陷阱**（进去出不来）。
+`Tooltip` / `focusColor` / `Slider` 那几条也都是同一个教训：**这类「看起来只是没用」
+的判断，必须探针说话**——因为它们错了不会报错，只会让用户以为遥控器坏了。
 
 **实施过程中改了主意的三处**（原方案写错了，这里更正）：
 
@@ -425,7 +481,7 @@ escape                                              →  DismissIntent
 `TvTypingNotice` 就加在承载它们的「刮削」与「在线字幕」两节里（两处），
 并在「备份与同步」一节反向写明操作顺序。
 
-**仍未做**：P1-1、P1-3、P1-5，P2 七项，以及 §7 里那 6 件只能真机定的事。
+**仍未做**：P2-3（要真机确认）、P2-5（清两个没用的依赖），以及 §7 里那 6 件只能真机定的事。
 **另外两处覆盖缺口，别当成已验**：
 
 * `TvTypingNotice` 这个**组件**有 5 例测试；但它被**接进设置页的两个调用点**
@@ -535,10 +591,21 @@ TV 判定可用 `package:flutter/services.dart` 之外的方式：
 
 ### P1 —— 可用，但难用
 
-**P1-1 让 Tooltip 在 TV 上有出路。** TV 上没有 hover，而当前有 6 类信息只存在于 tooltip 里
+**P1-1 让 Tooltip 在 TV 上有出路。** ✅ **已完成。** TV 上没有 hover，而当前有 6 类信息只存在于 tooltip 里
 （`_ScrapeButton` 的禁用原因、`_FolderRow` 的「只发现这一层」、`CopyTextButton` 的按钮名、
 `_WorkCard` 的「文件名」说明、刷新/返回等图标按钮的语义）。
 建议：TV 上对**图标按钮**一律补文字标签，对**禁用按钮**把原因渲染成按钮下方的可见小字。
+
+> 按建议原样做了：新增 `lib/ui/widgets/tv_affordance.dart`，两个组件 ——
+> `TvIconLabel`（图标旁边补**短**标签）与 `TvNote`（把「为什么按不动」写成一行可见小字）。
+> 接线点：`app_shell` / `library_page` / `folder_browser`（3 处）/ `work_detail_page`（2 处 + 1 条 `TvNote`）/
+> `diagnostics_page` / `auth_qr_login_page`。
+> ⚠️ 两个组件在**非 TV 上原样返回 / 返回 `SizedBox.shrink()`**，连一层 `Row` 都不多包 ——
+> 这是刻意的：桌面有 hover，补出来的标签只会让页头（视图切换 + 搜索 + 排序 + 筛选 + 刷新）
+> 挤成一团，而且会让既有 widget 测试的 `find` 结果变化。
+> 标签文案取的是 tooltip 那句话的**短版**（「刷新」「上一级」「播放」），tooltip 在桌面继续生效。
+> `TvNote` 放在**被禁用的那组按钮附近**而不是每个灰按钮各挂一条 —— 详情页的「刮削」和「手动」
+> 是同一条原因，各挂一条会把同一句话并排印两遍。
 
 **P1-2 补「没有 Esc」的替代路径。** ✅ **已完成。** `MenuAnchor`（筛选面板）在 TV 上只能靠「再按一次开关」关闭。
 最省事的做法是在面板底部加一个显式的「关闭」按钮；或者在 TV 上给 `MenuAnchor` 补一条 `goBack` 的 `DismissIntent` 绑定。
@@ -550,9 +617,11 @@ TV 判定可用 `package:flutter/services.dart` 之外的方式：
 > 两者不是二选一。⚠️ 另外 `MenuController` 是普通类**不是 `ChangeNotifier`**，
 > 打开状态只能用 `MenuAnchor.onOpen` / `onClose` 同步出来。
 
-**P1-3 一屏多看几行海报。** 现在 960×540 只有 1.58 行。把 `childAspectRatio` 从 `2/3` 改成约 `0.8`
+**P1-3 一屏多看几行海报。** ✅ **已完成。** 现在 960×540 只有 1.58 行。把 `childAspectRatio` 从 `2/3` 改成约 `0.8`
 （或把卡片文字块压到 1 行），行高从 272 降到约 220 → 能看到 2 行 8 张。
 
+> 抽成 `AppTheme.tvPosterAspect = 0.8`，只在 TV 上生效（桌面仍是标准海报比例 `2/3`）——
+> 写死在 `library_page` 里的话，将来「TV 卡片该多高」就没有唯一真源了。
 > ⚠️ 动手前先读 §6.0 里「没动海报墙的列数」那一条 —— 这里缩的是**卡片**不是列数，
 > 但两者都会改变「一屏看到几张」，得一起算。另外 `_SearchBox` 写死了 `height: 32`，
 > 所以放大字号**不能**顺手给媒体库头部套 `tvTextScaler`。
@@ -584,19 +653,64 @@ TV 判定可用 `package:flutter/services.dart` 之外的方式：
 > 所以「把年份做成候选下拉」这条无对象；而 #36b（`GenreEditDialog`）本来就有一行
 > 「常用类型」chip，点 chip 就能加，不必打字。真正该补的是设置页。
 
-**P1-5 播放页的 OSD 交互**（与 P0-2 配套）：OK 键唤出/收起控制栏、控制栏内方向键导航、
+**P1-5 播放页的 OSD 交互**（与 P0-2 配套）：✅ **已完成。** OK 键唤出/收起控制栏、控制栏内方向键导航、
 30 秒无操作自动收起（TV 通行约定）。
+
+> 「什么时候该藏」抽成纯函数 `shouldAutoHideControls({immersive, playing, stageFocused})`，
+> 定时器只负责倒计时 —— 三条不该藏的分支：已经沉浸 / **暂停中** / 焦点不在画面上。
+> 中间那条容易被当成漏写：暂停时用户多半在停下来读字幕或调设置，藏了等于把正看的东西盖掉。
+> 最后一条是「用户正在操作，藏了等于把控件从手底下抽走」。
+> 4 例测试在 `test/ui/pages/player_controls_autohide_test.dart`。
+> 「控制栏内方向键导航」不是单独写的代码 —— 它就是 `resolveRemoteKey` 在 `!stageFocused`
+> 时把 OK / ←/→ 一律 `ignored` 的**同一个决定**（见 P0-2 的「实施中改了主意的第 1 条」）。
 
 ### P2 —— 体验
 
-- **P2-1** 绑数字键 0–9 做「跳转到 N%」。
-- **P2-2** 长按 ← / → 加速快退/快进（现在硬件重复 keydown 会一次次跳 10 秒，可用但粗糙）。
-- **P2-3** 播放时保持屏幕常亮（`SystemChrome` 或 wakelock），**先真机确认是否必要**。
-- **P2-4** TV 上隐藏或改造无意义的东西：`CopyTextButton`（全部）、`SelectableText`（改用普通 `Text`）。
-- **P2-5** `flutter_inappwebview` 与 `url_launcher` 在 `lib/` 里**没有任何使用点**（只有 pubspec 声明），
-  TV 上更用不到 —— 可考虑移除，减 APK 体积。
-- **P2-6** 二维码登录页的二维码从 208 放大到 ≥320（TV 远距离扫码）。
-- **P2-7** `ScanPage` 未登录那个 `EmptyState` 没传 `onAction`，「去登录」按钮不渲染（既有缺陷）。
+- **P2-1** ✅ **已完成。** 绑数字键 0–9 做「跳转到 N%」。
+  键表抽到 `lib/ui/widgets/player_keys.dart` **两个播放器共享**（「哪个键算数字几」是同一件事，
+  各写一份的结果是「一个播放器认小键盘、另一个不认」）。主键盘 `digitN` 与小键盘 `numpadN` **都认**。
+  刻意**不提供「跳到结尾」**：用户真正想按的是「不看了」，那件事的入口是返回键，
+  跳到结尾会立刻触发播完退出，看起来像应用崩了。
+- **P2-2** ✅ **已完成。** 长按 ← / → 加速快退/快进。
+  步长表 `10s → 30s → 60s → 300s 封顶`，判定「算不算同一串」看**方向相同 + 间隔 < 700ms**。
+  算法在 `lib/core/utils/seek_acceleration.dart`，**时钟是注入的**（否则测不了）。
+  ⚠️ 见 §6.0 末尾「关于 P2-2 的一个已知不精确」。
+- **P2-3** ❌ 未做。播放时保持屏幕常亮（`SystemChrome` 或 wakelock），**先真机确认是否必要**（§7 第 3 条）。
+- **P2-4** ✅ **已完成。** TV 上隐藏或改造无意义的东西：`CopyTextButton`（全部）、`SelectableText`（改用普通 `Text`）。
+  - `CopyTextButton` 走的是**「改造」而不是「隐藏」**：电视上把短标签直接印在图标旁边
+    （`copy_button.dart` 的 `tvLabel`，给 `null` 时退回整句 `label`）。
+    理由：复制在 TV 上并非无意义（用户可能只是想知道路径），而「一个 ⧉ 不知道是什么」才是问题。
+  - `SelectableText`（5 处）统一走新增的 `lib/ui/widgets/tv_text.dart` 的 `TvSelectableText`：
+    TV 上退化成普通 `Text`，**其余平台原样返回 `SelectableText`**。
+    ⚠️ 动手前先探了一下「它是**没用**还是**有害**」—— 结论是**有害，而且比想象中严重**：
+
+    > 实测（`test/ui/tv_remote_probe_test.dart`）：在 `SelectableText` 上下各放一个按钮，
+    > 从上面那个按钮连按 **4 次 ↓**，焦点**一直停在它上面**，永远到不了下面那个按钮；
+    > 它的 `focusNode.canRequestFocus` 实测为 `true`（内部是 `EditableText(readOnly: true)`，
+    > 而 `EditableText` 自带 `FocusNode`）。
+    >
+    > 也就是说这不是「少个功能」，是**走进一段长文本就出不来**：按 OK 毫无反应、
+    > 方向键也不动，用户只会得出「遥控器坏了」。而这几处恰好都在**诊断页 / 登录页** ——
+    > 用户是在出问题的时候才来这里的。
+
+    这条用例**同时钉两件事**，缺一不可：裸 `SelectableText` 确实会卡住焦点（这是
+    `tv_text.dart` 存在的唯一理由），以及 `TvSelectableText` 确实不卡（修复没白写）。
+    只钉后者的话，「为什么要有这个包装」就只存在于注释里了。
+    另有 4 例在 `test/ui/widgets/tv_text_test.dart` 钉**按平台分工**：桌面/手机必须仍是
+    `SelectableText`（划选是刻意的设计，`LogPathRow` 的注释写明「不点按钮也能用鼠标带走」），
+    且「桌面 + 960 宽」不算 TV（判据必须带平台，不能只看宽度）。
+- **P2-5** ❌ 未做。`flutter_inappwebview` 与 `url_launcher` 在 `lib/` 里**没有任何使用点**（只有 pubspec 声明），
+  TV 上更用不到 —— 可考虑移除，减 APK 体积。⚠️ 动 pubspec 要重跑 `pod install`（macOS/iOS）并复验构建，
+  不是纯 Dart 改动。
+- **P2-6** ✅ **已完成。** 二维码登录页的二维码从 208 放大到 ≥320（TV 远距离扫码）。
+  尺寸抽成纯函数 `qrEdgeFor({tv, availableWidth})`（TV → 320、否则 208，并按可用宽度夹取），
+  这样「TV 上会不会溢出」是可断言的。
+- **P2-7** ✅ **已完成。** `ScanPage` 未登录那个 `EmptyState` 只给了 `actionLabel` 没给 `onAction`，
+  「去登录」按钮不渲染（既有缺陷）。补上回调的同时给 `EmptyState` 加了**构造期断言**
+  （`actionLabel` 与 `onAction` 必须成对），让这类「只给一半」在写代码时就报错。
+  ⚠️ 顺带说明这条缺陷**实际够不到**：`app_router.dart` 的 `redirect` 在未授权时会把任何
+  非 `/auth` 位置弹回 `/auth`，所以那个 `EmptyState` 正常路径上不会出现 —— 修它是为了
+  与 `folder_browser` / `library_page` 的口径一致，不是为了修一个线上可见的 bug。
 
 ---
 

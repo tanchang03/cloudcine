@@ -80,6 +80,27 @@ void main() {
     await seed.customStatement(
       'ALTER TABLE media_works DROP COLUMN season_count',
     );
+    // v11：`media_works` 的折叠标记。
+    //
+    // ⚠️ 加了新列就要在这里补一行 DROP —— 这个用例是「拿当前 schema 建库、
+    // 再删掉新列、把 user_version 调回 5」来伪造老库的。漏删的话 `onUpgrade`
+    // 会在 `addColumn` 上撞到 `duplicate column name`，而报错信息完全指不到
+    // 这个用例。
+    await seed.customStatement('ALTER TABLE media_works DROP COLUMN merged_into');
+    // v12：手标片头区间两列。同样要 DROP —— 见上方整段注释：建库用的是当前
+    // schema，漏删的话 `onUpgrade` 会在 `addColumn` 上撞 `duplicate column
+    // name`。
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN intro_start_ms',
+    );
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN intro_end_ms',
+    );
+    // v13：`media_items` 的文件级封面锚点。同一条规矩 —— 加列就要在这里
+    // DROP，否则 reopen 时 `ADD COLUMN face_anchor_x` 撞 duplicate。
+    await seed.customStatement(
+      'ALTER TABLE media_items DROP COLUMN face_anchor_x',
+    );
     await seed.customStatement('PRAGMA user_version = 5');
     await seed.close();
 

@@ -86,12 +86,20 @@ class WorkScrapeOutcome {
   ///
   /// 按 `(状态, 通道)` **两个维度**取文案 —— 只按状态分是不够的，理由见
   /// [ScrapeChannel]。成功那条两个通道共用（「已刮削：…」对谁说都一样），
-  /// 但会附上来源名（手动通道独有），让用户知道「这条结果来自哪个源」。
+  /// 但会附上来源名（手动通道独有）与**落库后的媒体类型**：
+  ///
+  ///   - 来源名让用户知道「这条结果来自哪个源」（手动通道他亲手挑的，来源
+  ///     正是他判断「挑得对不对」的依据）；
+  ///   - 类型（`work.category.label`）让用户**当场核对**「刮削有没有把这部
+  ///     归到对的那一栏」。它可能不是用户在对话框里选的那个 —— 类型标签
+  ///     给出「动画 / 纪录片」这类语义结论时优先级更高（见 `_categoryFor`），
+  ///     不写出来用户会以为「我选的没生效」。
   String get message => switch ((status, channel)) {
         (WorkScrapeStatus.scraped, _) =>
           '已刮削：${metadata!.title}'
               '${metadata!.year == null ? "" : "（${metadata!.year}）"}'
-              '${sourceName == null ? "" : " · $sourceName"}',
+              '${sourceName == null ? "" : " · $sourceName"}'
+              ' · 类型：${work!.category.label}',
         (WorkScrapeStatus.customized, _) =>
           '已清除在线刮削信息，设为「${work!.title}」· ${work!.category.label}'
               ' —— 重扫与自动刮削都不会再覆盖它。',
@@ -296,10 +304,22 @@ class WorkScraper {
   /// 另外**这里不看匹配闸门**：闸门是替自动流程做判断的，用户已经做过
   /// 判断了。目录名 `超z级z马z力z欧z银z河z大z电影aa` 正是被闸门拦下来的
   /// 那类输入 —— 用户手动选中《超级马力欧银河大电影》时，闸门必须让路。
+  ///
+  /// ## [category]：对话框里那个「媒体类型」选择框
+  ///
+  /// `null` = 用户没动它（选了「自动」）→ 类型按刮削结果自动判定；
+  /// 非空 = 用户亲手选的**结论** → 直接落库并锁住（`categoryManual`），
+  /// 之后的刮削不再改写它。
+  ///
+  /// 手动通道**额外**打开 [manualChannel]：刮到的条目自己带「电影 / 剧集」
+  /// 这个结构信号（`movie/…` / `tv/…`），而自动通道刻意不用它（理由见
+  /// `_categoryFor`）。手动通道可以用，是因为用户在候选列表里亲手确认过
+  /// 这一条 —— 那是比文件名结构强得多的证据。
   Future<WorkScrapeOutcome> applyCandidate(
     MediaWork work,
-    ScrapeCandidate candidate,
-  ) async {
+    ScrapeCandidate candidate, {
+    MediaCategory? category,
+  }) async {
     // 与 [scrape] 对称：本方法产出的结果全部属于**手动**通道。
     const channel = ScrapeChannel.manual;
 
@@ -313,7 +333,12 @@ class WorkScraper {
         );
       }
 
-      final merged = _apply(work, meta);
+      final merged = _apply(
+        work,
+        meta,
+        categoryOverride: category,
+        manualChannel: true,
+      );
       // 同 [scrape]：用户亲手选的候选，覆盖自定义过的行是**他的意图**。
       await _library.upsertWorks(
         [merged],
@@ -322,7 +347,8 @@ class WorkScraper {
       );
       diag.info(
         '刮削',
-        '${work.key} 手动选中 ${candidate.source}/${candidate.sourceId} → ${meta.title}',
+        '${work.key} 手动选中 ${candidate.source}/${candidate.sourceId} → '
+            '${meta.title}（媒体类型：${category?.label ?? "自动"}）',
       );
       return WorkScrapeOutcome(
         status: WorkScrapeStatus.scraped,
@@ -352,7 +378,20 @@ class WorkScraper {
   ///     缺失 —— 留着旧的锚点，`PosterImage` 会拿视频帧的人脸位置去裁海报。
   ///   - **`posterFile` 要一起清**。缓存文件名是按 URL 散列出来的，地址换了
   ///     就该重新下载；不清的话详情页会继续显示上一版海报。
-  MediaWork _apply(MediaWork work, ScrapedMetadata meta) {
+  ///
+  /// ## 两个类型参数
+  ///
+  ///   - [categoryOverride]：对话框里用户**亲手选**的媒体类型（`null` = 没选）；
+  ///   - [manualChannel]：本次是不是**手动通道**（由 `applyCandidate` 发起）。
+  ///     一个开关管两件事（理由见 [_categoryFor]）：① 手动通道的「自动」
+  ///     忽略分类锁，按本次刮削重判；② 允许用「刮到的条目是电影还是剧集」
+  ///     这条结构证据。
+  MediaWork _apply(
+    MediaWork work,
+    ScrapedMetadata meta, {
+    MediaCategory? categoryOverride,
+    bool manualChannel = false,
+  }) {
     final posterUrl = _nonEmpty(meta.posterUrl) ?? work.posterUrl;
     final posterChanged = posterUrl != work.posterUrl;
     final backdropChanged = meta.backdropUrl != work.backdropUrl;
@@ -361,8 +400,15 @@ class WorkScraper {
       key: work.key,
       provider: work.provider,
       kind: work.kind,
-      category: _categoryFor(work, meta),
-      categoryManual: work.categoryManual,
+      category: _categoryFor(
+        work,
+        meta,
+        categoryOverride,
+        manualChannel: manualChannel,
+      ),
+      // 用户在这次对话框里选过类型 → 锁住它（与「自定义」同一条规则：
+      // 用户明确要求的状态变更不该被后续自动流程改写）。
+      categoryManual: categoryOverride != null || work.categoryManual,
       title: meta.title,
       originalTitle: meta.originalTitle ?? work.originalTitle,
       year: meta.year ?? work.year,
@@ -388,6 +434,10 @@ class WorkScraper {
       totalBytes: work.totalBytes,
       // 同上：季数也是扫描的产物（刮削不碰 `media_items`）。
       seasonCount: work.seasonCount,
+      // 折叠标记原样抄：刮削改的是元数据，跟「这一行是不是被折叠走了」
+      // 没关系。漏抄会让「刮一次就把合并拆了」—— 而用户是在详情页
+      // 点了一下「刮削」，完全联想不到两个格子会分开。
+      mergedInto: work.mergedInto,
       // 与扫描无关、与刮削也无关，但它是「最近修改」排序的唯一依据。
       // 不抄的话构造器默认 null，落库后这一列被置空，刮完的电影会从
       // 列表前面直接跳到末尾（NULL 在 DESC 排序里垫底）。
@@ -419,6 +469,10 @@ class WorkScraper {
   ///   - `fromGenres` 没结论（剧情 / 科幻 / 喜剧…这些不改变栏目）→
   ///     **原样保留扫描期的判定**。
   ///
+  /// 唯一的例外是**手动通道**那条结构证据（见下面 [manualChannel] 一节）：
+  /// 用户在候选里亲手确认过条目，那时条目自带的「电影 / 剧集」比文件名结构
+  /// 可信。自动通道不走它。
+  ///
   /// ## 这条路径以前是死的
   ///
   /// 在加上这一行之前，`fromGenres` 在整个项目里**永远不会被执行**：
@@ -430,6 +484,7 @@ class WorkScraper {
   /// ⚠️ 改这里要同步改 `MediaRepositoryImpl.backfillWorkCategories` ——
   /// 那边负责把**已经刮过**的作品按同一套规则修正过来，否则老库要等
   /// 用户逐部重刮才生效。
+  ///
   /// ## 用户手动指定的分类不受刮削影响
   ///
   /// `work.categoryManual == true` 时直接返回原值 —— 用户改过的分类
@@ -441,19 +496,130 @@ class WorkScraper {
   /// （而不是 `meta.genres`）。那么分类也必须从 `work.genres` 折算 ——
   /// 否则会出现「类型标签写着『动画』、分类却是『电影』」这种自相矛盾的行，
   /// 而它不会报错，只会让分类栏和详情页各说各话。
-  MediaCategory _categoryFor(MediaWork work, ScrapedMetadata meta) {
-    if (work.categoryManual) return work.category;
-    final genres = work.genresManual ? work.genres : meta.genres;
-    final byGenre = MediaCategoryGuesser.fromGenres(genres);
-    if (byGenre == null) return work.category;
-    if (byGenre != work.category) {
-      diag.info(
-        '刮削',
-        '${work.key} 分类 ${work.category.label} → ${byGenre.label}'
-            '（类型 ${genres.join("/")}）',
+  ///
+  /// ## [categoryOverride]：用户在对话框里亲手选的类型
+  ///
+  /// 非空 = **结论**：直接用它，并让 `_apply` 把 `categoryManual` 置 `true`
+  /// （用户在「用这一条更新」那一步看过它，之后不该被自动流程改掉）。
+  ///
+  /// ⚠️ 它排在 `work.categoryManual` 的早退**之前** —— 否则「这部作品上次被
+  /// 设成手动分类，这次用户在对话框里改成了别的」会被旧值挡住，按钮亮着却
+  /// 什么都不变。用户在对话框里的选择是**更新的一次**手动指定。
+  ///
+  /// ## [manualChannel]：手动通道的两处特殊行为
+  ///
+  /// 手动通道（`applyCandidate` 发起）与自动通道（`scrape`）的差别集中在这
+  /// 一个开关上，它管两件事：
+  ///
+  ///   1. **忽略分类锁**（见下面第 ② 步）：手动重刮是用户明确要求「现在重判
+  ///      一次」，不该被「清空刮削数据」留下的旧锁卡住；
+  ///   2. **允许用条目结构这条证据**（见第 ④ 步）：刮到的条目自己带着
+  ///      「电影还是剧集」的信号 —— TMDB 是 `movie/…` / `tv/…`，豆瓣是
+  ///      `douban/movie/…` / `douban/tv/…`。自动通道**刻意不看它**：文件名
+  ///      把一部综艺解析成 `unknown` 时，按条目结构会把它判成「剧集」，而
+  ///      用户明明把它放在 `/综艺/` 里（`MediaCategoryGuesser` 那套的目录名
+  ///      证据比条目结构更贴近用户意图）。所以自动通道的判据仍然是
+  ///      「genres 说话才算」。
+  ///
+  /// 手动通道看结构证据，能救这一类：文件名只剩 `2026.2160p.WEB-DL.mkv`，
+  /// 扫描期结构上认不出（`kind == unknown` → 「其他」），而用户在候选里亲手
+  /// 确认了这是一部剧 —— 那时 `movie/…` / `tv/…` 正是**用户确认过**的结论。
+  ///
+  /// ⚠️ 手动通道**不再**用「当前分类是语义档就不许被结构覆盖」来挡（旧版有
+  /// 这一条）。原因就是那个 bug：一部被刮成「纪录片」的剧，其 TMDB 类型
+  /// （剧情 / 悬疑）给不出语义结论，只能靠结构证据（`tv/…`）救回来；若还用
+  /// 那个守卫挡着，它永远翻不了身。代价：放在 `/综艺/` 而 TMDB 又没给
+  /// 「真人秀」类型的片子，手动重刮会被判成「剧集」—— 此时在对话框
+  /// 「媒体类型」里点一下「综艺」即可。这符合对话框上那句「自动 = 按刮削
+  /// 结果判定」。
+  MediaCategory _categoryFor(
+    MediaWork work,
+    ScrapedMetadata meta,
+    MediaCategory? categoryOverride, {
+    required bool manualChannel,
+  }) {
+    // ⚠️ 每一次判定都留一条轨迹 —— **包括结果没变的那一次**。
+    //
+    // 这是「我明明在手动刮削里选了『剧集』，怎么还在『纪录片』栏里」这类
+    // 问题的唯一线索。以前只在分类**真的变了**时才写日志，于是当分类被旧值
+    // 挡住（`categoryManual` 已锁 + 对话框传 `null`）时一声不响：用户看到的
+    // 是一次「已刮削：…」的成功提示，类型却纹丝不动，日志里查不到任何痕迹。
+    if (categoryOverride != null) {
+      // ① 用户在对话框里选的类型是结论 —— 优先于「上次设的手动分类」。
+      return _logCategory(
+        work,
+        categoryOverride,
+        '对话框手选 override=${categoryOverride.label}',
       );
     }
-    return byGenre;
+
+    // ② 分类锁（`categoryManual`）**只挡自动刮削**。
+    //
+    // 手动通道的「自动」= 按本次刮削重判，故意跳过锁。理由：锁的本意是挡
+    // **无人值守的自动刮削**（别让 TMDB 的 genres 悄悄改写用户的选择），而
+    // 手动重刮是用户**明确要求「现在重判一次」**。若这里也认锁，用户在
+    // 「清空刮削数据」之后手动重刮会一直卡在旧分类上（原 bug 现场）。
+    if (work.categoryManual && !manualChannel) {
+      return _logCategory(
+        work,
+        work.category,
+        '保持旧值：categoryManual=true 已锁（自动通道）',
+      );
+    }
+
+    final genres = work.genresManual ? work.genres : meta.genres;
+    final byGenre = MediaCategoryGuesser.fromGenres(genres);
+    if (byGenre != null) {
+      // ③ genres 给出语义结论（动画 / 纪录片 / 真人秀）→ 用它。这是最强的
+      //    证据，与 `MediaCategoryGuesser` 把 genres 排第一优先级的口径一致。
+      return _logCategory(
+        work,
+        byGenre,
+        '类型标签 ${genres.join("/")}${work.genresManual ? "（手锁）" : ""}',
+      );
+    }
+
+    // ④ genres 说不出语义：手动通道才看「条目本身是电影还是剧集」。
+    //    ⚠️ 刻意**不检查** `_isSemantic(work.category)`（旧版会挡，见方法头）。
+    if (manualChannel) {
+      final byStructure = _structureFromOnlineId(meta.onlineId);
+      if (byStructure != null) {
+        return _logCategory(work, byStructure, '条目结构 ${meta.onlineId}');
+      }
+    }
+
+    return _logCategory(
+      work,
+      work.category,
+      '无新证据：genres=[${genres.join("/")}]、条目=${meta.onlineId ?? "?"}，保持旧值',
+    );
+  }
+
+  /// 记一条分类判定轨迹，并把结论原样返回（便于 `return _logCategory(...)`）。
+  ///
+  /// **每次都记**，不只是变了才记 —— 理由见 [_categoryFor] 开头。
+  MediaCategory _logCategory(MediaWork work, MediaCategory to, String why) {
+    final from = work.category;
+    final verdict = to == from ? '不变' : '${from.label} → ${to.label}';
+    diag.info('刮削', '${work.key} 分类判定：$verdict（$why）');
+    return to;
+  }
+
+  /// 从在线条目的 id 判「电影还是剧集」。
+  ///
+  /// TMDB：`movie/843527` / `tv/12345`；豆瓣：`douban/movie/678` /
+  /// `douban/tv/12345`。按**段**匹配而不是 `startsWith` —— 豆瓣那条多一层
+  /// 前缀，`startsWith('movie/')` 会漏掉它。
+  ///
+  /// 认不出来返回 `null`（测试里的假源给的 id 常常不带这两段）——
+  /// `null` 表示「这条证据没意见」，不是「归到其他」。
+  static MediaCategory? _structureFromOnlineId(String? onlineId) {
+    final id = (onlineId ?? '').trim().toLowerCase();
+    if (id.isEmpty) return null;
+    final parts = id.split('/');
+    if (parts.contains('tv')) return MediaCategory.series;
+    if (parts.contains('movie')) return MediaCategory.movie;
+    return null;
   }
 
   static String? _nonEmpty(String? v) =>

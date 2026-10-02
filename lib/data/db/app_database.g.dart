@@ -336,6 +336,17 @@ class $MediaItemsTable extends MediaItems
     type: DriftSqlType.string,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _faceAnchorXMeta = const VerificationMeta(
+    'faceAnchorX',
+  );
+  @override
+  late final GeneratedColumn<double> faceAnchorX = GeneratedColumn<double>(
+    'face_anchor_x',
+    aliasedName,
+    true,
+    type: DriftSqlType.double,
+    requiredDuringInsert: false,
+  );
   static const VerificationMeta _videoWidthMeta = const VerificationMeta(
     'videoWidth',
   );
@@ -391,6 +402,7 @@ class $MediaItemsTable extends MediaItems
     lastPlayedAt,
     resumePositionMs,
     thumbUrl,
+    faceAnchorX,
     videoWidth,
     videoHeight,
   ];
@@ -620,6 +632,15 @@ class $MediaItemsTable extends MediaItems
         thumbUrl.isAcceptableOrUnknown(data['thumb_url']!, _thumbUrlMeta),
       );
     }
+    if (data.containsKey('face_anchor_x')) {
+      context.handle(
+        _faceAnchorXMeta,
+        faceAnchorX.isAcceptableOrUnknown(
+          data['face_anchor_x']!,
+          _faceAnchorXMeta,
+        ),
+      );
+    }
     if (data.containsKey('video_width')) {
       context.handle(
         _videoWidthMeta,
@@ -781,6 +802,10 @@ class $MediaItemsTable extends MediaItems
         DriftSqlType.string,
         data['${effectivePrefix}thumb_url'],
       ),
+      faceAnchorX: attachedDatabase.typeMapping.read(
+        DriftSqlType.double,
+        data['${effectivePrefix}face_anchor_x'],
+      ),
       videoWidth: attachedDatabase.typeMapping.read(
         DriftSqlType.int,
         data['${effectivePrefix}video_width'],
@@ -885,6 +910,22 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
   /// 取图时必须由适配器现给请求头。
   final String? thumbUrl;
 
+  /// [thumbUrl] 那张图里**人物的水平位置**（0~1），来自夸克的人脸框。
+  ///
+  /// 与 [thumbUrl] **同源成对**：谁提供缩略图，谁提供锚点（见
+  /// `MediaItem.faceAnchorX`）。换封面来源时必须一起换。
+  ///
+  /// ## 为什么文件行也要留一份（作品行已有 `posterFaceX`）
+  ///
+  /// 作品级那份在**刮到在线海报时会被清成 NULL** —— 那张 2:3 的竖版海报
+  /// 不需要锚点，留着反而是「拿视频帧的人脸位置去裁海报」。于是「自定义
+  /// → 清掉刮削 → 封面回落到网盘缩略图」那一刻，锚点只能从**文件行**取回。
+  /// 缺了这一列，回落出来的封面永远没有锚点，只能按画面正中裁。
+  ///
+  /// 旧库升级后是 NULL（见 v13 迁移）：人脸框随列目录响应下发，旧库没存过，
+  /// 重扫一次即补上。
+  final double? faceAnchorX;
+
   /// 网盘给出的**实测**视频像素尺寸（夸克 `video_width` / `video_height`）。
   ///
   /// 2026-10-01 实测：递归遍历 44 个目录、427 个视频，这两个字段覆盖率
@@ -929,6 +970,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     this.lastPlayedAt,
     this.resumePositionMs,
     this.thumbUrl,
+    this.faceAnchorX,
     this.videoWidth,
     this.videoHeight,
   });
@@ -1001,6 +1043,9 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     }
     if (!nullToAbsent || thumbUrl != null) {
       map['thumb_url'] = Variable<String>(thumbUrl);
+    }
+    if (!nullToAbsent || faceAnchorX != null) {
+      map['face_anchor_x'] = Variable<double>(faceAnchorX);
     }
     if (!nullToAbsent || videoWidth != null) {
       map['video_width'] = Variable<int>(videoWidth);
@@ -1086,6 +1131,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           thumbUrl == null && nullToAbsent
               ? const Value.absent()
               : Value(thumbUrl),
+      faceAnchorX:
+          faceAnchorX == null && nullToAbsent
+              ? const Value.absent()
+              : Value(faceAnchorX),
       videoWidth:
           videoWidth == null && nullToAbsent
               ? const Value.absent()
@@ -1134,6 +1183,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       lastPlayedAt: serializer.fromJson<DateTime?>(json['lastPlayedAt']),
       resumePositionMs: serializer.fromJson<int?>(json['resumePositionMs']),
       thumbUrl: serializer.fromJson<String?>(json['thumbUrl']),
+      faceAnchorX: serializer.fromJson<double?>(json['faceAnchorX']),
       videoWidth: serializer.fromJson<int?>(json['videoWidth']),
       videoHeight: serializer.fromJson<int?>(json['videoHeight']),
     );
@@ -1173,6 +1223,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       'lastPlayedAt': serializer.toJson<DateTime?>(lastPlayedAt),
       'resumePositionMs': serializer.toJson<int?>(resumePositionMs),
       'thumbUrl': serializer.toJson<String?>(thumbUrl),
+      'faceAnchorX': serializer.toJson<double?>(faceAnchorX),
       'videoWidth': serializer.toJson<int?>(videoWidth),
       'videoHeight': serializer.toJson<int?>(videoHeight),
     };
@@ -1210,6 +1261,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     Value<DateTime?> lastPlayedAt = const Value.absent(),
     Value<int?> resumePositionMs = const Value.absent(),
     Value<String?> thumbUrl = const Value.absent(),
+    Value<double?> faceAnchorX = const Value.absent(),
     Value<int?> videoWidth = const Value.absent(),
     Value<int?> videoHeight = const Value.absent(),
   }) => MediaItemRow(
@@ -1247,6 +1299,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
             ? resumePositionMs.value
             : this.resumePositionMs,
     thumbUrl: thumbUrl.present ? thumbUrl.value : this.thumbUrl,
+    faceAnchorX: faceAnchorX.present ? faceAnchorX.value : this.faceAnchorX,
     videoWidth: videoWidth.present ? videoWidth.value : this.videoWidth,
     videoHeight: videoHeight.present ? videoHeight.value : this.videoHeight,
   );
@@ -1302,6 +1355,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
               ? data.resumePositionMs.value
               : this.resumePositionMs,
       thumbUrl: data.thumbUrl.present ? data.thumbUrl.value : this.thumbUrl,
+      faceAnchorX:
+          data.faceAnchorX.present ? data.faceAnchorX.value : this.faceAnchorX,
       videoWidth:
           data.videoWidth.present ? data.videoWidth.value : this.videoWidth,
       videoHeight:
@@ -1343,6 +1398,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('resumePositionMs: $resumePositionMs, ')
           ..write('thumbUrl: $thumbUrl, ')
+          ..write('faceAnchorX: $faceAnchorX, ')
           ..write('videoWidth: $videoWidth, ')
           ..write('videoHeight: $videoHeight')
           ..write(')'))
@@ -1382,6 +1438,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     lastPlayedAt,
     resumePositionMs,
     thumbUrl,
+    faceAnchorX,
     videoWidth,
     videoHeight,
   ]);
@@ -1420,6 +1477,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           other.lastPlayedAt == this.lastPlayedAt &&
           other.resumePositionMs == this.resumePositionMs &&
           other.thumbUrl == this.thumbUrl &&
+          other.faceAnchorX == this.faceAnchorX &&
           other.videoWidth == this.videoWidth &&
           other.videoHeight == this.videoHeight);
 }
@@ -1456,6 +1514,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
   final Value<DateTime?> lastPlayedAt;
   final Value<int?> resumePositionMs;
   final Value<String?> thumbUrl;
+  final Value<double?> faceAnchorX;
   final Value<int?> videoWidth;
   final Value<int?> videoHeight;
   final Value<int> rowid;
@@ -1491,6 +1550,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     this.lastPlayedAt = const Value.absent(),
     this.resumePositionMs = const Value.absent(),
     this.thumbUrl = const Value.absent(),
+    this.faceAnchorX = const Value.absent(),
     this.videoWidth = const Value.absent(),
     this.videoHeight = const Value.absent(),
     this.rowid = const Value.absent(),
@@ -1527,6 +1587,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     this.lastPlayedAt = const Value.absent(),
     this.resumePositionMs = const Value.absent(),
     this.thumbUrl = const Value.absent(),
+    this.faceAnchorX = const Value.absent(),
     this.videoWidth = const Value.absent(),
     this.videoHeight = const Value.absent(),
     this.rowid = const Value.absent(),
@@ -1570,6 +1631,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Expression<DateTime>? lastPlayedAt,
     Expression<int>? resumePositionMs,
     Expression<String>? thumbUrl,
+    Expression<double>? faceAnchorX,
     Expression<int>? videoWidth,
     Expression<int>? videoHeight,
     Expression<int>? rowid,
@@ -1606,6 +1668,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       if (lastPlayedAt != null) 'last_played_at': lastPlayedAt,
       if (resumePositionMs != null) 'resume_position_ms': resumePositionMs,
       if (thumbUrl != null) 'thumb_url': thumbUrl,
+      if (faceAnchorX != null) 'face_anchor_x': faceAnchorX,
       if (videoWidth != null) 'video_width': videoWidth,
       if (videoHeight != null) 'video_height': videoHeight,
       if (rowid != null) 'rowid': rowid,
@@ -1644,6 +1707,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Value<DateTime?>? lastPlayedAt,
     Value<int?>? resumePositionMs,
     Value<String?>? thumbUrl,
+    Value<double?>? faceAnchorX,
     Value<int?>? videoWidth,
     Value<int?>? videoHeight,
     Value<int>? rowid,
@@ -1680,6 +1744,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
       resumePositionMs: resumePositionMs ?? this.resumePositionMs,
       thumbUrl: thumbUrl ?? this.thumbUrl,
+      faceAnchorX: faceAnchorX ?? this.faceAnchorX,
       videoWidth: videoWidth ?? this.videoWidth,
       videoHeight: videoHeight ?? this.videoHeight,
       rowid: rowid ?? this.rowid,
@@ -1782,6 +1847,9 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     if (thumbUrl.present) {
       map['thumb_url'] = Variable<String>(thumbUrl.value);
     }
+    if (faceAnchorX.present) {
+      map['face_anchor_x'] = Variable<double>(faceAnchorX.value);
+    }
     if (videoWidth.present) {
       map['video_width'] = Variable<int>(videoWidth.value);
     }
@@ -1828,6 +1896,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('resumePositionMs: $resumePositionMs, ')
           ..write('thumbUrl: $thumbUrl, ')
+          ..write('faceAnchorX: $faceAnchorX, ')
           ..write('videoWidth: $videoWidth, ')
           ..write('videoHeight: $videoHeight, ')
           ..write('rowid: $rowid')
@@ -2139,6 +2208,39 @@ class $MediaWorksTable extends MediaWorks
     type: DriftSqlType.dateTime,
     requiredDuringInsert: true,
   );
+  static const VerificationMeta _mergedIntoMeta = const VerificationMeta(
+    'mergedInto',
+  );
+  @override
+  late final GeneratedColumn<String> mergedInto = GeneratedColumn<String>(
+    'merged_into',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _introStartMsMeta = const VerificationMeta(
+    'introStartMs',
+  );
+  @override
+  late final GeneratedColumn<int> introStartMs = GeneratedColumn<int>(
+    'intro_start_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _introEndMsMeta = const VerificationMeta(
+    'introEndMs',
+  );
+  @override
+  late final GeneratedColumn<int> introEndMs = GeneratedColumn<int>(
+    'intro_end_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
   @override
   List<GeneratedColumn> get $columns => [
     key,
@@ -2168,6 +2270,9 @@ class $MediaWorksTable extends MediaWorks
     firstSeenAt,
     lastPlayedAt,
     updatedAt,
+    mergedInto,
+    introStartMs,
+    introEndMs,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -2385,6 +2490,30 @@ class $MediaWorksTable extends MediaWorks
     } else if (isInserting) {
       context.missing(_updatedAtMeta);
     }
+    if (data.containsKey('merged_into')) {
+      context.handle(
+        _mergedIntoMeta,
+        mergedInto.isAcceptableOrUnknown(data['merged_into']!, _mergedIntoMeta),
+      );
+    }
+    if (data.containsKey('intro_start_ms')) {
+      context.handle(
+        _introStartMsMeta,
+        introStartMs.isAcceptableOrUnknown(
+          data['intro_start_ms']!,
+          _introStartMsMeta,
+        ),
+      );
+    }
+    if (data.containsKey('intro_end_ms')) {
+      context.handle(
+        _introEndMsMeta,
+        introEndMs.isAcceptableOrUnknown(
+          data['intro_end_ms']!,
+          _introEndMsMeta,
+        ),
+      );
+    }
     return context;
   }
 
@@ -2515,6 +2644,18 @@ class $MediaWorksTable extends MediaWorks
             DriftSqlType.dateTime,
             data['${effectivePrefix}updated_at'],
           )!,
+      mergedInto: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}merged_into'],
+      ),
+      introStartMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}intro_start_ms'],
+      ),
+      introEndMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}intro_end_ms'],
+      ),
     );
   }
 
@@ -2614,6 +2755,53 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   final DateTime? firstSeenAt;
   final DateTime? lastPlayedAt;
   final DateTime updatedAt;
+
+  /// 这一行**已被折叠进**哪一部作品（存目标的 `key`）。
+  ///
+  /// ## 为什么是「打个标记」而不是「删掉这一行」
+  ///
+  /// 跨目录归一（同一部片子在两个目录里各扫出一个作品）最初的设计是
+  /// 「把源作品的 `media_items.group_key` 改写成目标的 key，然后删掉源行」。
+  /// 那条路有个不可接受的后果：**合并错了就回不去**。用户看到两个格子
+  /// 变成一个，既不知道发生了什么，也没有任何按钮能还原 —— 他只会
+  /// 从此不敢让程序自动合并。
+  ///
+  /// 改成打标记之后：
+  ///
+  ///   - 列表 / 角标只认 `merged_into IS NULL` 的行 → 用户看到的仍然是
+  ///     一个格子，与「删掉」在观感上完全一致；
+  ///   - 源行的**所有列原样保留**（海报、片名、`firstSeenAt`……）；
+  ///   - 撤销 = 把这一列改回 `NULL`，一条 `UPDATE`，没有任何信息丢失；
+  ///   - `media_items.group_key` **永不改写**，所以「item.groupKey 一定
+  ///     等于某个 work.key」这条全库不变量继续成立 —— `PlayTarget`、
+  ///     续播点、字幕引用都不需要知道「合并」这件事存在。
+  ///
+  /// ## 链式合并是不允许的
+  ///
+  /// 只允许「源 → 根」一层：一个已经带标记的行**不会再被当成目标**。
+  /// 否则撤销要沿着链回溯，而链上的中间节点一旦被用户单独撤销就会
+  /// 把后面的节点孤儿化。
+  final String? mergedInto;
+
+  /// 用户手标的**片头**起点 / 终点（毫秒）。
+  ///
+  /// ## 为什么是「作品级」而不是「文件级」
+  ///
+  /// 同一部剧每一集的片头位置几乎完全一样（同一套片头、同一个位置），
+  /// 让用户给 24 集各标一次是不可接受的。标一次，全剧生效。
+  ///
+  /// ## 为什么两列必须成对
+  ///
+  /// 只有起点没有终点（或反过来）**跳不了** —— 半个区间没有落点。
+  /// 所以读取时（`IntroMarker.fromMilliseconds`）任一为空就整体当没有。
+  ///
+  /// ## 扫描不许把它清掉
+  ///
+  /// 与 [mergedInto] 同一条规矩：重扫造出来的新行这两列恒为 `NULL`，
+  /// `mergeWorkForUpsert` 必须走「旧值优先」的受保护通道。照抄新值等于
+  /// **每次重扫都把用户标好的片头抹掉**，而用户只看到「跳片头时灵时不灵」。
+  final int? introStartMs;
+  final int? introEndMs;
   const MediaWorkRow({
     required this.key,
     required this.provider,
@@ -2642,6 +2830,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     this.firstSeenAt,
     this.lastPlayedAt,
     required this.updatedAt,
+    this.mergedInto,
+    this.introStartMs,
+    this.introEndMs,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -2701,6 +2892,15 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       map['last_played_at'] = Variable<DateTime>(lastPlayedAt);
     }
     map['updated_at'] = Variable<DateTime>(updatedAt);
+    if (!nullToAbsent || mergedInto != null) {
+      map['merged_into'] = Variable<String>(mergedInto);
+    }
+    if (!nullToAbsent || introStartMs != null) {
+      map['intro_start_ms'] = Variable<int>(introStartMs);
+    }
+    if (!nullToAbsent || introEndMs != null) {
+      map['intro_end_ms'] = Variable<int>(introEndMs);
+    }
     return map;
   }
 
@@ -2770,6 +2970,18 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               ? const Value.absent()
               : Value(lastPlayedAt),
       updatedAt: Value(updatedAt),
+      mergedInto:
+          mergedInto == null && nullToAbsent
+              ? const Value.absent()
+              : Value(mergedInto),
+      introStartMs:
+          introStartMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(introStartMs),
+      introEndMs:
+          introEndMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(introEndMs),
     );
   }
 
@@ -2806,6 +3018,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       firstSeenAt: serializer.fromJson<DateTime?>(json['firstSeenAt']),
       lastPlayedAt: serializer.fromJson<DateTime?>(json['lastPlayedAt']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
+      mergedInto: serializer.fromJson<String?>(json['mergedInto']),
+      introStartMs: serializer.fromJson<int?>(json['introStartMs']),
+      introEndMs: serializer.fromJson<int?>(json['introEndMs']),
     );
   }
   @override
@@ -2839,6 +3054,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'firstSeenAt': serializer.toJson<DateTime?>(firstSeenAt),
       'lastPlayedAt': serializer.toJson<DateTime?>(lastPlayedAt),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
+      'mergedInto': serializer.toJson<String?>(mergedInto),
+      'introStartMs': serializer.toJson<int?>(introStartMs),
+      'introEndMs': serializer.toJson<int?>(introEndMs),
     };
   }
 
@@ -2870,6 +3088,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     Value<DateTime?> firstSeenAt = const Value.absent(),
     Value<DateTime?> lastPlayedAt = const Value.absent(),
     DateTime? updatedAt,
+    Value<String?> mergedInto = const Value.absent(),
+    Value<int?> introStartMs = const Value.absent(),
+    Value<int?> introEndMs = const Value.absent(),
   }) => MediaWorkRow(
     key: key ?? this.key,
     provider: provider ?? this.provider,
@@ -2900,6 +3121,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     firstSeenAt: firstSeenAt.present ? firstSeenAt.value : this.firstSeenAt,
     lastPlayedAt: lastPlayedAt.present ? lastPlayedAt.value : this.lastPlayedAt,
     updatedAt: updatedAt ?? this.updatedAt,
+    mergedInto: mergedInto.present ? mergedInto.value : this.mergedInto,
+    introStartMs: introStartMs.present ? introStartMs.value : this.introStartMs,
+    introEndMs: introEndMs.present ? introEndMs.value : this.introEndMs,
   );
   MediaWorkRow copyWithCompanion(MediaWorksCompanion data) {
     return MediaWorkRow(
@@ -2954,6 +3178,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               ? data.lastPlayedAt.value
               : this.lastPlayedAt,
       updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
+      mergedInto:
+          data.mergedInto.present ? data.mergedInto.value : this.mergedInto,
+      introStartMs:
+          data.introStartMs.present
+              ? data.introStartMs.value
+              : this.introStartMs,
+      introEndMs:
+          data.introEndMs.present ? data.introEndMs.value : this.introEndMs,
     );
   }
 
@@ -2986,7 +3218,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('lastModifiedAt: $lastModifiedAt, ')
           ..write('firstSeenAt: $firstSeenAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
-          ..write('updatedAt: $updatedAt')
+          ..write('updatedAt: $updatedAt, ')
+          ..write('mergedInto: $mergedInto, ')
+          ..write('introStartMs: $introStartMs, ')
+          ..write('introEndMs: $introEndMs')
           ..write(')'))
         .toString();
   }
@@ -3020,6 +3255,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     firstSeenAt,
     lastPlayedAt,
     updatedAt,
+    mergedInto,
+    introStartMs,
+    introEndMs,
   ]);
   @override
   bool operator ==(Object other) =>
@@ -3051,7 +3289,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.lastModifiedAt == this.lastModifiedAt &&
           other.firstSeenAt == this.firstSeenAt &&
           other.lastPlayedAt == this.lastPlayedAt &&
-          other.updatedAt == this.updatedAt);
+          other.updatedAt == this.updatedAt &&
+          other.mergedInto == this.mergedInto &&
+          other.introStartMs == this.introStartMs &&
+          other.introEndMs == this.introEndMs);
 }
 
 class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
@@ -3082,6 +3323,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<DateTime?> firstSeenAt;
   final Value<DateTime?> lastPlayedAt;
   final Value<DateTime> updatedAt;
+  final Value<String?> mergedInto;
+  final Value<int?> introStartMs;
+  final Value<int?> introEndMs;
   final Value<int> rowid;
   const MediaWorksCompanion({
     this.key = const Value.absent(),
@@ -3111,6 +3355,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.firstSeenAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
+    this.mergedInto = const Value.absent(),
+    this.introStartMs = const Value.absent(),
+    this.introEndMs = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   MediaWorksCompanion.insert({
@@ -3141,6 +3388,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.firstSeenAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
     required DateTime updatedAt,
+    this.mergedInto = const Value.absent(),
+    this.introStartMs = const Value.absent(),
+    this.introEndMs = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : key = Value(key),
        provider = Value(provider),
@@ -3176,6 +3426,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<DateTime>? firstSeenAt,
     Expression<DateTime>? lastPlayedAt,
     Expression<DateTime>? updatedAt,
+    Expression<String>? mergedInto,
+    Expression<int>? introStartMs,
+    Expression<int>? introEndMs,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -3206,6 +3459,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (firstSeenAt != null) 'first_seen_at': firstSeenAt,
       if (lastPlayedAt != null) 'last_played_at': lastPlayedAt,
       if (updatedAt != null) 'updated_at': updatedAt,
+      if (mergedInto != null) 'merged_into': mergedInto,
+      if (introStartMs != null) 'intro_start_ms': introStartMs,
+      if (introEndMs != null) 'intro_end_ms': introEndMs,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -3238,6 +3494,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<DateTime?>? firstSeenAt,
     Value<DateTime?>? lastPlayedAt,
     Value<DateTime>? updatedAt,
+    Value<String?>? mergedInto,
+    Value<int?>? introStartMs,
+    Value<int?>? introEndMs,
     Value<int>? rowid,
   }) {
     return MediaWorksCompanion(
@@ -3268,6 +3527,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       firstSeenAt: firstSeenAt ?? this.firstSeenAt,
       lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
       updatedAt: updatedAt ?? this.updatedAt,
+      mergedInto: mergedInto ?? this.mergedInto,
+      introStartMs: introStartMs ?? this.introStartMs,
+      introEndMs: introEndMs ?? this.introEndMs,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -3356,6 +3618,15 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     if (updatedAt.present) {
       map['updated_at'] = Variable<DateTime>(updatedAt.value);
     }
+    if (mergedInto.present) {
+      map['merged_into'] = Variable<String>(mergedInto.value);
+    }
+    if (introStartMs.present) {
+      map['intro_start_ms'] = Variable<int>(introStartMs.value);
+    }
+    if (introEndMs.present) {
+      map['intro_end_ms'] = Variable<int>(introEndMs.value);
+    }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
     }
@@ -3392,6 +3663,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('firstSeenAt: $firstSeenAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('updatedAt: $updatedAt, ')
+          ..write('mergedInto: $mergedInto, ')
+          ..write('introStartMs: $introStartMs, ')
+          ..write('introEndMs: $introEndMs, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -5340,6 +5614,7 @@ typedef $$MediaItemsTableCreateCompanionBuilder =
       Value<DateTime?> lastPlayedAt,
       Value<int?> resumePositionMs,
       Value<String?> thumbUrl,
+      Value<double?> faceAnchorX,
       Value<int?> videoWidth,
       Value<int?> videoHeight,
       Value<int> rowid,
@@ -5377,6 +5652,7 @@ typedef $$MediaItemsTableUpdateCompanionBuilder =
       Value<DateTime?> lastPlayedAt,
       Value<int?> resumePositionMs,
       Value<String?> thumbUrl,
+      Value<double?> faceAnchorX,
       Value<int?> videoWidth,
       Value<int?> videoHeight,
       Value<int> rowid,
@@ -5543,6 +5819,11 @@ class $$MediaItemsTableFilterComposer
 
   ColumnFilters<String> get thumbUrl => $composableBuilder(
     column: $table.thumbUrl,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<double> get faceAnchorX => $composableBuilder(
+    column: $table.faceAnchorX,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5721,6 +6002,11 @@ class $$MediaItemsTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<double> get faceAnchorX => $composableBuilder(
+    column: $table.faceAnchorX,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<int> get videoWidth => $composableBuilder(
     column: $table.videoWidth,
     builder: (column) => ColumnOrderings(column),
@@ -5856,6 +6142,11 @@ class $$MediaItemsTableAnnotationComposer
   GeneratedColumn<String> get thumbUrl =>
       $composableBuilder(column: $table.thumbUrl, builder: (column) => column);
 
+  GeneratedColumn<double> get faceAnchorX => $composableBuilder(
+    column: $table.faceAnchorX,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<int> get videoWidth => $composableBuilder(
     column: $table.videoWidth,
     builder: (column) => column,
@@ -5929,6 +6220,7 @@ class $$MediaItemsTableTableManager
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 Value<int?> resumePositionMs = const Value.absent(),
                 Value<String?> thumbUrl = const Value.absent(),
+                Value<double?> faceAnchorX = const Value.absent(),
                 Value<int?> videoWidth = const Value.absent(),
                 Value<int?> videoHeight = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
@@ -5964,6 +6256,7 @@ class $$MediaItemsTableTableManager
                 lastPlayedAt: lastPlayedAt,
                 resumePositionMs: resumePositionMs,
                 thumbUrl: thumbUrl,
+                faceAnchorX: faceAnchorX,
                 videoWidth: videoWidth,
                 videoHeight: videoHeight,
                 rowid: rowid,
@@ -6001,6 +6294,7 @@ class $$MediaItemsTableTableManager
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 Value<int?> resumePositionMs = const Value.absent(),
                 Value<String?> thumbUrl = const Value.absent(),
+                Value<double?> faceAnchorX = const Value.absent(),
                 Value<int?> videoWidth = const Value.absent(),
                 Value<int?> videoHeight = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
@@ -6036,6 +6330,7 @@ class $$MediaItemsTableTableManager
                 lastPlayedAt: lastPlayedAt,
                 resumePositionMs: resumePositionMs,
                 thumbUrl: thumbUrl,
+                faceAnchorX: faceAnchorX,
                 videoWidth: videoWidth,
                 videoHeight: videoHeight,
                 rowid: rowid,
@@ -6101,6 +6396,9 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       Value<DateTime?> firstSeenAt,
       Value<DateTime?> lastPlayedAt,
       required DateTime updatedAt,
+      Value<String?> mergedInto,
+      Value<int?> introStartMs,
+      Value<int?> introEndMs,
       Value<int> rowid,
     });
 typedef $$MediaWorksTableUpdateCompanionBuilder =
@@ -6132,6 +6430,9 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<DateTime?> firstSeenAt,
       Value<DateTime?> lastPlayedAt,
       Value<DateTime> updatedAt,
+      Value<String?> mergedInto,
+      Value<int?> introStartMs,
+      Value<int?> introEndMs,
       Value<int> rowid,
     });
 
@@ -6276,6 +6577,21 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<DateTime> get updatedAt => $composableBuilder(
     column: $table.updatedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get mergedInto => $composableBuilder(
+    column: $table.mergedInto,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get introStartMs => $composableBuilder(
+    column: $table.introStartMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get introEndMs => $composableBuilder(
+    column: $table.introEndMs,
     builder: (column) => ColumnFilters(column),
   );
 }
@@ -6423,6 +6739,21 @@ class $$MediaWorksTableOrderingComposer
     column: $table.updatedAt,
     builder: (column) => ColumnOrderings(column),
   );
+
+  ColumnOrderings<String> get mergedInto => $composableBuilder(
+    column: $table.mergedInto,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get introStartMs => $composableBuilder(
+    column: $table.introStartMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get introEndMs => $composableBuilder(
+    column: $table.introEndMs,
+    builder: (column) => ColumnOrderings(column),
+  );
 }
 
 class $$MediaWorksTableAnnotationComposer
@@ -6538,6 +6869,21 @@ class $$MediaWorksTableAnnotationComposer
 
   GeneratedColumn<DateTime> get updatedAt =>
       $composableBuilder(column: $table.updatedAt, builder: (column) => column);
+
+  GeneratedColumn<String> get mergedInto => $composableBuilder(
+    column: $table.mergedInto,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get introStartMs => $composableBuilder(
+    column: $table.introStartMs,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get introEndMs => $composableBuilder(
+    column: $table.introEndMs,
+    builder: (column) => column,
+  );
 }
 
 class $$MediaWorksTableTableManager
@@ -6598,6 +6944,9 @@ class $$MediaWorksTableTableManager
                 Value<DateTime?> firstSeenAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
+                Value<String?> mergedInto = const Value.absent(),
+                Value<int?> introStartMs = const Value.absent(),
+                Value<int?> introEndMs = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaWorksCompanion(
                 key: key,
@@ -6627,6 +6976,9 @@ class $$MediaWorksTableTableManager
                 firstSeenAt: firstSeenAt,
                 lastPlayedAt: lastPlayedAt,
                 updatedAt: updatedAt,
+                mergedInto: mergedInto,
+                introStartMs: introStartMs,
+                introEndMs: introEndMs,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -6658,6 +7010,9 @@ class $$MediaWorksTableTableManager
                 Value<DateTime?> firstSeenAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 required DateTime updatedAt,
+                Value<String?> mergedInto = const Value.absent(),
+                Value<int?> introStartMs = const Value.absent(),
+                Value<int?> introEndMs = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaWorksCompanion.insert(
                 key: key,
@@ -6687,6 +7042,9 @@ class $$MediaWorksTableTableManager
                 firstSeenAt: firstSeenAt,
                 lastPlayedAt: lastPlayedAt,
                 updatedAt: updatedAt,
+                mergedInto: mergedInto,
+                introStartMs: introStartMs,
+                introEndMs: introEndMs,
                 rowid: rowid,
               ),
           withReferenceMapper:

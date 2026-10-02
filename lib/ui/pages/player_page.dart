@@ -9,10 +9,14 @@ import 'package:go_router/go_router.dart';
 import 'package:media_kit/media_kit.dart' as mk;
 import 'package:media_kit_video/media_kit_video.dart';
 
+import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/seek_acceleration.dart';
 import '../../data/db/settings_store.dart';
 import '../../domain/entities/media_item.dart';
+import '../../domain/entities/media_work.dart';
 import '../../domain/entities/quality_option.dart';
 import '../../domain/entities/subtitle_track.dart';
+import '../../domain/services/episode_queue.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/playback_exit_policy.dart';
 import '../providers/app_providers.dart';
@@ -20,6 +24,8 @@ import '../theme/app_theme.dart';
 import '../widgets/anchored_menu.dart';
 import '../widgets/buffered_slider.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/missing_media_dialog.dart';
+import '../widgets/player_keys.dart';
 
 /// 遥控器 / 键盘上某个键，在当前上下文里该触发什么。
 ///
@@ -40,6 +46,14 @@ enum RemoteKeyAction {
   /// 非沉浸模式下按 Esc：退出播放页。
   pop,
 
+  /// 数字键：跳到片子的 N%。
+  ///
+  /// 「是哪个数字」不在这里定 —— 这个枚举只回答「该干什么」，
+  /// 具体百分比由 `player_keys.dart` 的 `seekFractionForKey` 从键本身读。
+  /// 把比例塞进枚举会让它变成带载荷的密封类，而**两个播放器都要用它**
+  /// （那个文件在 `ui/widgets/` 下，独立播放窗口也够得着）。
+  seekPercent,
+
   /// 放行给焦点系统（移动焦点、激活按钮）。
   ignored,
 }
@@ -49,6 +63,9 @@ enum RemoteKeyAction {
 /// ⚠️ 只能是 `final` 不能是 `const`：`LogicalKeyboardKey` 重写了 `==`，
 /// 而常量集合的元素要求原生相等（`const_set_element_not_primitive_equality`）。
 final Set<LogicalKeyboardKey> _remoteKeys = {
+  // 数字键也要认。沉浸模式「第一下先把控制栏叫回来」的判据是「认不认得这个
+  // 键」—— 漏掉数字键的话，用户按 5 只会换回控制栏，得按第二下才跳。
+  ...seekDigitKeys.keys,
   LogicalKeyboardKey.select,
   LogicalKeyboardKey.enter,
   LogicalKeyboardKey.space,
@@ -78,6 +95,10 @@ RemoteKeyAction resolveRemoteKey({
   if (immersive && _remoteKeys.contains(key)) {
     return RemoteKeyAction.showControls;
   }
+
+  // 数字键不挑焦点：它是**明确的意图**（「跳到 50%」），不像 OK / ←→ 那样
+  // 在按钮上有别的含义。焦点停在控制栏里时按 5，用户要的仍然是跳转。
+  if (isSeekDigit(key)) return RemoteKeyAction.seekPercent;
 
   // 这几个不挑焦点在哪：遥控器 / 键盘上的专用键，在任何位置都该生效。
   switch (key) {
@@ -186,11 +207,30 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 又不会让用户觉得「按了没反应」—— 因为唤回只要任意一键）。
   static const Duration _controlsIdleTimeout = Duration(seconds: 30);
 
+  /// 长按 / 连按 ←→ 的步长累加（10 秒 → 30 → 60 → 5 分钟）。
+  ///
+  /// 状态放在页面里而不是全局：它描述的是「用户手上这一串按键」，
+  /// 退出播放页就该忘掉。独立播放窗口另有一份（不同引擎，共享不了）。
+  final SeekRepeatTracker _seekRepeat = SeekRepeatTracker();
+
   /// 拖动进度条时的临时值。拖动过程中不能让 `position` 流把滑块拽回去。
   double? _dragFraction;
 
   /// 当前音轨 id。页面自己记：mpv 的 `tracks` 流只给列表，不给「当前选中」。
   String? _audioId;
+
+  /// 当前作品（作品级数据：手标的片头区间在这里）。
+  ///
+  /// `_item` 是「这一集」，`_work` 是「这部剧」—— 片头区间是**作品级**的
+  /// （见 `MediaWork.introStartMs` 的类文档：各集片头时长基本一致，
+  /// 而逐集标记的代价高得没人会去标）。
+  MediaWork? _work;
+
+  /// 设置：一集播完是否自动接下一集。
+  bool _autoPlayNext = true;
+
+  /// 设置：有片头标识时是否自动跳过。
+  bool _skipIntro = true;
 
   @override
   void initState() {
@@ -198,7 +238,61 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _controller = ref.read(playbackControllerProvider);
     // 播放状态一变就重算收起倒计时（见 [_onPlayStateChanged]）。
     _controller.addListener(_onPlayStateChanged);
+    // 自动连播。**在这里挂、在 dispose 摘**：控制器是 Provider 级的单例，
+    // 不摘的话它会在页面销毁之后继续持有这个 State 的闭包（`_onCompleted`
+    // 里要 `setState` / 读 provider），下一次播完会打到已销毁的页面上。
+    _controller.onCompleted = _onCompleted;
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
+  }
+
+  /// 一集播完。自动接下一集（设置里关掉时什么都不做）。
+  void _onCompleted() {
+    if (!_autoPlayNext) return;
+    unawaited(_playNextEpisode());
+  }
+
+  /// 找同一部作品里的下一集并打开它。
+  ///
+  /// 「下一集是哪一条」的规则本体在 [EpisodeQueue]（两个播放器共用）——
+  /// 这里只负责取列表、把当前项交出去、然后把结果播起来。
+  Future<void> _playNextEpisode() async {
+    final current = _item;
+    if (current == null) return;
+
+    final repo = ref.read(mediaRepositoryProvider);
+    // `itemsForWork` 取的是**并集**（含折叠过来的那些目录），与详情页
+    // 剧集列表同一口径 —— 否则跨目录归一的剧集会「播到第 3 集就断了」。
+    final siblings = await repo.itemsForWork(current.groupKey);
+    final next = EpisodeQueue.nextAfter<MediaItem>(
+      entries: siblings,
+      idOf: (i) => i.id,
+      currentId: current.id,
+      isExtra: (i) => i.isSampleOrExtra,
+    );
+
+    if (next == null) {
+      // 不是错误：最后一集播完就该停（见 `EpisodeQueue` 第 3 条 ——
+      // 循环重播会让睡着的用户被整夜播放）。
+      diag.info('播放', '没有下一集了：${current.displayTitle}');
+      return;
+    }
+    if (!mounted) return;
+
+    diag.info('播放', '自动连播 → ${next.displayTitle}');
+    await _openItem(next);
+  }
+
+  /// 当前这一条**在网盘上已经没了** → 问用户要不要把它的索引删掉。
+  ///
+  /// 删掉之后顺手退出播放页：留在一个「索引已经不存在」的页面上没有
+  /// 任何可做的事（重试必然再失败一次），而返回之后他能立刻看到已经
+  /// 更新过的媒体库 —— 那正是他刚做的那件事的结果。
+  Future<void> _removeCurrent() async {
+    final item = _item;
+    if (item == null) return;
+    final removed = await removeMissingMedia(context, ref, item);
+    if (!mounted || !removed) return;
+    context.pop();
   }
 
   /// 播放状态一变就重算收起倒计时：开始播 → 挂上；暂停 / 停止 → 撤掉
@@ -214,6 +308,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   @override
   void dispose() {
     _controller.removeListener(_onPlayStateChanged);
+    // 摘掉自动连播回调：它是**全局唯一**的那个（控制器是单例），
+    // 留着会让下一次播完打到这个已经销毁的 State 上。
+    if (_controller.onCompleted == _onCompleted) {
+      _controller.onCompleted = null;
+    }
     //   - 桌面：保留播放（可以一边浏览一边听）；
     //   - Android / Android TV：停止并释放解码器 —— 页面都走了，不该还占着
     //     4K 解码器与网络连接，而那边也没有通知栏控件能停它。
@@ -241,14 +340,50 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       return;
     }
 
-    // 字幕引用（扫描期建的，不含正文）与设置一起读。
-    final subtitles = await repo.subtitlesForItem(item.id);
+    // 设置一次性读齐：清晰度 / 字幕 / 音量 / 倍速 / **连播 / 跳片头**。
+    // 连播与跳片头这两项在切集时不会重读 —— 它们描述的是「这一轮观看」
+    // 的偏好，中途去设置页改的极端情况不值得为它每次切集多打一次库。
     final settings = ref.read(settingsStoreProvider);
     final values = await settings.readAll(const [
       SettingKeys.defaultQuality,
       SettingKeys.autoLoadSubtitles,
       SettingKeys.playerVolume,
       SettingKeys.playerRate,
+      SettingKeys.autoPlayNext,
+      SettingKeys.skipIntro,
+    ]);
+    if (!mounted) return;
+
+    final volume = double.tryParse(values[SettingKeys.playerVolume] ?? '') ?? 100;
+    final rate = double.tryParse(values[SettingKeys.playerRate] ?? '') ?? 1.0;
+
+    setState(() {
+      _autoPlayNext = values[SettingKeys.autoPlayNext] != 'false';
+      _skipIntro = values[SettingKeys.skipIntro] != 'false';
+    });
+
+    final controller = _controller;
+    await controller.setVolume(volume);
+    await controller.setRate(rate);
+
+    await _openItem(item);
+  }
+
+  /// 打开一集（首次进入与自动连播走的是**同一条路**）。
+  ///
+  /// 抽出来而不是让自动连播另写一份：两份必然会漂移，而漂移的表现是
+  /// 「自动切过去的那一集字幕没加载 / 清晰度不对 / 不跳片头」——
+  /// 用户完全不会想到这与「第一集」走的是不同代码。
+  Future<void> _openItem(MediaItem item) async {
+    final repo = ref.read(mediaRepositoryProvider);
+
+    // 字幕引用（扫描期建的，不含正文）与作品级数据一起读。
+    final subtitles = await repo.subtitlesForItem(item.id);
+    final work = await repo.workByKey(item.groupKey);
+    final settings = ref.read(settingsStoreProvider);
+    final values = await settings.readAll(const [
+      SettingKeys.defaultQuality,
+      SettingKeys.autoLoadSubtitles,
     ]);
     if (!mounted) return;
 
@@ -257,24 +392,120 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 默认 **true**：绝大多数片子都有中文字幕，默认加载省一次点击；
     // 没有字幕时 `_autoLoadSubtitle` 会安静地什么都不做。
     final autoSub = values[SettingKeys.autoLoadSubtitles] != 'false';
-    final volume = double.tryParse(values[SettingKeys.playerVolume] ?? '') ?? 100;
-    final rate = double.tryParse(values[SettingKeys.playerRate] ?? '') ?? 1.0;
-
-    final controller = _controller;
-    await controller.setVolume(volume);
-    await controller.setRate(rate);
 
     setState(() {
       _item = item;
+      _work = work;
       _ready = true;
+      // 音轨选中态是**逐文件**的：上一集的音轨号在新文件里可能根本不存在，
+      // 留着会让音轨菜单高亮一个不存在的轨。
+      _audioId = null;
+      // 拖拽预览值同理：它属于上一集的进度条。
+      _dragFraction = null;
     });
 
-    await controller.open(
+    await _controller.open(
       item,
       subtitles: subtitles,
       preferredQualityId: preferred,
       autoLoadSubtitles: autoSub,
+      // 手标区间（兜底）。文件章节那份由控制器自己探测，且优先级更高。
+      introMarker: work?.introRange,
+      skipIntro: _skipIntro,
     );
+  }
+
+  // -------------------------------------------------------------------
+  // 片头标记（手标那一半）
+  // -------------------------------------------------------------------
+
+  /// 把「当前位置」记成片头起点 / 终点，或清除整个标记。
+  ///
+  /// ## 为什么三个动作都写库、且写完**从库里重读**
+  ///
+  /// 仓储那三个方法是**分开的**（`setWorkIntroStart` / `setWorkIntroEnd` /
+  /// `clearWorkIntroRange`），而不是一个带可空参数的 —— 因为 `copyWith`
+  /// 的 `??` 把 `null` 当成「不改」，用一个方法表达不了「清除」。
+  ///
+  /// 本地这份同样不能用 `copyWith` 造：`copyWith(introStartMs: null)` 清不掉
+  /// 字段。重读一次既绕开了它，又保证界面显示的就是库里真正存着的东西 ——
+  /// 代价是一次 `SELECT`，而标片头是极低频动作。
+  Future<void> _markIntro(_IntroAction action) async {
+    final work = _work;
+    if (work == null) return;
+
+    // 「跳到片头」不写库，先单独处理掉。
+    if (action == _IntroAction.jump) {
+      final marker = _controller.introMarker;
+      if (marker != null) await _controller.seek(marker.start);
+      return;
+    }
+
+    final repo = ref.read(mediaRepositoryProvider);
+    final ms = _controller.position.inMilliseconds;
+    final String message;
+
+    switch (action) {
+      case _IntroAction.setStart:
+        if (ms <= 0) {
+          _toast('现在的位置是 0，先让画面播起来再标起点');
+          return;
+        }
+        await repo.setWorkIntroStart(work.key, ms);
+        message = '片头起点已记为 ${_fmt(Duration(milliseconds: ms))}';
+
+      case _IntroAction.setEnd:
+        if (ms <= 0) {
+          _toast('现在的位置是 0，先让画面播起来再标终点');
+          return;
+        }
+        await repo.setWorkIntroEnd(work.key, ms);
+        message = '片头终点已记为 ${_fmt(Duration(milliseconds: ms))}';
+
+      case _IntroAction.clear:
+        await repo.clearWorkIntroRange(work.key);
+        message = '已清除片头标记';
+
+      case _IntroAction.jump:
+        return; // 上面已经处理过。
+    }
+
+    final fresh = await repo.workByKey(work.key);
+    if (!mounted) return;
+    if (fresh != null) _applyWork(fresh);
+
+    // 标完之后区间还不成立（只标了一半 / 起终点反了）必须**说一声**：
+    // 否则用户看到的是「两个点都标了，可是还是不跳」。
+    final incomplete =
+        action != _IntroAction.clear && _controller.introMarker == null;
+    _toast(
+      incomplete
+          ? '$message。片头要同时有起点和终点、且起点在终点之前，'
+              '现在这样不会自动跳过'
+          : message,
+    );
+  }
+
+  void _applyWork(MediaWork work) {
+    if (!mounted) return;
+    setState(() => _work = work);
+    _controller.applyManualIntro(work.introRange);
+  }
+
+  /// 一条轻提示。用 SnackBar 而不是播放器里那个 `notice` 药丸：
+  /// 药丸是「播放状态的一部分」（控制器持有、会自动消失），而这几句是
+  /// 用户点按钮的**即时反馈**，生命周期属于这个页面。
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
   }
 
   static String? _nonEmpty(String? v) =>
@@ -336,6 +567,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// `Focus.onKeyEvent` 能返回 `ignored` 把按键交还给焦点系统，
   /// 这是「同一个键，在画面上是快退、在控制栏里是移动焦点」唯一能落地的写法。
   KeyEventResult _onRemoteKey(FocusNode node, KeyEvent event) {
+    // 松手 = 这一串快退/快进结束，下一串重新从 10 秒起步。
+    //
+    // 这里能显式收到 key-up（`Focus.onKeyEvent` 的待遇），比独立播放窗口那边
+    // 靠「间隔超时」判断开要准 —— 那边走 `CallbackShortcuts`，压根收不到 up。
+    if (event is KeyUpEvent) {
+      _seekRepeat.reset();
+      return KeyEventResult.ignored;
+    }
+
     // 长按要能连续快退/快进，所以 `KeyRepeatEvent` 也要处理。
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
@@ -354,18 +594,31 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
     switch (action) {
       case RemoteKeyAction.playPause:
+        _seekRepeat.reset();
         _controller.playOrPause();
       case RemoteKeyAction.seekBack:
-        _controller.seekRelative(const Duration(seconds: -10));
+        // 步长由「这一串已经连了几下」决定：按一下 10 秒，长按住会涨到 5 分钟。
+        _controller.seekRelative(-_seekRepeat.step(-1));
       case RemoteKeyAction.seekForward:
-        _controller.seekRelative(const Duration(seconds: 10));
+        _controller.seekRelative(_seekRepeat.step(1));
+      case RemoteKeyAction.seekPercent:
+        // 数字键是**一步到位**的跳转，与「连按累加」是两回事，别把两者混起来。
+        _seekRepeat.reset();
+        final fraction = seekFractionForKey(event.logicalKey);
+        if (fraction != null) _controller.seekToFraction(fraction);
       case RemoteKeyAction.showControls:
         // 唤回控制栏：倒计时从头算，给用户足够时间看清再决定下一步。
+        _seekRepeat.reset();
         setState(() => _immersive = false);
         _scheduleControlsHide();
       case RemoteKeyAction.pop:
+        _seekRepeat.reset();
         context.pop();
       case RemoteKeyAction.ignored:
+        // 走到这儿的是「放行给焦点系统」的键（↑/↓、焦点不在画面上时的 OK 与
+        // ←→）。它们与快退/快进不是同一件事，所以把这一串断掉 ——
+        // 否则「← ↓ ←」会被当成连按两下 ←。
+        _seekRepeat.reset();
         return KeyEventResult.ignored;
     }
     return KeyEventResult.handled;
@@ -518,6 +771,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             message: error,
             onRetry: controller.retry,
             onBack: () => context.pop(),
+            // 只有「网盘上已经没有这个文件」才给这个出口。登录失效、断网、
+            // 限流都是「这次没取到」—— 那些情况下文件还在，拿它们去问
+            // 用户要不要删片是最糟的一类误报。
+            onRemove: controller.isFileMissing ? _removeCurrent : null,
           ),
 
         // 非致命提示：**贴顶的小条，不盖画面**。
@@ -680,6 +937,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                 onSelected: (id) => setState(() => _audioId = id),
               ),
               _RateMenu(controller: controller),
+              // 片头标记入口。`_work` 为空（这一条没进过库）时不显示 ——
+              // 标记要写到作品行上，没有那一行就无处可写。
+              if (_work case final work?)
+                _IntroMenu(
+                  controller: controller,
+                  work: work,
+                  onAction: (a) => unawaited(_markIntro(a)),
+                ),
             ],
           ),
         ],
@@ -688,12 +953,34 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   }
 
   /// `1:02:03` / `02:03`
-  static String _fmt(Duration d) {
-    final h = d.inHours;
-    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return h > 0 ? '$h:$m:$s' : '$m:$s';
-  }
+  static String _fmt(Duration d) => _fmtClock(d);
+}
+
+/// `1:02:03` / `02:03`。
+///
+/// 提到顶层是因为**片头菜单也要用**（它是个独立的 `StatelessWidget`，
+/// 够不到 `_PlayerPageState` 的静态方法）。留两份的话，进度条上写着
+/// `1:30`、片头菜单里写着 `01:30`，同一段时间两个样子。
+String _fmtClock(Duration d) {
+  final h = d.inHours;
+  final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return h > 0 ? '$h:$m:$s' : '$m:$s';
+}
+
+/// 片头菜单能触发的四个动作。
+enum _IntroAction {
+  /// 把当前位置记为片头起点。
+  setStart,
+
+  /// 把当前位置记为片头终点。
+  setEnd,
+
+  /// 清掉手标的那一份（文件章节不受影响）。
+  clear,
+
+  /// 跳到片头起点。
+  jump,
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +1252,116 @@ class _RateMenu extends StatelessWidget {
   }
 }
 
+/// 片头菜单：看当前片头区间、跳过去、手动标记 / 清除。
+///
+/// ## 为什么这个入口必须存在
+///
+/// 「有片头标识就自动跳过」里的「标识」有两路来源：文件内章节（`Opening` /
+/// `片头` 这类章节名）与用户手标的区间。而**网盘上的剧集绝大多数没有章节**
+/// —— 压制时没人写。只有章节这一路的话，这个功能对大部分用户等于不存在。
+///
+/// ## 为什么标在「作品」而不是「这一集」
+///
+/// 同一部剧每集的片头位置几乎一样，让用户给 24 集各标一次是不可接受的。
+/// 代价是各集片长略有差异时会有偏差 —— 这个取舍见 `MediaWork.introStartMs`。
+class _IntroMenu extends StatelessWidget {
+  const _IntroMenu({
+    required this.controller,
+    required this.work,
+    required this.onAction,
+  });
+
+  final PlaybackController controller;
+  final MediaWork work;
+  final ValueChanged<_IntroAction> onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final marker = controller.introMarker;
+    final manual = work.introRange;
+    final fromChapters = controller.introFromChapters;
+
+    // 状态说明。三种情形对用户是**三件不同的事**，文案不能混：
+    //   - 有章节：这是发布者给的准确信息，用户不需要做任何事；
+    //   - 只有手标：告诉他这一份是「整部剧共用」的；
+    //   - 都没有：告诉他可以自己标一次 —— 否则他不会想到这个功能还能用。
+    final String status;
+    if (fromChapters) {
+      status = '来自文件章节（压制时写进去的），比手标更准';
+    } else if (manual != null) {
+      status = '来自你手动标记的区间，这部作品下的每一集共用';
+    } else {
+      status = '文件里没有章节标记。可以在这儿手动标一次，'
+          '这部作品下的每一集都会用';
+    }
+
+    final now = _fmtClock(controller.position);
+
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '片头',
+        onTap: () => unawaited(_openAnchoredMenu<_IntroAction>(
+          buttonContext: buttonContext,
+          title: '片头',
+          maxWidth: 330,
+          onSelected: onAction,
+          rows: (context, select) => [
+            _MenuTile(
+              child: _MenuRow(
+                label: marker == null
+                    ? '还没有片头标识'
+                    : '片头 ${_fmtClock(marker.start)} → '
+                        '${_fmtClock(marker.end)}（${marker.length.inSeconds} 秒）',
+                detail: status,
+                dim: marker == null,
+              ),
+            ),
+            if (marker != null)
+              _MenuTile(
+                onTap: () => select(_IntroAction.jump),
+                child: _MenuRow(
+                  label: '跳到片头',
+                  detail: '回到 ${_fmtClock(marker.start)}',
+                ),
+              ),
+            _MenuTile(
+              onTap: () => select(_IntroAction.setStart),
+              child: _MenuRow(
+                label: '把当前位置标为片头起点',
+                detail: '当前位置 $now',
+              ),
+            ),
+            _MenuTile(
+              onTap: () => select(_IntroAction.setEnd),
+              child: _MenuRow(
+                label: '把当前位置标为片头终点',
+                detail: '当前位置 $now',
+              ),
+            ),
+            // 「清除」只在真的手标过时才给 —— 章节那份清不掉（它在文件里），
+            // 给一个点了没反应的按钮比不给更让人困惑。
+            if (manual != null)
+              _MenuTile(
+                onTap: () => select(_IntroAction.clear),
+                child: _MenuRow(
+                  label: '清除手动标记',
+                  detail: fromChapters
+                      ? '清掉之后仍会用文件里的章节'
+                      : '清掉之后这一部不再自动跳过片头',
+                ),
+              ),
+          ],
+        )),
+        child: _BarButton(
+          icon: Icons.content_cut_rounded,
+          label: '片头',
+          active: marker != null,
+        ),
+      ),
+    );
+  }
+}
+
 /// 控制栏上的菜单入口。
 ///
 /// 用 `InkWell` 而不是 `PopupMenuButton`：菜单自己定位，但入口本身必须仍然
@@ -1172,11 +1569,16 @@ class _ErrorOverlay extends StatelessWidget {
     required this.message,
     required this.onRetry,
     required this.onBack,
+    this.onRemove,
   });
 
   final String message;
   final Future<void> Function() onRetry;
   final VoidCallback onBack;
+
+  /// 「从媒体库移除」的出口。**`null` 表示不给这个出口** —— 只有确认
+  /// 「网盘上已经没有这个文件」时才传（`PlaybackController.isFileMissing`）。
+  final VoidCallback? onRemove;
 
   @override
   Widget build(BuildContext context) {
@@ -1213,11 +1615,14 @@ class _ErrorOverlay extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 20),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+              // `Wrap` 而不是 `Row`：多出「从媒体库移除」那一个按钮之后，
+              // 三个按钮在窄窗口（TV 上尤其）会挤成一行溢出。
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 10,
+                runSpacing: 8,
                 children: [
                   OutlinedButton(onPressed: onBack, child: const Text('返回')),
-                  const SizedBox(width: 10),
                   FilledButton(
                     onPressed: () => unawaited(onRetry()),
                     style: FilledButton.styleFrom(
@@ -1225,6 +1630,14 @@ class _ErrorOverlay extends StatelessWidget {
                     ),
                     child: const Text('重新取链'),
                   ),
+                  if (onRemove != null)
+                    TextButton(
+                      onPressed: onRemove,
+                      child: const Text(
+                        '从媒体库移除…',
+                        style: TextStyle(color: AppTheme.warn),
+                      ),
+                    ),
                 ],
               ),
             ],

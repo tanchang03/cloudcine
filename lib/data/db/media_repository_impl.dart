@@ -12,6 +12,7 @@ import '../../core/utils/video_formats.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/entities/work_poster.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_cursor.dart';
@@ -78,6 +79,105 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<bool> deleteItem(String itemId) async {
+    // 先读后删：删完就再也拿不到 `group_key`，而重算作品计数要用它。
+    final row = await (_db.select(_db.mediaItems)
+          ..where((t) => t.id.equals(itemId)))
+        .getSingleOrNull();
+    if (row == null) return false;
+
+    await (_db.delete(_db.mediaItems)..where((t) => t.id.equals(itemId))).go();
+    // 字幕引用挂在媒体项上，而两张表之间**没有外键**（续扫的中间态需要
+    // 「有媒体项、没作品行」，见 `MediaItems.groupKey` 的注释）。所以这里
+    // 必须手动清 —— 漏掉的话它们会永远躺在表里，在任何界面上都看不到。
+    await (_db.delete(_db.subtitleRefs)
+          ..where((t) => t.itemId.equals(itemId)))
+        .go();
+
+    await _recountWork(row.groupKey);
+    return true;
+  }
+
+  @override
+  Future<int> deleteWork(String groupKey) async {
+    // 折叠进来的源作品行一起删：与 `itemsForWork` 的并集口径保持一致。
+    // 只删目标自己的话，「移除整部剧」会留下一半文件在库里 —— 那是一次
+    // 静默的数据变脏，没有任何界面会报错。
+    final merged = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([_db.mediaWorks.key])
+          ..where(_db.mediaWorks.mergedInto.equals(groupKey)))
+        .get();
+    final keyList = <String>{
+      groupKey,
+      ...merged.map((r) => r.read(_db.mediaWorks.key)).whereType<String>(),
+    }.toList(growable: false);
+
+    final rows = await (_db.selectOnly(_db.mediaItems)
+          ..addColumns([_db.mediaItems.id])
+          ..where(_db.mediaItems.groupKey.isIn(keyList)))
+        .get();
+    await _deleteSubtitleRefsFor(
+      rows.map((r) => r.read(_db.mediaItems.id)).whereType<String>().toList(),
+    );
+
+    final deleted = await (_db.delete(_db.mediaItems)
+          ..where((t) => t.groupKey.isIn(keyList)))
+        .go();
+    await (_db.delete(_db.mediaWorks)..where((t) => t.key.isIn(keyList))).go();
+    return deleted;
+  }
+
+  /// 按媒体项 id 批量删字幕引用。
+  ///
+  /// ⚠️ **必须分批**：SQLite 的宿主参数上限默认 999，而「一部几百集的剧、
+  /// 每集两条字幕」是很常见的量级。一次全塞进去会在库够大时才炸 —— 这种
+  /// 只在数据量上去之后才复现的问题最难查，所以这里提前分片。
+  Future<void> _deleteSubtitleRefsFor(List<String> itemIds) async {
+    const chunkSize = 500;
+    for (var i = 0; i < itemIds.length; i += chunkSize) {
+      var end = i + chunkSize;
+      if (end > itemIds.length) end = itemIds.length;
+      await (_db.delete(_db.subtitleRefs)
+            ..where((t) => t.itemId.isIn(itemIds.sublist(i, end))))
+          .go();
+    }
+  }
+
+  /// 重算一个作品行的三个计数与「最近修改」。
+  ///
+  /// ⚠️ 走**存值**口径（只数 `group_key` 等于它的行），不能用 `listWorks`
+  /// 那套并集：折叠进来的源作品由 `listWorks` 在**读的时候**并进去，
+  /// 这里再并一次就会被数两遍。
+  ///
+  /// 这里不删作品行 —— 「最后一个文件删完之后顺手删掉空作品」是一条产品
+  /// 决定，由 `MissingMediaController` 判断，仓储不做这个假设。
+  Future<void> _recountWork(String groupKey) async {
+    final rows = await (_db.select(_db.mediaItems)
+          ..where((t) => t.groupKey.equals(groupKey)))
+        .get();
+
+    DateTime? latest;
+    for (final r in rows) {
+      final t = r.modifiedAt;
+      if (t == null) continue;
+      if (latest == null || t.isAfter(latest)) latest = t;
+    }
+
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(groupKey)))
+        .write(
+      MediaWorksCompanion(
+        itemCount: Value(rows.length),
+        totalBytes:
+            Value(rows.fold<int>(0, (n, r) => n + (r.sizeBytes ?? 0))),
+        seasonCount:
+            Value(rows.map((r) => r.season ?? 0).where((s) => s > 0).toSet().length),
+        lastModifiedAt: Value(latest),
+        updatedAt: Value(DateTime.now()),
+      ),
+    );
+  }
+
+  @override
   Future<void> upsertWorks(
     List<MediaWork> works, {
     DateTime? now,
@@ -131,10 +231,16 @@ class DriftMediaRepository implements MediaRepository {
     final work = await workByKey(key);
     if (work == null) return null;
 
+    // 清掉在线海报之后，封面**回落到网盘缩略图**（作品名下的文件各自带着
+    // 一张服务端预览图）。不查这一次的话，「自定义」之后整墙变成灰块 ——
+    // 用户要的是「去掉刮错的那张」，不是「这部从此没有封面」。
+    final drivePoster = WorkPoster.fromItems(await itemsForWork(key));
+
     final custom = work.customized(
       title: title,
       category: category,
       updatedAt: now ?? DateTime.now(),
+      drivePoster: drivePoster,
     );
 
     // 整行写，**不过 `mergeWorkForUpsert`** —— 那边有一条「海报地址永不为空」
@@ -256,31 +362,53 @@ class DriftMediaRepository implements MediaRepository {
       key: incoming.key,
       provider: incoming.provider,
       kind: incoming.kind,
-      // 分类：**用户手动指定的优先于一切自动判定**。
+      // 分类：**用户手动指定的优先于一切自动判定**，而「用户显式发起的那次
+      // 写入」本身就是最高优先级的判定 —— 它由 `WorkScraper._categoryFor`
+      // 按完整优先级算好，这里照抄即可（`overrideManual` 那条）。
       //
-      // `existing.categoryManual == true` 时，无论本次是重扫还是重刮削，
-      // 都保留用户选的那个分类 —— `fromGenres` / `incoming.category` 都
-      // 不能覆盖它。这是「手动覆盖」的核心语义：用户说了算。
+      // 其余情况（扫描期写入，`overrideManual == false`）：
       //
-      // 没有手动标记时走原来的规则：**永远取新值，但新值要先把 `genres`
-      // 折算进去**。「永远取新值」不能改：放进 `protect` 分支会有一个
-      // 很难查的后果 —— 第一次扫描时判成「其他」的作品，之后无论怎么
-      // 重扫都修不回来（保护模式会一直保留那个旧的「其他」）。
+      //   - `existing.categoryManual == true` 时保留用户选的那个分类 ——
+      //     `fromGenres` / `incoming.category` 都不能覆盖它。这是「手动覆盖」
+      //     的核心语义：用户说了算，而且它**只挡无人值守的自动刮削**；
+      //   - 没有手动标记时**永远取新值，但新值要先把 `genres` 折算进去**。
+      //     「永远取新值」不能改：放进 `protect` 分支会有一个很难查的后果 ——
+      //     第一次扫描时判成「其他」的作品，之后无论怎么重扫都修不回来
+      //     （保护模式会一直保留那个旧的「其他」）；
+      //   - 只看 `incoming.category` 也不够：扫描期的
+      //     `MediaCategoryGuesser.guess` 拿不到 `genres`（那时还没刮削），
+      //     所以重扫一部已刮削的作品时，incoming 那个分类是按目录名 / 结构
+      //     重算的**旧口径**。直接用它会把刮削刚修正过来的分类冲回去 ——
+      //     用户看到的是「刮削后进了动漫栏，加一集重扫又回电影栏」。所以拿
+      //     [effectiveGenres] 再折算一次；`fromGenres` 给不出结论时（剧情 /
+      //     科幻这类不改变栏目）才退回 `incoming.category` —— 与
+      //     `WorkScraper._categoryFor` 是同一套口径。
       //
-      // 但只看 `incoming.category` 也不够：扫描期的
-      // `MediaCategoryGuesser.guess` 拿不到 `genres`（那时还没刮削），
-      // 所以重扫一部已刮削的作品时，incoming 那个分类是按目录名 / 结构
-      // 重算的**旧口径**。直接用它会把刮削刚修正过来的分类冲回去 ——
-      // 用户看到的是「刮削后进了动漫栏，加一集重扫又回电影栏」。
+      // ⚠️ `overrideManual`（详情页「刮削」/「手动」两个按钮）走第一条：
+      // 分类已经由 `WorkScraper._categoryFor` 按完整优先级算过一遍 —— 包括
+      // 「手动通道忽略旧锁、按本次刮削重判」那条。这里再拿
+      // `existing.categoryManual` 拦一次，等于把刚算对的结论原地扔掉：日志里
+      // 明明写着「分类判定：纪录片 → 剧集（对话框手选 override=剧集）」，
+      // 落库的却还是纪录片 —— 用户看到的是「类型设置没生效」，而且查不到
+      // 任何痕迹（界面还弹了「已刮削：…」）。自动通道（扫描期那条）**不传**
+      // `overrideManual`，仍然被锁挡住 —— 锁的本意就是挡无人值守的自动刮削。
+      category: overrideManual
+          ? incoming.category
+          : (existing.categoryManual
+              ? existing.category
+              : (MediaCategoryGuesser.fromGenres(effectiveGenres) ??
+                  incoming.category)),
+      // 锁跟着**同一次判定**走：`_apply` 已经把「用户这次选没选类型」写进
+      // `incoming.categoryManual`（选了 → `true` 锁住；「自动」→ 沿用旧锁）。
+      // 无条件取旧值会把「手动选了类型」这个动作丢掉 —— 分类当场是对的，
+      // 但没锁上，下一次自动刮削就能把它冲回去。
       //
-      // 所以这里拿 [effectiveGenres] 再折算一次；`fromGenres` 给不出结论时
-      // （剧情 / 科幻这类不改变栏目）才退回 `incoming.category` ——
-      // 与 `WorkScraper._categoryFor` 是同一套口径。
-      category: existing.categoryManual
-          ? existing.category
-          : (MediaCategoryGuesser.fromGenres(effectiveGenres) ??
-              incoming.category),
-      categoryManual: existing.categoryManual,
+      // 用 `||`（只增不减）：这个项目里**没有解锁入口**，锁只由用户的显式
+      // 操作置上；写成纯 `incoming.categoryManual` 反而会在某个调用方漏抄
+      // 该字段时静默解锁。
+      categoryManual: overrideManual
+          ? (incoming.categoryManual || existing.categoryManual)
+          : existing.categoryManual,
       title: protect ? existing.title : incoming.title,
       originalTitle: _preferOld(protect, existing.originalTitle, incoming.originalTitle),
       year: _preferOld(protect, existing.year, incoming.year),
@@ -326,6 +454,25 @@ class DriftMediaRepository implements MediaRepository {
       // 老片子会天天冒到列表最前。
       firstSeenAt: existing.firstSeenAt ?? incoming.firstSeenAt,
       lastPlayedAt: existing.lastPlayedAt ?? incoming.lastPlayedAt,
+      // ⚠️ 折叠标记**只认旧值**，且**不受 `protect` 影响**。
+      //
+      // 本次扫描造出来的行 `mergedInto` 恒为 `null`（`WorkSeed.build` 不填
+      // 这一列），照抄新值等于**每次重扫都把所有合并悄悄拆开** —— 用户看到
+      // 「明明合成一个格子的两部片子又变回两个」，而他什么都没做。
+      //
+      // 走 `protect` 也不行：`protect` 是「元数据要不要被刮削覆盖」的开关，
+      // 重刮削（`incoming.source == online`）时它是 `false`，那时照样会把
+      // 合并拆掉。这一列与刮削无关，所以无条件取旧值。
+      mergedInto: existing.mergedInto,
+      // ⚠️ 手标的片头区间与 `mergedInto` **同一条规矩**：本次扫描造出来的行
+      // 这两列恒为 `null`（`WorkSeed.build` 不填），照抄新值等于**每次重扫
+      // 都把用户标好的片头抹掉**。而用户看到的是「跳片头时灵时不灵」——
+      // 他重扫一次就失效一次，根本不会想到这两件事有关。
+      //
+      // 也不能走 `protect`：那是「元数据要不要被刮削覆盖」的开关，
+      // 与播放偏好无关。
+      introStartMs: existing.introStartMs,
+      introEndMs: existing.introEndMs,
       updatedAt: ts,
     );
   }
@@ -344,6 +491,84 @@ class DriftMediaRepository implements MediaRepository {
           ..limit(1))
         .getSingleOrNull();
     return row == null ? null : _toWork(row);
+  }
+
+  @override
+  Future<List<MediaWork>> allWorks() async {
+    // **不滤** `merged_into`：自动归一要靠它看到「这一行已经折走了」。
+    // 按 `key` 排是为了确定性（规划器的兜底 tiebreak 就靠它）。
+    final rows = await (_db.select(_db.mediaWorks)
+          ..orderBy([(t) => OrderingTerm.asc(t.key)]))
+        .get();
+    return rows.map(_toWork).toList();
+  }
+
+  @override
+  Future<int> mergeWorksInto(
+    String targetKey,
+    List<String> sourceKeys,
+  ) async {
+    final t = _db.mediaWorks;
+
+    // 目标必须存在，否则一条都不动。
+    //
+    // ⚠️ 这不是「防御性编程」而是**必需的前置检查**：折叠是「源指向目标」
+    // 的引用，目标不存在的话列表里会凭空少掉几部作品，而它们指向的
+    // 目标根本不在库里 —— 用户既看不到它们，也没有任何入口能撤销。
+    final target = await (_db.select(t)
+          ..where((x) => x.key.equals(targetKey))
+          ..limit(1))
+        .getSingleOrNull();
+    if (target == null) return 0;
+
+    // 目标自己必须**不是**别名行。把一个别名当目标会形成链
+    // （A←B←C），而链上任何一环被单独撤销都会把后面的节点孤儿化。
+    if ((target.mergedInto ?? '').isNotEmpty) return 0;
+
+    final wanted = sourceKeys.where((k) => k != targetKey).toSet().toList();
+    if (wanted.isEmpty) return 0;
+
+    // 只折「根」行：已经带标记的（无论指向谁）跳过。
+    // 这条把「链」从数据层面堵死，不依赖调用方守规矩。
+    final rows = await (_db.select(t)
+          ..where((x) => x.key.isIn(wanted) & x.mergedInto.isNull()))
+        .get();
+    if (rows.isEmpty) return 0;
+
+    final keys = rows.map((r) => r.key).toList();
+    await (_db.update(t)..where((x) => x.key.isIn(keys))).write(
+      MediaWorksCompanion(mergedInto: Value(targetKey)),
+    );
+    return keys.length;
+  }
+
+  @override
+  Future<int> unmergeWorks(List<String> sourceKeys) async {
+    if (sourceKeys.isEmpty) return 0;
+    final t = _db.mediaWorks;
+    // 只清真的带标记的那些 —— 返回值是「实际改了几行」，调用方用它决定
+    // 要不要提示「已撤销」。
+    final rows = await (_db.select(t)
+          ..where((x) => x.key.isIn(sourceKeys) & x.mergedInto.isNotNull()))
+        .get();
+    if (rows.isEmpty) return 0;
+
+    final keys = rows.map((r) => r.key).toList();
+    // 直接写 SQL 而不是 `copyWith(mergedInto: null)`：`copyWith` 的 `??`
+    // 把 `null` 当成「不改」，用它撤销会**静默失败**（返回值还说是成功）。
+    await (_db.update(t)..where((x) => x.key.isIn(keys))).write(
+      const MediaWorksCompanion(mergedInto: Value(null)),
+    );
+    return keys.length;
+  }
+
+  @override
+  Future<List<MediaWork>> mergedSourcesOf(String targetKey) async {
+    final rows = await (_db.select(_db.mediaWorks)
+          ..where((t) => t.mergedInto.equals(targetKey))
+          ..orderBy([(t) => OrderingTerm.asc(t.key)]))
+        .get();
+    return rows.map(_toWork).toList();
   }
 
   @override
@@ -517,6 +742,46 @@ class DriftMediaRepository implements MediaRepository {
     );
   }
 
+  @override
+  Future<void> setWorkIntroStart(String key, int startMs) async {
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      MediaWorksCompanion(
+        introStartMs: Value(startMs),
+        updatedAt: Value(DateTime.now()),
+      ),
+    );
+  }
+
+  @override
+  Future<void> setWorkIntroEnd(String key, int endMs) async {
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      MediaWorksCompanion(
+        introEndMs: Value(endMs),
+        updatedAt: Value(DateTime.now()),
+      ),
+    );
+  }
+
+  @override
+  Future<void> clearWorkIntroRange(String key) async {
+    // ⚠️ 必须**直接写 `Value(null)`**，不能走 `MediaWork.copyWith`。
+    //
+    // `copyWith` 的 `??` 把 `null` 当成「这个字段不改」，所以
+    // `copyWith(introStartMs: null)` 返回的对象里旧值还在 —— 用它来「取消
+    // 片头标记」会**静默失败**，界面上按钮点了、提示也弹了，重新打开
+    // 播放器照样跳。`unmergeWorks` 里那条 `mergedInto: Value(null)` 是
+    // 同一个坑的第一次踩踏。
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      const MediaWorksCompanion(
+        introStartMs: Value(null),
+        introEndMs: Value(null),
+        // 注意这里没写 `updatedAt`：`const` 构造里塞不了 `DateTime.now()`，
+        // 而这一列的语义是「作品元数据变了没有」，清一个播放偏好不算 ——
+        // 写它还会把「最近修改」排序搅乱。
+      ),
+    );
+  }
+
   // -------------------------------------------------------------------
   // 读取
   // -------------------------------------------------------------------
@@ -579,8 +844,132 @@ class DriftMediaRepository implements MediaRepository {
       ..orderBy(_orderingFor(sort))
       ..limit(limit, offset: offset);
 
+    final sw = Stopwatch()..start();
     final rows = await q.get();
-    return rows.map(_toWork).toList();
+    final selectMs = sw.elapsedMilliseconds;
+    final out = await _withUnionStats(rows.map(_toWork).toList());
+
+    // 这条是媒体库列表的**主查询**：切分类、切排序、敲搜索词、播完一集回到
+    // 媒体库，走的都是它 —— 它的数字直接等于用户感受到的「列表卡不卡」。
+    //
+    // 用 `debug` 而不是 `info`：它每次筛选都跑一遍，`info` 会把日志刷满。
+    // 排查性能时按 `listWorks` 过滤即可。
+    diag.debug(
+      '媒体库',
+      'listWorks：${out.length} 部，${sw.elapsedMilliseconds}ms'
+      '（主查询 $selectMs ms，limit=$limit offset=$offset）',
+    );
+    return out;
+  }
+
+  /// 把「已被折叠进来的源作品」的文件数 / 体积 / 季数并进返回值。
+  ///
+  /// 只改**返回值**，不写回库里 —— 理由见接口文档（写回会被重扫冲掉）。
+  ///
+  /// 只处理**确实有源折进来**的那些行：没有折叠过的行原样返回。这一点不是
+  /// 优化而是**正确性**要求 —— 老库里 `item_count` 与 `media_items` 的真实
+  /// 行数本来就可能不一致（`deleteItemsNotIn` 只删项、不减这一列），
+  /// 顺手重算会把一批与归一无关的作品的显示数字改掉。
+  Future<List<MediaWork>> _withUnionStats(List<MediaWork> works) async {
+    if (works.isEmpty) return works;
+    final sw = Stopwatch()..start();
+    final stats = await _unionStats(works.map((w) => w.key).toList());
+    final ms = sw.elapsedMilliseconds;
+    if (stats.isEmpty) {
+      // 这条 SQL 曾经是列表最贵的一步（336ms / 172 部），所以它的耗时
+      // 单独记一条：只有它能回答「列表为什么慢」。
+      diag.debug('媒体库', '并集统计：本页没有折进源的作品，${ms}ms');
+      return works;
+    }
+
+    final out = <MediaWork>[];
+    for (final w in works) {
+      final s = stats[w.key];
+      out.add(
+        s == null
+            ? w
+            : w.copyWith(
+                itemCount: s.items,
+                totalBytes: s.bytes,
+                seasonCount: s.seasons,
+              ),
+      );
+    }
+    diag.debug(
+      '媒体库',
+      '并集统计：${stats.length} 个目标 / 本页 ${works.length} 部，${ms}ms',
+    );
+    return out;
+  }
+
+  /// 有源折进来的那些作品，其**并集**的文件数 / 体积 / 季数。
+  ///
+  /// ## 为什么是裸 SQL
+  ///
+  /// `season_count` 要的是 `COUNT(DISTINCT season)` **且只数 > 0 的季**
+  /// （`0` 表示「没标季」，见 `WorkSeed.seasonCount`）。三个计数里两个带条件，
+  /// drift 的表达式 API 没有条件聚合，硬凑要拆成两三条查询 —— 一条 SQL 更直白。
+  ///
+  /// ## 两个必须写对的地方
+  ///
+  ///   - **「自己名下的文件」与「折叠进来的文件」都要数**：只数后一半会把
+  ///     目标自己那一份丢掉，表现是「合并后集数反而变少了」。这里靠 `src`
+  ///     那个 CTE 的两段 `UNION ALL` 保证（旧版是 JOIN 条件里的一个 `OR`）；
+  ///   - **`season` 是绝对数、不是增量**：`COUNT(DISTINCT …)` 不能相加
+  ///     （目标有 S1、源也有 S1 时相加得 2，而并集只有 1 季），所以这里
+  ///     直接算出并集的季数交给调用方**覆盖**。
+  ///
+  /// ## ⚠️ 别把两段 `UNION ALL` 合回 JOIN 条件里的一个 `OR`
+  ///
+  /// 旧版写的是 `JOIN media_items i ON i.group_key = t.key
+  /// OR i.group_key IN (SELECT …)`。那个 `OR` 让连接条件**用不上任何索引**，
+  /// SQLite 只能对每个目标键把 `media_items` 整表扫一遍 —— 实测（172 部作品 /
+  /// 2886 个文件）这条查询要 **336ms**，而 `listWorks` 的其余部分合计不到
+  /// 10ms。也就是说媒体库列表**每次**刷新（切分类、切排序、播完一集回来）
+  /// 都要白等 300ms+，用户的感觉就是「列表显示特别慢」。
+  ///
+  /// 拆成两段**等值**连接后，同一份数据只要 **3ms**，且逐键比对结果完全一致。
+  ///
+  /// 第一段里那个 `EXISTS` **不能删**：它保证「没有源折进来的目标一行都不
+  /// 出」。少了它，调用方会拿「按 `media_items` 重算的数字」去覆盖一批与归一
+  /// 无关的作品 —— 而老库里 `item_count` 与真实行数本来就可能不一致
+  /// （`deleteItemsNotIn` 只删项、不减这一列）。顺带一提，删掉 `EXISTS` 之后
+  /// 那条 `OR` 查询实测要 **6.4 秒**（参与 OR 的目标从 9 个涨到 172 个）。
+  ///
+  /// 第二段刻意**不加**「目标在本页」的过滤：源行只有个位数（当前库里 11 条），
+  /// 多算出来的目标调用方按 key 查表时自然被忽略，而少一个 `IN` 就少一份
+  /// 绑定参数。
+  Future<Map<String, ({int items, int bytes, int seasons})>> _unionStats(
+    List<String> targetKeys,
+  ) async {
+    if (targetKeys.isEmpty) return const {};
+    final marks = List.filled(targetKeys.length, '?').join(', ');
+    final rows = await _db.customSelect(
+      'WITH src AS ('
+      '  SELECT t.key AS tgt, t.key AS src FROM media_works t '
+      '   WHERE t.key IN ($marks) '
+      '     AND EXISTS (SELECT 1 FROM media_works s WHERE s.merged_into = t.key) '
+      '  UNION ALL '
+      '  SELECT s.merged_into AS tgt, s.key AS src FROM media_works s '
+      '   WHERE s.merged_into IS NOT NULL) '
+      'SELECT s.tgt AS tgt, '
+      '       COUNT(i.id) AS items, '
+      '       COALESCE(SUM(i.size_bytes), 0) AS bytes, '
+      '       COUNT(DISTINCT CASE WHEN i.season > 0 THEN i.season END) AS seasons '
+      'FROM src s JOIN media_items i ON i.group_key = s.src '
+      'GROUP BY s.tgt',
+      variables: [for (final k in targetKeys) Variable<String>(k)],
+      readsFrom: {_db.mediaWorks, _db.mediaItems},
+    ).get();
+
+    return {
+      for (final r in rows)
+        r.read<String>('tgt'): (
+          items: r.read<int>('items'),
+          bytes: r.read<int>('bytes'),
+          seasons: r.read<int>('seasons'),
+        ),
+    };
   }
 
   /// 作品列表的**基础筛选条件**（分类 / 搜索 / 「播过没有」/ 结构）。
@@ -609,6 +998,13 @@ class DriftMediaRepository implements MediaRepository {
 
     void add(Expression<bool> c) => cond = cond == null ? c : (cond! & c);
 
+    // 已被折叠走的别名行一律不算「作品」—— 这是归一在用户眼里的全部表现。
+    //
+    // 放在这里而不是各查询里，是因为 [listWorks]、[countWorksByYear]、
+    // [countWorksByGenre] 三处共用本方法；漏掉任何一处就会立刻出现
+    // 「列表 11 部、角标写 12」这种用户一眼看得见却查不出来的不一致。
+    add(t.mergedInto.isNull());
+
     if (kind != null) add(t.kind.equals(kind.name));
 
     // 「最近播放」栏。判据是 `last_played_at IS NOT NULL` ——
@@ -621,12 +1017,25 @@ class DriftMediaRepository implements MediaRepository {
     final trimmed = query?.trim();
     if (trimmed != null && trimmed.isNotEmpty) {
       final like = '%$trimmed%';
-      // 标题命中，**或者**它下面任一文件的文件名命中。
-      // 后者是必须的：用户记得的往往是 `S02E05` 这种文件名，
-      // 而列表上显示的是作品名。
+      // 搜索必须**穿透折叠**：文件名命中「这部作品自己名下的」或
+      // 「已被折叠进来的那几部名下的」都算。少这一层就会出现
+      // 「搜 S02E05 搜不到」，而那一集明明就列在这部剧的详情页里。
+      //
+      // ⚠️ 内层子查询**必须给作品表起别名**。
+      //
+      // 内层要引用的是**外层**那一行的 `key`（`media_works.key`），但它自己
+      // 也是从 `media_works` 里查的 —— 不起别名的话 SQLite 会把这个名字
+      // 解析成内层自己的那一行，生成 `merged_into = key` 这种恒假条件，
+      // 于是「搜源作品里的文件名」**永远搜不到**，且不报任何错。
+      final src = _db.mediaWorks.createAlias('merged_src');
+      final owners = _db.selectOnly(src)
+        ..addColumns([src.key])
+        ..where(src.mergedInto.equalsExp(t.key));
+
       final sub = _db.selectOnly(_db.mediaItems)
         ..addColumns([_db.mediaItems.id])
-        ..where(_db.mediaItems.groupKey.equalsExp(t.key) &
+        ..where((_db.mediaItems.groupKey.equalsExp(t.key) |
+                _db.mediaItems.groupKey.isInQuery(owners)) &
             _db.mediaItems.name.like(like));
       add(t.title.like(like) | existsQuery(sub));
     }
@@ -730,6 +1139,10 @@ class DriftMediaRepository implements MediaRepository {
   /// 「读一遍、零写入」，会自然收敛。
   @override
   Future<int> backfillWorkCategories() async {
+    // ⚠️ 这是首屏的**第一条**查询，而 drift 是懒打开的 —— 所以
+    // 「开库 + 迁移 + `beforeOpen`」的耗时也计在这一段里。别把它当成回填
+    // 本身的成本：`beforeOpen` 那条日志会单独交代开库那一段。
+    final sw = Stopwatch()..start();
     // 只取需要的列：几千行作品表上做一次全列物化是浪费。
     final rows = await (_db.selectOnly(_db.mediaWorks)
           ..addColumns([
@@ -741,8 +1154,16 @@ class DriftMediaRepository implements MediaRepository {
             _db.mediaWorks.categoryManual,
           ]))
         .get();
+    final readMs = sw.elapsedMilliseconds;
 
-    if (rows.isEmpty) return 0;
+    if (rows.isEmpty) {
+      diag.info(
+        '数据库',
+        '分类回填：库里还没有作品，${sw.elapsedMilliseconds}ms'
+        '（读表 $readMs ms，含首次开库/迁移）',
+      );
+      return 0;
+    }
 
     var fixed = 0;
     await _db.batch((batch) {
@@ -783,9 +1204,11 @@ class DriftMediaRepository implements MediaRepository {
       }
     });
 
-    if (fixed > 0) {
-      diag.info('数据库', '分类修正完成：$fixed 部作品（老库回填 + 刮削类型折算）');
-    }
+    diag.info(
+      '数据库',
+      '分类回填：扫 ${rows.length} 行、修正 $fixed 行，'
+      '${sw.elapsedMilliseconds}ms（读表 $readMs ms，含首次开库/迁移）',
+    );
     return fixed;
   }
 
@@ -794,6 +1217,8 @@ class DriftMediaRepository implements MediaRepository {
     final count = _db.mediaWorks.key.count();
     final query = _db.selectOnly(_db.mediaWorks)
       ..addColumns([_db.mediaWorks.category, count])
+      // 折叠走的别名行不进角标：角标必须严格等于「点进去能看到的条数」。
+      ..where(_db.mediaWorks.mergedInto.isNull())
       ..groupBy([_db.mediaWorks.category]);
 
     final out = <MediaCategory, int>{};
@@ -815,7 +1240,8 @@ class DriftMediaRepository implements MediaRepository {
     final expr = _db.mediaWorks.key.count();
     final row = await (_db.selectOnly(_db.mediaWorks)
           ..addColumns([expr])
-          ..where(_db.mediaWorks.lastPlayedAt.isNotNull()))
+          ..where(_db.mediaWorks.lastPlayedAt.isNotNull() &
+              _db.mediaWorks.mergedInto.isNull()))
         .getSingle();
     return row.read(expr) ?? 0;
   }
@@ -882,8 +1308,20 @@ class DriftMediaRepository implements MediaRepository {
 
   @override
   Future<List<MediaItem>> itemsForWork(String groupKey) async {
+    final sw = Stopwatch()..start();
+    // **并集**：自己名下的 + 所有已折叠进来的源作品名下的。
+    //
+    // 归一之后目标作品必须真的「包含」另一部的内容，否则用户看到的是
+    // 「两个格子变成一个，但集数少了一半」。口径与内存实现一致。
+    //
+    // 用 `IN (子查询)` 而不是「先查源 key 再拼字面量」：折叠的层数只有
+    // 一层（不允许链），所以这个子查询永远只是一次索引查找。
+    final owners = _db.selectOnly(_db.mediaWorks)
+      ..addColumns([_db.mediaWorks.key])
+      ..where(_db.mediaWorks.mergedInto.equals(groupKey));
+
     final rows = await (_db.select(_db.mediaItems)
-          ..where((t) => t.groupKey.equals(groupKey))
+          ..where((t) => t.groupKey.equals(groupKey) | t.groupKey.isInQuery(owners))
           // 排序在 Dart 侧做（见下），SQL 侧只保证稳定
           ..orderBy([(t) => OrderingTerm.asc(t.name)]))
         .get();
@@ -902,6 +1340,11 @@ class DriftMediaRepository implements MediaRepository {
       if (e != 0) return e;
       return a.name.compareTo(b.name);
     });
+    // 详情页与「点这部作品播哪一条」都走这里。它带一个 `IN (子查询)`，
+    // 慢起来的表现是「点开一部剧要等一下」—— 单独记一条便于区分是它慢
+    // 还是海报加载慢。
+    diag.debug('媒体库', 'itemsForWork($groupKey)：${items.length} 个文件，'
+        '${sw.elapsedMilliseconds}ms');
     return items;
   }
 
@@ -912,6 +1355,7 @@ class DriftMediaRepository implements MediaRepository {
     int limit = 20000,
     int offset = 0,
   }) async {
+    final sw = Stopwatch()..start();
     final q = _db.select(_db.mediaItems);
 
     final prefix = pathPrefix?.trim();
@@ -950,6 +1394,13 @@ class DriftMediaRepository implements MediaRepository {
       final byDir = a.dirPath.compareTo(b.dirPath);
       return byDir != 0 ? byDir : naturalCompare(a.name, b.name);
     });
+    // 目录视图的「已入库」叠加层与文件夹浏览都读这张表（默认 limit 20000，
+    // 等于全表物化）—— 全库文件数上万时它就是首屏最重的一条查询。
+    diag.debug(
+      '媒体库',
+      'listItems：${items.length} 行，${sw.elapsedMilliseconds}ms'
+      '（pathPrefix=${pathPrefix ?? "全部"}，limit=$limit offset=$offset）',
+    );
     return items;
   }
 
@@ -1074,7 +1525,9 @@ class DriftMediaRepository implements MediaRepository {
   @override
   Future<int> countWorks() async {
     final expr = _db.mediaWorks.key.count();
-    final row = await (_db.selectOnly(_db.mediaWorks)..addColumns([expr]))
+    final row = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([expr])
+          ..where(_db.mediaWorks.mergedInto.isNull()))
         .getSingle();
     return row.read(expr) ?? 0;
   }
@@ -1145,6 +1598,15 @@ class DriftMediaRepository implements MediaRepository {
         thumbUrl: skipFirstSeen && item.thumbUrl == null
             ? const Value.absent()
             : Value(item.thumbUrl),
+        // 锚点与地址**同进同退**：只有「地址也保留了旧值」时才保留旧锚点
+        // （本次没图 + 没锚点 → 整对不动）。本次换了图却留着上一次的人脸
+        // 位置，`PosterImage` 会拿甲图的锚点去裁乙图 —— 人物被切出画面，
+        // 而没有任何报错。
+        faceAnchorX: skipFirstSeen &&
+                item.thumbUrl == null &&
+                item.faceAnchorX == null
+            ? const Value.absent()
+            : Value(item.faceAnchorX),
         // 与 `thumbUrl` 同一条规则、同一个理由：夸克对「还没处理完」的文件
         // 不下发尺寸字段，直接写 null 会把上一次扫描拿到的实测值抹掉。
         videoWidth: skipFirstSeen && item.videoWidth == null
@@ -1182,6 +1644,9 @@ class DriftMediaRepository implements MediaRepository {
         itemCount: Value(w.itemCount),
         totalBytes: Value(w.totalBytes),
         seasonCount: Value(w.seasonCount),
+        mergedInto: Value(w.mergedInto),
+        introStartMs: Value(w.introStartMs),
+        introEndMs: Value(w.introEndMs),
         lastModifiedAt: Value(w.lastModifiedAt),
         firstSeenAt: Value(w.firstSeenAt),
         lastPlayedAt: Value(w.lastPlayedAt),
@@ -1250,6 +1715,7 @@ class DriftMediaRepository implements MediaRepository {
         releaseGroup: row.releaseGroup,
         isSampleOrExtra: row.isSampleOrExtra,
         thumbUrl: row.thumbUrl,
+        faceAnchorX: row.faceAnchorX,
         lastPlayedAt: row.lastPlayedAt,
         firstSeenAt: row.firstSeenAt,
         updatedAt: row.updatedAt,
@@ -1285,6 +1751,9 @@ class DriftMediaRepository implements MediaRepository {
         itemCount: row.itemCount,
         totalBytes: row.totalBytes,
         seasonCount: row.seasonCount,
+        mergedInto: row.mergedInto,
+        introStartMs: row.introStartMs,
+        introEndMs: row.introEndMs,
         lastModifiedAt: row.lastModifiedAt,
         firstSeenAt: row.firstSeenAt,
         lastPlayedAt: row.lastPlayedAt,

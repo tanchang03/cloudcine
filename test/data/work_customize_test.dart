@@ -95,6 +95,85 @@ void main() {
     expect(r.genres, '[]');
   });
 
+  /// 插一条**这部作品名下**的文件，带网盘缩略图与人脸锚点。
+  Future<void> seedItem({
+    required String fileId,
+    String? thumbUrl,
+    double? faceX,
+    bool extra = false,
+  }) async {
+    await db.into(db.mediaItems).insert(
+          MediaItemsCompanion.insert(
+            id: 'quark:$fileId',
+            provider: DriveProvider.quark.id,
+            fileId: fileId,
+            name: '$fileId.mkv',
+            dirId: const Value('d'),
+            dirPath: const Value('/演唱会/'),
+            groupKey: 'w',
+            kind: 'episode',
+            isSampleOrExtra: Value(extra),
+            thumbUrl: Value(thumbUrl),
+            faceAnchorX: Value(faceX),
+            firstSeenAt: now,
+            updatedAt: now,
+          ),
+        );
+  }
+
+  test('清掉刮错的海报后，封面回落到网盘缩略图', () async {
+    await seedScraped();
+    await seedItem(
+      fileId: 'f01',
+      thumbUrl: 'https://drive-pc.quark.cn/thumb?fid=f01',
+      faceX: 0.28,
+    );
+
+    await repo.customizeWork(
+      'w',
+      title: '2024 演唱会现场',
+      category: MediaCategory.other,
+      now: now,
+    );
+
+    final r = await row();
+    expect(
+      r.posterUrl,
+      'https://drive-pc.quark.cn/thumb?fid=f01',
+      reason: '「自定义」要去掉的是**刮错的那张**，不是「这部作品从此没有'
+          '封面」。缩略图一直存在 item 行上（夸克给每个视频生成的服务端'
+          '预览图），清成 NULL 的话用户点完就看到一墙灰块。',
+    );
+    expect(r.posterFaceX, 0.28, reason: '锚点必须与地址同源、成对。');
+    expect(
+      r.posterFile,
+      isNull,
+      reason: '图换了 → 缓存文件名必须换，否则 PosterCache 见 knownFile '
+          '存在就返回旧文件，封面显示成前一张。',
+    );
+    // 该清的在线痕迹仍然清干净 —— 补回落不能顺手把「清空」这个功能弄坏。
+    expect(r.overview, isNull);
+    expect(r.rating, isNull);
+    expect(r.onlineId, isNull);
+    expect(r.scrapedAt, isNull);
+  });
+
+  test('名下文件都没缩略图 → 海报真的清空', () async {
+    await seedScraped();
+    await seedItem(fileId: 'f01'); // 夸克约 30% 的视频还没生成预览图
+
+    await repo.customizeWork(
+      'w',
+      title: '2024 演唱会现场',
+      category: MediaCategory.other,
+      now: now,
+    );
+
+    final r = await row();
+    expect(r.posterUrl, isNull, reason: '没有本地可用来源时就是没有封面，不造地址。');
+    expect(r.posterFaceX, isNull);
+  });
+
   test('写入片名 / 分类，锁住分类，来源标成手动修改', () async {
     await seedScraped();
 

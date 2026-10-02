@@ -1,4 +1,6 @@
 import 'package:cloudcine/ui/theme/app_theme.dart';
+import 'package:cloudcine/ui/widgets/tv_text.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -401,5 +403,125 @@ void main() {
 
     expect(blanket, 0, reason: '这是原来的写法：控制栏整块 ExcludeFocus，遥控器够不到任何控件，于是没有暂停/清晰度/字幕');
     expect(precise, 1, reason: '把滑块单独摘出焦点链后，↓ 能走到暂停按钮、OK 能按下去');
+  });
+
+  testWidgets('SelectableText 是 TV 上的焦点陷阱，TvSelectableText 不是（P2-4 的判据）', (tester) async {
+    // P2-4 原话是「TV 上把 `SelectableText` 换成普通 `Text`」。做之前得先分清
+    // 它属于哪一种 —— 这两者的处理**完全不同**：
+    //
+    //   * **没用**（只是划选不了）→ 换不换都行。换了反而丢掉诊断页
+    //     「不点按钮也能用鼠标选走」这个刻意的设计（见 `LogPathRow` 注释）；
+    //   * **有害**（自带可聚焦的 `EditableText`）→ D-pad 会停在它上面，
+    //     按 OK 什么都不发生，用户以为遥控器坏了。**这个必须换。**
+    //
+    // `SelectableText` 内部就是 `EditableText(readOnly: true)`，而 `EditableText`
+    // 天生带一个 `FocusNode` —— 所以「有害」这个可能性一点都不小，不能靠猜。
+    // 实测结果：**有害**（`canRequestFocus == true`，且焦点进去就出不来）。
+    //
+    // 这条用例同时钉两件事，缺一不可：
+    //   1. 裸 `SelectableText` **确实**会卡住焦点 —— 这是 `tv_text.dart` 存在的
+    //      唯一理由。哪天 Flutter 改了它的焦点行为，第 1 条会红，那时才该考虑
+    //      能不能删掉那个包装；
+    //   2. `TvSelectableText` **确实**不卡 —— 这是修复本身没白写的证明。
+    //
+    // 只钉第 2 条是不够的：那样「为什么要有这个包装」就只存在于注释里了。
+    Future<List<String>> dpadTrace(Widget Function(FocusNode node) textOf) async {
+      final selNode = FocusNode(debugLabel: 'text');
+      final before = FocusNode(debugLabel: 'before');
+      final after = FocusNode(debugLabel: 'after');
+      addTearDown(() {
+        selNode.dispose();
+        before.dispose();
+        after.dispose();
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.dark(),
+          home: MediaQuery(
+            // ⚠️ 尺寸用 `MediaQuery` 显式给，**不用 `setSurfaceSize`** ——
+            // 本项目的 TV 用例都走这条（见 `test/ui/theme/tv_layout_test.dart`），
+            // 它直接决定 `AppTheme.isTvLayout` 看到的那个宽度。
+            data: const MediaQueryData(size: Size(960, 540)),
+            child: Scaffold(
+              body: Column(
+                children: [
+                  FilledButton(
+                    focusNode: before,
+                    onPressed: () {},
+                    child: const Text('上面'),
+                  ),
+                  textOf(selNode),
+                  FilledButton(
+                    focusNode: after,
+                    onPressed: () {},
+                    child: const Text('下面'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+
+      before.requestFocus();
+      await tester.pump();
+
+      final trace = <String>[];
+      for (var i = 0; i < 4; i++) {
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        trace.add(
+          selNode.hasFocus
+              ? 'text'
+              : (after.hasFocus ? 'after' : (before.hasFocus ? 'before' : '?')),
+        );
+        if (after.hasFocus) break;
+      }
+      return trace;
+    }
+
+    // ⚠️ 复位必须写在**测试体里**（这个 `finally`），`addTearDown` / `tearDown`
+    // 都不行 —— Flutter 的 `_verifyInvariants` 排在它们前面，用错会得到一条
+    // 与业务毫无关系的「foundation debug variable was changed by the test」。
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      final raw = await dpadTrace(
+        (node) => SelectableText('这一段能不能被遥控器选中？', focusNode: node),
+      );
+      final wrapped = await dpadTrace(
+        (node) => TvSelectableText('这一段能不能被遥控器选中？', focusNode: node),
+      );
+
+      // ignore: avoid_print
+      print('裸 SelectableText 的 ↓ 轨迹: $raw\nTvSelectableText 的 ↓ 轨迹: $wrapped');
+
+      expect(
+        raw,
+        contains('text'),
+        reason: '裸 SelectableText 不再吃焦点了（Flutter 行为变了）—— '
+            '`widgets/tv_text.dart` 这个包装可以撤掉，这条断言该跟着改',
+      );
+      expect(
+        raw,
+        isNot(contains('after')),
+        reason: '裸 SelectableText 居然能走过去 —— 那就不是陷阱，包装也没必要了。'
+            '实测它是**进去就出不来**：连按 4 次 ↓ 都停在原地',
+      );
+      expect(
+        wrapped,
+        isNot(contains('text')),
+        reason: 'TvSelectableText 在 TV 上仍然把焦点让了出去 —— 修复失效了，'
+            '诊断页/登录页在电视上会再次「方向键走不动」',
+      );
+      expect(
+        wrapped,
+        contains('after'),
+        reason: 'TV 上必须能从文本**直接走到下面那个按钮** —— '
+            '这才是「用户走进一段长文本不会被困住」',
+      );
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 }

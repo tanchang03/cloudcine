@@ -15,6 +15,7 @@ import 'request_throttle.dart';
 import 'scraper.dart';
 import 'subtitle_service.dart';
 import 'work_builder.dart';
+import 'work_merge_service.dart';
 
 /// 扫描取消信号。
 ///
@@ -133,10 +134,12 @@ class ScanService {
     this.parser = const MediaFilenameParser(),
     this.subtitleIndexer = const SubtitleIndexer(),
     ScraperPipeline? scraper,
+    WorkMergeService? merger,
     DateTime Function()? clock,
   })  : _registry = registry,
         _library = library,
         _scraper = scraper,
+        _merger = merger,
         _clock = clock ?? DateTime.now;
 
   final DriveAdapterRegistry _registry;
@@ -150,6 +153,12 @@ class ScanService {
 
   /// 刮削流水线。`null` 表示本次扫描只做本地解析、不刮削。
   final ScraperPipeline? _scraper;
+
+  /// 跨目录归一。`null` 表示扫描结束后不做自动归一。
+  ///
+  /// **由组合根按设置决定传不传**（与 [_scraper] 同一种做法）：领域层
+  /// 不去读设置，否则「测试里怎么把开关关掉」会变成一个无从下手的问题。
+  final WorkMergeService? _merger;
 
   final DateTime Function() _clock;
 
@@ -629,6 +638,24 @@ class ScanService {
         );
         if (work == null) continue;
         await _library.upsertWorks([work], now: _clock());
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // 阶段二点五：跨目录归一
+    // -----------------------------------------------------------------
+    //
+    // 为什么放在这里而不是阶段二**里面**：阶段二是「逐部作品 upsert」，
+    // 而归一要比较的恰恰是**不同作品之间**的 `onlineId` —— 一部刚被刮完、
+    // 另一部早在上一轮扫描里就刮好了，只有等这一轮全部落库之后才看得全。
+    //
+    // 与刮削同一个前置条件（未取消、无错）：半份数据上做归一，会拿
+    // 「这次还没扫到」当成「另一部不存在」，从而漏合 —— 漏合只是不生效，
+    // 下次扫描会补上，比误合好得多。
+    if (_merger != null && !cancelled && error == null) {
+      final merged = await _merger.mergeAll();
+      if (merged.isNotEmpty) {
+        diag.info('扫描', '跨目录归一：${merged.length} 组');
       }
     }
 

@@ -1,3 +1,4 @@
+import 'package:cloudcine/ui/widgets/player_keys.dart';
 import 'package:cloudcine/ui/windows/child_window_channel.dart';
 import 'package:cloudcine/ui/windows/player_protocol.dart';
 import 'package:cloudcine/ui/windows/player_window_app.dart';
@@ -252,6 +253,26 @@ void main() {
       expect(find.byTooltip('全屏（F）'), findsOneWidget);
       await drainTimers(tester);
     });
+
+    testWidgets('宽窗下控制栏右簇贴着窗口右边缘 —— 别缩在中间留一大块空白', (tester) async {
+      await pumpPlayer(tester, size: const Size(1280, 720));
+
+      // `_buildChrome` 的右内边距是 10，所以右簇最右那个按钮的右沿应当落在
+      // 窗口右边缘减去这点内边距的位置。
+      //
+      // ⚠️ 这条盯的是曾经的一个**不报错的**坏布局：右簇用 `Spacer` + `Flexible`
+      // 推右，两者各占 flex 1、剩余宽度被对半分，而 `SingleChildScrollView` 在
+      // 主轴上是收缩的、`Flexible` 又是 loose fit —— 分到的那一半填不满的部分
+      // 留在末尾。实测 1280 宽的窗口里这个按钮的右沿只到 ~1130，右边空 150px。
+      // 用户看到的就是「底部按钮没右对齐」，而控制台一声不响。
+      final rect = tester.getRect(find.byTooltip('停止并关闭'));
+      expect(
+        rect.right,
+        greaterThan(1280 - 40),
+        reason: '右簇没贴右边缘（右沿 ${rect.right}）—— 按钮会缩在中间、右边空一块',
+      );
+      await drainTimers(tester);
+    });
   });
 
   group('浮层显隐（片名 + 控制栏）', () {
@@ -368,6 +389,29 @@ void main() {
       // F / Esc 是原有的，不能被这次改动挤掉。
       expect(keys, contains(LogicalKeyboardKey.keyF));
       expect(keys, contains(LogicalKeyboardKey.escape));
+      await drainTimers(tester);
+    });
+
+    testWidgets('数字键一个都不能少 —— 主键盘与小键盘都要认', (tester) async {
+      await pumpPlayer(tester);
+
+      final keys = triggers(tester);
+      // 这张表是从 `player_keys.dart` 里长出来的（不是这里手抄的常量），
+      // 所以这条断言真正钉的是「窗口把共享表整个接上了」——
+      // 少一半的结果是「有的遥控器按 5 没反应」，而那台遥控器在开发机上
+      // 永远不出现。
+      expect(seekDigitKeys, isNotEmpty);
+      for (final entry in seekDigitKeys.entries) {
+        expect(
+          keys,
+          contains(entry.key),
+          reason: '${entry.key} 没接上 —— 按下去不会跳到 ${entry.value * 10}%，'
+              '也不会报错',
+        );
+      }
+      // 主键盘与小键盘是两组**不同**的键码，各少一个都是上面那种「没反应」。
+      expect(keys, contains(LogicalKeyboardKey.digit5));
+      expect(keys, contains(LogicalKeyboardKey.numpad5));
       await drainTimers(tester);
     });
 
@@ -681,6 +725,56 @@ void main() {
       await drainTimers(tester);
     });
 
+    testWidgets('提不出集号的长标题要占两行 —— 挤成一行等于「哪一集」又看不出来', (tester) async {
+      // 「目录名作为系列名」的目录里每一项都没有集号，标题是 `剧名-文件名`
+      // （见 `desktop_play.dart` 的 `_episodeLabel`）。这类标题动辄 28 个字，
+      // 而标题那行只有约 194px（面板 320 − 缩略图 96 − 间距与内边距）≈ 中文
+      // 15 字 —— 只给一行的话，用户用来分辨集数的文件名后半段全被省略号吃掉，
+      // 这个修复就等于没做。
+      const longTitle = '姜松《家电维修视频教程》-182.格力空调显示E6如何维修';
+      await pumpPlayer(tester);
+      await pushPlayRequest(
+        tester,
+        _playRequestWithPlaylist(
+          playlist: const <PlaylistEntry>[
+            PlaylistEntry(
+              itemId: 'quark:fid-1',
+              title: longTitle,
+              subtitle: '1080P · MKV',
+              // 带续播点 = 面板会多画一条进度条，这一项就是**最高**的那种
+              // 条目。溢出只要有一种组合能触发就会触发，所以拿它来验。
+              resumePosition: Duration(minutes: 5),
+              duration: Duration(minutes: 45),
+            ),
+            // 同一列表里放一条短标题当**标尺**：直接断言高度比它高，就同时
+            // 证明了「长的那条真的折了行」和「短的那条仍然只占一行」——
+            // 比硬编码一个像素值稳（字体度量会随平台/版本变）。
+            PlaylistEntry(
+              itemId: 'quark:fid-2',
+              title: '第 1 集',
+              subtitle: '1080P · MKV',
+            ),
+          ],
+        ),
+      );
+      await drainTimers(tester);
+      await showChrome(tester);
+      await openPlaylist(tester);
+
+      expect(tester.widget<Text>(find.text(longTitle)).maxLines, 2);
+      expect(
+        tester.getSize(find.text(longTitle)).height,
+        greaterThan(tester.getSize(find.text('第 1 集')).height),
+        reason: '长标题要真的折成两行；只放开 maxLines 但被压成一行就白改了',
+      );
+
+      // 两行标题 + 副标题仍要装得进 `_episodeTileHeight`。装不下的表现是内容
+      // 画到面板外面（真机：「开剧集列表后底部按钮乱飞／被裁」），在测试里
+      // 是一条 RenderFlex overflow 异常 —— 所以这里必须显式查一次。
+      expect(tester.takeException(), isNull);
+      await drainTimers(tester);
+    });
+
     testWidgets('点另一集 → 让主窗口按那一集重新取链', (tester) async {
       await pumpPlayer(tester);
       await pushPlayRequest(tester, _playRequestWithPlaylist());
@@ -794,6 +888,50 @@ void main() {
       expect(body['itemId'], 'quark:fid-2', reason: '换档不该把片子也换掉');
       await drainTimers(tester);
     });
+
+    testWidgets('菜单开着时鼠标移出去，控制栏不该跟着消失', (tester) async {
+      await pumpPlayer(tester, size: const Size(1280, 720));
+      await pushPlayRequest(tester, _playRequestWithPlaylist());
+      await drainTimers(tester);
+
+      // ⚠️ 自己建鼠标指针，**不用 `showChrome()`**：`MouseTracker` 按「设备」记账，
+      // 一个测试里建两个鼠标指针会直接踩到框架断言
+      // （`(event is PointerAddedEvent) == (lastEvent is PointerRemovedEvent)`）。
+      // 后面还要用它做「移出窗口」那一步，所以必须自己拿着这个引用。
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.addPointer(location: const Offset(640, 300));
+      addTearDown(mouse.removePointer);
+      // 移进控制栏 → 浮层重新显示（`drainTimers` 会把它跑没）。
+      await mouse.moveTo(const Offset(640, 700));
+      await tester.pump();
+      expect(find.byTooltip('停止并关闭'), findsOneWidget, reason: '前提：控制栏可见');
+
+      await tester.tap(find.widgetWithText(TextButton, '原画'));
+      await tester.pumpAndSettle();
+      expect(find.text('清晰度'), findsOneWidget, reason: '前提：菜单已经弹出来了');
+
+      // 点开菜单之后，用户必然把鼠标移到菜单上去选。而菜单挂在 **Overlay** 上、
+      // 在播放页那个 `MouseRegion` **之外** —— 这一移会被判成「指针离开了窗口
+      // 内容」，直接走到 `_hideChrome()`。真隐藏了，用户看到的就是「菜单还在、
+      // 底部控制栏先没了」，也就是那条实测反馈。
+      await mouse.moveTo(const Offset(-30, -30));
+      await tester.pump();
+
+      expect(
+        find.byTooltip('停止并关闭'),
+        findsOneWidget,
+        reason: '菜单还开着，控制栏不该先没了 —— 用户会以为界面坏了',
+      );
+
+      // 倒计时那条路也得挡住：鼠标离开会让倒计时重新起算，到点同样不能收。
+      await tester.pump(const Duration(seconds: 4));
+      expect(
+        find.byTooltip('停止并关闭'),
+        findsOneWidget,
+        reason: '菜单存续期间倒计时到点也不能收控制栏',
+      );
+      await drainTimers(tester);
+    });
   });
 }
 
@@ -805,7 +943,9 @@ void main() {
 ///
 /// 第 1 集**存了续播点**（30 / 45 分钟），另外两集没有 —— 列表上的进度条、
 /// 切集时的起播位置都靠这个差别来验。
-PlayRequest _playRequestWithPlaylist() {
+///
+/// [playlist] 可以换掉那一列（长标题那类用例要自己给），不换就用默认的三集。
+PlayRequest _playRequestWithPlaylist({List<PlaylistEntry>? playlist}) {
   return PlayRequest(
     url: 'https://cdn.example.com/e2.mp4?sig=x',
     title: '某剧 S01E02',
@@ -820,26 +960,27 @@ PlayRequest _playRequestWithPlaylist() {
         detail: '1920×1080 · 4.2 Mbps',
       ),
     ],
-    playlist: const <PlaylistEntry>[
-      PlaylistEntry(
-        itemId: 'quark:fid-1',
-        title: '第 1 集',
-        subtitle: '1080P · MKV',
-        resumePosition: Duration(minutes: 30),
-        duration: Duration(minutes: 45),
-      ),
-      PlaylistEntry(
-        itemId: 'quark:fid-2',
-        title: '第 2 集',
-        subtitle: '1080P · MKV',
-        duration: Duration(minutes: 45),
-      ),
-      PlaylistEntry(
-        itemId: 'quark:fid-3',
-        title: '第 3 集',
-        subtitle: '1080P · MKV',
-        duration: Duration(minutes: 45),
-      ),
-    ],
+    playlist: playlist ??
+        const <PlaylistEntry>[
+          PlaylistEntry(
+            itemId: 'quark:fid-1',
+            title: '第 1 集',
+            subtitle: '1080P · MKV',
+            resumePosition: Duration(minutes: 30),
+            duration: Duration(minutes: 45),
+          ),
+          PlaylistEntry(
+            itemId: 'quark:fid-2',
+            title: '第 2 集',
+            subtitle: '1080P · MKV',
+            duration: Duration(minutes: 45),
+          ),
+          PlaylistEntry(
+            itemId: 'quark:fid-3',
+            title: '第 3 集',
+            subtitle: '1080P · MKV',
+            duration: Duration(minutes: 45),
+          ),
+        ],
   );
 }

@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/services/work_levels.dart';
+import '../../domain/services/work_merge_service.dart';
+import '../providers/app_providers.dart';
 import '../providers/library_providers.dart';
 import '../providers/scrape_providers.dart';
 import '../providers/settings_providers.dart';
@@ -15,6 +17,7 @@ import '../widgets/customize_work_dialog.dart';
 import '../widgets/genre_edit_dialog.dart';
 import '../widgets/manual_scrape_dialog.dart';
 import '../widgets/media_item_row.dart';
+import '../widgets/merge_work_dialog.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
 import '../widgets/tv_affordance.dart';
@@ -180,6 +183,12 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
           ),
           const SizedBox(height: 18),
           _NetdiskLocation(detail: detail),
+          // 「已并入」提示条。只在真的归一过东西时才画 ——
+          // 没归一过的详情页版式与这个功能上线前完全一致。
+          if (detail.mergedSources.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            _MergedSourcesBanner(detail: detail),
+          ],
           const SizedBox(height: 22),
           // 季 / 部选择器。**只在数据里真的成层时才画** ——
           // 单集电影、单季剧的版式与改造前完全一致。
@@ -221,14 +230,23 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
             ),
             const SizedBox(height: 8),
             for (var i = 0; i < features.length; i++)
-              MediaItemRow(item: features[i], index: i),
+              MediaItemRow(
+                item: features[i],
+                index: i,
+                workTitle: work.title,
+              ),
           ],
           if (extras.isNotEmpty) ...[
             const SizedBox(height: 22),
             _SectionTitle(title: '花絮 / 样片', count: extras.length),
             const SizedBox(height: 8),
             for (var i = 0; i < extras.length; i++)
-              MediaItemRow(item: extras[i], index: i, dim: true),
+              MediaItemRow(
+                item: extras[i],
+                index: i,
+                dim: true,
+                workTitle: work.title,
+              ),
           ],
         ],
       ),
@@ -256,6 +274,114 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
     final kept = _partKey;
     if (kept != null && keys.contains(kept)) return kept;
     return WorkLevels.keyOf(parts, widget.detail.primary) ?? parts.first.key;
+  }
+}
+
+/// 「已并入《X》《Y》」提示条 + 拆开。
+///
+/// ## 为什么这条提示是必须的，而不是「锦上添花」
+///
+/// 自动归一是**用户没发起**的动作：他只是刮了一部片子，两个格子就变成了
+/// 一个。没有这条提示的话，他唯一能观察到的现象是「我的电影少了一部」——
+/// 而「少了一部」既可以解释成合并，也可以解释成扫描把数据删了，**没有任何
+/// 办法分辨**。提示条同时给了两样东西：一句「发生了什么事」，和一个撤销。
+///
+/// ## 撤销走的是「清标记」而不是「恢复备份」
+///
+/// 折叠从来没有删过东西：源作品的行、它的海报、它下面的文件全都还在，
+/// 只是 `merged_into` 指向了这里。所以撤销是一条 `UPDATE`，零风险。
+/// 这也是整个归一设计选「打标记」而不选「改 groupKey + 删行」的全部理由。
+class _MergedSourcesBanner extends ConsumerStatefulWidget {
+  const _MergedSourcesBanner({required this.detail});
+
+  final WorkDetail detail;
+
+  @override
+  ConsumerState<_MergedSourcesBanner> createState() =>
+      _MergedSourcesBannerState();
+}
+
+class _MergedSourcesBannerState extends ConsumerState<_MergedSourcesBanner> {
+  bool _busy = false;
+
+  Future<void> _undo() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    final keys = widget.detail.mergedSources.map((w) => w.key).toList();
+    try {
+      final n = await WorkMergeService(
+        library: ref.read(mediaRepositoryProvider),
+      ).undo(keys);
+      if (!mounted) return;
+      // 撤销改了「哪些行算作品」，列表 / 角标 / 详情页三处都要重取。
+      // 漏掉任何一个，用户会看到「列表里回来了、角标还是旧数」。
+      ref.invalidate(workListProvider);
+      ref.invalidate(categoryCountsProvider);
+      ref.invalidate(libraryStatsProvider);
+      ref.invalidate(workDetailProvider(widget.detail.work.key));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(n == 0 ? '这些作品已经分开了。' : '已拆回 $n 部独立作品。'),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sources = widget.detail.mergedSources;
+    final names = sources.map((w) => '《${w.title}》').join('、');
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: AppTheme.panel2,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppTheme.line),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child:
+                Icon(Icons.merge_type_rounded, size: 15, color: AppTheme.muted),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '已并入 $names',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    height: 1.6,
+                    color: AppTheme.text,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '刮削到同一条目，所以合成了这一部。它们的文件都在下面'
+                  '（共 ${widget.detail.mergedItemCount} 个）。',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    height: 1.6,
+                    color: AppTheme.dim,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          TextButton(
+            onPressed: _busy ? null : _undo,
+            child: Text(_busy ? '处理中…' : '拆开'),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -484,10 +610,10 @@ class _InfoColumn extends ConsumerWidget {
           ),
         ],
         const SizedBox(height: 18),
-        // 用 `Wrap` 而不是 `Row`：这一行现在有四个按钮（播放 / 刮削 / 手动 /
-        // 自定义），主窗口没有最小宽度限制，用户把窗口拖窄时 `Row` 会直接
-        // 溢出报黄条。`Wrap` 在空间不够时把「N 个文件」挤到下一行，
-        // 按钮一个都不会变形。
+        // 用 `Wrap` 而不是 `Row`：这一行现在有五个按钮（播放 / 刮削 / 手动 /
+        // 自定义 / 合并到…），主窗口没有最小宽度限制，用户把窗口拖窄时
+        // `Row` 会直接溢出报黄条。`Wrap` 在空间不够时把「N 个文件」挤到
+        // 下一行，按钮一个都不会变形。
         Wrap(
           spacing: 10,
           runSpacing: 10,
@@ -519,6 +645,7 @@ class _InfoColumn extends ConsumerWidget {
             _ScrapeButton(work: work),
             _ManualScrapeButton(work: work),
             _CustomizeButton(work: work),
+            _MergeButton(work: work),
             Text(
               '$visibleCount 个文件',
               maxLines: 1,
@@ -773,6 +900,97 @@ class _CustomizeButton extends ConsumerWidget {
         ),
       ),
     );
+  }
+}
+
+/// 「合并到…」：把这一部并到库里另一部作品上（手动归一）。
+///
+/// ## 为什么需要它，而自动归还不够
+///
+/// 自动那条路（`WorkMergeService.mergeAll`）**只认 `onlineId`** —— 这个克制
+/// 是对的（按片名模糊匹配正是 `182.格力空调` 那次事故的形态），但代价是三种
+/// 情况它永远处理不了：本地片名差异大（`流浪地球2` vs `The Wandering Earth II`）、
+/// 压根没刮到（两行都没有 `onlineId`）、刮到两个不同条目但其实是同一部。
+/// 这些只有人能判，所以这个按钮是「归一」那半不可缺的另一半。
+///
+/// ## 为什么它**没有** `canScrapeOnline` 门槛
+///
+/// 与「自定义」同一条理由：它一次网络请求都不发，是纯本地的数据修正。
+/// 跟着「刮削」「手动」一起变灰的话，**没配 TMDB / 豆瓣的用户就永远用不了
+/// 它** —— 而他们恰恰最需要（没有在线源时全靠文件名解析，最容易出现同一部
+/// 片子被拆成两个格子）。
+///
+/// ## 合并完为什么会跳页
+///
+/// 合并后当前行变成别名行，而 `workDetailProvider` 会跟着 `mergedInto`
+/// 走到目标作品（那是给「后台归一把我正看着的这部折走了」准备的路径，
+/// 手动合并走的是同一条）。所以用户点完会落在**他选中的那一部**上 ——
+/// 那正是他要的结果，而且目标页上就挂着「已并入《X》／拆开」。
+class _MergeButton extends ConsumerWidget {
+  const _MergeButton({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(workScrapeControllerProvider);
+    // 与「自定义」共用 runningKey：三个入口都在写同一行作品数据，
+    // 同时跑会让「刮削写元数据」和「合并写 mergedInto」互相踩。
+    final running = state.isRunning(work.key);
+
+    return Tooltip(
+      message: '同一部片子被扫成了两个格子（不同目录、片名不一样、或没刮到）时：'
+          '把它并到库里另一部作品上，列表里只留一部。'
+          '不会删文件，目标作品页上随时能「拆开」。',
+      child: OutlinedButton.icon(
+        onPressed: running ? null : () => _open(context, ref),
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        icon: const Icon(Icons.merge_type_rounded, size: 16),
+        label: const Text(
+          '合并到…',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _open(BuildContext context, WidgetRef ref) async {
+    final result = await MergeWorkDialog.show(context, work);
+    if (result == null || !context.mounted) return;
+
+    // 归一改的是「哪些行算作品」—— 列表、角标、详情页三处都要重取。
+    // 漏掉任何一个，用户会看到「列表里少了一格、角标还是旧数」。
+    _refresh(ref);
+
+    // 提示里带一个**撤销**。目标页上那条常驻提示条才是主入口，这条 SnackBar
+    // 只是即时反馈：用户刚点完那一下，眼前必须有东西确认「发生了什么」。
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(result.message),
+        action: SnackBarAction(
+          label: '撤销',
+          onPressed: () async {
+            await WorkMergeService(
+              library: ref.read(mediaRepositoryProvider),
+            ).undo([work.key]);
+            _refresh(ref);
+          },
+        ),
+      ),
+    );
+  }
+
+  /// 三处一起失效 —— 它们从三个角度描述同一份数据（行 / 角标 / 详情）。
+  void _refresh(WidgetRef ref) {
+    ref.invalidate(workListProvider);
+    ref.invalidate(categoryCountsProvider);
+    ref.invalidate(libraryStatsProvider);
+    ref.invalidate(workDetailProvider(work.key));
   }
 }
 

@@ -7,6 +7,7 @@ import '../entities/media_work.dart';
 import '../entities/subtitle_track.dart';
 import '../entities/drive_provider.dart';
 import '../entities/scan_cursor.dart';
+import '../entities/work_poster.dart';
 
 /// 媒体库列表的排序方式。
 ///
@@ -56,6 +57,44 @@ abstract class MediaRepository {
   /// 扫到的** id 集合，不能用「库里现有的全部」—— 那等于永远删不掉。
   Future<int> deleteItemsNotIn(DriveProvider provider, Set<String> keepIds);
 
+  /// 删除**一个**媒体项，连同挂在它上面的字幕引用。返回是否真的删掉了。
+  ///
+  /// 服务于「网盘上这个文件已经没了」之后的清理 —— 与 [deleteItemsNotIn]
+  /// 的区别是范围：那一个是扫描收尾时的**整批**差集删除，这一个是用户
+  /// 指着某一行说「删掉它」。
+  ///
+  /// ## 顺带把所属作品的三个计数重算一遍
+  ///
+  /// `itemCount` / `totalBytes` / `seasonCount` 是**冗余列**（卡片上要显示
+  /// 「24 集」而不想每次 `COUNT(*)`）。删掉一个文件不重算的话，卡片会一直
+  /// 写着删之前的数字，直到下一次全盘扫描 —— 用户刚点完「移除」，回头看到
+  /// 数字没变，只会以为没删掉。
+  ///
+  /// ⚠️ 重算必须用**存值口径**（只看 `group_key` 等于这个 key 的行），
+  /// 不能用 `listWorks` 那套并集口径：折叠进来的源作品的文件由
+  /// `listWorks` 在**读的时候**并进去，这里若再并一次就会被数两遍。
+  ///
+  /// **不删作品行**。作品下还有没有文件由调用方判断（见
+  /// `MissingMediaController._removeSingle`）：「删最后一个文件时顺手删掉
+  /// 空作品」是一条产品决定，不是仓储该替调用方做的假设。
+  Future<bool> deleteItem(String itemId);
+
+  /// 删除一部作品，以及它名下的**全部**媒体项。返回删掉的文件数。
+  ///
+  /// 「整部一起删」在用户眼里就是「这一部彻底不见了」，所以作品行、它的
+  /// 文件、那些文件的字幕引用必须一起走 —— 只删作品行会留下一堆
+  /// 在任何界面上都看不到、却一直占着计数的孤儿文件。
+  ///
+  /// ## 折叠进来的源作品也一起删
+  ///
+  /// 归一（见 [mergeWorksInto]）从来不搬 `media_items.group_key`，所以
+  /// 「这一部有多少文件」的正确答案是**并集**（`itemsForWork` 的口径）。
+  /// 卡片上写 37 个文件、用户点了「移除整部剧」，结果只删掉目标自己名下
+  /// 的 25 个、另外 12 个还在库里 —— 那是数据静默变脏，而没有界面会报错。
+  ///
+  /// 返回 `0` 表示这一部本来就不在库里（或名下没有文件），不是错误。
+  Future<int> deleteWork(String groupKey);
+
   /// 批量 upsert 作品。
   ///
   /// [overrideManual] 只给**用户显式发起**的写入用（详情页的「刮削」/「手动」
@@ -92,6 +131,14 @@ abstract class MediaRepository {
   ///
   /// 所以本方法直接整行写（与 [setWorkCategory] 同一种做法：用户明确要求的
   /// 状态变更不该被「为自动流程准备的容错」改写）。
+  ///
+  /// ## 清空之后，封面回落到网盘缩略图
+  ///
+  /// 「清除刮削」要去掉的是**刮错的那张海报**，不是「这部作品从此没有封面」。
+  /// 所以实现要先查一遍这部作品名下的媒体项，用 [WorkPoster.fromItems] 挑一
+  /// 张网盘缩略图（正片优先），连同人脸锚点一起写回 `posterUrl` /
+  /// `posterFaceX`。少了这一步，用户点完「自定义」看到的就是一墙片名首字
+  /// 的灰块 —— 而那张图一直都在库里（`MediaItem.thumbUrl`）。
   Future<MediaWork?> customizeWork(
     String key, {
     required String title,
@@ -126,8 +173,87 @@ abstract class MediaRepository {
   /// 会重新覆盖它。
   Future<void> setWorkGenres(String key, List<String>? genres);
 
+  /// 记下这部作品的**片头起点**（毫秒）。终点原样保留。
+  ///
+  /// ## 为什么起点 / 终点 / 清除是三个方法，而不是一个带可空参数的
+  ///
+  /// 「传 `null` 表示清除」在 [setWorkCategory] 那边成立，是因为那里只有
+  /// **一个**值。片头有起点和终点两个值，合成一个方法就会出现
+  /// 「`startMs: null` 是『清掉起点』还是『不改起点』」这种必须靠约定
+  /// 记住的歧义 —— 而写错的表现是「标了一半的片头被悄悄清掉」。
+  ///
+  /// ## 允许只标一半
+  ///
+  /// 用户可以只标起点（先记住片头从哪儿开始，回头再标终点），此时
+  /// [MediaWork.introRange] 是 `null`（半个区间跳不了），但起点本身**存下来**
+  /// 了 —— 不然「先标起点、退出播放器、明天再标终点」这条路走不通，
+  /// 而它恰恰是最自然的用法（看片时顺手标一下）。
+  Future<void> setWorkIntroStart(String key, int startMs);
+
+  /// 记下这部作品的**片头终点**（毫秒）。起点原样保留。
+  Future<void> setWorkIntroEnd(String key, int endMs);
+
+  /// 清除这部作品的片头标记（两列一起清）。
+  ///
+  /// ⚠️ 不能用 `copyWith(introStartMs: null)` 代替 —— `copyWith` 的 `??`
+  /// 把 `null` 当「不改」，那是**清不掉的**（与 `mergedInto` 同一个坑）。
+  Future<void> clearWorkIntroRange(String key);
+
   /// 按归组键取作品。
   Future<MediaWork?> workByKey(String key);
+
+  /// **全库作品，含已被折叠走的别名行**，按 `key` 升序。
+  ///
+  /// ## 为什么不能用 `listWorks` 代替
+  ///
+  /// [listWorks] 有三层与「归一」冲突的语义：
+  ///
+  ///   1. 它**滤掉** `merged_into` 非空的行 —— 而自动归一恰恰需要看到
+  ///      「这一行已经被折走了」，否则同一个 `onlineId` 会在每次重跑时
+  ///      被重新算成「还有两部独立的作品」；
+  ///   2. 它有默认 `limit`（200）—— 拿它当全量会在大库上**静默漏掉**
+  ///      后面的作品，表现为「归一只对前 200 部生效」；
+  ///   3. 它按展示顺序排（最近修改等），而规划器需要的是**稳定**的顺序
+  ///      （同一份数据两次运行必须给出同一个目标）。
+  Future<List<MediaWork>> allWorks();
+
+  /// 把 [sourceKeys] 这几部作品**折叠进** [targetKey]，返回实际改动的行数。
+  ///
+  /// ## 它做什么、不做什么
+  ///
+  /// 只做一件事：把这些源行的 `merged_into` 置为 [targetKey]。
+  ///
+  ///   - **不删行**、**不改 `media_items.group_key`**。源行的海报、片名、
+  ///     `firstSeenAt` 全部原样留着，所以 [unmergeWorks] 能把一切还原；
+  ///   - **不重算目标行的 `itemCount`** —— 目标行那一列一直只统计「自己
+  ///     名下的文件」，折叠来的那些由 [itemsForWork] 在查询时并进来。
+  ///     若在这里把数字加进去，撤销时就得减回来，而两处一旦漂移，
+  ///     卡片上会显示一个既不是 A 也不是 B 的文件数；
+  ///   - 已存在的源行 [targetKey] 或已经是目标的 [targetKey] 自身会被
+  ///     忽略（源列表里出现 `targetKey` 是调用方的 bug，不该把目标
+  ///     折进它自己）。
+  ///
+  /// ## 传进来的源必须是「根」
+  ///
+  /// 源行自己不能已经带 `merged_into`（会形成链）。实现里会跳过这种行，
+  /// 但**这是兜底不是许可** —— 调用方（`WorkMergeService`）应当已经通过
+  /// `WorkMergePlanner` 保证了这一点。
+  Future<int> mergeWorksInto(String targetKey, List<String> sourceKeys);
+
+  /// 撤销折叠：把这几行的 `merged_into` 清回 `null`，返回改动的行数。
+  ///
+  /// 折叠是**双向可逆**的 —— 这正是它选择「打标记」而不是「删行」的全部
+  /// 理由。用户看到两个格子变成一个却不知道发生了什么时，得有个按钮
+  /// 能退回去，否则他下次会直接关掉自动归一。
+  Future<int> unmergeWorks(List<String> sourceKeys);
+
+  /// 取「已折叠进 [targetKey] 的那些作品行」。
+  ///
+  /// 详情页用它显示「已并入 N 个来源」并生成撤销入口。返回空列表表示
+  /// 这一部没有被折叠过任何东西 —— 与 [itemsForWork] 的并集口径**必须
+  /// 一致**（详情页显示「并入了 2 个」而文件列表只多出来一个，是最难
+  /// 查的那类不一致）。
+  Future<List<MediaWork>> mergedSourcesOf(String targetKey);
 
   /// 批量 upsert 字幕引用。
   ///
@@ -186,6 +312,26 @@ abstract class MediaRepository {
   ///     取交集几乎永远筛不出东西）。
   ///
   /// 两者为 `null` 或空集合都表示「这一维不限」。
+  ///
+  /// ## 返回行里的三个计数是**并集**，与库里的存值可能不同
+  ///
+  /// [MediaWork.itemCount] / `totalBytes` / `seasonCount` 在库里存的是
+  /// 「这一行**自己名下**的文件」。而归一（见 [mergeWorksInto]）从来不搬
+  /// `media_items.group_key`，所以被折叠走的那几部的文件**不在这三个数字里**。
+  ///
+  /// 卡片上显示的是这三个数字，详情页显示的是 [itemsForWork] 的并集 ——
+  /// 不补这一层就会出现「两个格子并成一个，卡片还写 25 集、点进去 37 个文件」。
+  /// 所以**本方法返回的行已经把它们并进去了**（只对「有折叠进来的作品」的
+  /// 那些行生效；没有折叠过的行原样返回，不碰）。
+  ///
+  /// ## 为什么不把并集数字写回库里
+  ///
+  /// 重扫会把它冲掉：`mergeWorkForUpsert` 里 `item_count` 永远取本次扫描
+  /// 看到的文件集合（那张表就在它上面）。写回去的结果是「合并后 37、重扫
+  /// 一次变回 25」，而用户什么都没做。读时现算没有这个漂移面。
+  ///
+  /// [allWorks] / [workByKey] 返回的仍是**存值**（自己名下的文件）——
+  /// 规划器挑「哪一部当目标」用的就是它，那是个启发式，不是展示数字。
   Future<List<MediaWork>> listWorks({
     MediaKind? kind,
     MediaCategory? category,
@@ -395,6 +541,65 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<bool> deleteItem(String itemId) async {
+    final removed = _items.remove(itemId);
+    if (removed == null) return false;
+    // 三张挂在这条文件上的旁表一起走：`_played` 决定「最近播放」排序，
+    // `_resume` 是续播点。留着的话被删掉的文件仍然会出现在「最近播放」里
+    // —— 而点它只会再失败一次。
+    _subtitles.remove(itemId);
+    _resume.remove(itemId);
+    _played.remove(itemId);
+    _recountWork(removed.groupKey);
+    return true;
+  }
+
+  @override
+  Future<int> deleteWork(String groupKey) async {
+    // 折叠进来的源作品一起删：与 `itemsForWork` 的并集口径保持一致，
+    // 否则「移除整部剧」会只删掉一半。
+    final keys = <String>{groupKey};
+    for (final w in _works.values) {
+      if (w.mergedInto == groupKey) keys.add(w.key);
+    }
+    final doomed = _items.values
+        .where((i) => keys.contains(i.groupKey))
+        .map((i) => i.id)
+        .toList(growable: false);
+    for (final id in doomed) {
+      _items.remove(id);
+      _subtitles.remove(id);
+      _resume.remove(id);
+      _played.remove(id);
+    }
+    for (final k in keys) {
+      _works.remove(k);
+    }
+    return doomed.length;
+  }
+
+  /// 重算一个作品行的三个计数（**存值**口径：只看自己名下的文件）。
+  void _recountWork(String groupKey) {
+    final work = _works[groupKey];
+    if (work == null) return;
+    final mine = _items.values.where((i) => i.groupKey == groupKey).toList();
+    DateTime? latest;
+    for (final i in mine) {
+      final t = i.modifiedAt;
+      if (t == null) continue;
+      if (latest == null || t.isAfter(latest)) latest = t;
+    }
+    _works[groupKey] = work.copyWith(
+      itemCount: mine.length,
+      totalBytes: mine.fold<int>(0, (n, i) => n + (i.sizeBytes ?? 0)),
+      seasonCount:
+          mine.map((i) => i.season ?? 0).where((s) => s > 0).toSet().length,
+      lastModifiedAt: latest,
+      updatedAt: DateTime.now(),
+    );
+  }
+
+  @override
   Future<void> upsertWorks(
     List<MediaWork> works, {
     DateTime? now,
@@ -440,10 +645,22 @@ class InMemoryMediaRepository implements MediaRepository {
           ? existing.genres
           : (existing.isScraped ? existing.genres : w.genres);
 
-      // 分类：用户手选的优先；否则从**生效后的**类型折算，再退回本次分类。
-      final effectiveCategory = keepManualCategory
-          ? existing.category
-          : (MediaCategoryGuesser.fromGenres(effectiveGenres) ?? w.category);
+      // 分类锁**只增不减** —— 这个项目里没有解锁入口，锁只由用户的显式操作
+      // 置上。写成纯 `w.categoryManual` 会在某个调用方漏抄该字段时静默解锁。
+      final effectiveCategoryManual = overrideManual
+          ? (w.categoryManual || existing.categoryManual)
+          : existing.categoryManual;
+
+      // 分类：**显式发起的写入**（`overrideManual`）里，`WorkScraper._categoryFor`
+      // 已经按完整优先级算过一遍（含「手动通道忽略旧锁、按本次刮削重判」）——
+      // 这里再拦一次会把刚算对的结论扔掉（长注释在
+      // `DriftMediaRepository.mergeWorkForUpsert`）。
+      // 其余情况：用户手选的优先；否则从**生效后的**类型折算，再退回本次分类。
+      final effectiveCategory = overrideManual
+          ? w.category
+          : (keepManualCategory
+              ? existing.category
+              : (MediaCategoryGuesser.fromGenres(effectiveGenres) ?? w.category));
 
       _works[w.key] = existing.isScraped
           ? w.copyWith(
@@ -465,17 +682,28 @@ class InMemoryMediaRepository implements MediaRepository {
               source: existing.source,
               scrapedAt: existing.scrapedAt,
               category: effectiveCategory,
-              categoryManual: existing.categoryManual,
+              categoryManual: effectiveCategoryManual,
               // `firstSeenAt` 保留旧值：它决定「最近添加」排序。
               firstSeenAt: existing.firstSeenAt,
+              // ⚠️ 折叠标记**必须保留旧值**。本次扫描造出来的行
+              // `mergedInto` 恒为 `null`，照抄等于每次重扫都把用户
+              // （或自动归一）合好的片子悄悄拆回两个格子。
+              mergedInto: existing.mergedInto,
+              // 片头区间同理：它是**用户标的播放偏好**，重扫造出来的行
+              // 这两列恒为 `null`。照抄 = 每次重扫都抹掉用户标好的片头。
+              introStartMs: existing.introStartMs,
+              introEndMs: existing.introEndMs,
               updatedAt: now ?? w.updatedAt,
             )
           : w.copyWith(
               genres: effectiveGenres,
               genresManual: existing.genresManual,
               category: effectiveCategory,
-              categoryManual: existing.categoryManual,
+              categoryManual: effectiveCategoryManual,
               firstSeenAt: existing.firstSeenAt,
+              mergedInto: existing.mergedInto,
+              introStartMs: existing.introStartMs,
+              introEndMs: existing.introEndMs,
               updatedAt: now ?? w.updatedAt,
             );
     }
@@ -483,6 +711,92 @@ class InMemoryMediaRepository implements MediaRepository {
 
   @override
   Future<MediaWork?> workByKey(String key) async => _works[key];
+
+  @override
+  Future<List<MediaWork>> allWorks() async {
+    final list = _works.values.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    return list;
+  }
+
+  @override
+  Future<int> mergeWorksInto(
+    String targetKey,
+    List<String> sourceKeys,
+  ) async {
+    final target = _works[targetKey];
+    // 目标不存在 → 一条都不动（与 drift 实现同一口径）。全部失败比
+    // 折一半好：折一半会留下一个「有源行指向不存在的目标」的库。
+    if (target == null) return 0;
+
+    var changed = 0;
+    for (final key in sourceKeys) {
+      if (key == targetKey) continue;
+      final src = _works[key];
+      if (src == null) continue;
+      // 已经折走了、或它自己就是别人的目标 —— 都不许再折（防成链）。
+      if (src.isMergedAway) continue;
+      _works[key] = src.copyWith(mergedInto: targetKey);
+      changed++;
+    }
+    return changed;
+  }
+
+  @override
+  Future<int> unmergeWorks(List<String> sourceKeys) async {
+    var changed = 0;
+    for (final key in sourceKeys) {
+      final src = _works[key];
+      if (src == null || !src.isMergedAway) continue;
+      // ⚠️ 这里不能用 `copyWith(mergedInto: null)` —— `copyWith` 的 `??`
+      // 把 `null` 当成「不改」。必须整行重建，理由与 drift 侧相同。
+      _works[key] = MediaWork(
+        key: src.key,
+        provider: src.provider,
+        kind: src.kind,
+        title: src.title,
+        category: src.category,
+        categoryManual: src.categoryManual,
+        originalTitle: src.originalTitle,
+        year: src.year,
+        overview: src.overview,
+        posterUrl: src.posterUrl,
+        posterFile: src.posterFile,
+        posterFaceX: src.posterFaceX,
+        backdropUrl: src.backdropUrl,
+        backdropFile: src.backdropFile,
+        rating: src.rating,
+        genres: src.genres,
+        genresManual: src.genresManual,
+        onlineId: src.onlineId,
+        source: src.source,
+        scrapedAt: src.scrapedAt,
+        itemCount: src.itemCount,
+        totalBytes: src.totalBytes,
+        seasonCount: src.seasonCount,
+        mergedInto: null,
+        // 片头区间与「合并」无关 —— 撤销合并只是把这一列改回 null，
+        // 顺手把用户标的片头丢掉是纯损失（而且没有任何提示）。
+        introStartMs: src.introStartMs,
+        introEndMs: src.introEndMs,
+        lastModifiedAt: src.lastModifiedAt,
+        firstSeenAt: src.firstSeenAt,
+        lastPlayedAt: src.lastPlayedAt,
+        updatedAt: src.updatedAt,
+      );
+      changed++;
+    }
+    return changed;
+  }
+
+  @override
+  Future<List<MediaWork>> mergedSourcesOf(String targetKey) async {
+    final list = _works.values
+        .where((w) => w.mergedInto == targetKey)
+        .toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    return list;
+  }
 
   @override
   Future<void> upsertSubtitles(
@@ -573,10 +887,14 @@ class InMemoryMediaRepository implements MediaRepository {
   }) async {
     final work = _works[key];
     if (work == null) return null;
+    // 与 drift 实现同一口径：清掉在线海报后回落到网盘缩略图。这里的
+    // 「替身比真身弱」会直接让用它写的测试给出错误信心（界面测出「有图」，
+    // 真机上却是一墙灰块）。
     final custom = work.customized(
       title: title,
       category: category,
       updatedAt: now ?? DateTime.now(),
+      drivePoster: WorkPoster.fromItems(await itemsForWork(key)),
     );
     _works[key] = custom;
     return custom;
@@ -603,6 +921,67 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<void> setWorkIntroStart(String key, int startMs) async {
+    final work = _works[key];
+    if (work == null) return;
+    _works[key] = _withIntro(work, startMs, work.introEndMs);
+  }
+
+  @override
+  Future<void> setWorkIntroEnd(String key, int endMs) async {
+    final work = _works[key];
+    if (work == null) return;
+    _works[key] = _withIntro(work, work.introStartMs, endMs);
+  }
+
+  @override
+  Future<void> clearWorkIntroRange(String key) async {
+    final work = _works[key];
+    if (work == null) return;
+    // 与 `unmergeWorks` 同一条：清空必须**整行重建** —— `copyWith` 的 `??`
+    // 把 `null` 当「不改」，走它等于「清了个寂寞」。
+    _works[key] = _withIntro(work, null, null);
+  }
+
+  /// 整行重建，只换片头那两列。
+  ///
+  /// ⚠️ 逐列抄一遍看着笨，但这是**唯一**能清空可空字段的写法（理由见
+  /// [clearWorkIntroRange]）。漏抄一列的后果是静默丢数据：比如漏了
+  /// `mergedInto`，清一次片头就会顺手把跨目录归一拆开。
+  MediaWork _withIntro(MediaWork w, int? startMs, int? endMs) => MediaWork(
+        key: w.key,
+        provider: w.provider,
+        kind: w.kind,
+        title: w.title,
+        category: w.category,
+        categoryManual: w.categoryManual,
+        originalTitle: w.originalTitle,
+        year: w.year,
+        overview: w.overview,
+        posterUrl: w.posterUrl,
+        posterFile: w.posterFile,
+        posterFaceX: w.posterFaceX,
+        backdropUrl: w.backdropUrl,
+        backdropFile: w.backdropFile,
+        rating: w.rating,
+        genres: w.genres,
+        genresManual: w.genresManual,
+        onlineId: w.onlineId,
+        source: w.source,
+        scrapedAt: w.scrapedAt,
+        itemCount: w.itemCount,
+        totalBytes: w.totalBytes,
+        seasonCount: w.seasonCount,
+        mergedInto: w.mergedInto,
+        introStartMs: startMs,
+        introEndMs: endMs,
+        lastModifiedAt: w.lastModifiedAt,
+        firstSeenAt: w.firstSeenAt,
+        lastPlayedAt: w.lastPlayedAt,
+        updatedAt: w.updatedAt,
+      );
+
+  @override
   Future<List<MediaWork>> listWorks({
     MediaKind? kind,
     MediaCategory? category,
@@ -619,6 +998,9 @@ class InMemoryMediaRepository implements MediaRepository {
     int offset = 0,
   }) async {
     var list = _works.values.toList();
+    // 已被折叠走的别名行一律不出现在列表里 —— 这是「归一」在用户眼里的
+    // 全部表现。**放在所有筛选之前**：后面的条件都假定「这是一部独立作品」。
+    list = list.where((w) => !w.isMergedAway).toList();
     if (kind != null) list = list.where((w) => w.kind == kind).toList();
     if (category != null) {
       list = list.where((w) => w.category == category).toList();
@@ -645,13 +1027,57 @@ class InMemoryMediaRepository implements MediaRepository {
     if (q != null && q.isNotEmpty) {
       list = list.where((w) {
         if (w.title.toLowerCase().contains(q)) return true;
+        // 文件名命中：**包括被折叠进来的那些源作品的文件**。漏掉这一层
+        // 会出现「搜 S02E05 搜不到」，而那一集明明就显示在这部剧的文件
+        // 列表里 —— 与 drift 侧的 EXISTS 子查询必须同口径。
         return _items.values.any(
-          (i) => i.groupKey == w.key && i.name.toLowerCase().contains(q),
+          (i) =>
+              (i.groupKey == w.key ||
+                  _works[i.groupKey]?.mergedInto == w.key) &&
+              i.name.toLowerCase().contains(q),
         );
       }).toList();
     }
     list.sort((a, b) => _compareWorks(a, b, sort));
-    return list.skip(offset).take(limit).toList();
+    return _withUnionStats(list.skip(offset).take(limit).toList());
+  }
+
+  /// 把「已被折叠进来的源作品」的文件数 / 体积 / 季数并进返回值。
+  ///
+  /// 口径与 `DriftMediaRepository._withUnionStats`（裸 SQL）**必须一致**：
+  /// 只改有源折进来的那些行；季数是**绝对数**（`COUNT(DISTINCT …)` 不能
+  /// 相加），不是增量。替身与真身在这里分叉的话，用内存库跑过的用例会给出
+  /// 「列表计数对了」的错误信心，而真机上卡片仍然写少。
+  List<MediaWork> _withUnionStats(List<MediaWork> works) {
+    // 目标 key → 「目标自己 + 折进来的源」的 group_key 集合。
+    final owners = <String, Set<String>>{};
+    for (final w in _works.values) {
+      final t = w.mergedInto;
+      if (t == null || t.isEmpty) continue;
+      owners.putIfAbsent(t, () => <String>{t}).add(w.key);
+    }
+    if (owners.isEmpty) return works;
+
+    final out = <MediaWork>[];
+    for (final w in works) {
+      final keys = owners[w.key];
+      if (keys == null) {
+        out.add(w);
+        continue;
+      }
+      final mine = _items.values.where((i) => keys.contains(i.groupKey));
+      out.add(
+        w.copyWith(
+          itemCount: mine.length,
+          // ⚠️ `fold<int>` 必须显式给类型参数：`copyWith` 的形参是 `int?`，
+          // 上下文推断会让 `fold` 取 `int?`，于是累加器变成可空、编译不过。
+          totalBytes: mine.fold<int>(0, (n, i) => n + (i.sizeBytes ?? 0)),
+          seasonCount:
+              mine.map((i) => i.season ?? 0).where((s) => s > 0).toSet().length,
+        ),
+      );
+    }
+    return out;
   }
 
   /// 与 drift 实现保持**同一口径**的排序。
@@ -726,14 +1152,18 @@ class InMemoryMediaRepository implements MediaRepository {
   Future<Map<MediaCategory, int>> countWorksByCategory() async {
     final out = <MediaCategory, int>{};
     for (final w in _works.values) {
+      // 折叠走的别名行不进角标 —— 角标必须严格等于「列表里的条数」，
+      // 否则「电影 12」点进去只有 11 部。
+      if (w.isMergedAway) continue;
       out[w.category] = (out[w.category] ?? 0) + 1;
     }
     return out;
   }
 
   @override
-  Future<int> countPlayedWorks() async =>
-      _works.values.where((w) => w.lastPlayedAt != null).length;
+  Future<int> countPlayedWorks() async => _works.values
+      .where((w) => !w.isMergedAway && w.lastPlayedAt != null)
+      .length;
 
   @override
   Future<Map<int, int>> countWorksByYear({
@@ -789,7 +1219,17 @@ class InMemoryMediaRepository implements MediaRepository {
 
   @override
   Future<List<MediaItem>> itemsForWork(String groupKey) async {
-    final list = _items.values.where((i) => i.groupKey == groupKey).toList();
+    // **并集**：自己名下的文件 + 所有已折叠进来的源作品名下的文件。
+    //
+    // 归一之后目标作品必须真的「包含」另一部的内容，否则用户看到的是
+    // 「两个格子变成一个，但里面的集数少了一半」。口径与
+    // `DriftMediaRepository.itemsForWork` 的子查询一致。
+    final owners = <String>{groupKey};
+    for (final w in _works.values) {
+      if (w.mergedInto == groupKey) owners.add(w.key);
+    }
+    final list =
+        _items.values.where((i) => owners.contains(i.groupKey)).toList();
     // ⚠️ 必须与 `DriftMediaRepository.itemsForWork` 的排序**逐条一致**
     // （季 → 部 → 集 → 名称）。替身少排一段，用它的测试就会对
     // 「Part.1 在前还是 Part.2 在前」给出与真库不同的结论 ——
@@ -881,7 +1321,8 @@ class InMemoryMediaRepository implements MediaRepository {
   Future<int> countItems() async => _items.length;
 
   @override
-  Future<int> countWorks() async => _works.length;
+  Future<int> countWorks() async =>
+      _works.values.where((w) => !w.isMergedAway).length;
 
   @override
   Future<DateTime?> latestLibraryChangeAt() async {

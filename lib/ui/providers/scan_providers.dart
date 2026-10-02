@@ -5,6 +5,7 @@ import '../../data/db/settings_store.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_policy.dart';
 import '../../domain/services/scan_service.dart';
+import '../../domain/services/work_merge_service.dart';
 import 'app_providers.dart';
 import 'library_providers.dart';
 import 'library_refresh_providers.dart';
@@ -56,10 +57,21 @@ Future<ScanPolicy> buildScanPolicy(Ref<Object?> ref) async {
 /// 默认是关的，所以扫描多半根本不碰它们 —— 详情页那个按钮用的才是同一套
 /// 实例，熔断状态要在那里延续。
 Future<ScanService> buildScanService(Ref<Object?> ref) async {
+  // 自动归一由设置决定**传不传**服务，而不是传一个开关进去 ——
+  // 与 `scraper` 同一种做法，领域层因此完全不知道「设置」这回事。
+  //
+  // ⚠️ 读设置失败时**不**降级成「默认开」：宁可这次不归一（下次扫描
+  // 还会再跑一遍），也不要在一个读不出设置的环境里动用户的库。
+  final settings = ref.read(settingsProvider).valueOrNull;
+  final autoMerge = settings?.autoMergeByOnlineId ?? false;
+
   return ScanService(
     registry: ref.read(adapterRegistryProvider),
     library: ref.read(mediaRepositoryProvider),
     scraper: ref.read(scraperPipelineProvider),
+    merger: autoMerge
+        ? WorkMergeService(library: ref.read(mediaRepositoryProvider))
+        : null,
     policy: await buildScanPolicy(ref),
   );
 }

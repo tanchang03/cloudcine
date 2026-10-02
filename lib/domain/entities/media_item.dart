@@ -1,7 +1,32 @@
+import '../../core/utils/file_names.dart';
 import '../../core/utils/filename_parser.dart';
 import '../../core/utils/video_formats.dart';
 import 'drive_entry.dart';
 import 'drive_provider.dart';
+
+/// 列表行标题在**有集号**时的两种口径（见 [MediaItem.rowLabel]）。
+///
+/// 「提不出集号」那一支两种口径一致，所以这个枚举只管有集号的情形。
+///
+/// ⚠️ 两处的差别**不是笔误**，是实测撞出来的：
+enum RowLabelStyle {
+  /// 播放器的剧集面板。面板只有 320px、一行文字就是全部信息，而每一行都是
+  /// 同一部剧 —— 片名是噪音，所以只写 `第 3 集`。
+  ///
+  /// 代价：**同一集的多个版本会撞成同一行文字**（`翡翠台` 与 `MyTVSuper`
+  /// 两版都写成 `第 1 集`）。窄面板上没有更好的位置放版本名，接受这个代价。
+  compact,
+
+  /// 详情页的「文件」列表。这里是宽列表，一行就是一集，所以**保留片名**
+  /// （`剧名 S01E03`）—— 同一集常常有多个版本（翡翠台 / MyTVSuper、
+  /// 国语 / 粤语），版本之间**只有片名不同**；用 `第 1 集` 会让两个版本
+  /// 变成两行一模一样的字，比不显示还糟。
+  withTitle,
+
+  /// 只要 `剧名-文件名`。**撞名时的最后一道兜底** —— 连片名也分不开的两条
+  /// （同一集的两个不同压制、两个码率），只有文件名保证互不相同。
+  fileName,
+}
 
 /// 媒体库里的一条**文件级**记录（一个可播放的视频文件）。
 ///
@@ -214,6 +239,81 @@ class MediaItem {
     final y = year;
     return y == null ? t : '$t ($y)';
   }
+
+  /// 列表行上的展示名 —— 用在**整屏都是同一部作品**的那些列表里
+  /// （播放器的剧集面板、详情页的「文件」列表）。
+  ///
+  /// ## 与 [displayTitle] 的分工
+  ///
+  /// [displayTitle] 带片名（`剧名 S01E03`），用在**脱离上下文**的地方：
+  /// 播放窗口标题、日志、字幕搜索词。这个方法反过来 —— 片名只在需要时才
+  /// 出现，因为那种列表里片名往往对每一行都一样，是纯噪音。
+  ///
+  /// ## 两种口径（[RowLabelStyle]）
+  ///
+  /// **有集号**那一支两处不同，这不是笔误，见 [RowLabelStyle]。
+  ///
+  /// **提不出集号**时两支一致：`剧名-文件名`（文件名过 [baseNameOf] 去扩展名；
+  /// 列表的副标题那行已经在报容器格式了）。
+  ///
+  /// ## 为什么提不出集号时**不能**退回 [displayTitle]
+  ///
+  /// 那正是最初的写法，实测后果是「整列一模一样的剧名」。而且这批条目不是
+  /// 「解析器没认出来」，是**被刻意清掉的**：「目录名作为系列名」那条规则
+  /// （见 `MediaFilenameParser.parse` 的目录级归组）在把整目录归成一部剧时
+  /// 会执行 `season/episode/episodeEnd = null` —— 事故现场
+  /// `182.格力空调显示E6如何维修.mp4`，那个 `E6` 是**故障代码**不是第 6 集。
+  /// 真实样本：`/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4` / `01.粤语.mp4`…
+  /// 解析不出片名也解析不出集号，全被顶成目录名 `F飞CC日 志2`，详情页
+  /// 12 行主标题一模一样。
+  ///
+  /// 这些条目里唯一能区分开的信息就是**文件名**，所以退回它。前面补上剧名
+  /// 是为了让这一行脱离上下文时（截图、朗读）也知道自己在哪部剧里。
+  ///
+  /// [workTitle] 是**作品行**（`MediaWork.title`，也就是刮削后的剧名）；
+  /// 传空时退回条目自己解析出的 [title]，不会拼出一个空前缀。
+  String rowLabel(RowLabelStyle style, {String? workTitle}) {
+    if (style == RowLabelStyle.fileName) return _fileRowLabel(workTitle);
+
+    final e = episode;
+    if (e == null) return _fileRowLabel(workTitle);
+    if (style == RowLabelStyle.withTitle) return displayTitle;
+
+    final s = season;
+    final end = episodeEnd;
+    final range = (end != null && end != e) ? '$e-$end' : '$e';
+    final prefix = (s == null || s <= 1) ? '' : 'S$s · ';
+    return '$prefix第 $range 集';
+  }
+
+  /// 提不出集号时的行标题：`剧名-文件名`。
+  String _fileRowLabel(String? workTitle) {
+    final name = baseNameOf(this.name);
+    final prefix = _nonEmptyText(workTitle) ?? _nonEmptyText(title);
+    // 文件名自己就带着剧名时不再重复一遍 —— `姜松家电维修视频教程 182.mp4`
+    // 这种文件在 `姜松《家电维修视频教程》` 目录下很常见，拼出来会是
+    // 「剧名-剧名 182」那种念着别扭的东西。
+    //
+    // 顺带：同一部电影的多个版本（`流浪地球2.2023.1080p` / `…2160p`）走
+    // 这一支，于是它们不再都显示成 `流浪地球2 (2023)`。
+    if (prefix == null ||
+        _foldForCompare(name).startsWith(_foldForCompare(prefix))) {
+      return name;
+    }
+    return '$prefix-$name';
+  }
+
+  /// 比较两个名字是否「说的是同一件事」用的折叠形式：只留字母、数字与汉字，
+  /// 大小写不敏感。
+  ///
+  /// 折掉标点是有意的：剧名来自目录名（`姜松《家电维修视频教程》`），文件名里
+  /// 却往往不带书名号（`姜松家电维修视频教程 182.mp4`）—— 不折的话
+  /// [_fileRowLabel] 里那条 `startsWith` 判据永远不成立，那层去重就形同虚设。
+  static String _foldForCompare(String s) =>
+      s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
+
+  static String? _nonEmptyText(String? v) =>
+      (v == null || v.trim().isEmpty) ? null : v.trim();
 
   /// 列表副标题：`2160P · MKV · H.265 · HDR · 12.3 GB`
   String get technicalSummary {

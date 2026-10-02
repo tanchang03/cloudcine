@@ -2,6 +2,7 @@ import 'package:cloudcine/core/utils/filename_parser.dart';
 import 'package:cloudcine/core/utils/media_category.dart';
 import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/media_work.dart';
+import 'package:cloudcine/domain/entities/work_poster.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// 「清除刮削 + 自定义」的纯规则（[MediaWork.customized]）。
@@ -101,6 +102,53 @@ void main() {
     );
   });
 
+  test('B：分类没动就不新加锁 —— 「只想清数据」不该把错分类冻死', () {
+    // 对话框预填当前分类（scraped() 是 movie）。用户只清在线信息、没改分类 →
+    // 不该把它锁住，否则之后手动重刮也改不动（原 bug 现场）。
+    final w = scraped().customized(
+      title: '低俗小说',
+      category: MediaCategory.movie, // 与 scraped() 的 category 相同
+      updatedAt: now,
+    );
+
+    expect(
+      w.categoryManual,
+      isFalse,
+      reason: '用户没在这个对话框里表达「我要这个分类」—— 别顺手锁住它。',
+    );
+  });
+
+  test('B：真的改了分类才锁', () {
+    final w = scraped().customized(
+      title: '低俗小说',
+      category: MediaCategory.documentary, // 与 movie 不同
+      updatedAt: now,
+    );
+
+    expect(
+      w.categoryManual,
+      isTrue,
+      reason: '用户主动选了另一个分类 → 这是明确的指定，锁住；'
+          '后续重扫 / 自动刮削不许改写。',
+    );
+  });
+
+  test('B：此前已有的锁，在「没改分类」时原样保留', () {
+    final w = scraped()
+        .copyWith(categoryManual: true)
+        .customized(
+          title: '低俗小说',
+          category: MediaCategory.movie, // 与当前相同
+          updatedAt: now,
+        );
+
+    expect(
+      w.categoryManual,
+      isTrue,
+      reason: '用户更早的明确指定，不该被一次「只为清数据」的操作悄悄解锁。',
+    );
+  });
+
   test('来源标记成「手动修改」—— 不是「文件名解析」', () {
     final w = subject();
 
@@ -142,6 +190,69 @@ void main() {
     );
     expect(w.lastPlayedAt, DateTime(2026, 9, 25));
     expect(w.updatedAt, now);
+  });
+
+  test('有网盘缩略图 → 清掉刮错的海报后回落到它', () {
+    final w = scraped().customized(
+      title: '2024 演唱会现场',
+      category: MediaCategory.other,
+      updatedAt: now,
+      drivePoster: const WorkPoster(
+        url: 'https://drive-pc.quark.cn/1/clouddrive/file/video/thumbnail?fid=x',
+        faceX: 0.31,
+      ),
+    );
+
+    expect(
+      w.posterUrl,
+      'https://drive-pc.quark.cn/1/clouddrive/file/video/thumbnail?fid=x',
+      reason: '用户点「自定义」是为了**去掉刮错的那张**，不是让这部作品'
+          '从此没有封面。网盘缩略图一直在库里（MediaItem.thumbUrl），'
+          '清成 null 的话整墙会变成片名首字的灰块。',
+    );
+    expect(w.posterFaceX, 0.31, reason: '锚点跟着这一张图一起回来。');
+    expect(
+      w.posterFile,
+      isNull,
+      reason: '换了图就必须清缓存文件名：`PosterCache.pathFor` 见 '
+          '`knownFile` 存在就直接返回旧文件，留着它封面会显示成前一张。',
+    );
+    expect(w.backdropUrl, isNull, reason: '背景图没有网盘来源，该清还是清。');
+  });
+
+  test('清之前用的本来就是网盘缩略图 → 缓存文件名留着', () {
+    const thumb = 'https://drive-pc.quark.cn/thumb?fid=x';
+    final w = scraped()
+        .copyWith(
+          posterUrl: thumb,
+          posterFile: 'show_abc123.jpg',
+          posterFaceX: 0.31,
+        )
+        .customized(
+          title: '2024 演唱会现场',
+          category: MediaCategory.other,
+          updatedAt: now,
+          drivePoster: const WorkPoster(url: thumb, faceX: 0.31),
+        );
+
+    expect(
+      w.posterFile,
+      'show_abc123.jpg',
+      reason: '地址没变就是同一张图，缓存文件仍然有效 —— 清掉它会让本来'
+          '秒出的封面重新下一遍（网盘缩略图还得带 Cookie）。',
+    );
+  });
+
+  test('没有网盘缩略图 → 封面真的清空（不是「清了个寂寞」）', () {
+    final w = scraped().customized(
+      title: '2024 演唱会现场',
+      category: MediaCategory.other,
+      updatedAt: now,
+      drivePoster: null,
+    );
+
+    expect(w.posterUrl, isNull);
+    expect(w.posterFaceX, isNull);
   });
 
   test('用户手敲并锁住的类型标签原样保留（连同锁一起）', () {

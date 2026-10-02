@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
+import 'tv_text.dart';
 
 /// 页面标题栏。
 ///
@@ -70,7 +71,13 @@ class EmptyState extends StatelessWidget {
     this.actionLabel,
     this.onAction,
     this.danger = false,
-  });
+  }) : assert(
+          (actionLabel == null) == (onAction == null),
+          'actionLabel 与 onAction 必须**成对**给：下面渲染按钮的判据是'
+          '「两个都非空」，只给标签的话按钮根本不出现，屏幕上只剩一句'
+          '「说了要去做点什么」的空话 —— 而它看起来完全正常，没人会去查。'
+          '（`scan_page` 未登录那条就漏过一次，见评估文档 P2-7。）',
+        );
 
   final IconData icon;
   final String title;
@@ -241,7 +248,7 @@ class KeyValueRow extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: SelectableText(
+            child: TvSelectableText(
               value,
               style: TextStyle(
                 fontSize: 11.5,

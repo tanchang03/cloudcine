@@ -110,9 +110,46 @@ class _Manual implements MetadataScraper {
   }
 }
 
-/// 每次调用都抛 —— 钉住「一个源挂了不该让整个对话框空掉」。
-class _Throwing implements MetadataScraper {
+/// 手动通道的假源：`resolve` 返回**指定**的条目 id 与类型标签。
+///
+/// 用来钉两件事：
+///   - 手动通道会拿「刮到的条目是电影还是剧集」（`movie/…` / `tv/…`）更新
+///     媒体类型 —— 自动通道刻意不这么做；
+///   - 语义档（动漫 / 综艺 / 纪录片）不会被这条结构证据冲掉。
+class _ManualMeta implements MetadataScraper {
+  _ManualMeta({required this.onlineId, this.genres = const []});
+
+  final String onlineId;
+  final List<String> genres;
+
   @override
+  String get id => 'douban';
+
+  @override
+  String get displayName => '豆瓣';
+
+  @override
+  bool get isEnabled => true;
+
+  @override
+  Future<ScrapedMetadata?> scrape(ScrapeQuery query) async => null;
+
+  @override
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async => const [];
+
+  @override
+  Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async =>
+      ScrapedMetadata(
+        title: candidate.title,
+        year: candidate.year,
+        genres: genres,
+        onlineId: onlineId,
+        source: ScrapeSource.online,
+      );
+}
+
+/// 每次调用都抛 —— 钉住「一个源挂了不该让整个对话框空掉」。
+class _Throwing implements MetadataScraper {  @override
   String get id => 'boom';
 
   @override
@@ -171,6 +208,7 @@ void main() {
     double? posterFaceX = 0.32,
     ScrapeSource source = ScrapeSource.local,
     MediaCategory category = MediaCategory.anime,
+    bool categoryManual = false,
     DateTime? lastModifiedAt,
   }) =>
       MediaWork(
@@ -179,6 +217,7 @@ void main() {
         kind: MediaKind.episode,
         title: 'Show',
         category: category,
+        categoryManual: categoryManual,
         year: 2023,
         posterUrl: posterUrl,
         posterFaceX: posterFaceX,
@@ -913,6 +952,313 @@ void main() {
         reason: '手动和自动走的是同一个 `_apply`，分类折算不能只在一条路上生效 '
             '—— 那样「手动刮完分类不对、自动刮完才对」会变成一个玄学问题。',
       );
+    });
+  });
+
+  group('手动刮削按条目结构更新媒体类型（2026-10-02）', () {
+    // 用户反馈：手动刮削「需要根据刮削结果更新媒体类型」。原来的规则是
+    // 「genres 说话才算」—— 类型标签给不出「动画 / 纪录片 / 真人秀」时分类
+    // 一个字段都不动。而手动刮削最常见的场景恰恰是**文件名认不出类型**
+    // （只剩 `2026.2160p.WEB-DL.mkv`），那时 genres 多半也只是「剧情」，
+    // 于是分类永远停在扫描期那个「电影 / 其他」。
+    //
+    // 手动通道多了一条证据可用：用户亲手确认的条目自己带着
+    // `movie/…` / `tv/…`（TMDB 与豆瓣都把类型编进 id）。自动通道**不开**
+    // 这条 —— 它会让「靠目录名判成综艺」的作品被条目的 tv 前缀冲成剧集。
+
+    test('手动刮到 tv 条目 → 分类从「电影」挪到「剧集」', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: '2026.2160p.WEB-DL.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(onlineId: 'douban/tv/12345', genres: const ['剧情']),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.movie),
+        const ScrapeCandidate(source: 'douban', sourceId: '1', title: '某剧'),
+      );
+
+      expect(repo.written.single.category, MediaCategory.series);
+    });
+
+    test('手动刮到 movie 条目 → 分类从「剧集」挪到「电影」', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.series),
+        [item(name: '2026.2160p.WEB-DL.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(onlineId: 'douban/movie/678', genres: const ['剧情']),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.series),
+        const ScrapeCandidate(source: 'douban', sourceId: '2', title: '某片'),
+      );
+
+      expect(repo.written.single.category, MediaCategory.movie);
+    });
+
+    test('A：类型标签优先 —— 综艺给了「真人秀」就不被结构冲掉', () async {
+      // 结构证据只是**兜底**：只要 genres 说得出语义结论（真人秀 → 综艺），
+      // 就以 genres 为准，结构不参与。这保住了绝大多数综艺 —— TMDB 对综艺
+      // 通常会给 Reality / Talk。
+      final repo = await repoWith(
+        work(category: MediaCategory.variety),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(onlineId: 'douban/tv/12345', genres: const ['真人秀']),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.variety),
+        const ScrapeCandidate(source: 'douban', sourceId: '3', title: '某综艺'),
+      );
+
+      expect(repo.written.single.category, MediaCategory.variety);
+    });
+
+    test('A：genres 说不出语义时，手动重刮按条目结构重判（含语义档）', () async {
+      // ⚠️ 2026-10-02 的取舍：手动通道的「自动」= 按**本次**刮削重判，不再用
+      // 「当前是语义档就不许被结构覆盖」来挡（旧版有这一条）。原因：一部被
+      // 刮成「纪录片」的剧，其 TMDB 类型（剧情 / 悬疑）给不出语义结论，只能
+      // 靠结构证据（`tv/…`）救回来 —— 旧守卫会让它永远翻不了身（就是用户报
+      // 的那个 bug）。代价：放在 `/综艺/` 而 TMDB 又没给「真人秀」的片子，
+      // 手动重刮会被判成「剧集」；要保住「综艺」，在对话框「媒体类型」里
+      // 点一下即可。
+      final repo = await repoWith(
+        work(category: MediaCategory.variety),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(onlineId: 'douban/tv/12345', genres: const ['剧情']),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.variety),
+        const ScrapeCandidate(source: 'douban', sourceId: '3b', title: '某综艺'),
+      );
+
+      expect(repo.written.single.category, MediaCategory.series);
+    });
+
+    test('A：分类被锁（旧版「清空」留下的）→ 手动重刮照样按结构重判', () async {
+      // 用户报的 bug 现场：自动刮成「纪录片」→ 清空（旧版把分类锁死）→
+      // 手动刮到 `tv/…` 也改不动。A 让手动通道忽略分类锁。
+      final repo = await repoWith(
+        work(category: MediaCategory.documentary, categoryManual: true),
+        [item(name: 'The.Glory.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(
+            onlineId: 'douban/tv/136283',
+            genres: const ['剧情', '悬疑'],
+          ),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.documentary, categoryManual: true),
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: 'tv/136283',
+          title: '黑暗荣耀',
+        ),
+      );
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.series,
+        reason: '「手动重刮 = 用户要求现在重判一次」，不该被旧锁卡住。',
+      );
+    });
+
+    test('A：锁着的分类要**真的落库** —— 光算出对的不够', () async {
+      // 用户报的 bug 有**两层**：`_categoryFor` 算出「剧集」是对的（日志里
+      // 写着），但落库那一步被 `mergeWorkForUpsert` 的旧锁拦了回去，库里
+      // 仍然是「纪录片」。上一条用例只看 `written`（WorkScraper 的产物），
+      // 照不出第二层 —— 所以这条读回**库里那一行**。
+      final repo = await repoWith(
+        work(category: MediaCategory.documentary, categoryManual: true),
+        [item(name: 'The.Glory.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(
+            onlineId: 'douban/tv/136283',
+            genres: const ['剧情', '悬疑'],
+          ),
+        ]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.documentary, categoryManual: true),
+        const ScrapeCandidate(
+          source: 'douban',
+          sourceId: 'tv/136283',
+          title: '黑暗荣耀',
+        ),
+        category: MediaCategory.series,
+      );
+
+      final stored = await repo.workByKey('show');
+      expect(
+        stored!.category,
+        MediaCategory.series,
+        reason: '用户看到的是**库里那一行**（列表按它分栏），不是 WorkScraper 的'
+            '返回值。分类算对了却写不进去，界面照样弹「已刮削 · 类型：剧集」，'
+            '而纪录片栏里它还在 —— 这正是用户报的「设置没生效」。',
+      );
+      expect(stored.categoryManual, isTrue);
+    });
+
+    test('A：**自动**通道仍然认锁 —— 锁只对手动通道让路', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.documentary, categoryManual: true),
+        [item(name: 'The.Glory.S01E01.mkv')],
+      );
+      await WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online(genres: const ['动画']))]),
+        clock: () => now,
+      ).scrape(work(category: MediaCategory.documentary, categoryManual: true));
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.documentary,
+        reason: '锁的本意就是挡无人值守的自动刮削 —— 自动通道不许绕过它，'
+            '否则用户手动指定的分类会被 TMDB 的 genres 悄悄改写。',
+      );
+    });
+
+    test('同一份数据：自动通道不动，手动通道才按条目结构更新', () async {
+      // 自动通道（详情页「刮削」按钮）：genres 说不出结论 → 保留原值。
+      final autoRepo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      await WorkScraper(
+        library: autoRepo,
+        pipeline: ScraperPipeline([_Fixed('fake', online(genres: const []))]),
+        clock: () => now,
+      ).scrape(work(category: MediaCategory.movie));
+      expect(
+        autoRepo.written.single.category,
+        MediaCategory.movie,
+        reason: '自动通道拿不到「用户确认过」这个前提，所以继续用保守规则。',
+      );
+
+      // 手动通道（对话框里用户亲手选了候选）：条目结构生效。
+      final manualRepo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      await WorkScraper(
+        library: manualRepo,
+        pipeline: ScraperPipeline([
+          _ManualMeta(onlineId: 'douban/tv/12345', genres: const []),
+        ]),
+        clock: () => now,
+      ).applyCandidate(
+        work(category: MediaCategory.movie),
+        const ScrapeCandidate(source: 'douban', sourceId: '4', title: '某剧'),
+      );
+      expect(manualRepo.written.single.category, MediaCategory.series);
+    });
+
+    test('用户在对话框里选的类型 → 直接落库并锁住 categoryManual', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        // `_Manual.resolve` 给的 genres 是 `['动画']`。
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.movie),
+        const ScrapeCandidate(source: 'douban', sourceId: '5', title: '某片'),
+        category: MediaCategory.documentary,
+      );
+
+      expect(
+        repo.written.single.category,
+        MediaCategory.documentary,
+        reason: '用户亲手选的类型是**结论**，优先于类型标签的折算'
+            '（这里 genres 说「动画」，但用户要的是「纪录片」）。',
+      );
+      expect(
+        repo.written.single.categoryManual,
+        isTrue,
+        reason: '他在「用这一条更新」那一步看过这个选择 —— 之后的自动刮削'
+            '不该再改写它，否则等于「我选的没生效」。',
+      );
+    });
+
+    test('没选（null）→ 不锁，类型仍交给自动规则', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      await subject.applyCandidate(
+        work(category: MediaCategory.movie),
+        const ScrapeCandidate(source: 'douban', sourceId: '6', title: '某片'),
+      );
+
+      expect(
+        repo.written.single.categoryManual,
+        isFalse,
+        reason: '用户没动那个选择框 → 别顺手把它锁住；下次刮削 / 回填仍可以改它。',
+      );
+    });
+
+    test('成功文案带上落库后的类型（用户当场核对有没有归错栏）', () async {
+      final repo = await repoWith(
+        work(category: MediaCategory.movie),
+        [item(name: 'Show.S01E01.mkv')],
+      );
+      final outcome = await WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      ).applyCandidate(
+        work(category: MediaCategory.movie),
+        const ScrapeCandidate(source: 'douban', sourceId: '7', title: '某片'),
+      );
+
+      expect(outcome.message, contains('类型：动漫'));
     });
   });
 }

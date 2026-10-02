@@ -9,9 +9,10 @@ import 'play_action.dart';
 
 /// 一行媒体文件。
 ///
-/// 作品详情页的「文件」列表与媒体库的目录视图共用它。两处各写一份的话，
-/// 「显示什么、点一下发生什么」很快会漂移 —— 而这两处是用户找片子的
-/// 两条主要路径，行为不一致会让人以为功能时好时坏。
+/// 目前只有作品详情页的「文件」列表用它。媒体库的**目录视图刻意不共用**
+/// （那里描述的是「网盘上的这个文件」，不是「已入库的媒体项」，见
+/// `folder_browser.dart` 里那一段）—— 所以这一行总是有作品上下文，
+/// [workTitle] 传得进来。
 ///
 /// **点整行 = 直接起播**，与海报墙点卡片一致（走 `playItem`，全应用唯一的
 /// 起播入口）。行内不再放「播放」按钮，只留一个静态的播放图标作提示。
@@ -24,9 +25,16 @@ class MediaItemRow extends ConsumerWidget {
     this.dim = false,
     this.onLocate,
     this.locateTooltip = '在目录中显示',
+    this.workTitle,
   });
 
   final MediaItem item;
+
+  /// 所属**作品行**的标题（刮削后的剧名），只用于主标题的组装。
+  ///
+  /// 提不出集号的那些条目主标题是 `剧名-文件名`（见 [MediaItem.listLabel]），
+  /// 这个字段就是那个「剧名」。不传时退回条目自己解析出的片名。
+  final String? workTitle;
 
   /// 行号。给 `null` 时不显示 —— 目录视图里「这一层的第几个」没有意义，
   /// 而详情页里「第几集」有意义。
@@ -77,7 +85,17 @@ class MediaItemRow extends ConsumerWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        item.displayTitle,
+                        // ⚠️ **不能**用 `item.displayTitle` 一把梭：提不出集号时
+                        // 它就是片名，而这一整屏都是同一部剧。真实样本
+                        // `/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4`…
+                        // 全被顶成同一个目录名，12 行主标题一模一样，只有下面
+                        // 那条暗色的网盘路径能看出区别。
+                        //
+                        // 取 `withTitle` 而不是 `compact`：有集号时**要**保留
+                        // 片名 —— 同一集常有多个版本（翡翠台 / MyTVSuper），
+                        // 版本之间只有片名不同（见 `RowLabelStyle`）。
+                        item.rowLabel(RowLabelStyle.withTitle,
+                            workTitle: workTitle),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(

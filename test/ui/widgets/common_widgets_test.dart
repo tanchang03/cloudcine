@@ -88,19 +88,52 @@ void main() {
   });
 
   group('EmptyState', () {
-    testWidgets('只给文案不给回调时不渲染按钮（避免点了没反应）', (tester) async {
-      await _pump(
-        tester,
-        const EmptyState(
+    testWidgets('标签与回调**必须成对** —— 只给一个就是接线错误', (tester) async {
+      // 这条原来是「只给标签就不渲染按钮」，测的是**当时的行为**。
+      // 但类文档写的是「刻意必须给一个行动按钮」—— 也就是说「半配」
+      // 从来不是一种合法用法，而 `scan_page` 未登录那条正是照着一个
+      // 「看起来能用」的写法漏掉了 `onAction`：按钮不渲染、不报错、
+      // 不留痕，屏幕上只剩一句「说了要去做点什么」的空话
+      // （见 `docs/AndroidTV-遥控器体验评估.md` 的 P2-7）。
+      //
+      // 所以改成在**构造时**就断言失败。release 下断言被剥掉，行为与
+      // 原来完全一致（不渲染按钮），但 debug / 测试里它会立刻炸出来。
+      // ⚠️ 这两处**不能写 `const`**：常量表达式里断言抛异常是编译错误
+      // （`const_eval_throws_exception`），报错信息还完全指不到业务上。
+      expect(
+        () => EmptyState(
           icon: Icons.inbox_rounded,
           title: '媒体库还是空的',
           actionLabel: '去扫描',
         ),
+        throwsAssertionError,
+      );
+      expect(
+        () => EmptyState(
+          icon: Icons.inbox_rounded,
+          title: '媒体库还是空的',
+          onAction: () {},
+        ),
+        throwsAssertionError,
+        reason: '反着漏（有回调没标签）是同一个坑的另一半：按钮同样不渲染。',
+      );
+    });
+
+    testWidgets('两个都不给 → 合法：确实存在「没有下一步」的空态', (tester) async {
+      await _pump(
+        tester,
+        const EmptyState(
+          icon: Icons.receipt_long_outlined,
+          title: '暂无日志',
+        ),
       );
 
-      expect(find.text('媒体库还是空的'), findsOneWidget);
-      expect(find.text('去扫描'), findsNothing);
-      expect(find.byType(FilledButton), findsNothing);
+      expect(find.text('暂无日志'), findsOneWidget);
+      expect(
+        find.byType(FilledButton),
+        findsNothing,
+        reason: '诊断页无日志就是这种：不该为了满足「必须有按钮」硬塞一个。',
+      );
     });
 
     testWidgets('文案与回调都给了才渲染按钮，并且点击能回调', (tester) async {
@@ -133,7 +166,8 @@ void main() {
       );
 
       expect(find.text('缓存占用'), findsOneWidget);
-      // 值用 SelectableText 渲染，便于复制诊断信息
+      // 值走 TvSelectableText：桌面/手机上可划选便于复制诊断信息，
+      // TV 上退化成普通 Text（否则 D-pad 会卡在这行字上出不去）。
       expect(find.text('12.4 MB'), findsOneWidget);
     });
   });

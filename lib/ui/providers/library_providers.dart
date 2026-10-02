@@ -1,11 +1,13 @@
 import 'package:flutter/foundation.dart' show setEquals;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/media_category.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/entities/subtitle_track.dart';
+import '../../domain/services/missing_media.dart';
 import '../../domain/services/play_target.dart';
 import 'app_providers.dart';
 import 'library_refresh_providers.dart';
@@ -282,6 +284,103 @@ final workClassificationControllerProvider =
   (ref) => WorkClassificationController(ref),
 );
 
+/// 「网盘上这个文件已经没了」→ 从媒体库里移除它。
+///
+/// ## 为什么单独一个控制器
+///
+/// 这条路径要惊动的 provider 和 `WorkClassificationController` 一样多
+/// （详情页 + 海报墙 + 三组角标 + 目录视图的「已入库」叠加层），但触发它的
+/// 地方在**播放器**里（`playItem` 与播放页的错误浮层）。播放器不认识、也
+/// 不该认识那五个 provider —— 所以把它们收在这里，播放器只需要喊一句
+/// 「这个文件没了」。
+class MissingMediaController {
+  MissingMediaController(this._ref);
+
+  final Ref _ref;
+
+  /// 把「打不开的那个文件」翻译成对话框需要的全部信息。
+  ///
+  /// 文件数走 `itemsForWork`（**并集**口径）：它与详情页「文件」列表的长度
+  /// 必须一致，用户据它判断「是不是整部都没了」—— 写着 24 而只坏了一集，
+  /// 就该选「只移除这一集」。
+  Future<MissingMediaPlan> planFor(MediaItem item) async {
+    final repo = _ref.read(mediaRepositoryProvider);
+    final work = await repo.workByKey(item.groupKey);
+    final siblings = await repo.itemsForWork(item.groupKey);
+    return MissingMediaPlan.of(
+      item: item,
+      work: work,
+      fileCount: siblings.length,
+    );
+  }
+
+  /// 按 [scope] 移除，并让所有读这张表的 provider 重取。
+  ///
+  /// 返回是否真的动了库 —— 调用方（播放页）据此决定要不要关掉自己。
+  Future<bool> remove(
+    MediaItem item, {
+    required MediaRemovalScope scope,
+  }) async {
+    final repo = _ref.read(mediaRepositoryProvider);
+    final removed = switch (scope) {
+      MediaRemovalScope.singleItem => await _removeSingle(repo, item),
+      MediaRemovalScope.wholeWork => await _removeWhole(repo, item),
+    };
+    _refresh(item.groupKey);
+    return removed;
+  }
+
+  /// 只删这一个文件。
+  ///
+  /// ⚠️ 删完之后**还要回头看一眼作品行还有没有文件**。没有的话那一部就
+  /// 只剩一张空卡片：点进去什么都没有，却仍然占着「电影」栏的角标
+  /// （角标数的是作品行）。留着它，用户会看到一个「有 1 部电影、空的」
+  /// 的媒体库。
+  ///
+  /// 这条决定**放在这里而不是仓储里**是刻意的：`deleteItem` 的契约是
+  /// 「删一个文件」，让它在某种情况下顺带删掉作品行属于出乎调用方意料的
+  /// 副作用 —— 而「删完之后要不要连带删作品」将来可能变成一次二次确认。
+  Future<bool> _removeSingle(MediaRepository repo, MediaItem item) async {
+    if (!await repo.deleteItem(item.id)) return false;
+    final left = await repo.itemsForWork(item.groupKey);
+    if (left.isEmpty) {
+      diag.info('媒体库', '${item.groupKey} 名下已无文件，一并删除作品行');
+      await repo.deleteWork(item.groupKey);
+    }
+    return true;
+  }
+
+  /// 整部一起删（含折叠进来的源作品）。
+  Future<bool> _removeWhole(MediaRepository repo, MediaItem item) async {
+    // 返回 0 表示这一部本来就不在库里、或名下没有文件。那时作品行同样
+    // 已经被删掉了，对用户来说结果一致，所以不算失败。
+    final n = await repo.deleteWork(item.groupKey);
+    diag.info('媒体库', '整部移除 ${item.groupKey}：$n 个文件');
+    return true;
+  }
+
+  /// 与 `WorkClassificationController._refresh` 同一套，另加两个：
+  ///
+  ///   - `playedCountProvider`：删掉的可能是「最近播放」里那部；
+  ///   - `libraryWriteSignalProvider`：目录视图的「已入库」叠加层读的是
+  ///     同一张 `media_items` 表，不喊一声的话，删掉的文件在那儿还标记着
+  ///     「已在库」，而点它只会再失败一次。
+  void _refresh(String workKey) {
+    _ref.invalidate(workDetailProvider(workKey));
+    _ref.invalidate(workListProvider);
+    _ref.invalidate(categoryCountsProvider);
+    _ref.invalidate(yearCountsProvider);
+    _ref.invalidate(genreCountsProvider);
+    _ref.invalidate(playedCountProvider);
+    _ref.invalidate(libraryStatsProvider);
+    _ref.read(libraryWriteSignalProvider.notifier).bump();
+  }
+}
+
+final missingMediaControllerProvider = Provider<MissingMediaController>(
+  (ref) => MissingMediaController(ref),
+);
+
 /// 把 `category` 列修正到当前规则下的正确值，**只跑一次**。
 ///
 /// 它管两件事：老库的空分类回填，以及把**已经刮过**的作品的 `genres`
@@ -300,8 +399,12 @@ final categoryBackfillProvider = FutureProvider<int>((ref) async {
 /// 超过几百，而**分页会让海报墙的滚动体验变差**（滚到底要等加载）。
 /// 真到了需要分页的量级，这里换 `PagedListView` 即可，UI 不用动。
 final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
+  final sw = Stopwatch()..start();
+
   // 先保证分类列有值，否则用户点「动漫」会看到空列表 —— 而库里明明有动漫。
+  final wait = Stopwatch()..start();
   await ref.watch(categoryBackfillProvider.future);
+  final waitMs = wait.elapsedMilliseconds;
 
   // 换条播放会让「最近播放」的内容与顺序都变（见 `PlaybackLibraryLink`）。
   // `invalidate` 语义上是「重新取」，Riverpod 会保留上一次的值进 loading，
@@ -310,7 +413,7 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
 
   final filter = ref.watch(libraryFilterProvider);
   final query = filter.query.trim();
-  return ref.watch(mediaRepositoryProvider).listWorks(
+  final works = await ref.watch(mediaRepositoryProvider).listWorks(
         category: filter.category,
         playedOnly: filter.playedOnly,
         query: query.isEmpty ? null : query,
@@ -321,7 +424,35 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
         sort: filter.sort,
         limit: 500,
       );
+
+  // 这条才是用户眼里的「进媒体库要等多久」：`listWorks` 只报 SQL 那一段，
+  // 而首屏真正花掉的是「等分类回填 + 查询」两段之和。仓储那条日志回答
+  // 「SQL 快不快」，这条回答「用户等了多久」—— 两个数字对不上时，
+  // 差额就是回填或 Riverpod 侧的开销。
+  //
+  // 条件一起打出来：测试时要能一眼分清「切了分类所以慢」和「一直这么慢」。
+  diag.debug(
+    '媒体库',
+    '列表就绪：${works.length} 部，${sw.elapsedMilliseconds}ms'
+    '（等回填 $waitMs ms + 查询 ${sw.elapsedMilliseconds - waitMs}ms，$filter）',
+  );
+  return works;
 });
+
+/// 给首屏那几条**并发**查询各记一条耗时。
+///
+/// 它们与 [workListProvider] 同时发出，所以只看 `listWorks` 的数字回答不了
+/// 「列表为什么慢」—— 真正拖住首帧的可能是这里某一条（分类角标要扫全表、
+/// 年份/类型角标各读一列）。分开记，慢的那一条自己会露出来。
+///
+/// 全是 `debug` 级：它们每次改筛选都会重跑，`info` 会把日志刷满。
+/// 排查性能时按 `[媒体库]` 过滤。
+Future<T> _timedQuery<T>(String label, Future<T> Function() body) async {
+  final sw = Stopwatch()..start();
+  final value = await body();
+  diag.debug('媒体库', '$label：${sw.elapsedMilliseconds}ms');
+  return value;
+}
 
 /// 各分类的作品数（分类栏上的角标）。
 ///
@@ -330,7 +461,10 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
 final categoryCountsProvider =
     FutureProvider<Map<MediaCategory, int>>((ref) async {
   await ref.watch(categoryBackfillProvider.future);
-  return ref.watch(mediaRepositoryProvider).countWorksByCategory();
+  return _timedQuery(
+    '分类角标',
+    () => ref.watch(mediaRepositoryProvider).countWorksByCategory(),
+  );
 });
 
 /// 播过的作品数（「最近播放」栏的角标）。
@@ -340,7 +474,10 @@ final categoryCountsProvider =
 final playedCountProvider = FutureProvider<int>((ref) {
   // 播过一部新片子，这个数字就变了。
   ref.watch(playbackLibraryLinkProvider);
-  return ref.watch(mediaRepositoryProvider).countPlayedWorks();
+  return _timedQuery(
+    '最近播放角标',
+    () => ref.watch(mediaRepositoryProvider).countPlayedWorks(),
+  );
 });
 
 /// 筛选面板两组选项的**共同作用域**：当前分类 / 「最近播放」/ 搜索词。
@@ -383,11 +520,14 @@ final playedCountProvider = FutureProvider<int>((ref) {
 final yearCountsProvider = FutureProvider<Map<int, int>>((ref) async {
   await ref.watch(categoryBackfillProvider.future);
   final scope = _facetScope(ref);
-  return ref.watch(mediaRepositoryProvider).countWorksByYear(
-        category: scope.category,
-        playedOnly: scope.playedOnly,
-        query: scope.query.isEmpty ? null : scope.query,
-      );
+  return _timedQuery(
+    '年份角标（${scope.category?.label ?? "全部"}）',
+    () => ref.watch(mediaRepositoryProvider).countWorksByYear(
+          category: scope.category,
+          playedOnly: scope.playedOnly,
+          query: scope.query.isEmpty ? null : scope.query,
+        ),
+  );
 });
 
 /// 各类型的作品数（筛选面板「类型」那一组的选项与角标）。
@@ -399,11 +539,14 @@ final yearCountsProvider = FutureProvider<Map<int, int>>((ref) async {
 final genreCountsProvider = FutureProvider<Map<String, int>>((ref) async {
   await ref.watch(categoryBackfillProvider.future);
   final scope = _facetScope(ref);
-  return ref.watch(mediaRepositoryProvider).countWorksByGenre(
-        category: scope.category,
-        playedOnly: scope.playedOnly,
-        query: scope.query.isEmpty ? null : scope.query,
-      );
+  return _timedQuery(
+    '类型角标（${scope.category?.label ?? "全部"}）',
+    () => ref.watch(mediaRepositoryProvider).countWorksByGenre(
+          category: scope.category,
+          playedOnly: scope.playedOnly,
+          query: scope.query.isEmpty ? null : scope.query,
+        ),
+  );
 });
 
 /// 「点这部作品该播哪一条」。
@@ -435,12 +578,26 @@ Future<MediaItem?> resolvePlayTarget(
 
 /// 一个作品的详情：作品元数据 + 它下面的全部文件。
 class WorkDetail {
-  const WorkDetail({required this.work, required this.items});
+  const WorkDetail({
+    required this.work,
+    required this.items,
+    this.mergedSources = const [],
+  });
 
   final MediaWork work;
 
   /// 全部文件，已按「季 → 集 → 名称」排序
   final List<MediaItem> items;
+
+  /// 已被折叠进这一部的**其他作品行**（跨目录归一的产物）。
+  ///
+  /// 详情页用它在标题下面写一句「已并入《X》」并给出撤销入口。空列表
+  /// 表示这一部没有归一过任何东西 —— 版式与归一功能上线前完全一致。
+  final List<MediaWork> mergedSources;
+
+  /// 归一进来的文件数（撤销提示里说「会把 N 个文件分出去」用）。
+  int get mergedItemCount =>
+      mergedSources.fold(0, (n, w) => n + w.itemCount);
 
   /// 正片。默认列表只显示这些 —— 花絮会淹没正片，但不该被丢弃。
   List<MediaItem> get features =>
@@ -460,10 +617,24 @@ class WorkDetail {
 final workDetailProvider =
     FutureProvider.family<WorkDetail?, String>((ref, key) async {
   final repo = ref.watch(mediaRepositoryProvider);
-  final work = await repo.workByKey(key);
+  var work = await repo.workByKey(key);
   if (work == null) return null;
-  final items = await repo.itemsForWork(key);
-  return WorkDetail(work: work, items: items);
+
+  // 已被折叠走的行要**跟着走到目标**。
+  //
+  // 列表里看不到别名行，所以唯一还能打开它的路径是「用户正停在它的详情页
+  // 上，而后台归一把它折走了」（刮削后的即时归一、扫描结束时的全库归一）。
+  // 不跟的话，用户会停在一个「片名还在、但文件少了一半、而且从列表里
+  // 再也找不到」的页面上 —— 而他刚刚只点了一下「刮削」。
+  final targetKey = work.mergedInto;
+  if (targetKey != null) {
+    final resolved = await repo.workByKey(targetKey);
+    if (resolved != null) work = resolved;
+  }
+
+  final items = await repo.itemsForWork(work.key);
+  final merged = await repo.mergedSourcesOf(work.key);
+  return WorkDetail(work: work, items: items, mergedSources: merged);
 });
 
 /// 某个媒体项的字幕引用（扫描期建立的，不含正文）。
@@ -475,5 +646,8 @@ final itemSubtitlesProvider =
 /// 媒体库规模统计（设置页 / 空态提示用）。
 final libraryStatsProvider = FutureProvider<({int items, int works})>((ref) async {
   final repo = ref.watch(mediaRepositoryProvider);
-  return (items: await repo.countItems(), works: await repo.countWorks());
+  return _timedQuery(
+    '规模统计（文件数 + 作品数）',
+    () async => (items: await repo.countItems(), works: await repo.countWorks()),
+  );
 });

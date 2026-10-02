@@ -114,6 +114,13 @@ class PosterCache {
       // （TMDB 的图是内容寻址的，夸克缩略图按 `fid` 固定）。
       if (File(target).existsSync()) return target;
 
+      // 走到这里说明**盘上确实没有**这张图 —— 只有这一刻才真的发请求。
+      //
+      // 媒体库「显示特别慢」时先数这条刷了几行：一张未命中就是一次带
+      // Cookie 的网络往返（夸克还要排 QPS 队列），几十张就是几百毫秒到
+      // 几秒。它为零就说明慢不在图片上，该去看 `[媒体库]` 那几条查询日志。
+      diag.debug('海报', '缓存未命中，去下载：$url');
+
       final bytes = await _http.getBytes(
         url,
         headers: _headersFor?.call(url),

@@ -53,11 +53,23 @@ class _ScanPageState extends ConsumerState<ScanPage> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 if (!loggedIn)
-                  const EmptyState(
+                  // ⚠️ `actionLabel` 与 `onAction` **必须成对**：
+                  // `EmptyState` 里的判据是 `actionLabel != null &&
+                  // onAction != null`，只写标签的话按钮**根本不渲染**，
+                  // 而屏幕上看起来只是一个「说了去登录却没按钮」的空态。
+                  // 原来这里正是漏了 `onAction`（评估文档 P2-7）。
+                  //
+                  // 说明：路由的 `redirect` 在未授权时会把任何非 `/auth`
+                  // 的地址踢回 `/auth`，所以这一段当下几乎到不了（只在
+                  // 退出登录那一两帧可能闪过）。补它不是为了修一个用户能
+                  // 看见的 bug，而是**别在守卫万一改掉时留一个假按钮**，
+                  // 且与 `library_page.dart` 的同名空态保持一致。
+                  EmptyState(
                     icon: Icons.lock_outline_rounded,
                     title: '还没登录网盘账号',
                     body: '扫描要读网盘目录，先扫码登录夸克账号。',
                     actionLabel: '去登录',
+                    onAction: () => context.go('/auth'),
                   ),
                 if (!loggedIn) const SizedBox(height: 8),
                 if (loggedIn) ...[

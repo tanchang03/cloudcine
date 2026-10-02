@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/utils/filename_parser.dart';
+import '../../core/utils/media_category.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/services/work_scraper.dart';
 import '../providers/app_providers.dart';
@@ -92,6 +93,19 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
   ScrapeCandidate? _selected;
   String? _error;
 
+  /// 用户选的**媒体类型**（那个 chip 行）。
+  ///
+  ///   - `null` = 没动它（「自动」）→ 落库时交给 `WorkScraper._categoryFor`
+  ///     按刮削结果判定（类型标签给出的「动画 / 纪录片 / 综艺」优先，
+  ///     手动通道下还会用「条目是电影还是剧集」这条结构证据）；
+  ///   - 非空 = 用户亲手选的**结论** → 直接落库并锁住（`categoryManual`），
+  ///     之后的自动刮削不再改写它。
+  ///
+  /// ⚠️ 默认是「自动」而不是「预选一个具体分类」：预选会让用户以为
+  /// 「不动它就是电影」，而类型标签其实可能把它判成「动漫」——
+  /// 那时结果与预选不一致，看起来像「我选的没生效」。
+  MediaCategory? _categoryOverride;
+
   /// 手动搜索的来源筛选。`null` = 搜全部启用的源；`'tmdb'` / `'douban'`
   /// 只搜那一个。用户选了「只在豆瓣搜」时，没必要把 TMDB 的额度也花掉。
   String? _sourceFilter;
@@ -169,7 +183,12 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
 
     final outcome = await ref
         .read(workScrapeControllerProvider.notifier)
-        .applyCandidate(widget.work.key, candidate);
+        .applyCandidate(
+          widget.work.key,
+          candidate,
+          // `null` = 用户没动那个选择框 → 由刮削结果自动判定媒体类型。
+          category: _categoryOverride,
+        );
 
     if (!mounted) return;
 
@@ -449,56 +468,151 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
     final selected = _selected;
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 11, 18, 12),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Expanded(
-            child: Text(
-              selected == null
-                  ? '还没选候选。'
-                  // 结果里带上**来源**：用户在确认那一步就能看到
-                  // 「这一条会从哪个源取」，而不是等更新完才知道。
-                  : '将更新为「${selected.title}」'
-                      '${selected.year == null ? "" : "（${selected.year}）"}'
-                      ' · ${_sourceLabel(selected.source)}',
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 11.5,
-                height: 1.6,
-                color: selected == null ? AppTheme.dim : AppTheme.muted,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          TextButton(
-            onPressed: _applying ? null : () => Navigator.of(context).pop(false),
-            child: const Text('取消', style: TextStyle(fontSize: 12.5)),
-          ),
-          const SizedBox(width: 8),
-          FilledButton(
-            onPressed: (_selected == null || busy) ? null : _apply,
-            style: FilledButton.styleFrom(
-              backgroundColor: AppTheme.accent,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-            child: _applying
-                ? const SizedBox(
-                    width: 13,
-                    height: 13,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : const Text(
-                    '用这一条更新',
-                    style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+          // 媒体类型选择只在**选中候选之后**出现：它描述的是「这一条会怎么
+          // 落库」，没选候选时它没有对象，摆在底部只会占地方。
+          if (selected != null) ...[
+            _categoryPickerRow(busy),
+            const SizedBox(height: 10),
+          ],
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  selected == null
+                      ? '还没选候选。'
+                      // 结果里带上**来源**：用户在确认那一步就能看到
+                      // 「这一条会从哪个源取」，而不是等更新完才知道。
+                      : '将更新为「${selected.title}」'
+                          '${selected.year == null ? "" : "（${selected.year}）"}'
+                          ' · ${_sourceLabel(selected.source)}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    height: 1.6,
+                    color: selected == null ? AppTheme.dim : AppTheme.muted,
                   ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              TextButton(
+                onPressed:
+                    _applying ? null : () => Navigator.of(context).pop(false),
+                child: const Text('取消', style: TextStyle(fontSize: 12.5)),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: (_selected == null || busy) ? null : _apply,
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppTheme.accent,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: _applying
+                    ? const SizedBox(
+                        width: 13,
+                        height: 13,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Text(
+                        '用这一条更新',
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+              ),
+            ],
           ),
         ],
+      ),
+    );
+  }
+
+  /// 「媒体类型」那一行 chip。
+  ///
+  /// ## 为什么是 chip 行而不是下拉
+  ///
+  /// 与上面的「来源」选择器同一个版式，而且**第一个选项是「自动」**——
+  /// 下拉里放一个「自动」需要一个非枚举的哨兵值，而 chip 行天然能表达
+  /// 「不指定」：高亮哪一枚就是哪一枚，`null` 对应「自动」。
+  ///
+  /// ## 「自动」是默认，而且它不是「什么都不做」
+  ///
+  /// 它意味着「按刮削结果判定」：类型标签给出「动画 / 纪录片 / 综艺」时以
+  /// 标签为准；手动通道下还会用「条目本身是电影还是剧集」这条证据
+  /// （`WorkScraper.applyCandidate` 的 `manualChannel`）。
+  /// 所以下面那行提示必须写清楚 —— 用户选「自动」时看到的不是「保持不变」。
+  Widget _categoryPickerRow(bool busy) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 6,
+          runSpacing: 4,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            const Text(
+              '媒体类型：',
+              style: TextStyle(fontSize: 11, color: AppTheme.dim),
+            ),
+            _categoryChip(null, '自动', busy),
+            for (final c in MediaCategory.displayOrder)
+              _categoryChip(c, c.label, busy),
+          ],
+        ),
+        const SizedBox(height: 5),
+        Text(
+          _categoryOverride == null
+              ? '自动 = 按本次刮削结果判定：类型标签说「动画 / 纪录片 / 综艺」时'
+                  '以它为准，否则按条目本身是电影还是剧集。'
+                  '（这部作品之前若被锁过分类，手动重刮也会按本次结果重判。）'
+              : '已指定为「${_categoryOverride!.label}」—— 之后重新刮削不会再改它。',
+          style: const TextStyle(
+            fontSize: 10.5,
+            height: 1.6,
+            color: AppTheme.dim,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _categoryChip(MediaCategory? value, String label, bool busy) {
+    final selected = _categoryOverride == value;
+    return InkWell(
+      onTap: busy ? null : () => setState(() => _categoryOverride = value),
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: selected
+              ? AppTheme.accent.withValues(alpha: 0.15)
+              : AppTheme.panel2,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: selected ? AppTheme.accent : AppTheme.line,
+            width: selected ? 0.8 : 0.5,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            color: selected ? AppTheme.accent : AppTheme.muted,
+            fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+          ),
+        ),
       ),
     );
   }

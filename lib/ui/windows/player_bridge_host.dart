@@ -4,13 +4,16 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/error/drive_error.dart';
 import '../../core/utils/text_encoding.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/remote/subtitle/opensubtitles_client.dart';
 import '../../domain/entities/drive_provider.dart';
+import '../../domain/services/missing_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../../domain/services/subtitle_query.dart';
 import '../providers/app_providers.dart';
+import '../providers/library_providers.dart';
 import '../providers/library_refresh_providers.dart';
 import 'desktop_play.dart';
 import 'player_protocol.dart';
@@ -130,14 +133,58 @@ final playerBridgeHostProvider = Provider<void>((ref) {
         qualityId: request.qualityId,
         startPosition: request.position,
       );
+    } on DriveException catch (e, st) {
+      diag.error('窗口', '刷新直链时取链失败', error: e, stackTrace: st);
+      // 「文件已经不在网盘上」**必须抛回去**，而不是像其它失败那样返回 null。
+      //
+      // 返回 null 在播放窗口那边是「刷新失败，停在原地」，于是用户点了
+      // 「下一集」之后什么都不会发生 —— 一个静默失败。而自动连播撞上它时
+      // 表现更糟：一集播完就没动静了，没有任何提示。
+      //
+      // 抛出去之后，播放窗口靠 `code` 认出这一类，进而问用户「要不要把这条
+      // 已经失效的索引删掉」（见 `player_window_app.dart`）。
+      if (isMissingFileError(e)) throw _asMissingFileError(e);
+      return null;
     } catch (e, st) {
-      // 取链本身会失败（登录失效、网络断了、路由全挂）。
-      // **返回 null 而不是让它抛**：抛出去会变成一条平台通道异常，
-      // 播放窗口那边只能看到一句没头没尾的 `PlatformException`，
-      // 而这里的日志已经把原因写清楚了。
+      // 其余失败（登录失效、网络断了、路由全挂）返回 null 而不是让它抛：
+      // 抛出去会变成一条没头没尾的平台通道异常，而这里的日志已经把原因
+      // 写清楚了。
       diag.error('窗口', '刷新直链时取链失败', error: e, stackTrace: st);
       return null;
     }
+  };
+
+  // -------------------------------------------------------------------
+  // 服务七：播放窗口撞上「文件没了」之后的查询与移除
+  // -------------------------------------------------------------------
+  //
+  // 这两条是上面「服务二」抛出 `drive/notFound` 之后的后续两步：播放窗口
+  // 手里只有一句失败，而「能删到哪一层」要读库才知道（它连 `groupKey`
+  // 都没有），删除本身更是只能由主窗口执行 —— 库与仓储都装在这边。
+  onQueryMissingMedia = (itemId) async {
+    final item = await ref.read(mediaRepositoryProvider).itemById(itemId);
+    if (item == null) return null;
+    final plan =
+        await ref.read(missingMediaControllerProvider).planFor(item);
+    return MissingMediaBrief(
+      itemId: itemId,
+      itemTitle: plan.itemTitle,
+      itemPath: plan.itemPath,
+      workTitle: plan.workTitle,
+      kind: plan.kind.name,
+      fileCount: plan.fileCount,
+    );
+  };
+
+  onRemoveMissingMedia = (request) async {
+    final item =
+        await ref.read(mediaRepositoryProvider).itemById(request.itemId);
+    if (item == null) return false;
+    // 走同一个控制器：删完之后媒体库的所有列表都要重取，那些 provider 都
+    // 装在主窗口 —— 播放窗口不需要知道，也不该知道。
+    return ref
+        .read(missingMediaControllerProvider)
+        .remove(item, scope: request.scope);
   };
 
   // -------------------------------------------------------------------
@@ -248,12 +295,71 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     }
   };
 
+  // -------------------------------------------------------------------
+  // 服务六：保存手标的片头区间
+  // -------------------------------------------------------------------
+  //
+  // 播放窗口在**另一个引擎**里，它的「片头」菜单只能把「标了什么」报回来 ——
+  // 库、仓储、`groupKey` 全都在主窗口这边。所以这里要做的是「把 itemId 翻译成
+  // 作品行，再写那两列」。
+  //
+  // ⚠️ 三个仓储方法**分开调**，不要试图合成一个：
+  // `setWorkIntroStart` / `setWorkIntroEnd` / `clearWorkIntroRange` 之所以
+  // 是三个而不是一个带可空参数的，正是因为 `copyWith` 的 `??` 把 `null`
+  // 当成「不改」——用一个方法表达不了「清除」。
+  onSaveIntroRange = (request) async {
+    final repo = ref.read(mediaRepositoryProvider);
+    final item = await repo.itemById(request.itemId);
+    if (item == null) {
+      // 条目被删、或被重扫换过 id。返回 null 让播放窗口如实提示，
+      // 而不是假装存上了 —— 那会让用户以为标好了，下次播却不跳。
+      diag.warn('窗口', '保存片头区间失败：库里找不到 ${request.itemId}');
+      return null;
+    }
+
+    final key = item.groupKey;
+    try {
+      if (request.clear) {
+        await repo.clearWorkIntroRange(key);
+      } else {
+        // 允许只写一半：用户是先标起点、播一段、再标终点的。
+        // 中间那段时间库里存着「半条标记」是正常状态 ——
+        // `IntroMarker.fromMilliseconds` 会把半条当没有，所以不会误跳。
+        if (request.startMs case final ms?) {
+          await repo.setWorkIntroStart(key, ms);
+        }
+        if (request.endMs case final ms?) {
+          await repo.setWorkIntroEnd(key, ms);
+        }
+      }
+
+      // 回**落库之后的真实值**，不是一个 bool：播放窗口拿到 true 也仍然不知道
+      // 「现在到底存的是什么」，只能照自己的请求猜 —— 而它猜不出「只标了
+      // 起点」这种半条状态在库里是被接受还是被拒。
+      final work = await repo.workByKey(key);
+      final snapshot = IntroRangeSnapshot(
+        startMs: work?.introStartMs,
+        endMs: work?.introEndMs,
+      );
+      diag.info('窗口', '片头区间已保存：$key → $snapshot');
+      return snapshot;
+    } catch (e, st) {
+      // 不抛：抛出去会变成一条没头没尾的 PlatformException，而播放窗口
+      // 能做的也只是提示一句。日志里已经把原因写清楚了。
+      diag.error('窗口', '保存片头区间失败：$key', error: e, stackTrace: st);
+      return null;
+    }
+  };
+
   ref.onDispose(() {
     onPlaybackProgress = null;
     onTicketRefresh = null;
     onFetchSubtitleText = null;
     onSearchOnlineSubtitles = null;
     onFetchOnlineSubtitle = null;
+    onSaveIntroRange = null;
+    onQueryMissingMedia = null;
+    onRemoveMissingMedia = null;
   });
 });
 
@@ -274,4 +380,16 @@ PlatformException _asChannelError(OpenSubtitlesException e) => PlatformException
       code: 'opensubtitles/${e.failure.name}',
       message: e.message,
       details: e.statusCode,
+    );
+
+/// 把「文件已经不在网盘上」翻译成跨引擎通道的形状。
+///
+/// 与 [_asChannelError] 同一条理由，但这里多一层要求：**`code` 必须稳定**。
+/// 播放窗口靠它把「这次没取到」和「文件没了」分开 —— 只有后者才该给出
+/// 「从媒体库移除」这个出口。写错或改名的后果是那个出口永远不出现，
+/// 而用户在自动连播时只会看到「播完一集就没动静了」。
+PlatformException _asMissingFileError(DriveException e) => PlatformException(
+      code: PlayerBridgeError.missingFile,
+      message: '文件不存在或已被删除（可能网盘侧删掉了）',
+      details: e.message,
     );

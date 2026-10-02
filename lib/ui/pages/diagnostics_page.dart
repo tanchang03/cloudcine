@@ -8,6 +8,7 @@ import '../../core/diagnostics/diag_log.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/tv_affordance.dart';
+import '../widgets/tv_text.dart';
 import '../windows/player_window_bridge.dart';
 
 /// 诊断日志页。
@@ -209,8 +210,10 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
 /// 「输入（[path]）→ 输出（界面）」的纯函数 —— 测试不必去启动那个全局日志
 /// 单例、也不必造一个真实文件，就能把「有路径 / 没路径」两种形态钉住。
 ///
-/// 路径用 [SelectableText] 而不是普通 [Text]：即使不点按钮，也能用鼠标
+/// 路径用 [TvSelectableText] 而不是普通 [Text]：即使不点按钮，也能用鼠标
 /// 划选带走。按钮只是让这一步更省事，不是唯一出口。
+/// ⚠️ 但 TV 上必须退回普通 `Text` —— `SelectableText` 自带可聚焦的
+/// `EditableText`，D-pad 会卡在它上面出不去（理由见 `widgets/tv_text.dart`）。
 class LogPathRow extends StatelessWidget {
   const LogPathRow({super.key, required this.path, required this.onCopy});
 
@@ -226,7 +229,7 @@ class LogPathRow extends StatelessWidget {
     return Row(
       children: [
         Expanded(
-          child: SelectableText(
+          child: TvSelectableText(
             p ?? '日志文件不可写（仅内存）',
             style: AppTheme.mono,
           ),
@@ -265,7 +268,7 @@ class _LogLine extends StatelessWidget {
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 3),
-      child: SelectableText(
+      child: TvSelectableText(
         text,
         style: TextStyle(
           fontFamily: 'Menlo',

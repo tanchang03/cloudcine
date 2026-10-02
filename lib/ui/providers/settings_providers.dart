@@ -11,6 +11,7 @@ class AppSettings {
   const AppSettings({
     this.onlineScrape = false,
     this.autoScrapeOnScan = false,
+    this.autoMergeByOnlineId = true,
     this.tmdbApiKey = '',
     this.tmdbApiBase = '',
     this.tmdbImageBase = '',
@@ -20,6 +21,8 @@ class AppSettings {
     this.defaultQuality = '',
     this.autoLoadSubtitles = true,
     this.rememberPosition = true,
+    this.autoPlayNext = true,
+    this.skipIntro = true,
     this.playerVolume = 100,
     this.playerRate = 1,
     this.scanIntervalMs = 350,
@@ -37,6 +40,12 @@ class AppSettings {
   /// 扫描结束后是否自动刮一遍。**默认关**，理由见
   /// `SettingKeys.autoScrapeOnScan`（豆瓣额度小、耗尽后整批失败）。
   final bool autoScrapeOnScan;
+
+  /// 刮到同一条目的几部作品是否自动折成一部（跨目录归一）。**默认开**。
+  ///
+  /// 理由（默认值为什么与上一项相反）见 `SettingKeys.autoMergeByOnlineId`：
+  /// 它不发网络请求，而且误合是可一键撤销的。
+  final bool autoMergeByOnlineId;
 
   /// TMDB API Key（v3 或 v4）。空串表示未配置。
   final String tmdbApiKey;
@@ -87,6 +96,22 @@ class AppSettings {
 
   final bool autoLoadSubtitles;
   final bool rememberPosition;
+
+  /// 一集播完是否自动播下一集。**默认开**，理由见
+  /// `SettingKeys.autoPlayNext`（这一项没有代价，而它的全部意义就是
+  /// 「躺在沙发上看完一整季」）。
+  ///
+  /// 「下一集是哪一条」由 `EpisodeQueue.nextAfter` 决定，两个播放器共用：
+  /// 往后扫、跳过花絮、不循环、当前项不在列表时**绝不从头开始**。
+  final bool autoPlayNext;
+
+  /// 有片头标识时是否自动跳过片头。**默认开**。
+  ///
+  /// 区间来源两路：文件内章节名（`IntroMarkerDetector`）优先，用户手标的
+  /// 区间（`MediaWork.introRange`）兜底。两路都没有时这条规则空转，
+  /// 所以开着它不会误跳。
+  final bool skipIntro;
+
   final double playerVolume;
   final double playerRate;
 
@@ -116,6 +141,7 @@ class AppSettings {
   AppSettings copyWith({
     bool? onlineScrape,
     bool? autoScrapeOnScan,
+    bool? autoMergeByOnlineId,
     String? tmdbApiKey,
     String? tmdbApiBase,
     String? tmdbImageBase,
@@ -125,6 +151,8 @@ class AppSettings {
     String? defaultQuality,
     bool? autoLoadSubtitles,
     bool? rememberPosition,
+    bool? autoPlayNext,
+    bool? skipIntro,
     double? playerVolume,
     double? playerRate,
     int? scanIntervalMs,
@@ -135,6 +163,7 @@ class AppSettings {
     return AppSettings(
       onlineScrape: onlineScrape ?? this.onlineScrape,
       autoScrapeOnScan: autoScrapeOnScan ?? this.autoScrapeOnScan,
+      autoMergeByOnlineId: autoMergeByOnlineId ?? this.autoMergeByOnlineId,
       tmdbApiKey: tmdbApiKey ?? this.tmdbApiKey,
       tmdbApiBase: tmdbApiBase ?? this.tmdbApiBase,
       tmdbImageBase: tmdbImageBase ?? this.tmdbImageBase,
@@ -144,6 +173,8 @@ class AppSettings {
       defaultQuality: defaultQuality ?? this.defaultQuality,
       autoLoadSubtitles: autoLoadSubtitles ?? this.autoLoadSubtitles,
       rememberPosition: rememberPosition ?? this.rememberPosition,
+      autoPlayNext: autoPlayNext ?? this.autoPlayNext,
+      skipIntro: skipIntro ?? this.skipIntro,
       playerVolume: playerVolume ?? this.playerVolume,
       playerRate: playerRate ?? this.playerRate,
       scanIntervalMs: scanIntervalMs ?? this.scanIntervalMs,
@@ -160,8 +191,8 @@ class AppSettings {
   /// 这里有一组**刻意不对称**的默认值，而它们在代码里长得几乎一样：
   ///
   ///   - `autoScrapeOnScan` 缺失即 `false`（产品决定：默认**不**自动刮）
-  ///   - `autoLoadSubtitles` / `rememberPosition` 缺失即 `true`（与播放器
-  ///     的缺省行为一致）
+  ///   - `autoLoadSubtitles` / `rememberPosition` / `autoPlayNext` /
+  ///     `skipIntro` 缺失即 `true`（与播放器的缺省行为一致）
   ///
   /// 判据因此必须写成两种形式（`== 'true'` 与 `!= 'false'`），写反了
   /// **不报错**，只会表现成「新装用户字幕不加载」或者「没打开开关却自动
@@ -172,6 +203,11 @@ class AppSettings {
       // 缺失即 `false`：自动刮削**默认关**，这是产品决定而不是实现细节，
       // 所以判据写成「等于 true」而不是「不等于 false」。
       autoScrapeOnScan: v[SettingKeys.autoScrapeOnScan] == 'true',
+      // ⚠️ 与上一行**刻意相反**：这一项缺失即 `true`，所以判据必须写成
+      // 「不等于 false」。写反的后果不是报错，而是「新装用户永远不合库」
+      // —— 一个没人会想到去查的默认值问题。理由见
+      // `SettingKeys.autoMergeByOnlineId`。
+      autoMergeByOnlineId: v[SettingKeys.autoMergeByOnlineId] != 'false',
       tmdbApiKey: v[SettingKeys.tmdbApiKey] ?? '',
       tmdbApiBase: v[SettingKeys.tmdbApiBase] ?? '',
       tmdbImageBase: v[SettingKeys.tmdbImageBase] ?? '',
@@ -185,6 +221,14 @@ class AppSettings {
       // 缺省行为保持一致。两处不一致会出现「设置页显示开、实际没加载」。
       autoLoadSubtitles: v[SettingKeys.autoLoadSubtitles] != 'false',
       rememberPosition: v[SettingKeys.rememberPosition] != 'false',
+      // 连播与跳片头同属「缺失即开」这一族，判据也必须是 `!= 'false'`。
+      //
+      // ⚠️ 连播**不**依赖 `rememberPosition`：即使关了「记住进度」，
+      // 一集播完照样该接下一集。把两者绑在一起（`rememberPosition &&
+      // autoPlayNext`）看着省事，实际会造出「关了记住进度就再也不连播」
+      // 这种没人预料得到的联动。
+      autoPlayNext: v[SettingKeys.autoPlayNext] != 'false',
+      skipIntro: v[SettingKeys.skipIntro] != 'false',
       playerVolume: double.tryParse(v[SettingKeys.playerVolume] ?? '') ?? 100,
       playerRate: double.tryParse(v[SettingKeys.playerRate] ?? '') ?? 1,
       scanIntervalMs: int.tryParse(v[SettingKeys.scanIntervalMs] ?? '') ?? 350,
@@ -207,6 +251,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     final v = await store.readAll(const [
       SettingKeys.onlineScrape,
       SettingKeys.autoScrapeOnScan,
+      SettingKeys.autoMergeByOnlineId,
       SettingKeys.tmdbApiKey,
       SettingKeys.tmdbApiBase,
       SettingKeys.tmdbImageBase,
@@ -216,6 +261,8 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       SettingKeys.defaultQuality,
       SettingKeys.autoLoadSubtitles,
       SettingKeys.rememberPosition,
+      SettingKeys.autoPlayNext,
+      SettingKeys.skipIntro,
       SettingKeys.playerVolume,
       SettingKeys.playerRate,
       SettingKeys.scanIntervalMs,
@@ -231,6 +278,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
   Future<void> set({
     bool? onlineScrape,
     bool? autoScrapeOnScan,
+    bool? autoMergeByOnlineId,
     String? tmdbApiKey,
     String? tmdbApiBase,
     String? tmdbImageBase,
@@ -240,6 +288,8 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     String? defaultQuality,
     bool? autoLoadSubtitles,
     bool? rememberPosition,
+    bool? autoPlayNext,
+    bool? skipIntro,
     double? playerVolume,
     double? playerRate,
     int? scanIntervalMs,
@@ -254,6 +304,12 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     }
     if (autoScrapeOnScan != null) {
       await store.writeBool(SettingKeys.autoScrapeOnScan, autoScrapeOnScan);
+    }
+    if (autoMergeByOnlineId != null) {
+      await store.writeBool(
+        SettingKeys.autoMergeByOnlineId,
+        autoMergeByOnlineId,
+      );
     }
     if (tmdbApiKey != null) {
       await store.write(SettingKeys.tmdbApiKey, tmdbApiKey.trim());
@@ -285,6 +341,12 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     if (rememberPosition != null) {
       await store.writeBool(SettingKeys.rememberPosition, rememberPosition);
     }
+    if (autoPlayNext != null) {
+      await store.writeBool(SettingKeys.autoPlayNext, autoPlayNext);
+    }
+    if (skipIntro != null) {
+      await store.writeBool(SettingKeys.skipIntro, skipIntro);
+    }
     if (playerVolume != null) {
       await store.write(SettingKeys.playerVolume, '$playerVolume');
     }
@@ -305,6 +367,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       current.copyWith(
         onlineScrape: onlineScrape,
         autoScrapeOnScan: autoScrapeOnScan,
+        autoMergeByOnlineId: autoMergeByOnlineId,
         tmdbApiKey: tmdbApiKey?.trim(),
         tmdbApiBase: tmdbApiBase?.trim(),
         tmdbImageBase: tmdbImageBase?.trim(),
@@ -314,6 +377,8 @@ class SettingsController extends AsyncNotifier<AppSettings> {
         defaultQuality: defaultQuality,
         autoLoadSubtitles: autoLoadSubtitles,
         rememberPosition: rememberPosition,
+        autoPlayNext: autoPlayNext,
+        skipIntro: skipIntro,
         playerVolume: playerVolume,
         playerRate: playerRate,
         scanIntervalMs: scanIntervalMs,

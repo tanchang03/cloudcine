@@ -16,6 +16,34 @@ import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/tv_affordance.dart';
+import '../widgets/tv_text.dart';
+
+/// 二维码那一块外框的 key（测试用来量边长）。
+///
+/// 需要一个 key 才能在不建立真实扫码会话的前提下断言尺寸 —— 这个框
+/// **任何阶段都渲染**（loading 时里面是转圈、错误时是图标），所以测试不必
+/// 造一个假的网络客户端就能量到它。
+@visibleForTesting
+const Key qrAreaKey = Key('qr-login-area');
+
+/// 二维码外框的边长。
+///
+/// ## 为什么不能写死 208
+///
+/// 208 是「人坐在电脑前 40 厘米」的尺寸。TV 上用户得退到 **3 米**外才看得全
+/// 整个画面，208 的码在那个距离上糊成一团 —— 而「扫不出来」和「码没生成」
+/// 在用户眼里是同一件事，他只会反复点「刷新二维码」
+/// （见 `docs/AndroidTV-遥控器体验评估.md` 的 P2-6）。TV 上按官方建议取 **320**。
+///
+/// ## 为什么要夹到可用宽度
+///
+/// 被父级裁掉一角的二维码**永远扫不出来**，而且看起来完全正常 ——
+/// 所以宁可画得比目标值小，也不许溢出：窗口被拉窄时跟着缩。
+double qrEdgeFor({required bool tv, required double availableWidth}) {
+  final wanted = tv ? 320.0 : 208.0;
+  if (!availableWidth.isFinite || availableWidth >= wanted) return wanted;
+  return availableWidth < 0 ? 0 : availableWidth;
+}
 
 /// 扫码登录页（主登录入口）。
 ///
@@ -346,8 +374,19 @@ class _AuthQrLoginPageState extends ConsumerState<AuthQrLoginPage> {
   }
 
   Widget _buildQrArea() {
-    const size = 208.0;
+    return LayoutBuilder(
+      builder: (context, constraints) => _qrBox(
+        qrEdgeFor(
+          tv: AppTheme.isTvLayout(context),
+          availableWidth: constraints.maxWidth,
+        ),
+      ),
+    );
+  }
+
+  Widget _qrBox(double size) {
     return Container(
+      key: qrAreaKey,
       width: size,
       height: size,
       decoration: BoxDecoration(
@@ -613,7 +652,7 @@ class _MonoBlock extends StatelessWidget {
         color: AppTheme.panel2,
         borderRadius: BorderRadius.circular(8),
       ),
-      child: SelectableText(text, style: AppTheme.mono),
+      child: TvSelectableText(text, style: AppTheme.mono),
     );
   }
 }
