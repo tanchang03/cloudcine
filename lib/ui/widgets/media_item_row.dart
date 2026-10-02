@@ -157,6 +157,7 @@ class MediaItemRow extends ConsumerWidget {
                 CopyTextButton(
                   text: item.netdiskPath,
                   label: '复制这个文件的网盘路径',
+                  tvLabel: '复制路径',
                   icon: Icons.content_copy_rounded,
                 ),
                 const SizedBox(width: 4),

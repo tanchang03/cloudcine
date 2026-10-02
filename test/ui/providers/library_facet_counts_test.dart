@@ -19,7 +19,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// 就会出现「列表已经按回填后的分类筛好了，面板上的数字却还是按回填前的
 /// 分类算的」—— 两者对不上，而用户完全看不出为什么。
 ///
-/// 这条依赖很反直觉（「数年代为什么会依赖分类？」），所以写个测试钉住，
+/// 这条依赖很反直觉（「数年份为什么会依赖分类？」），所以写个测试钉住，
 /// 免得下一轮有人觉得那个 `await` 是多余的顺手删掉。
 void main() {
   final now = DateTime(2026, 10, 1);
@@ -76,14 +76,14 @@ void main() {
     // 用户在分类栏里点了「动漫」。
     container.read(libraryFilterProvider.notifier).setCategory(MediaCategory.anime);
 
-    final counts = await container.read(decadeCountsProvider.future);
+    final counts = await container.read(yearCountsProvider.future);
 
     expect(
       counts,
-      {2020: 1},
+      {2021: 1},
       reason: '不等回填的话，这一行还带着空串分类，而「动漫」那一档的条件是 '
           '`category = "anime"` —— 统计结果是空表。用户看到的是「动漫栏里'
-          '明明有一部 2021 年的片子，筛选面板里却没有 2020 年代」。',
+          '明明有一部 2021 年的片子，筛选面板里却没有 2021」。',
     );
   });
 
@@ -97,13 +97,13 @@ void main() {
     );
     container.read(libraryFilterProvider.notifier).setCategory(MediaCategory.anime);
 
-    final counts = await container.read(decadeCountsProvider.future);
+    final counts = await container.read(yearCountsProvider.future);
     final genres = await container.read(genreCountsProvider.future);
 
     // 这两条断言不是凑数的：下面的循环**空表时一次都不执行**，
     // 所以少了它们，provider 一旦漏掉回填（角标全空），这条不变量
     // 会以「零次比较」的方式通过 —— 正是它要防的那种失败。
-    expect(counts, isNotEmpty, reason: '年代角标空了，下面的循环等于没跑');
+    expect(counts, isNotEmpty, reason: '年份角标空了，下面的循环等于没跑');
     expect(genres, isNotEmpty, reason: '类型角标空了，下面的循环等于没跑');
 
     // 列表侧走的是同一个仓储，但 `workListProvider` 已经等过回填了 ——
@@ -113,9 +113,9 @@ void main() {
     for (final entry in counts.entries) {
       final hit = await repo.listWorks(
         category: MediaCategory.anime,
-        decades: {entry.key},
+        years: {entry.key},
       );
-      expect(hit, hasLength(entry.value), reason: '${entry.key} 年代');
+      expect(hit, hasLength(entry.value), reason: '${entry.key} 年');
     }
     for (final entry in genres.entries) {
       final hit = await repo.listWorks(
@@ -130,6 +130,6 @@ void main() {
     await seedLegacy(key: 'a', kind: 'movie', title: '甲', year: 1995);
     await seedLegacy(key: 'b', kind: 'movie', title: '乙', year: 2023);
 
-    expect(await container.read(decadeCountsProvider.future), {1990: 1, 2020: 1});
+    expect(await container.read(yearCountsProvider.future), {1995: 1, 2023: 1});
   });
 }

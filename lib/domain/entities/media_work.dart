@@ -1,4 +1,5 @@
 import '../../core/utils/filename_parser.dart';
+import '../../core/utils/format.dart';
 import '../../core/utils/media_category.dart';
 import 'drive_provider.dart';
 
@@ -35,6 +36,7 @@ class MediaWork {
     required this.kind,
     required this.title,
     this.category = MediaCategory.other,
+    this.categoryManual = false,
     this.originalTitle,
     this.year,
     this.overview,
@@ -45,11 +47,13 @@ class MediaWork {
     this.backdropFile,
     this.rating,
     this.genres = const [],
+    this.genresManual = false,
     this.onlineId,
     this.source = ScrapeSource.local,
     this.scrapedAt,
     this.itemCount = 0,
     this.totalBytes = 0,
+    this.seasonCount = 0,
     this.lastModifiedAt,
     this.firstSeenAt,
     this.lastPlayedAt,
@@ -72,6 +76,14 @@ class MediaWork {
   /// 每次查询时现算，是因为分类栏要能**在 SQL 里筛选**，几千部作品在
   /// Dart 侧过滤会让「点一下分类」变成一次全表扫描。
   final MediaCategory category;
+
+  /// 分类是否由用户手动指定。
+  ///
+  /// `true` 时，`mergeWorkForUpsert` 和 `WorkScraper._categoryFor` 不会用
+  /// `fromGenres` 覆盖 [category] —— 即使用户重新刮削 / 重新扫描。
+  ///
+  /// 设为 `false` 可以恢复自动判定行为（后续刮削可再次改写分类）。
+  final bool categoryManual;
 
   /// 原始标题（在线刮削返回的 `original_title`）
   final String? originalTitle;
@@ -102,6 +114,13 @@ class MediaWork {
   final double? rating;
   final List<String> genres;
 
+  /// 类型标签是否由用户手动编辑过。
+  ///
+  /// `true` 时，`mergeWorkForUpsert` 和 `WorkScraper._apply` 不会用刮削
+  /// 返回的类型覆盖 [genres] —— 即使用户重新刮削。设为 `false` 恢复
+  /// 「刮削说了算」。
+  final bool genresManual;
+
   /// 在线刮削的条目 ID（如 TMDB 的 `tv/12345`）
   final String? onlineId;
 
@@ -111,6 +130,15 @@ class MediaWork {
   /// 作品下的文件数（冗余字段，列表页避免 N+1 查询）
   final int itemCount;
   final int totalBytes;
+
+  /// 作品下**已标季号**的季数（去重；不含「未标季」那一桶）。
+  ///
+  /// 冗余字段，与 [itemCount] 同一条理由：卡片要显示「3 季」，现算就得对
+  /// `media_items` 做一次 `COUNT(DISTINCT season)` 子查询。
+  ///
+  /// ⚠️ **`0` 和 `1` 都表示「不该显示」** —— 电影、单季剧、以及还没重扫过的
+  /// 老库都是这个值。只有 `>= 2` 才有信息量（「只有一季」写在卡片上是废话）。
+  final int seasonCount;
 
   /// 作品下所有文件的**网盘修改时间**最大值。
   ///
@@ -139,6 +167,9 @@ class MediaWork {
   String get subtitleLine {
     final parts = <String>[category.label];
     if (year != null) parts.add('$year');
+    // 「N 季」只在这个数字**有信息量**时才出现：一季写在卡片上是废话，
+    // 而 0（电影 / 老库）更不该出现。
+    if (seasonCount >= 2) parts.add('$seasonCount 季');
     if (itemCount > 0) {
       parts.add(kind == MediaKind.episode ? '$itemCount 集' : '$itemCount 个文件');
     }
@@ -146,9 +177,28 @@ class MediaWork {
     return parts.join(' · ');
   }
 
+  /// 卡片第三行：文件大小 · 网盘更新时间。
+  ///
+  /// 与 [subtitleLine] 分开：副标题已经可能满行（分类 · 年份 · N集 · 评分），
+  /// 再塞进去会被 `TextOverflow.ellipsis` 截掉，而体积和时间恰恰是
+  /// 用户想看到的信息。单独一行保证它们至少各有一次出现的机会。
+  ///
+  /// - `totalBytes` 为 0（未扫描或聚合前）时不显示体积；
+  /// - `lastModifiedAt` 为 null 时不显示时间；
+  /// - 两者都没有时返回空串，调用方应据此不画这一行。
+  String get metaLine {
+    final parts = <String>[];
+    if (totalBytes > 0) parts.add(formatBytes(totalBytes));
+    if (lastModifiedAt != null) {
+      parts.add(formatRelativeTime(lastModifiedAt!));
+    }
+    return parts.join(' · ');
+  }
+
   MediaWork copyWith({
     String? title,
     MediaCategory? category,
+    bool? categoryManual,
     String? originalTitle,
     int? year,
     String? overview,
@@ -159,11 +209,13 @@ class MediaWork {
     String? backdropFile,
     double? rating,
     List<String>? genres,
+    bool? genresManual,
     String? onlineId,
     ScrapeSource? source,
     DateTime? scrapedAt,
     int? itemCount,
     int? totalBytes,
+    int? seasonCount,
     DateTime? lastModifiedAt,
     DateTime? firstSeenAt,
     DateTime? lastPlayedAt,
@@ -175,6 +227,7 @@ class MediaWork {
         kind: kind,
         title: title ?? this.title,
         category: category ?? this.category,
+        categoryManual: categoryManual ?? this.categoryManual,
         originalTitle: originalTitle ?? this.originalTitle,
         year: year ?? this.year,
         overview: overview ?? this.overview,
@@ -185,15 +238,103 @@ class MediaWork {
         backdropFile: backdropFile ?? this.backdropFile,
         rating: rating ?? this.rating,
         genres: genres ?? this.genres,
+        genresManual: genresManual ?? this.genresManual,
         onlineId: onlineId ?? this.onlineId,
         source: source ?? this.source,
         scrapedAt: scrapedAt ?? this.scrapedAt,
         itemCount: itemCount ?? this.itemCount,
         totalBytes: totalBytes ?? this.totalBytes,
+        seasonCount: seasonCount ?? this.seasonCount,
         lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
         firstSeenAt: firstSeenAt ?? this.firstSeenAt,
         lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
         updatedAt: updatedAt ?? this.updatedAt,
+      );
+
+  /// **清除在线刮削信息 + 自定义**。
+  ///
+  /// 走这条路的场景只有一个：自动刮削把这部作品刮错了，而**库里根本没有
+  /// 对得上的条目**（自制视频、演唱会、赛事、课程…）。自动那侧能做的都做了，
+  /// 剩下唯一正确的动作是把在线源留下的痕迹全部抹掉，换成人自己敲的片名与
+  /// 分类 —— 也就是详情页「自定义」那个按钮。
+  ///
+  /// ## 为什么是独立方法，而不是拼一串 `copyWith`
+  ///
+  /// `copyWith` 对每个可空字段都用 `??` 兜底，**没法把字段改回 `null`**
+  /// （传 `null` 等于「不改」）。而本方法要做的恰恰是把海报、简介、评分、
+  /// 刮来的类型这些**清空** —— 用 `copyWith` 拼出来会得到一个「看着像清空了、
+  /// 其实一个字段都没清」的行，而且它编译通过、落库成功、界面上什么都不变。
+  ///
+  /// ## 四个不那么显然的决定
+  ///
+  ///   - **[source] 是 [ScrapeSource.manual]，不是 [ScrapeSource.local]。**
+  ///     `local` 的含义是「这一行是文件名解析的产物」，于是下一次扫描时
+  ///     `mergeWorkForUpsert` 会认为「库里这条和我这次算出来的同源」，
+  ///     拿文件名解析出的标题**覆盖掉用户刚敲进去的片名**。`manual` 才落进
+  ///     那边的保护分支（那条注释写的就是「用户手工改过的当然更不能被
+  ///     文件名顶掉」）；
+  ///   - **[categoryManual] 置 `true`**：分类是用户在对话框里选的，后续
+  ///     重扫 / 重刮都不许用 `fromGenres` 改写它 —— 与 `setWorkCategory`
+  ///     同一条规则；
+  ///   - **`genres` 只清「刮来的」那一份**：类型标签现在是可手敲、可锁的
+  ///     （`genresManual`，详情页「编辑类型」那个 chip），而
+  ///     `mergeWorkForUpsert` 早就立过规矩 —— 用户手敲的类型连**重刮削**
+  ///     都不许覆盖（那条 `genresManual` 分支排在保护模式**之前**）。
+  ///     「清在线信息」当然更该守这条：无条件清空会把用户挑好的类型连同
+  ///     锁一起抹掉，而且**不报错**；
+  ///   - **文件数 / 体积 / 网盘时间 / 播放记录原样保留**：它们与刮削无关，
+  ///     是扫描和播放的产物。这里若图省事不抄，构造器默认值会把库里的真实
+  ///     数字抹成 0 —— `itemCount` 一变成 0，卡片副标题上的「N 集」就没了。
+  ///
+  /// ## 清掉的字段会自己长回来吗
+  ///
+  /// 会，而且这正是想要的效果 —— 但**只从本地来源**：
+  ///
+  ///   - `year`：下次重扫时由文件名解析补回（`_preferOld` 在旧值为 `null`
+  ///     时取新值）；
+  ///   - `posterUrl` / `posterFaceX`：下次重扫时回落到**网盘缩略图**
+  ///     （夸克的服务端视频帧），成对恢复。
+  ///
+  /// 而在线源那张**刮错了的海报**不会回来：`mergeWorkForUpsert` 里有一条
+  /// 针对 `manual` 的守卫，扫描期的自动刮削碰不到这一行。
+  MediaWork customized({
+    required String title,
+    required MediaCategory category,
+    required DateTime updatedAt,
+  }) =>
+      MediaWork(
+        key: key,
+        provider: provider,
+        kind: kind,
+        category: category,
+        categoryManual: true,
+        title: title,
+        // ---- 以下全部是在线刮削的产物，逐项清空 ----
+        originalTitle: null,
+        year: null,
+        overview: null,
+        posterUrl: null,
+        posterFile: null,
+        posterFaceX: null,
+        backdropUrl: null,
+        backdropFile: null,
+        rating: null,
+        // 只清刮来的那份；用户手敲并锁住的原样保留（理由见上方文档）。
+        // `genresManual` 必须一起抄 —— 漏了它就等于**偷偷解锁**：
+        // 类型留着，但下一次刮削会把它们整份覆盖掉。
+        genres: genresManual ? genres : const [],
+        genresManual: genresManual,
+        onlineId: null,
+        source: ScrapeSource.manual,
+        scrapedAt: null,
+        // ---- 与刮削无关，原样保留 ----
+        itemCount: itemCount,
+        totalBytes: totalBytes,
+        seasonCount: seasonCount,
+        lastModifiedAt: lastModifiedAt,
+        firstSeenAt: firstSeenAt,
+        lastPlayedAt: lastPlayedAt,
+        updatedAt: updatedAt,
       );
 
   @override
@@ -344,10 +485,22 @@ class ScrapeQuery {
   ///
   /// 只在**两种文字都解析出来**时才有备用词：只有一个的时候它已经就是
   /// [title] 了，再搜一遍是白花一次配额。
+  ///
+  /// ## 备用词必须是「另一个名字」，不是一串编号
+  ///
+  /// 2026-10-02 事故：`182.格力空调显示E6如何维修.mp4` 解析出
+  /// `cjk=格力空调显示`、`latin=182`。旧规则只看「两边都非空」，于是又拿
+  /// `"182"` 去搜了一次 TMDB —— 模糊搜索返回希腊纪录片《1821: Οι Ήρωες》，
+  /// 匹配闸门的前缀档判它 **0.91**（`182` 是 `1821` 的前缀），无条件通过，
+  /// 整部家电维修教程被挂上了一部希腊纪录片的海报与简介。
+  ///
+  /// 判据：去掉数字与标点后**至少还剩 2 个字母**。
+  /// `182` → 0 个（拒）、`182 E6` → 1 个（拒）、`3 Idiots` → 6 个（放行）。
   static String? _alternateOf(ParsedMediaName parsed) {
     final cjk = parsed.cjkTitle;
     final latin = parsed.latinTitle;
     if (cjk == null || latin == null) return null;
+    if (RegExp(r'[A-Za-z]').allMatches(latin).length < 2) return null;
     return latin;
   }
 

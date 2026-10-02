@@ -138,6 +138,26 @@ class $MediaItemsTable extends MediaItems
     type: DriftSqlType.int,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _partMeta = const VerificationMeta('part');
+  @override
+  late final GeneratedColumn<int> part = GeneratedColumn<int>(
+    'part',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _partLabelMeta = const VerificationMeta(
+    'partLabel',
+  );
+  @override
+  late final GeneratedColumn<String> partLabel = GeneratedColumn<String>(
+    'part_label',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
   static const VerificationMeta _containerMeta = const VerificationMeta(
     'container',
   );
@@ -353,6 +373,8 @@ class $MediaItemsTable extends MediaItems
     season,
     episode,
     episodeEnd,
+    part,
+    partLabel,
     container,
     resolution,
     sizeBytes,
@@ -469,6 +491,18 @@ class $MediaItemsTable extends MediaItems
       context.handle(
         _episodeEndMeta,
         episodeEnd.isAcceptableOrUnknown(data['episode_end']!, _episodeEndMeta),
+      );
+    }
+    if (data.containsKey('part')) {
+      context.handle(
+        _partMeta,
+        part.isAcceptableOrUnknown(data['part']!, _partMeta),
+      );
+    }
+    if (data.containsKey('part_label')) {
+      context.handle(
+        _partLabelMeta,
+        partLabel.isAcceptableOrUnknown(data['part_label']!, _partLabelMeta),
       );
     }
     if (data.containsKey('container')) {
@@ -670,6 +704,14 @@ class $MediaItemsTable extends MediaItems
         DriftSqlType.int,
         data['${effectivePrefix}episode_end'],
       ),
+      part: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}part'],
+      ),
+      partLabel: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}part_label'],
+      ),
       container:
           attachedDatabase.typeMapping.read(
             DriftSqlType.string,
@@ -778,6 +820,18 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
   final int? episode;
   final int? episodeEnd;
 
+  /// 部号（`第X部` / `上部`·`下部` / `Part.2` / `CD1`）。
+  ///
+  /// 与 [season] 是两个维度：季是外层、部是内层（《进击的巨人》第三季
+  /// Part.1/Part.2）。**NULL 语义是「没标部」** —— 详情页据此不画「部」
+  /// 那一层，所以旧库升级后不需要回填，行为与升级前完全一致。
+  final int? part;
+
+  /// 部的展示名（`特别篇` / `上部` / `下部`）。NULL 表示没有专名。
+  ///
+  /// 存文本而不是枚举：这是发布组自己起的名字，穷举不完。
+  final String? partLabel;
+
   /// 容器标识（`VideoContainer.name`）
   final String container;
 
@@ -857,6 +911,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     this.season,
     this.episode,
     this.episodeEnd,
+    this.part,
+    this.partLabel,
     required this.container,
     this.resolution,
     this.sizeBytes,
@@ -901,6 +957,12 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     }
     if (!nullToAbsent || episodeEnd != null) {
       map['episode_end'] = Variable<int>(episodeEnd);
+    }
+    if (!nullToAbsent || part != null) {
+      map['part'] = Variable<int>(part);
+    }
+    if (!nullToAbsent || partLabel != null) {
+      map['part_label'] = Variable<String>(partLabel);
     }
     map['container'] = Variable<String>(container);
     if (!nullToAbsent || resolution != null) {
@@ -972,6 +1034,11 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           episodeEnd == null && nullToAbsent
               ? const Value.absent()
               : Value(episodeEnd),
+      part: part == null && nullToAbsent ? const Value.absent() : Value(part),
+      partLabel:
+          partLabel == null && nullToAbsent
+              ? const Value.absent()
+              : Value(partLabel),
       container: Value(container),
       resolution:
           resolution == null && nullToAbsent
@@ -1049,6 +1116,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       season: serializer.fromJson<int?>(json['season']),
       episode: serializer.fromJson<int?>(json['episode']),
       episodeEnd: serializer.fromJson<int?>(json['episodeEnd']),
+      part: serializer.fromJson<int?>(json['part']),
+      partLabel: serializer.fromJson<String?>(json['partLabel']),
       container: serializer.fromJson<String>(json['container']),
       resolution: serializer.fromJson<String?>(json['resolution']),
       sizeBytes: serializer.fromJson<int?>(json['sizeBytes']),
@@ -1086,6 +1155,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       'season': serializer.toJson<int?>(season),
       'episode': serializer.toJson<int?>(episode),
       'episodeEnd': serializer.toJson<int?>(episodeEnd),
+      'part': serializer.toJson<int?>(part),
+      'partLabel': serializer.toJson<String?>(partLabel),
       'container': serializer.toJson<String>(container),
       'resolution': serializer.toJson<String?>(resolution),
       'sizeBytes': serializer.toJson<int?>(sizeBytes),
@@ -1121,6 +1192,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     Value<int?> season = const Value.absent(),
     Value<int?> episode = const Value.absent(),
     Value<int?> episodeEnd = const Value.absent(),
+    Value<int?> part = const Value.absent(),
+    Value<String?> partLabel = const Value.absent(),
     String? container,
     Value<String?> resolution = const Value.absent(),
     Value<int?> sizeBytes = const Value.absent(),
@@ -1153,6 +1226,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     season: season.present ? season.value : this.season,
     episode: episode.present ? episode.value : this.episode,
     episodeEnd: episodeEnd.present ? episodeEnd.value : this.episodeEnd,
+    part: part.present ? part.value : this.part,
+    partLabel: partLabel.present ? partLabel.value : this.partLabel,
     container: container ?? this.container,
     resolution: resolution.present ? resolution.value : this.resolution,
     sizeBytes: sizeBytes.present ? sizeBytes.value : this.sizeBytes,
@@ -1191,6 +1266,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       episode: data.episode.present ? data.episode.value : this.episode,
       episodeEnd:
           data.episodeEnd.present ? data.episodeEnd.value : this.episodeEnd,
+      part: data.part.present ? data.part.value : this.part,
+      partLabel: data.partLabel.present ? data.partLabel.value : this.partLabel,
       container: data.container.present ? data.container.value : this.container,
       resolution:
           data.resolution.present ? data.resolution.value : this.resolution,
@@ -1248,6 +1325,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           ..write('season: $season, ')
           ..write('episode: $episode, ')
           ..write('episodeEnd: $episodeEnd, ')
+          ..write('part: $part, ')
+          ..write('partLabel: $partLabel, ')
           ..write('container: $container, ')
           ..write('resolution: $resolution, ')
           ..write('sizeBytes: $sizeBytes, ')
@@ -1285,6 +1364,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     season,
     episode,
     episodeEnd,
+    part,
+    partLabel,
     container,
     resolution,
     sizeBytes,
@@ -1321,6 +1402,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           other.season == this.season &&
           other.episode == this.episode &&
           other.episodeEnd == this.episodeEnd &&
+          other.part == this.part &&
+          other.partLabel == this.partLabel &&
           other.container == this.container &&
           other.resolution == this.resolution &&
           other.sizeBytes == this.sizeBytes &&
@@ -1355,6 +1438,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
   final Value<int?> season;
   final Value<int?> episode;
   final Value<int?> episodeEnd;
+  final Value<int?> part;
+  final Value<String?> partLabel;
   final Value<String> container;
   final Value<String?> resolution;
   final Value<int?> sizeBytes;
@@ -1388,6 +1473,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     this.season = const Value.absent(),
     this.episode = const Value.absent(),
     this.episodeEnd = const Value.absent(),
+    this.part = const Value.absent(),
+    this.partLabel = const Value.absent(),
     this.container = const Value.absent(),
     this.resolution = const Value.absent(),
     this.sizeBytes = const Value.absent(),
@@ -1422,6 +1509,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     this.season = const Value.absent(),
     this.episode = const Value.absent(),
     this.episodeEnd = const Value.absent(),
+    this.part = const Value.absent(),
+    this.partLabel = const Value.absent(),
     this.container = const Value.absent(),
     this.resolution = const Value.absent(),
     this.sizeBytes = const Value.absent(),
@@ -1463,6 +1552,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Expression<int>? season,
     Expression<int>? episode,
     Expression<int>? episodeEnd,
+    Expression<int>? part,
+    Expression<String>? partLabel,
     Expression<String>? container,
     Expression<String>? resolution,
     Expression<int>? sizeBytes,
@@ -1497,6 +1588,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       if (season != null) 'season': season,
       if (episode != null) 'episode': episode,
       if (episodeEnd != null) 'episode_end': episodeEnd,
+      if (part != null) 'part': part,
+      if (partLabel != null) 'part_label': partLabel,
       if (container != null) 'container': container,
       if (resolution != null) 'resolution': resolution,
       if (sizeBytes != null) 'size_bytes': sizeBytes,
@@ -1533,6 +1626,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Value<int?>? season,
     Value<int?>? episode,
     Value<int?>? episodeEnd,
+    Value<int?>? part,
+    Value<String?>? partLabel,
     Value<String>? container,
     Value<String?>? resolution,
     Value<int?>? sizeBytes,
@@ -1567,6 +1662,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       season: season ?? this.season,
       episode: episode ?? this.episode,
       episodeEnd: episodeEnd ?? this.episodeEnd,
+      part: part ?? this.part,
+      partLabel: partLabel ?? this.partLabel,
       container: container ?? this.container,
       resolution: resolution ?? this.resolution,
       sizeBytes: sizeBytes ?? this.sizeBytes,
@@ -1630,6 +1727,12 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     }
     if (episodeEnd.present) {
       map['episode_end'] = Variable<int>(episodeEnd.value);
+    }
+    if (part.present) {
+      map['part'] = Variable<int>(part.value);
+    }
+    if (partLabel.present) {
+      map['part_label'] = Variable<String>(partLabel.value);
     }
     if (container.present) {
       map['container'] = Variable<String>(container.value);
@@ -1707,6 +1810,8 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
           ..write('season: $season, ')
           ..write('episode: $episode, ')
           ..write('episodeEnd: $episodeEnd, ')
+          ..write('part: $part, ')
+          ..write('partLabel: $partLabel, ')
           ..write('container: $container, ')
           ..write('resolution: $resolution, ')
           ..write('sizeBytes: $sizeBytes, ')
@@ -1777,6 +1882,21 @@ class $MediaWorksTable extends MediaWorks
     type: DriftSqlType.string,
     requiredDuringInsert: false,
     defaultValue: const Constant(''),
+  );
+  static const VerificationMeta _categoryManualMeta = const VerificationMeta(
+    'categoryManual',
+  );
+  @override
+  late final GeneratedColumn<bool> categoryManual = GeneratedColumn<bool>(
+    'category_manual',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("category_manual" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
   );
   static const VerificationMeta _titleMeta = const VerificationMeta('title');
   @override
@@ -1892,6 +2012,21 @@ class $MediaWorksTable extends MediaWorks
     requiredDuringInsert: false,
     defaultValue: const Constant('[]'),
   );
+  static const VerificationMeta _genresManualMeta = const VerificationMeta(
+    'genresManual',
+  );
+  @override
+  late final GeneratedColumn<bool> genresManual = GeneratedColumn<bool>(
+    'genres_manual',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("genres_manual" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
   static const VerificationMeta _onlineIdMeta = const VerificationMeta(
     'onlineId',
   );
@@ -1941,6 +2076,18 @@ class $MediaWorksTable extends MediaWorks
   @override
   late final GeneratedColumn<int> totalBytes = GeneratedColumn<int>(
     'total_bytes',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(0),
+  );
+  static const VerificationMeta _seasonCountMeta = const VerificationMeta(
+    'seasonCount',
+  );
+  @override
+  late final GeneratedColumn<int> seasonCount = GeneratedColumn<int>(
+    'season_count',
     aliasedName,
     false,
     type: DriftSqlType.int,
@@ -1998,6 +2145,7 @@ class $MediaWorksTable extends MediaWorks
     provider,
     kind,
     category,
+    categoryManual,
     title,
     originalTitle,
     year,
@@ -2009,11 +2157,13 @@ class $MediaWorksTable extends MediaWorks
     backdropFile,
     rating,
     genres,
+    genresManual,
     onlineId,
     source,
     scrapedAt,
     itemCount,
     totalBytes,
+    seasonCount,
     lastModifiedAt,
     firstSeenAt,
     lastPlayedAt,
@@ -2059,6 +2209,15 @@ class $MediaWorksTable extends MediaWorks
       context.handle(
         _categoryMeta,
         category.isAcceptableOrUnknown(data['category']!, _categoryMeta),
+      );
+    }
+    if (data.containsKey('category_manual')) {
+      context.handle(
+        _categoryManualMeta,
+        categoryManual.isAcceptableOrUnknown(
+          data['category_manual']!,
+          _categoryManualMeta,
+        ),
       );
     }
     if (data.containsKey('title')) {
@@ -2141,6 +2300,15 @@ class $MediaWorksTable extends MediaWorks
         genres.isAcceptableOrUnknown(data['genres']!, _genresMeta),
       );
     }
+    if (data.containsKey('genres_manual')) {
+      context.handle(
+        _genresManualMeta,
+        genresManual.isAcceptableOrUnknown(
+          data['genres_manual']!,
+          _genresManualMeta,
+        ),
+      );
+    }
     if (data.containsKey('online_id')) {
       context.handle(
         _onlineIdMeta,
@@ -2171,6 +2339,15 @@ class $MediaWorksTable extends MediaWorks
       context.handle(
         _totalBytesMeta,
         totalBytes.isAcceptableOrUnknown(data['total_bytes']!, _totalBytesMeta),
+      );
+    }
+    if (data.containsKey('season_count')) {
+      context.handle(
+        _seasonCountMeta,
+        seasonCount.isAcceptableOrUnknown(
+          data['season_count']!,
+          _seasonCountMeta,
+        ),
       );
     }
     if (data.containsKey('last_modified_at')) {
@@ -2237,6 +2414,11 @@ class $MediaWorksTable extends MediaWorks
             DriftSqlType.string,
             data['${effectivePrefix}category'],
           )!,
+      categoryManual:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.bool,
+            data['${effectivePrefix}category_manual'],
+          )!,
       title:
           attachedDatabase.typeMapping.read(
             DriftSqlType.string,
@@ -2283,6 +2465,11 @@ class $MediaWorksTable extends MediaWorks
             DriftSqlType.string,
             data['${effectivePrefix}genres'],
           )!,
+      genresManual:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.bool,
+            data['${effectivePrefix}genres_manual'],
+          )!,
       onlineId: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
         data['${effectivePrefix}online_id'],
@@ -2305,6 +2492,11 @@ class $MediaWorksTable extends MediaWorks
           attachedDatabase.typeMapping.read(
             DriftSqlType.int,
             data['${effectivePrefix}total_bytes'],
+          )!,
+      seasonCount:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.int,
+            data['${effectivePrefix}season_count'],
           )!,
       lastModifiedAt: attachedDatabase.typeMapping.read(
         DriftSqlType.dateTime,
@@ -2345,6 +2537,17 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   /// 两者混在一起的话，回填逻辑会反复把 `other` 当成待判定的行重算，
   /// 而真正的「其他」作品永远修不好（因为它本来就该是 other）。
   final String category;
+
+  /// 用户是否手动指定了分类。
+  ///
+  /// `true` 时，[mergeWorkForUpsert] 与 `WorkScraper._categoryFor` **不再用
+  /// `fromGenres` 覆盖** `category` 列 —— 用户说了算，刮削的 genres 说了不算。
+  ///
+  /// 为什么不直接复用 `source = manual`：`source` 是「整条元数据的来源」
+  /// （标题 / 海报 / 简介），刮削过一次就会变成 `online`；而分类只是其中
+  /// 一列，用户可以在保留在线标题的同时只改分类。两者语义不同，混在一起
+  /// 会让「重新刮削」误判为「需要保护整行」或反过来。
+  final bool categoryManual;
   final String title;
   final String? originalTitle;
   final int? year;
@@ -2369,6 +2572,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
 
   /// 类型列表，存 JSON 数组字符串。
   final String genres;
+
+  /// 用户是否手动编辑过类型标签（[genres]）。
+  ///
+  /// `true` 时，`mergeWorkForUpsert` 与 `WorkScraper._apply` **不再用刮削
+  /// 返回的 `meta.genres` 覆盖**这一列 —— 用户自己敲的「动画 / 科幻」不会被
+  /// 下一次刮削（往往只是为了补张海报）整份冲掉。
+  ///
+  /// 与 `categoryManual` 分开：分类和类型是两个轴，用户可能只改其中一个。
+  /// 两者都手动时互不干扰 —— 分类从**手动后的**类型折算，而不是从刮削的。
+  final bool genresManual;
   final String? onlineId;
 
   /// 元数据来源（`ScrapeSource.name`）。
@@ -2381,6 +2594,15 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   /// 冗余计数，避免列表页为每个作品做一次 count 查询（N+1）。
   final int itemCount;
   final int totalBytes;
+
+  /// 作品下**已标季号**的季数（去重；不含「未标季」那一桶）。
+  ///
+  /// 与 [itemCount] 同一条理由：列表页卡片要显示「3 季」，而按 `group_key`
+  /// 去 `COUNT(DISTINCT season)` 是一次子查询 —— 几百个作品就是几百次。
+  ///
+  /// `0` 和 `1` 都表示**不该显示季数**（电影、单季剧、老库还没重扫）。
+  /// 只有 `>= 2` 才有展示价值，见 `MediaWork.subtitleLine`。
+  final int seasonCount;
 
   /// 作品下所有文件的**网盘修改时间**最大值（`MediaItem.modifiedAt`）。
   ///
@@ -2397,6 +2619,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     required this.provider,
     required this.kind,
     required this.category,
+    required this.categoryManual,
     required this.title,
     this.originalTitle,
     this.year,
@@ -2408,11 +2631,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     this.backdropFile,
     this.rating,
     required this.genres,
+    required this.genresManual,
     this.onlineId,
     required this.source,
     this.scrapedAt,
     required this.itemCount,
     required this.totalBytes,
+    required this.seasonCount,
     this.lastModifiedAt,
     this.firstSeenAt,
     this.lastPlayedAt,
@@ -2425,6 +2650,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     map['provider'] = Variable<String>(provider);
     map['kind'] = Variable<String>(kind);
     map['category'] = Variable<String>(category);
+    map['category_manual'] = Variable<bool>(categoryManual);
     map['title'] = Variable<String>(title);
     if (!nullToAbsent || originalTitle != null) {
       map['original_title'] = Variable<String>(originalTitle);
@@ -2454,6 +2680,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       map['rating'] = Variable<double>(rating);
     }
     map['genres'] = Variable<String>(genres);
+    map['genres_manual'] = Variable<bool>(genresManual);
     if (!nullToAbsent || onlineId != null) {
       map['online_id'] = Variable<String>(onlineId);
     }
@@ -2463,6 +2690,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     }
     map['item_count'] = Variable<int>(itemCount);
     map['total_bytes'] = Variable<int>(totalBytes);
+    map['season_count'] = Variable<int>(seasonCount);
     if (!nullToAbsent || lastModifiedAt != null) {
       map['last_modified_at'] = Variable<DateTime>(lastModifiedAt);
     }
@@ -2482,6 +2710,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       provider: Value(provider),
       kind: Value(kind),
       category: Value(category),
+      categoryManual: Value(categoryManual),
       title: Value(title),
       originalTitle:
           originalTitle == null && nullToAbsent
@@ -2515,6 +2744,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       rating:
           rating == null && nullToAbsent ? const Value.absent() : Value(rating),
       genres: Value(genres),
+      genresManual: Value(genresManual),
       onlineId:
           onlineId == null && nullToAbsent
               ? const Value.absent()
@@ -2526,6 +2756,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               : Value(scrapedAt),
       itemCount: Value(itemCount),
       totalBytes: Value(totalBytes),
+      seasonCount: Value(seasonCount),
       lastModifiedAt:
           lastModifiedAt == null && nullToAbsent
               ? const Value.absent()
@@ -2552,6 +2783,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       provider: serializer.fromJson<String>(json['provider']),
       kind: serializer.fromJson<String>(json['kind']),
       category: serializer.fromJson<String>(json['category']),
+      categoryManual: serializer.fromJson<bool>(json['categoryManual']),
       title: serializer.fromJson<String>(json['title']),
       originalTitle: serializer.fromJson<String?>(json['originalTitle']),
       year: serializer.fromJson<int?>(json['year']),
@@ -2563,11 +2795,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       backdropFile: serializer.fromJson<String?>(json['backdropFile']),
       rating: serializer.fromJson<double?>(json['rating']),
       genres: serializer.fromJson<String>(json['genres']),
+      genresManual: serializer.fromJson<bool>(json['genresManual']),
       onlineId: serializer.fromJson<String?>(json['onlineId']),
       source: serializer.fromJson<String>(json['source']),
       scrapedAt: serializer.fromJson<DateTime?>(json['scrapedAt']),
       itemCount: serializer.fromJson<int>(json['itemCount']),
       totalBytes: serializer.fromJson<int>(json['totalBytes']),
+      seasonCount: serializer.fromJson<int>(json['seasonCount']),
       lastModifiedAt: serializer.fromJson<DateTime?>(json['lastModifiedAt']),
       firstSeenAt: serializer.fromJson<DateTime?>(json['firstSeenAt']),
       lastPlayedAt: serializer.fromJson<DateTime?>(json['lastPlayedAt']),
@@ -2582,6 +2816,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'provider': serializer.toJson<String>(provider),
       'kind': serializer.toJson<String>(kind),
       'category': serializer.toJson<String>(category),
+      'categoryManual': serializer.toJson<bool>(categoryManual),
       'title': serializer.toJson<String>(title),
       'originalTitle': serializer.toJson<String?>(originalTitle),
       'year': serializer.toJson<int?>(year),
@@ -2593,11 +2828,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'backdropFile': serializer.toJson<String?>(backdropFile),
       'rating': serializer.toJson<double?>(rating),
       'genres': serializer.toJson<String>(genres),
+      'genresManual': serializer.toJson<bool>(genresManual),
       'onlineId': serializer.toJson<String?>(onlineId),
       'source': serializer.toJson<String>(source),
       'scrapedAt': serializer.toJson<DateTime?>(scrapedAt),
       'itemCount': serializer.toJson<int>(itemCount),
       'totalBytes': serializer.toJson<int>(totalBytes),
+      'seasonCount': serializer.toJson<int>(seasonCount),
       'lastModifiedAt': serializer.toJson<DateTime?>(lastModifiedAt),
       'firstSeenAt': serializer.toJson<DateTime?>(firstSeenAt),
       'lastPlayedAt': serializer.toJson<DateTime?>(lastPlayedAt),
@@ -2610,6 +2847,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     String? provider,
     String? kind,
     String? category,
+    bool? categoryManual,
     String? title,
     Value<String?> originalTitle = const Value.absent(),
     Value<int?> year = const Value.absent(),
@@ -2621,11 +2859,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     Value<String?> backdropFile = const Value.absent(),
     Value<double?> rating = const Value.absent(),
     String? genres,
+    bool? genresManual,
     Value<String?> onlineId = const Value.absent(),
     String? source,
     Value<DateTime?> scrapedAt = const Value.absent(),
     int? itemCount,
     int? totalBytes,
+    int? seasonCount,
     Value<DateTime?> lastModifiedAt = const Value.absent(),
     Value<DateTime?> firstSeenAt = const Value.absent(),
     Value<DateTime?> lastPlayedAt = const Value.absent(),
@@ -2635,6 +2875,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     provider: provider ?? this.provider,
     kind: kind ?? this.kind,
     category: category ?? this.category,
+    categoryManual: categoryManual ?? this.categoryManual,
     title: title ?? this.title,
     originalTitle:
         originalTitle.present ? originalTitle.value : this.originalTitle,
@@ -2647,11 +2888,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     backdropFile: backdropFile.present ? backdropFile.value : this.backdropFile,
     rating: rating.present ? rating.value : this.rating,
     genres: genres ?? this.genres,
+    genresManual: genresManual ?? this.genresManual,
     onlineId: onlineId.present ? onlineId.value : this.onlineId,
     source: source ?? this.source,
     scrapedAt: scrapedAt.present ? scrapedAt.value : this.scrapedAt,
     itemCount: itemCount ?? this.itemCount,
     totalBytes: totalBytes ?? this.totalBytes,
+    seasonCount: seasonCount ?? this.seasonCount,
     lastModifiedAt:
         lastModifiedAt.present ? lastModifiedAt.value : this.lastModifiedAt,
     firstSeenAt: firstSeenAt.present ? firstSeenAt.value : this.firstSeenAt,
@@ -2664,6 +2907,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       provider: data.provider.present ? data.provider.value : this.provider,
       kind: data.kind.present ? data.kind.value : this.kind,
       category: data.category.present ? data.category.value : this.category,
+      categoryManual:
+          data.categoryManual.present
+              ? data.categoryManual.value
+              : this.categoryManual,
       title: data.title.present ? data.title.value : this.title,
       originalTitle:
           data.originalTitle.present
@@ -2684,12 +2931,18 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               : this.backdropFile,
       rating: data.rating.present ? data.rating.value : this.rating,
       genres: data.genres.present ? data.genres.value : this.genres,
+      genresManual:
+          data.genresManual.present
+              ? data.genresManual.value
+              : this.genresManual,
       onlineId: data.onlineId.present ? data.onlineId.value : this.onlineId,
       source: data.source.present ? data.source.value : this.source,
       scrapedAt: data.scrapedAt.present ? data.scrapedAt.value : this.scrapedAt,
       itemCount: data.itemCount.present ? data.itemCount.value : this.itemCount,
       totalBytes:
           data.totalBytes.present ? data.totalBytes.value : this.totalBytes,
+      seasonCount:
+          data.seasonCount.present ? data.seasonCount.value : this.seasonCount,
       lastModifiedAt:
           data.lastModifiedAt.present
               ? data.lastModifiedAt.value
@@ -2711,6 +2964,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('provider: $provider, ')
           ..write('kind: $kind, ')
           ..write('category: $category, ')
+          ..write('categoryManual: $categoryManual, ')
           ..write('title: $title, ')
           ..write('originalTitle: $originalTitle, ')
           ..write('year: $year, ')
@@ -2722,11 +2976,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('backdropFile: $backdropFile, ')
           ..write('rating: $rating, ')
           ..write('genres: $genres, ')
+          ..write('genresManual: $genresManual, ')
           ..write('onlineId: $onlineId, ')
           ..write('source: $source, ')
           ..write('scrapedAt: $scrapedAt, ')
           ..write('itemCount: $itemCount, ')
           ..write('totalBytes: $totalBytes, ')
+          ..write('seasonCount: $seasonCount, ')
           ..write('lastModifiedAt: $lastModifiedAt, ')
           ..write('firstSeenAt: $firstSeenAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
@@ -2741,6 +2997,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     provider,
     kind,
     category,
+    categoryManual,
     title,
     originalTitle,
     year,
@@ -2752,11 +3009,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     backdropFile,
     rating,
     genres,
+    genresManual,
     onlineId,
     source,
     scrapedAt,
     itemCount,
     totalBytes,
+    seasonCount,
     lastModifiedAt,
     firstSeenAt,
     lastPlayedAt,
@@ -2770,6 +3029,7 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.provider == this.provider &&
           other.kind == this.kind &&
           other.category == this.category &&
+          other.categoryManual == this.categoryManual &&
           other.title == this.title &&
           other.originalTitle == this.originalTitle &&
           other.year == this.year &&
@@ -2781,11 +3041,13 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.backdropFile == this.backdropFile &&
           other.rating == this.rating &&
           other.genres == this.genres &&
+          other.genresManual == this.genresManual &&
           other.onlineId == this.onlineId &&
           other.source == this.source &&
           other.scrapedAt == this.scrapedAt &&
           other.itemCount == this.itemCount &&
           other.totalBytes == this.totalBytes &&
+          other.seasonCount == this.seasonCount &&
           other.lastModifiedAt == this.lastModifiedAt &&
           other.firstSeenAt == this.firstSeenAt &&
           other.lastPlayedAt == this.lastPlayedAt &&
@@ -2797,6 +3059,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<String> provider;
   final Value<String> kind;
   final Value<String> category;
+  final Value<bool> categoryManual;
   final Value<String> title;
   final Value<String?> originalTitle;
   final Value<int?> year;
@@ -2808,11 +3071,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<String?> backdropFile;
   final Value<double?> rating;
   final Value<String> genres;
+  final Value<bool> genresManual;
   final Value<String?> onlineId;
   final Value<String> source;
   final Value<DateTime?> scrapedAt;
   final Value<int> itemCount;
   final Value<int> totalBytes;
+  final Value<int> seasonCount;
   final Value<DateTime?> lastModifiedAt;
   final Value<DateTime?> firstSeenAt;
   final Value<DateTime?> lastPlayedAt;
@@ -2823,6 +3088,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.provider = const Value.absent(),
     this.kind = const Value.absent(),
     this.category = const Value.absent(),
+    this.categoryManual = const Value.absent(),
     this.title = const Value.absent(),
     this.originalTitle = const Value.absent(),
     this.year = const Value.absent(),
@@ -2834,11 +3100,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.backdropFile = const Value.absent(),
     this.rating = const Value.absent(),
     this.genres = const Value.absent(),
+    this.genresManual = const Value.absent(),
     this.onlineId = const Value.absent(),
     this.source = const Value.absent(),
     this.scrapedAt = const Value.absent(),
     this.itemCount = const Value.absent(),
     this.totalBytes = const Value.absent(),
+    this.seasonCount = const Value.absent(),
     this.lastModifiedAt = const Value.absent(),
     this.firstSeenAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
@@ -2850,6 +3118,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     required String provider,
     required String kind,
     this.category = const Value.absent(),
+    this.categoryManual = const Value.absent(),
     required String title,
     this.originalTitle = const Value.absent(),
     this.year = const Value.absent(),
@@ -2861,11 +3130,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.backdropFile = const Value.absent(),
     this.rating = const Value.absent(),
     this.genres = const Value.absent(),
+    this.genresManual = const Value.absent(),
     this.onlineId = const Value.absent(),
     required String source,
     this.scrapedAt = const Value.absent(),
     this.itemCount = const Value.absent(),
     this.totalBytes = const Value.absent(),
+    this.seasonCount = const Value.absent(),
     this.lastModifiedAt = const Value.absent(),
     this.firstSeenAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
@@ -2882,6 +3153,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<String>? provider,
     Expression<String>? kind,
     Expression<String>? category,
+    Expression<bool>? categoryManual,
     Expression<String>? title,
     Expression<String>? originalTitle,
     Expression<int>? year,
@@ -2893,11 +3165,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<String>? backdropFile,
     Expression<double>? rating,
     Expression<String>? genres,
+    Expression<bool>? genresManual,
     Expression<String>? onlineId,
     Expression<String>? source,
     Expression<DateTime>? scrapedAt,
     Expression<int>? itemCount,
     Expression<int>? totalBytes,
+    Expression<int>? seasonCount,
     Expression<DateTime>? lastModifiedAt,
     Expression<DateTime>? firstSeenAt,
     Expression<DateTime>? lastPlayedAt,
@@ -2909,6 +3183,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (provider != null) 'provider': provider,
       if (kind != null) 'kind': kind,
       if (category != null) 'category': category,
+      if (categoryManual != null) 'category_manual': categoryManual,
       if (title != null) 'title': title,
       if (originalTitle != null) 'original_title': originalTitle,
       if (year != null) 'year': year,
@@ -2920,11 +3195,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (backdropFile != null) 'backdrop_file': backdropFile,
       if (rating != null) 'rating': rating,
       if (genres != null) 'genres': genres,
+      if (genresManual != null) 'genres_manual': genresManual,
       if (onlineId != null) 'online_id': onlineId,
       if (source != null) 'source': source,
       if (scrapedAt != null) 'scraped_at': scrapedAt,
       if (itemCount != null) 'item_count': itemCount,
       if (totalBytes != null) 'total_bytes': totalBytes,
+      if (seasonCount != null) 'season_count': seasonCount,
       if (lastModifiedAt != null) 'last_modified_at': lastModifiedAt,
       if (firstSeenAt != null) 'first_seen_at': firstSeenAt,
       if (lastPlayedAt != null) 'last_played_at': lastPlayedAt,
@@ -2938,6 +3215,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<String>? provider,
     Value<String>? kind,
     Value<String>? category,
+    Value<bool>? categoryManual,
     Value<String>? title,
     Value<String?>? originalTitle,
     Value<int?>? year,
@@ -2949,11 +3227,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<String?>? backdropFile,
     Value<double?>? rating,
     Value<String>? genres,
+    Value<bool>? genresManual,
     Value<String?>? onlineId,
     Value<String>? source,
     Value<DateTime?>? scrapedAt,
     Value<int>? itemCount,
     Value<int>? totalBytes,
+    Value<int>? seasonCount,
     Value<DateTime?>? lastModifiedAt,
     Value<DateTime?>? firstSeenAt,
     Value<DateTime?>? lastPlayedAt,
@@ -2965,6 +3245,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       provider: provider ?? this.provider,
       kind: kind ?? this.kind,
       category: category ?? this.category,
+      categoryManual: categoryManual ?? this.categoryManual,
       title: title ?? this.title,
       originalTitle: originalTitle ?? this.originalTitle,
       year: year ?? this.year,
@@ -2976,11 +3257,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       backdropFile: backdropFile ?? this.backdropFile,
       rating: rating ?? this.rating,
       genres: genres ?? this.genres,
+      genresManual: genresManual ?? this.genresManual,
       onlineId: onlineId ?? this.onlineId,
       source: source ?? this.source,
       scrapedAt: scrapedAt ?? this.scrapedAt,
       itemCount: itemCount ?? this.itemCount,
       totalBytes: totalBytes ?? this.totalBytes,
+      seasonCount: seasonCount ?? this.seasonCount,
       lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
       firstSeenAt: firstSeenAt ?? this.firstSeenAt,
       lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
@@ -3003,6 +3286,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     }
     if (category.present) {
       map['category'] = Variable<String>(category.value);
+    }
+    if (categoryManual.present) {
+      map['category_manual'] = Variable<bool>(categoryManual.value);
     }
     if (title.present) {
       map['title'] = Variable<String>(title.value);
@@ -3037,6 +3323,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     if (genres.present) {
       map['genres'] = Variable<String>(genres.value);
     }
+    if (genresManual.present) {
+      map['genres_manual'] = Variable<bool>(genresManual.value);
+    }
     if (onlineId.present) {
       map['online_id'] = Variable<String>(onlineId.value);
     }
@@ -3051,6 +3340,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     }
     if (totalBytes.present) {
       map['total_bytes'] = Variable<int>(totalBytes.value);
+    }
+    if (seasonCount.present) {
+      map['season_count'] = Variable<int>(seasonCount.value);
     }
     if (lastModifiedAt.present) {
       map['last_modified_at'] = Variable<DateTime>(lastModifiedAt.value);
@@ -3077,6 +3369,7 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('provider: $provider, ')
           ..write('kind: $kind, ')
           ..write('category: $category, ')
+          ..write('categoryManual: $categoryManual, ')
           ..write('title: $title, ')
           ..write('originalTitle: $originalTitle, ')
           ..write('year: $year, ')
@@ -3088,11 +3381,13 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('backdropFile: $backdropFile, ')
           ..write('rating: $rating, ')
           ..write('genres: $genres, ')
+          ..write('genresManual: $genresManual, ')
           ..write('onlineId: $onlineId, ')
           ..write('source: $source, ')
           ..write('scrapedAt: $scrapedAt, ')
           ..write('itemCount: $itemCount, ')
           ..write('totalBytes: $totalBytes, ')
+          ..write('seasonCount: $seasonCount, ')
           ..write('lastModifiedAt: $lastModifiedAt, ')
           ..write('firstSeenAt: $firstSeenAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
@@ -5027,6 +5322,8 @@ typedef $$MediaItemsTableCreateCompanionBuilder =
       Value<int?> season,
       Value<int?> episode,
       Value<int?> episodeEnd,
+      Value<int?> part,
+      Value<String?> partLabel,
       Value<String> container,
       Value<String?> resolution,
       Value<int?> sizeBytes,
@@ -5062,6 +5359,8 @@ typedef $$MediaItemsTableUpdateCompanionBuilder =
       Value<int?> season,
       Value<int?> episode,
       Value<int?> episodeEnd,
+      Value<int?> part,
+      Value<String?> partLabel,
       Value<String> container,
       Value<String?> resolution,
       Value<int?> sizeBytes,
@@ -5154,6 +5453,16 @@ class $$MediaItemsTableFilterComposer
 
   ColumnFilters<int> get episodeEnd => $composableBuilder(
     column: $table.episodeEnd,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get part => $composableBuilder(
+    column: $table.part,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get partLabel => $composableBuilder(
+    column: $table.partLabel,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5322,6 +5631,16 @@ class $$MediaItemsTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<int> get part => $composableBuilder(
+    column: $table.part,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get partLabel => $composableBuilder(
+    column: $table.partLabel,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get container => $composableBuilder(
     column: $table.container,
     builder: (column) => ColumnOrderings(column),
@@ -5463,6 +5782,12 @@ class $$MediaItemsTableAnnotationComposer
     builder: (column) => column,
   );
 
+  GeneratedColumn<int> get part =>
+      $composableBuilder(column: $table.part, builder: (column) => column);
+
+  GeneratedColumn<String> get partLabel =>
+      $composableBuilder(column: $table.partLabel, builder: (column) => column);
+
   GeneratedColumn<String> get container =>
       $composableBuilder(column: $table.container, builder: (column) => column);
 
@@ -5586,6 +5911,8 @@ class $$MediaItemsTableTableManager
                 Value<int?> season = const Value.absent(),
                 Value<int?> episode = const Value.absent(),
                 Value<int?> episodeEnd = const Value.absent(),
+                Value<int?> part = const Value.absent(),
+                Value<String?> partLabel = const Value.absent(),
                 Value<String> container = const Value.absent(),
                 Value<String?> resolution = const Value.absent(),
                 Value<int?> sizeBytes = const Value.absent(),
@@ -5619,6 +5946,8 @@ class $$MediaItemsTableTableManager
                 season: season,
                 episode: episode,
                 episodeEnd: episodeEnd,
+                part: part,
+                partLabel: partLabel,
                 container: container,
                 resolution: resolution,
                 sizeBytes: sizeBytes,
@@ -5654,6 +5983,8 @@ class $$MediaItemsTableTableManager
                 Value<int?> season = const Value.absent(),
                 Value<int?> episode = const Value.absent(),
                 Value<int?> episodeEnd = const Value.absent(),
+                Value<int?> part = const Value.absent(),
+                Value<String?> partLabel = const Value.absent(),
                 Value<String> container = const Value.absent(),
                 Value<String?> resolution = const Value.absent(),
                 Value<int?> sizeBytes = const Value.absent(),
@@ -5687,6 +6018,8 @@ class $$MediaItemsTableTableManager
                 season: season,
                 episode: episode,
                 episodeEnd: episodeEnd,
+                part: part,
+                partLabel: partLabel,
                 container: container,
                 resolution: resolution,
                 sizeBytes: sizeBytes,
@@ -5745,6 +6078,7 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       required String provider,
       required String kind,
       Value<String> category,
+      Value<bool> categoryManual,
       required String title,
       Value<String?> originalTitle,
       Value<int?> year,
@@ -5756,11 +6090,13 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       Value<String?> backdropFile,
       Value<double?> rating,
       Value<String> genres,
+      Value<bool> genresManual,
       Value<String?> onlineId,
       required String source,
       Value<DateTime?> scrapedAt,
       Value<int> itemCount,
       Value<int> totalBytes,
+      Value<int> seasonCount,
       Value<DateTime?> lastModifiedAt,
       Value<DateTime?> firstSeenAt,
       Value<DateTime?> lastPlayedAt,
@@ -5773,6 +6109,7 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<String> provider,
       Value<String> kind,
       Value<String> category,
+      Value<bool> categoryManual,
       Value<String> title,
       Value<String?> originalTitle,
       Value<int?> year,
@@ -5784,11 +6121,13 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<String?> backdropFile,
       Value<double?> rating,
       Value<String> genres,
+      Value<bool> genresManual,
       Value<String?> onlineId,
       Value<String> source,
       Value<DateTime?> scrapedAt,
       Value<int> itemCount,
       Value<int> totalBytes,
+      Value<int> seasonCount,
       Value<DateTime?> lastModifiedAt,
       Value<DateTime?> firstSeenAt,
       Value<DateTime?> lastPlayedAt,
@@ -5822,6 +6161,11 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<String> get category => $composableBuilder(
     column: $table.category,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get categoryManual => $composableBuilder(
+    column: $table.categoryManual,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5880,6 +6224,11 @@ class $$MediaWorksTableFilterComposer
     builder: (column) => ColumnFilters(column),
   );
 
+  ColumnFilters<bool> get genresManual => $composableBuilder(
+    column: $table.genresManual,
+    builder: (column) => ColumnFilters(column),
+  );
+
   ColumnFilters<String> get onlineId => $composableBuilder(
     column: $table.onlineId,
     builder: (column) => ColumnFilters(column),
@@ -5902,6 +6251,11 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<int> get totalBytes => $composableBuilder(
     column: $table.totalBytes,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get seasonCount => $composableBuilder(
+    column: $table.seasonCount,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5952,6 +6306,11 @@ class $$MediaWorksTableOrderingComposer
 
   ColumnOrderings<String> get category => $composableBuilder(
     column: $table.category,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<bool> get categoryManual => $composableBuilder(
+    column: $table.categoryManual,
     builder: (column) => ColumnOrderings(column),
   );
 
@@ -6010,6 +6369,11 @@ class $$MediaWorksTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<bool> get genresManual => $composableBuilder(
+    column: $table.genresManual,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get onlineId => $composableBuilder(
     column: $table.onlineId,
     builder: (column) => ColumnOrderings(column),
@@ -6032,6 +6396,11 @@ class $$MediaWorksTableOrderingComposer
 
   ColumnOrderings<int> get totalBytes => $composableBuilder(
     column: $table.totalBytes,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get seasonCount => $composableBuilder(
+    column: $table.seasonCount,
     builder: (column) => ColumnOrderings(column),
   );
 
@@ -6077,6 +6446,11 @@ class $$MediaWorksTableAnnotationComposer
   GeneratedColumn<String> get category =>
       $composableBuilder(column: $table.category, builder: (column) => column);
 
+  GeneratedColumn<bool> get categoryManual => $composableBuilder(
+    column: $table.categoryManual,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<String> get title =>
       $composableBuilder(column: $table.title, builder: (column) => column);
 
@@ -6120,6 +6494,11 @@ class $$MediaWorksTableAnnotationComposer
   GeneratedColumn<String> get genres =>
       $composableBuilder(column: $table.genres, builder: (column) => column);
 
+  GeneratedColumn<bool> get genresManual => $composableBuilder(
+    column: $table.genresManual,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<String> get onlineId =>
       $composableBuilder(column: $table.onlineId, builder: (column) => column);
 
@@ -6134,6 +6513,11 @@ class $$MediaWorksTableAnnotationComposer
 
   GeneratedColumn<int> get totalBytes => $composableBuilder(
     column: $table.totalBytes,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get seasonCount => $composableBuilder(
+    column: $table.seasonCount,
     builder: (column) => column,
   );
 
@@ -6191,6 +6575,7 @@ class $$MediaWorksTableTableManager
                 Value<String> provider = const Value.absent(),
                 Value<String> kind = const Value.absent(),
                 Value<String> category = const Value.absent(),
+                Value<bool> categoryManual = const Value.absent(),
                 Value<String> title = const Value.absent(),
                 Value<String?> originalTitle = const Value.absent(),
                 Value<int?> year = const Value.absent(),
@@ -6202,11 +6587,13 @@ class $$MediaWorksTableTableManager
                 Value<String?> backdropFile = const Value.absent(),
                 Value<double?> rating = const Value.absent(),
                 Value<String> genres = const Value.absent(),
+                Value<bool> genresManual = const Value.absent(),
                 Value<String?> onlineId = const Value.absent(),
                 Value<String> source = const Value.absent(),
                 Value<DateTime?> scrapedAt = const Value.absent(),
                 Value<int> itemCount = const Value.absent(),
                 Value<int> totalBytes = const Value.absent(),
+                Value<int> seasonCount = const Value.absent(),
                 Value<DateTime?> lastModifiedAt = const Value.absent(),
                 Value<DateTime?> firstSeenAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
@@ -6217,6 +6604,7 @@ class $$MediaWorksTableTableManager
                 provider: provider,
                 kind: kind,
                 category: category,
+                categoryManual: categoryManual,
                 title: title,
                 originalTitle: originalTitle,
                 year: year,
@@ -6228,11 +6616,13 @@ class $$MediaWorksTableTableManager
                 backdropFile: backdropFile,
                 rating: rating,
                 genres: genres,
+                genresManual: genresManual,
                 onlineId: onlineId,
                 source: source,
                 scrapedAt: scrapedAt,
                 itemCount: itemCount,
                 totalBytes: totalBytes,
+                seasonCount: seasonCount,
                 lastModifiedAt: lastModifiedAt,
                 firstSeenAt: firstSeenAt,
                 lastPlayedAt: lastPlayedAt,
@@ -6245,6 +6635,7 @@ class $$MediaWorksTableTableManager
                 required String provider,
                 required String kind,
                 Value<String> category = const Value.absent(),
+                Value<bool> categoryManual = const Value.absent(),
                 required String title,
                 Value<String?> originalTitle = const Value.absent(),
                 Value<int?> year = const Value.absent(),
@@ -6256,11 +6647,13 @@ class $$MediaWorksTableTableManager
                 Value<String?> backdropFile = const Value.absent(),
                 Value<double?> rating = const Value.absent(),
                 Value<String> genres = const Value.absent(),
+                Value<bool> genresManual = const Value.absent(),
                 Value<String?> onlineId = const Value.absent(),
                 required String source,
                 Value<DateTime?> scrapedAt = const Value.absent(),
                 Value<int> itemCount = const Value.absent(),
                 Value<int> totalBytes = const Value.absent(),
+                Value<int> seasonCount = const Value.absent(),
                 Value<DateTime?> lastModifiedAt = const Value.absent(),
                 Value<DateTime?> firstSeenAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
@@ -6271,6 +6664,7 @@ class $$MediaWorksTableTableManager
                 provider: provider,
                 kind: kind,
                 category: category,
+                categoryManual: categoryManual,
                 title: title,
                 originalTitle: originalTitle,
                 year: year,
@@ -6282,11 +6676,13 @@ class $$MediaWorksTableTableManager
                 backdropFile: backdropFile,
                 rating: rating,
                 genres: genres,
+                genresManual: genresManual,
                 onlineId: onlineId,
                 source: source,
                 scrapedAt: scrapedAt,
                 itemCount: itemCount,
                 totalBytes: totalBytes,
+                seasonCount: seasonCount,
                 lastModifiedAt: lastModifiedAt,
                 firstSeenAt: firstSeenAt,
                 lastPlayedAt: lastPlayedAt,

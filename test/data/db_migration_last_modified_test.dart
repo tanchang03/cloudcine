@@ -54,13 +54,31 @@ void main() {
     await repo.upsertWorks(works, now: now);
     addTearDown(seed.close);
 
-    // 第二步：降回 v5 —— 删掉 v6/v7 才有的列 + 改版本号。
+    // 第二步：降回 v5 —— 删掉 v6/v7/v8 才有的列 + 改版本号。
     // 此后这个文件对 drift 来说就是一个「还没升级过的老库」。
+    //
+    // ⚠️ 加新列时**必须**把新列也 DROP 掉：建库用的是当前 schema，
+    // 所有列一开始就都在。漏掉一列的话，reopen 时 `onUpgrade` 会对一个
+    // 已经存在的列执行 `ADD COLUMN` → `duplicate column name`，
+    // 而这条测试就会以一个和「迁移写没写」无关的理由变红。
     await seed.customStatement(
       'ALTER TABLE media_works DROP COLUMN last_modified_at',
     );
     await seed.customStatement(
       'ALTER TABLE media_works DROP COLUMN first_seen_at',
+    );
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN category_manual',
+    );
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN genres_manual',
+    );
+    // v9：`media_items` 的分部两列。
+    await seed.customStatement('ALTER TABLE media_items DROP COLUMN part');
+    await seed.customStatement('ALTER TABLE media_items DROP COLUMN part_label');
+    // v10：`media_works` 的季数。
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN season_count',
     );
     await seed.customStatement('PRAGMA user_version = 5');
     await seed.close();
@@ -79,6 +97,7 @@ void main() {
     String name, {
     required String groupKey,
     DateTime? modifiedAt,
+    int? season,
   }) =>
       MediaItem(
         provider: DriveProvider.quark,
@@ -88,6 +107,7 @@ void main() {
         dirPath: '/电影/',
         groupKey: groupKey,
         kind: MediaKind.movie,
+        season: season,
         modifiedAt: modifiedAt,
         firstSeenAt: now,
         updatedAt: now,
@@ -176,5 +196,62 @@ void main() {
     // 迁移只碰了 last_modified_at 一列；标题/计数这类既有数据必须原样在。
     expect(list.single.title, 'w');
     expect(list.single.itemCount, 1);
+  });
+
+  test('v8 迁移后两个手动标记位都是 false（老库的分类仍是自动判定的）', () async {
+    final file = await makeOldV5Database(
+      items: [item('ep1', groupKey: 'w', modifiedAt: DateTime(2026, 9, 5))],
+      works: [work('w', itemCount: 1)],
+    );
+
+    final repo = await reopen(file);
+    final list = await repo.listWorks(sort: WorkSort.recentModified);
+
+    expect(
+      list.single.categoryManual,
+      isFalse,
+      reason: '老库里的分类是自动判定的结果，不能因为加了这一列就把它'
+          '「升级」成用户手动指定 —— 那会让后续刮削再也改不动它。',
+    );
+    expect(list.single.genresManual, isFalse);
+  });
+
+  test('v10 迁移回填季数 —— 去重、且不算「未标季」', () async {
+    final file = await makeOldV5Database(
+      items: [
+        item('a', groupKey: 'w', season: 1),
+        item('b', groupKey: 'w', season: 2),
+        item('c', groupKey: 'w', season: 2),
+        item('d', groupKey: 'w'), // 未标季
+      ],
+      works: [work('w', itemCount: 4)],
+    );
+
+    final repo = await reopen(file);
+    final list = await repo.listWorks(sort: WorkSort.recentModified);
+
+    expect(
+      list.single.seasonCount,
+      2,
+      reason: '4 集里有 2 个不同季号（1、2）+ 1 集未标季 → 2 季。'
+          '不去重会数成 3；把「未标季」也算进去会数成 3。',
+    );
+  });
+
+  test('v10 迁移：没有季号的作品季数是 0，卡片上不出现「N 季」', () async {
+    final file = await makeOldV5Database(
+      items: [item('a', groupKey: 'w')],
+      works: [work('w', itemCount: 1)],
+    );
+
+    final repo = await reopen(file);
+    final list = await repo.listWorks(sort: WorkSort.recentModified);
+
+    expect(list.single.seasonCount, 0);
+    expect(
+      list.single.subtitleLine.contains('季'),
+      isFalse,
+      reason: '0 或 1 季写在卡片上都是废话，只有 >= 2 才有信息量',
+    );
   });
 }

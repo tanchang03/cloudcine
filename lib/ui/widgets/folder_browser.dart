@@ -19,6 +19,7 @@ import '../theme/app_theme.dart';
 import 'common_widgets.dart';
 import 'copy_button.dart';
 import 'play_action.dart';
+import 'tv_affordance.dart';
 
 /// 网盘目录视图。
 ///
@@ -251,14 +252,20 @@ class _BreadcrumbState extends ConsumerState<_Breadcrumb> {
       ),
       child: Row(
         children: [
-          IconButton(
-            onPressed: atRoot ? null : () => navigate(controller.up),
-            iconSize: 16,
-            padding: EdgeInsets.zero,
-            // 默认的 48×48 会把这一条撑成两倍高，跟分类栏（28）明显不齐。
-            constraints: const BoxConstraints.tightFor(width: 28, height: 28),
-            tooltip: atRoot ? '已经在最上层' : '上一级',
-            icon: const Icon(Icons.arrow_upward_rounded),
+          // 「上一级」是纯图标按钮；TV 上补一个文字标签，
+          // 否则「已经在最上层」与「上一级」两种状态只能靠颜色分辨。
+          TvIconLabel(
+            label: atRoot ? '最上层' : '上一级',
+            enabled: !atRoot,
+            child: IconButton(
+              onPressed: atRoot ? null : () => navigate(controller.up),
+              iconSize: 16,
+              padding: EdgeInsets.zero,
+              // 默认的 48×48 会把这一条撑成两倍高，跟分类栏（28）明显不齐。
+              constraints: const BoxConstraints.tightFor(width: 28, height: 28),
+              tooltip: atRoot ? '已经在最上层' : '上一级',
+              icon: const Icon(Icons.arrow_upward_rounded),
+            ),
           ),
           Expanded(
             child: SingleChildScrollView(
@@ -297,6 +304,7 @@ class _BreadcrumbState extends ConsumerState<_Breadcrumb> {
           CopyTextButton(
             text: stack.last.path,
             label: '复制当前目录路径',
+            tvLabel: '复制路径',
             icon: Icons.folder_copy_outlined,
           ),
         ],
@@ -548,6 +556,7 @@ class _FolderRow extends ConsumerWidget {
       if (indexed > 0) '已入库 $indexed 个',
       if (dir.sizeBytes != null && dir.sizeBytes! > 0)
         formatBytes(dir.sizeBytes, fractionDigits: 1),
+      if (dir.modifiedAt != null) formatRelativeTime(dir.modifiedAt!),
     ];
 
     return Padding(
@@ -600,21 +609,29 @@ class _FolderRow extends ConsumerWidget {
                 ),
                 // 「只发现这一个目录」——不递归。用户点它往往是因为
                 // 「子目录太多，我只想要这一层」。
-                Tooltip(
-                  message: '只发现「${dir.name}」这一层',
-                  child: IconButton(
-                    onPressed: discovery.running || scanning
-                        ? null
-                        : () => ref
-                            .read(discoveryControllerProvider.notifier)
-                            .discoverDirectory(child, recursive: false),
-                    iconSize: 16,
-                    visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints.tightFor(
-                      width: 30,
-                      height: 30,
+                //
+                // 这句话**只**存在于 tooltip 里，而 tooltip 要 hover ——
+                // 电视上没有 hover，所以 TV 上补一个「只这一层」标签：
+                // 没有它，这个 ⤒ 图标在电视上就是一个猜不出用途的符号。
+                TvIconLabel(
+                  label: '只这一层',
+                  enabled: !(discovery.running || scanning),
+                  child: Tooltip(
+                    message: '只发现「${dir.name}」这一层',
+                    child: IconButton(
+                      onPressed: discovery.running || scanning
+                          ? null
+                          : () => ref
+                              .read(discoveryControllerProvider.notifier)
+                              .discoverDirectory(child, recursive: false),
+                      iconSize: 16,
+                      visualDensity: VisualDensity.compact,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 30,
+                        height: 30,
+                      ),
+                      icon: const Icon(Icons.travel_explore_rounded),
                     ),
-                    icon: const Icon(Icons.travel_explore_rounded),
                   ),
                 ),
                 const Icon(
@@ -657,6 +674,8 @@ class _DriveFileRow extends ConsumerWidget {
         formatDuration(Duration(milliseconds: entry.durationMs!)),
       if (entry.videoWidth != null && entry.videoHeight != null)
         '${entry.videoWidth}×${entry.videoHeight}',
+      if (entry.modifiedAt != null)
+        formatRelativeTime(entry.modifiedAt!),
     ];
 
     return Padding(
@@ -708,16 +727,19 @@ class _DriveFileRow extends ConsumerWidget {
               if (inLibrary) ...[
                 const TagChip(label: '已在库', color: AppTheme.dim),
                 const SizedBox(width: 6),
-                IconButton(
-                  tooltip: '播放',
-                  onPressed: () => _play(context, ref),
-                  iconSize: 17,
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints.tightFor(
-                    width: 30,
-                    height: 30,
+                TvIconLabel(
+                  label: '播放',
+                  child: IconButton(
+                    tooltip: '播放',
+                    onPressed: () => _play(context, ref),
+                    iconSize: 17,
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints.tightFor(
+                      width: 30,
+                      height: 30,
+                    ),
+                    icon: const Icon(Icons.play_arrow_rounded),
                   ),
-                  icon: const Icon(Icons.play_arrow_rounded),
                 ),
               ] else
                 FilledButton.tonal(

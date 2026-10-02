@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart' show setEquals;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/utils/media_category.dart';
 import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/tmdb_client.dart';
 import '../../domain/entities/media_work.dart';
@@ -98,6 +99,14 @@ final workScraperProvider = Provider<WorkScraper>(
     pipeline: ref.watch(scraperPipelineProvider),
   ),
 );
+
+/// 手动刮削可选的源列表（供对话框渲染「选哪个源」的选择器）。
+///
+/// 排除本地兜底（它给不出候选）。只有一个在线源时 UI 那边会隐藏选择器。
+final manualScrapeSourcesProvider =
+    Provider<List<({String id, String displayName})>>((ref) {
+  return ref.watch(scraperPipelineProvider).availableSources;
+});
 
 /// 详情页「刮削」按钮的状态。
 class WorkScrapeState {
@@ -212,6 +221,76 @@ class WorkScrapeController extends Notifier<WorkScrapeState> {
     }
   }
 
+  /// 「自定义」：清掉在线刮削信息，改成用户自己敲的片名与分类。
+  ///
+  /// 返回写库后的作品行；作品已不在库里、或另一个写操作正占着
+  /// [WorkScrapeState.runningKey] 时返回 `null`。
+  ///
+  /// ## 为什么与两个刮削入口共用 `runningKey`
+  ///
+  /// 同一部作品不能有两笔写操作并发跑 —— 用户看到的会是先返回的那一次
+  /// 的结果，而另一次的提示还挂在屏幕上。三个入口（自动 / 手动 / 自定义）
+  /// 都是「改这一行」，所以共用同一个互斥位。
+  ///
+  /// ## 刷新交给 [_refreshAfter]
+  ///
+  /// 这个动作会同时改片名、分类、海报、年份、类型 —— 列表、详情页、三组
+  /// 角标都可能变。复用同一套刷新规则，免得「自定义之后分类栏的数字没
+  /// 跟上」变成又一处要单独记得的例外。
+  Future<WorkScrapeOutcome?> customize(
+    String workKey, {
+    required String title,
+    required MediaCategory category,
+  }) async {
+    if (state.runningKey != null) return null;
+    state = WorkScrapeState(runningKey: workKey);
+
+    try {
+      final repo = ref.read(mediaRepositoryProvider);
+      final work = await repo.workByKey(workKey);
+      if (work == null) {
+        state = WorkScrapeState(
+          messageKey: workKey,
+          message: '找不到这部作品，它可能已经被重新扫描移除。',
+        );
+        return null;
+      }
+
+      final updated = await repo.customizeWork(
+        workKey,
+        title: title,
+        category: category,
+      );
+      if (updated == null) {
+        state = WorkScrapeState(
+          messageKey: workKey,
+          message: '找不到这部作品，它可能已经被重新扫描移除。',
+        );
+        return null;
+      }
+
+      final outcome = WorkScrapeOutcome(
+        status: WorkScrapeStatus.customized,
+        channel: ScrapeChannel.manual,
+        work: updated,
+      );
+      state = WorkScrapeState(
+        messageKey: workKey,
+        message: outcome.message,
+        ok: true,
+      );
+
+      _refreshAfter(work, outcome);
+      return outcome;
+    } catch (e) {
+      state = WorkScrapeState(
+        messageKey: workKey,
+        message: '保存失败：$e',
+      );
+      return null;
+    }
+  }
+
   /// 刮削成功后要把哪些东西重算一遍。
   ///
   ///   - **详情页**要重画（新标题 / 海报 / 简介 / 类型标签）；
@@ -227,8 +306,8 @@ class WorkScrapeController extends Notifier<WorkScrapeState> {
   /// 只在**分类真的变了**时才作废：那是一次全表 `GROUP BY`，
   /// 而绝大多数刮削（补海报、修简介）并不会动分类。
   ///
-  /// 年代 / 类型同理（它们是筛选面板另外两组选项的来源）：刮削会同时改
-  /// `year` 与 `genres`，不作废的话面板上会一直列着「2020 年代 · 3 部」
+  /// 年份 / 类型同理（它们是筛选面板另外两组选项的来源）：刮削会同时改
+  /// `year` 与 `genres`，不作废的话面板上会一直列着「2020 · 3 部」
   /// 这种过期数字，而用户点进去发现是 4 部。
   void _refreshAfter(MediaWork before, WorkScrapeOutcome outcome) {
     ref.invalidate(workDetailProvider(before.key));
@@ -251,13 +330,13 @@ class WorkScrapeController extends Notifier<WorkScrapeState> {
       // 之后才出现（或之后才被读到）的行它管不到。而这时 `genres` 逐字没变，
       // 「按集合比类型」那条判据盖不住，不作废就会在「剧集」栏里挂着一个
       // 根本不存在的类型。见 `test/ui/providers/scrape_refresh_test.dart`。
-      ref.invalidate(decadeCountsProvider);
+      ref.invalidate(yearCountsProvider);
       ref.invalidate(genreCountsProvider);
       return;
     }
 
     if (after.year != before.year) {
-      ref.invalidate(decadeCountsProvider);
+      ref.invalidate(yearCountsProvider);
     }
     // 按**集合**比：类型列表的顺序取决于数据源返回的顺序，
     // 顺序变了不代表内容变了，不该白跑一次统计。

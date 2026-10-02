@@ -50,6 +50,19 @@ double titleSimilarity(String a, String b) {
   if (na.isEmpty || nb.isEmpty) return 0;
   if (na == nb) return 1;
 
+  // 纯数字不是名字。前缀档的下界是 `0.65`，而「无条件接受」阈值是 `0.6` ——
+  // 也就是说**只要短的是长的前缀，多短都会通过**。2026-10-02 实测事故：
+  // 备用词 `182` 是希腊纪录片《1821: Οι Ήρωες》的前缀 → 0.9125 → 通过，
+  // 整部家电维修教程被刮成了那部纪录片。
+  //
+  // 前缀档本身是对的（`仙逆` → `仙逆第一季` 正是它要救的），问题在于它把
+  // 「数字」当成了「名字」：`182` 与 `1821` 之间没有任何语义关系。
+  // 比例也分不开这两者（0.75 vs 0.40），只有字符类型能。
+  //
+  // ⚠️ 精确相等在上面已经返回 1 —— 所以片名就叫《2012》《1917》的电影
+  // 照样刮得到，被挡掉的只是「数字靠沾边命中另一个数字」。
+  if (_allDigits(na) || _allDigits(nb)) return 0;
+
   final shorter = na.length <= nb.length ? na : nb;
   final longer = na.length <= nb.length ? nb : na;
   final ratio = shorter.length / longer.length;
@@ -64,8 +77,7 @@ double titleSimilarity(String a, String b) {
 
 /// 字符 bigram 的 Dice 系数。用于「顺序不同但字符高度重合」的情形
 /// （`The Wandering Earth II` 与 `Wandering Earth II The`）。
-double _diceBigram(String a, String b) {
-  if (a.length < 2 || b.length < 2) return 0;
+double _diceBigram(String a, String b) {  if (a.length < 2 || b.length < 2) return 0;
   final ba = _bigrams(a);
   final bb = _bigrams(b);
   if (ba.isEmpty || bb.isEmpty) return 0;
@@ -88,6 +100,9 @@ double _diceBigram(String a, String b) {
 List<String> _bigrams(String s) => [
       for (var i = 0; i + 1 < s.length; i++) s.substring(i, i + 2),
     ];
+
+/// 归一化之后是不是一串纯数字。**数字不是名字** —— 见 [titleSimilarity]。
+bool _allDigits(String s) => RegExp(r'^[0-9]+$').hasMatch(s);
 
 /// 闸门结论。
 enum ScrapeMatchVerdict {

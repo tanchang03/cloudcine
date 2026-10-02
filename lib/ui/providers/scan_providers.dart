@@ -183,7 +183,7 @@ class ScanController extends Notifier<ScanState> {
         // 少一个的话，用户扫完 100 部电影，筛选面板上「电影」还是旧数字，
         // 看起来像「筛选没生效」。
         ref.invalidate(categoryCountsProvider);
-        ref.invalidate(decadeCountsProvider);
+        ref.invalidate(yearCountsProvider);
         ref.invalidate(genreCountsProvider);
       }
     }

@@ -20,12 +20,14 @@ import '../widgets/folder_browser.dart';
 import '../widgets/library_filter_panel.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
+import '../widgets/tv_affordance.dart';
+import '../widgets/tv_focus.dart';
 
 /// 空列表时那个按钮**具体该清掉什么**。
 ///
 /// 见 [libraryEmptyHint]。
 enum LibraryEmptyAction {
-  /// 只清筛选面板的两组（年代 / 类型）。
+  /// 只清筛选面板的两组（年份 / 类型）。
   clearExtra,
 
   /// 只清搜索词（连同输入框里的字）。
@@ -48,34 +50,34 @@ enum LibraryEmptyAction {
 ///
 /// ## 为什么要按「全部在用的条件」分派，而不是挑一个清
 ///
-/// 按钮的用途是**让用户重新看到内容**。同时设了搜索词与年代时只清一个，
-/// 列表很可能还是空的 —— 用户会认为这个按钮坏了。所以：
-///
-///   1. 两组都在用 → 两个都清，保留分类；
-///   2. 只有年代 / 类型 → 清那两组，保留分类；
-///   3. 只有搜索词 → 清搜索词，保留分类；
-///   4. 都没有（只切了分类）→ 提示语本来就在说「换个分类看看」，
-///      按钮也就该是「回到全部」。
-///
-/// 抽成纯函数是为了能单测：这一段的分支写错不报错，只表现为「用户点完
-/// 丢了本来不想丢的东西」，事后才被发现。
-@visibleForTesting
-({String body, String actionLabel, LibraryEmptyAction action}) libraryEmptyHint(
-  LibraryFilter filter,
-) {
-  final query = filter.query.trim();
-  final hasQuery = query.isNotEmpty;
+  /// 按钮的用途是**让用户重新看到内容**。同时设了搜索词与年份时只清一个，
+  /// 列表很可能还是空的 —— 用户会认为这个按钮坏了。所以：
+  ///
+  ///   1. 两组都在用 → 两个都清，保留分类；
+  ///   2. 只有年份 / 类型 → 清那两组，保留分类；
+  ///   3. 只有搜索词 → 清搜索词，保留分类；
+  ///   4. 都没有（只切了分类）→ 提示语本来就在说「换个分类看看」，
+  ///      按钮也就该是「回到全部」。
+  ///
+  /// 抽成纯函数是为了能单测：这一段的分支写错不报错，只表现为「用户点完
+  /// 丢了本来不想丢的东西」，事后才被发现。
+  @visibleForTesting
+  ({String body, String actionLabel, LibraryEmptyAction action}) libraryEmptyHint(
+    LibraryFilter filter,
+  ) {
+    final query = filter.query.trim();
+    final hasQuery = query.isNotEmpty;
 
-  if (filter.hasExtra && hasQuery) {
-    return (
-      body: '没有同时匹配「$query」与所选年代 / 类型的作品。',
-      actionLabel: '清空筛选条件',
-      action: LibraryEmptyAction.clearExtraAndQuery,
-    );
-  }
-  if (filter.hasExtra) {
-    return (
-      body: '当前筛选条件下一条都没筛到。清掉年代 / 类型再看看。',
+    if (filter.hasExtra && hasQuery) {
+      return (
+        body: '没有同时匹配「$query」与所选年份 / 类型的作品。',
+        actionLabel: '清空筛选条件',
+        action: LibraryEmptyAction.clearExtraAndQuery,
+      );
+    }
+    if (filter.hasExtra) {
+      return (
+        body: '当前筛选条件下一条都没筛到。清掉年份 / 类型再看看。',
       actionLabel: '清空筛选',
       action: LibraryEmptyAction.clearExtra,
     );
@@ -155,8 +157,8 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     ref.invalidate(playedCountProvider);
     // 筛选面板的两组选项也是从库里数出来的，一起失效 ——
     // 否则手动改了库（比如在设置页清过数据）之后，面板上还列着
-    // 已经一部都不剩的年代 / 类型。
-    ref.invalidate(decadeCountsProvider);
+    // 已经一部都不剩的年份 / 类型。
+    ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
     ref.invalidate(libraryStatsProvider);
     // 目录视图：列表本身要重列网盘，叠加的「已入库」标记也要重算。
@@ -218,14 +220,19 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
               const SizedBox(width: 8),
               const _SortMenu(),
               const SizedBox(width: 4),
-              // 年代 / 类型筛选同理：目录视图的列表是**文件**，
-              // 而年代 / 类型是作品的元数据，在那里没有可筛的东西。
+              // 年份 / 类型筛选同理：目录视图的列表是**文件**，
+              // 而年份 / 类型是作品的元数据，在那里没有可筛的东西。
               const LibraryFilterButton(),
             ],
-            IconButton(
-              tooltip: '刷新',
-              onPressed: _refresh,
-              icon: const Icon(Icons.refresh_rounded, size: 17),
+            // 「刷新」是个纯图标按钮：桌面上悬停会出 tooltip，电视上没有
+            // hover —— 所以 TV 上补一个看得见的「刷新」标签。
+            TvIconLabel(
+              label: '刷新',
+              child: IconButton(
+                tooltip: '刷新',
+                onPressed: _refresh,
+                icon: const Icon(Icons.refresh_rounded, size: 17),
+              ),
             ),
           ],
         ),
@@ -589,25 +596,38 @@ class _PosterGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GridView.builder(
+    final grid = GridView.builder(
       padding: const EdgeInsets.fromLTRB(22, 4, 22, 28),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
         // 用「最大宽度」而不是固定列数：侧栏固定宽 + 窗口可缩放，
         // 固定列数会让宽窗口下的海报被拉成巨幅。
         maxCrossAxisExtent: 172,
         mainAxisSpacing: 18,
         crossAxisSpacing: 14,
-        // 用主题里的标准海报比例（2:3），不要在这里写魔法数字。
+        // 卡片宽高比：**桌面沿用标准海报比例 2:3**，TV 上压到 [AppTheme.tvPosterAspect]
+        // 让卡片变矮、多挤一排。两种都收在主题里，不写魔法数字。
         //
         // 这个值要和 `PosterImage` 的画法配套看：那里前景是 `BoxFit.contain`，
         // 所以卡片取 2:3 时，**2:3 的 TMDB 真海报正好铺满、看不到模糊底**；
         // 而 16:9 的夸克视频帧会完整落在卡片中部，上下由模糊底图填。
         // 取更窄的比例（比如原来写的 0.56）只会让视频帧更小、模糊带更宽。
-        childAspectRatio: AppTheme.posterAspect,
+        childAspectRatio: AppTheme.isTvLayout(context)
+            ? AppTheme.tvPosterAspect
+            : AppTheme.posterAspect,
       ),
       itemCount: works.length,
       itemBuilder: (context, i) => _WorkCard(work: works[i]),
     );
+
+    // TV 上整体放大一档文字（官方规范正文最小 12sp、默认 18sp，
+    // 而卡片上写的是 10.5–13 —— 隔着三米读不了）。非 TV 上原样返回。
+    //
+    // 刻意**不动**列数：实测 960×540 下 `maxCrossAxisExtent` 从 172 提到 240
+    // 会把列数从 4 压到 3，可见张数从 ~7.7 掉到 ~4.3。
+    // 文字已经能读之后，为了「看得见更多」而放弃一半信息量不划算。
+    // 卡片高度是固定的（`childAspectRatio`），文字长高只会让海报变矮 ——
+    // 海报是 `Expanded`，所以这里放大字号**不会**溢出。
+    return AppTheme.tvTextScaler(context, grid);
   }
 }
 
@@ -672,7 +692,7 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
   Widget build(BuildContext context) {
     final work = widget.work;
 
-    return MouseRegion(
+    final card = MouseRegion(
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
@@ -775,9 +795,31 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 11, color: AppTheme.dim),
             ),
+            if (work.metaLine.isNotEmpty) ...[
+              const SizedBox(height: 2),
+              Text(
+                work.metaLine,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 10.5, color: AppTheme.muted),
+              ),
+            ],
           ],
         ),
       ),
+    );
+
+    // 焦点环必须画在**子节点之上**：这张卡片的 InkWell 是全项目唯一一个
+    // 没给自己包 `Material` 的卡片点击区，它的 ink 落到 `Scaffold` 那一层，
+    // 而 `_RenderInkFeatures.paint` 是先画 ink、再画子节点 ——
+    // 于是高亮被海报整个盖住，**只调主题的 `focusColor` 一点用都没有**。
+    // 详见 [TvFocusable] 的类文档。
+    return TvFocusable(
+      borderRadius: BorderRadius.circular(10),
+      // 1.05 是安全值：卡片约 133×199、网格间距 14/18，
+      // 每边只向外溢出 3.3 / 5 px，不会和邻卡重叠。
+      focusScale: 1.05,
+      child: card,
     );
   }
 }
@@ -845,6 +887,10 @@ class _SearchBox extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       width: 220,
+      // ⚠️ 这个高度是**写死的 32**，故意不进 tvTextScaler。媒体库页头（含搜索框）
+      // 不能在 TV 上放大字号：P1-3 给海报网格套了 `tvTextScaler`，但页头那行
+      // 没有 —— 一个固定高度的输入框一旦被放大字号，里面的字会顶破 32 的框、
+      // 触发 RenderFlex 溢出。要放大也得先让这个 `SizedBox` 改吸收高度。
       height: 32,
       child: TextField(
         controller: controller,

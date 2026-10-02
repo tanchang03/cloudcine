@@ -79,28 +79,37 @@ class _RecordingRepo extends InMemoryMediaRepository {
   final List<MediaWork> written = [];
 
   @override
-  Future<void> upsertWorks(List<MediaWork> works, {DateTime? now}) async {
+  Future<void> upsertWorks(
+    List<MediaWork> works, {
+    DateTime? now,
+    bool overrideManual = false,
+  }) async {
     written.addAll(works);
-    return super.upsertWorks(works, now: now);
+    return super.upsertWorks(works, now: now, overrideManual: overrideManual);
   }
 }
 
 /// 只实现手动通道的假刮削器。
-class _ManualScraper implements MetadataScraper {  _ManualScraper({this.candidates = const []});
+class _ManualScraper implements MetadataScraper {
+  _ManualScraper({
+    this.candidates = const [],
+    this.id = 'douban',
+    this.displayName = '豆瓣',
+  });
 
   final List<ScrapeCandidate> candidates;
+
+  @override
+  final String id;
+
+  @override
+  final String displayName;
 
   /// 搜过几次 —— 用来钉「打开对话框时不自动搜索」。
   int searchCalls = 0;
 
   /// 被选中解析的是哪一条。
   ScrapeCandidate? resolved;
-
-  @override
-  String get id => 'douban';
-
-  @override
-  String get displayName => '豆瓣';
 
   @override
   bool get isEnabled => true;
@@ -179,11 +188,16 @@ void main() {
   });
 
   /// 把对话框挂进一棵最小的树里，并返回「打开对话框」的那个按钮。
+  ///
+  /// [extraSources] 用来造出「配了多个在线源」的场景 —— 对话框的来源筛选器
+  /// 只有在 2 个及以上源时才显示。
   Future<(_ManualScraper, _RecordingRepo)> open(
     WidgetTester tester, {
     List<ScrapeCandidate> candidates = const [candidate],
+    List<MetadataScraper> extraSources = const [],
   }) async {
     final scraper = _ManualScraper(candidates: candidates);
+    final pipeline = ScraperPipeline(<MetadataScraper>[scraper, ...extraSources]);
     final repo = _RecordingRepo();
     await repo.upsertWorks([work()], now: now);
     await repo.upsertItems([item()], now: now);
@@ -194,10 +208,14 @@ void main() {
       ProviderScope(
         overrides: [
           mediaRepositoryProvider.overrideWithValue(repo),
+          // 来源筛选器读的是 `manualScrapeSourcesProvider` → 这条流水线；
+          // 搜索走的是 `workScraperProvider`。两处必须是**同一批源**，
+          // 否则筛选器列出的选项和实际能搜的源会对不上。
+          scraperPipelineProvider.overrideWithValue(pipeline),
           workScraperProvider.overrideWith(
             (ref) => WorkScraper(
               library: repo,
-              pipeline: ScraperPipeline([scraper]),
+              pipeline: pipeline,
               clock: () => now,
             ),
           ),
@@ -303,6 +321,12 @@ void main() {
 
       expect(applyEnabled(tester), isTrue);
       expect(find.textContaining('将更新为「超级马力欧银河大电影」'), findsOneWidget);
+      expect(
+        find.text('将更新为「超级马力欧银河大电影」（2026） · 豆瓣'),
+        findsOneWidget,
+        reason: '确认那一步也要点明来源：用户在按下「用这一条更新」之前'
+            '就该知道「这条是从豆瓣取的」，而不是更新完才看到。',
+      );
 
       await tester.tap(applyButton());
       await tester.pump();
@@ -414,6 +438,85 @@ void main() {
             '用户已经在候选列表里看到了结果，被告知「片名解析不准」'
             '只会让他去改一个本来没错的词。',
       );
+    });
+  });
+
+  group('手动刮削的来源筛选（指定刮削方案）', () {
+    testWidgets('只有一个在线源时**不显示**筛选器 —— 没得选就别占地方', (tester) async {
+      await open(tester);
+
+      expect(find.text('来源：'), findsNothing);
+      expect(find.text('全部'), findsNothing);
+    });
+
+    testWidgets('两个源时列出「全部」与各源展示名', (tester) async {
+      await open(
+        tester,
+        extraSources: [_ManualScraper(id: 'tmdb', displayName: 'TMDB')],
+      );
+
+      expect(find.text('来源：'), findsOneWidget);
+      expect(find.text('全部'), findsOneWidget);
+      expect(find.text('豆瓣'), findsOneWidget);
+      expect(
+        find.text('TMDB'),
+        findsOneWidget,
+        reason: '用 `displayName` 而不是原始 id（`tmdb`）—— 用户看到的是'
+            '「TMDB」这个品牌名，不是内部标识符。',
+      );
+    });
+
+    testWidgets('默认「全部」→ 每个源都收到搜索', (tester) async {
+      final tmdb = _ManualScraper(id: 'tmdb', displayName: 'TMDB');
+      final (douban, _) = await open(tester, extraSources: [tmdb]);
+
+      await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(tmdb.searchCalls, 1);
+      expect(douban.searchCalls, 1);
+    });
+
+    testWidgets('选中某个源 → 只有那个源收到搜索，别家的额度不花', (tester) async {
+      final tmdb = _ManualScraper(id: 'tmdb', displayName: 'TMDB');
+      final (douban, _) = await open(tester, extraSources: [tmdb]);
+
+      await tester.tap(find.text('TMDB'));
+      await tester.pump();
+
+      await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(tmdb.searchCalls, 1);
+      expect(
+        douban.searchCalls,
+        0,
+        reason: '用户指定「只在 TMDB 搜」时，豆瓣一个请求都不该发 —— '
+            '豆瓣匿名额度只有约 10 个搜索词，白花一格是实打实的损失。',
+      );
+    });
+
+    testWidgets('切源会清掉上一轮候选（不同源的候选不该混在一起）', (tester) async {
+      final tmdb = _ManualScraper(id: 'tmdb', displayName: 'TMDB');
+      await open(tester, extraSources: [tmdb]);
+
+      await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('超级马力欧银河大电影'), findsOneWidget);
+
+      await tester.tap(find.text('TMDB'));
+      await tester.pump();
+
+      expect(
+        find.text('超级马力欧银河大电影'),
+        findsNothing,
+        reason: '留着上一个源的候选，用户会以为「换了源结果也一样」—— '
+            '而其实他还没搜过新源。',
+      );
+      expect(find.text('改好片名，点「搜索」看候选。'), findsOneWidget);
     });
   });
 }

@@ -352,6 +352,112 @@ void main() {
 
       expect(await pipeline.search(_q), isEmpty);
     });
+
+    test('指定 sourceId → 只搜那一个源，别的源一次都不发', () async {
+      final tmdb = _Fake(
+        'tmdb',
+        run: (_) async => null,
+        onSearch: (_) async => const [
+          ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+        ],
+      );
+      final douban = _Fake(
+        'douban',
+        run: (_) async => null,
+        onSearch: (_) async => const [
+          ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+        ],
+      );
+      final pipeline = ScraperPipeline([tmdb, douban]);
+
+      final found = await pipeline.search(_q, sourceId: 'douban');
+
+      expect(found.map((c) => c.title), ['乙']);
+      expect(
+        tmdb.searchCalls,
+        0,
+        reason: '用户选了「只在豆瓣搜」时，TMDB 的额度没必要花 —— '
+            '而这正是这个筛选存在的全部意义。',
+      );
+      expect(douban.searchCalls, 1);
+    });
+
+    test('sourceId 为 null → 照旧搜全部（不改变原行为）', () async {
+      final pipeline = ScraperPipeline([
+        _Fake(
+          'tmdb',
+          run: (_) async => null,
+          onSearch: (_) async => const [
+            ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+          ],
+        ),
+        _Fake(
+          'douban',
+          run: (_) async => null,
+          onSearch: (_) async => const [
+            ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+          ],
+        ),
+      ]);
+
+      expect((await pipeline.search(_q)).map((c) => c.title), ['甲', '乙']);
+    });
+
+    test('sourceId 指向不在流水线里的源 → 空列表，不退回「搜全部」', () async {
+      final tmdb = _Fake(
+        'tmdb',
+        run: (_) async => null,
+        onSearch: (_) async => const [
+          ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+        ],
+      );
+      final pipeline = ScraperPipeline([tmdb]);
+
+      expect(
+        await pipeline.search(_q, sourceId: 'douban'),
+        isEmpty,
+        reason: '用户选了一个当前没配好的源（比如 Cookie 被清空了）。'
+            '这时退回「搜全部」会把 TMDB 的候选冒充成他要找的那一家 —— '
+            '宁可空，也不能给错来源的结果。',
+      );
+      expect(tmdb.searchCalls, 0);
+    });
+  });
+
+  group('ScraperPipeline.availableSources / displayNameOf（给 UI 用）', () {
+    test('availableSources 只列已启用且能出候选的源，排除本地兜底', () {
+      final pipeline = ScraperPipeline([
+        _Fake('tmdb', run: (_) async => null),
+        _Fake('douban', enabled: false, run: (_) async => null),
+        const LocalFilenameScraper(),
+      ]);
+
+      final sources = pipeline.availableSources;
+
+      expect(sources.map((s) => s.id), ['tmdb']);
+      expect(
+        sources.map((s) => s.displayName),
+        ['tmdb'],
+        reason: '本地文件名解析永远返回空候选，把它列进「来源筛选」'
+            '只会给用户一个点了没反应的选项。',
+      );
+    });
+
+    test('displayNameOf 按 id 查展示名；查不到返回 null', () {
+      final pipeline = ScraperPipeline([
+        _Fake('tmdb', run: (_) async => null),
+        const LocalFilenameScraper(),
+      ]);
+
+      expect(pipeline.displayNameOf('tmdb'), 'tmdb');
+      expect(pipeline.displayNameOf('local'), '文件名解析');
+      expect(
+        pipeline.displayNameOf('nope'),
+        isNull,
+        reason: '查不到时返回 null，让调用方决定怎么兜底 —— 而不是'
+            '把原始 id 直接贴进用户可见的文案里。',
+      );
+    });
   });
 
   group('ScraperPipeline.resolve（用户选中之后）', () {

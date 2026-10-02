@@ -17,9 +17,13 @@ class _RecordingRepo extends InMemoryMediaRepository {
   final List<MediaWork> written = [];
 
   @override
-  Future<void> upsertWorks(List<MediaWork> works, {DateTime? now}) async {
+  Future<void> upsertWorks(
+    List<MediaWork> works, {
+    DateTime? now,
+    bool overrideManual = false,
+  }) async {
     written.addAll(works);
-    return super.upsertWorks(works, now: now);
+    return super.upsertWorks(works, now: now, overrideManual: overrideManual);
   }
 }
 
@@ -70,6 +74,9 @@ class _Manual implements MetadataScraper {
   /// `false` = 详情接口失败 / 响应不是条目，`resolve` 返回 `null`。
   final bool resolvable;
 
+  /// 搜过几次 —— 用来钉「指定了源时别的源一次都不发」。
+  int searchCalls = 0;
+
   @override
   String get displayName => id;
 
@@ -80,7 +87,10 @@ class _Manual implements MetadataScraper {
   Future<ScrapedMetadata?> scrape(ScrapeQuery query) async => null;
 
   @override
-  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async => candidates;
+  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async {
+    searchCalls++;
+    return candidates;
+  }
 
   @override
   Future<ScrapedMetadata?> resolve(ScrapeCandidate candidate) async {
@@ -133,13 +143,14 @@ void main() {
     int episode = 1,
     bool extra = false,
     String fileId = 'f1',
+    String dirPath = '/动漫/Show/',
   }) =>
       MediaItem(
         provider: DriveProvider.quark,
         fileId: fileId,
         name: name,
         dirId: 'd1',
-        dirPath: '/动漫/Show/',
+        dirPath: dirPath,
         groupKey: 'show',
         kind: MediaKind.episode,
         title: 'Show',
@@ -372,9 +383,13 @@ void main() {
     });
 
     test('文件名解析不出可信片名 → noQuery，不发请求', () async {
+      // ⚠️ 目录名必须是**容器名**（`/电影/`）：2026-10-02 起「目录名可信且
+      // 文件自己说不清楚」时，整目录会按目录名归组 —— 用默认的
+      // `/动漫/Show/` 的话，`video.mkv` 会被救成一部叫「Show」的作品，
+      // 这条用例就测不到「真的什么都提不出来」了。
       final repo = await repoWith(
         work(),
-        [item(name: 'video.mkv')],
+        [item(name: 'video.mkv', dirPath: '/电影/')],
       );
       final scraper = _Fixed('fake', online());
       final subject = WorkScraper(
@@ -453,7 +468,11 @@ void main() {
     });
 
     test('queryFor 解析不出片名 → null，让对话框退回库里已有的标题', () async {
-      final repo = await repoWith(work(), [item(name: 'video.mkv')]);
+      // 同上：目录名得是容器名，否则目录名会兜底成一个可信片名。
+      final repo = await repoWith(
+        work(),
+        [item(name: 'video.mkv', dirPath: '/电影/')],
+      );
       final subject = WorkScraper(
         library: repo,
         pipeline: ScraperPipeline([_Fixed('fake', online())]),
@@ -461,6 +480,31 @@ void main() {
       );
 
       expect(await subject.queryFor(work()), isNull);
+    });
+
+    test('目录名可信时 queryFor 给出「目录名」查询 —— 与扫描期同一条解析路径', () async {
+      // 2026-10-02 事故的正面用例：`182.格力空调显示E6如何维修.mp4` 这类
+      // 「编号 + 描述」的文件名提不出片名，靠目录名才拿得到正确的查询词。
+      // 备用词必须为空 —— 旧规则会把开头那个 `182` 当英文名再搜一次 TMDB，
+      // 模糊搜索返回希腊纪录片《1821: Οι Ήρωες》并刮错。
+      final repo = await repoWith(work(), [
+        item(
+          name: '182.格力空调显示E6如何维修.mp4',
+          dirPath: '/来自：分享/姜松《家电维修视频教程》/',
+        ),
+      ]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      );
+
+      final q = await subject.queryFor(work());
+
+      expect(q, isNotNull);
+      expect(q!.title, '姜松 家电维修视频教程');
+      expect(q.kind, MediaKind.episode);
+      expect(q.alternateTitle, isNull);
     });
 
     test('searchCandidates 把各源候选汇总返回', () async {
@@ -498,6 +542,52 @@ void main() {
           const ScrapeQuery(title: '某片', kind: MediaKind.movie),
         ),
         isEmpty,
+      );
+    });
+
+    test('searchCandidates 传 sourceId → 只搜那一个源', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final tmdb = _Manual('tmdb', candidates: const [
+        ScrapeCandidate(source: 'tmdb', sourceId: '1', title: '甲'),
+      ]);
+      final douban = _Manual('douban', candidates: const [
+        ScrapeCandidate(source: 'douban', sourceId: '2', title: '乙'),
+      ]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([tmdb, douban]),
+        clock: () => now,
+      );
+
+      final found = await subject.searchCandidates(
+        const ScrapeQuery(title: '某片', kind: MediaKind.movie),
+        sourceId: 'douban',
+      );
+
+      expect(found.map((c) => c.title), ['乙']);
+      expect(tmdb.searchCalls, 0, reason: '用户指定了只在豆瓣搜。');
+      expect(douban.searchCalls, 1);
+    });
+
+    test('applyCandidate 的 outcome 带上来源展示名', () async {
+      final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Manual('douban')]),
+        clock: () => now,
+      );
+
+      final outcome = await subject.applyCandidate(
+        work(),
+        const ScrapeCandidate(source: 'douban', sourceId: '1', title: '某片'),
+      );
+
+      expect(outcome.status, WorkScrapeStatus.scraped);
+      expect(
+        outcome.sourceName,
+        'douban',
+        reason: '手动通道的结果要能告诉用户「这条是哪家给的」—— '
+            '对话框与详情页的消息都靠它拼出「… · 豆瓣」。',
       );
     });
 
@@ -678,7 +768,7 @@ void main() {
       );
     });
 
-    test('成功文案两个通道一致 —— 「已刮削：…」对谁说都一样', () async {
+    test('成功文案：两个通道共用「已刮削：片名（年份）」核心，手动多带来源', () async {
       final repo = await repoWith(work(), [item(name: 'Show.S01E01.mkv')]);
       final auto = await WorkScraper(
         library: repo,
@@ -703,12 +793,27 @@ void main() {
 
       expect(auto.status, WorkScrapeStatus.scraped);
       expect(manual.status, WorkScrapeStatus.scraped);
-      expect(auto.message, contains('已刮削'));
+
+      const core = '已刮削：仙逆 第一季（2023）';
+      expect(auto.message, contains(core));
       expect(
         manual.message,
+        contains(core),
+        reason: '成功那条的核心没有歧义：两个通道都说「已刮削：片名（年份）」。'
+            '按通道给它分叉出一套完全不同的说法，只会多一处要维护的重复。',
+      );
+
+      expect(
+        manual.message,
+        contains('douban'),
+        reason: '手动通道**必须**在结果里点明来源：用户亲手从候选里挑了一条，'
+            '「这条是哪家给的」正是他判断自己挑得对不对的依据。',
+      );
+      expect(
         auto.message,
-        reason: '成功那条没有歧义：两个通道都说「已刮削：片名（年份）」。'
-            '给它也按通道分叉，只会多一处要维护的重复。',
+        isNot(contains('douban')),
+        reason: '自动通道的来源对用户没有意义（他没做选择，是算法挑的），'
+            '所以不附来源名 —— 免得给一个用户无法据此行动的信息。',
       );
     });
   });

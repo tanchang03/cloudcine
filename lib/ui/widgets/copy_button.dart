@@ -18,6 +18,7 @@ class CopyTextButton extends StatelessWidget {
     required this.text,
     required this.label,
     required this.icon,
+    this.tvLabel,
     this.logScope = '媒体库',
   });
 
@@ -26,6 +27,14 @@ class CopyTextButton extends StatelessWidget {
   /// 既是 tooltip，也是复制成功提示里的名字。
   final String label;
 
+  /// TV 上印在图标旁边的**短**标签。给 `null` 时退回 [label]。
+  ///
+  /// 为什么不直接用 [label]：它是一句完整的说明（「复制这个文件的网盘
+  /// 路径」，11 个字），在电视上会把这行文件标题挤到只剩几个字 ——
+  /// 而标题才是用户扫这一行时要看的东西。这里要的是「知道按下去会发生
+  /// 什么」的下限，两三个字就够。
+  final String? tvLabel;
+
   final IconData icon;
 
   /// 诊断日志的分类名。
@@ -33,6 +42,10 @@ class CopyTextButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // TV 上没有 hover，「这个 ⧉ 复制的是什么」只写在 tooltip 里 = 等于没写。
+    // 所以电视上把短标签直接印在图标旁边。
+    final isTv = AppTheme.isTvLayout(context);
+
     return Tooltip(
       message: label,
       child: Material(
@@ -54,7 +67,23 @@ class CopyTextButton extends StatelessWidget {
           },
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-            child: Icon(icon, size: 14, color: AppTheme.muted),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 14, color: AppTheme.muted),
+                if (isTv) ...[
+                  const SizedBox(width: 5),
+                  Text(
+                    tvLabel ?? label,
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      height: 1.2,
+                      color: AppTheme.muted,
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
         ),
       ),

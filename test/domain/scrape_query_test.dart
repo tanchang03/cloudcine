@@ -53,6 +53,40 @@ void main() {
     });
   });
 
+  group('备用词必须是「名字」：数字堆不算（2026-10-02 事故）', () {
+    test('开头的纯数字不配当备用词', () {
+      // 事故现场：`182.格力空调显示E6如何维修.mp4` →
+      // cjk=`格力空调显示`、latin=`182`，旧规则「两边都非空就用 latin」，
+      // 于是又拿 `"182"` 搜了一次 TMDB，模糊搜索返回希腊纪录片
+      // 《1821: Οι Ήρωες》，前缀档判 0.91 → 刮错。
+      //
+      // 备用词是为了「中英混排时用另一半再搜一次」（`流浪地球2 The Wandering
+      // Earth II`）。一串编号**不是另一半名字**，它只会把查询带到一堆
+      // 编号相同的无关条目上。
+      //
+      // ⚠️ 这里必须带年份：不带年份的这部电影解析结果不可信
+      // （`isConfident` 要求「有年份或有季集」），`fromParsed` 直接返回
+      // null —— 那是另一条规则，测不到备用词。
+      final q = queryOf('182.格力空调显示E6如何维修.2024.mp4');
+
+      expect(q, isNotNull);
+      expect(q!.alternateTitle, isNull,
+          reason: 'latin 去掉数字与标点后只剩 1 个字母（E），不是名字');
+    });
+
+    test('⚠️ 含真实英文名的拉丁半仍然是备用词 —— 这条规则不许做过头', () {
+      final q = queryOf('流浪地球2.The.Wandering.Earth.II.2023.2160p.WEB-DL.mkv');
+
+      expect(q!.alternateTitle, 'The Wandering Earth II');
+    });
+
+    test('以数字开头的英文片名也仍然放行 —— 3 Idiots 是名字不是编号', () {
+      final q = queryOf('三傻大闹宝莱坞.3.Idiots.2009.1080p.mkv');
+
+      expect(q!.alternateTitle, '3 Idiots');
+    });
+  });
+
   group('字段透传：季集与类型', () {
     test('剧集带出季号集号，年份可以缺', () {
       final q = queryOf('仙逆.S01E12.1080p.WEB-DL.mkv');

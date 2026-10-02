@@ -71,6 +71,64 @@ void main() {
     });
   });
 
+  /// 「部」—— 季下面的一层（《进击的巨人》第三季 Part.1/Part.2），
+  /// 电影则只有部（《流浪地球》上下部）。
+  ///
+  /// ⚠️ 这里每一条都同时断言**片名被截干净**：`_partOf` 负责解析出部，
+  /// `_markerPatterns` 负责把片名截在部之前。只做对一半的表现是
+  /// 「片名里多出『特别篇』三个字」→ 它和正片归成两个作品，且不报错。
+  group('分部（部 / 篇 / 特别篇）', () {
+    test('Part.2：点分风格里最常见的分部写法（点号分隔符不能漏）', () {
+      final r = parser.parse('Some.Show.S03.Part.2.1080p.mkv');
+
+      expect(r.title, 'Some Show');
+      expect(r.season, 3);
+      expect(r.part, 2);
+      expect(r.partLabel, isNull);
+    });
+
+    test('第X部：中文分部，片名截在它之前', () {
+      final r = parser.parse('庆余年 第二部 1080p.mkv');
+
+      expect(r.title, '庆余年');
+      expect(r.part, 2);
+    });
+
+    test('上部 / 下部：有编号也有专名', () {
+      final up = parser.parse('流浪地球 上部 2160p.mkv');
+      expect(up.title, '流浪地球');
+      expect(up.part, 1);
+      expect(up.partLabel, '上部');
+
+      final down = parser.parse('流浪地球 下部 2160p.mkv');
+      expect(down.part, 2);
+      expect(down.partLabel, '下部');
+    });
+
+    test('特别篇：不进片名，归入「特别篇」部', () {
+      final r = parser.parse('进击的巨人 特别篇 1080p.mkv');
+
+      expect(r.title, '进击的巨人');
+      expect(r.partLabel, '特别篇');
+      expect(r.part, isNull);
+    });
+
+    test('第X集仍是集、不是部（只差最后一个字）', () {
+      final cn = parser.parse('庆余年 第3集 1080p.mkv');
+
+      expect(cn.episode, 3);
+      expect(cn.part, isNull);
+      expect(cn.partLabel, isNull);
+    });
+
+    test('括号风格里的分部也认', () {
+      final r = parser.parse('[组名][进击的巨人][特别篇][1080p][JPSC].mkv');
+
+      expect(r.title, '进击的巨人');
+      expect(r.partLabel, '特别篇');
+    });
+  });
+
   group('点分风格 · 剧集', () {
     test('S01E02 全字段', () {
       final r = parser.parse(
@@ -177,6 +235,127 @@ void main() {
 
       expect(r.title, 'Inception');
       expect(r.year, 2010);
+    });
+  });
+
+  group('故障代码不是集号（2026-10-02 事故）', () {
+    test('紧贴汉字的 E6 是故障代码，不是第 6 集', () {
+      // 事故现场：`182.格力空调显示E6如何维修.mp4` 里的 E6 是空调故障代码，
+      // 旧代码把 `E` 前面的汉字当成了合法边界 → episode=6 → `isConfident`
+      // 被顶成 true → 这条垃圾片名**变成了一个作品**（同目录里没有 E 码的
+      // 文件反而不建作品）。家电/汽车/医疗教程里 E1~E9 是成表的，会成片误判。
+      final r = parser.parse('182.格力空调显示E6如何维修.mp4');
+
+      expect(r.episode, isNull);
+      expect(r.kind, MediaKind.movie,
+          reason: 'kind 被顶成 episode 会让它变成「可信」，进而各建一个作品');
+      expect(r.title, '182 格力空调显示E6如何维修',
+          reason: '标记表里的 `e\\d+` 也要一起修，否则片名仍被截在 E6 前面');
+    });
+
+    test('汉字后的 E1~E9 全都不算集号', () {
+      for (final n in [
+        '5.格力空调显示E1怎么办.mp4',
+        '23.美的空调E3故障代码维修.mp4',
+        '88.洗衣机显示E4怎么处理.mp4',
+      ]) {
+        expect(parser.parse(n).episode, isNull, reason: n);
+      }
+    });
+
+    test('⚠️ 分隔符后的 E01 仍然是集号 —— 别把这条规则做过头', () {
+      final r = parser.parse('Some.Show.E01.1080p.WEB-DL.mkv');
+
+      expect(r.episode, 1);
+      expect(r.kind, MediaKind.episode);
+    });
+  });
+
+  group('目录名作为系列名（2026-10-02）', () {
+    test('课程目录：文件名只剩「编号+描述」时，整目录按目录名归组', () {
+      final r = parser.parse(
+        '182.格力空调显示E6如何维修.mp4',
+        dirPath: '/来自：分享/姜松《家电维修视频教程》/',
+      );
+
+      expect(r.title, '姜松 家电维修视频教程');
+      expect(r.kind, MediaKind.episode,
+          reason: '用户定的口径：同目录多视频 → 作为系列整体归类，不是独立电影');
+      expect(r.groupKey, '姜松家电维修视频教程',
+          reason: '同目录 182 个文件必须落到**同一个**分组键，否则还是 182 个作品');
+      expect(r.episode, isNull, reason: 'E6 是故障代码，不该留在作品里显示成 E06');
+    });
+
+    test('容器目录名向上回溯 —— day01 用上一级的章节名', () {
+      final r = parser.parse(
+        '01-什么是程序.wmv',
+        dirPath: '/来自：分享/尚硅谷嵌入式全套教程/01_尚硅谷嵌入式技术之C语言/4.视频/day01/',
+      );
+
+      expect(r.title, '01 尚硅谷嵌入式技术之C语言');
+      expect(r.groupKey, '01尚硅谷嵌入式技术之c语言');
+    });
+
+    test('自带年份的独立发行物不被目录名顶掉 —— 单部电影仍是电影', () {
+      final r = parser.parse(
+        'The.Wandering.Earth.II.2023.2160p.WEB-DL.mkv',
+        dirPath: '/电影/流浪地球2 (2023)/',
+      );
+
+      expect(r.title, 'The Wandering Earth II');
+      expect(r.kind, MediaKind.movie,
+          reason: '文件名自带年份 = 它自己就说得清楚；改成剧集会让整部电影掉进「剧集」栏');
+      expect(r.year, 2023);
+    });
+
+    test('栏目名不算系列名，也不算片名兜底 —— `/电影/` 里提不出片名的散片不建作品', () {
+      // `2012.2009.1080p.BluRay.mkv` 的 `2012` 会被当成技术标记 → 提不出片名。
+      // 旧代码此时拿目录名兜底，于是库里多出一部叫「电影」的作品。
+      final r = parser.parse(
+        '2012.2009.1080p.BluRay.mkv',
+        dirPath: '/电影/',
+      );
+
+      expect(r.title, isNull,
+          reason: '宁可让它在库里以文件名示人（不归组），也不要造一个假作品');
+      expect(r.groupKey, isNot('电影'));
+    });
+
+    test('`/电影/流浪地球2 (2023)/movie.mkv` 仍然靠目录名兜底 —— 别把兜底一起废掉', () {
+      final r = parser.parse('1080p.mkv', dirPath: '/电影/流浪地球2 (2023)/');
+
+      expect(r.title, '流浪地球2');
+      expect(r.year, 2023);
+    });
+
+    test('分享根目录不算系列名 —— 那 2 个散视频不该合成一个「来自：分享」', () {
+      final r = parser.parse(
+        '虚天战纪 导演剪辑版（上）.mp4',
+        dirPath: '/来自：分享/',
+      );
+
+      expect(r.title, isNot('来自 分享'));
+      expect(r.groupKey, isNot(contains('来自')));
+    });
+
+    test('剧集目录里的 SxxExx 文件不被目录名顶掉 —— 沧元图 77 集要仍是一个作品', () {
+      final r = parser.parse(
+        'S01E01.60fps.10bit.AAC.mp4',
+        dirPath: '/来自：分享/沧元图/',
+      );
+
+      expect(r.kind, MediaKind.episode);
+      expect(r.title, '沧元图', reason: '文件名提不出片名时本来就退到目录名，这里不变');
+      expect(r.groupKey, '沧元图');
+    });
+
+    test('不给 dirPath 时行为完全不变 —— 老调用点与老测试不受影响', () {
+      final r = parser.parse(
+        '182.格力空调显示E6如何维修.mp4',
+        dirName: '姜松《家电维修视频教程》',
+      );
+
+      expect(r.title, '182 格力空调显示E6如何维修');
     });
   });
 

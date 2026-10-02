@@ -1,4 +1,5 @@
 import 'package:cloudcine/ui/theme/app_theme.dart';
+import 'package:cloudcine/ui/widgets/anchored_menu.dart';
 import 'package:cloudcine/ui/windows/player_protocol.dart';
 import 'package:cloudcine/ui/windows/player_window_app.dart';
 import 'package:flutter/material.dart';
@@ -73,7 +74,7 @@ void main() {
   /// `Navigator.of(context).pop(…)` 收尾，没有 Navigator 就会在**点下去的那一刻**
   /// 抛异常 —— 而这里要断言的恰恰是「点下去会发生什么」。
   ///
-  /// 窗口刻意开得很大：字幕菜单满配时有 14 行，默认的 800×600 会让 `AlertDialog`
+  /// 窗口刻意开得很大：字幕菜单满配时有 14 行，默认的 800×600 会让菜单面板
   /// 的内容溢出，而溢出在测试里是**报错**（不是「看不全」），会把用例带崩。
   Future<Object? Function()> openMenu(WidgetTester tester, Widget menu) async {
     tester.view.physicalSize = const Size(900, 1600);
@@ -129,10 +130,10 @@ void main() {
   /// 菜单里所有文案，按**从上到下**的顺序。
   ///
   /// 菜单的内容和顺序就是它对用户的全部承诺，所以这里直接按顺序整列比对。
-  /// 只收 `AlertDialog` 里面的 —— 外面那层测试脚手架（「打开」按钮）不算菜单。
+  /// 只收 [AnchoredMenuPanel] 里面的 —— 外面那层测试脚手架（「打开」按钮）不算菜单。
   List<String> menuTexts(WidgetTester tester) => tester
       .widgetList<Text>(find.descendant(
-        of: find.byType(AlertDialog),
+        of: find.byType(AnchoredMenuPanel),
         matching: find.byType(Text),
       ))
       .map((t) => t.data)

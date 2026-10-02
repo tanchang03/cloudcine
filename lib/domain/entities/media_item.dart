@@ -25,6 +25,8 @@ class MediaItem {
     this.season,
     this.episode,
     this.episodeEnd,
+    this.part,
+    this.partLabel,
     this.container = VideoContainer.other,
     this.resolution,
     this.videoWidth,
@@ -70,6 +72,20 @@ class MediaItem {
   final int? season;
   final int? episode;
   final int? episodeEnd;
+
+  /// 部号（`第X部` / `上部`·`下部` / `Part.2` / `CD1`）。
+  ///
+  /// ## 与 [season] 是两个维度
+  ///
+  /// 季是**外层**（《进击的巨人》第三季），部是**内层**（Part.1 / Part.2）；
+  /// 而电影没有季，只有部（《流浪地球》上下部）。两者不能合并成一个字段 ——
+  /// 混在一起会让 `S03 Part.2` 排成「第三季的第 2 集」那种错位。
+  final int? part;
+
+  /// 部的展示名（`特别篇` / `上部` / `下部`）。
+  ///
+  /// 非空时展示**优先用它**：用户认的是「特别篇」这三个字，不是「第 9999 部」。
+  final String? partLabel;
 
   final VideoContainer container;
 
@@ -212,6 +228,34 @@ class MediaItem {
     return parts.join(' · ');
   }
 
+  /// 没有编号的部（`特别篇` / `剧场版`）的排序号 —— 排在所有编号部之后。
+  ///
+  /// 取一个大到不可能被真实部号撞上的值：真实部号是「第几部」，两位数都罕见。
+  static const int specialPartOrder = 9999;
+
+  /// 部的**排序号**。
+  ///
+  ///   - 有编号的部（`第2部` / `Part.2`）→ 用编号；
+  ///   - `特别篇` 这类没有编号的 → [specialPartOrder]，排在所有编号部**之后**；
+  ///   - 没标部的 → 0，排在最前（与 [season] 用 `?? 0` 的口径一致）。
+  ///
+  /// 抽成 getter 是为了让「特别篇排最后」这条规则**只有一份实现** ——
+  /// 列表排序、层级选择器、`PlayTarget` 三处都读它。散成三份的话，
+  /// 三处对「特别篇算第几部」的理解迟早分叉。
+  int get partOrder {
+    if (part != null) return part!;
+    if (partLabel != null && partLabel!.isNotEmpty) return specialPartOrder;
+    return 0;
+  }
+
+  /// 部的展示文本；没标部时返回 `null`（调用方据此不画这一层）。
+  String? get partText {
+    final l = partLabel;
+    if (l != null && l.isNotEmpty) return l;
+    if (part != null) return '第 $part 部';
+    return null;
+  }
+
   MediaItem copyWith({
     String? dirPath,
     String? title,
@@ -219,6 +263,8 @@ class MediaItem {
     int? season,
     int? episode,
     int? episodeEnd,
+    int? part,
+    String? partLabel,
     VideoResolution? resolution,
     int? videoWidth,
     int? videoHeight,
@@ -242,6 +288,8 @@ class MediaItem {
         season: season ?? this.season,
         episode: episode ?? this.episode,
         episodeEnd: episodeEnd ?? this.episodeEnd,
+        part: part ?? this.part,
+        partLabel: partLabel ?? this.partLabel,
         container: container,
         resolution: resolution ?? this.resolution,
         videoWidth: videoWidth ?? this.videoWidth,
@@ -284,6 +332,8 @@ class MediaItem {
       season: parsed.season,
       episode: parsed.episode,
       episodeEnd: parsed.episodeEnd,
+      part: parsed.part,
+      partLabel: parsed.partLabel,
       container: VideoFormats.containerOf(entry.name, mimeType: entry.mimeType),
       // **实测优先**：网盘给的像素尺寸比文件名可靠 —— 文件名是发布组自己
       // 标的，会标错也会缺；尺寸是服务端读文件头得到的（实测覆盖率 100%）。

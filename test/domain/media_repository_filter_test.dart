@@ -10,7 +10,7 @@ import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:drift/drift.dart' show Value;
 import 'package:flutter_test/flutter_test.dart';
 
-/// 年代 / 类型筛选在两个实现上的**一致性**。
+/// 年份 / 类型筛选在两个实现上的**一致性**。
 ///
 /// ## 为什么专门写一份「两个实现比一比」
 ///
@@ -42,7 +42,7 @@ typedef Filter = ({
   MediaCategory? category,
   bool playedOnly,
   String? query,
-  Set<int>? decades,
+  Set<int>? years,
   Set<String>? genres,
 });
 
@@ -143,20 +143,20 @@ void main() {
 
   /// 一份筛选条件。
   final filters = <Filter>[
-    (category: null, playedOnly: false, query: null, decades: null, genres: null),
-    (category: MediaCategory.movie, playedOnly: false, query: null, decades: null, genres: null),
-    (category: MediaCategory.anime, playedOnly: false, query: null, decades: null, genres: null),
-    (category: null, playedOnly: false, query: null, decades: {2020}, genres: null),
-    (category: null, playedOnly: false, query: null, decades: {1990}, genres: null),
-    (category: null, playedOnly: false, query: null, decades: {1990, 2020}, genres: null),
-    (category: null, playedOnly: false, query: null, decades: null, genres: {'剧情'}),
-    (category: null, playedOnly: false, query: null, decades: null, genres: {'动画'}),
-    (category: null, playedOnly: false, query: null, decades: null, genres: {'动画片'}),
-    (category: null, playedOnly: false, query: null, decades: null, genres: {'动画', '科幻'}),
-    (category: MediaCategory.anime, playedOnly: false, query: null, decades: null, genres: {'动画'}),
-    (category: MediaCategory.movie, playedOnly: false, query: null, decades: {2020}, genres: {'剧情'}),
-    (category: null, playedOnly: false, query: '小说', decades: null, genres: null),
-    (category: null, playedOnly: false, query: '某剧', decades: null, genres: null),
+    (category: null, playedOnly: false, query: null, years: null, genres: null),
+    (category: MediaCategory.movie, playedOnly: false, query: null, years: null, genres: null),
+    (category: MediaCategory.anime, playedOnly: false, query: null, years: null, genres: null),
+    (category: null, playedOnly: false, query: null, years: {2023}, genres: null),
+    (category: null, playedOnly: false, query: null, years: {1994}, genres: null),
+    (category: null, playedOnly: false, query: null, years: {1994, 2023}, genres: null),
+    (category: null, playedOnly: false, query: null, years: null, genres: {'剧情'}),
+    (category: null, playedOnly: false, query: null, years: null, genres: {'动画'}),
+    (category: null, playedOnly: false, query: null, years: null, genres: {'动画片'}),
+    (category: null, playedOnly: false, query: null, years: null, genres: {'动画', '科幻'}),
+    (category: MediaCategory.anime, playedOnly: false, query: null, years: null, genres: {'动画'}),
+    (category: MediaCategory.movie, playedOnly: false, query: null, years: {2023}, genres: {'剧情'}),
+    (category: null, playedOnly: false, query: '小说', years: null, genres: null),
+    (category: null, playedOnly: false, query: '某剧', years: null, genres: null),
   ];
 
   Future<List<String>> keys(
@@ -168,7 +168,7 @@ void main() {
       category: f.category,
       playedOnly: f.playedOnly,
       query: f.query,
-      decades: f.decades,
+      years: f.years,
       genres: f.genres,
       limit: limit,
     );
@@ -188,19 +188,19 @@ void main() {
     }
   });
 
-  test('countWorksByDecade：两个实现一致，且等于实际条数', () async {
+  test('countWorksByYear：两个实现一致，且等于实际条数', () async {
     for (final f in filters) {
-      final a = await real.countWorksByDecade(
+      final a = await real.countWorksByYear(
         category: f.category,
         playedOnly: f.playedOnly,
         query: f.query,
       );
-      final b = await fake.countWorksByDecade(
+      final b = await fake.countWorksByYear(
         category: f.category,
         playedOnly: f.playedOnly,
         query: f.query,
       );
-      expect(b, a, reason: '条件 $f 的年代分布：真身 $a，替身 $b');
+      expect(b, a, reason: '条件 $f 的年份分布：真身 $a，替身 $b');
 
       // 角标 == 点了之后的条数（面板上的数字必须能兑现）。
       for (final entry in a.entries) {
@@ -208,10 +208,10 @@ void main() {
           category: f.category,
           playedOnly: f.playedOnly,
           query: f.query,
-          decades: {entry.key},
+          years: {entry.key},
           genres: null,
         ));
-        expect(hit.length, entry.value, reason: '条件 $f / ${entry.key} 年代');
+        expect(hit.length, entry.value, reason: '条件 $f / ${entry.key} 年');
       }
     }
   });
@@ -235,7 +235,7 @@ void main() {
           category: f.category,
           playedOnly: f.playedOnly,
           query: f.query,
-          decades: null,
+          years: null,
           genres: {entry.key},
         ));
         expect(hit.length, entry.value, reason: '条件 $f / ${entry.key}');
@@ -249,7 +249,7 @@ void main() {
         category: null,
         playedOnly: false,
         query: null,
-        decades: <int>{},
+        years: <int>{},
         genres: <String>{},
       ))).length, specs.length);
     }

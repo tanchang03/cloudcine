@@ -25,7 +25,7 @@ import '../theme/app_theme.dart';
 /// **认输**（匹配闸门拦下、按未命中处理，见 `scrape_match.dart`），
 /// 然后把决定权交给人：这个对话框。
 ///
-/// ## 三个交互决定
+/// ## 四个交互决定
 ///
 ///   1. **预填的是「文件名解析出来的词」，不是库里已存的标题。**
 ///      库里那个可能是上一次刮错的结果（`低俗小说`），用户得先意识到
@@ -38,6 +38,20 @@ import '../theme/app_theme.dart';
 ///   3. **选中之后还要再点一次「用这一条更新」**，点候选行只是选中。
 ///      这是「确认」那一步 —— 刮削会覆盖标题、年份、海报、简介，
 ///      不该在用户只是「看看有哪些候选」的时候发生。
+///   4. **可以指定只用某一个源搜**（源 ≥2 时才给这排 chip）。同一个片名
+///      在 TMDB 和豆瓣的收录情况可能差很远，而自动流程是**两家都问**：
+///      用户已经知道「这片子豆瓣上有」时，让他再等 TMDB 一轮（甚至白烧
+///      一次请求）没有意义。选中之后**结果里也会带上来源名** ——
+///      他亲手挑的候选，来源正是他判断「挑得对不对」的依据。
+///
+/// ## 一个容易踩的接线坑
+///
+/// 来源 chip 的选项读 [manualScrapeSourcesProvider]（= 流水线的
+/// `availableSources`），而真正的搜索走 [workScraperProvider]。生产环境
+/// 两者同源于 `scraperPipelineProvider`，天然一致；**测试里必须同时
+/// override 这两个 provider 并传同一个 pipeline 实例**，否则 chip 列出的
+/// 源和实际能搜的源会对不上（`manual_scrape_dialog_test.dart` 的 `open()`
+/// 就是按这个方式搭的）。
 class ManualScrapeDialog extends ConsumerStatefulWidget {
   const ManualScrapeDialog({super.key, required this.work});
 
@@ -77,6 +91,10 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
 
   ScrapeCandidate? _selected;
   String? _error;
+
+  /// 手动搜索的来源筛选。`null` = 搜全部启用的源；`'tmdb'` / `'douban'`
+  /// 只搜那一个。用户选了「只在豆瓣搜」时，没必要把 TMDB 的额度也花掉。
+  String? _sourceFilter;
 
   @override
   void initState() {
@@ -130,7 +148,9 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
       _selected = null;
     });
 
-    final found = await ref.read(workScraperProvider).searchCandidates(query);
+    final found = await ref
+        .read(workScraperProvider)
+        .searchCandidates(query, sourceId: _sourceFilter);
     if (!mounted) return;
     setState(() {
       _searching = false;
@@ -322,6 +342,7 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
             ],
           ),
           const SizedBox(height: 8),
+          ..._sourcePickerRow(busy),
           const Text(
             '提示：年份留空能搜到更多候选（TMDB 的年份是硬过滤，'
             '填错会把正主直接筛掉）。',
@@ -425,22 +446,26 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
   }
 
   Widget _footer(bool busy) {
+    final selected = _selected;
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 11, 18, 12),
       child: Row(
         children: [
           Expanded(
             child: Text(
-              _selected == null
+              selected == null
                   ? '还没选候选。'
-                  : '将更新为「${_selected!.title}」'
-                      '${_selected!.year == null ? "" : "（${_selected!.year}）"}',
+                  // 结果里带上**来源**：用户在确认那一步就能看到
+                  // 「这一条会从哪个源取」，而不是等更新完才知道。
+                  : '将更新为「${selected.title}」'
+                      '${selected.year == null ? "" : "（${selected.year}）"}'
+                      ' · ${_sourceLabel(selected.source)}',
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 11.5,
                 height: 1.6,
-                color: _selected == null ? AppTheme.dim : AppTheme.muted,
+                color: selected == null ? AppTheme.dim : AppTheme.muted,
               ),
             ),
           ),
@@ -541,6 +566,75 @@ class _ManualScrapeDialogState extends ConsumerState<ManualScrapeDialog> {
               DropdownMenuItem(value: MediaKind.episode, child: Text('剧集')),
             ],
             onChanged: busy ? null : (v) => setState(() => _kind = v ?? _kind),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 来源 id → 展示名。查不到就退回 id 本身 —— 不显示比显示一个空串好。
+  String _sourceLabel(String sourceId) {
+    for (final s in ref.watch(manualScrapeSourcesProvider)) {
+      if (s.id == sourceId) return s.displayName;
+    }
+    return sourceId;
+  }
+
+  /// 来源筛选行。只有一个在线源时不显示（没得选）。
+  List<Widget> _sourcePickerRow(bool busy) {
+    final sources = ref.watch(manualScrapeSourcesProvider);
+    if (sources.length < 2) return const [SizedBox.shrink()];
+
+    return [
+      Wrap(
+        spacing: 6,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          const Text(
+            '来源：',
+            style: TextStyle(fontSize: 11, color: AppTheme.dim),
+          ),
+          _sourceChip(null, '全部', busy),
+          for (final s in sources) _sourceChip(s.id, s.displayName, busy),
+        ],
+      ),
+      const SizedBox(height: 8),
+    ];
+  }
+
+  Widget _sourceChip(String? id, String label, bool busy) {
+    final selected = _sourceFilter == id;
+    return InkWell(
+      onTap: (busy)
+          ? null
+          : () => setState(() {
+                _sourceFilter = id;
+                // 切源时清掉上一轮的结果：不同源的候选不一样，
+                // 留着旧列表会让用户误以为「结果一样」。
+                _candidates = null;
+                _selected = null;
+                _error = null;
+              }),
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: selected
+              ? AppTheme.accent.withValues(alpha: 0.15)
+              : AppTheme.panel2,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: selected ? AppTheme.accent : AppTheme.line,
+            width: selected ? 0.8 : 0.5,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            color: selected ? AppTheme.accent : AppTheme.muted,
+            fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
           ),
         ),
       ),

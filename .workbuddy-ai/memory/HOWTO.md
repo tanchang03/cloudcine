@@ -1026,3 +1026,324 @@ x-oss-callback:{callbackB64}\nx-oss-date:{ossDate}\nx-oss-user-agent:{ua}\n
 ### 冲突与恢复
 - 不同设备 + 相差 <60s ⇒ `conflictsWith` 判冲突，交用户决定。
 - 新机器必须先手动「从网盘恢复」（设置页按钮）拉一份下来，再谈同步。
+
+---
+
+# Android TV 遥控器适配（2026-10-02 评估，未实施）
+
+主文档：`docs/AndroidTV-遥控器体验评估.md`（86 条逐功能点）；证据：`test/ui/tv_remote_probe_test.dart`（7 条探针）。
+
+## 为什么探针测试就是「一台 TV 的按键层」
+`flutter test` 下 `defaultTargetPlatform` 默认 **`android`**（见 `MEMORY.md` 测试取向那条），
+所以 `tester.sendKeyEvent` 走的是**真的 Android 键码表**（`keyboard_maps.g.dart`）。
+不用真机、不用 adb，就能验证「遥控器按下去会发生什么」。
+
+## 键码事实（写错键名 = 功能看起来「没做」）
+| 遥控器键 | Android keycode | 映射到 |
+|---|---|---|
+| 上/下/左/右 | 19/20/21/22 | `arrowUp/Down/Left/Right` |
+| **中心 OK** | **23** | **`LogicalKeyboardKey.select`** |
+| 播放/暂停 | 85 | `mediaPlayPause` |
+| 快退/快进 | 89/90 | `mediaRewind` / `mediaFastForward` |
+| 返回 BACK | 4 | **不给 app 送 key event**，由 Activity 处理 |
+
+`WidgetsApp._defaultShortcuts` 把 **`select` / `enter` / `space` / `gameButtonA` 四个都**映射到 `ActivateIntent`。
+⇒ ⛔ **自己写 `CallbackShortcuts` 只绑 `space` 等于遥控器完全收不到**。
+探针 6 实测：`select` 命中 **0**、`space` 命中 1 —— 这就是「遥控器按不出暂停」的全部机制。
+
+## 三条实测结论（推翻了最初猜测，别再去改）
+1. **方向键能钻进 `GridView.builder` 的懒加载目标**。探针 1 轨迹 `[0,5,10,...,55]`、滚动 `2576.4/2576.4` 走满。
+   原因：`defaultTraversalRequestFocusCallback` 内部调 `Scrollable.ensureVisible`。
+   ⇒ 「海报墙遥控器划不动」**不成立**，别去自定义遍历策略。
+2. **OK 键能激活 `InkWell` / `Switch` / `FilterChip` / `ExpansionTile`**（探针 2/3）。⇒ 「遥控器点不动卡片」**不成立**。
+3. **`Slider` 会吃掉方向键**（探针 4：0.5 → 0.55）。所以播放页拿 `ExcludeFocus` 包顶栏/控制栏**是有道理的** ——
+   但那等于把控件整个踢出遥控器可达范围。**正解是给一套 TV 专用 OSD，不是简单删 `ExcludeFocus`。**
+
+## 焦点高亮为什么「看不见」——两重原因叠加，只修一个无效
+1. **默认 `focusColor` = `Colors.white.withOpacity(0.12)`**（`theme_data.dart:442`），探针 5 实测 alpha `0.1216`，3 米外不可见。
+2. ⚠️ **`_WorkCard` 是全项目唯一一个没有自己 `Material` 的卡片类点击区**
+   （`_NavTile`/`_FolderRow`/`MediaItemRow`/`_DetailButton`/`_ViewSegment`/`_CategoryChip`/`_Crumb` **都包了**）。
+   最近的 `Material` 于是变成 `Scaffold` 那层，而 `_RenderInkFeatures.paint` 是**先画 ink、再 `super.paint`（画子节点）**
+   → 高亮只可能从卡片下半部那段透明底的文字区露出来，**海报整个盖住它**。
+   ⇒ **只调 `focusColor` 不改这一条，海报墙上照样等于没焦点。**
+
+## 关不掉的浮层：`MenuAnchor` 不是 route
+`MenuAnchor` 是 `OverlayPortal`，关闭只绑了 `escape: DismissIntent()`（`menu_anchor.dart:69/330/411`）。
+**电视上没有 Esc** ⇒ 筛选面板打开后关不掉。
+- ✅ `PopupMenuButton` / `DropdownButton` 走 `showMenu`（**真 route**）→ BACK 能关，**这两类不用改**。
+- ✅ `showDialog` 也包在 `ModalRoute` 里 → BACK 能关。
+⇒ 需要修的**只有 `library_filter_panel.dart` 这一类裸 `MenuAnchor`**。
+
+## 已经「做对了」的（别改）
+- `PlaybackExitPolicy`：`TargetPlatform.android → stopAndRelease` ✅
+- `player_window_bridge.dart` 的 `supportsMultiWindow` 排除 Android → `playItem` 自动回落内置播放页 ✅
+- 侧边栏在左、深色主题 ✅
+
+## Android 构建：三个坑串成一条链（2026-10-02 已打通）
+`flutter build apk --release` 已成功产出 `build/app/outputs/flutter-apk/app-release.apk`
+（53.8MB、4 个 ABI、debug 签名 —— 无 `android/key.properties` 时按设计退回 debug 签名）。
+下面三条**不是各自独立的毛病**，是同一串；报错位置和真因差得很远，照报错字面修会白花时间。
+
+### 坑一：沙箱里 `flutter build` 必然死在 `:gradle:compileKotlin`
+症状：`Unable to delete directory '<flutter_sdk>/packages/flutter_tools/gradle/build/classes/kotlin/main'`
++ `Operation not permitted`，反复出现，`rm -rf` 也救不回来。
+**真因**：Flutter 会在 **SDK 目录内部**编译它自己的 Gradle 插件（`includeBuild`），
+而该路径在**工作区之外** → 沙箱拒绝**子进程**的 `file-write-unlink`。
+（⚠️ 关键判据：**同一个路径我自己的 shell 能 `touch` + `rm` 成功**，被拒的只有 Gradle/JVM 子进程 ——
+所以「权限 / TCC / 文件被占用」方向的排查全是错的。）
+**修法**：`dangerouslyDisableSandbox: true` **且必须前台运行** —— 后台运行时这个标记会被**静默忽略**，
+命令照旧带沙箱跑。判据：stderr 里出现 `[sandbox] 命令被沙箱拦截` 就说明标记没生效。
+另加 `org.gradle.daemon=false` + `kotlin.compiler.execution.strategy=in-process`
+（两份 `gradle.properties` 都要写：真实 HOME 与**沙箱 HOME**，见坑二）。
+
+### 坑二：`local.properties` 被写成 homebrew 的 `platform-tools`（CMake 报错的真因）
+症状：`:app:configureCMakeRelWithDebInfo[arm64-v8a]` → `[CXX1300] CMake '3.22.1' was not found
+in SDK, PATH, or by cmake.dir property`，而 `~/Library/Android/sdk/cmake/3.22.1` 明明装好了、能跑。
+**真因**：`flutter build` 会把**它定位到的** SDK 写回 `local.properties`。Flutter 的
+`findAndroidHomeDir()` 顺序是：`config['android-sdk']` → `ANDROID_HOME` → `ANDROID_SDK_ROOT`
+→ macOS 默认 `$HOME/Library/Android/sdk` → 兜底 `which aapt` → **`which adb`**。
+**沙箱里 `HOME=/Users/tandy/.workbuddy-ai-6-home`**，那个 HOME 下没有 `Library/Android/sdk` →
+一路掉到兜底：`/opt/homebrew/bin/adb` 是符号链接，`resolveSymbolicLinksSync()` 后取 `parent.parent`
+得到 `/opt/homebrew/Caskroom/android-platform-tools/35.0.2`；而 `validSdkDirectory()` 只要求
+**`platform-tools/` 或 `licenses/` 存在其一** → 这个「只有 adb、没有 platforms/NDK/CMake」的目录被当成 SDK 收下。
+于是 AGP 在**错的根**下找 CMake → `[CXX1300]`。**CMake 报错和 SDK 路径是同一个问题。**
+**修法**：所有 flutter/gradle 命令显式 `export ANDROID_HOME=/Users/tandy/Library/Android/sdk`
+（第 2 步就命中，短路掉那个兜底）；保险起见在 `local.properties` 里同时钉 `sdk.dir` 与
+`cmake.dir=<sdk>/cmake/3.22.1`（`updateLocalProperties` 是逐键 `changeIfNecessary`，不会抹掉 `cmake.dir`）。
+⚠️ 项目里**没有任何 `externalNativeBuild` / `CMakeLists.txt`**（全仓 + pub-cache 都搜过），
+所以别去 `app/build.gradle.kts` 里找 CMake 配置 —— 那条线索是假的。
+
+### 坑三：Kotlin 插件版本（唯一一个「报错字面即真因」的）
+`screen_brightness_android-2.1.6` 用的是 KGP 2.x 才有的
+`KotlinAndroidProjectExtension.compilerOptions { }`；Flutter 3.29 模板给的是 **1.8.22** →
+报 `'void …compilerOptions(Function1)'`（方法不存在）。`android/settings.gradle.kts` 已升 **2.1.0**
+（别退回 1.8.22、也别跳 2.2 —— 2.2 删了 `kotlinOptions`，`app/build.gradle.kts` 还在用）。
+NDK 同理：12 个插件声明依赖 `27.0.12077973`，`app/build.gradle.kts` 已从 `flutter.ndkVersion`（26.3.x）
+改成钉死 27 —— 于是**本机 / CI 必须装 `ndk;27.0.12077973`**，否则配置期直接 `NDK not configured`。
+
+### 收尾验证（别只看「BUILD SUCCESSFUL」）
+`aapt2 dump badging <apk>` 要能看到 `leanback-launchable-activity` 与
+`application: … banner='res/xx.png'`；`apksigner verify --print-certs` 确认签名者。
+本机 `cmdline-tools/latest` 偏旧（`only understands SDK XML versions up to 3` 警告），但装 NDK 仍可用。
+
+- 遥控器模拟命令（有设备即可复现全部交互）：
+  `adb shell input keyevent 19/20/21/22/23/85/89/90/4`
+
+## 只能真机验的 6 件事
+`MediaQuery.navigationMode`（traditional vs directional，决定 `InkWell._canRequestFocus`）、
+libmpv 在 TV 芯片上的硬解、播放期**屏幕常亮/屏保**（全项目**没有任何 wakelock**）、
+遥控器音量键是否经 CEC 到达 app、TV 输入法打中文、1.05 焦点缩放会不会让海报卡重叠。
+
+## P0 实施记录（2026-10-02）
+
+### 一个能反复坑人的测试细节：`debugDefaultTargetPlatformOverride` 的复位位置
+⛔ **复位必须写在测试体里**（`try/finally`），`tearDown` 和 `addTearDown` **都不行**。
+Flutter 的 `_verifyInvariants`（断言「foundation 的调试变量都已复位」）是在
+`TestWidgetsFlutterBinding._runTestBody` **内部**调用的，而两种 tearDown 都排在它后面。
+用错会得到一条与业务毫无关系的报错：
+`The value of a foundation debug variable was changed by the test.`
+（2026-10-02 连踩两次，两次都以为是平台判据写错了。）
+
+### 播放页遥控器化：为什么不能用 `CallbackShortcuts`
+`CallbackShortcuts` 命中就一律报 `handled`。于是**焦点一旦进到控制栏，←/→ 就再也
+挪不动焦点** —— TV 上挪不动焦点 = 选不了字幕和清晰度。
+改用 `Focus(canRequestFocus: false, onKeyEvent:)`：能返回 `ignored` 把按键交还焦点系统，
+这是同时满足「画面上 ←/→ 快退」与「控制栏里 ←/→ 换焦点」的唯一写法。
+判据是 `_stageNode.hasPrimaryFocus`（焦点真的在画面上吗）：
+- 在画面上 → `select`/`enter` = 播放暂停，←/→ = 快退快进；
+- 在按钮上 → 这三个键一律 `ignored`，否则 OK 会**既暂停又点按钮**。
+
+⚠️ 只绑 `space` 是不够的：TV 中心键的键码是 23 → `LogicalKeyboardKey.select`。
+⚠️ `const Set<LogicalKeyboardKey>` **编译不过**（它重写了 `==`，常量集合要求原生相等，
+报 `const_set_element_not_primitive_equality`）—— 只能 `final`。
+
+### 控制栏：精确 `ExcludeFocus`，不是整块
+原来整条控制栏 `ExcludeFocus` 是**过度修复**：真正吃方向键的只有 `Slider`
+（实测焦点在 0.5 的滑块上按 → 会变成 0.55）。把两条滑块单独摘出焦点链即可，
+按钮留给遥控器。对照探针实测：整块排除时 OK 命中 **0** 次，只摘滑块后 **1** 次。
+只在 Android 上放开（`_remoteReachable`），桌面维持原样，避免键盘用户在桌面上的手感回退。
+
+### 焦点环：`focusColor` 治不了海报墙
+* 只调 `focusColor` 没用：ink 画在子节点**下面**，海报把它整个盖住。
+* ⛔ **别用 `FocusableActionDetector` 的 `onShowFocusHighlight`**：`enabled: false` 时
+  它把「显示不显示」交给 `MediaQuery.navigationMode`
+  （`actions.dart`：`canRequestFocus(target) => traditional || null => target.enabled`），
+  而 Android TV 上那个值只能真机验。
+* ✅ 自建 `ui/widgets/tv_focus.dart` 的 `TvFocusable`：`Focus(canRequestFocus: false)`
+  观察焦点（**不会变成多出来的一站**，否则每张卡要多按一次方向键），
+  在子节点**之后**叠描边，并只看 `FocusManager.instance.highlightMode`
+  （Android 默认 `touch`，**收到第一个按键翻成 `traditional`** —— 源码确定行为）。
+  测试里要钉死分支就用 `FocusManager.instance.highlightStrategy = alwaysTraditional/alwaysTouch`。
+
+### TV 判据与安全边距
+`AppTheme.isTvLayout` = `defaultTargetPlatform == android && MediaQuery.sizeOf(context).width >= 960`。
+Flutter 没有暴露 leanback 标志，只能靠尺寸推断（官方 TV 设计稿 960×540，手机逻辑宽只有 360–430）。
+⛔ **判据必须带平台**，否则宽屏桌面会凭空多出一圈 48px 黑边。
+`AppTheme.safeAreaInsets` 在 TV 上给 48/27（官方过扫描规范），非 TV 返回 `EdgeInsets.zero`。
+
+### 海报墙列数：别凭感觉调
+960×540 实测（外壳安全边距 → 侧栏 196 → 网格 padding 22 之后可用宽度 623.5）：
+`maxCrossAxisExtent=172` → **4 列** × 145×218，可见 1.92 行 ≈ **7.7 张**；
+`=240` → **3 列** × 198×298，可见 1.44 行 ≈ **4.3 张**。
+⇒ 提高卡片尺寸会**腰斩**信息量，所以字号改用整体 `textScaler`（×1.25）解决，列数不动。
+⚠️ `tvTextScaler` **只能用在高度能吸收的地方**（海报卡片的图片是 `Expanded`，
+文字长高只让图变矮）。给固定高度控件（播放页顶栏 48 / 控制栏 64）套它会 RenderFlex 溢出。
+
+### 1.05 焦点缩放会不会让海报卡重叠？—— 不会（实测算过）
+卡片 145×218、网格间距 14/18；1.05 时每边向外溢出 3.6 / 5.45 px，都小于间距。
+
+## P1 实施记录（2026-10-02）
+
+### 补充：为什么 `debugDefaultTargetPlatformOverride = null` 是安全的复位
+上面 P0 那条说了「必须写在测试体里」，这里补**为什么复位成 `null` 不会污染后续测试**：
+`foundation/_platform_io.dart:29-34` 把测试环境强制成 android ——
+
+```dart
+assert(() {
+  if (Platform.environment.containsKey('FLUTTER_TEST')) {
+    result = platform.TargetPlatform.android;
+  }
+  return true;
+}());
+if (kDebugMode && platform.debugDefaultTargetPlatformOverride != null) {
+  result = platform.debugDefaultTargetPlatformOverride;
+}
+```
+
+两点结论：①`flutter test` 下 `defaultTargetPlatform` **恒为 android**（在 `assert` 里，所以只在
+断言开启的构建生效）；②override 为 `null` 时回落到上面那个值，也就是 **android，不是宿主机 macOS**。
+⇒ 复位成 `null` 安全；要测 macOS 分支必须显式设 override。
+⚠️ **给 `tester.view.physicalSize` 设尺寸没有这条约束**（它不是 foundation 调试变量），
+用 `addTearDown(tester.view.resetPhysicalSize)` 就行 —— 但 `debugDefaultTargetPlatformOverride`
+**不能**用 `addTearDown`。同一个测试里两种复位方式并存是正常的。
+
+### `MenuAnchor` 那一条的两个后续坑（P1-2 踩到）
+1. `MenuController` 是**普通类，不是 `ChangeNotifier`** —— 没有 `addListener`、没有 `isOpen` 流。
+   要在外面知道「面板开着没」，只能用 `MenuAnchor.onOpen` / `onClose` 回调同步到一个 `bool` 字段。
+2. ⛔ `find.byType(PopScope)` 会 `Bad state: No element`：`PopScope` 是**泛型**（`PopScope<T>`），
+   而 `find.byType` 按 `runtimeType` **精确匹配**。要写
+   `find.byWidgetPredicate((w) => w is PopScope)`，并配一条 `hasLength(1)` ——
+   否则以后树里多一个 `PopScope`，`w.single` 会抛一条看不出原因的错。
+   同理适用于任何泛型 widget（`ValueListenableBuilder<T>`、`InheritedWidget` 子类等）。
+
+### 备份的 `includeSettings` / `restoreSettings` 是**空开关**（别信注释）
+`library_backup_service.dart` 里：
+- 导出：`Uint8List dbBytesToWrite = dbBytes;` —— **恒等于原始字节**，没有「剔掉 settings 表」的实现；
+- 导入：`dbFile.writeAsBytes(dbBytes)` —— **整个库文件覆盖**。
+所以传 `false` 的实际效果只有一行日志 + `manifest.note = '不含设置'`。
+**根因是 SQLite 无法在字节层面删表** —— 要真做，得先 `VACUUM INTO` 一份副本、
+在副本上 `DELETE FROM settings`、再读副本的字节。
+UI 三条通道（上传备份 / 同步 / 从网盘恢复）**全部传 `true`** ⇒ 这个分支够不到，属死代码。
+**已把 3 处承诺了不存在行为的注释改成如实说明，但没有实现它**（够不到的路径实现出来也无法验证）。
+✅ 反过来，这条**证实了**「在电脑上配好 → 上传备份 → 电视上同步」这条路成立：
+设置就在 `settings` 表里，跟着整个 sqlite 一起走。而 `BackupManifest` 里**根本没有设置字段**，
+所以**别去 manifest 里找设置**。
+⚠️ 网盘凭证不进备份 → TV 上顺序必须「先扫码登录，再同步」。
+
+### 清点「TV 上要打字的地方」的方法
+`grep -n "TextField(\|TextFormField(" lib/` —— 全项目只有 **6 处**，逐个判两件事：
+①TV 上够不够得着（`WindowLaunch.main()` 的文档写明 Android 端没有多窗口 ⇒
+`player_window_app.dart` 那个直链框够不着）；②有没有免打字路径。
+结果：设置页 6 个配置字段是唯一「够得着又无解」的；`ManualScrapeDialog` 片名/年份都按文件名预填、
+类型是下拉；`GenreEditDialog` 有「常用类型」chip 行；`CustomizeWorkDialog` 敲片名就是它的用途。
+⇒ 所以 `TvTypingNotice` 只加在设置页承载这些字段的两节里。
+⚠️ 新写 UI 文案前**先清点一遍** —— 原方案里「把 `CustomizeWorkDialog` 的年份做成候选下拉」
+就是凭印象写的，而那个对话框**根本没有年份字段**。
+
+### `_SearchBox` 写死 `height: 32`（P1-3 动手前必看）
+`library_page.dart` 的搜索框是 `SizedBox(width: 220, height: 32)`。
+⇒ 给媒体库**头部**套 `AppTheme.tvTextScaler` 会 RenderFlex 溢出（和播放页顶栏 48 同类问题）。
+⚠️ 这一条只是读代码看到的，**没有测试钉住**；改字号前先补一条断言。
+
+---
+
+## 目录名作为系列名（2026-10-02）
+
+起因：`/来自：分享/姜松《家电维修视频教程》/182.格力空调显示E6如何维修.mp4` 被自动刮成
+**《1821: Οι Ήρωες》(2021)**（希腊纪录片）。完整归因见 `docs/目录名作为系列名-规则评估.md`。
+
+### 为什么「目录名是不是系列名」的界限不在目录名里
+
+`/姜松《家电维修视频教程》/182.格力空调显示E6如何维修.mp4` 与 `/我的电影/01.流浪地球2.mp4`
+**文件名形态一模一样**（都是「编号.片名」）。只看文件名，判不出来哪个是教程合集、哪个是散片。
+能分开它们的只有**兄弟文件集合**（222 个 `NNN.xxx.mp4` vs 孤零零 1 个）。
+⇒ **判定单元必须是文件夹，不是文件**。这就是为什么 `parse` 要拿到 `dirPath`。
+
+四步链路（每步都用一次性 `dart run` 探针实测过）：
+1. `182.格力空调显示E6如何维修.mp4` → `title="182 格力空调显示"`、`latinTitle="182"`，
+   且 **`E6` 被当成第 6 集**（守卫 `(?<![0-9a-z])` 不把汉字当边界）。
+2. `_alternateOf` 只要求「两种文字都非空」→ 备用词 = `"182"`（没检查有没有字母）。
+3. TMDB 模糊搜索 `"182"` → `1821: Οι Ήρωες`。
+4. 闸门：主名 `182 格力空调显示` → 0.3636 **拒（对的）**；备用词 `182` → 0.9125 **过（错的）**。
+   年份闸门是 `null`（文件名里没年份）→ 没有第二道防线。
+   前缀档下限是 `0.65 > strongSimilarity 0.6` ⇒「短串是长串前缀」**恒过**。
+
+### 容器名的判定为什么是「精确匹配」而不是「包含」
+
+`_containerWords` 用**归一化后全等**比较，不是 `contains`。
+理由：`姜松家电维修合集` 含「合集」但是**真作品名**；用 `contains` 会把它吃掉。
+宁可漏判（个别容器名当成了作品名，用户手动改一下），也不要误判（把真作品名抹掉，用户看不出来）。
+
+容器形态（`directory_title.dart` 的 `_containerPatterns`）：
+`day01`/`Day_18` · `04_视频`/`3.视频` · `01 基础篇` · `第2章` · 纯数字 · 日期 · `1080p`/`4K`。
+另外 `_containerWords` 收录栏目名：`电影`/`电视剧`/`动漫`/`纪录片`/`来自：分享` 等。
+
+### 上溯：为什么要往上找，而不是只用末级
+
+实测真实库：**118 个目录（1291 条 = 全库 45%）末级是容器名**，几乎全在
+`尚硅谷嵌入式全套教程/` 下面（`day01`、`04_视频`、`4.视频`）。
+⇒ 只用末级会得到一堆叫 `day01` 的作品；有意义的名字在上一两级。
+`seriesTitleOf(dirPath)` 从末级**往上**取第一个非容器名（`for (var i = segments.length - 1; i >= 0; i--)`），
+全容器时返回 `null`。
+
+### 「独立发行物」豁免 —— 别把正常的散片也并进来
+
+目录名可信 ≠ 一律覆盖文件名。下面这条豁免必须留着：
+
+```
+_isStandaloneRelease = 片名里含字母/汉字  且  (自带年份 或 kind==episode)
+```
+
+满足即**不**用目录名，保留自己的片名。所以：
+- `/电影/流浪地球2 (2023)/movie.mkv` → 仍然是「流浪地球2」（自带年份）。
+- `/仙逆/S01E12.mkv` → 仍然是文件自己的短片名，不会被并成「仙逆」一个作品（实测 49→6）。
+- `/姜松.../182.格力空调显示E6如何维修.mp4` → 片名 `182 格力空调显示` 虽含汉字，但**没有年份、
+  修好 `E6` 后也不再是 episode** ⇒ `_isStandaloneRelease == false` ⇒ 用目录名
+  `姜松 家电维修视频教程`。判据是「自带年份或季集」，**不是**「片名看起来像不像名字」。
+
+⚠️ **老 `dirName` 兜底也要排容器名**。原来 `/电影/2012.2009.1080p.mkv` 会兜底出一个叫
+**「电影」**的作品（`2012` 被判成技术标记 → title 空 → 用目录名）。现在兜底条件加了
+`!DirectoryTitle.isContainerSegment(effectiveDirName)` → `title == null` → 不归组，以文件名示人。
+
+### 四处调用点必须都传 `dirPath`（漏一处 = 扫一次刮一次得出不同片名）
+
+- `scan_service.dart:417`
+- `media_discovery.dart:357`、`:510`
+- `work_scraper.dart:226`（`_queryFor`）
+
+`WorkScraper` 是**从 `itemsForWork(work.key)` 重新解析**的，走的是同一条 `parse`。
+如果它只传 `dirName` 而不传 `dirPath`，就会「扫描期刮到 A，详情页点刮削刮到 B」——
+这种不一致不会报错，只会让用户觉得「刮削按钮时灵时不灵」。
+
+### 三个配套缺陷一起修了（详见 docs §6 第 1 档）
+
+1. 备用词必须含 ≥2 个字母（`media_work.dart` `_alternateOf`）。
+2. 纯数字相似度恒 0（`scrape_match.dart`，加在**精确相等之后** —— 否则《2012》自己搜自己也被判 0）。
+3. `E\d+` 前有汉字不算集号（`filename_parser.dart` 两处：标记表 + `_matchEpisodePattern`）。
+   这条单独看小，实际最脏：它把 `conf` 顶成 `true`，一个文件夹里 7 个视频能各变成一个作品。
+
+### 真实库回归数字（2847 条，只读导出）
+
+```
+旧作品数（库内） 2259 → 新作品数 180 / 不归组（无片名） 16
+疑似垃圾标题（day01 / 电影 / 来自：分享）：（无）
+```
+
+抽查：姜松 222→1；尚硅谷 `day01` 24→1（标题 `01 尚硅谷嵌入式技术之C语言`）；沧元图 77→1；天龙八部 45→1。
+
+### 两条必须记住的副作用
+
+1. **规则改了不会自动重排已有分组** —— 库内还是旧的 2259 个作品，**要用户跑一次全盘重扫**才生效。
+2. **「≥2 个」阈值没有显式实现** —— 解析器逐文件调用，数不到兄弟个数。
+   阈值实际由 `WorkSeedBook` 的归组承担（同目录条目片名相同 → 同一 `groupKey` → 1 个作品）。
+   副作用：一个目录里**只有 1 个视频且提不出片名**时，现在会用目录名当作品名（原来是「不归组」）。

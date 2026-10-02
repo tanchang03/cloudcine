@@ -39,7 +39,14 @@ android {
     // ⚠️ 前提：本机 / CI 要装 `platforms;android-36`（沙箱里 AGP 不会自动装成功，
     // 得手动 `sdkmanager`）。
     compileSdk = maxOf(flutter.compileSdkVersion, 36)
-    ndkVersion = flutter.ndkVersion
+    // ⚠️ **不能停在 `flutter.ndkVersion`**（Flutter 3.29 给的是 26.3.11579264）：
+    // 12 个插件（media_kit_video / sqlite3_flutter_libs / flutter_inappwebview_android …）
+    // 都声明依赖 27.0.12077973，停在 26 时每次构建都会打一长串警告，并让 AGP
+    // 在需要 NDK 的任务上去解析一个插件并不认的版本。
+    // Flutter 自己的提示就是「用最高的那个版本，NDK 向后兼容」。
+    // ⚠️ 前提：本机 / CI 要装 `ndk;27.0.12077973`（`sdkmanager --install`），
+    // 否则 AGP 会在配置期直接报「NDK not configured」。
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11

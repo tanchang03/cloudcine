@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../../core/diagnostics/diag_log.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/tv_affordance.dart';
 import '../windows/player_window_bridge.dart';
 
 /// 诊断日志页。
@@ -47,11 +48,14 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                 padding: const EdgeInsets.fromLTRB(10, 8, 14, 0),
                 child: Row(
                   children: [
-                    IconButton(
-                      onPressed: () => context.pop(),
-                      iconSize: 18,
-                      tooltip: '返回',
-                      icon: const Icon(Icons.arrow_back_rounded),
+                    TvIconLabel(
+                      label: '返回',
+                      child: IconButton(
+                        onPressed: () => context.pop(),
+                        iconSize: 18,
+                        tooltip: '返回',
+                        icon: const Icon(Icons.arrow_back_rounded),
+                      ),
                     ),
                     const SizedBox(width: 6),
                     const Text(

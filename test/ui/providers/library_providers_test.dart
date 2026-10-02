@@ -92,40 +92,40 @@ void main() {
     });
   });
 
-  group('筛选面板（年代 / 类型）', () {
+  group('筛选面板（年份 / 类型）', () {
     test('点一下选中，再点一下取消', () {
-      controller().toggleDecade(2020);
-      expect(filter().decades, {2020});
+      controller().toggleYear(2023);
+      expect(filter().years, {2023});
 
-      controller().toggleDecade(2020);
+      controller().toggleYear(2023);
       expect(
-        filter().decades,
+        filter().years,
         isEmpty,
-        reason: '用户点错一个年代时应该只需要再点一下，而不是清掉整组条件重来',
+        reason: '用户点错一个年份时应该只需要再点一下，而不是清掉整组条件重来',
       );
     });
 
-    test('年代与类型两组互不影响', () {
-      controller().toggleDecade(2020);
+    test('年份与类型两组互不影响', () {
+      controller().toggleYear(2023);
       controller().toggleGenre('动画');
 
-      expect(filter().decades, {2020});
+      expect(filter().years, {2023});
       expect(filter().genres, {'动画'});
 
       controller().toggleGenre('动画');
-      expect(filter().decades, {2020},
-          reason: '取消类型不该顺手把年代也清掉 —— 两组是两个独立的维度');
+      expect(filter().years, {2023},
+          reason: '取消类型不该顺手把年份也清掉 —— 两组是两个独立的维度');
     });
 
     test('clearExtra 只清面板里的两组', () {
       controller().setCategory(MediaCategory.anime);
       controller().setQuery('魔法');
-      controller().toggleDecade(2020);
+      controller().toggleYear(2023);
       controller().toggleGenre('动画');
 
       controller().clearExtra();
 
-      expect(filter().decades, isEmpty);
+      expect(filter().years, isEmpty);
       expect(filter().genres, isEmpty);
       expect(filter().category, MediaCategory.anime,
           reason: '分类栏与搜索框在面板之外、各有自己的清除入口。'
@@ -140,7 +140,7 @@ void main() {
       controller().setCategory(MediaCategory.movie);
       expect(filter().hasExtra, isFalse, reason: '分类是分类栏的事，不是面板的');
 
-      controller().toggleDecade(2020);
+      controller().toggleYear(2023);
       expect(filter().hasExtra, isTrue);
     });
 
@@ -154,21 +154,21 @@ void main() {
     });
 
     test('copyWith 传空集合能清空（不能像 category 那样用 null 表示不改）', () {
-      controller().toggleDecade(2020);
+      controller().toggleYear(2023);
       controller().toggleGenre('动画');
 
-      final cleared = filter().copyWith(decades: const <int>{});
+      final cleared = filter().copyWith(years: const <int>{});
 
-      expect(cleared.decades, isEmpty);
+      expect(cleared.years, isEmpty);
       expect(cleared.genres, {'动画'},
-          reason: '只传了 decades 就不该动 genres');
+          reason: '只传了 years 就不该动 genres');
     });
 
     test('相等性按集合**内容**比，不按引用', () {
       // 故意用非 const 字面量：const 会被规范化成同一个对象，
       // 那样连引用相等都能过，测不出真正想钉的东西。
-      final a = LibraryFilter(decades: {2020}, genres: {'动画'});
-      final b = LibraryFilter(decades: {2020}, genres: {'动画'});
+      final a = LibraryFilter(years: {2023}, genres: {'动画'});
+      final b = LibraryFilter(years: {2023}, genres: {'动画'});
 
       expect(a == b, isTrue,
           reason: 'Set 没重写 ==（默认是引用相等）。不比内容的话，'
@@ -178,14 +178,14 @@ void main() {
 
       // 与顺序无关
       expect(
-        LibraryFilter(decades: {2020, 2010}) ==
-            LibraryFilter(decades: {2010, 2020}),
+        LibraryFilter(years: {2023, 2010}) ==
+            LibraryFilter(years: {2010, 2023}),
         isTrue,
       );
     });
 
     test('clear() 把面板条件也复位', () {
-      controller().toggleDecade(2020);
+      controller().toggleYear(2023);
       controller().toggleGenre('动画');
       controller().clear();
 
@@ -193,11 +193,11 @@ void main() {
     });
 
     test('toString 里看得出筛了哪些', () {
-      controller().toggleDecade(2020);
+      controller().toggleYear(2023);
       controller().toggleGenre('动画');
       final text = filter().toString();
 
-      expect(text, contains('2020'));
+      expect(text, contains('2023'));
       expect(text, contains('动画'));
     });
   });

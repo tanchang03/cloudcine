@@ -42,8 +42,14 @@ class AppDatabase extends _$AppDatabase {
   /// v7：`media_works.firstSeenAt`（作品首次入库时间，「最近添加」排序用）。
   ///     之前这列隐式地由 `updatedAt` 兼任，但重扫时会刷新，导致「最近添加」
   ///     变成「最近被扫到」。
+  /// v8：`media_works.categoryManual` / `genresManual` —— 用户手动指定
+  ///     分类 / 类型标签的标记位。置位后重扫与重刮削都不再覆盖对应的列。
+  /// v9：`media_items.part` / `partLabel` —— 「部」（`第X部` / `Part.N` /
+  ///     `特别篇`）。与「季」构成两级细分，详情页据此画层级选择器。
+  /// v10：`media_works.seasonCount` —— 作品下已标季号的季数，列表页卡片
+  ///     显示「N 季」用（冗余列，避免每个作品一次 COUNT DISTINCT 子查询）。
   @override
-  int get schemaVersion => 7;
+  int get schemaVersion => 10;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -134,6 +140,54 @@ class AppDatabase extends _$AppDatabase {
               )
             ''');
             diag.info('数据库', '索引库已升级到 v7（入库时间，已从媒体项回填）');
+          }
+          if (from < 8) {
+            // 两个标记位都是 `DEFAULT false`，SQLite 的 `ADD COLUMN` 会把
+            // 旧行一并填成 false —— 语义正好是「这两列都还没被用户手动改过」，
+            // 不需要回填，也不需要额外的数据迁移。
+            //
+            // 老库里的分类 / 类型仍然是自动判定的结果，行为和升级前完全一致；
+            // 用户手动改一次之后才会置位。
+            await m.addColumn(mediaWorks, mediaWorks.categoryManual);
+            await m.addColumn(mediaWorks, mediaWorks.genresManual);
+            diag.info('数据库', '索引库已升级到 v8（手动分类 / 类型标记位）');
+          }
+          if (from < 9) {
+            // 两列的 NULL 语义都是「这个文件没标部」，详情页据此**不画**
+            // 「部」那一层 —— 所以不需要回填，旧库升级后的表现与升级前
+            // 完全一致（平铺列表，只多了一次「没有部」的判定）。
+            //
+            // 也**没法**回填：部号是从文件名解析出来的，旧库里根本没存过，
+            // 只能等下次扫描。代价是老作品暂时看不到「部」分层，重扫一次
+            // 即好。这比「编一个部号塞进去」诚实 —— 编出来的值会让用户
+            // 以为它是从文件名读出来的。
+            await m.addColumn(mediaItems, mediaItems.part);
+            await m.addColumn(mediaItems, mediaItems.partLabel);
+            diag.info('数据库', '索引库已升级到 v9（分部：第X部 / 特别篇）');
+          }
+          if (from < 10) {
+            await m.addColumn(mediaWorks, mediaWorks.seasonCount);
+            // ⚠️ 这一列**必须回填**，和 `lastModifiedAt`（v6）同一条理由：
+            // 它直接显示在卡片副标题上（「剧集 · 2023 · 3 季 · 24 集」）。
+            // 留成 0 的话，升级后**所有**多季剧的「N 季」都会消失 ——
+            // 用户看不出是「新列还没值」还是「这个功能没了」。
+            //
+            // 好在能回填：`media_items.season` 里就存着每集的季号，
+            // 数一下去重个数即可，不需要碰网络。
+            //
+            // 口径与 `WorkSeed.seasonCount` 一致：只数 `> 0` 的季号
+            // （`NULL` 和 `0` 都是「未标季」，不算一季）。
+            await customStatement('''
+              UPDATE media_works
+              SET season_count = (
+                SELECT COUNT(DISTINCT mi.season)
+                FROM media_items mi
+                WHERE mi.group_key = media_works.key
+                  AND mi.season IS NOT NULL
+                  AND mi.season > 0
+              )
+            ''');
+            diag.info('数据库', '索引库已升级到 v10（季数，已从媒体项回填）');
           }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，

@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../providers/auth_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
+import '../widgets/tv_affordance.dart';
 
 /// 一级导航的侧栏外壳。
 ///
@@ -20,16 +21,22 @@ class AppShell extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: Row(
-        children: [
-          _Sidebar(shell: shell),
-          const VerticalDivider(
-            width: 0.5,
-            thickness: 0.5,
-            color: AppTheme.line,
-          ),
-          Expanded(child: shell),
-        ],
+      // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉
+      // （侧栏最左边那列字首当其冲）。
+      // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
+      body: Padding(
+        padding: AppTheme.safeAreaInsets(context),
+        child: Row(
+          children: [
+            _Sidebar(shell: shell),
+            const VerticalDivider(
+              width: 0.5,
+              thickness: 0.5,
+              color: AppTheme.line,
+            ),
+            Expanded(child: shell),
+          ],
+        ),
       ),
     );
   }
@@ -191,11 +198,17 @@ class _AccountBlock extends StatelessWidget {
               ],
             ),
           ),
-          IconButton(
-            onPressed: busy ? null : onSignOut,
-            iconSize: 15,
-            tooltip: '退出登录',
-            icon: const Icon(Icons.logout_rounded),
+          // 侧栏底部那个 ⤴ 是纯图标 —— TV 上补「退出登录」，
+          // 否则它看起来和「关掉窗口」没什么区别。
+          TvIconLabel(
+            label: '退出登录',
+            enabled: !busy,
+            child: IconButton(
+              onPressed: busy ? null : onSignOut,
+              iconSize: 15,
+              tooltip: '退出登录',
+              icon: const Icon(Icons.logout_rounded),
+            ),
           ),
         ],
       ),

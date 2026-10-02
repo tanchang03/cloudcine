@@ -14,7 +14,12 @@ class MainFlutterWindow: NSWindow {
 
     // 主窗口标题栏：与用户可见名称保持一致（播放器子窗口的标题在
     // `ChildWindowController` 里单独设为「云影 · 播放器」）。
+    // 标题文字虽然被 `applyVirtualTitleBar` 藏掉了，但属性本身仍保留 ——
+    // 窗口菜单、Mission Control、辅助功能都读它。
     self.title = "云影 CloudCine"
+
+    applyVirtualTitleBar()
+    applyMinimumSize()
 
     RegisterGeneratedPlugins(registry: flutterViewController)
 
@@ -34,6 +39,53 @@ class MainFlutterWindow: NSWindow {
     }
 
     super.awakeFromNib()
+  }
+
+  // -------------------------------------------------------------------
+  // 虚拟标题栏 & 最小尺寸
+  // -------------------------------------------------------------------
+
+  /// 抹掉系统标题栏，让窗口内容一路铺到最顶端。
+  ///
+  /// 三个开关各管一件事，缺一不可（与播放器子窗口 `ChildWindowController`
+  /// 的做法完全一致）：
+  ///   - `titlebarAppearsTransparent`：标题栏不再画自己的底色，
+  ///     Flutter 的内容能一直铺到窗口最顶端；
+  ///   - `titleVisibility = .hidden`：不画窗口标题文字 ——
+  ///     应用名改由侧栏的 Logo 承担，顶部那条**刻意什么都不画**，
+  ///     画了就像系统标题栏没去掉；
+  ///   - `.fullSizeContentView`：内容视图铺满整个窗口（含标题栏那 32pt），
+  ///     否则顶上会留一条画不到的空白。
+  ///
+  /// 红黄绿三个原生按钮**仍然浮在左上角**（位置由 AppKit 决定，
+  /// x 约 9..69、圆心距顶 16），Flutter 侧靠
+  /// `AppTheme.titleBarHeight = 32` 的顶部留白（`WindowTopInset`）给它们让位。
+  ///
+  /// **刻意保留原生红黄绿**：它们才是真正的窗口控制（关闭 / 最小化 /
+  /// 缩放 / 全屏），自带悬停符号、辅助功能、双击标题栏缩放、键盘快捷键。
+  private func applyVirtualTitleBar() {
+    titlebarAppearsTransparent = true
+    titleVisibility = .hidden
+    styleMask.insert(.fullSizeContentView)
+
+    if #available(macOS 11.0, *) {
+      titlebarSeparatorStyle = .none
+    }
+  }
+
+  /// 不允许把窗口拖到比**默认尺寸**更小。
+  ///
+  /// 默认尺寸写在 `Base.lproj/MainMenu.xib` 的 `contentRect` 里（1280 × 820）。
+  /// 这里**不写死数字**，而是从当前 frame 反算内容区 —— 以后改默认尺寸时，
+  /// 最小尺寸自动跟着走。
+  ///
+  /// 为什么需要：界面是按桌面宽度排的（左侧 196pt 侧栏 + 主区），再窄下去
+  /// 页头、筛选行、海报卡片会挤到换行甚至溢出（800×600 时就有 overflow 告警）。
+  ///
+  /// 用 `contentMinSize` 而不是 `minSize`：后者约束的是**窗口 frame**
+  /// （含标题栏那一段），设成同一个数会让内容区比预期矮一截。
+  private func applyMinimumSize() {
+    contentMinSize = contentRect(forFrameRect: frame).size
   }
 }
 

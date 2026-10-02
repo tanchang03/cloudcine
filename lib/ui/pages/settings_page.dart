@@ -212,6 +212,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // 这一节下面有 3 个自由文本字段（Key / API 地址 / 图片地址）。
+          // 电视上必须先告诉用户「别在这儿敲」—— 见 TvTypingNotice 的文档。
+          const TvTypingNotice(),
           _ToggleRow(
             label: '联网刮削',
             hint: s.canScrapeOnline
@@ -736,6 +739,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // 同上：Api-Key 与 API 地址都是自由文本，电视上打不了。
+          const TvTypingNotice(),
           const Text(
             'OpenSubtitles（api.opensubtitles.com）',
             style: TextStyle(fontSize: 12.5, color: AppTheme.text),
@@ -979,10 +984,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       // 索引库清空后「最近播放」必然是空的 —— 不重取的话角标会一直挂着
       // 一个已经不存在的数字。
       ref.invalidate(playedCountProvider);
-      // 同理，筛选面板上的年代 / 类型也是从库里数出来的：清空之后
-      // 它们必须变成空列表，否则用户点一个「2020 年代 · 37 部」会发现
+      // 同理，筛选面板上的年份 / 类型也是从库里数出来的：清空之后
+      // 它们必须变成空列表，否则用户点一个「2020 · 37 部」会发现
       // 一部都没有。
-      ref.invalidate(decadeCountsProvider);
+      ref.invalidate(yearCountsProvider);
       ref.invalidate(genreCountsProvider);
       ref.invalidate(categoryCountsProvider);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1109,6 +1114,34 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             '两台设备在 60 秒内同时备份会触发冲突提示。',
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
           ),
+          // 反向指路：上面「刮削」「在线字幕」两节让用户来这里同步设置，
+          // 这里就得把顺序说清（尤其是「先登录再同步」那一步）。
+          if (AppTheme.isTvLayout(context)) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 11),
+              decoration: BoxDecoration(
+                color: AppTheme.accent.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(9),
+                border: Border.all(
+                  color: AppTheme.accent.withValues(alpha: 0.35),
+                  width: 0.5,
+                ),
+              ),
+              child: Text(
+                '电视上第一次使用，顺序是：\n'
+                '1. 在这台电视上扫码登录网盘（凭证不进备份，必须单独做这一步）；\n'
+                '2. 点「同步」—— 媒体库索引、刮削元数据、海报与**设置**会一起下来。\n'
+                '在电脑/手机上先配好 TMDB、豆瓣、字幕这些要打字的项，再「上传备份」，'
+                '就不必在电视上敲字了。',
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  height: 1.75,
+                  color: AppTheme.muted,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -1176,8 +1209,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   /// 手动从网盘恢复：列出远程备份，让用户挑一份下载并覆盖本地。
   ///
-  /// 这条通道是**新机器**的正路：新机器本地库是空的，`sync()` 会把刚导出
-  /// 的空库当成「比远程新」而反向覆盖，所以必须先手动拉一份下来。
+  /// 它与「同步」的区别**不是**「新机器必须走这条」—— `sync()` 里
+  /// `!localManifest.hasLibraryContent` 那一条已经保证空库会让远程赢
+  /// （见 `BackupManifest.hasLibraryContent` 的文档）。这条通道多出来的是
+  /// **选择权**：能挑一份指定的备份（例如想退回昨天那份），
+  /// 而「同步」只会拿最新的一份。
   Future<void> _doRestore() async {
     setState(() {
       _restoring = true;
@@ -1232,12 +1268,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   /// 媒体库被整体替换后，把所有读取它的视图全部作废。
   ///
   /// 四个 provider 一个都不能少：列表、统计、两个角标计数。
-  /// 只作废列表的话，筛选面板上的「年代 / 类型」角标会停留在旧库的数字上。
+  /// 只作废列表的话，筛选面板上的「年份 / 类型」角标会停留在旧库的数字上。
   void _refreshLibraryViews() {
     ref.read(libraryWriteSignalProvider.notifier).bump();
     ref.invalidate(workListProvider);
     ref.invalidate(libraryStatsProvider);
-    ref.invalidate(decadeCountsProvider);
+    ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
   }
 

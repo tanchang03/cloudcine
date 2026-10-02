@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 
 import '../../core/utils/video_formats.dart';
@@ -53,8 +54,65 @@ class AppTheme {
   /// 海报宽高比（2:3 是电影海报的标准比例）。
   static const double posterAspect = 2 / 3;
 
+  /// TV 上海报墙的卡片宽高比。
+  ///
+  /// 比标准海报更**矮**（0.8 > 2/3）：卡片变矮，960×540 那块屏才能多挤出一排
+  /// （行高 ~258 → ~215，一屏从 1 行半变成 2 行）。桌面绝不沾这条 ——
+  /// 12sp 的标题在 0.8 的卡片里会被横向压扁，看着像「海报被剪了一刀」。
+  /// 取 0.8 是实测折中：再宽（0.9+）海报剩得太扁、更像缩略图；再窄就退回 2:3 了。
+  static const double tvPosterAspect = 0.8;
+
   /// 播放页底部控制栏高度。
   static const double playerBarHeight = 64;
+
+  // -------------------------------------------------------------------
+  // TV / 过扫描安全边距
+  // -------------------------------------------------------------------
+
+  /// 官方 TV 设计规范（960×540）里的过扫描安全边距：左右 48dp、上下 27dp。
+  ///
+  /// 电视会把画面边缘切掉一圈（overscan）。原来媒体库的页边距是 **22**，
+  /// 不到安全线的一半 —— 真机上侧栏最左边的字**可能直接被切掉**。
+  static const double tvSafeHorizontal = 48;
+  static const double tvSafeVertical = 27;
+
+  /// 「这台设备是电视」的判据。
+  ///
+  /// Flutter 没有暴露 Android 的 leanback 标志，只能靠尺寸推断：
+  /// 官方 TV 设计稿是 **960×540**，而手机的逻辑宽度普遍只有 360–430，
+  /// 取 960 当分界线既不误伤手机，也不会给平板套上一圈没必要的黑边。
+  static bool isTvLayout(BuildContext context) =>
+      defaultTargetPlatform == TargetPlatform.android &&
+      MediaQuery.sizeOf(context).width >= 960;
+
+  /// 页面内容要避开的过扫描区域。非 TV 上返回 `EdgeInsets.zero`。
+  static EdgeInsets safeAreaInsets(BuildContext context) => isTvLayout(context)
+      ? const EdgeInsets.symmetric(
+          horizontal: tvSafeHorizontal,
+          vertical: tvSafeVertical,
+        )
+      : EdgeInsets.zero;
+
+  /// TV 上的文字放大倍数。
+  ///
+  /// 官方 TV 规范是「正文最小 12sp、默认 18sp」，而本项目页面里大量写着
+  /// 10.5–13 —— 差近一倍，隔着三米基本读不了。
+  /// 与其去改上百处写死的字号（既容易漏、又很难回退），不如在 TV 上整体放大一档。
+  static const double tvTextScale = 1.25;
+
+  /// 需要放大文字的地方拿它包一层；非 TV 上原样返回。
+  ///
+  /// ⚠️ **只能用在「高度能吸收」的地方**（例如海报墙的卡片：海报是
+  /// `Expanded`，文字长高只会让海报变矮）。给固定高度的控件
+  /// （播放页顶栏 48、控制栏 64）套这个会直接报 RenderFlex 溢出。
+  static Widget tvTextScaler(BuildContext context, Widget child) =>
+      isTvLayout(context)
+          ? MediaQuery.withClampedTextScaling(
+              minScaleFactor: tvTextScale,
+              maxScaleFactor: tvTextScale,
+              child: child,
+            )
+          : child;
 
   // -------------------------------------------------------------------
   // 语义化取色
@@ -114,7 +172,24 @@ class AppTheme {
       fontFamily: fontFamily,
       // 媒体库是「点一下就播」的场景，涟漪动画只会让点击显得迟钝。
       splashFactory: NoSplash.splashFactory,
-      visualDensity: VisualDensity.compact,
+      // 桌面用 compact 是为了让信息密度高一点；TV 上反过来 ——
+      // `compact` 会把控件压到低于官方建议的焦点目标尺寸，
+      // 遥控器选起来更容易点错。手机上两种都行，跟着 TV 用 standard。
+      visualDensity: defaultTargetPlatform == TargetPlatform.android
+          ? VisualDensity.standard
+          : VisualDensity.compact,
+      // ---- 焦点必须一眼可见（TV / 遥控器）----
+      //
+      // 不设的话，深色主题下 `ThemeData` 的默认值是
+      // `Colors.white.withValues(alpha: 0.12)` —— 实测 alpha 恰好 `0.1216`。
+      // 隔三米看电视，12% 的白色蒙层**等于没有**，用户不知道遥控器正指着谁。
+      // 换成强调色 30% 蒙层：亮度够，又不至于把按钮本身的颜色盖掉。
+      //
+      // ⚠️ **只改这一行不够**：海报卡片的 `InkWell` 高亮是画在子节点**下面**的
+      // （`_RenderInkFeatures.paint` 先画 ink、再 `super.paint` 画子节点），
+      // 一整张海报会把它盖得干干净净 —— 调多亮都没用。
+      // 卡片类点击区还要额外套一层 `TvFocusable`（见 `ui/widgets/tv_focus.dart`）。
+      focusColor: accent.withValues(alpha: 0.30),
     );
 
     return base.copyWith(

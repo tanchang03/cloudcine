@@ -20,7 +20,7 @@ class LibraryFilter {
     this.playedOnly = false,
     this.sort = WorkSort.recentModified,
     this.query = '',
-    this.decades = const <int>{},
+    this.years = const <int>{},
     this.genres = const <String>{},
   });
 
@@ -50,20 +50,20 @@ class LibraryFilter {
 
   final String query;
 
-  /// 年代多选，元素是**年代起始年**（`2020` 表示 2020–2029）。
+  /// 年份多选，元素是**具体年份**（`2023` 只匹配 2023 年上映的作品）。
   ///
-  /// 空集合 = 这一维不限。多选之间是「或」（一部片子只属于一个年代，
+  /// 空集合 = 这一维不限。多选之间是「或」（一部片子只有一个上映年份，
   /// 取交集恒为空）。
-  final Set<int> decades;
+  final Set<int> years;
 
   /// 类型多选（TMDB / 豆瓣的类型名，如 `动画` / `科幻`）。
   ///
   /// 空集合 = 这一维不限。多选之间是「或」—— 一部片子只会有一两个类型，
-  /// 取交集几乎永远筛不出东西。与 [decades] 之间是「与」。
+  /// 取交集几乎永远筛不出东西。与 [years] 之间是「与」。
   final Set<String> genres;
 
   /// 筛选面板里是否有生效的条件（决定「筛选」按钮要不要亮标记）。
-  bool get hasExtra => decades.isNotEmpty || genres.isNotEmpty;
+  bool get hasExtra => years.isNotEmpty || genres.isNotEmpty;
 
   /// 「一个内容筛选都没设」。
   ///
@@ -88,7 +88,7 @@ class LibraryFilter {
     bool? playedOnly,
     WorkSort? sort,
     String? query,
-    Set<int>? decades,
+    Set<int>? years,
     Set<String>? genres,
     bool clearCategory = false,
   }) {
@@ -99,7 +99,7 @@ class LibraryFilter {
       query: query ?? this.query,
       // 空集合是一个**合法取值**（「这一维不限」），所以不能像 category 那样
       // 用 null 表达「清空」—— 传 `const <int>{}` 就是要清空。
-      decades: decades ?? this.decades,
+      years: years ?? this.years,
       genres: genres ?? this.genres,
     );
   }
@@ -113,7 +113,7 @@ class LibraryFilter {
       other.query == query &&
       // Set 没重写 `==`（默认是**引用**相等），直接比会漏掉
       // 「内容一样但不是同一个对象」的更新，让 Riverpod 误判成「没变」。
-      setEquals(other.decades, decades) &&
+      setEquals(other.years, years) &&
       setEquals(other.genres, genres);
 
   @override
@@ -122,15 +122,15 @@ class LibraryFilter {
         playedOnly,
         sort,
         query,
-        // 与顺序无关：`{2020, 2010}` 和 `{2010, 2020}` 是同一份条件。
-        Object.hashAllUnordered(decades),
+        // 与顺序无关：`{2023, 2010}` 和 `{2010, 2023}` 是同一份条件。
+        Object.hashAllUnordered(years),
         Object.hashAllUnordered(genres),
       );
 
   @override
   String toString() {
     final extra = [
-      if (decades.isNotEmpty) '年代 ${(decades.toList()..sort()).join("/")}',
+      if (years.isNotEmpty) '年份 ${(years.toList()..sort()).join("/")}',
       if (genres.isNotEmpty) genres.join("/"),
     ];
     return 'LibraryFilter('
@@ -176,29 +176,29 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
 
   void setQuery(String query) => state = state.copyWith(query: query);
 
-  /// 切换一个年代的选中状态。
+  /// 切换一个年份的选中状态。
   ///
-  /// 已选则取消、未选则加入 —— 与「清空」不同，用户点错一个年代时
+  /// 已选则取消、未选则加入 —— 与「清空」不同，用户点错一个年份时
   /// 只需要再点一下，不用清掉整组条件重来。
-  void toggleDecade(int decade) {
-    final next = Set<int>.of(state.decades);
-    if (!next.remove(decade)) next.add(decade);
-    state = state.copyWith(decades: next);
+  void toggleYear(int year) {
+    final next = Set<int>.of(state.years);
+    if (!next.remove(year)) next.add(year);
+    state = state.copyWith(years: next);
   }
 
-  /// 切换一个类型的选中状态。语义与 [toggleDecade] 一致。
+  /// 切换一个类型的选中状态。语义与 [toggleYear] 一致。
   void toggleGenre(String genre) {
     final next = Set<String>.of(state.genres);
     if (!next.remove(genre)) next.add(genre);
     state = state.copyWith(genres: next);
   }
 
-  /// 清空筛选面板里的两组条件（年代 + 类型）。
+  /// 清空筛选面板里的两组条件（年份 + 类型）。
   ///
   /// **只清这两组**：分类栏与搜索框在面板之外、各有自己的清除入口，
   /// 面板上的「清空筛选」把它们一起抹掉会让用户莫名其妙地丢掉搜索词。
   void clearExtra() {
-    state = state.copyWith(decades: const <int>{}, genres: const <String>{});
+    state = state.copyWith(years: const <int>{}, genres: const <String>{});
   }
 
   void clear() => state = const LibraryFilter();
@@ -207,6 +207,79 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
 final libraryFilterProvider =
     NotifierProvider<LibraryFilterController, LibraryFilter>(
   LibraryFilterController.new,
+);
+
+/// 手动指定一部作品的**分类**与**类型标签**。
+///
+/// ## 为什么需要它
+///
+/// 这两样原本**完全由自动规则决定**：
+///
+///   - `category` 由 `MediaCategoryGuesser` 折算（genres → 目录名 → 片名/
+///     文件名 → 结构兜底）；
+///   - `genres` 由 TMDB / 豆瓣的刮削结果直接写入。
+///
+/// 两者都会错：目录名里没有「动漫」二字的动画电影会落进「电影」栏；被发布组
+/// 插了字符的片名（`超z级z马z力z…`）会刮到完全不相干的条目；TMDB 也常常
+/// 给不出「真人秀」这类类型。而用户**没有任何办法纠正** —— 详情页的「刮削」
+/// 与「手动」都只改标题 / 年份 / 海报，碰不到这两列。
+///
+/// ## 手动改过的东西不该被下一次刮削冲掉
+///
+/// 这是本控制器存在的核心理由。用户为了修类型去重刮一次（顺便补张海报），
+/// 结果刚改好的类型又被刮削覆盖 —— 那不是「覆盖」，那是「改了也白改」。
+/// 所以落库时同时置 `categoryManual` / `genresManual`，由仓储层的合并逻辑
+/// 保证后续 upsert 不再覆盖对应列。
+///
+/// ## 两条路，缺一不可
+///
+/// 每一维都有「设成手动」和「交回自动」（传 `null`）。只有前者的话，用户
+/// 手滑点错一次就永远回不去了 —— 只能选另一个手动值，再也不能让刮削的结果
+/// 生效。
+///
+/// ## 为什么要作废五个 provider
+///
+/// 与 `WorkScrapeController._refreshAfter` 里「分类变了」那一支**完全一致**
+/// （那边有完整解释）：分类一改，详情页、海报墙，以及分类栏 / 筛选面板的
+/// 三组角标都要重算。少作废任何一个，用户都会看到一个停在旧值的数字 ——
+/// 而他点进去发现数量对不上，只会怀疑筛选坏了。
+///
+/// 改类型标签时同理：`genreCountsProvider` 直接由 `genres` 数出来，而
+/// 分类可能跟着变（加了「动画」→ 从「电影」挪到「动漫」），所以三组角标
+/// 一起作废最省心，反正这是一次点击一次的事，不在热路径上。
+class WorkClassificationController {
+  WorkClassificationController(this._ref);
+
+  final Ref _ref;
+
+  /// 手动指定分类。传 `null` 等价于 [restoreAutoCategory]。
+  Future<void> setCategory(String workKey, MediaCategory? category) async {
+    await _ref.read(mediaRepositoryProvider).setWorkCategory(workKey, category);
+    _refresh(workKey);
+  }
+
+  /// 恢复分类的自动判定：按当前规则立刻重算一次。
+  Future<void> restoreAutoCategory(String workKey) =>
+      setCategory(workKey, null);
+
+  /// 手动编辑类型标签。传 `null` 表示恢复自动（清掉手动标记，下次刮削可覆盖）。
+  Future<void> setGenres(String workKey, List<String>? genres) async {
+    await _ref.read(mediaRepositoryProvider).setWorkGenres(workKey, genres);
+    _refresh(workKey);
+  }
+
+  void _refresh(String workKey) {
+    _ref.invalidate(workDetailProvider(workKey));
+    _ref.invalidate(workListProvider);
+    _ref.invalidate(categoryCountsProvider);
+    _ref.invalidate(yearCountsProvider);
+    _ref.invalidate(genreCountsProvider);
+  }
+}
+
+final workClassificationControllerProvider =
+    Provider<WorkClassificationController>(
+  (ref) => WorkClassificationController(ref),
 );
 
 /// 把 `category` 列修正到当前规则下的正确值，**只跑一次**。
@@ -243,7 +316,7 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
         query: query.isEmpty ? null : query,
         // 空集合与 `null` 在仓储里是同一件事（「这一维不限」），
         // 但显式传 `null` 让 SQL 侧连条件都不用拼。
-        decades: filter.decades.isEmpty ? null : filter.decades,
+        years: filter.years.isEmpty ? null : filter.years,
         genres: filter.genres.isEmpty ? null : filter.genres,
         sort: filter.sort,
         limit: 500,
@@ -274,13 +347,13 @@ final playedCountProvider = FutureProvider<int>((ref) {
 ///
 /// ## 为什么只 `select` 这三个
 ///
-/// 面板上的角标要严格等于「**把年代 / 类型清空后**列表里的条数」——
+/// 面板上的角标要严格等于「**把年份 / 类型清空后**列表里的条数」——
 /// 这样每一个选项点下去都至少有结果。所以它跟着这三个条件收窄，
-/// 却**不能**跟着 `decades` / `genres` 收窄：否则用户每勾一个类型，
+/// 却**不能**跟着 `years` / `genres` 收窄：否则用户每勾一个类型，
 /// 剩下的类型角标就会跟着变，勾到第二个时列表已经空了。
 ///
 /// 用 `select` 而不是直接 `watch(libraryFilterProvider)` 是必须的：
-/// 后者会让「勾一个年代」也触发一次统计查询（白跑两遍全表扫描）。
+/// 后者会让「勾一个年份」也触发一次统计查询（白跑两遍全表扫描）。
 /// 记录（record）有结构相等，所以只有这三个值真的变了才会重算。
 ({MediaCategory? category, bool playedOnly, String query}) _facetScope(
   Ref ref,
@@ -297,7 +370,7 @@ final playedCountProvider = FutureProvider<int>((ref) {
   );
 }
 
-/// 各年代的作品数（筛选面板「年代」那一组的选项与角标）。
+/// 各年份的作品数（筛选面板「年份」那一组的选项与角标）。
 ///
 /// ## 为什么要等 [categoryBackfillProvider]
 ///
@@ -307,10 +380,10 @@ final playedCountProvider = FutureProvider<int>((ref) {
 /// 不等的话会出现：`workListProvider` 已经按回填后的分类筛好了列表，
 /// 面板上的数字却还是按回填前的分类算的 —— 两者对不上，而用户完全看不出
 /// 为什么。而「角标 == 点下去之后的条数」正是这个面板唯一的承诺。
-final decadeCountsProvider = FutureProvider<Map<int, int>>((ref) async {
+final yearCountsProvider = FutureProvider<Map<int, int>>((ref) async {
   await ref.watch(categoryBackfillProvider.future);
   final scope = _facetScope(ref);
-  return ref.watch(mediaRepositoryProvider).countWorksByDecade(
+  return ref.watch(mediaRepositoryProvider).countWorksByYear(
         category: scope.category,
         playedOnly: scope.playedOnly,
         query: scope.query.isEmpty ? null : scope.query,
@@ -322,7 +395,7 @@ final decadeCountsProvider = FutureProvider<Map<int, int>>((ref) async {
 /// 类型来自刮削（`genres` 列），所以**刮一部新片子这个表就可能变** ——
 /// 由 `scrape_providers` 在刮削成功后 invalidate 它。
 ///
-/// 等回填的理由与 [decadeCountsProvider] 完全相同（范围按 `category` 收窄）。
+/// 等回填的理由与 [yearCountsProvider] 完全相同（范围按 `category` 收窄）。
 final genreCountsProvider = FutureProvider<Map<String, int>>((ref) async {
   await ref.watch(categoryBackfillProvider.future);
   final scope = _facetScope(ref);

@@ -31,6 +31,18 @@ class MediaItems extends Table {
   IntColumn get episode => integer().nullable()();
   IntColumn get episodeEnd => integer().nullable()();
 
+  /// 部号（`第X部` / `上部`·`下部` / `Part.2` / `CD1`）。
+  ///
+  /// 与 [season] 是两个维度：季是外层、部是内层（《进击的巨人》第三季
+  /// Part.1/Part.2）。**NULL 语义是「没标部」** —— 详情页据此不画「部」
+  /// 那一层，所以旧库升级后不需要回填，行为与升级前完全一致。
+  IntColumn get part => integer().nullable()();
+
+  /// 部的展示名（`特别篇` / `上部` / `下部`）。NULL 表示没有专名。
+  ///
+  /// 存文本而不是枚举：这是发布组自己起的名字，穷举不完。
+  TextColumn get partLabel => text().nullable()();
+
   /// 容器标识（`VideoContainer.name`）
   TextColumn get container => text().withDefault(const Constant('other'))();
 
@@ -122,6 +134,18 @@ class MediaWorks extends Table {
   /// 而真正的「其他」作品永远修不好（因为它本来就该是 other）。
   TextColumn get category => text().withDefault(const Constant(''))();
 
+  /// 用户是否手动指定了分类。
+  ///
+  /// `true` 时，[mergeWorkForUpsert] 与 `WorkScraper._categoryFor` **不再用
+  /// `fromGenres` 覆盖** `category` 列 —— 用户说了算，刮削的 genres 说了不算。
+  ///
+  /// 为什么不直接复用 `source = manual`：`source` 是「整条元数据的来源」
+  /// （标题 / 海报 / 简介），刮削过一次就会变成 `online`；而分类只是其中
+  /// 一列，用户可以在保留在线标题的同时只改分类。两者语义不同，混在一起
+  /// 会让「重新刮削」误判为「需要保护整行」或反过来。
+  BoolColumn get categoryManual =>
+      boolean().withDefault(const Constant(false))();
+
   TextColumn get title => text()();
   TextColumn get originalTitle => text().nullable()();
   IntColumn get year => integer().nullable()();
@@ -150,6 +174,17 @@ class MediaWorks extends Table {
   /// 类型列表，存 JSON 数组字符串。
   TextColumn get genres => text().withDefault(const Constant('[]'))();
 
+  /// 用户是否手动编辑过类型标签（[genres]）。
+  ///
+  /// `true` 时，`mergeWorkForUpsert` 与 `WorkScraper._apply` **不再用刮削
+  /// 返回的 `meta.genres` 覆盖**这一列 —— 用户自己敲的「动画 / 科幻」不会被
+  /// 下一次刮削（往往只是为了补张海报）整份冲掉。
+  ///
+  /// 与 `categoryManual` 分开：分类和类型是两个轴，用户可能只改其中一个。
+  /// 两者都手动时互不干扰 —— 分类从**手动后的**类型折算，而不是从刮削的。
+  BoolColumn get genresManual =>
+      boolean().withDefault(const Constant(false))();
+
   TextColumn get onlineId => text().nullable()();
 
   /// 元数据来源（`ScrapeSource.name`）。
@@ -163,6 +198,15 @@ class MediaWorks extends Table {
   /// 冗余计数，避免列表页为每个作品做一次 count 查询（N+1）。
   IntColumn get itemCount => integer().withDefault(const Constant(0))();
   IntColumn get totalBytes => integer().withDefault(const Constant(0))();
+
+  /// 作品下**已标季号**的季数（去重；不含「未标季」那一桶）。
+  ///
+  /// 与 [itemCount] 同一条理由：列表页卡片要显示「3 季」，而按 `group_key`
+  /// 去 `COUNT(DISTINCT season)` 是一次子查询 —— 几百个作品就是几百次。
+  ///
+  /// `0` 和 `1` 都表示**不该显示季数**（电影、单季剧、老库还没重扫）。
+  /// 只有 `>= 2` 才有展示价值，见 `MediaWork.subtitleLine`。
+  IntColumn get seasonCount => integer().withDefault(const Constant(0))();
 
   /// 作品下所有文件的**网盘修改时间**最大值（`MediaItem.modifiedAt`）。
   ///

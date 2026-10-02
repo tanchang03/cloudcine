@@ -398,7 +398,7 @@ class DiscoveryController extends Notifier<DiscoveryState> {
     ref.invalidate(libraryStatsProvider);
     ref.invalidate(playedCountProvider);
     ref.invalidate(categoryCountsProvider);
-    ref.invalidate(decadeCountsProvider);
+    ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
   }
 

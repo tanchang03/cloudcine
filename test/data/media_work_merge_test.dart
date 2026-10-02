@@ -15,6 +15,7 @@ MediaWork _work({
   ScrapeSource source = ScrapeSource.local,
   MediaKind kind = MediaKind.movie,
   MediaCategory? category,
+  bool categoryManual = false,
   String title = '标题',
   int? year,
   String? overview,
@@ -29,6 +30,7 @@ MediaWork _work({
   DateTime? scrapedAt,
   int itemCount = 0,
   int totalBytes = 0,
+  int seasonCount = 0,
   DateTime? lastPlayedAt,
 }) =>
     MediaWork(
@@ -41,6 +43,7 @@ MediaWork _work({
             MediaKind.episode => MediaCategory.series,
             MediaKind.unknown => MediaCategory.other,
           },
+      categoryManual: categoryManual,
       title: title,
       year: year,
       overview: overview,
@@ -56,6 +59,7 @@ MediaWork _work({
       scrapedAt: scrapedAt,
       itemCount: itemCount,
       totalBytes: totalBytes,
+      seasonCount: seasonCount,
       lastPlayedAt: lastPlayedAt,
       updatedAt: DateTime(2020),
     );
@@ -518,6 +522,177 @@ void main() {
       expect(_work(source: ScrapeSource.local).isScraped, isFalse);
       expect(_work(source: ScrapeSource.online).isScraped, isTrue);
       expect(_work(source: ScrapeSource.manual).isScraped, isTrue);
+    });
+  });
+
+  group('用户自定义过的行（manual）不被自动刮削覆盖', () {
+    /// 用户在详情页点了「自定义」之后，库里那一行长这样 ——
+    /// 由 `MediaWork.customized` 产出（那条纯函数由
+    /// `media_work_customized_test.dart` 单独覆盖）。
+    MediaWork customized() => _work(
+          source: ScrapeSource.manual,
+          title: '2024 演唱会现场',
+          category: MediaCategory.other,
+          categoryManual: true,
+          year: null,
+          posterUrl: null,
+          rating: null,
+          genres: const [],
+          itemCount: 1,
+        );
+
+    test('扫描期自动刮削（incoming=online）碰不到它', () {
+      final incoming = _work(
+        source: ScrapeSource.online,
+        title: '低俗小说',
+        year: 1994,
+        overview: '两个杀手…',
+        posterUrl: 'https://image.tmdb.org/wrong.jpg',
+        rating: 8.9,
+        genres: const ['犯罪'],
+        onlineId: 'movie/680',
+        scrapedAt: ts,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, customized(), ts);
+
+      expect(
+        merged.title,
+        '2024 演唱会现场',
+        reason: '这条守卫是「自定义」功能能站住的前提。没有它，开着'
+            '「扫描后自动刮削」的用户每次重扫都会被在线源拿同一个错条目'
+            '再糊一遍 —— 而他刚刚手工改对，界面上却什么都没有提示。',
+      );
+      expect(merged.category, MediaCategory.other);
+      expect(merged.source, ScrapeSource.manual);
+      expect(merged.year, isNull);
+      expect(merged.posterUrl, isNull, reason: '刮错的那张海报不许回来。');
+      expect(merged.overview, isNull);
+      expect(merged.rating, isNull);
+      expect(merged.genres, isEmpty);
+      expect(merged.onlineId, isNull);
+      expect(merged.scrapedAt, isNull);
+    });
+
+    test('计数照常更新 —— 它是扫描的产物，不是刮削的', () {
+      final incoming = _work(
+        source: ScrapeSource.online,
+        itemCount: 7,
+        totalBytes: 7000,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, customized(), ts);
+
+      expect(merged.itemCount, 7);
+      expect(merged.totalBytes, 7000);
+      expect(merged.updatedAt, ts);
+    });
+
+    test('用户显式点「刮削」→ overrideManual 放行', () {
+      final incoming = _work(
+        source: ScrapeSource.online,
+        title: '低俗小说',
+        posterUrl: 'https://image.tmdb.org/a.jpg',
+        scrapedAt: ts,
+      );
+
+      final merged = DriftMediaRepository.mergeWorkForUpsert(
+        incoming,
+        customized(),
+        ts,
+        overrideManual: true,
+      );
+
+      expect(
+        merged.title,
+        '低俗小说',
+        reason: '「刮削」按钮是用户唯一能把作品交还给在线源的路。'
+            '这里若也拦下，库里一个字段都不会变，而 `WorkScraper` 已经'
+            '按流水线的命中结果返回了「已刮削：低俗小说」—— 界面在撒谎。',
+      );
+      expect(merged.source, ScrapeSource.online);
+    });
+
+    test('本地重扫（incoming=local）仍然进得来：年份与海报要能自愈', () {
+      // 这一条钉住守卫的**边界**。拦宽一格（把本地重扫也冻住）会造出一个
+      // 很难归因的现象：用户自定义完之后，这部作品永远既没有封面也没有
+      // 年份 —— 因为「自愈」唯一的发生时机就是本地重扫。
+      final incoming = _work(
+        source: ScrapeSource.local,
+        title: '2024演唱会现场.2160p.WEB-DL',
+        year: 2024,
+        posterUrl: 'https://drive-pc.quark.cn/file/video/preview?fid=f1',
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, customized(), ts);
+
+      expect(merged.title, '2024 演唱会现场', reason: '片名仍是用户写死的。');
+      expect(merged.source, ScrapeSource.manual, reason: '来源标记不回退。');
+      expect(merged.category, MediaCategory.other, reason: '分类也不被改写。');
+      expect(merged.year, 2024, reason: '年份由文件名解析补回。');
+      expect(
+        merged.posterUrl,
+        contains('quark.cn'),
+        reason: '海报回落到网盘缩略图（本地来源），而不是留空。',
+      );
+    });
+  });
+
+  group('季数（seasonCount）', () {
+    test('合并时永远取本次扫描的值 —— 与 itemCount 同类', () {
+      final incoming = _work(itemCount: 24, seasonCount: 3);
+      final existing = _work(itemCount: 12, seasonCount: 1);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(
+        merged.seasonCount,
+        3,
+        reason: '季数是「本次扫描看到的文件集合」的产物。留在旧值上的话，'
+            '用户新加一季、重扫完，卡片上还是写着「1 季」—— 而重扫恰恰是'
+            '他为了让这个数字变对才做的。',
+      );
+    });
+
+    test('「自定义」过的行也照样更新季数（它跟刮削无关）', () {
+      final existing = _work(
+        source: ScrapeSource.manual,
+        title: '用户手写的片名',
+        itemCount: 12,
+        seasonCount: 1,
+      );
+      // 扫描期自动刮削（online + 非 override）走的是「整行冻结」分支，
+      // 但**计数类**字段必须照常更新 —— 否则自定义过的作品永远停在旧数字上。
+      final incoming = _work(
+        source: ScrapeSource.online,
+        itemCount: 36,
+        seasonCount: 3,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.title, '用户手写的片名', reason: '元数据仍然冻着。');
+      expect(merged.seasonCount, 3, reason: '计数不冻。');
+    });
+
+    test('卡片副标题：>= 2 季才显示，0 / 1 季都不显示', () {
+      expect(_work(seasonCount: 3, itemCount: 24).subtitleLine, contains('3 季'));
+      expect(
+        _work(seasonCount: 1, itemCount: 12).subtitleLine,
+        isNot(contains('季')),
+        reason: '「1 季」写在卡片上是废话，还会把有信息量的「12 集」'
+            '挤到 ellipsis 后面。',
+      );
+      expect(
+        _work(seasonCount: 0, itemCount: 1).subtitleLine,
+        isNot(contains('季')),
+        reason: '0 表示「电影 / 老库还没回填」，同样不该出现。',
+      );
     });
   });
 }

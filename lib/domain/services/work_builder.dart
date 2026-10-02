@@ -51,6 +51,15 @@ class WorkSeed {
   int itemCount = 0;
   int totalBytes = 0;
 
+  /// 这个作品里出现过的**季号**（`parsed.season`；没标季的记 `0`）。
+  ///
+  /// 攒 `Set` 而不是计数器：一季里几十集，计数器会把「12 集」当成「12 季」。
+  /// `0` 代表「未标季」，展示时不计入季数。
+  final Set<int> seasons = {};
+
+  /// 已标季号的季数（不含「未标季」那一桶）。列表页卡片显示「N 季」用它。
+  int get seasonCount => seasons.where((s) => s > 0).length;
+
   /// 作品下所有文件的**网盘修改时间**最大值。
   ///
   /// 新增一集或替换一集时，这个值会变大，整个作品在「最近修改」排序里
@@ -146,6 +155,9 @@ class WorkSeedBook {
 
     seed.itemCount++;
     seed.totalBytes += item.sizeBytes ?? 0;
+    // 季号来自 `parsed`（不是 `item`）：两者同源，但 `parsed` 是**这次扫描
+    // 的解析结果**，而 `item` 在「已入库」路径上可能是库里那一条。
+    seed.seasons.add(parsed.season ?? 0);
     final m = item.modifiedAt;
     if (m != null) {
       final current = seed.lastModifiedAt;
@@ -226,6 +238,7 @@ class WorkSeedBook {
       scrapedAt: meta?.source == ScrapeSource.online ? now : null,
       itemCount: seed.itemCount,
       totalBytes: seed.totalBytes,
+      seasonCount: seed.seasonCount,
       lastModifiedAt: seed.lastModifiedAt,
       // firstSeenAt 由 mergeWorkForUpsert 处理：新作品填 now，已有作品保留旧值。
       updatedAt: now,

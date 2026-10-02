@@ -2,17 +2,31 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/work_levels.dart';
 import '../providers/library_providers.dart';
 import '../providers/scrape_providers.dart';
 import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/copy_button.dart';
+import '../widgets/customize_work_dialog.dart';
+import '../widgets/genre_edit_dialog.dart';
 import '../widgets/manual_scrape_dialog.dart';
 import '../widgets/media_item_row.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
+import '../widgets/tv_affordance.dart';
+import '../widgets/tv_focus.dart';
+
+/// 「刮削」与「手动」两个按钮**共用**的那句「为什么按不动」。
+///
+/// 两处 tooltip 与 TV 上那行可见小字都从这里取。抄成三份的话，改了一处就会
+/// 出现「tooltip 说去设置里开开关、屏幕上那行字说去别处」这种自相矛盾 ——
+/// 而这句话是 TV 用户**唯一**的出路说明（电视上没有鼠标可以去悬停问一下）。
+const String _noScrapeSourceReason = '还没有可用的在线刮削源。'
+    '到「设置 → 刮削」打开开关，并填入 TMDB Key 或豆瓣 Cookie。';
 
 /// 作品详情页。
 ///
@@ -36,17 +50,26 @@ class WorkDetailPage extends ConsumerWidget {
             padding: const EdgeInsets.fromLTRB(10, 8, 14, 0),
             child: Row(
               children: [
-                IconButton(
-                  onPressed: () => context.pop(),
-                  iconSize: 18,
-                  tooltip: '返回',
-                  icon: const Icon(Icons.arrow_back_rounded),
+                // 返回 / 刷新都是纯图标按钮 —— TV 上没有 hover，
+                // 不补文字标签就等于「两个含义不明的图标」。
+                TvIconLabel(
+                  label: '返回',
+                  child: IconButton(
+                    onPressed: () => context.pop(),
+                    iconSize: 18,
+                    tooltip: '返回',
+                    icon: const Icon(Icons.arrow_back_rounded),
+                  ),
                 ),
                 const Spacer(),
-                IconButton(
-                  tooltip: '刷新',
-                  onPressed: () => ref.invalidate(workDetailProvider(workKey)),
-                  icon: const Icon(Icons.refresh_rounded, size: 17),
+                TvIconLabel(
+                  label: '刷新',
+                  child: IconButton(
+                    tooltip: '刷新',
+                    onPressed: () =>
+                        ref.invalidate(workDetailProvider(workKey)),
+                    icon: const Icon(Icons.refresh_rounded, size: 17),
+                  ),
                 ),
               ],
             ),
@@ -83,20 +106,52 @@ class WorkDetailPage extends ConsumerWidget {
   }
 }
 
-/// 「播这部片」。
+/// 「播这部片」+ 季 / 部层级。
 ///
 /// 起播走 `playItem`（全应用唯一的起播入口），所以从这里点播与从海报墙
 /// 点播的行为**完全一致**：桌面端开独立窗口，其余平台跳内置播放页。
-class _DetailBody extends ConsumerWidget {
+///
+/// ## 为什么它是 stateful
+///
+/// 「现在在看哪一季 / 哪一部」是**页面内的临时状态**，不该进 provider：
+/// 它只是展示筛选，不参与落库、也不需要跨页共享。放进 provider 反而会让
+/// 「换一部作品」时残留上一部的选中项。
+class _DetailBody extends ConsumerStatefulWidget {
   const _DetailBody({required this.detail});
 
   final WorkDetail detail;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_DetailBody> createState() => _DetailBodyState();
+}
+
+class _DetailBodyState extends ConsumerState<_DetailBody> {
+  /// 用户手选的层级键（`s:3` / `p:2`）。`null` = 还没选过，走默认。
+  ///
+  /// ⚠️ 存**键**而不是存 `WorkLevelGroup` 对象：provider 一刷新 group 就是
+  /// 新实例，存对象会让「记住的选中项」永远指向上一份数据 —— 表现是
+  /// 「每次刷新都跳回第一季」，而且不报错。
+  String? _seasonKey;
+  String? _partKey;
+
+  @override
+  Widget build(BuildContext context) {
+    final detail = widget.detail;
     final work = detail.work;
-    final features = detail.features;
-    final extras = detail.extras;
+    final levels = WorkLevels.of(detail.items);
+
+    final seasonKey = _resolveSeason(levels);
+    final parts =
+        seasonKey == null ? const <WorkLevelGroup>[] : levels.partsOf(seasonKey);
+    final partKey = _resolvePart(parts);
+    final visible = levels.itemsIn(seasonKey: seasonKey, partKey: partKey);
+
+    final features =
+        visible.where((i) => !i.isSampleOrExtra).toList(growable: false);
+    final extras =
+        visible.where((i) => i.isSampleOrExtra).toList(growable: false);
+    final primary =
+        features.isNotEmpty ? features.first : (visible.isEmpty ? null : visible.first);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 4, 24, 32),
@@ -112,12 +167,44 @@ class _DetailBody extends ConsumerWidget {
                 child: PosterImage(work: work, borderRadius: 10),
               ),
               const SizedBox(width: 20),
-              Expanded(child: _InfoColumn(work: work, detail: detail)),
+              Expanded(
+                child: _InfoColumn(
+                  work: work,
+                  detail: detail,
+                  primary: primary,
+                  visibleCount: visible.length,
+                  featureCount: features.length,
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 18),
           _NetdiskLocation(detail: detail),
           const SizedBox(height: 22),
+          // 季 / 部选择器。**只在数据里真的成层时才画** ——
+          // 单集电影、单季剧的版式与改造前完全一致。
+          if (levels.hasSeasonLevel) ...[
+            _LevelRow(
+              label: '季',
+              groups: levels.seasons,
+              selectedKey: seasonKey,
+              onSelect: (k) => setState(() {
+                _seasonKey = k;
+                // 换了季就把部重置 —— 上一季的部键落在这一季里没有意义。
+                _partKey = null;
+              }),
+            ),
+            const SizedBox(height: 10),
+          ],
+          if (parts.length >= 2) ...[
+            _LevelRow(
+              label: '部',
+              groups: parts,
+              selectedKey: partKey,
+              onSelect: (k) => setState(() => _partKey = k),
+            ),
+            const SizedBox(height: 10),
+          ],
           if (features.isNotEmpty) ...[
             _SectionTitle(
               title: '文件',
@@ -147,18 +234,191 @@ class _DetailBody extends ConsumerWidget {
       ),
     );
   }
+
+  /// 当前该高亮哪一季。
+  ///
+  /// 优先级：**用户手选的**（只要它还在这一份数据里）→ 续播那一集所在的季
+  /// → 第一季。第二步是关键：打开详情页时高亮的层，与「点播放会播的那一集」
+  /// 永远是同一格 —— 两者都看 `detail.primary`。
+  String? _resolveSeason(WorkLevels levels) {
+    if (levels.seasons.isEmpty) return null;
+    final keys = levels.seasons.map((g) => g.key).toSet();
+    final kept = _seasonKey;
+    if (kept != null && keys.contains(kept)) return kept;
+    return WorkLevels.keyOf(levels.seasons, widget.detail.primary) ??
+        levels.seasons.first.key;
+  }
+
+  /// 当前该高亮哪一个部；这一季没有分部时返回 `null`（不画部行）。
+  String? _resolvePart(List<WorkLevelGroup> parts) {
+    if (parts.length < 2) return null;
+    final keys = parts.map((g) => g.key).toSet();
+    final kept = _partKey;
+    if (kept != null && keys.contains(kept)) return kept;
+    return WorkLevels.keyOf(parts, widget.detail.primary) ?? parts.first.key;
+  }
+}
+
+/// 层级选择器的一行（`季` 或 `部`）。
+///
+/// ## 为什么是常驻 chip 行而不是下拉
+///
+/// 本项目的首要目标是 TV。chip 是**方向键可达的焦点目标**；下拉在遥控器上
+/// 要先聚焦、再展开、再选，多两步 —— 而层级切换是看剧时的高频动作。
+///
+/// ## 为什么用 `InkWell` 而不是 `MenuItemButton`
+///
+/// 与筛选面板同一条理由（见 `library_filter_panel`）：`MenuItemButton` 带着
+/// 菜单语义，点一下会连带关掉宿主；这里根本没有宿主可关，用普通 `InkWell`
+/// 最不容易出意外。
+class _LevelRow extends StatelessWidget {
+  const _LevelRow({
+    required this.label,
+    required this.groups,
+    required this.selectedKey,
+    required this.onSelect,
+  });
+
+  final String label;
+  final List<WorkLevelGroup> groups;
+  final String? selectedKey;
+  final ValueChanged<String> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 16,
+          child: Text(
+            label,
+            style: const TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.dim,
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: SingleChildScrollView(
+            // ⚠️ `primary: false` 必须给：嵌套的 `SingleChildScrollView`
+            // 会去抢外层滚动视图的 controller，不给就抛
+            // 「attached to multiple scroll views」（筛选面板踩过同一个坑）。
+            primary: false,
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                for (final g in groups) ...[
+                  _LevelChip(
+                    group: g,
+                    selected: g.key == selectedKey,
+                    onTap: () => onSelect(g.key),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _LevelChip extends StatelessWidget {
+  const _LevelChip({
+    required this.group,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final WorkLevelGroup group;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = selected ? AppTheme.accent : AppTheme.muted;
+
+    return TvFocusable(
+      borderRadius: BorderRadius.circular(8),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: selected ? color.withValues(alpha: 0.16) : AppTheme.panel,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: selected ? color.withValues(alpha: 0.5) : AppTheme.line,
+                width: 0.5,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  group.label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                    color: selected ? color : AppTheme.text,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                // 集数角标：一眼看出哪一季还没看。
+                Text(
+                  '${group.count}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color:
+                        selected ? color.withValues(alpha: 0.8) : AppTheme.dim,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _InfoColumn extends ConsumerWidget {
-  const _InfoColumn({required this.work, required this.detail});
+  const _InfoColumn({
+    required this.work,
+    required this.detail,
+    required this.primary,
+    required this.visibleCount,
+    required this.featureCount,
+  });
 
   final MediaWork work;
   final WorkDetail detail;
 
+  /// 当前层级下「点播放会播的那一条」。
+  ///
+  /// **由 `_DetailBody` 按选中的季 / 部算好传进来** —— 在这里重算一遍就等于
+  /// 把「层级筛选」的逻辑抄了第二份，两处一旦分叉，会出现「列表显示第三季、
+  /// 播放按钮却播第一季」。
+  final MediaItem? primary;
+
+  /// 当前层级下的文件数（角标与「N 个文件」都用它）。
+  final int visibleCount;
+
+  /// 当前层级下的正片条数。> 1 时播放按钮说明是「第一个版本」。
+  final int featureCount;
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final primary = detail.primary;
-
+    // 提到局部变量：`primary` 是**字段**，而 Dart 不对字段做类型提升，
+    // 直接写 `primary == null ? null : playItem(..., primary)` 编译不过。
+    final p = primary;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -184,6 +444,7 @@ class _InfoColumn extends ConsumerWidget {
         Wrap(
           spacing: 6,
           runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             TagChip(label: work.kind.label, color: AppTheme.accent),
             if (work.year != null)
@@ -201,8 +462,12 @@ class _InfoColumn extends ConsumerWidget {
                   ? Icons.cloud_done_rounded
                   : Icons.description_outlined,
             ),
+            // 类型标签只展示前 4 个（多了会把这一行撑到换行好几排），
+            // 全量在「编辑类型」对话框里看。所以后面那个入口是必须的 ——
+            // 否则第 5 个之后的类型用户在详情页根本看不到。
             for (final g in work.genres.take(4))
               TagChip(label: g, color: AppTheme.muted),
+            _EditGenresChip(work: work),
           ],
         ),
         if (work.overview != null && work.overview!.isNotEmpty) ...[
@@ -219,17 +484,17 @@ class _InfoColumn extends ConsumerWidget {
           ),
         ],
         const SizedBox(height: 18),
-        // 用 `Wrap` 而不是 `Row`：这一行现在有三个按钮（播放 / 刮削 / 手动），
-        // 主窗口没有最小宽度限制，用户把窗口拖窄时 `Row` 会直接溢出报黄条。
-        // `Wrap` 在空间不够时把「N 个文件」挤到下一行，按钮一个都不会变形。
+        // 用 `Wrap` 而不是 `Row`：这一行现在有四个按钮（播放 / 刮削 / 手动 /
+        // 自定义），主窗口没有最小宽度限制，用户把窗口拖窄时 `Row` 会直接
+        // 溢出报黄条。`Wrap` 在空间不够时把「N 个文件」挤到下一行，
+        // 按钮一个都不会变形。
         Wrap(
           spacing: 10,
           runSpacing: 10,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             FilledButton.icon(
-              onPressed:
-                  primary == null ? null : () => playItem(context, ref, primary),
+              onPressed: p == null ? null : () => playItem(context, ref, p),
               style: FilledButton.styleFrom(
                 backgroundColor: AppTheme.accent,
                 padding: const EdgeInsets.symmetric(
@@ -244,7 +509,7 @@ class _InfoColumn extends ConsumerWidget {
               label: Text(
                 primary == null
                     ? '没有可播文件'
-                    : (detail.hasMultipleVersions ? '播放第一个版本' : '播放'),
+                    : (featureCount > 1 ? '播放第一个版本' : '播放'),
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -253,18 +518,96 @@ class _InfoColumn extends ConsumerWidget {
             ),
             _ScrapeButton(work: work),
             _ManualScrapeButton(work: work),
+            _CustomizeButton(work: work),
             Text(
-              '${detail.items.length} 个文件',
+              '$visibleCount 个文件',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
             ),
           ],
         ),
+        // 按钮变灰却没有任何解释 —— 桌面上悬停一下就有 tooltip，电视上
+        // 用户唯一的结论是「这个应用坏了」。所以 TV 上把原因写成看得见的一行。
+        //
+        // 只放**一条**：两个按钮（刮削 / 手动）是同一个原因，各挂一条会把
+        // 同一句话并排印两遍。「自定义」不受这个门槛限制，不在此列。
+        if (!(ref.watch(settingsProvider).valueOrNull?.canScrapeOnline ?? false))
+          const TvNote(text: _noScrapeSourceReason),
         // 刮削结果。**只在属于这部作品时显示** —— 否则刮完 A 再打开 B，
         // B 的页面上还挂着 A 的「已刮削：…」。
         _ScrapeMessage(workKey: work.key),
       ],
+    );
+  }
+}
+
+/// 「编辑类型标签」入口 —— 加 / 删这部作品的 `genres`。
+///
+/// ## 为什么类型需要手动编辑
+///
+/// `genres` 是 TMDB / 豆瓣**返回什么就存什么**，经常不全或不对：国产综艺 /
+/// 国漫在 TMDB 上常常压根没有条目；跨类型的片子（「动画 + 科幻 + 冒险」）
+/// 源只给一两个；片名被发布组打散时更会命中一个完全不相干的条目。
+///
+/// 而它有两个实打实的下游：详情页这几个 chip，以及筛选面板「类型」那一组
+/// 的选项与角标 —— 错了就是「按类型筛不到这部片」。
+///
+/// ## 为什么是一个常驻 chip 而不是菜单项
+///
+/// 类型标签在详情页是**看得见**的东西，改它的入口就该在它旁边。藏进
+/// 「更多」菜单里的话，用户看到标签写错了也找不到地方改 —— 只会以为
+/// 这个应用不能改类型。
+///
+/// ## 已手动编辑过时会点亮
+///
+/// `genresManual == true` 时用强调色，让用户知道「这一列现在被锁住了，
+/// 重新刮削不会再覆盖它」—— 否则他下次刮削发现类型没变，会以为刮削坏了。
+class _EditGenresChip extends ConsumerWidget {
+  const _EditGenresChip({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final manual = work.genresManual;
+    final color = manual ? AppTheme.accent : AppTheme.muted;
+
+    return Tooltip(
+      message: manual
+          ? '类型标签已被你手动锁定，重新刮削不会覆盖。点一下继续编辑'
+          : '加 / 删这部作品的类型标签',
+      child: InkWell(
+        onTap: () => GenreEditDialog.show(context, work),
+        borderRadius: BorderRadius.circular(5),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2.5),
+          decoration: BoxDecoration(
+            color: manual ? color.withValues(alpha: 0.14) : null,
+            borderRadius: BorderRadius.circular(5),
+            border: Border.all(
+              color: manual ? color.withValues(alpha: 0.35) : AppTheme.line,
+              width: 0.5,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.edit_outlined, size: 10, color: color),
+              const SizedBox(width: 3),
+              Text(
+                work.genres.isEmpty ? '添加类型' : '编辑类型',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  height: 1.3,
+                  color: color,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -301,8 +644,7 @@ class _ScrapeButton extends ConsumerWidget {
     return Tooltip(
       message: canScrape
           ? '用在线源（TMDB / 豆瓣）重新查一次海报与简介'
-          : '还没有可用的在线刮削源。到「设置 → 刮削」打开开关，'
-              '并填入 TMDB Key 或豆瓣 Cookie。',
+          : _noScrapeSourceReason,
       child: OutlinedButton.icon(
         onPressed: (!canScrape || running)
             ? null
@@ -361,8 +703,7 @@ class _ManualScrapeButton extends ConsumerWidget {
       message: canScrape
           ? '自动刮削认不出片名时（文件名被插字符、或只剩分辨率信息），'
               '自己敲片名从候选里挑一条'
-          : '还没有可用的在线刮削源。到「设置 → 刮削」打开开关，'
-              '并填入 TMDB Key 或豆瓣 Cookie。',
+          : _noScrapeSourceReason,
       child: OutlinedButton.icon(
         onPressed: (!canScrape || running)
             ? null
@@ -376,6 +717,58 @@ class _ManualScrapeButton extends ConsumerWidget {
         icon: const Icon(Icons.manage_search_rounded, size: 16),
         label: const Text(
           '手动',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
+/// 「自定义」：清除在线刮削信息，自己写死片名与分类。
+///
+/// ## 为什么它和「刮削」「手动」并排
+///
+/// 前两个按钮是「**去网上找**」，这个按钮是「**网上找不到，我自己写**」。
+/// 三者是同一个问题的三条出路，所以放在一起。自动那条失败时的文案
+/// （`WorkScrapeOutcome.message` 的 auto 分支）也会把用户引到这里来 ——
+/// 那句里写死了「点「自定义」直接写死片名和分类」，说的就是这个按钮。
+///
+/// ⚠️ 与「手动」那条一样，**文案与位置是绑定的**：把这个按钮挪进菜单，
+/// 就得同步改 `WorkScrapeOutcome` 里的引导语，否则用户会去找一个看不见的
+/// 东西。
+///
+/// ## 为什么它**没有** `canScrapeOnline` 门槛
+///
+/// 它一次网络请求都不发，是纯本地的数据修正。跟着那两个按钮一起变灰的话，
+/// **没配 TMDB / 豆瓣的用户就永远用不了它** —— 而他们恰恰最需要：没有在线
+/// 源时作品全靠文件名解析，片名常常就是 `2024.2160p.WEB-DL`。
+class _CustomizeButton extends ConsumerWidget {
+  const _CustomizeButton({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(workScrapeControllerProvider);
+    // 与两个刮削入口共用 runningKey —— 三个入口不能同时跑。
+    final running = state.isRunning(work.key);
+
+    return Tooltip(
+      message: '自动刮削刮错了、而数据源里根本没有这部片子（自制 / 演唱会 / '
+          '赛事…）时：清掉刮来的海报、简介、评分，自己敲片名和分类。'
+          '保存后标记为「手动修改」，重扫与自动刮削都不会再覆盖它。',
+      child: OutlinedButton.icon(
+        onPressed:
+            running ? null : () => CustomizeWorkDialog.show(context, work),
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        icon: const Icon(Icons.edit_outlined, size: 16),
+        label: const Text(
+          '自定义',
           style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
         ),
       ),
@@ -504,6 +897,7 @@ class _NetdiskLocation extends StatelessWidget {
                 // 复制一个不完整的结果比不给复制更糟。
                 text: dirs.join('\n'),
                 label: singleDir ? '复制路径' : '复制全部目录',
+                tvLabel: singleDir ? '复制路径' : '复制全部',
                 icon: Icons.folder_copy_outlined,
               ),
             ],
@@ -535,6 +929,7 @@ class _NetdiskLocation extends StatelessWidget {
                     ? items.first.fileId
                     : items.map((i) => i.fileId).join('\n'),
                 label: '复制 ID',
+                tvLabel: '复制 ID',
                 icon: Icons.tag_rounded,
               ),
             ],

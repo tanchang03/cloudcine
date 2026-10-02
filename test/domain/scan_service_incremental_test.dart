@@ -344,9 +344,13 @@ class _RecordingRepo extends InMemoryMediaRepository {
   }
 
   @override
-  Future<void> upsertWorks(List<MediaWork> works, {DateTime? now}) async {
+  Future<void> upsertWorks(
+    List<MediaWork> works, {
+    DateTime? now,
+    bool overrideManual = false,
+  }) async {
     events.add('works');
-    return super.upsertWorks(works, now: now);
+    return super.upsertWorks(works, now: now, overrideManual: overrideManual);
   }
 }
 

@@ -119,7 +119,7 @@ void main() {
   Future<void> scrape(String key) =>
       container.read(workScrapeControllerProvider.notifier).scrape(key);
 
-  test('分类变了、年份没变 → 年代角标要重算', () async {
+  test('分类变了、年份没变 → 年份角标要重算', () async {
     await seed(
       key: 'w',
       kind: 'episode',
@@ -142,17 +142,17 @@ void main() {
     container
         .read(libraryFilterProvider.notifier)
         .setCategory(MediaCategory.anime);
-    expect(await container.read(decadeCountsProvider.future), isEmpty);
+    expect(await container.read(yearCountsProvider.future), isEmpty);
 
     await scrape('w');
 
     expect(
-      await container.read(decadeCountsProvider.future),
-      {2010: 1},
-      reason: '键是**年代起始年**（2015 落在 2010 年代）。`year` 一个字都没变'
-          '（2015 → 2015），只按「年份变了没」判重算的话这个 provider 会一直'
-          '返回缓存里的空表 —— 用户看到的是「动漫栏里明明有一部 2015 年的'
-          '片子，筛选面板里却没有 2010 年代」。',
+      await container.read(yearCountsProvider.future),
+      {2015: 1},
+      reason: '键是**具体年份**（2015）。`year` 一个字都没变（2015 → 2015），'
+          '只按「年份变了没」判重算的话这个 provider 会一直返回缓存里的空表'
+          '—— 用户看到的是「动漫栏里明明有一部 2015 年的片子，筛选面板里却'
+          '没有 2015」。',
     );
   });
 
@@ -218,17 +218,17 @@ void main() {
       ),
     );
 
-    await container.read(decadeCountsProvider.future);
+    await container.read(yearCountsProvider.future);
     await container.read(genreCountsProvider.future);
-    expect(repo.decadeCalls, 1);
+    expect(repo.yearCalls, 1);
     expect(repo.genreCalls, 1);
 
     await scrape('w');
 
-    await container.read(decadeCountsProvider.future);
+    await container.read(yearCountsProvider.future);
     await container.read(genreCountsProvider.future);
     expect(
-      repo.decadeCalls,
+      repo.yearCalls,
       1,
       reason: '年份没变，不该白跑一次全表扫描。',
     );
@@ -240,7 +240,7 @@ void main() {
     );
   });
 
-  test('只有年份变了 → 年代角标重算，类型角标不动', () async {
+  test('只有年份变了 → 年份角标重算，类型角标不动', () async {
     await seed(
       key: 'w',
       kind: 'episode',
@@ -251,15 +251,15 @@ void main() {
     );
     build(change((w) => w.copyWith(year: 2021, source: ScrapeSource.online)));
 
-    await container.read(decadeCountsProvider.future);
+    await container.read(yearCountsProvider.future);
     await container.read(genreCountsProvider.future);
-    expect(repo.decadeCalls, 1);
+    expect(repo.yearCalls, 1);
     expect(repo.genreCalls, 1);
 
     await scrape('w');
 
-    expect(await container.read(decadeCountsProvider.future), {2020: 1});
-    expect(repo.decadeCalls, 2);
+    expect(await container.read(yearCountsProvider.future), {2021: 1});
+    expect(repo.yearCalls, 2);
     await container.read(genreCountsProvider.future);
     expect(
       repo.genreCalls,
@@ -277,17 +277,17 @@ void main() {
 class _CountingRepo extends DriftMediaRepository {
   _CountingRepo(super.db);
 
-  int decadeCalls = 0;
+  int yearCalls = 0;
   int genreCalls = 0;
 
   @override
-  Future<Map<int, int>> countWorksByDecade({
+  Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
   }) {
-    decadeCalls++;
-    return super.countWorksByDecade(
+    yearCalls++;
+    return super.countWorksByYear(
       category: category,
       playedOnly: playedOnly,
       query: query,

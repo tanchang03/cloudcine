@@ -1,9 +1,23 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- ===== Android TV（2026-10-02）=====
+         下面两条 uses-feature 决定「应用会不会出现在 TV 的 Google Play 上」。
+         缺 android.hardware.touchscreen(required=false) 时系统认为本应用需要触摸屏，
+         会把无触摸屏的 TV 设备从可安装列表里滤掉。
+         ⚠️ required="false" 不能省成「不写」—— 不写等于 required="true"，效果一样是被 TV 排除。 -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
     <application
         android:label="云影 CloudCine"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/banner">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -12,6 +26,7 @@
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
+            android:screenOrientation="landscape"
             android:windowSoftInputMode="adjustResize">
             <!-- Specifies an Android theme to apply to this Activity as soon as
                  the Android process has started. This theme is visible to the user
@@ -21,9 +36,15 @@
               android:name="io.flutter.embedding.android.NormalTheme"
               android:resource="@style/NormalTheme"
               />
+            <!-- 两个 category 必须同时在同一个 intent-filter 里：
+                 LAUNCHER        → 手机/平板的桌面图标
+                 LEANBACK_LAUNCHER → TV 首页的图标。
+                 ⚠️ 缺 LEANBACK_LAUNCHER 时，官方文档的原话是
+                 「用开发工具装到 TV 上，它不会出现在 TV 用户界面里」—— 侧载都找不到入口。 -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

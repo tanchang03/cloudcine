@@ -57,7 +57,74 @@ abstract class MediaRepository {
   Future<int> deleteItemsNotIn(DriveProvider provider, Set<String> keepIds);
 
   /// 批量 upsert 作品。
-  Future<void> upsertWorks(List<MediaWork> works, {DateTime? now});
+  ///
+  /// [overrideManual] 只给**用户显式发起**的写入用（详情页的「刮削」/「手动」
+  /// 两个按钮）。默认 `false` 时，`source == manual` 的作品（用户自定义过
+  /// 片名 / 分类的那些）**不接受在线刮削结果的覆盖** —— 见
+  /// `DriftMediaRepository.mergeWorkForUpsert` 里那条守卫。
+  ///
+  /// ## 为什么需要一个显式开关，而不是「一律保护」
+  ///
+  /// 一律保护的话，用户手工改过之后就**再也没法重新刮削**了：点「刮削」
+  /// 按钮会走到这里、被守卫拦下、库里的行一个字段都不变，而 `WorkScraper`
+  /// 已经按流水线的命中结果返回了「已刮削：xxx」—— 界面在撒谎。
+  ///
+  /// 反过来，一律不保护就会让**扫描期的自动刮削**（`ScanService` 那条）
+  /// 每次重扫都拿同一个错条目把用户刚改对的片名糊回去。两者的区别是
+  /// 「是不是用户点的」，只有调用方知道，所以由调用方声明。
+  Future<void> upsertWorks(
+    List<MediaWork> works, {
+    DateTime? now,
+    bool overrideManual = false,
+  });
+
+  /// **清除在线刮削信息 + 自定义片名与分类**（详情页「自定义」按钮）。
+  ///
+  /// 规则全在 [MediaWork.customized] 里（那是个纯函数，可脱离数据库单测）。
+  /// 这里负责落库，返回写入后的作品行；作品已不在库里时返回 `null`。
+  ///
+  /// ## 为什么不能走 [upsertWorks]
+  ///
+  /// `mergeWorkForUpsert` 有一条「**海报地址永不为空**」的规则（为「某次扫描
+  /// 恰好没拿到缩略图」准备的兜底）：本次地址为 `null` 时它会保留库里那个。
+  /// 那正是这里要清掉的东西 —— 走合并等于**清了个寂寞**，而用户看到的是
+  /// 「点了自定义，那张刮错的海报还挂在那儿」。
+  ///
+  /// 所以本方法直接整行写（与 [setWorkCategory] 同一种做法：用户明确要求的
+  /// 状态变更不该被「为自动流程准备的容错」改写）。
+  Future<MediaWork?> customizeWork(
+    String key, {
+    required String title,
+    required MediaCategory category,
+    DateTime? now,
+  });
+
+  /// 手动指定一部作品的分类；传 `null` 表示**恢复自动判定**。
+  ///
+  /// 传具体分类时写入 [category] 并标记 `categoryManual = true`，使后续
+  /// 刮削 / 重扫不再覆盖它。传 `null` 时清掉标记并按当前规则重算一次
+  /// （`MediaCategoryGuesser.guessFromWork`），把这部作品交回自动逻辑。
+  ///
+  /// ## 为什么必须有「恢复」这条路
+  ///
+  /// 只有「设成手动」没有「交回自动」的话，用户手滑点错一次分类就**永远
+  /// 回不去**了 —— 他只能选另一个手动值，再也不能让刮削的类型（动画 /
+  /// 纪录片）生效。那不是「覆盖」，那是「焊死」。
+  ///
+  /// 传与当前值相同的分类时仍写入（只翻 `categoryManual` 标记）——
+  /// 用户点了一下当前分类就是在说「这个值我要锁住」。
+  Future<void> setWorkCategory(String key, MediaCategory? category);
+
+  /// 手动编辑一部作品的**类型标签**（`genres`）；传 `null` 表示恢复自动。
+  ///
+  /// 传具体列表时写入并标记 `genresManual = true`，使后续刮削不再覆盖它
+  /// —— 用户可能就是为了修「刮削返回的类型是错的」才动手的。同时把
+  /// **分类**从新的类型折算一次（除非分类本身也是手动指定的），
+  /// 否则会出现「类型标签写着『动画』、分类却是『电影』」的自相矛盾行。
+  ///
+  /// 传 `null` 时只清掉 `genresManual` 标记（类型本身保留）—— 下次刮削
+  /// 会重新覆盖它。
+  Future<void> setWorkGenres(String key, List<String>? genres);
 
   /// 按归组键取作品。
   Future<MediaWork?> workByKey(String key);
@@ -110,10 +177,10 @@ abstract class MediaRepository {
   /// 「电影」里，也在「最近播放」里），所以是一个独立的开关而不是分类的一个
   /// 取值 —— 理由见 `LibraryFilter.playedOnly`。
   ///
-  /// [decades] 与 [genres] 是筛选面板里的两个条件，与上面几个**全部取交集**。
+  /// [years] 与 [genres] 是筛选面板里的两个条件，与上面几个**全部取交集**。
   ///
-  ///   - [decades] 是**年代起始年**（`2020` 表示 2020–2029），不是具体年份。
-  ///     逐年列会把筛选面板撑成几十项，而用户想找的是「最近几年的片子」；
+  ///   - [years] 是**具体年份**（`2023` 只匹配 2023 年上映的作品），不是年代。
+  ///     一部片子只属于一个年份，所以多项之间是「或」；
   ///   - [genres] 是 TMDB / 豆瓣的类型名（`动画` / `科幻`…），**任一命中即可**
   ///     （多选是「或」，不是「与」—— 一部片子只会有一两个类型，
   ///     取交集几乎永远筛不出东西）。
@@ -124,7 +191,7 @@ abstract class MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
-    Set<int>? decades,
+    Set<int>? years,
     Set<String>? genres,
     WorkSort sort = WorkSort.recentModified,
     int limit = 200,
@@ -171,25 +238,24 @@ abstract class MediaRepository {
   /// 两栏里，两边的数字本来就不该相加。
   Future<int> countPlayedWorks();
 
-  /// 各年代的作品数（筛选面板「年代」那一组的选项与角标）。
+  /// 各年份的作品数（筛选面板「年份」那一组的选项与角标）。
   ///
-  /// 键是**年代起始年**（`2020` 表示 2020–2029）。只返回**库里真的有的**
-  /// 年代 —— 写死一张「2020s / 2010s / …」的表，会让用户点一个永远是 0 的
-  /// 选项，然后怀疑筛选坏了。
+  /// 键是**具体年份**（`2023`）。只返回**库里真的有的**年份 —— 写死一张
+  /// 年份表会让用户点一个永远是 0 的选项，然后怀疑筛选坏了。
   ///
-  /// ## 计数口径：等于「把年代 / 类型清空后，列表里的条数」
+  /// ## 计数口径：等于「把年份 / 类型清空后，列表里的条数」
   ///
   /// 所以它跟着 [category] / [playedOnly] / [query] 收窄，但**不跟着
-  /// [decades] / [genres] 收窄**（那两维由调用方保证不传进来）。
+  /// [years] / [genres] 收窄**（那两维由调用方保证不传进来）。
   /// 这条规则只有一个目的：**面板上出现的每一个选项，点下去至少有一条结果**。
   /// 整库统计做不到这一点 —— 用户切到「综艺」栏再打开面板，会看到一堆
   /// 综艺里根本不存在的类型，点下去是空列表。
   ///
   /// 副作用是切换分类 / 搜索时面板上的数字会变（标准的分面筛选行为）。
   ///
-  /// `year` 为空的作品不进这个表（它们归不进任何年代），
-  /// 所以各年代之和**可能小于**作品总数。
-  Future<Map<int, int>> countWorksByDecade({
+  /// `year` 为空的作品不进这个表（它们归不进任何年份），
+  /// 所以各年份之和**可能小于**作品总数。
+  Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
@@ -201,7 +267,7 @@ abstract class MediaRepository {
   /// 这里只能把那**一列**读出来在 Dart 里拆。与 [countWorksByCategory] 的
   /// 「一次 GROUP BY」不同，但代价仍然可控：只读一列、不反序列化整行。
   ///
-  /// 计数口径与 [countWorksByDecade] 完全一致（见那里的说明）。
+  /// 计数口径与 [countWorksByYear] 完全一致（见那里的说明）。
   ///
   /// 没有任何类型的作品（没刮过）不进这个表。
   Future<Map<String, int>> countWorksByGenre({
@@ -329,7 +395,11 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
-  Future<void> upsertWorks(List<MediaWork> works, {DateTime? now}) async {
+  Future<void> upsertWorks(
+    List<MediaWork> works, {
+    DateTime? now,
+    bool overrideManual = false,
+  }) async {
     final ts = now ?? DateTime.now();
     for (final w in works) {
       final existing = _works[w.key];
@@ -339,7 +409,42 @@ class InMemoryMediaRepository implements MediaRepository {
             : w;
         continue;
       }
+      // 用户手工写死的行（`manual`）不接受**自动**在线刮削的覆盖：
+      // 只更新扫描的产物（文件数 / 体积 / 网盘时间），元数据整行保留。
+      // 与 drift 实现的早退分支同一口径 —— 两个实现给出不同的合并结果
+      // 会让「用内存库跑过的用例在真库上失败」变成一个谜。
+      if (existing.source == ScrapeSource.manual &&
+          w.source == ScrapeSource.online &&
+          !overrideManual) {
+        _works[w.key] = existing.copyWith(
+          itemCount: w.itemCount,
+          totalBytes: w.totalBytes,
+          lastModifiedAt: w.lastModifiedAt,
+          updatedAt: ts,
+        );
+        continue;
+      }
       // 刮削结果不能被「本地解析」的标题覆盖；反之可以。
+      //
+      // 用户手动改过的两个轴（`categoryManual` / `genresManual`）在两个分支里
+      // 都保留 —— 用户改过的不能被重扫 / 重刮削冲掉。
+      //
+      // ⚠️ 这段规则的真源是 `DriftMediaRepository.mergeWorkForUpsert`
+      // （有长注释解释每一条为什么）。替身在这里复刻它，是为了让
+      // 「手动改过分类 / 类型后重扫」这类测试也能跑在内存库上；
+      // 但真正守规则的是 `test/data/media_work_merge_test.dart`。
+      final keepManualCategory = existing.categoryManual;
+
+      // 生效后的类型：用户手敲的优先，其次保护模式沿用库里的，否则用本次的。
+      final effectiveGenres = existing.genresManual
+          ? existing.genres
+          : (existing.isScraped ? existing.genres : w.genres);
+
+      // 分类：用户手选的优先；否则从**生效后的**类型折算，再退回本次分类。
+      final effectiveCategory = keepManualCategory
+          ? existing.category
+          : (MediaCategoryGuesser.fromGenres(effectiveGenres) ?? w.category);
+
       _works[w.key] = existing.isScraped
           ? w.copyWith(
               title: existing.title,
@@ -354,15 +459,22 @@ class InMemoryMediaRepository implements MediaRepository {
               backdropUrl: existing.backdropUrl,
               backdropFile: existing.backdropFile,
               rating: existing.rating,
-              genres: existing.genres,
+              genres: effectiveGenres,
+              genresManual: existing.genresManual,
               onlineId: existing.onlineId,
               source: existing.source,
               scrapedAt: existing.scrapedAt,
+              category: effectiveCategory,
+              categoryManual: existing.categoryManual,
               // `firstSeenAt` 保留旧值：它决定「最近添加」排序。
               firstSeenAt: existing.firstSeenAt,
               updatedAt: now ?? w.updatedAt,
             )
           : w.copyWith(
+              genres: effectiveGenres,
+              genresManual: existing.genresManual,
+              category: effectiveCategory,
+              categoryManual: existing.categoryManual,
               firstSeenAt: existing.firstSeenAt,
               updatedAt: now ?? w.updatedAt,
             );
@@ -436,12 +548,67 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<void> setWorkCategory(String key, MediaCategory? category) async {
+    final work = _works[key];
+    if (work == null) return;
+    // `null` = 恢复自动判定：按当前规则重算一次（与 drift 实现同一口径）。
+    final target = category ??
+        MediaCategoryGuesser.guessFromWork(
+          kind: work.kind,
+          title: work.title,
+          genres: work.genres,
+        );
+    _works[key] = work.copyWith(
+      category: target,
+      categoryManual: category != null,
+    );
+  }
+
+  @override
+  Future<MediaWork?> customizeWork(
+    String key, {
+    required String title,
+    required MediaCategory category,
+    DateTime? now,
+  }) async {
+    final work = _works[key];
+    if (work == null) return null;
+    final custom = work.customized(
+      title: title,
+      category: category,
+      updatedAt: now ?? DateTime.now(),
+    );
+    _works[key] = custom;
+    return custom;
+  }
+
+  @override
+  Future<void> setWorkGenres(String key, List<String>? genres) async {
+    final work = _works[key];
+    if (work == null) return;
+    if (genres == null) {
+      // 恢复自动：只清手动标记，类型留着（下次刮削会覆盖它）。
+      _works[key] = work.copyWith(genresManual: false);
+      return;
+    }
+    // 分类跟着新类型走（除非分类本身也是手选的）—— 与 drift 实现同一口径。
+    final newCategory = work.categoryManual
+        ? work.category
+        : (MediaCategoryGuesser.fromGenres(genres) ?? work.category);
+    _works[key] = work.copyWith(
+      genres: genres,
+      genresManual: true,
+      category: newCategory,
+    );
+  }
+
+  @override
   Future<List<MediaWork>> listWorks({
     MediaKind? kind,
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
-    Set<int>? decades,
+    Set<int>? years,
     Set<String>? genres,
     // ⚠️ 默认值必须与接口声明、drift 实现三处一致：接口默认值只是个
     // 「文档」，真正生效的是**实现**上的默认值。这里漏改的话，调用方
@@ -460,12 +627,12 @@ class InMemoryMediaRepository implements MediaRepository {
     if (playedOnly) {
       list = list.where((w) => w.lastPlayedAt != null).toList();
     }
-    // 年代：`decades` 存的是**年代起始年**（2020 = 2020–2029）。没有年份的
-    // 作品（`year == null`）归不进任何年代 —— 选了年代就等于把它排掉，
-    // 与 drift 实现里 `year >= d0 AND year < d0+10` 的口径一致。
-    if (decades != null && decades.isNotEmpty) {
+    // 年份：`years` 存的是**具体年份**（2023 只匹配 2023 年上映的作品）。
+    // 没有年份的作品（`year == null`）归不进任何年份 —— 选了年份就等于把
+    // 它排掉，与 drift 实现里 `year IN (...)` 的口径一致。
+    if (years != null && years.isNotEmpty) {
       list = list
-          .where((w) => w.year != null && decades.contains(w.year! ~/ 10 * 10))
+          .where((w) => w.year != null && years.contains(w.year))
           .toList();
     }
     // 类型：**任一命中**（或，不是与）。与 drift 实现里 `LIKE '%"类型"%'`
@@ -569,13 +736,13 @@ class InMemoryMediaRepository implements MediaRepository {
       _works.values.where((w) => w.lastPlayedAt != null).length;
 
   @override
-  Future<Map<int, int>> countWorksByDecade({
+  Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
   }) async {
     // 直接复用 [listWorks] 的筛选，而不是把条件再抄一遍：口径要严格等于
-    // 「清空年代 / 类型后列表里的条数」，抄一遍就迟早会漂移。
+    // 「清空年份 / 类型后列表里的条数」，抄一遍就迟早会漂移。
     final works = await listWorks(
       category: category,
       playedOnly: playedOnly,
@@ -585,11 +752,10 @@ class InMemoryMediaRepository implements MediaRepository {
     final out = <int, int>{};
     for (final w in works) {
       final y = w.year;
-      // 没有年份的作品不进表 —— 与 `listWorks` 的年代过滤口径一致，
-      // 否则面板上会冒出一个点了就空列表的年代。
+      // 没有年份的作品不进表 —— 与 `listWorks` 的年份过滤口径一致，
+      // 否则面板上会冒出一个点了就空列表的年份。
       if (y == null) continue;
-      final d = y ~/ 10 * 10;
-      out[d] = (out[d] ?? 0) + 1;
+      out[y] = (out[y] ?? 0) + 1;
     }
     return out;
   }
@@ -624,9 +790,15 @@ class InMemoryMediaRepository implements MediaRepository {
   @override
   Future<List<MediaItem>> itemsForWork(String groupKey) async {
     final list = _items.values.where((i) => i.groupKey == groupKey).toList();
+    // ⚠️ 必须与 `DriftMediaRepository.itemsForWork` 的排序**逐条一致**
+    // （季 → 部 → 集 → 名称）。替身少排一段，用它的测试就会对
+    // 「Part.1 在前还是 Part.2 在前」给出与真库不同的结论 ——
+    // 而那种测试通过只说明替身和被测代码犯了同一个错。
     list.sort((a, b) {
       final s = (a.season ?? 0).compareTo(b.season ?? 0);
       if (s != 0) return s;
+      final p = a.partOrder.compareTo(b.partOrder);
+      if (p != 0) return p;
       final e = (a.episode ?? 0).compareTo(b.episode ?? 0);
       if (e != 0) return e;
       return a.name.compareTo(b.name);

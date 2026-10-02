@@ -4,11 +4,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/library_providers.dart';
 import '../theme/app_theme.dart';
 
-/// 右上角的「筛选」按钮，点开是贴在它下面的年代 / 类型两组多选。
+/// 右上角的「筛选」按钮，点开是贴在它下面的年份 / 类型两组多选。
 ///
 /// ## 为什么是浮层而不是常驻的一排
 ///
-/// 分类栏（`_CategoryBar`）已经占了列表上方一整条，再摆两排类型 / 年代
+/// 分类栏（`_CategoryBar`）已经占了列表上方一整条，再摆两排类型 / 年份
 /// 会把海报墙挤到屏幕下半部分 —— 而这两组条件绝大多数时候是不用的。
 /// 做成浮层后，**生效的条件会以数字标在按钮上**，所以「现在到底筛没筛」
 /// 这件事仍然是随时可见的，只是不再常驻占地方。
@@ -22,35 +22,72 @@ import '../theme/app_theme.dart';
 ///
 /// 面板里放的是普通 [InkWell] 而不是 [MenuItemButton]，所以**点一个 chip
 /// 不会把面板关掉** —— 多选必须能连续点几下。
-class LibraryFilterButton extends StatelessWidget {
+///
+/// ## ⚠️ 为什么还要自己加一个「关闭」按钮和 [PopScope]
+///
+/// `MenuAnchor` 关掉自己**只认 Esc**（源码里 `_kMenuShortcuts` 把 `escape`
+/// 绑到 `DismissIntent`）。而它是个 `OverlayPortal`、**不是一条路由**，于是：
+///   * **Android TV 遥控器上没有 Esc** → 面板一打开就出不去；
+///   * 更糟的是，按遥控器的 BACK 会**穿透到路由**上 —— 面板还开着，
+///     人已经被带离媒体库了。
+///
+/// 所以补两条出口：面板底部的显式「关闭」按钮（鼠标/遥控器都能用），
+/// 以及 [PopScope]（面板开着时把 BACK 拦下来关面板，而不是退出页面）。
+class LibraryFilterButton extends StatefulWidget {
   const LibraryFilterButton({super.key});
 
   @override
+  State<LibraryFilterButton> createState() => _LibraryFilterButtonState();
+}
+
+class _LibraryFilterButtonState extends State<LibraryFilterButton> {
+  final MenuController _controller = MenuController();
+
+  /// 自己记一份开关状态。
+  ///
+  /// `MenuController` **不是** `ChangeNotifier`（它就是个普通类，
+  /// 只有 `open()` / `close()` / `isOpen`），所以 `PopScope.canPop`
+  /// 没法靠监听它来更新 —— 只能借 `MenuAnchor` 的 `onOpen` / `onClose`
+  /// 回调把状态同步过来。
+  bool _open = false;
+
+  @override
   Widget build(BuildContext context) {
-    return MenuAnchor(
-      // 按钮在窗口最右侧，菜单默认从按钮左下角向右展开会出界；
-      // Flutter 的菜单布局会把超出的部分自动推回屏幕内，所以这里只需要
-      // 留一点竖直间距。
-      alignmentOffset: const Offset(0, 6),
-      style: MenuStyle(
-        backgroundColor: const WidgetStatePropertyAll(AppTheme.panel2),
-        surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
-        shadowColor: const WidgetStatePropertyAll(Colors.black),
-        elevation: const WidgetStatePropertyAll(10),
-        // 面板自己画内边距，菜单默认那圈 8px 会让分组标题贴不到边。
-        padding: const WidgetStatePropertyAll(EdgeInsets.zero),
-        maximumSize: const WidgetStatePropertyAll(Size(300, 460)),
-        shape: WidgetStatePropertyAll(
-          RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-            side: const BorderSide(color: AppTheme.line, width: 0.5),
+    return PopScope(
+      // 面板开着时不许退页面：那一下 BACK 的语义是「关面板」。
+      canPop: !_open,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _controller.close();
+      },
+      child: MenuAnchor(
+        controller: _controller,
+        onOpen: () => setState(() => _open = true),
+        onClose: () => setState(() => _open = false),
+        // 按钮在窗口最右侧，菜单默认从按钮左下角向右展开会出界；
+        // Flutter 的菜单布局会把超出的部分自动推回屏幕内，所以这里只需要
+        // 留一点竖直间距。
+        alignmentOffset: const Offset(0, 6),
+        style: MenuStyle(
+          backgroundColor: const WidgetStatePropertyAll(AppTheme.panel2),
+          surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+          shadowColor: const WidgetStatePropertyAll(Colors.black),
+          elevation: const WidgetStatePropertyAll(10),
+          // 面板自己画内边距，菜单默认那圈 8px 会让分组标题贴不到边。
+          padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+          maximumSize: const WidgetStatePropertyAll(Size(300, 460)),
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+              side: const BorderSide(color: AppTheme.line, width: 0.5),
+            ),
           ),
         ),
-      ),
-      menuChildren: const [_FilterPanel()],
-      builder: (context, controller, child) => _FilterButton(
-        open: controller.isOpen,
-        onTap: () => controller.isOpen ? controller.close() : controller.open(),
+        menuChildren: [_FilterPanel(onClose: _controller.close)],
+        builder: (context, controller, child) => _FilterButton(
+          open: controller.isOpen,
+          onTap: () =>
+              controller.isOpen ? controller.close() : controller.open(),
+        ),
       ),
     );
   }
@@ -66,7 +103,7 @@ class _FilterButton extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final filter = ref.watch(libraryFilterProvider);
-    final selected = filter.decades.length + filter.genres.length;
+    final selected = filter.years.length + filter.genres.length;
     final active = selected > 0;
 
     // 有生效条件时整颗按钮变强调色并带数字：用户从别的地方回到媒体库，
@@ -75,7 +112,7 @@ class _FilterButton extends ConsumerWidget {
     final color = active ? AppTheme.accent : AppTheme.muted;
 
     return Tooltip(
-      message: '按年代 / 类型筛选',
+      message: '按年份 / 类型筛选',
       child: Material(
         color: active
             ? AppTheme.accent.withValues(alpha: open ? 0.22 : 0.14)
@@ -118,9 +155,13 @@ class _FilterButton extends ConsumerWidget {
   }
 }
 
-/// 浮层内容：年代 + 类型两组，底部一个「清空筛选」。
+/// 浮层内容：年份 + 类型两组，底部「清空筛选」+「关闭」。
 class _FilterPanel extends ConsumerWidget {
-  const _FilterPanel();
+  const _FilterPanel({required this.onClose});
+
+  /// 显式关闭。**TV 上唯一的出口** —— 遥控器没有 Esc，
+  /// 而这个面板是个 `OverlayPortal`（不是路由），BACK 也关不掉它。
+  final VoidCallback onClose;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -128,11 +169,11 @@ class _FilterPanel extends ConsumerWidget {
     // 传整个 `AsyncValue` 而不是 `valueOrNull`：后者把「正在加载」和「查询
     // 出错」都变成 `null`，于是出错时面板会永远停在「正在统计…」——
     // 用户等一个永远不会来的结果，而日志里什么都没有。
-    final decades = ref.watch(decadeCountsProvider);
+    final years = ref.watch(yearCountsProvider);
     final genres = ref.watch(genreCountsProvider);
     final notifier = ref.read(libraryFilterProvider.notifier);
 
-    final selected = filter.decades.length + filter.genres.length;
+    final selected = filter.years.length + filter.genres.length;
 
     return SizedBox(
       key: const Key('library-filter-panel'),
@@ -171,8 +212,8 @@ class _FilterPanel extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const _SectionTitle('年代'),
-                  _DecadeChips(counts: decades, filter: filter),
+                  const _SectionTitle('年份'),
+                  _YearChips(counts: years, filter: filter),
                   const SizedBox(height: 15),
                   const _SectionTitle('类型'),
                   _GenreChips(counts: genres, filter: filter),
@@ -202,6 +243,19 @@ class _FilterPanel extends ConsumerWidget {
                     textStyle: const TextStyle(fontSize: 12),
                   ),
                   child: const Text('清空筛选'),
+                ),
+                TextButton(
+                  // TV 上唯一的出口。做成**常驻可见**而不是「只在 TV 上出现」：
+                  // 浮层里有一个明确的「关闭」对鼠标用户同样是好事，
+                  // 而且平台条件渲染会让这条路径在开发机上永远测不到。
+                  onPressed: onClose,
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(0, 30),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    foregroundColor: AppTheme.text,
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                  child: const Text('关闭'),
                 ),
               ],
             ),
@@ -234,21 +288,21 @@ class _SectionTitle extends StatelessWidget {
   }
 }
 
-/// 年代一组。倒序（新的在前）—— 用户找的通常是「最近几年的片子」。
+/// 年份一组。倒序（新的在前）—— 用户找的通常是「最近几年的片子」。
 ///
 /// ## 为什么「已选但当前范围里没有」的项也要画出来
 ///
-/// 选项是按当前分类 / 搜索词收窄的（见 `decadeCountsProvider`），而选中的
-/// 条件**不会**跟着分类切换被清掉（`setCategory` 不碰 `decades`）。于是：
-/// 用户在「电影」栏选了「1990 年代」，切到「动漫」栏 —— 动漫里一部 90 年代
-/// 的片子都没有，这一项就不在 `counts` 里了。
+/// 选项是按当前分类 / 搜索词收窄的（见 `yearCountsProvider`），而选中的
+/// 条件**不会**跟着分类切换被清掉（`setCategory` 不碰 `years`）。于是：
+/// 用户在「电影」栏选了「1995」，切到「动漫」栏 —— 动漫里一部 1995 年的
+/// 片子都没有，这一项就不在 `counts` 里了。
 ///
 /// 只画 `counts` 里有的项的话，那颗 chip 会**整个消失**，而它仍然是生效的
 /// 筛选条件：用户看到按钮上写着「已选 2 项」、列表却是空的，却找不到那第二个
 /// 条件在哪 —— 唯一的出路是「清空筛选」，把另外那个还想留的条件一起抹掉。
 /// 所以这里把它一并画出来并标注「无结果」，让它**可以被单独取消**。
-class _DecadeChips extends ConsumerWidget {
-  const _DecadeChips({required this.counts, required this.filter});
+class _YearChips extends ConsumerWidget {
+  const _YearChips({required this.counts, required this.filter});
 
   final AsyncValue<Map<int, int>> counts;
   final LibraryFilter filter;
@@ -261,11 +315,11 @@ class _DecadeChips extends ConsumerWidget {
       // 「正在统计…」—— 用户等一个永远不会来的结果，而这与「库是空的」
       // 表现完全不同，却被同一句话盖住了。
       return counts.hasError
-          ? _Hint('统计年代失败：${counts.error}')
+          ? _Hint('统计年份失败：${counts.error}')
           : const _Hint('正在统计…');
     }
 
-    final missing = filter.decades.where((d) => !c.containsKey(d)).toList()
+    final missing = filter.years.where((y) => !c.containsKey(y)).toList()
       ..sort((a, b) => b.compareTo(a));
 
     if (c.isEmpty && missing.isEmpty) {
@@ -274,7 +328,7 @@ class _DecadeChips extends ConsumerWidget {
       //
       // ⚠️ 这一句只在**没有任何已选项**时才说。有已选项时再说它，
       // 就与下面那颗写着「无结果」的 chip 自相矛盾（范围里不是没年份，
-      // 而是这个年代没有）。
+      // 而是这个年份没有）。
       return const _Hint('还没有带年份的作品。刮削一次就能拿到上映年份。');
     }
 
@@ -284,19 +338,19 @@ class _DecadeChips extends ConsumerWidget {
       spacing: 6,
       runSpacing: 6,
       children: [
-        for (final decade in sorted)
+        for (final year in sorted)
           _FilterChip(
-            label: '$decade 年代',
-            count: c[decade],
-            selected: filter.decades.contains(decade),
-            onTap: () => notifier.toggleDecade(decade),
+            label: '$year',
+            count: c[year],
+            selected: filter.years.contains(year),
+            onTap: () => notifier.toggleYear(year),
           ),
-        for (final decade in missing)
+        for (final year in missing)
           _FilterChip(
-            label: '$decade 年代',
+            label: '$year',
             selected: true,
             stale: true,
-            onTap: () => notifier.toggleDecade(decade),
+            onTap: () => notifier.toggleYear(year),
           ),
       ],
     );
@@ -305,7 +359,7 @@ class _DecadeChips extends ConsumerWidget {
 
 /// 类型一组。按作品数倒序 —— 片多的类型排在前面，用户更可能点它。
 ///
-/// 「已选但当前范围里没有」的项照样画出来，理由与 [_DecadeChips] 完全相同。
+/// 「已选但当前范围里没有」的项照样画出来，理由与 [_YearChips] 完全相同。
 class _GenreChips extends ConsumerWidget {
   const _GenreChips({required this.counts, required this.filter});
 
@@ -316,7 +370,7 @@ class _GenreChips extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final c = counts.valueOrNull;
     if (c == null) {
-      // 与 [_DecadeChips] 同理：出错不能伪装成「正在统计…」。
+      // 与 [_YearChips] 同理：出错不能伪装成「正在统计…」。
       return counts.hasError
           ? _Hint('统计类型失败：${counts.error}')
           : const _Hint('正在统计…');

@@ -414,9 +414,12 @@ class ScanService {
 
               case EntryRole.video:
                 {
+                  // ⚠️ 传**整个目录路径**而不是末级目录名：目录名什么时候
+                  // 才是作品名（`姜松《家电维修视频教程》` 是，
+                  // `day01`/`04_视频` 不是）要靠它判，见 [DirectoryTitle]。
                   final parsed = parser.parse(
                     entry.name,
-                    dirName: MediaFilenameParser.dirNameOf(dir.path),
+                    dirPath: dir.path,
                   );
                   final item = MediaItem.fromEntry(
                     entry: entry,

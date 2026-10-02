@@ -85,8 +85,17 @@ class LibraryBackupService {
   /// 将本地媒体库打包成备份字节流。
   ///
   /// [includePosters] 为 `false` 时只备份数据库（体积小，适合频繁同步）。
-  /// [includeSettings] 为 `false` 时会在 manifest 里标注不含设置，
-  /// 导入时据此决定是否恢复设置表。
+  ///
+  /// ⚠️ **[includeSettings] 目前只是清单上的标注，不做实际裁剪。**
+  /// 设置项存在 `cloudcine.sqlite` 的 `settings` 表里，而这里导出的是
+  /// **整个数据库文件的原始字节**（见下方 `dbBytesToWrite`），所以在字节
+  /// 层面剔掉一张表是做不到的。传 `false` 的后果只有两条：
+  ///   1. 日志里多一行「标注不含设置」；
+  ///   2. manifest 的 `note` 变成「不含设置」。
+  /// 设置**照样**在包里。要真正做到「不带走设置」，得先把库 `VACUUM INTO`
+  /// 一份副本、在副本上 `DELETE FROM settings`、再读副本的字节 —— 目前没做，
+  /// 而且 UI 三条通道（上传备份 / 同步 / 从网盘恢复）全部传 `true`，
+  /// 所以这个分支当下是够不到的。
   ///
   /// 返回的字节流可以直接写文件或上传网盘。
   Future<Uint8List> exportBackup({
@@ -123,13 +132,14 @@ class LibraryBackupService {
       }
     }
 
-    // 3. 如果不含设置，需要在导出时清空 settings 表的副本
-    //    但不修改原数据库文件 —— 在内存中操作
+    // 3. 设置不单独处理 —— 它就是数据库里的一张表，跟着 dbBytes 一起走。
+    //    ⚠️ 这里**没有**「剔除 settings 表」的实现（原因见 exportBackup 的
+    //    文档：SQLite 没法在字节层面删表）。保留 includeSettings 参数是为了
+    //    清单语义与将来的实现，不要误以为传 false 就真的不带设置。
     Uint8List dbBytesToWrite = dbBytes;
     if (!includeSettings) {
-      // 对于 SQLite，直接用原始字节即可 —— 导入时由调用方决定
-      // 是否覆盖 settings 表。manifest 中标注即可。
       diag.info('备份', '标注不含设置（导入时保留本地设置）');
+      // 仅标注，见上方说明。
     }
 
     // 4. 构造 manifest
@@ -185,7 +195,12 @@ class LibraryBackupService {
   ///
   /// [targetDbPath] 是恢复后数据库的写入路径（通常就是 `_databasePath`）。
   /// [targetPosterPath] 是海报缓存的写入目录。
-  /// [restoreSettings] 为 `false` 时跳过设置表恢复（保留本地设置）。
+  ///
+  /// ⚠️ **[restoreSettings] 同样只是标注，不做实际过滤。** 导入是把整个
+  /// 数据库文件覆盖过去（见下方 `dbFile.writeAsBytes`），`settings` 表随之
+  /// 一起被覆盖 —— SQLite 没法在字节层面只留一部分表。传 `false` 的效果只有
+  /// 一行日志。UI 三条通道全部用默认的 `true`，所以这个分支当下够不到。
+  /// 真要「保留本地设置」，做法是先写库、再打开数据库把本地设置回写一遍。
   ///
   /// ⚠️ 恢复前应先关闭数据库连接，否则写入会被锁。
   Future<BackupManifest> importBackup(
@@ -260,14 +275,11 @@ class LibraryBackupService {
       diag.info('备份', '海报缓存已恢复 $count 个文件到 $posterPath');
     }
 
-    // 7. 如果不恢复设置，需要在数据库中清空 settings 表
-    //    但由于 SQLite 文件已经是完整的，无法在字节层面操作。
-    //    实际做法：导入后由调用方在数据库打开后执行 `DELETE FROM settings`
-    //    或者只覆盖非 settings 表的数据。
-    //    这里只标注 manifest，实际设置过滤交给导入后的迁移步骤。
+    // 7. 设置表已经跟着数据库文件一起被覆盖了 —— 见 importBackup 的文档。
+    //    这里不做任何过滤，只留一行日志说明调用方**意图**是什么。
     if (!restoreSettings) {
-      diag.info('备份', '用户选择不恢复设置（保留本地设置）');
-      // 在 manifest 上标注
+      diag.info('备份', '调用方要求保留本地设置，但当前实现无法做到'
+          '（settings 表随数据库文件一起覆盖）');
     }
 
     return manifest;

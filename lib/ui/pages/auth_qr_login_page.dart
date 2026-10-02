@@ -15,6 +15,7 @@ import '../../domain/entities/drive_provider.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
 import '../theme/app_theme.dart';
+import '../widgets/tv_affordance.dart';
 
 /// 扫码登录页（主登录入口）。
 ///
@@ -291,11 +292,14 @@ class _AuthQrLoginPageState extends ConsumerState<AuthQrLoginPage> {
               padding: const EdgeInsets.fromLTRB(10, 8, 14, 0),
               child: Row(
                 children: [
-                  IconButton(
-                    onPressed: () => context.pop(),
-                    iconSize: 18,
-                    tooltip: '返回',
-                    icon: const Icon(Icons.arrow_back_rounded),
+                  TvIconLabel(
+                    label: '返回',
+                    child: IconButton(
+                      onPressed: () => context.pop(),
+                      iconSize: 18,
+                      tooltip: '返回',
+                      icon: const Icon(Icons.arrow_back_rounded),
+                    ),
                   ),
                   const Spacer(),
                   TextButton.icon(

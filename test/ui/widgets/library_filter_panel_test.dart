@@ -81,7 +81,7 @@ void main() {
   LibraryFilter state(ProviderContainer c) => c.read(libraryFilterProvider);
 
   group('面板内容', () {
-    testWidgets('年代与类型都列出来，带作品数', (tester) async {
+    testWidgets('年份与类型都列出来，带作品数', (tester) async {
       await pump(tester, works: [
         work('a', year: 2021, genres: ['剧情']),
         work('b', year: 2023, genres: ['剧情']),
@@ -90,8 +90,9 @@ void main() {
 
       await open(tester);
 
-      expect(find.text('2020 年代'), findsOneWidget);
-      expect(find.text('1990 年代'), findsOneWidget);
+      expect(find.text('2021'), findsOneWidget);
+      expect(find.text('2023'), findsOneWidget);
+      expect(find.text('1995'), findsOneWidget);
       expect(find.text('剧情'), findsOneWidget);
       expect(find.text('科幻'), findsOneWidget);
       // 剧情 2 部、科幻 1 部
@@ -139,35 +140,35 @@ void main() {
   });
 
   group('交互', () {
-    testWidgets('点一个年代 → 选中，再点一次 → 取消', (tester) async {
+    testWidgets('点一个年份 → 选中，再点一次 → 取消', (tester) async {
       final c = await pump(tester, works: [
         work('a', year: 2021, genres: ['剧情']),
         work('b', year: 1995, genres: ['剧情']),
       ]);
       await open(tester);
 
-      await tester.tap(find.text('2020 年代'));
+      await tester.tap(find.text('2021'));
       await tester.pumpAndSettle();
-      expect(state(c).decades, {2020});
+      expect(state(c).years, {2021});
 
-      await tester.tap(find.text('2020 年代'));
+      await tester.tap(find.text('2021'));
       await tester.pumpAndSettle();
-      expect(state(c).decades, isEmpty);
+      expect(state(c).years, isEmpty);
     });
 
-    testWidgets('多选：年代与类型可以叠加', (tester) async {
+    testWidgets('多选：年份与类型可以叠加', (tester) async {
       final c = await pump(tester, works: [
         work('a', year: 2021, genres: ['剧情']),
         work('b', year: 2023, genres: ['科幻']),
       ]);
       await open(tester);
 
-      await tester.tap(find.text('2020 年代'));
+      await tester.tap(find.text('2021'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('剧情'));
       await tester.pumpAndSettle();
 
-      expect(state(c).decades, {2020});
+      expect(state(c).years, {2021});
       expect(state(c).genres, {'剧情'});
     });
 
@@ -178,7 +179,7 @@ void main() {
       ]);
       await open(tester);
 
-      await tester.tap(find.text('2020 年代'));
+      await tester.tap(find.text('2021'));
       await tester.pumpAndSettle();
 
       expect(
@@ -200,7 +201,7 @@ void main() {
           findsNothing);
 
       await open(tester);
-      await tester.tap(find.text('2020 年代'));
+      await tester.tap(find.text('2021'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('剧情'));
       await tester.pumpAndSettle();
@@ -211,7 +212,7 @@ void main() {
         reason: '用户从别的地方回到媒体库，一眼就要看出「列表不是全量，'
             '是因为筛着东西」—— 否则只会觉得「怎么少了好多片子」',
       );
-      expect(state(c).decades.length + state(c).genres.length, 2);
+      expect(state(c).years.length + state(c).genres.length, 2);
     });
 
     testWidgets('清空筛选只清面板里的两组，不动分类与搜索词', (tester) async {
@@ -220,7 +221,7 @@ void main() {
       ]);
 
       await open(tester);
-      await tester.tap(find.text('2020 年代'));
+      await tester.tap(find.text('2021'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('剧情'));
       await tester.pumpAndSettle();
@@ -235,7 +236,7 @@ void main() {
       await tester.tap(find.widgetWithText(TextButton, '清空筛选'));
       await tester.pumpAndSettle();
 
-      expect(state(c).decades, isEmpty);
+      expect(state(c).years, isEmpty);
       expect(state(c).genres, isEmpty);
       expect(
         state(c).category,
@@ -248,16 +249,16 @@ void main() {
   });
 
   group('统计失败时不能伪装成「正在统计…」', () {
-    testWidgets('countWorksByDecade 出错 → 面板显示失败', (tester) async {
+    testWidgets('countWorksByYear 出错 → 面板显示失败', (tester) async {
       await pump(
         tester,
         works: [work('a', year: 2021, genres: ['剧情'])],
-        repo: _BrokenDecadeRepo(),
+        repo: _BrokenYearRepo(),
       );
       await open(tester);
 
       expect(
-        find.textContaining('统计年代失败'),
+        find.textContaining('统计年份失败'),
         findsOneWidget,
         reason: '如果只是 `valueOrNull`，出错也是 `null`，面板会永远停在'
             '「正在统计…」—— 用户等一个永远不会来的结果。',
@@ -279,10 +280,10 @@ void main() {
   });
 
   group('已选条件在切换分类后仍然可取消', () {
-    /// 「电影」栏里有一部 90 年代的科幻片；「动漫」栏是空的。
+    /// 「电影」栏里有一部 1995 年的科幻片；「动漫」栏是空的。
     ///
     /// 在「电影」栏里选好条件，再切到「动漫」—— 选中的两项就都不在当前
-    /// 范围里了（`decadeCountsProvider` 是按分类收窄的）。
+    /// 范围里了（`yearCountsProvider` 是按分类收窄的）。
     Future<ProviderContainer> selectThenSwitch(
       WidgetTester tester,
     ) async {
@@ -290,7 +291,7 @@ void main() {
         work('a', year: 1995, genres: ['科幻']),
       ]);
       await open(tester);
-      await tester.tap(find.text('1990 年代'));
+      await tester.tap(find.text('1995'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('科幻'));
       await tester.pumpAndSettle();
@@ -304,9 +305,9 @@ void main() {
       await selectThenSwitch(tester);
 
       expect(
-        find.text('1990 年代'),
+        find.text('1995'),
         findsOneWidget,
-        reason: '这一项不在 `counts` 里（动漫栏里没有 90 年代的片子），但它**仍然'
+        reason: '这一项不在 `counts` 里（动漫栏里没有 1995 年的片子），但它**仍然'
             '是生效的筛选条件**。不画出来的话，用户看到按钮上写着「已选 2 项」、'
             '列表却是空的，却找不到那第二个条件在哪 —— 唯一出路是「清空筛选」，'
             '把另一个还想留的条件一起抹掉。',
@@ -318,14 +319,14 @@ void main() {
     testWidgets('点那颗「无结果」的 chip 能把它单独取消，别的条件不受影响', (tester) async {
       final c = await selectThenSwitch(tester);
 
-      await tester.tap(find.text('1990 年代'));
+      await tester.tap(find.text('1995'));
       await tester.pumpAndSettle();
 
-      expect(state(c).decades, isEmpty);
+      expect(state(c).years, isEmpty);
       expect(
         state(c).genres,
         {'科幻'},
-        reason: '用户点的是「1990 年代」这一颗，不该顺手把「科幻」也清掉 ——'
+        reason: '用户点的是「1995」这一颗，不该顺手把「科幻」也清掉 ——'
             '能**单独**取消正是把它画出来的全部意义。',
       );
     });
@@ -336,18 +337,93 @@ void main() {
       expect(
         find.textContaining('还没有带年份的作品'),
         findsNothing,
-        reason: '范围里不是「没有带年份的作品」，而是「这个年代没有」。'
-            '两句话同时出现会自相矛盾 —— 用户正看着一颗勾着的「1990 年代'
+        reason: '范围里不是「没有带年份的作品」，而是「这个年份没有」。'
+            '两句话同时出现会自相矛盾 —— 用户正看着一颗勾着的「1995'
             '（无结果）」。',
+      );
+    });
+  });
+
+  /// 面板必须能从遥控器上关掉。
+  ///
+  /// 这不是「顺手加个按钮」：`MenuAnchor` 关自己**只认 Esc**
+  /// （源码里 `_kMenuShortcuts` 把 escape 绑到 `DismissIntent`），
+  /// 而它是个 `OverlayPortal`、**不是路由**。Android TV 遥控器上没有 Esc，
+  /// 按 BACK 又会穿透到路由上把人带走 —— 没有显式出口，这个面板就是一间单向门。
+  group('关得掉：TV 上没有 Esc', () {
+    testWidgets('面板底部有「关闭」按钮，点它能把面板关掉', (tester) async {
+      await pump(tester, works: [work('/a', year: 1995)]);
+      await open(tester);
+      expect(find.byKey(const Key('library-filter-panel')), findsOneWidget);
+
+      await tester.tap(find.text('关闭'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const Key('library-filter-panel')),
+        findsNothing,
+        reason: 'TV 上这是唯一的出口 —— 遥控器没有 Esc',
+      );
+    });
+
+    testWidgets('面板开着时按系统返回键：关面板，而不是把人带离页面', (tester) async {
+      await pump(tester, works: [work('/a', year: 1995)]);
+      await open(tester);
+      expect(find.byKey(const Key('library-filter-panel')), findsOneWidget);
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const Key('library-filter-panel')),
+        findsNothing,
+        reason: '遥控器的 BACK 应当先关掉这个浮层',
+      );
+      expect(
+        find.byType(LibraryFilterButton),
+        findsOneWidget,
+        reason: '页面本身不能被带走 —— 原来 BACK 会穿透到路由，'
+            '面板还开着，人已经离开媒体库了',
+      );
+    });
+
+    testWidgets('面板关着时不能把返回键拦下（否则这个页面就退不出去了）', (tester) async {
+      await pump(tester, works: [work('/a', year: 1995)]);
+
+      // ⚠️ 只能用 predicate 找：`PopScope` 是**泛型**（`PopScope<T>`），
+      // 而 `find.byType` 比的是 `runtimeType` 全等，泛型参数一多就找不着。
+      PopScope scope() {
+        final found = tester
+            .widgetList<PopScope>(find.byWidgetPredicate((w) => w is PopScope))
+            .toList();
+        expect(
+          found,
+          hasLength(1),
+          reason: '这棵最小树里应当只有筛选按钮自己那一个 PopScope',
+        );
+        return found.single;
+      }
+
+      expect(
+        scope().canPop,
+        isTrue,
+        reason: '没开面板时必须是 true，否则整个媒体库页面就再也退不出去',
+      );
+
+      await open(tester);
+      expect(
+        scope().canPop,
+        isFalse,
+        reason: '开着面板时那一下 BACK 的语义是「关面板」',
       );
     });
   });
 }
 
-/// 年代计数**故意抛出异常**的仓储，用来验证面板出错时的文案。
-class _BrokenDecadeRepo extends InMemoryMediaRepository {
+/// 年份计数**故意抛出异常**的仓储，用来验证面板出错时的文案。
+class _BrokenYearRepo extends InMemoryMediaRepository {
   @override
-  Future<Map<int, int>> countWorksByDecade({
+  Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
     String? query,

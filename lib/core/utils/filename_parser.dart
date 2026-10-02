@@ -23,6 +23,7 @@
 /// 什么符号都可能有（`Spider-Man`、`Se7en`、`流浪地球2`）。
 library;
 
+import 'directory_title.dart';
 import 'file_names.dart';
 import 'video_formats.dart';
 
@@ -57,6 +58,7 @@ class ParsedMediaName {
     this.episode,
     this.episodeEnd,
     this.part,
+    this.partLabel,
     this.resolution,
     this.source,
     this.videoCodec,
@@ -92,8 +94,28 @@ class ParsedMediaName {
   /// 结束集号（`E01-E03` / `第1-3集` 这类）。单集为 `null`。
   final int? episodeEnd;
 
-  /// 分卷号（`CD1` / `Disc2` / `Part1`）。
+  /// 部号（`第X部` / `第X篇` / `上部`·`下部` / `CD1` / `Disc2` / `Part1`）。
+  ///
+  /// ## 与 [season] 是两个维度，不能合并
+  ///
+  /// 季是发布组的**强约定**（`SxxExx`、`第x季`），部是更细的一层：
+  /// 《进击的巨人》第三季 Part.1 / Part.2 里，季 = 3、部 = 1/2。
+  /// 而电影没有季，只有部（《流浪地球》上下部）。
+  ///
+  /// ## 为什么它不是「分卷」
+  ///
+  /// 旧注释把这里叫「分卷」（`CD1` / `Disc2`），但同一个字段现在也承载
+  /// 「第 X 部」这种**叙事分部** —— 两者在展示与层级上的用法完全一致
+  /// （都是季下面的一层），没必要拆成两个字段。
   final int? part;
+
+  /// 部的**展示名**，只在部号说不清或另有叫法时才填。
+  ///
+  ///   - `特别篇` / `剧场版` —— 没有编号，统一排在所有编号部**之后**；
+  ///   - `上部` / `下部` —— 有编号（1/2）但用户认的是这两个字。
+  ///
+  /// 展示口径：非空时优先用它，否则用 `第 N 部`。
+  final String? partLabel;
 
   final VideoResolution? resolution;
 
@@ -162,6 +184,7 @@ class ParsedMediaName {
   @override
   String toString() => 'ParsedMediaName(${kind.name}, "$title", '
       'y=$year s=$season e=$episode${episodeEnd == null ? "" : "-$episodeEnd"}, '
+      'p=${part ?? partLabel ?? "-"}, '
       'res=${resolution?.label ?? "-"}, src=${source ?? "-"}, '
       'v=${videoCodec ?? "-"}, a=${audioCodec ?? "-"}, '
       'flags=${flags.join("/")})';
@@ -192,7 +215,23 @@ class MediaFilenameParser {
   /// [dirName] 作为**兜底**：很多网盘目录是这样的结构
   /// `/电影/流浪地球2 (2023)/movie.mkv`，文件名本身没有信息量，
   /// 片名在目录名上。
-  ParsedMediaName parse(String fileName, {String? dirName}) {
+  ///
+  /// [dirPath] 是**完整的目录路径**，比 [dirName] 多一件事：它能让
+  /// 「这个目录本身是不是一个系列」被判定出来（见 [DirectoryTitle]）。
+  /// 给了 [dirPath] 时 [dirName] 由它推出，不需要也不应该再单独传 ——
+  /// 两个目录来源会让「同一文件在两处解析出不同片名」重新出现。
+  ///
+  /// ## 目录名什么时候能顶掉文件名
+  ///
+  /// 实测事故（2026-10-02）：`/来自：分享/姜松《家电维修视频教程》/182.格力空调显示E6如何维修.mp4`
+  /// 的文件名里只有「编号 + 描述」，提不出片名，于是它成了**一部独立作品**，
+  /// 还刮成了希腊纪录片。那个目录里另外 221 个文件本该是同一部教程的集。
+  ///
+  /// 所以规则是：**目录名可信、且这个文件自己说不清楚时，整目录按目录名归组。**
+  /// 「自己说得清楚」的判据见 [_isStandaloneRelease]：片名是真名字，
+  /// 而且自带年份或季集结构（`天龙八部…S01E01.1997…`、`流浪地球2.2023…`）。
+  /// 这类文件名自己就够准，用目录名去顶它只会把 `S01E01` 那样的信息抹掉。
+  ParsedMediaName parse(String fileName, {String? dirName, String? dirPath}) {
     final base = baseNameOf(fileName);
     final isSample = VideoFormats.isSampleOrExtra(base);
     final isDisc = VideoFormats.isDiscImage(fileName);
@@ -211,8 +250,21 @@ class MediaFilenameParser {
     var episodeEnd = parsed.episodeEnd;
     var resolution = parsed.resolution;
 
-    if ((title == null || title.isEmpty) && dirName != null && dirName.isNotEmpty) {
-      final fromDir = _parseDotted(dirName);
+    // ⚠️ `dirPath` 优先于 `dirName`，且**只用它推 dirName**：两个来源各自
+    // 生效时，同一个文件在扫描期与详情页会解析出不同的片名（静默分叉）。
+    final effectiveDirName =
+        dirPath != null ? dirNameOf(dirPath) : dirName;
+
+    // ⚠️ 兜底也要**排掉容器名**：`/电影/2012.2009.1080p.mkv` 的文件名提不出
+    // 片名（`2012` 被当成标记），旧代码就拿目录名兜底 → 库里多出一部叫
+    // 「电影」的作品。`day01`、`来自：分享` 同理。
+    // 排掉之后 title 为空 → `WorkSeedBook.add` 不归组 → 这条文件在库里以
+    // 文件名示人。那比造一个假作品好（见 `WorkSeedBook.add` 的说明）。
+    if ((title == null || title.isEmpty) &&
+        effectiveDirName != null &&
+        effectiveDirName.isNotEmpty &&
+        !DirectoryTitle.isContainerSegment(effectiveDirName)) {
+      final fromDir = _parseDotted(effectiveDirName);
       title = fromDir.title;
       cjk = fromDir.cjkTitle;
       latin = fromDir.latinTitle;
@@ -226,6 +278,30 @@ class MediaFilenameParser {
       if (kind == MediaKind.unknown) kind = fromDir.kind;
     }
 
+    // 目录级归组（见方法头与 [DirectoryTitle]）。
+    if (dirPath != null && dirPath.isNotEmpty) {
+      final series = DirectoryTitle.seriesTitleOf(dirPath);
+      if (series != null &&
+          !_isStandaloneRelease(kind: kind, title: title, year: year) &&
+          // 目录名与片名是同一个名字时，这个目录只是「那部作品的发行文件夹」，
+          // 不是「装着许多集的容器」—— 顶掉它只会把电影改成剧集。
+          _normalizeName(title) != _normalizeName(series)) {
+        final scripts = _splitScripts(series);
+        title = series;
+        cjk = scripts.cjk;
+        latin = scripts.latin;
+        year ??= _pickYear(series, -1);
+        // 整目录归一个作品 = 一部剧集。这是用户定的口径：
+        // 「同目录多视频 → 作为系列整体归类，不作为独立电影存在」。
+        kind = MediaKind.episode;
+        // 季集号来自**单个文件**，归组后它不再代表「这部剧的第几集」，
+        // 而且 `E6` 这类故障代码正是从这里混进来的（事故现场）。
+        season = null;
+        episode = null;
+        episodeEnd = null;
+      }
+    }
+
     return ParsedMediaName(
       rawName: fileName,
       kind: kind,
@@ -237,6 +313,7 @@ class MediaFilenameParser {
       episode: episode,
       episodeEnd: episodeEnd,
       part: parsed.part,
+      partLabel: parsed.partLabel,
       resolution: resolution,
       source: parsed.source,
       videoCodec: parsed.videoCodec,
@@ -247,6 +324,39 @@ class MediaFilenameParser {
       isDiscImage: isDisc,
     );
   }
+
+  // -------------------------------------------------------------------
+  // 目录级归组
+  // -------------------------------------------------------------------
+
+  /// 这个文件名是否**自称一份独立发行物** —— 是的话目录名不许顶掉它。
+  ///
+  /// 两条都要满足：
+  ///
+  ///   1. 片名是**真名字**（含字母或汉字）。`159.mkv`、`1080p.mp4` 提出来的
+  ///      是编号/分辨率，不是名字 —— 它们最需要目录名来救；
+  ///   2. 它**自带年份或季集结构**。`天龙八部…S01E01.1997…` 这类文件名自己
+  ///      就说得清清楚楚，用目录名去顶反而会把 `S01E01` 抹掉。
+  ///
+  /// ⚠️ 第 2 条依赖「故障代码不算集号」那条修复：`显示E6` 曾经被当成第 6 集，
+  /// 于是 `182.格力空调显示E6如何维修.mp4` 被判成「自带季集结构」→ 保住垃圾
+  /// 片名 → 各建一个作品。两条规则是**配套**的，改一条要看另一条。
+  static bool _isStandaloneRelease({
+    required MediaKind kind,
+    required String? title,
+    required int? year,
+  }) {
+    final t = title;
+    if (t == null || t.isEmpty) return false;
+    if (!RegExp(r'[a-z\u4e00-\u9fff]', caseSensitive: false).hasMatch(t)) {
+      return false;
+    }
+    return year != null || kind == MediaKind.episode;
+  }
+
+  /// 「同一个名字」的判定口径 —— 与 [ParsedMediaName.groupKey] 一致。
+  static String _normalizeName(String? s) =>
+      (s ?? '').toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
 
   // -------------------------------------------------------------------
   // 括号风格：`[组名][片名][集号][1080p][语言]`
@@ -279,6 +389,8 @@ class MediaFilenameParser {
     int? episode;
     int? episodeEnd;
     int? season;
+    int? part;
+    String? partLabel;
     VideoResolution? resolution;
     String? source;
     String? videoCodec;
@@ -317,6 +429,18 @@ class MediaFilenameParser {
       final cn = _chineseEpisode.firstMatch(g);
       if (cn != null) {
         episode ??= int.tryParse(cn.group(1)!);
+        continue;
+      }
+
+      // 2.5 分部（`第2部` / `特别篇` / `Part.1` / `CD1`）
+      //
+      // 必须排在**集号判定之后**：`第3集` 是集、`第3部` 是部，两者的写法
+      // 只差最后一个字 —— 让 `_chineseEpisode` 先吃掉「集」那种，剩下的
+      // 才轮到这里。
+      final p = _partOf(lower);
+      if (p.index != null || p.label != null) {
+        part ??= p.index;
+        partLabel ??= p.label;
         continue;
       }
 
@@ -373,6 +497,8 @@ class MediaFilenameParser {
       season: season,
       episode: episode,
       episodeEnd: episodeEnd,
+      part: part,
+      partLabel: partLabel,
       resolution: resolution,
       source: source,
       videoCodec: videoCodec,
@@ -428,11 +554,26 @@ class MediaFilenameParser {
     RegExp(r'(?<![0-9a-z])s\d{1,2}\s*e\d{1,3}(?![0-9a-z])',
         caseSensitive: false),
     RegExp(r'(?<![0-9a-z])\d{1,2}x\d{2,3}(?![0-9a-z])'),
-    RegExp(r'(?<![0-9a-z])e(?:p)?\d{1,3}(?![0-9a-z])', caseSensitive: false),
+    // ⚠️ 前置守卫必须**连汉字一起排除**：`格力空调显示E6` 里的 E6 是空调
+    // 故障代码，而 `(?<![0-9a-z])` 让紧跟在汉字后面的 `E6` 通过了守卫 ——
+    // 于是片名被截在 E6 前面、集号被记成 6（2026-10-02 事故）。
+    // 家电/汽车/医疗教程里 `E1`~`E9` 是成表的，会成片误判。
+    RegExp(r'(?<![0-9a-z\u4e00-\u9fff])e(?:p)?\d{1,3}(?![0-9a-z])',
+        caseSensitive: false),
     RegExp(r'第\s*\d{1,4}\s*[集话話]'),
     RegExp(r'(?<![0-9a-z])s\d{1,2}(?![0-9a-z])', caseSensitive: false),
     RegExp(r'season\s*\d{1,2}', caseSensitive: false),
     RegExp(r'第\s*[一二三四五六七八九十\d]{1,3}\s*季'),
+    // 分部：`第X部` / `第X篇` / `特别篇` / `剧场版`
+    //
+    // ⚠️ 必须和 `_partOf` 一起看：这里只负责把片名**截断**在分部标记之前
+    // （`进击的巨人 特别篇 01` → 片名 `进击的巨人`），真正把「部」解析出来
+    // 的是 `_partOf`。少了这一段，`特别篇` 会留在片名里，而
+    // `_isStandaloneRelease` 会判定它「自带季集结构」→ 目录名顶不掉它
+    // → 特别篇和正片归成**两个作品**。
+    RegExp(r'第\s*[一二三四五六七八九十\d]{1,3}\s*[部篇]'),
+    RegExp(r'特别篇|特別篇|剧场版|劇場版'),
+    RegExp(r'上部|下部|前篇|后篇|後篇'),
     // 来源
     RegExp(
       r'(?<![0-9a-z])(?:blu-?ray|bluray|bd-?remux|remux|bd-?rip|br-?rip|bd|'
@@ -490,6 +631,7 @@ class MediaFilenameParser {
         : ((title ?? '').isNotEmpty
             ? MediaKind.movie
             : MediaKind.unknown);
+    final partInfo = _partOf(lower);
 
     return ParsedMediaName(
       rawName: base,
@@ -501,7 +643,8 @@ class MediaFilenameParser {
       season: tv?.season,
       episode: tv?.episode,
       episodeEnd: tv?.episodeEnd,
-      part: _partOf(lower),
+      part: partInfo.index,
+      partLabel: partInfo.label,
       resolution: resolution,
       source: _sourceOf(lower),
       videoCodec: _videoCodecOf(lower),
@@ -694,7 +837,10 @@ class MediaFilenameParser {
     }
 
     // `EP01` / `E01`（单独出现，没有 S 前缀）
-    final ep = RegExp(r'(?<![0-9a-z])ep?(\d{1,3})(?![0-9a-z])')
+    //
+    // ⚠️ 前置守卫**连汉字一起排除**：`显示E6` 里的 E6 是故障代码不是集号。
+    // 与 `_markerPatterns` 里那条必须同时改，否则片名仍会被截在 E6 前面。
+    final ep = RegExp(r'(?<![0-9a-z\u4e00-\u9fff])ep?(\d{1,3})(?![0-9a-z])')
         .firstMatch(lower);
     if (ep != null) {
       final n = int.tryParse(ep.group(1)!);
@@ -725,7 +871,15 @@ class MediaFilenameParser {
   static int? _chineseSeason(String s) {
     final m = RegExp(r'第\s*([一二三四五六七八九十\d]{1,3})\s*季').firstMatch(s);
     if (m == null) return null;
-    final raw = m.group(1)!;
+    return _chineseToInt(m.group(1)!);
+  }
+
+  /// 中文数词 → 整数：`一`→1、`十`→10、`十二`→12、`二十一`→21。
+  /// 纯数字串（`2`）直接解析。
+  ///
+  /// 抽出来是因为**季和部都要用**：`第二季` 与 `第二部` 的换算规则一模一样，
+  /// 各写一份就会在某次修改后只有一处认识「廿」。
+  static int? _chineseToInt(String raw) {
     final n = int.tryParse(raw);
     if (n != null) return n;
     const digits = {
@@ -747,11 +901,49 @@ class MediaFilenameParser {
     return null;
   }
 
-  /// 分卷号：`CD1` / `Disc 2` / `Part3` / `DVD1`。
-  static int? _partOf(String lower) {
-    final m = RegExp(r'(?<![0-9a-z])(?:cd|disc|disk|part|dvd)\s*(\d{1,2})(?![0-9a-z])')
-        .firstMatch(lower);
-    return m == null ? null : int.tryParse(m.group(1)!);
+  /// 分部：`第X部` / `第X篇` / `上部`·`下部` / `CD1` / `Part.2` / `特别篇`。
+  ///
+  /// 返回 `(index, label)`：能定序的填 [index]，另有叫法的填 [label]，
+  /// 两个都是 `null` 就是「没标部」。
+  ///
+  /// ## 特别篇 / 剧场版 为什么也算「部」
+  ///
+  /// 用户定的口径：它们**不独立成作品**，而是归到所属作品的一个「特别篇」
+  /// 部里。所以这里给一个**非数字**的 label，排序时统一排在所有编号部
+  /// **之后**（见 `MediaItem.partOrder`）。
+  ///
+  /// ⚠️ 与 `_markerPatterns` 里那两条分部正则**必须同时存在**：这里负责
+  /// 「解析出部」，那里负责「把片名截断在部之前」。只改一处会让
+  /// `进击的巨人 特别篇` 变成一个片名叫「进击的巨人 特别篇」的独立作品。
+  static ({int? index, String? label}) _partOf(String lower) {
+    // 1) 特别篇 / 剧场版 —— 无编号，排在最后
+    if (RegExp(r'特别篇|特別篇|剧场版|劇場版').hasMatch(lower)) {
+      return (index: null, label: '特别篇');
+    }
+    // 2) `第X部` / `第X篇`
+    final cn =
+        RegExp(r'第\s*([一二三四五六七八九十\d]{1,3})\s*[部篇]').firstMatch(lower);
+    if (cn != null) {
+      final n = _chineseToInt(cn.group(1)!);
+      if (n != null) return (index: n, label: null);
+    }
+    // 3) `上部` / `下部` / `前篇` / `后篇`
+    if (RegExp(r'上部|前篇').hasMatch(lower)) {
+      return (index: 1, label: '上部');
+    }
+    if (RegExp(r'下部|后篇|後篇').hasMatch(lower)) {
+      return (index: 2, label: '下部');
+    }
+    // 4) `CD1` / `Disc.2` / `Part.2` / `DVD1`
+    //
+    // ⚠️ 分隔符必须含 `.`：发布名里 `Part.2` 是**最常见**的写法（点分风格），
+    // 只写 `\s*` 会漏掉它，而漏掉的后果是「部」解析不出来 → 层级选择器
+    // 少一层，且**不报错**。
+    final m = RegExp(
+      r'(?<![0-9a-z])(?:cd|disc|disk|part|dvd)[\s._-]*(\d{1,2})(?![0-9a-z])',
+    ).firstMatch(lower);
+    if (m != null) return (index: int.tryParse(m.group(1)!), label: null);
+    return (index: null, label: null);
   }
 
   /// 来源归一化。

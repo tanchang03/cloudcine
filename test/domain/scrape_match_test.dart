@@ -322,4 +322,65 @@ void main() {
       expect(rejectYear.reason, contains('32'));
     });
   });
+
+  group('纯数字不是名字（2026-10-02 实测事故）', () {
+    // 事故现场：`/来自：分享/姜松《家电维修视频教程》/182.格力空调显示E6如何维修.mp4`
+    // 的备用词是 "182"，TMDB 模糊搜索返回希腊纪录片《1821: Οι Ήρωες》，
+    // 前缀档给出 0.91 —— 高于 strongSimilarity(0.6)，**无条件通过**。
+    //
+    // 前缀档本身是对的（`仙逆` → `仙逆第一季` 正是它要救的），问题在于它把
+    // 「数字」当成了「名字」：`182` 与 `1821` 之间没有任何语义关系。
+    // 而且比例也分不开这两者（0.75 vs 0.40），只有字符类型能。
+    test('182 不该靠前缀命中 1821 —— 数字之间没有「分季命名」这回事', () {
+      expect(
+        titleSimilarity('182', '1821: Οι Ήρωες'),
+        lessThan(ScrapeMatch.strongSimilarity),
+      );
+      expect(
+        _accepts(
+          queryTitle: '182',
+          resultTitle: '1821: Οι Ήρωες',
+          resultYear: 2021,
+        ),
+        isFalse,
+      );
+    });
+
+    test('单字符数字更是如此 —— 1 不该命中 127 Hours', () {
+      expect(
+        titleSimilarity('1', '127 Hours'),
+        lessThan(ScrapeMatch.strongSimilarity),
+      );
+    });
+
+    test('包含档同样不认数字 —— 2 不该命中 2012', () {
+      expect(
+        titleSimilarity('2', '2012'),
+        lessThan(ScrapeMatch.strongSimilarity),
+      );
+      expect(
+        titleSimilarity('10', '10000 BC'),
+        lessThan(ScrapeMatch.strongSimilarity),
+      );
+    });
+
+    test('⚠️ 但完全相同的数字仍是命中 —— 片名就叫《2012》的电影要能刮到', () {
+      expect(titleSimilarity('2012', '2012'), 1);
+      expect(
+        _accepts(
+          queryTitle: '2012',
+          resultTitle: '2012',
+          resultYear: 2009,
+        ),
+        isTrue,
+      );
+    });
+
+    test('汉字里带数字的片名不受影响 —— 流浪地球2 与 流浪地球 仍是包含关系', () {
+      expect(
+        titleSimilarity('流浪地球2', '流浪地球'),
+        greaterThan(ScrapeMatch.weakSimilarity),
+      );
+    });
+  });
 }

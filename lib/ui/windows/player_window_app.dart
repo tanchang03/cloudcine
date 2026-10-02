@@ -21,6 +21,7 @@ import '../../domain/services/cache_speed_meter.dart';
 import '../../domain/services/playback_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../theme/app_theme.dart';
+import '../widgets/anchored_menu.dart';
 import '../widgets/buffered_slider.dart';
 import 'child_window_channel.dart';
 import 'player_protocol.dart';
@@ -1322,23 +1323,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   final GlobalKey<ScaffoldMessengerState> _messengerKey =
       GlobalKey<ScaffoldMessengerState>();
 
-  /// 弹框用的 navigator。
+  /// `MaterialApp` 的 navigator。
   ///
-  /// ⚠️ **与 [_messengerKey] 是同一类坑，理由也一样**：`build` 里的 `context`
-  /// 是 [PlayerWindowApp] 自己的 element context，而它返回的正是 `MaterialApp`
-  /// —— 也就是说这个 context 在 `MaterialApp` **外面**，头上既没有 `Navigator`
-  /// 也没有 `MaterialLocalizations`。
+  /// 菜单浮层由 [showAnchoredMenu] 推到这个 navigator 上（它拿的是**按钮自己**
+  /// 的 context，所以本来就能取到），这个 key 是为了给 `MaterialApp` 一个稳定的
+  /// navigator 身份，也方便将来从 `State` 里直接推路由。
   ///
-  /// `showDialog(context: context)` 撞上去会直接抛
-  /// 「No MaterialLocalizations found」，表现是「点画质，什么都没发生」。
-  /// 所以弹框必须拿 `MaterialApp` **内部**的 context，而 `navigatorKey` 就是
-  /// 那条稳定的取用路径（实测：画质弹框的用例就是这么红起来的）。
+  /// ⚠️ 别拿 `build` 里的 `context` 去 `Navigator.of` / `ScaffoldMessenger.of`：
+  /// 那是 [PlayerWindowApp] 自己的 element，而它返回的正是 `MaterialApp`
+  /// —— 也就是说它在 `MaterialApp` **外面**，头上既没有 `Navigator` 也没有
+  /// `MaterialLocalizations`。撞上去会直接抛「No MaterialLocalizations found」。
+  /// 提示走 [_messengerKey]，菜单走按钮自己的 context。
   final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
-
-  /// 画质按钮的锚点。画质菜单不再是屏幕居中的 `AlertDialog`，
-  /// 而是用 `Overlay` + `CompositedTransformFollower` 挂在按钮正上方，
-  /// 所以需要一个 `LayerLink` 把「按钮」与「菜单」连起来。
-  final LayerLink _qualityLink = LayerLink();
 
   /// 弹一条提示。取 messenger 前先判 mounted —— 这个类里的调用点
   /// 多半在 `await` 之后或流回调里，那时窗口可能已经关了。
@@ -1369,7 +1365,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 提示要用 key 拿 messenger，不能用 `ScaffoldMessenger.of(context)`。
       // 理由见 [_messengerKey] 的说明。
       scaffoldMessengerKey: _messengerKey,
-      // 弹框同理，理由见 [_navigatorKey]。
+      // 菜单浮层推在这个 navigator 上，理由见 [_navigatorKey]。
       navigatorKey: _navigatorKey,
       home: Scaffold(
         // 整窗都是画面底：窗口形状已经由原生锁成视频比例（见
@@ -1963,14 +1959,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         // 画质：**文字按钮**而不是图标。用户要看的是「现在是多少」，
         // 而不是「这里有个设置入口」—— 夸克播放器也是这么做的。
         //
-        // 按钮用 `CompositedTransformTarget` 包起来，菜单要锚在它正上方
-        // （见 [_qualityLink] 与 [_showQualityMenu]）。
-        CompositedTransformTarget(
-          link: _qualityLink,
-          child: TextButton(
+        // 按钮外面套一层 `Builder`：菜单要锚在**这个按钮**的正上方，
+        // 就得拿到按钮自己的 `BuildContext` 去量它的位置（见 [globalRectOf]
+        // 与 [_showQualityMenu]）。
+        Builder(
+          builder: (buttonContext) => TextButton(
             onPressed: qualities.isEmpty
                 ? null
-                : () => unawaited(_showQualityMenu()),
+                : () => unawaited(_showQualityMenu(buttonContext)),
             style: TextButton.styleFrom(
               foregroundColor: Colors.white,
               disabledForegroundColor: Colors.white38,
@@ -1990,16 +1986,23 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         // 解析完容器才填出来，起播前一直是空的。按有无来隐藏的话，控制栏会在
         // 开播那一瞬间突然多出两个图标，把右边一排整体挤动一下 —— 看起来像
         // 界面抖了一下。一个灰着的按钮比一个会跳动的布局好。
-        _buildBarIcon(
-          icon: Icons.subtitles_outlined,
-          tooltip: '字幕',
-          onPressed:
-              _player == null ? null : () => unawaited(_showSubtitleMenu()),
+        Builder(
+          builder: (buttonContext) => _buildBarIcon(
+            icon: Icons.subtitles_outlined,
+            tooltip: '字幕',
+            onPressed: _player == null
+                ? null
+                : () => unawaited(_showSubtitleMenu(buttonContext)),
+          ),
         ),
-        _buildBarIcon(
-          icon: Icons.audiotrack_rounded,
-          tooltip: '音轨',
-          onPressed: _player == null ? null : () => unawaited(_showAudioMenu()),
+        Builder(
+          builder: (buttonContext) => _buildBarIcon(
+            icon: Icons.audiotrack_rounded,
+            tooltip: '音轨',
+            onPressed: _player == null
+                ? null
+                : () => unawaited(_showAudioMenu(buttonContext)),
+          ),
         ),
         // 剧集列表的入口**不在这里**。原来它是控制栏上的一个图标，但它要跟
         // 着一个展开后面板走，放在底部控制栏里，展开后会出现「按钮在这儿、
@@ -2297,14 +2300,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 画质菜单。
   ///
-  /// 早先用 `showDialog` + `AlertDialog`：菜单**居中**浮在画面正中，
-  /// 盖住画面、还跟底部控制栏的画质按钮离得老远，体验很差。
-  /// 现在改用 `Overlay` + `CompositedTransformFollower` **贴着画质按钮正上方**
-  /// 划出来（见 [_qualityLink]），点哪儿开、菜单就在哪儿上方，跟主流播放器一致。
+  /// 早先用 `showDialog` + `AlertDialog`：菜单**居中**浮在画面正中，盖住画面、
+  /// 还跟底部控制栏的画质按钮离得老远。现在贴着**按钮正上方**划出来
+  /// （见 [showAnchoredMenu]），点哪儿开、菜单就在哪儿上方，跟主流播放器一致。
   ///
-  /// 不用 `PopupMenuButton`：每一项要带副标题（`1920×1080 · 4.2 Mbps`），
-  /// 而 `PopupMenuItem` 的高度是固定的，塞两行会溢出；自定义 `Overlay` 没有这个限制。
-  Future<void> _showQualityMenu() async {
+  /// ⚠️ 锚点必须从**按钮自己的** context（[buttonContext]）量，不能用
+  /// `State.context`：后者在 `MaterialApp` 外面，量不到按钮的坐标，
+  /// 也取不到能推浮层的 Navigator。
+  Future<void> _showQualityMenu(BuildContext buttonContext) async {
     final request = _currentRequest;
     if (request == null) return;
     final qualities = request.qualities;
@@ -2316,45 +2319,37 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 菜单开着别让浮层自己收起来 —— 用户看不到按钮会以为界面卡住了。
     _cancelHide();
 
-    // ⚠️ 这里**不能**用 `State.context`：它在 `MaterialApp` 外面，
-    // 拿它的 overlay 会抛「No MaterialLocalizations found」——
-    // 表现为「点画质，什么都没发生」。理由见 [_navigatorKey]。
-    final overlay = _navigatorKey.currentState?.overlay;
-    if (overlay == null) {
+    if (!buttonContext.mounted) {
+      _pokeChrome();
+      return;
+    }
+    final navigator = Navigator.of(buttonContext, rootNavigator: true);
+    final anchor = globalRectOf(buttonContext);
+    if (anchor == null) {
       _pokeChrome();
       return;
     }
 
-    final completer = Completer<void>();
-    late final OverlayEntry entry;
-    void close() {
-      if (entry.mounted) entry.remove();
-      if (!completer.isCompleted) completer.complete();
-    }
-
-    entry = OverlayEntry(
-      builder: (context) => _QualityPopupLayer(
-        link: _qualityLink,
+    final picked = await showAnchoredMenu<QualityBrief>(
+      navigator: navigator,
+      anchor: anchor,
+      builder: (context) => _QualityMenuPanel(
         qualities: qualities,
         activeId: request.qualityId,
-        onPick: (q) {
-          close();
-          unawaited(_switchQuality(q));
-        },
-        onDismiss: close,
       ),
     );
-    overlay.insert(entry);
-    await completer.future;
-    if (mounted) _pokeChrome();
+    if (!mounted) return;
+    _pokeChrome();
+    if (picked == null) return;
+    await _switchQuality(picked);
   }
 
-  /// 音轨选择弹框。
+  /// 音轨选择菜单。
   ///
   /// 「没有音轨」和「只有一条音轨」是两回事，但**都还是要把菜单打开**：
   /// 用户点它是想知道「这条片子的音频是什么样的」（语言 / 编码 / 声道 / 码率），
   /// 那是**识别**能力，不是「切换」能力。所以只在完全读不到轨道时才提示。
-  Future<void> _showAudioMenu() async {
+  Future<void> _showAudioMenu(BuildContext buttonContext) async {
     final player = _player;
     if (player == null) return;
     if (_audioTracks.isEmpty) {
@@ -2363,15 +2358,21 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     }
 
     _cancelHide();
-    final dialogContext = _navigatorKey.currentContext;
-    if (dialogContext == null) {
+    if (!buttonContext.mounted) {
+      _pokeChrome();
+      return;
+    }
+    final navigator = Navigator.of(buttonContext, rootNavigator: true);
+    final anchor = globalRectOf(buttonContext);
+    if (anchor == null) {
       _pokeChrome();
       return;
     }
 
-    final picked = await showDialog<AudioTrack>(
-      context: dialogContext,
-      builder: (context) => _AudioDialog(
+    final picked = await showAnchoredMenu<AudioTrack>(
+      navigator: navigator,
+      anchor: anchor,
+      builder: (context) => _AudioMenuPanel(
         tracks: _audioTracks,
         activeId: _activeAudioId,
       ),
@@ -2384,25 +2385,33 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     await player.setAudioTrack(picked);
   }
 
-  /// 字幕选择弹框。
+  /// 字幕选择菜单。
   ///
-  /// ## 为什么是个 `while` 循环而不是一次 `showDialog`
+  /// ## 为什么是个 `while` 循环而不是一次弹菜单
   ///
   /// 菜单里除了字幕，还有一个**动作**项（「搜索在线字幕…」）：选它之后要去网上
   /// 搜，搜完把**同一个菜单**重新打开，让用户从结果里挑。写成递归的话栈会随
   /// 搜索次数增长，而且「谁负责把菜单关掉」会变得很难读 —— 循环把
   /// 「开菜单 → 拿到选择 → 要么应用要么重开」这一件事摆在一处。
-  Future<void> _showSubtitleMenu() async {
+  Future<void> _showSubtitleMenu(BuildContext buttonContext) async {
     final player = _player;
     if (player == null) return;
 
+    if (!buttonContext.mounted) return;
+    // navigator 与锚点都在**第一次 await 之前**取好：这个菜单会被重开好几次
+    //（搜完在线字幕 / 挑完本地文件），每次都去碰按钮的 context 就要跨 async
+    // gap，而按钮在整段流程里不会挪位置 —— 取一次就够。
+    final navigator = Navigator.of(buttonContext, rootNavigator: true);
+    final anchor = globalRectOf(buttonContext);
+    if (anchor == null) return;
+
     while (true) {
-      // 弹菜单这件事单独一个方法：它自己不带任何 `await` 之前的上下文获取，
+      // 弹菜单这件事单独一个方法：它只收已经取好的 navigator 与锚点，
       // 循环体里也就没有「跨 async gap 用 context」的问题。
-      final picked = await _promptSubtitleChoice();
+      final picked = await _promptSubtitleChoice(navigator, anchor);
       if (!mounted) return;
 
-      // 关掉菜单（点外面 / Esc），或者菜单根本弹不出来（没有 Navigator）：
+      // 关掉菜单（点外面 / Esc），或者菜单根本弹不出来（按钮已经不在树上）：
       // 什么都不做，但要把控制栏的隐藏倒计时重新起算 —— 用户刚在这里点过，
       // 此刻把按钮藏起来是最糟的时机。
       if (picked == null) {
@@ -2435,14 +2444,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 弹出字幕菜单。返回用户的选择；**菜单弹不出来或用户关掉它**都返回 null
   /// （这两种情况调用方的处置完全一样，没必要分开）。
-  Future<_SubtitleChoice?> _promptSubtitleChoice() async {
+  Future<_SubtitleChoice?> _promptSubtitleChoice(
+    NavigatorState navigator,
+    Rect anchor,
+  ) {
     _cancelHide();
-    final dialogContext = _navigatorKey.currentContext;
-    if (dialogContext == null) return null;
-
-    return showDialog<_SubtitleChoice>(
-      context: dialogContext,
-      builder: (context) => _SubtitleDialog(
+    return showAnchoredMenu<_SubtitleChoice>(
+      navigator: navigator,
+      anchor: anchor,
+      builder: (context) => _SubtitleMenuPanel(
         tracks: _embeddedSubtitles,
         cloud: _currentRequest?.subtitles ?? const <SubtitleBrief>[],
         online: _onlineSubtitles,
@@ -3166,128 +3176,52 @@ class _SelfCheckRow extends StatelessWidget {
   }
 }
 
-/// 清晰度选择弹框。
+/// 清晰度选择菜单。
 ///
 /// 只是**选择**：它不自己换流，而是把选中的档位 `pop` 回去，由
 /// [_PlayerWindowAppState._switchQuality] 走跨引擎通道让主窗口重新取链。
 /// 理由见 [QualityBrief] 的类文档 —— 播放窗口没有取链能力。
-/// 画质菜单的浮层。
 ///
-/// 两层叠在一起：
-/// 1. 全屏透明 `GestureDetector` —— 点菜单以外任意处即关闭（点视频、点别的控件都算）；
-/// 2. `CompositedTransformFollower` —— 把菜单贴到 [_QualityPopupLayer.link]
-///    锚的那个画质按钮**正上方、右沿对齐**（见 [player_window_app._qualityLink]）。
-class _QualityPopupLayer extends StatelessWidget {
-  const _QualityPopupLayer({
-    required this.link,
+/// 摆位与动画都在 [showAnchoredMenu] 里（贴着画质按钮正上方划出来）；
+/// 这里只管「长什么样」。
+class _QualityMenuPanel extends StatelessWidget {
+  const _QualityMenuPanel({
     required this.qualities,
     required this.activeId,
-    required this.onPick,
-    required this.onDismiss,
   });
-
-  /// 与画质按钮共享的锚点。
-  final LayerLink link;
 
   final List<QualityBrief> qualities;
 
   /// 当前正在播的那一档。打勾 / 高亮用。
   final String? activeId;
 
-  /// 选了一档 → 关掉菜单并把选择抛上去。
-  final ValueChanged<QualityBrief> onPick;
-
-  /// 点菜单外 → 只关菜单。
-  final VoidCallback onDismiss;
-
   @override
   Widget build(BuildContext context) {
-    return Stack(
+    return AnchoredMenuPanel(
+      title: '清晰度',
+      maxWidth: 300,
       children: [
-        // 透明全屏拦截层：吃掉菜单以外的所有点击，点它即关。
-        Positioned.fill(
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: onDismiss,
+        for (final q in qualities)
+          ListTile(
+            dense: true,
+            visualDensity: VisualDensity.compact,
+            selected: q.id == activeId,
+            selectedTileColor: AppTheme.accent.withValues(alpha: 0.14),
+            title: Text(q.label, style: const TextStyle(fontSize: 13)),
+            subtitle: q.detail == null
+                ? null
+                : Text(
+                    q.detail!,
+                    style: const TextStyle(fontSize: 11),
+                  ),
+            // 打勾而不是只靠高亮：深色底上的高亮在小屏/低对比度下
+            // 未必看得出来，而「现在是多少」是用户点开这个菜单的唯一原因。
+            trailing: q.id == activeId
+                ? const Icon(Icons.check_rounded, size: 18)
+                : null,
+            onTap: () => Navigator.of(context).pop(q),
           ),
-        ),
-        CompositedTransformFollower(
-          link: link,
-          // 按钮「右上角」对齐菜单「右下角」→ 菜单整块落在按钮上方、右沿齐平。
-          targetAnchor: Alignment.topRight,
-          followerAnchor: Alignment.bottomRight,
-          child: _QualityPopup(
-            qualities: qualities,
-            activeId: activeId,
-            onPick: onPick,
-          ),
-        ),
       ],
-    );
-  }
-}
-
-/// 画质菜单本体：一块圆角面板，顶上一行「清晰度」，下面是可选项列表。
-///
-/// 每一项带副标题（`1920×1080 · 4.2 Mbps`），当前档打勾。
-class _QualityPopup extends StatelessWidget {
-  const _QualityPopup({
-    required this.qualities,
-    required this.activeId,
-    required this.onPick,
-  });
-
-  final List<QualityBrief> qualities;
-
-  /// 当前正在播的那一档。打勾用。
-  final String? activeId;
-
-  final ValueChanged<QualityBrief> onPick;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: AppTheme.panel,
-      elevation: 8,
-      borderRadius: BorderRadius.circular(10),
-      clipBehavior: Clip.antiAlias,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 300),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Padding(
-              padding: EdgeInsets.fromLTRB(14, 10, 14, 7),
-              child: Text(
-                '清晰度',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-              ),
-            ),
-            const Divider(height: 1, thickness: 1, color: Colors.white12),
-            for (final q in qualities)
-              ListTile(
-                dense: true,
-                visualDensity: VisualDensity.compact,
-                selected: q.id == activeId,
-                selectedTileColor: AppTheme.accent.withValues(alpha: 0.14),
-                title: Text(q.label, style: const TextStyle(fontSize: 13)),
-                subtitle: q.detail == null
-                    ? null
-                    : Text(
-                        q.detail!,
-                        style: const TextStyle(fontSize: 11),
-                      ),
-                // 打勾而不是只靠高亮：深色底上的高亮在小屏/低对比度下
-                // 未必看得出来，而「现在是多少」是用户点开这个菜单的唯一原因。
-                trailing: q.id == activeId
-                    ? const Icon(Icons.check_rounded, size: 18)
-                    : null,
-                onTap: () => onPick(q),
-              ),
-          ],
-        ),
-      ),
     );
   }
 }
@@ -3404,7 +3338,7 @@ Widget buildAudioMenuForTest({
   required List<AudioTrack> tracks,
   String? activeId,
 }) =>
-    _AudioDialog(tracks: tracks, activeId: activeId);
+    _AudioMenuPanel(tracks: tracks, activeId: activeId);
 
 /// 仅测试用：字幕菜单。理由见 [buildAudioMenuForTest]。
 ///
@@ -3423,7 +3357,7 @@ Widget buildSubtitleMenuForTest({
   int? activeOnlineId,
   String? activeLocalPath,
 }) =>
-    _SubtitleDialog(
+    _SubtitleMenuPanel(
       tracks: tracks,
       cloud: cloud,
       online: online,
@@ -3442,8 +3376,8 @@ Widget buildSubtitleMenuForTest({
 /// 副标题是「识别」那一半：语言之外还给出编码、声道、采样率、码率。
 /// 这些字段 mpv 只在探到时才填（见 [TrackLabels]），所以副标题可能是空的 ——
 /// 空着比写「未知 · 未知」好。
-class _AudioDialog extends StatelessWidget {
-  const _AudioDialog({required this.tracks, required this.activeId});
+class _AudioMenuPanel extends StatelessWidget {
+  const _AudioMenuPanel({required this.tracks, required this.activeId});
 
   final List<AudioTrack> tracks;
 
@@ -3452,33 +3386,26 @@ class _AudioDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: AppTheme.panel,
-      title: const Text('音轨', style: TextStyle(fontSize: 15)),
-      contentPadding: const EdgeInsets.symmetric(vertical: 6),
-      content: SizedBox(
-        width: 340,
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            for (final t in tracks)
-              ListTile(
-                dense: true,
-                selected: t.id == activeId,
-                selectedTileColor: AppTheme.accent.withValues(alpha: 0.14),
-                title: Text(
-                  TrackLabels.audioTitle(t),
-                  style: const TextStyle(fontSize: 13),
-                ),
-                subtitle: _subtitleOf(TrackLabels.audioDetail(t)),
-                trailing: t.id == activeId
-                    ? const Icon(Icons.check_rounded, size: 18)
-                    : null,
-                onTap: () => Navigator.of(context).pop(t),
-              ),
-          ],
-        ),
-      ),
+    return AnchoredMenuPanel(
+      title: '音轨',
+      maxWidth: 340,
+      children: [
+        for (final t in tracks)
+          ListTile(
+            dense: true,
+            selected: t.id == activeId,
+            selectedTileColor: AppTheme.accent.withValues(alpha: 0.14),
+            title: Text(
+              TrackLabels.audioTitle(t),
+              style: const TextStyle(fontSize: 13),
+            ),
+            subtitle: _subtitleOf(TrackLabels.audioDetail(t)),
+            trailing: t.id == activeId
+                ? const Icon(Icons.check_rounded, size: 18)
+                : null,
+            onTap: () => Navigator.of(context).pop(t),
+          ),
+      ],
     );
   }
 }
@@ -3498,8 +3425,8 @@ class _AudioDialog extends StatelessWidget {
 /// **有外挂字幕（网盘 / 在线）挂着时，内嵌轨一律不打勾**。mpv 认不出我们后挂
 /// 上去的外挂字幕是哪一条，它只会把「有字幕轨被选中」报成一个数字 —— 靠那个
 /// 数字去高亮，会在错误的内嵌轨上打勾。
-class _SubtitleDialog extends StatelessWidget {
-  const _SubtitleDialog({
+class _SubtitleMenuPanel extends StatelessWidget {
+  const _SubtitleMenuPanel({
     required this.tracks,
     required this.cloud,
     required this.online,
@@ -3552,108 +3479,100 @@ class _SubtitleDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: AppTheme.panel,
-      title: const Text('字幕', style: TextStyle(fontSize: 15)),
-      contentPadding: const EdgeInsets.symmetric(vertical: 6),
-      content: SizedBox(
-        width: 380,
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            _SubtitleTile(
-              title: '关闭字幕',
-              selected: _nothingActive,
-              onTap: () =>
-                  Navigator.of(context).pop(const _SubtitleChoice.off()),
-            ),
-            if (cloud.isNotEmpty) ...[
-              const _SectionLabel('网盘字幕'),
-              for (final s in cloud)
-                _SubtitleTile(
-                  title: s.label,
-                  detail: s.fileName,
-                  selected: s.fileId == activeCloudId,
-                  onTap: () => Navigator.of(context).pop(
-                    _SubtitleChoice.cloud(s.fileId),
-                  ),
-                ),
-            ],
-            if (tracks.isNotEmpty) ...[
-              const _SectionLabel('内嵌字幕'),
-              for (final t in tracks)
-                _SubtitleTile(
-                  title: TrackLabels.subtitleTitle(t),
-                  detail: TrackLabels.subtitleDetail(t),
-                  selected: !_externalActive && t.id == '$activeId',
-                  onTap: () => Navigator.of(context).pop(
-                    _SubtitleChoice.embedded(int.parse(t.id)),
-                  ),
-                ),
-            ],
-            if (online.isNotEmpty) ...[
-              const _SectionLabel('在线字幕'),
-              for (final s in online)
-                _SubtitleTile(
-                  title: s.title ?? s.fileName,
-                  detail: _onlineDetail(s),
-                  selected: s.fileId == activeOnlineId,
-                  onTap: () => Navigator.of(context).pop(
-                    _SubtitleChoice.online(s.fileId),
-                  ),
-                ),
-            ],
-            if (local case final picked?) ...[
-              const _SectionLabel('本地文件'),
-              _SubtitleTile(
-                title: picked.label,
-                detail: picked.path,
-                selected: picked.path == activeLocalPath,
-                onTap: () => Navigator.of(context).pop(
-                  _SubtitleChoice.local(picked.path, picked.label),
-                ),
-              ),
-            ],
-            // 「去搜一下」和「去挑个文件」都是**动作**，不是字幕 ——
-            // 所以它们单独一组、放在最后：它们是"出口"，不是"选项"。
-            //
-            // 搜过/挑过之后这两条仍然留着：字幕站上可能有新的，用户也可能想
-            // 换一个文件再试。文案跟着变，让他知道点了会发生什么。
-            const _SectionLabel('从别处加载'),
-            _SubtitleTile(
-              title: searchingOnline
-                  ? '搜索中…'
-                  : (online.isEmpty ? '搜索在线字幕…' : '重新搜索在线字幕…'),
-              leading: Icons.search_rounded,
-              // 搜索中时不给点：这是个会打接口、要烧额度的动作。
-              onTap: searchingOnline
-                  ? null
-                  : () => Navigator.of(context).pop(
-                        const _SubtitleChoice.searchOnline(),
-                      ),
-            ),
-            _SubtitleTile(
-              title: local == null ? '选择本地字幕文件…' : '换一个本地字幕文件…',
-              leading: Icons.folder_open_rounded,
-              onTap: () => Navigator.of(context).pop(
-                const _SubtitleChoice.pickLocal(),
-              ),
-            ),
-            // 一条都没有时给一句人话。什么都不显示的话，用户只会以为
-            // 「这个功能还没做完」。
-            if (cloud.isEmpty && tracks.isEmpty && online.isEmpty && local == null)
-              const ListTile(
-                dense: true,
-                enabled: false,
-                title: Text(
-                  '这个片源没有内嵌字幕，网盘同目录也没扫到字幕文件 —— '
-                  '可以从下面去网上搜，或者自己挑一个本地文件',
-                  style: TextStyle(fontSize: 12, color: Colors.white38),
-                ),
-              ),
-          ],
+    return AnchoredMenuPanel(
+      title: '字幕',
+      maxWidth: 380,
+      children: [
+        _SubtitleTile(
+          title: '关闭字幕',
+          selected: _nothingActive,
+          onTap: () => Navigator.of(context).pop(const _SubtitleChoice.off()),
         ),
-      ),
+        if (cloud.isNotEmpty) ...[
+          const _SectionLabel('网盘字幕'),
+          for (final s in cloud)
+            _SubtitleTile(
+              title: s.label,
+              detail: s.fileName,
+              selected: s.fileId == activeCloudId,
+              onTap: () => Navigator.of(context).pop(
+                _SubtitleChoice.cloud(s.fileId),
+              ),
+            ),
+        ],
+        if (tracks.isNotEmpty) ...[
+          const _SectionLabel('内嵌字幕'),
+          for (final t in tracks)
+            _SubtitleTile(
+              title: TrackLabels.subtitleTitle(t),
+              detail: TrackLabels.subtitleDetail(t),
+              selected: !_externalActive && t.id == '$activeId',
+              onTap: () => Navigator.of(context).pop(
+                _SubtitleChoice.embedded(int.parse(t.id)),
+              ),
+            ),
+        ],
+        if (online.isNotEmpty) ...[
+          const _SectionLabel('在线字幕'),
+          for (final s in online)
+            _SubtitleTile(
+              title: s.title ?? s.fileName,
+              detail: _onlineDetail(s),
+              selected: s.fileId == activeOnlineId,
+              onTap: () => Navigator.of(context).pop(
+                _SubtitleChoice.online(s.fileId),
+              ),
+            ),
+        ],
+        if (local case final picked?) ...[
+          const _SectionLabel('本地文件'),
+          _SubtitleTile(
+            title: picked.label,
+            detail: picked.path,
+            selected: picked.path == activeLocalPath,
+            onTap: () => Navigator.of(context).pop(
+              _SubtitleChoice.local(picked.path, picked.label),
+            ),
+          ),
+        ],
+        // 「去搜一下」和「去挑个文件」都是**动作**，不是字幕 ——
+        // 所以它们单独一组、放在最后：它们是"出口"，不是"选项"。
+        //
+        // 搜过/挑过之后这两条仍然留着：字幕站上可能有新的，用户也可能想
+        // 换一个文件再试。文案跟着变，让他知道点了会发生什么。
+        const _SectionLabel('从别处加载'),
+        _SubtitleTile(
+          title: searchingOnline
+              ? '搜索中…'
+              : (online.isEmpty ? '搜索在线字幕…' : '重新搜索在线字幕…'),
+          leading: Icons.search_rounded,
+          // 搜索中时不给点：这是个会打接口、要烧额度的动作。
+          onTap: searchingOnline
+              ? null
+              : () => Navigator.of(context).pop(
+                    const _SubtitleChoice.searchOnline(),
+                  ),
+        ),
+        _SubtitleTile(
+          title: local == null ? '选择本地字幕文件…' : '换一个本地字幕文件…',
+          leading: Icons.folder_open_rounded,
+          onTap: () => Navigator.of(context).pop(
+            const _SubtitleChoice.pickLocal(),
+          ),
+        ),
+        // 一条都没有时给一句人话。什么都不显示的话，用户只会以为
+        // 「这个功能还没做完」。
+        if (cloud.isEmpty && tracks.isEmpty && online.isEmpty && local == null)
+          const ListTile(
+            dense: true,
+            enabled: false,
+            title: Text(
+              '这个片源没有内嵌字幕，网盘同目录也没扫到字幕文件 —— '
+              '可以从下面去网上搜，或者自己挑一个本地文件',
+              style: TextStyle(fontSize: 12, color: Colors.white38),
+            ),
+          ),
+      ],
     );
   }
 

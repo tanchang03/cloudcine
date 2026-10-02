@@ -13,7 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// 其妙地回到了全部」，而且他不会把这两件事联系起来。
 ///
 /// 第二条断言（按钮清的范围）是重点：**按钮的用途是让用户重新看到内容**，
-/// 所以它必须清掉全部在用的条件。同时设了搜索词与年代却只清一个，列表
+/// 所以它必须清掉全部在用的条件。同时设了搜索词与年份却只清一个，列表
 /// 很可能还是空的 —— 用户会认为这个按钮坏了。
 void main() {
   const plain = LibraryFilter();
@@ -22,7 +22,7 @@ void main() {
     const filter = LibraryFilter(
       category: MediaCategory.movie,
       query: '魔法',
-      decades: {2020},
+      years: {2023},
       genres: {'动画'},
     );
 
@@ -43,10 +43,10 @@ void main() {
     );
   });
 
-  test('只有年代 / 类型 → 清那两组，保留分类与搜索词', () {
+  test('只有年份 / 类型 → 清那两组，保留分类与搜索词', () {
     const filter = LibraryFilter(
       category: MediaCategory.anime,
-      decades: {1990},
+      years: {1995},
     );
 
     final hint = libraryEmptyHint(filter);
@@ -55,7 +55,7 @@ void main() {
     expect(hint.actionLabel, '清空筛选');
     expect(
       hint.body,
-      contains('年代'),
+      contains('年份'),
       reason: '提示语要说出清的是哪一类条件，否则用户点完不知道刚才是什么在拦着。',
     );
   });

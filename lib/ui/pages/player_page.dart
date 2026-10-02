@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show defaultTargetPlatform;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -16,8 +17,113 @@ import '../../domain/services/playback_controller.dart';
 import '../../domain/services/playback_exit_policy.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
+import '../widgets/anchored_menu.dart';
 import '../widgets/buffered_slider.dart';
 import '../widgets/common_widgets.dart';
+
+/// 遥控器 / 键盘上某个键，在当前上下文里该触发什么。
+///
+/// 抽成**纯函数**是为了可单测 —— 这套路由最典型的故障是「键名写错」：
+/// Android TV 遥控器的中心 OK 键键码是 23，映射到
+/// `LogicalKeyboardKey.select`，**不是 `enter`、也不是 `space`**。
+/// 写错的后果是「按了没反应」，既不报错也不崩溃，只有断言能钉住它。
+enum RemoteKeyAction {
+  playPause,
+  seekBack,
+  seekForward,
+
+  /// 沉浸模式下：把控制栏叫回来。
+  ///
+  /// TV 上**没有 Esc**，不补这条的话沉浸模式就是一间单向门。
+  showControls,
+
+  /// 非沉浸模式下按 Esc：退出播放页。
+  pop,
+
+  /// 放行给焦点系统（移动焦点、激活按钮）。
+  ignored,
+}
+
+/// 遥控器上「我们认识的」键。
+///
+/// ⚠️ 只能是 `final` 不能是 `const`：`LogicalKeyboardKey` 重写了 `==`，
+/// 而常量集合的元素要求原生相等（`const_set_element_not_primitive_equality`）。
+final Set<LogicalKeyboardKey> _remoteKeys = {
+  LogicalKeyboardKey.select,
+  LogicalKeyboardKey.enter,
+  LogicalKeyboardKey.space,
+  LogicalKeyboardKey.escape,
+  LogicalKeyboardKey.arrowLeft,
+  LogicalKeyboardKey.arrowRight,
+  LogicalKeyboardKey.arrowUp,
+  LogicalKeyboardKey.arrowDown,
+  LogicalKeyboardKey.mediaPlayPause,
+  LogicalKeyboardKey.mediaRewind,
+  LogicalKeyboardKey.mediaFastForward,
+};
+
+/// 决定一个按键该干什么。
+///
+/// [stageFocused] = 焦点是否**真的落在画面上**（而不是某个按钮 / 菜单 / 遮罩上）。
+/// 这个参数是整套 TV 交互的关键：
+///   * 焦点在画面上 → OK = 播放/暂停、←/→ = 快退/快进；
+///   * 焦点在按钮上 → 这三个键必须 `ignored`，交回焦点系统去「激活按钮 / 换焦点」。
+/// 不区分的话，OK 会**既暂停又点按钮**，而 ←/→ 会**既快退又不换焦点**。
+RemoteKeyAction resolveRemoteKey({
+  required LogicalKeyboardKey key,
+  required bool immersive,
+  required bool stageFocused,
+}) {
+  // 沉浸模式优先：任何认识的键，第一下都用来把控制栏叫回来。
+  if (immersive && _remoteKeys.contains(key)) {
+    return RemoteKeyAction.showControls;
+  }
+
+  // 这几个不挑焦点在哪：遥控器 / 键盘上的专用键，在任何位置都该生效。
+  switch (key) {
+    case LogicalKeyboardKey.mediaPlayPause || LogicalKeyboardKey.space:
+      return RemoteKeyAction.playPause;
+    case LogicalKeyboardKey.mediaRewind:
+      return RemoteKeyAction.seekBack;
+    case LogicalKeyboardKey.mediaFastForward:
+      return RemoteKeyAction.seekForward;
+    case LogicalKeyboardKey.escape:
+      return RemoteKeyAction.pop;
+  }
+
+  // 焦点不在画面上时，OK 与方向键都属于焦点系统。
+  if (!stageFocused) return RemoteKeyAction.ignored;
+
+  switch (key) {
+    case LogicalKeyboardKey.select || LogicalKeyboardKey.enter:
+      return RemoteKeyAction.playPause;
+    case LogicalKeyboardKey.arrowLeft:
+      return RemoteKeyAction.seekBack;
+    case LogicalKeyboardKey.arrowRight:
+      return RemoteKeyAction.seekForward;
+  }
+
+  // ↑/↓ 一律放行：「从画面往下走到控制栏」靠的就是焦点遍历本身。
+  return RemoteKeyAction.ignored;
+}
+
+/// 控制栏是否该在无操作超时后自动收起（进入沉浸）。
+///
+/// 抽成**纯函数**是为了可单测 —— 「什么时候藏」一旦散在定时器回调里，
+/// 就会随按钮越来越多而漂移，且无法断言。判据（TV 遥控器通行约定）：
+///   * 已经沉浸（控制栏已藏）→ 不用再藏；
+///   * **暂停**时用户多半是停下来读字幕 / 调设置 → 藏了等于把正看的东西
+///     盖掉，宁可不藏；
+///   * 焦点不在画面上（进了控制栏按钮 / 字幕菜单）→ 用户正在操作，藏了
+///     等于把控件从手底下抽走。
+///
+/// 注意它只看「能不能藏」，不看「过了多少秒」—— 超时由调用方的定时器负责。
+bool shouldAutoHideControls({
+  required bool immersive,
+  required bool playing,
+  required bool stageFocused,
+}) =>
+    !immersive && playing && stageFocused;
 
 /// 播放页。
 ///
@@ -61,6 +167,25 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 沉浸模式：隐藏顶栏与控制栏，只剩画面。
   bool _immersive = false;
 
+  /// 画面区的焦点节点 —— 遥控器适配的核心判据。
+  ///
+  /// `hasPrimaryFocus` 回答的是「遥控器现在指的是画面，还是指某个按钮」。
+  /// 只有焦点真的落在画面上时，OK 键才该是「播放/暂停」、←/→ 才该是「快退/快进」；
+  /// 焦点一旦进到控制栏的按钮上，这两个键必须**放行**给焦点系统 ——
+  /// 否则 OK 会既暂停又点按钮，←/→ 会既快退又不换焦点。
+  final FocusNode _stageNode = FocusNode(debugLabel: 'player-stage');
+
+  /// 无操作收起控制栏（进入沉浸）的定时器。
+  ///
+  /// TV 通行约定是「遥控器静置一会儿就只剩画面」；但**每次按键都重置它** ——
+  /// 用户正找按钮时把控件藏起来是最糟的时机。真机上这条行为肉眼可见，所以
+  /// 它的判据抽成了 [shouldAutoHideControls]，定时器只负责倒计时。
+  Timer? _idleHideTimer;
+
+  /// 控制栏无操作后收起的时间。30 秒是 TV 的主流约定（足够读完一行字幕，
+  /// 又不会让用户觉得「按了没反应」—— 因为唤回只要任意一键）。
+  static const Duration _controlsIdleTimeout = Duration(seconds: 30);
+
   /// 拖动进度条时的临时值。拖动过程中不能让 `position` 流把滑块拽回去。
   double? _dragFraction;
 
@@ -71,12 +196,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   void initState() {
     super.initState();
     _controller = ref.read(playbackControllerProvider);
+    // 播放状态一变就重算收起倒计时（见 [_onPlayStateChanged]）。
+    _controller.addListener(_onPlayStateChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
+  }
+
+  /// 播放状态一变就重算收起倒计时：开始播 → 挂上；暂停 / 停止 → 撤掉
+  /// （暂停时用户多半在读数 / 调设置，藏控制栏会把正看的东西盖掉）。
+  void _onPlayStateChanged() {
+    if (_controller.isPlaying) {
+      _scheduleControlsHide();
+    } else {
+      _cancelIdleHide();
+    }
   }
 
   @override
   void dispose() {
-    // 返回时要不要停播是**平台约定**，见 [PlaybackExitBehavior]：
+    _controller.removeListener(_onPlayStateChanged);
     //   - 桌面：保留播放（可以一边浏览一边听）；
     //   - Android / Android TV：停止并释放解码器 —— 页面都走了，不该还占着
     //     4K 解码器与网络连接，而那边也没有通知栏控件能停它。
@@ -88,6 +225,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         PlaybackExitBehavior.stopAndRelease) {
       unawaited(_controller.stop());
     }
+    _cancelIdleHide();
+    _stageNode.dispose();
     super.dispose();
   }
 
@@ -149,50 +288,116 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       backgroundColor: AppTheme.cinema,
       body: ListenableBuilder(
         listenable: controller,
-        builder: (context, _) => CallbackShortcuts(
-          bindings: {
-            const SingleActivator(LogicalKeyboardKey.space):
-                controller.playOrPause,
-            const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
-                controller.seekRelative(const Duration(seconds: -10)),
-            const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
-                controller.seekRelative(const Duration(seconds: 10)),
-            const SingleActivator(LogicalKeyboardKey.escape): () {
-              if (_immersive) {
-                setState(() => _immersive = false);
-              } else {
-                context.pop();
-              }
-            },
-          },
-          child: Focus(
-            autofocus: true,
-            child: Column(
-              children: [
-                // ⚠️ 顶栏与控制栏整块 `ExcludeFocus`，这不是装饰，是上面那张
-                // 键位表能生效的**前提**。
-                //
-                // 按键从主焦点沿焦点链往上找、**最近的处理器赢**。控制栏里的
-                // 进度条滑块自带方向键处理 —— 实测（Flutter 3.29）把焦点给一个
-                // `value: 0.5` 的滑块再按 →，它的值会变成 `0.55`：方向键根本
-                // 轮不到我们。用户只要点过一次进度条，← / → 就再也不是
-                // 「跳 10 秒」了。这些控件本来就只该用鼠标操作。
-                //
-                // 关掉聚焦**不影响鼠标**：点击与拖拽走手势层，不经过焦点。
-                // 也不能因此把下面那个 `Focus(autofocus: true)` 一起去掉 ——
-                // `CallbackShortcuts` 只在自己处于焦点链上时才收得到按键，
-                // 少了它一条快捷键都不会触发，而且不报任何错。
-                if (!_immersive)
-                  ExcludeFocus(child: _buildTopBar(controller)),
-                Expanded(child: _buildStage(controller)),
-                if (!_immersive)
-                  ExcludeFocus(child: _buildControlBar(controller)),
-              ],
-            ),
+        builder: (context, _) => Focus(
+          // 这一层**只为收按键**存在，自己不参与焦点遍历。
+          // 放在最外层，是为了让焦点无论在画面还是在控制栏，按键都能冒泡到这里。
+          canRequestFocus: false,
+          skipTraversal: true,
+          onKeyEvent: _onRemoteKey,
+          child: Column(
+            children: [
+              // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
+              // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
+              // 沉浸模式是桌面鼠标的用法，TV 上不该让焦点先停在这里。
+              if (!_immersive) ExcludeFocus(child: _buildTopBar(controller)),
+              Expanded(
+                child: Focus(
+                  focusNode: _stageNode,
+                  autofocus: true,
+                  child: _buildStage(controller),
+                ),
+              ),
+              if (!_immersive) _remoteReachable(_buildControlBar(controller)),
+            ],
           ),
         ),
       ),
     );
+  }
+
+  /// 控制栏在 TV 上必须能被遥控器走到；桌面上维持「纯鼠标控件」。
+  ///
+  /// 桌面端继续 `ExcludeFocus` 是有实测理由的，见 [_buildControlBar] 里
+  /// 进度条滑块那处注释：焦点一旦落到滑块上，←/→ 就被滑块吃掉，
+  /// 用户只要点过一次进度条就再也跳不了 10 秒。**只在 Android 上放开。**
+  Widget _remoteReachable(Widget child) =>
+      defaultTargetPlatform == TargetPlatform.android
+          ? child
+          : ExcludeFocus(child: child);
+
+  /// 遥控器 / 键盘按键 → 播放动作。
+  ///
+  /// 路由判断本身在 [resolveRemoteKey]（纯函数，可单测），这里只负责执行。
+  ///
+  /// ## 为什么不用 `CallbackShortcuts`
+  ///
+  /// 它命中就一律报 `handled`。于是「焦点在控制栏里按 ←/→」会被它抢走，
+  /// 焦点**永远**在按钮之间挪不动 —— 而 TV 上挪不动焦点就等于选不了字幕和清晰度。
+  /// `Focus.onKeyEvent` 能返回 `ignored` 把按键交还给焦点系统，
+  /// 这是「同一个键，在画面上是快退、在控制栏里是移动焦点」唯一能落地的写法。
+  KeyEventResult _onRemoteKey(FocusNode node, KeyEvent event) {
+    // 长按要能连续快退/快进，所以 `KeyRepeatEvent` 也要处理。
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+
+    // 任意一次按键都算「用户还在」—— 重置收起倒计时。放在路由判断之前，
+    // 这样连「放行给焦点系统」的方向键（↑/↓）也会重置，而不是只有播放 /
+    // 快退才重置（否则用户在控制栏里找按钮时，倒计时照样到点把控件藏掉）。
+    _scheduleControlsHide();
+
+    final action = resolveRemoteKey(
+      key: event.logicalKey,
+      immersive: _immersive,
+      stageFocused: _stageNode.hasPrimaryFocus,
+    );
+
+    switch (action) {
+      case RemoteKeyAction.playPause:
+        _controller.playOrPause();
+      case RemoteKeyAction.seekBack:
+        _controller.seekRelative(const Duration(seconds: -10));
+      case RemoteKeyAction.seekForward:
+        _controller.seekRelative(const Duration(seconds: 10));
+      case RemoteKeyAction.showControls:
+        // 唤回控制栏：倒计时从头算，给用户足够时间看清再决定下一步。
+        setState(() => _immersive = false);
+        _scheduleControlsHide();
+      case RemoteKeyAction.pop:
+        context.pop();
+      case RemoteKeyAction.ignored:
+        return KeyEventResult.ignored;
+    }
+    return KeyEventResult.handled;
+  }
+
+  /// 看过 30 秒无操作就收起控制栏（进入沉浸）。
+  ///
+  /// 超时那一刻再判一次 [shouldAutoHideControls]：倒计时期间用户可能把焦点
+  /// 挪进了控制栏按钮或字幕菜单，这时藏掉等于把控件从手底下抽走；
+  /// 也可能按了暂停正读字幕 —— 两种都不该藏。
+  void _scheduleControlsHide() {
+    // 桌面 / 手机上「控制栏一直可见」是更让人安心的默认 —— 这条只服务于
+    // TV 遥控器「静置即只剩画面」的约定，所以非 TV 一律不挂定时器。
+    if (!AppTheme.isTvLayout(context)) return;
+
+    _idleHideTimer?.cancel();
+    _idleHideTimer = Timer(_controlsIdleTimeout, () {
+      // 窗口可能已经在倒计时里关了。
+      if (!mounted) return;
+      if (shouldAutoHideControls(
+        immersive: _immersive,
+        playing: _controller.isPlaying,
+        stageFocused: _stageNode.hasPrimaryFocus,
+      )) {
+        setState(() => _immersive = true);
+      }
+    });
+  }
+
+  void _cancelIdleHide() {
+    _idleHideTimer?.cancel();
+    _idleHideTimer = null;
   }
 
   // -------------------------------------------------------------------
@@ -335,7 +540,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _immersive = false),
+              onTap: () {
+                setState(() => _immersive = false);
+                _scheduleControlsHide();
+              },
             ),
           ),
       ],
@@ -346,6 +554,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   // 控制栏
   // -------------------------------------------------------------------
 
+  /// 控制栏。
+  ///
+  /// ⚠️ **两条滑块必须 `ExcludeFocus`**，这不是装饰。滑块自带方向键处理 ——
+  /// 实测（Flutter 3.29）把焦点给一个 `value: 0.5` 的滑块再按 →，
+  /// 它的值会变成 `0.55`：方向键根本轮不到播放器。用户只要点过一次进度条，
+  /// ← / → 就再也不是「跳 10 秒」了。
+  ///
+  /// 为什么不是**整条控制栏** `ExcludeFocus`（原来的写法）：那样遥控器就
+  /// **够不到任何控件**，TV 上等于没有暂停、没有清晰度、没有字幕。
+  /// 精确地把滑块摘出焦点链、按钮留给遥控器，两边才都满足。
+  /// 关掉聚焦**不影响鼠标**：点击与拖拽走手势层，不经过焦点。
   Widget _buildControlBar(PlaybackController controller) {
     final duration = controller.duration;
     final position = controller.position;
@@ -369,19 +588,21 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                 style: AppTheme.mono.copyWith(color: AppTheme.muted),
               ),
               Expanded(
-                child: BufferedSlider(
-                  value: fraction,
-                  // 「已经缓存到这儿了」那一层。时长未知时是 null（不画）。
-                  //
-                  // ⚠️ 用的是**真实播放头**，不是 [_dragFraction]：拖拽只是预览，
-                  // mpv 的缓存并不会跟着预览值走，按预览算会画出一段假的缓冲。
-                  buffered: controller.bufferedFraction,
-                  onChangeStart: (v) => setState(() => _dragFraction = v),
-                  onChanged: (v) => setState(() => _dragFraction = v),
-                  onChangeEnd: (v) {
-                    setState(() => _dragFraction = null);
-                    unawaited(controller.seekToFraction(v));
-                  },
+                child: ExcludeFocus(
+                  child: BufferedSlider(
+                    value: fraction,
+                    // 「已经缓存到这儿了」那一层。时长未知时是 null（不画）。
+                    //
+                    // ⚠️ 用的是**真实播放头**，不是 [_dragFraction]：拖拽只是预览，
+                    // mpv 的缓存并不会跟着预览值走，按预览算会画出一段假的缓冲。
+                    buffered: controller.bufferedFraction,
+                    onChangeStart: (v) => setState(() => _dragFraction = v),
+                    onChanged: (v) => setState(() => _dragFraction = v),
+                    onChangeEnd: (v) {
+                      setState(() => _dragFraction = null);
+                      unawaited(controller.seekToFraction(v));
+                    },
+                  ),
                 ),
               ),
               Text(
@@ -436,12 +657,16 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                   color: AppTheme.muted,
                 ),
               ),
+              // 音量滑块同样 `ExcludeFocus`（理由见方法头）。TV 上音量交给
+              // 电视自己的音量键，遥控器只需要那个静音按钮。
               SizedBox(
                 width: 84,
-                child: Slider(
-                  value: controller.volume.clamp(0, 100),
-                  max: 100,
-                  onChanged: (v) => unawaited(controller.setVolume(v)),
+                child: ExcludeFocus(
+                  child: Slider(
+                    value: controller.volume.clamp(0, 100),
+                    max: 100,
+                    onChanged: (v) => unawaited(controller.setVolume(v)),
+                  ),
                 ),
               ),
 
@@ -475,6 +700,41 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 // 菜单
 // ---------------------------------------------------------------------------
 
+/// 打开一个「贴着 [buttonContext] 正上方划出」的菜单。
+///
+/// 摆位与动画都在 [showAnchoredMenu] 里；这里只负责「量按钮坐标 → 推浮层 →
+/// 把选中的值交给 [onSelected]」这套重复了四遍（画质 / 字幕 / 音轨 / 倍速）的活。
+///
+/// 不用 `PopupMenuButton`：位置由它自己挑，而我们要的是**固定贴着按钮正上方**
+/// 划出来 —— 跟独立窗口播放器（`player_window_app.dart`）一套观感。
+Future<void> _openAnchoredMenu<T>({
+  required BuildContext buttonContext,
+  required String title,
+  required List<Widget> Function(
+    BuildContext context,
+    void Function(T value) select,
+  ) rows,
+  required ValueChanged<T> onSelected,
+  double maxWidth = 280,
+}) async {
+  if (!buttonContext.mounted) return;
+  final navigator = Navigator.of(buttonContext, rootNavigator: true);
+  final anchor = globalRectOf(buttonContext);
+  if (anchor == null) return;
+
+  final picked = await showAnchoredMenu<T>(
+    navigator: navigator,
+    anchor: anchor,
+    builder: (context) => AnchoredMenuPanel(
+      title: title,
+      maxWidth: maxWidth,
+      children: rows(context, (value) => Navigator.of(context).pop(value)),
+    ),
+  );
+  if (picked == null) return;
+  onSelected(picked);
+}
+
 class _QualityMenu extends StatelessWidget {
   const _QualityMenu({required this.controller});
 
@@ -490,27 +750,31 @@ class _QualityMenu extends StatelessWidget {
 
     final active = controller.activeQualityId;
 
-    return PopupMenuButton<String>(
-      tooltip: '清晰度',
-      initialValue: active,
-      onSelected: (id) => unawaited(controller.switchQuality(id)),
-      itemBuilder: (context) => [
-        for (final q in qualities)
-          PopupMenuItem<String>(
-            value: q.id,
-            enabled: q.isAvailable,
-            child: _MenuRow(
-              label: q.label,
-              detail: q.displayDetail,
-              selected: q.id == active,
-              dim: !q.isAvailable,
-            ),
-          ),
-      ],
-      child: _BarButton(
-        icon: Icons.high_quality_rounded,
-        label: _activeLabel(qualities, active),
-        active: true,
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '清晰度',
+        onTap: () => unawaited(_openAnchoredMenu<String>(
+          buttonContext: buttonContext,
+          title: '清晰度',
+          onSelected: (id) => unawaited(controller.switchQuality(id)),
+          rows: (context, select) => [
+            for (final q in qualities)
+              _MenuTile(
+                onTap: q.isAvailable ? () => select(q.id) : null,
+                child: _MenuRow(
+                  label: q.label,
+                  detail: q.displayDetail,
+                  selected: q.id == active,
+                  dim: !q.isAvailable,
+                ),
+              ),
+          ],
+        )),
+        child: _BarButton(
+          icon: Icons.high_quality_rounded,
+          label: _activeLabel(qualities, active),
+          active: true,
+        ),
       ),
     );
   }
@@ -535,41 +799,47 @@ class _SubtitleMenu extends StatelessWidget {
     final tracks = controller.allSubtitles;
     final active = controller.activeSubtitleId;
 
-    return PopupMenuButton<String>(
-      tooltip: '字幕',
-      initialValue: active ?? _offValue,
-      onSelected: (value) {
-        if (value == _offValue) {
-          unawaited(controller.selectSubtitle(null));
-          return;
-        }
-        for (final t in tracks) {
-          if (t.id == value) {
-            unawaited(controller.selectSubtitle(t));
-            return;
-          }
-        }
-      },
-      itemBuilder: (context) => [
-        const PopupMenuItem<String>(
-          value: _offValue,
-          child: _MenuRow(label: '关闭字幕', detail: ''),
-        ),
-        if (tracks.isNotEmpty) const PopupMenuDivider(),
-        for (final t in tracks)
-          PopupMenuItem<String>(
-            value: t.id,
-            child: _MenuRow(
-              label: t.displayLabel,
-              detail: _originLabel(t),
-              selected: t.id == active,
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '字幕',
+        onTap: () => unawaited(_openAnchoredMenu<String>(
+          buttonContext: buttonContext,
+          title: '字幕',
+          onSelected: (value) {
+            if (value == _offValue) {
+              unawaited(controller.selectSubtitle(null));
+              return;
+            }
+            for (final t in tracks) {
+              if (t.id == value) {
+                unawaited(controller.selectSubtitle(t));
+                return;
+              }
+            }
+          },
+          rows: (context, select) => [
+            _MenuTile(
+              onTap: () => select(_offValue),
+              child: const _MenuRow(label: '关闭字幕', detail: ''),
             ),
-          ),
-      ],
-      child: _BarButton(
-        icon: Icons.subtitles_rounded,
-        label: active == null ? '字幕' : '字幕 · 开',
-        active: active != null,
+            if (tracks.isNotEmpty)
+              const Divider(height: 1, thickness: 1, color: Colors.white12),
+            for (final t in tracks)
+              _MenuTile(
+                onTap: () => select(t.id),
+                child: _MenuRow(
+                  label: t.displayLabel,
+                  detail: _originLabel(t),
+                  selected: t.id == active,
+                ),
+              ),
+          ],
+        )),
+        child: _BarButton(
+          icon: Icons.subtitles_rounded,
+          label: active == null ? '字幕' : '字幕 · 开',
+          active: active != null,
+        ),
       ),
     );
   }
@@ -598,32 +868,37 @@ class _AudioMenu extends StatelessWidget {
     // 只有一条音轨时菜单没有意义。
     if (tracks.length <= 1) return const SizedBox.shrink();
 
-    return PopupMenuButton<String>(
-      tooltip: '音轨',
-      initialValue: activeId,
-      onSelected: (id) {
-        for (final t in tracks) {
-          if (t.id == id) {
-            onSelected(id);
-            unawaited(controller.selectAudioTrack(t));
-            return;
-          }
-        }
-      },
-      itemBuilder: (context) => [
-        for (var i = 0; i < tracks.length; i++)
-          PopupMenuItem<String>(
-            value: tracks[i].id,
-            child: _MenuRow(
-              label: tracks[i].title ??
-                  _languageLabel(tracks[i].language) ??
-                  '音轨 ${i + 1}',
-              detail: _trackDetail(tracks[i]),
-              selected: tracks[i].id == activeId,
-            ),
-          ),
-      ],
-      child: const _BarButton(icon: Icons.graphic_eq_rounded, label: '音轨'),
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '音轨',
+        onTap: () => unawaited(_openAnchoredMenu<String>(
+          buttonContext: buttonContext,
+          title: '音轨',
+          onSelected: (id) {
+            for (final t in tracks) {
+              if (t.id == id) {
+                onSelected(id);
+                unawaited(controller.selectAudioTrack(t));
+                return;
+              }
+            }
+          },
+          rows: (context, select) => [
+            for (var i = 0; i < tracks.length; i++)
+              _MenuTile(
+                onTap: () => select(tracks[i].id),
+                child: _MenuRow(
+                  label: tracks[i].title ??
+                      _languageLabel(tracks[i].language) ??
+                      '音轨 ${i + 1}',
+                  detail: _trackDetail(tracks[i]),
+                  selected: tracks[i].id == activeId,
+                ),
+              ),
+          ],
+        )),
+        child: const _BarButton(icon: Icons.graphic_eq_rounded, label: '音轨'),
+      ),
     );
   }
 
@@ -661,25 +936,80 @@ class _RateMenu extends StatelessWidget {
   Widget build(BuildContext context) {
     final rate = controller.rate;
 
-    return PopupMenuButton<double>(
-      tooltip: '播放速度',
-      initialValue: rate,
-      onSelected: (v) => unawaited(controller.setRate(v)),
-      itemBuilder: (context) => [
-        for (final r in _rates)
-          PopupMenuItem<double>(
-            value: r,
-            child: _MenuRow(
-              label: r == 1.0 ? '正常速度' : '${r}x',
-              detail: '',
-              selected: (r - rate).abs() < 0.001,
-            ),
-          ),
-      ],
-      child: _BarButton(
-        icon: Icons.speed_rounded,
-        label: rate == 1.0 ? '倍速' : '${rate}x',
-        active: rate != 1.0,
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '播放速度',
+        onTap: () => unawaited(_openAnchoredMenu<double>(
+          buttonContext: buttonContext,
+          title: '播放速度',
+          onSelected: (v) => unawaited(controller.setRate(v)),
+          rows: (context, select) => [
+            for (final r in _rates)
+              _MenuTile(
+                onTap: () => select(r),
+                child: _MenuRow(
+                  label: r == 1.0 ? '正常速度' : '${r}x',
+                  detail: '',
+                  selected: (r - rate).abs() < 0.001,
+                ),
+              ),
+          ],
+        )),
+        child: _BarButton(
+          icon: Icons.speed_rounded,
+          label: rate == 1.0 ? '倍速' : '${rate}x',
+          active: rate != 1.0,
+        ),
+      ),
+    );
+  }
+}
+
+/// 控制栏上的菜单入口。
+///
+/// 用 `InkWell` 而不是 `PopupMenuButton`：菜单自己定位，但入口本身必须仍然
+/// **可聚焦、可被遥控器 OK 激活** —— TV 上控制栏只走焦点链（见 `_remoteReachable`），
+/// 换成一块不可聚焦的装饰就等于把这个入口从遥控器手里拿走了。
+class _MenuButton extends StatelessWidget {
+  const _MenuButton({
+    required this.tooltip,
+    required this.onTap,
+    required this.child,
+  });
+
+  final String tooltip;
+  final VoidCallback onTap;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: child,
+      ),
+    );
+  }
+}
+
+/// 菜单里的一行：可点，且能被遥控器 OK 激活。
+class _MenuTile extends StatelessWidget {
+  const _MenuTile({required this.child, this.onTap});
+
+  final Widget child;
+
+  /// `null` = 这一项不可点（比如服务端没给这一档转码）。
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        child: child,
       ),
     );
   }
@@ -715,6 +1045,9 @@ class _BarButton extends StatelessWidget {
 }
 
 /// 菜单里的一行：主标签 + 说明 + 选中勾。
+///
+/// 不自己定宽：宽度由 [AnchoredMenuPanel] 给（撑满面板），否则每行右边会空出
+/// 一块、看着像没对齐。
 class _MenuRow extends StatelessWidget {
   const _MenuRow({
     required this.label,
@@ -730,43 +1063,40 @@ class _MenuRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 240,
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: dim
+                      ? AppTheme.dim
+                      : (selected ? AppTheme.accent : AppTheme.text),
+                ),
+              ),
+              if (detail.isNotEmpty)
                 Text(
-                  label,
+                  detail,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12.5,
-                    color: dim
-                        ? AppTheme.dim
-                        : (selected ? AppTheme.accent : AppTheme.text),
-                  ),
+                  style: const TextStyle(fontSize: 10.5, color: AppTheme.dim),
                 ),
-                if (detail.isNotEmpty)
-                  Text(
-                    detail,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 10.5, color: AppTheme.dim),
-                  ),
-              ],
-            ),
+            ],
           ),
-          if (selected)
-            const Padding(
-              padding: EdgeInsets.only(left: 8),
-              child: Icon(Icons.check_rounded, size: 14, color: AppTheme.accent),
-            ),
-        ],
-      ),
+        ),
+        if (selected)
+          const Padding(
+            padding: EdgeInsets.only(left: 8),
+            child: Icon(Icons.check_rounded, size: 14, color: AppTheme.accent),
+          ),
+      ],
     );
   }
 }

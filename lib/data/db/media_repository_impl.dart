@@ -78,7 +78,11 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
-  Future<void> upsertWorks(List<MediaWork> works, {DateTime? now}) async {
+  Future<void> upsertWorks(
+    List<MediaWork> works, {
+    DateTime? now,
+    bool overrideManual = false,
+  }) async {
     if (works.isEmpty) return;
     final ts = now ?? DateTime.now();
 
@@ -99,7 +103,12 @@ class DriftMediaRepository implements MediaRepository {
 
     await _db.batch((batch) {
       for (final w in works) {
-        final merged = mergeWorkForUpsert(w, existing[w.key], ts);
+        final merged = mergeWorkForUpsert(
+          w,
+          existing[w.key],
+          ts,
+          overrideManual: overrideManual,
+        );
         batch.insert(
           _db.mediaWorks,
           _workCompanion(merged),
@@ -110,6 +119,30 @@ class DriftMediaRepository implements MediaRepository {
         );
       }
     });
+  }
+
+  @override
+  Future<MediaWork?> customizeWork(
+    String key, {
+    required String title,
+    required MediaCategory category,
+    DateTime? now,
+  }) async {
+    final work = await workByKey(key);
+    if (work == null) return null;
+
+    final custom = work.customized(
+      title: title,
+      category: category,
+      updatedAt: now ?? DateTime.now(),
+    );
+
+    // 整行写，**不过 `mergeWorkForUpsert`** —— 那边有一条「海报地址永不为空」
+    // 的兜底规则，会把这里刚刚清掉的 `posterUrl` 用库里那张刮错的海报补回来。
+    // 详见接口文档。
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key)))
+        .write(_workCompanion(custom));
+    return custom;
   }
 
   /// 合并「本次扫描看到的作品」与「库里已有的作品」。
@@ -134,13 +167,44 @@ class DriftMediaRepository implements MediaRepository {
   static MediaWork mergeWorkForUpsert(
     MediaWork incoming,
     MediaWork? existing,
-    DateTime ts,
-  ) {
+    DateTime ts, {
+    bool overrideManual = false,
+  }) {
     if (existing == null) {
       return incoming.copyWith(
         // 新作品首次入库时补 firstSeenAt：WorkSeedBook.build 没传这列，
         // 但「最近添加」排序需要它。用 ts（本次扫描时刻）兜底。
         firstSeenAt: incoming.firstSeenAt ?? ts,
+        updatedAt: ts,
+      );
+    }
+
+    // 「用户自定义过的行」：元数据一个字段都不动，只更新扫描的产物。
+    //
+    // 判据里必须**同时**有 `incoming.source == online` 和 `!overrideManual`：
+    //
+    //   - 只看「existing 是 manual」就整行冻结 → 连本地重扫也进不来。而本地
+    //     重扫恰恰是**该**进来的：`year` 要靠文件名解析补回、`posterUrl`
+    //     要靠网盘缩略图补回（见 `MediaWork.customized` 的文档）。冻死它
+    //     等于用户自定义完，这部作品就永远既没有封面也没有年份；
+    //   - 不看 `overrideManual` → 用户点「刮削」按钮再也救不回来：库里一个
+    //     字段没变，而 `WorkScraper` 已经按流水线命中结果返回了
+    //     「已刮削：xxx」—— 界面在撒谎。
+    //
+    // 所以要拦的只有一种写入：**不是用户点出来的**在线刮削结果
+    // （扫描期自动刮削，`ScanService` 那条）。
+    //
+    // ⚠️ 这条分支在「自定义」功能上线前是死代码（那时没有任何一行会是
+    // `manual`），所以它对老库零风险；但它管的是**用户刚改对的东西**，
+    // 删掉不会有编译错误，只会有「重扫一次又变回去了」的投诉。
+    if (existing.source == ScrapeSource.manual &&
+        incoming.source == ScrapeSource.online &&
+        !overrideManual) {
+      return existing.copyWith(
+        itemCount: incoming.itemCount,
+        totalBytes: incoming.totalBytes,
+        seasonCount: incoming.seasonCount,
+        lastModifiedAt: incoming.lastModifiedAt,
         updatedAt: ts,
       );
     }
@@ -160,15 +224,22 @@ class DriftMediaRepository implements MediaRepository {
         incoming.posterUrl == existing.posterUrl;
     final keepBackdropFile = protect || incoming.backdropUrl == existing.backdropUrl;
 
-    // **生效后的类型列表**：保护模式下沿用库里的，否则用本次的。
+    // **生效后的类型列表**：用户手动编辑过的优先，其次保护模式下沿用库里的，
+    // 否则用本次的。
     //
     // 抽出来只算一次，是为了让 `category` 与 `genres` 两列永远基于**同一份
     // 输入** —— 各算各的会造出「分类是按 A 折算的、`genres` 存的却是 B」
     // 这种自相矛盾的行，而它不会报错，只会在下一次刮削时算出一个莫名其妙的
     // 分类。
-    final effectiveGenres = protect && existing.genres.isNotEmpty
+    //
+    // ⚠️ `genresManual` 那条排在最前：用户手敲的类型不能被刮削整份覆盖。
+    // 这不是「保护模式」的特例 —— 重刮削（`incoming.source == online`）
+    // 本来是会覆盖的，但用户的手动编辑比刮削的权威更高。
+    final effectiveGenres = existing.genresManual
         ? existing.genres
-        : incoming.genres;
+        : (protect && existing.genres.isNotEmpty
+            ? existing.genres
+            : incoming.genres);
 
     // 海报地址**永不为空**：本次算不出新地址时保留旧的。
     //
@@ -185,13 +256,18 @@ class DriftMediaRepository implements MediaRepository {
       key: incoming.key,
       provider: incoming.provider,
       kind: incoming.kind,
-      // 分类：**永远取新值，但新值要先把 `genres` 折算进去**。
+      // 分类：**用户手动指定的优先于一切自动判定**。
       //
-      // 「永远取新值」这条不能改：放进 `protect` 分支会有一个很难查的后果 ——
-      // 第一次扫描时判成「其他」的作品，之后无论怎么重扫都修不回来
-      // （保护模式会一直保留那个旧的「其他」）。
+      // `existing.categoryManual == true` 时，无论本次是重扫还是重刮削，
+      // 都保留用户选的那个分类 —— `fromGenres` / `incoming.category` 都
+      // 不能覆盖它。这是「手动覆盖」的核心语义：用户说了算。
       //
-      // 但**只看 `incoming.category` 也不够**：扫描期的
+      // 没有手动标记时走原来的规则：**永远取新值，但新值要先把 `genres`
+      // 折算进去**。「永远取新值」不能改：放进 `protect` 分支会有一个
+      // 很难查的后果 —— 第一次扫描时判成「其他」的作品，之后无论怎么
+      // 重扫都修不回来（保护模式会一直保留那个旧的「其他」）。
+      //
+      // 但只看 `incoming.category` 也不够：扫描期的
       // `MediaCategoryGuesser.guess` 拿不到 `genres`（那时还没刮削），
       // 所以重扫一部已刮削的作品时，incoming 那个分类是按目录名 / 结构
       // 重算的**旧口径**。直接用它会把刮削刚修正过来的分类冲回去 ——
@@ -200,8 +276,11 @@ class DriftMediaRepository implements MediaRepository {
       // 所以这里拿 [effectiveGenres] 再折算一次；`fromGenres` 给不出结论时
       // （剧情 / 科幻这类不改变栏目）才退回 `incoming.category` ——
       // 与 `WorkScraper._categoryFor` 是同一套口径。
-      category: MediaCategoryGuesser.fromGenres(effectiveGenres) ??
-          incoming.category,
+      category: existing.categoryManual
+          ? existing.category
+          : (MediaCategoryGuesser.fromGenres(effectiveGenres) ??
+              incoming.category),
+      categoryManual: existing.categoryManual,
       title: protect ? existing.title : incoming.title,
       originalTitle: _preferOld(protect, existing.originalTitle, incoming.originalTitle),
       year: _preferOld(protect, existing.year, incoming.year),
@@ -232,11 +311,14 @@ class DriftMediaRepository implements MediaRepository {
           : incoming.backdropFile,
       rating: _preferOld(protect, existing.rating, incoming.rating),
       genres: effectiveGenres,
+      genresManual: existing.genresManual,
       onlineId: _preferOld(protect, existing.onlineId, incoming.onlineId),
       source: protect ? existing.source : incoming.source,
       scrapedAt: protect ? existing.scrapedAt : incoming.scrapedAt,
       itemCount: incoming.itemCount,
       totalBytes: incoming.totalBytes,
+      // 季数与 `itemCount` 同类：都是**本次扫描看到的文件集合**的产物。
+      seasonCount: incoming.seasonCount,
       // `lastModifiedAt` 永远取本次扫描的值：它是作品下所有文件
       // `modifiedAt` 的最大值，重扫就是为了更新它。
       lastModifiedAt: incoming.lastModifiedAt,
@@ -367,6 +449,74 @@ class DriftMediaRepository implements MediaRepository {
         .write(MediaItemsCompanion(resumePositionMs: Value(ms)));
   }
 
+  @override
+  Future<void> setWorkCategory(String key, MediaCategory? category) async {
+    if (category != null) {
+      await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+        MediaWorksCompanion(
+          category: Value(category.name),
+          categoryManual: const Value(true),
+          updatedAt: Value(DateTime.now()),
+        ),
+      );
+      return;
+    }
+
+    // 恢复自动判定：先把这部作品读出来，按当前规则重算一次分类。
+    //
+    // 走 `workByKey`（而非只 select 三列）是有意的：重算需要 kind / title /
+    // genres，而这三列的解码口径已经封在 `_toWork` / `_stringList` 里，
+    // 在这里再抄一份解析逻辑迟早会漂移。
+    final work = await workByKey(key);
+    if (work == null) return;
+
+    final recomputed = MediaCategoryGuesser.guessFromWork(
+      kind: work.kind,
+      title: work.title,
+      genres: work.genres,
+    );
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      MediaWorksCompanion(
+        category: Value(recomputed.name),
+        categoryManual: const Value(false),
+        updatedAt: Value(DateTime.now()),
+      ),
+    );
+  }
+
+  @override
+  Future<void> setWorkGenres(String key, List<String>? genres) async {
+    if (genres == null) {
+      // 恢复自动：只清手动标记，类型本身留着（下次刮削会覆盖它）。
+      await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+        MediaWorksCompanion(
+          genresManual: const Value(false),
+          updatedAt: Value(DateTime.now()),
+        ),
+      );
+      return;
+    }
+
+    // 分类要跟着新类型走 —— 否则会留下「类型写着『动画』、分类还是『电影』」
+    // 这种自相矛盾的行。`fromGenres` 给不出结论时（科幻 / 剧情这类不改变
+    // 栏目）保留原分类，与 `WorkScraper._categoryFor` 是同一套口径。
+    final work = await workByKey(key);
+    if (work == null) return;
+
+    final newCategory = work.categoryManual
+        ? work.category
+        : (MediaCategoryGuesser.fromGenres(genres) ?? work.category);
+
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      MediaWorksCompanion(
+        genres: Value(jsonEncode(genres)),
+        genresManual: const Value(true),
+        category: Value(newCategory.name),
+        updatedAt: Value(DateTime.now()),
+      ),
+    );
+  }
+
   // -------------------------------------------------------------------
   // 读取
   // -------------------------------------------------------------------
@@ -377,7 +527,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
-    Set<int>? decades,
+    Set<int>? years,
     Set<String>? genres,
     WorkSort sort = WorkSort.recentModified,
     int limit = 200,
@@ -395,22 +545,14 @@ class DriftMediaRepository implements MediaRepository {
     );
     if (base != null) q.where((_) => base);
 
-    // 年代：`decades` 里存的是**年代起始年**（2020 = 2020–2029），
-    // 每项展开成 `year >= d0 AND year < d0+10`，多项之间是「或」。
+    // 年份：`years` 里存的是**具体年份**（2023 只匹配 2023 年上映的作品）。
     //
-    // `year IS NULL` 的行（还没解析出年份）在任何年代条件下都不命中 ——
-    // 这与 `InMemoryMediaRepository` 的口径一致（那边要求 `w.year != null`），
-    // 也和面板上的角标一致（`countWorksByDecade` 不统计它们）。
-    if (decades != null && decades.isNotEmpty) {
-      q.where((t) {
-        Expression<bool>? any;
-        for (final d0 in decades) {
-          final cond = t.year.isBiggerOrEqualValue(d0) &
-              t.year.isSmallerThanValue(d0 + 10);
-          any = any == null ? cond : (any | cond);
-        }
-        return any!;
-      });
+    // `year IS NULL` 的行（还没解析出年份）在任何年份条件下都不命中 ——
+    // `IN` 对 NULL 求值为 NULL（假），这与 `InMemoryMediaRepository` 的口径
+    // 一致（那边要求 `w.year != null`），也和面板上的角标一致
+    // （`countWorksByYear` 不统计它们）。
+    if (years != null && years.isNotEmpty) {
+      q.where((t) => t.year.isIn(years));
     }
 
     // 类型：`genres` 列是 JSON 数组文本（`["动画","科幻"]`），
@@ -448,7 +590,7 @@ class DriftMediaRepository implements MediaRepository {
   ///
   /// ## 为什么要抽出来
   ///
-  /// [listWorks]、[countWorksByDecade]、[countWorksByGenre] 三处都要这一份
+  /// [listWorks]、[countWorksByYear]、[countWorksByGenre] 三处都要这一份
   /// 条件，而其中两条判据都很微妙：
   ///
   ///   - **分类**要处理「空串 = 还没判定过」的历史行（见 [_categoryCondition]）；
@@ -588,7 +730,7 @@ class DriftMediaRepository implements MediaRepository {
   /// 「读一遍、零写入」，会自然收敛。
   @override
   Future<int> backfillWorkCategories() async {
-    // 只取需要的五列：几千行作品表上做一次全列物化是浪费。
+    // 只取需要的列：几千行作品表上做一次全列物化是浪费。
     final rows = await (_db.selectOnly(_db.mediaWorks)
           ..addColumns([
             _db.mediaWorks.key,
@@ -596,6 +738,7 @@ class DriftMediaRepository implements MediaRepository {
             _db.mediaWorks.title,
             _db.mediaWorks.genres,
             _db.mediaWorks.category,
+            _db.mediaWorks.categoryManual,
           ]))
         .get();
 
@@ -606,6 +749,9 @@ class DriftMediaRepository implements MediaRepository {
       for (final row in rows) {
         final key = row.read(_db.mediaWorks.key);
         if (key == null) continue;
+
+        // 用户手动指定的分类不参与回填 —— 那是用户改过的，不归自动逻辑管。
+        if (row.read(_db.mediaWorks.categoryManual) == true) continue;
 
         final stored = row.read(_db.mediaWorks.category) ?? '';
         final genres = _stringList(row.read(_db.mediaWorks.genres) ?? '[]');
@@ -675,20 +821,20 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
-  Future<Map<int, int>> countWorksByDecade({
+  Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
     String? query,
   }) async {
     // 只读 `year` 一列：作品表有十几列，为了一组数字把整行物化是浪费。
     //
-    // 不在 SQL 里 `GROUP BY year / 10 * 10`：那要靠 SQLite 的整数除法
-    // （两个 INTEGER 相除会截断），而 drift 的表达式类型是 `int`，
-    // 一旦哪次 `year` 的列类型变成 REAL 就会静默变成浮点分组 ——
-    // 在这里用 Dart 的 `~/` 算，行为是确定的，且与内存实现逐字一致。
+    // 不在 SQL 里 `GROUP BY year`：`year` 可能为 NULL，而 SQL 的 `GROUP BY`
+    // 会把所有 NULL 归成一个桶（一个「未知年份」的选项）—— 那正是我们要
+    // 排除的（没有年份的作品归不进任何年份）。在 Dart 里跳过 NULL 更直白，
+    // 且与内存实现逐字一致。
     final q = _db.selectOnly(_db.mediaWorks)
       ..addColumns([_db.mediaWorks.year]);
-    // 与 `listWorks` 共用条件：角标必须严格等于「清空年代/类型后列表里的
+    // 与 `listWorks` 共用条件：角标必须严格等于「清空年份/类型后列表里的
     // 条数」，否则用户会点到一个空列表（理由见接口文档）。
     final cond = _workConditions(
       category: category,
@@ -700,10 +846,9 @@ class DriftMediaRepository implements MediaRepository {
     final out = <int, int>{};
     for (final row in await q.get()) {
       final y = row.read(_db.mediaWorks.year);
-      // 没有年份的作品不进表 —— 与 `listWorks` 的年代过滤口径一致。
+      // 没有年份的作品不进表 —— 与 `listWorks` 的年份过滤口径一致。
       if (y == null) continue;
-      final d = y ~/ 10 * 10;
-      out[d] = (out[d] ?? 0) + 1;
+      out[y] = (out[y] ?? 0) + 1;
     }
     return out;
   }
@@ -743,11 +888,16 @@ class DriftMediaRepository implements MediaRepository {
           ..orderBy([(t) => OrderingTerm.asc(t.name)]))
         .get();
     final items = rows.map(_toItem).toList();
-    // 「季 → 集 → 名称」。放在 Dart 里排是因为 SQL 的 NULL 排序行为
+    // 「季 → 部 → 集 → 名称」。放在 Dart 里排是因为 SQL 的 NULL 排序行为
     // 在各驱动/版本上不一致（电影没有季集号），而这里必须稳定。
+    //
+    // ⚠️ 「季在外、部在内」这条口径**必须与详情页的层级选择器一致** ——
+    // 两处排法不同就会出现「选择器高亮 Part.1、列表第一行却是 Part.2」。
     items.sort((a, b) {
       final s = (a.season ?? 0).compareTo(b.season ?? 0);
       if (s != 0) return s;
+      final p = a.partOrder.compareTo(b.partOrder);
+      if (p != 0) return p;
       final e = (a.episode ?? 0).compareTo(b.episode ?? 0);
       if (e != 0) return e;
       return a.name.compareTo(b.name);
@@ -975,6 +1125,8 @@ class DriftMediaRepository implements MediaRepository {
         season: Value(item.season),
         episode: Value(item.episode),
         episodeEnd: Value(item.episodeEnd),
+        part: Value(item.part),
+        partLabel: Value(item.partLabel),
         container: Value(item.container.name),
         resolution: Value(item.resolution?.label),
         sizeBytes: Value(item.sizeBytes),
@@ -1011,6 +1163,7 @@ class DriftMediaRepository implements MediaRepository {
         provider: Value(w.provider.id),
         kind: Value(w.kind.name),
         category: Value(w.category.name),
+        categoryManual: Value(w.categoryManual),
         title: Value(w.title),
         originalTitle: Value(w.originalTitle),
         year: Value(w.year),
@@ -1022,11 +1175,13 @@ class DriftMediaRepository implements MediaRepository {
         backdropFile: Value(w.backdropFile),
         rating: Value(w.rating),
         genres: Value(jsonEncode(w.genres)),
+        genresManual: Value(w.genresManual),
         onlineId: Value(w.onlineId),
         source: Value(w.source.name),
         scrapedAt: Value(w.scrapedAt),
         itemCount: Value(w.itemCount),
         totalBytes: Value(w.totalBytes),
+        seasonCount: Value(w.seasonCount),
         lastModifiedAt: Value(w.lastModifiedAt),
         firstSeenAt: Value(w.firstSeenAt),
         lastPlayedAt: Value(w.lastPlayedAt),
@@ -1069,6 +1224,8 @@ class DriftMediaRepository implements MediaRepository {
         season: row.season,
         episode: row.episode,
         episodeEnd: row.episodeEnd,
+        part: row.part,
+        partLabel: row.partLabel,
         container: VideoContainer.values.firstWhere(
           (c) => c.name == row.container,
           orElse: () => VideoContainer.other,
@@ -1106,6 +1263,7 @@ class DriftMediaRepository implements MediaRepository {
           orElse: () => MediaKind.unknown,
         ),
         category: _categoryOf(row),
+        categoryManual: row.categoryManual,
         title: row.title,
         originalTitle: row.originalTitle,
         year: row.year,
@@ -1117,6 +1275,7 @@ class DriftMediaRepository implements MediaRepository {
         backdropFile: row.backdropFile,
         rating: row.rating,
         genres: _stringList(row.genres),
+        genresManual: row.genresManual,
         onlineId: row.onlineId,
         source: ScrapeSource.values.firstWhere(
           (s) => s.name == row.source,
@@ -1125,6 +1284,7 @@ class DriftMediaRepository implements MediaRepository {
         scrapedAt: row.scrapedAt,
         itemCount: row.itemCount,
         totalBytes: row.totalBytes,
+        seasonCount: row.seasonCount,
         lastModifiedAt: row.lastModifiedAt,
         firstSeenAt: row.firstSeenAt,
         lastPlayedAt: row.lastPlayedAt,

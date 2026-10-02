@@ -16,6 +16,14 @@ enum WorkScrapeStatus {
 
   /// 文件名解析不出可信片名，没有可查的东西。
   noQuery,
+
+  /// 用户**清掉了在线刮削信息**，改成自己敲的片名与分类
+  /// （详情页「自定义」按钮，走 `MediaRepository.customizeWork`）。
+  ///
+  /// 与 [scraped] 分开是必须的：两者的成功文案不同，而且 [WorkScrapeOutcome]
+  /// 的 `metadata` 在自定义这条路上是 `null` —— 把自定义也报成 [scraped]，
+  /// 成功文案里那句 `metadata!.title` 会直接抛。
+  customized,
 }
 
 /// 这次刮削是**谁发起的**。
@@ -52,6 +60,7 @@ class WorkScrapeOutcome {
     required this.channel,
     this.work,
     this.metadata,
+    this.sourceName,
   });
 
   final WorkScrapeStatus status;
@@ -68,17 +77,29 @@ class WorkScrapeOutcome {
   /// 命中的元数据（[WorkScrapeStatus.scraped] 时非空）。
   final ScrapedMetadata? metadata;
 
+  /// 命中来源的展示名（如「豆瓣」「TMDB」），用于在 [message] 里提示用户
+  /// 「这条结果是从哪个源刮来的」。手动通道由 [applyCandidate] 从候选的
+  /// `source` 经流水线 `displayNameOf` 查得；自动通道暂留空。
+  final String? sourceName;
+
   /// 面向用户的一句话结果。
   ///
   /// 按 `(状态, 通道)` **两个维度**取文案 —— 只按状态分是不够的，理由见
-  /// [ScrapeChannel]。成功那条两个通道共用（「已刮削：…」对谁说都一样）。
+  /// [ScrapeChannel]。成功那条两个通道共用（「已刮削：…」对谁说都一样），
+  /// 但会附上来源名（手动通道独有），让用户知道「这条结果来自哪个源」。
   String get message => switch ((status, channel)) {
         (WorkScrapeStatus.scraped, _) =>
           '已刮削：${metadata!.title}'
-              '${metadata!.year == null ? "" : "（${metadata!.year}）"}',
+              '${metadata!.year == null ? "" : "（${metadata!.year}）"}'
+              '${sourceName == null ? "" : " · $sourceName"}',
+        (WorkScrapeStatus.customized, _) =>
+          '已清除在线刮削信息，设为「${work!.title}」· ${work!.category.label}'
+              ' —— 重扫与自动刮削都不会再覆盖它。',
         (WorkScrapeStatus.notFound, ScrapeChannel.auto) =>
           '在线源都没找到信得过的条目 —— 可能是片名解析不准，'
-              '或这个词在数据源里没有收录。点旁边的「手动」自己敲片名再搜。',
+              '或这个词在数据源里没有收录。点旁边的「手动」自己敲片名再搜；'
+              '如果这片子本来就不在数据源里（自制、演唱会、赛事…），'
+              '点「自定义」直接写死片名和分类。',
         (WorkScrapeStatus.notFound, ScrapeChannel.manual) =>
           '这一条解析不出完整信息（条目可能已被删除或改版），换一条候选再试。',
         (WorkScrapeStatus.noQuery, _) => '这个文件名解析不出可信的片名，无法刮削。',
@@ -168,7 +189,15 @@ class WorkScraper {
       }
 
       final merged = _apply(work, meta);
-      await _library.upsertWorks([merged], now: _clock());
+      // `overrideManual: true`：用户**亲手点了**这个按钮，所以即使这部作品
+      // 是他之前「自定义」过的（`source == manual`），这次也照刮不误 ——
+      // 那是他唯一能把作品交还给在线源的路。扫描期那条自动刮削没有这个
+      // 开关，碰不到自定义过的行（见 `mergeWorkForUpsert`）。
+      await _library.upsertWorks(
+        [merged],
+        now: _clock(),
+        overrideManual: true,
+      );
       diag.info('刮削', '${work.key} 已更新：${meta.title}');
       return WorkScrapeOutcome(
         status: WorkScrapeStatus.scraped,
@@ -190,13 +219,17 @@ class WorkScraper {
   /// 挑法与详情页「播放」按钮一致（`WorkDetail.features.first`）：**跳过花絮
   /// 与样片**。`-trailer.mkv` 解析出来的片名常常带着 `trailer`，拿它去搜
   /// 只会搜到一堆不相关的东西。
+  ///
+  /// ⚠️ 必须传 `dirPath` 而不是末级目录名 —— 与扫描期（`ScanService`）
+  /// **完全同一条解析路径**。两处一旦不同，同一个作品「扫描期刮出来是 A、
+  /// 点按钮刮出来是 B」，而用户只会觉得「这个按钮有时候不准」。
   ScrapeQuery? _queryFor(List<MediaItem> items) {
     final features = items.where((i) => !i.isSampleOrExtra).toList();
     final pool = features.isNotEmpty ? features : items;
     for (final item in pool) {
       final parsed = _parser.parse(
         item.name,
-        dirName: MediaFilenameParser.dirNameOf(item.dirPath),
+        dirPath: item.dirPath,
       );
       final query = ScrapeQuery.fromParsed(parsed);
       if (query != null) return query;
@@ -234,9 +267,15 @@ class WorkScraper {
   ///
   /// 与 [scrape] 一样不设「结果为空」以外的失败信号：对话框那边
   /// 无论哪种原因都只能说「换个词再试」，区分了对用户没有额外价值。
-  Future<List<ScrapeCandidate>> searchCandidates(ScrapeQuery query) async {
+  ///
+  /// [sourceId] 非空时只搜那一个源 —— 用户在手动对话框里选了「只在豆瓣搜」
+  /// 时，没必要把 TMDB 的额度也花掉。`null` = 搜全部启用的源。
+  Future<List<ScrapeCandidate>> searchCandidates(
+    ScrapeQuery query, {
+    String? sourceId,
+  }) async {
     try {
-      final found = await _pipeline.search(query);
+      final found = await _pipeline.search(query, sourceId: sourceId);
       diag.info('刮削', '手动刮削搜 "${query.title}"：${found.length} 条候选');
       return found;
     } catch (e) {
@@ -275,7 +314,12 @@ class WorkScraper {
       }
 
       final merged = _apply(work, meta);
-      await _library.upsertWorks([merged], now: _clock());
+      // 同 [scrape]：用户亲手选的候选，覆盖自定义过的行是**他的意图**。
+      await _library.upsertWorks(
+        [merged],
+        now: _clock(),
+        overrideManual: true,
+      );
       diag.info(
         '刮削',
         '${work.key} 手动选中 ${candidate.source}/${candidate.sourceId} → ${meta.title}',
@@ -285,6 +329,9 @@ class WorkScraper {
         channel: channel,
         work: merged,
         metadata: meta,
+        // 让用户在结果消息里看到「这条来自哪个源」—— 手动刮削时
+        // 用户选了候选、也选了搜索源，来源信息对他是有意义的。
+        sourceName: _pipeline.displayNameOf(candidate.source),
       );
     } catch (e) {
       diag.warn('刮削', '${work.key} 应用候选失败，按未命中处理', error: e);
@@ -315,6 +362,7 @@ class WorkScraper {
       provider: work.provider,
       kind: work.kind,
       category: _categoryFor(work, meta),
+      categoryManual: work.categoryManual,
       title: meta.title,
       originalTitle: meta.originalTitle ?? work.originalTitle,
       year: meta.year ?? work.year,
@@ -325,7 +373,12 @@ class WorkScraper {
       backdropUrl: meta.backdropUrl ?? work.backdropUrl,
       backdropFile: backdropChanged ? null : work.backdropFile,
       rating: meta.rating ?? work.rating,
-      genres: meta.genres.isEmpty ? work.genres : meta.genres,
+      // 用户手敲过的类型标签不被刮削覆盖：他可能就是为了修「刮削返回的
+      // 类型是错的」才动手的，再刮一次又冲掉等于白改。
+      genres: work.genresManual
+          ? work.genres
+          : (meta.genres.isEmpty ? work.genres : meta.genres),
+      genresManual: work.genresManual,
       onlineId: meta.onlineId ?? work.onlineId,
       source: ScrapeSource.online,
       scrapedAt: _clock(),
@@ -333,6 +386,8 @@ class WorkScraper {
       // `upsertWorks` 的合并分支原样保留它们 —— 传 0 会把库里的数字抹掉。
       itemCount: work.itemCount,
       totalBytes: work.totalBytes,
+      // 同上：季数也是扫描的产物（刮削不碰 `media_items`）。
+      seasonCount: work.seasonCount,
       // 与扫描无关、与刮削也无关，但它是「最近修改」排序的唯一依据。
       // 不抄的话构造器默认 null，落库后这一列被置空，刮完的电影会从
       // 列表前面直接跳到末尾（NULL 在 DESC 排序里垫底）。
@@ -375,14 +430,27 @@ class WorkScraper {
   /// ⚠️ 改这里要同步改 `MediaRepositoryImpl.backfillWorkCategories` ——
   /// 那边负责把**已经刮过**的作品按同一套规则修正过来，否则老库要等
   /// 用户逐部重刮才生效。
+  /// ## 用户手动指定的分类不受刮削影响
+  ///
+  /// `work.categoryManual == true` 时直接返回原值 —— 用户改过的分类
+  /// 不该被 TMDB 的 genres 悄悄覆盖。用户随时可以重新手动指定来「解锁」。
+  ///
+  /// ## 折算用的必须是「真正会落库的那份 genres」
+  ///
+  /// `work.genresManual == true` 时，`_apply` 会把 `work.genres` 原样带下去
+  /// （而不是 `meta.genres`）。那么分类也必须从 `work.genres` 折算 ——
+  /// 否则会出现「类型标签写着『动画』、分类却是『电影』」这种自相矛盾的行，
+  /// 而它不会报错，只会让分类栏和详情页各说各话。
   MediaCategory _categoryFor(MediaWork work, ScrapedMetadata meta) {
-    final byGenre = MediaCategoryGuesser.fromGenres(meta.genres);
+    if (work.categoryManual) return work.category;
+    final genres = work.genresManual ? work.genres : meta.genres;
+    final byGenre = MediaCategoryGuesser.fromGenres(genres);
     if (byGenre == null) return work.category;
     if (byGenre != work.category) {
       diag.info(
         '刮削',
         '${work.key} 分类 ${work.category.label} → ${byGenre.label}'
-            '（TMDB 类型 ${meta.genres.join("/")}）',
+            '（类型 ${genres.join("/")}）',
       );
     }
     return byGenre;

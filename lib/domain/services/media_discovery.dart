@@ -354,9 +354,10 @@ class MediaDiscoveryService {
 
               case EntryRole.video:
                 {
+                  // 传整个目录路径（不是末级目录名）—— 目录级归组要用它，见 [DirectoryTitle]。
                   final parsed = parser.parse(
                     entry.name,
-                    dirName: MediaFilenameParser.dirNameOf(dir.path),
+                    dirPath: dir.path,
                   );
                   final item = MediaItem.fromEntry(
                     entry: entry,
@@ -509,7 +510,7 @@ class MediaDiscoveryService {
 
     final parsed = parser.parse(
       entry.name,
-      dirName: MediaFilenameParser.dirNameOf(rootPath),
+      dirPath: rootPath,
     );
     final item = MediaItem.fromEntry(
       entry: entry,

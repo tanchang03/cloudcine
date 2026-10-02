@@ -174,16 +174,42 @@ class ScraperPipeline {
     return _attempt(fallback, query);
   }
 
+  /// 当前可做手动搜索的源（已启用且**能出候选**的）。
+  ///
+  /// 排除本地兜底 —— 它没有 `search` 能力（永远返回空列表）。UI 用这个
+  /// 在手动对话框里渲染「选哪个源」的选择器。
+  List<({String id, String displayName})> get availableSources => [
+        for (final s in scrapers)
+          if (s.isEnabled && s.id != 'local')
+            (id: s.id, displayName: s.displayName),
+      ];
+
+  /// 按 id 查展示名。找不到返回 `null` —— UI 那边用 `?? source` 兜底，
+  /// 而不是把原始 id 贴到用户可见的文案里。
+  String? displayNameOf(String sourceId) {
+    for (final s in scrapers) {
+      if (s.id == sourceId) return s.displayName;
+    }
+    return null;
+  }
+
   /// 向所有启用的源要候选，**按源的优先级拼接**，一个都不丢。
   ///
   /// 与 [scrape] 的跑法刻意不同：那个是「并发起跑、按优先级取第一个成功的」，
   /// 因为自动刮削只需要一个答案；这里是「用户要自己挑」，所以必须把
   /// 每个源的候选都给出来。串行而不是并发，是因为豆瓣的额度按搜索词计，
   /// 没必要为了省几百毫秒让它和 TMDB 抢跑 —— 手动刮削一次点一下，量很小。
-  Future<List<ScrapeCandidate>> search(ScrapeQuery query) async {
+  ///
+  /// [sourceId] 非空时只搜那一个源 —— 用户在手动对话框里选了「只在豆瓣搜」
+  /// 时，没必要把 TMDB 的额度也花掉。
+  Future<List<ScrapeCandidate>> search(
+    ScrapeQuery query, {
+    String? sourceId,
+  }) async {
     final out = <ScrapeCandidate>[];
     for (final s in scrapers) {
       if (!s.isEnabled) continue;
+      if (sourceId != null && s.id != sourceId) continue;
       try {
         final found = await s.search(query);
         if (found.isNotEmpty) {

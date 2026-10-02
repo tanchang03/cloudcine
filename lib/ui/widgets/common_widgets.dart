@@ -311,3 +311,100 @@ class TagChip extends StatelessWidget {
     );
   }
 }
+
+/// 「电视上没有键盘」的说明卡。**只在 TV 布局下渲染**，其余平台返回空盒子。
+///
+/// ## 为什么必须有这一块
+///
+/// 设置页有 6 个自由文本字段（TMDB API Key / API 地址 / 图片地址 /
+/// 豆瓣 Cookie / OpenSubtitles Api-Key / API 地址）。在电脑上它们是
+/// 「粘一段字符串」，在电视上却变成「拿遥控器在软键盘上按方向键逐格选字」——
+/// 一段上百字符的豆瓣 Cookie 要按几百下，实际等于填不了。
+///
+/// 难处在于**用户看不出还有别的路**：他看到的就是一排能聚焦、点下去却几乎
+/// 没法用的输入框。所以这块不是「温馨提示」，而是唯一一条可行操作路径的
+/// 说明书 —— 没有它，这一节在电视上就是死路。
+///
+/// ## 为什么这句话不是画饼
+///
+/// 设置项存在 `cloudcine.sqlite` 的 `settings` 表里，而备份服务导出的是
+/// **整个数据库文件**（`library_backup_service.dart` 的 `dbBytesToWrite`
+/// 恒等于 `dbBytes`，不做裁剪），所以设置确实跟着备份走。新电视上本地库是
+/// 空的，`sync()` 里 `!localManifest.hasLibraryContent` 那一条会无条件让
+/// 远程赢 —— 正好就是「第一次同步就把配置拉下来」。
+///
+/// ⚠️ 唯一不跟着走的是**网盘凭证**（扫码登录那一步），所以顺序必须先登录
+/// 再同步。正文里写明了这一点，否则用户会在「同步」上卡住却不知道原因。
+///
+/// ## 为什么不做成「TV 上禁用输入框」
+///
+/// 因为 Android TV 的软键盘是**能用**的，只是难用：插一个 USB 键盘、或用
+/// 电视厂商手机遥控 App 里的键盘，体验与电脑上没差别。禁用会把这条路一起
+/// 堵死 —— 而键盘不是我们的东西，不该替用户决定他用不用。
+class TvTypingNotice extends StatelessWidget {
+  const TvTypingNotice({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    if (!AppTheme.isTvLayout(context)) return const SizedBox.shrink();
+
+    // 这块是 TV 用户唯一的出路，必须读得清 —— 所以自己套一层文字放大，
+    // 而不是跟着设置页其余部分的 11px 走（那是照着电脑屏幕定的）。
+    // 容器高度由内容撑开，放大不会溢出。
+    return AppTheme.tvTextScaler(
+      context,
+      Container(
+        margin: const EdgeInsets.only(bottom: 14),
+        padding: const EdgeInsets.fromLTRB(12, 11, 12, 12),
+        decoration: BoxDecoration(
+          color: AppTheme.accent.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(9),
+          border: Border.all(
+            color: AppTheme.accent.withValues(alpha: 0.35),
+            width: 0.5,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.keyboard_alt_outlined,
+                  size: 15,
+                  color: AppTheme.accent,
+                ),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    '电视上没有键盘 —— 这一节建议在电脑/手机上配好',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: AppTheme.text,
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '用遥控器在软键盘上逐字选，一段 Cookie 要按几百下，等于填不了。\n'
+              '正路：在电脑或手机上打开云影 → 把这里填好 → 点「上传备份」→ '
+              '回到这台电视，在「备份与同步」里点「同步」，配置就跟着媒体库一起过来。\n'
+              '也可以：给电视插一个 USB 键盘，或用电视厂商手机遥控 App 里的键盘 —— '
+              '那样和电脑上一样好打。\n'
+              '⚠️ 网盘登录（扫码）不在备份里，所以顺序是「先在电视上登录，再同步」。',
+              style: const TextStyle(
+                fontSize: 11.5,
+                height: 1.75,
+                color: AppTheme.muted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
