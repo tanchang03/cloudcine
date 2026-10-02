@@ -40,8 +40,13 @@ import '../http/http_client.dart';
 ///    `{"request":"GET /v2/search","msg":"need_login","code":103}`，
 ///    实测**既见过 200 也见过 403**。所以判成功必须在解析业务码**之后**，
 ///    只看状态码会把 403 那次的 103 当成普通失败而漏掉熔断。
-/// 6. **海报 CDN 缺 `Referer` 一律 418。** 实测带 Referer 200 / 不带 418。
-///    这条在 `imageHeaders()` 里给，由 `PosterCache` 在下载时调用。
+/// 6. **海报 CDN 的 `img*` 子域会拒绝带 Referer 的请求。** 2026-10-02
+///    实测：同一张图 `p2616542123.jpg`、同一个 `Referer` 头，
+///    `qnmob3-sign.doubanio.com` 返回 200，`img3.doubanio.com` 返回 403，
+///    `img9.doubanio.com` 返回 418。详情接口给的 `cover_url` 恰好用的是
+///    `img*` 子域，所以在 [_toMetadata] 里统一改写成 `qnmob3-sign`（见
+///    [_rewritePosterUrl]）。`Referer` 仍然必带（[imageHeaders]），少了
+///    照样 418 —— 改域名是解决「带了 Referer 还是被拒」，不是替代它。
 ///
 /// ## 额度与节流
 ///
@@ -580,9 +585,14 @@ class DoubanScraper implements MetadataScraper {
       return null;
     }
 
-    final cover = _stringOf(detail['cover_url']);
+    final cover = _rewritePosterUrl(_stringOf(detail['cover_url']));
 
     // 海报直接用详情给的 `cover_url`（`m_ratio_poster`，实测 540×803 = 2:3）。
+    //
+    // ⚠️ 详情接口返回的 `cover_url` 用的是 `img*.doubanio.com` 子域，该子域
+    // 已启用了新的防盗链策略（即使带 Referer 也 403/418）。[_rewritePosterUrl]
+    // 把它改写成 `qnmob3-sign.doubanio.com`（搜索结果缩略图一直用的那个子域，
+    // 实测同图同头返回 200）。路径不变 —— 它是按图 ID 给的，换域名后有效。
     //
     // 不改写成 `l_ratio_poster`（1080×1606，但 299KB）：卡片墙的格子约
     // 170×255 逻辑像素，`m` 在 3 倍屏下也够（510×765），而体积只有三分之一。
@@ -739,9 +749,36 @@ class DoubanScraper implements MetadataScraper {
     return host == 'doubanio.com' || host.endsWith('.doubanio.com');
   }
 
+  /// 把 `img*.doubanio.com` 海报地址改写成 `qnmob3-sign.doubanio.com`。
+  ///
+  /// 2026-10-02 实测：豆瓣启用了新的 CDN 防盗链策略，`img3` / `img9` 等
+  /// 子域名即使带正确 `Referer` 也返回 403/418；而搜索结果缩略图用的
+  /// `qnmob3-sign.doubanio.com` 同图同头返回 200。详情接口返回的
+  /// `cover_url` 用的正是 `img*` 子域，落库前改写过去，`PosterCache`
+  /// 下载时就能成功。
+  ///
+  /// **只换域名，路径不变**：`/view/photo/m_ratio_poster/public/pXXX.jpg`
+  /// 是服务端按图 ID 给的，换到 `qnmob3-sign` 子域后仍然有效（已 curl 验证）。
+  ///
+  /// 已经是目标域名的 URL 原样返回（幂等）。非豆瓣 URL 原样返回（不误伤
+  /// TMDB 等其他刮削器的海报）。
+  static String? _rewritePosterUrl(String? url) {
+    if (url == null) return null;
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme) return url;
+    final host = uri.host;
+    if (host == 'qnmob3-sign.doubanio.com') return url; // 已是目标域名
+    if (host == 'doubanio.com' || host.endsWith('.doubanio.com')) {
+      return uri.replace(host: 'qnmob3-sign.doubanio.com').toString();
+    }
+    return url;
+  }
+
   /// 下载豆瓣图片必须带的请求头。
   ///
-  /// 实测 `img*.doubanio.com` 缺 `Referer` 一律 **418**（带则 200）。
+  /// 实测豆瓣图片 CDN 缺 `Referer` 一律 **418**。但 `img*` 子域名还会
+  /// 间歇性 403（即使带 Referer），所以海报 URL 在 [_rewritePosterUrl] 里
+  /// 改写到了 `qnmob3-sign` 子域。
   ///
   /// **不带 Cookie**：实测图片 CDN 只看 Referer，而把用户的豆瓣登录凭证
   /// 送到图片域名上没有必要 —— 能少送一处就少送一处。

@@ -11,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/format.dart';
+import '../../core/utils/mpv_cache_state.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
@@ -170,7 +171,43 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// 单位看着别扭但很关键 —— `1.0×` 正好是「下载与播放持平」的分界线，
   /// 低于它就迟早再卡一次。KB/s 是 [_cacheBytesPerSecond] 的事。
+  ///
+  /// ⚠️ 读它请用 [_currentCacheRate]：本字段**不会**因为「太久没新样本」而
+  /// 失效，直接读会把一个过时的尖峰一直印在界面上。
   double? _cacheRate;
+
+  /// [_cacheRate] 最近一次被刷新的时刻，配合 [_currentCacheRate] 做过期。
+  ///
+  /// 为什么需要过期：`_cacheRate` 只在算出新值时才更新（`null` 时保留旧值，
+  /// 否则数字会一格一格地闪）。可一旦 mpv 停止发 `demuxer-cache-time`
+  /// （缓存填满、片源结束），那个旧值就**永远留在界面上** —— 若它恰好是一个
+  /// 尖峰，用户就会长时间看着一个假数字（「缓冲 1.0 GB/s」的观感由此而来）。
+  DateTime? _cacheRateAt;
+
+  /// 缓存倍速的有效期。超过它没刷新就当没测到。
+  static const Duration _cacheRateStaleAfter = Duration(seconds: 5);
+
+  /// mpv 直接给的**输入速率**（字节/秒，`demuxer-cache-state.raw-input-rate`）。
+  ///
+  /// 这是**真实下载速率**，不是估算：有它就不必再乘平均码率，也就顺带消掉了
+  /// 「播转码档时码率对不上」那个偏差。拿不到时为 null，那时退回
+  /// [_cacheBytesPerSecond] 的估算值。解析见 [rawInputBytesPerSecond]。
+  double? _netBytesPerSecond;
+
+  /// 轮询 `demuxer-cache-state` 的计时器。
+  ///
+  /// 用轮询而不是 `observeProperty`：这个属性是 node 类型、变更通知不保证发，
+  /// 而 1 Hz 读一个字符串的代价可以忽略。
+  Timer? _netSpeedTimer;
+
+  /// 当前**可信**的缓存倍速。
+  double? get _currentCacheRate {
+    final at = _cacheRateAt;
+    final rate = _cacheRate;
+    if (rate == null || at == null) return null;
+    if (DateTime.now().difference(at) > _cacheRateStaleAfter) return null;
+    return rate;
+  }
 
   /// mpv 自己的「初始填充」百分比（0~100，`cache-buffering-state`）。
   ///
@@ -299,6 +336,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 已经在拆了。测试里则会表现成「A Timer is still pending」。
     _hideTimer?.cancel();
     _playlistUnmountTimer?.cancel();
+    _netSpeedTimer?.cancel();
     _playlistController.dispose();
     unawaited(_releasePlayer());
 
@@ -340,6 +378,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _currentRequest = null;
     _refreshing = false;
     _refreshGuard.reset();
+    // 轮询也该停：播放器马上就没了，继续读只会每秒白跑一次。
+    _netSpeedTimer?.cancel();
+    _netSpeedTimer = null;
 
     // 先取消订阅：否则 dispose 过程中还可能触发一次进度回报，
     // 而那会在通道上打一条指向已释放播放器的消息。
@@ -672,7 +713,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         if (!mounted) return;
         setState(() {
           _cacheAhead = ahead;
-          if (rate != null) _cacheRate = rate;
+          if (rate != null) {
+            _cacheRate = rate;
+            // 时间戳跟着值一起走：[_currentCacheRate] 靠它判断这一份还新不新。
+            _cacheRateAt = DateTime.now();
+          }
         });
       }),
     );
@@ -1209,11 +1254,19 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 上一部片子的「已缓存 10 秒」出现，然后突然跳回 0。
       _cacheAhead = Duration.zero;
       _cacheRate = null;
+      _cacheRateAt = null;
       _cacheFill = null;
+      _netBytesPerSecond = null;
       _cacheMeter.reset();
     });
     try {
       _ensurePlayer();
+      // 输入速率从换源那一刻起重新采（上一条流的数字不能带过来）。
+      //
+      // ⚠️ 必须放在 `_ensurePlayer()` **之后**：播放器建不出来时
+      // （`flutter test` 里就是如此，libmpv 不在 rpath 里）不该留下一个
+      // 永远在跑的计时器 —— 那会变成「A Timer is still pending」。
+      _startNetSpeedPolling();
       // ⚠️ 请求头必须带上。夸克直链缺 Cookie 一律返回 412，
       // 表现是「能取到链、一播就报错」，而错误信息里看不出是缺头。
       //
@@ -1704,14 +1757,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   String _cacheStatusLine() {
     final parts = <String>['已缓存 ${_formatDuration(_cacheAhead)}'];
 
-    final bytes = _cacheBytesPerSecond();
+    final bytes = _currentBytesPerSecond();
     if (bytes != null && bytes >= 1) {
       // 复用 `formatBytes`（已有单测覆盖），只在后面补一个「/秒」。
       parts.add('≈${formatBytes(bytes.round())}/s');
     } else {
-      // 没有文件大小（手输直链、自检视频）时换不出字节数，就退回报倍速 ——
-      // 它本身也说明问题：`1.0×` 是下载与播放持平的分界线。
-      final rate = _cacheRate;
+      // 没有文件大小（手输直链、自检视频）、或字节数被护栏挡下时，退回报倍速
+      // —— 它本身也说明问题：`1.0×` 是下载与播放持平的分界线。
+      final rate = _currentCacheRate;
       if (rate != null && rate > 0.05) {
         parts.add('${rate.toStringAsFixed(1)}×');
       }
@@ -1719,20 +1772,65 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     return parts.join(' · ');
   }
 
-  /// 把 [CacheSpeedMeter] 的倍速换算成字节/秒；缺任何一环都返回 null。
+  /// 界面上该显示多少字节/秒。
   ///
-  /// 换算靠平均码率：`文件大小 ÷ 时长`，再乘「每秒缓存多少秒视频」。
-  /// 这是**估算**（VBR 片源会偏），所以显示时带 `≈`。
-  double? _cacheBytesPerSecond() {
-    final rate = _cacheRate;
-    final size = _currentRequest?.sizeBytes;
-    final total = _player?.state.duration ?? Duration.zero;
-    if (rate == null || size == null || size <= 0) return null;
-    if (total <= Duration.zero) return null;
+  /// **优先用 mpv 直接给的输入速率**（[_netBytesPerSecond]，真实下载速率），
+  /// 拿不到才退回估算。两条路的差别很实际：估算要乘「文件大小 ÷ 时长」这个
+  /// 平均码率，播转码档时它跟实际流码率对不上，会把网速放大若干倍。
+  ///
+  /// 两条路都过同一道护栏（[defaultMaxCacheBytesPerSecond]）：无论来源如何，
+  /// 超过它就不是网速，宁可这一拍不显示。
+  double? _currentBytesPerSecond() {
+    final net = _netBytesPerSecond;
+    if (net != null && net >= 1 && net <= defaultMaxCacheBytesPerSecond) {
+      return net;
+    }
+    return _cacheBytesPerSecond();
+  }
 
-    final seconds =
-        total.inMicroseconds / Duration.microsecondsPerSecond;
-    return rate * (size / seconds);
+  /// 把 [CacheSpeedMeter] 的倍速换算成字节/秒；缺任何一环、或算出来的数字
+  /// 物理上不可能时返回 `null`。
+  ///
+  /// 换算与护栏都在 [cacheBytesPerSecond] 里 —— 那里写了为什么必须挡掉
+  /// GB/s 级的数字（一句话：`demuxer-cache-time` 量到的可能是本地块填充，
+  /// 不是下载），别在这里另写一份判断。
+  double? _cacheBytesPerSecond() {
+    return cacheBytesPerSecond(
+      rate: _currentCacheRate,
+      sizeBytes: _currentRequest?.sizeBytes,
+      duration: _player?.state.duration ?? Duration.zero,
+    );
+  }
+
+  /// 开始 1 Hz 轮询 `demuxer-cache-state`。重复调用只会重置计时器。
+  void _startNetSpeedPolling() {
+    _netSpeedTimer?.cancel();
+    _netSpeedTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => unawaited(_readNetSpeed()),
+    );
+  }
+
+  /// 读一次 mpv 的输入速率。
+  ///
+  /// 用 `getProperty` 轮询而不是 `observeProperty`：这个属性是 node 类型、
+  /// 变更通知不保证发；1 Hz 读一个字符串的代价可以忽略。
+  ///
+  /// 任何失败（播放器还没建好、已 dispose、属性读不到）都只是让这个值为 null
+  /// —— 那时界面退回估算值。**绝不抛**，它跑在播放路径上。
+  Future<void> _readNetSpeed() async {
+    final platform = _player?.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      final state = await platform.getProperty('demuxer-cache-state');
+      final bytes = rawInputBytesPerSecond(state);
+      if (!mounted) return;
+      // 值没变就不 setState：1 Hz 的重建虽然便宜，但没必要。
+      if (bytes == _netBytesPerSecond) return;
+      setState(() => _netBytesPerSecond = bytes);
+    } catch (e) {
+      diag.debug('缓冲', '读输入速率失败：$e');
+    }
   }
 
   /// 底部浮层：片名 + 进度条 + 按钮行。

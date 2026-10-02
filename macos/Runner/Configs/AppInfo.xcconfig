@@ -5,13 +5,15 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = cloudcine
+// 构建产物名（磁盘上的 .app 文件名）= CloudCine.app；用户可见名称见 Info.plist 的
+// CFBundleDisplayName（云影 CloudCine）。两者刻意区分：文件名保持 ASCII、无空格。
+PRODUCT_NAME = CloudCine
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = com.cloudcine.cloudcine
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 com.cloudcine. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 tanchang03 <tanchang03@163.com>
 
 // ── 代码签名 ──────────────────────────────────────────────────────────────
 // 本仓库**不提交任何真实签名身份**：公司主体名、Team ID、证书名一律不落库。

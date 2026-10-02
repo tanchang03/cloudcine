@@ -1,7 +1,6 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:cloudcine/core/error/drive_error.dart';
 import 'package:cloudcine/domain/adapters/cloud_drive_adapter.dart';
 import 'package:cloudcine/domain/entities/auth_credential.dart';
 import 'package:cloudcine/domain/entities/capabilities.dart';
@@ -241,6 +240,175 @@ void main() {
       expect(manifest.fileNames, isNot(contains('posters/')));
     });
   });
+
+  group('sync —— Last-Write-Wins 必须比「库内容时间」', () {
+    /// 造一份「远程已存在」的备份：用一个独立的 service 导出，
+    /// 时间由 [remoteModifiedAt] 决定（null = 空库）。
+    Future<Uint8List> makeRemoteBackup({
+      required DateTime? remoteModifiedAt,
+      String deviceId = 'remote-machine',
+    }) async {
+      final remoteDir = Directory('${tempDir.path}/remote_${deviceId}_$remoteModifiedAt')
+        ..createSync(recursive: true);
+      final remoteDb = File('${remoteDir.path}/cloudcine.sqlite');
+      await remoteDb.writeAsBytes(_fakeSqliteHeader());
+      final remotePosters = Directory('${remoteDir.path}/posters')
+        ..createSync(recursive: true);
+      await File('${remotePosters.path}/p.jpg')
+          .writeAsBytes(Uint8List.fromList([1, 2, 3]));
+
+      final remoteService = LibraryBackupService(
+        adapter: _NoOpAdapter(),
+        databasePath: remoteDb.path,
+        posterCachePath: remotePosters.path,
+        deviceId: deviceId,
+        deviceName: '远程机器',
+        schemaVersion: 6,
+        localModifiedAt: () async => remoteModifiedAt,
+      );
+      return remoteService.exportBackup();
+    }
+
+    /// 造一个本地 service，库内容时间由 [localModifiedAt] 决定。
+    LibraryBackupService localService({
+      required DateTime? localModifiedAt,
+      String deviceId = 'local-machine',
+      _FakeRemoteDrive? drive,
+    }) =>
+        LibraryBackupService(
+          adapter: drive ?? _FakeRemoteDrive(),
+          databasePath: dbPath,
+          posterCachePath: posterPath,
+          deviceId: deviceId,
+          deviceName: '本地机器',
+          schemaVersion: 6,
+          localModifiedAt: () async => localModifiedAt,
+        );
+
+    test('⚠️ 本地空库 + 远程有内容 → 恢复远程（绝不覆盖）', () async {
+      final remoteBytes = await makeRemoteBackup(
+        remoteModifiedAt: DateTime.utc(2026, 9, 1, 8),
+      );
+      final drive = _FakeRemoteDrive()
+        ..seed('cloudcine_backup_remote.ccbak', remoteBytes);
+
+      final svc = localService(localModifiedAt: null, drive: drive);
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.restored);
+      // 关键：远程那份**没被覆盖**，且本地库被写成了远程的内容。
+      expect(drive.uploadedFiles, isEmpty);
+      expect(drive.bytesOf('cloudcine_backup_remote.ccbak'), remoteBytes);
+      final localDb = await File(dbPath).readAsBytes();
+      expect(localDb, _fakeSqliteHeader());
+    });
+
+    test('本地库比远程新 → 上传覆盖', () async {
+      final remoteBytes = await makeRemoteBackup(
+        remoteModifiedAt: DateTime.utc(2026, 9, 1, 8),
+      );
+      final drive = _FakeRemoteDrive()
+        ..seed('cloudcine_backup_remote.ccbak', remoteBytes);
+
+      final svc = localService(
+        localModifiedAt: DateTime.utc(2026, 10, 2, 12),
+        drive: drive,
+      );
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.uploaded);
+      expect(drive.uploadedFiles, isNotEmpty);
+    });
+
+    test('远程库比本地新 → 下载恢复本地', () async {
+      final remoteBytes = await makeRemoteBackup(
+        remoteModifiedAt: DateTime.utc(2026, 10, 2, 12),
+      );
+      final drive = _FakeRemoteDrive()
+        ..seed('cloudcine_backup_remote.ccbak', remoteBytes);
+
+      final svc = localService(
+        localModifiedAt: DateTime.utc(2026, 9, 1, 8),
+        drive: drive,
+      );
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.restored);
+      expect(drive.uploadedFiles, isEmpty);
+    });
+
+    test('⚠️ 远程是空备份 + 本地有内容 → 用本地覆盖，不被空库清掉', () async {
+      // 远程那份是「别人从新机器推上来的空库」。
+      final emptyRemote = await makeRemoteBackup(
+        remoteModifiedAt: null,
+        deviceId: 'someone-elses-new-machine',
+      );
+      final drive = _FakeRemoteDrive()
+        ..seed('cloudcine_backup_empty.ccbak', emptyRemote);
+
+      final svc = localService(
+        localModifiedAt: DateTime.utc(2026, 10, 2, 12),
+        drive: drive,
+      );
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.uploaded);
+      // 本地库**没有**被那个空备份覆盖。
+      final localDb = await File(dbPath).readAsBytes();
+      expect(localDb, _fakeSqliteHeader());
+    });
+
+    test('远程无备份 → 首次上传', () async {
+      final svc = localService(
+        localModifiedAt: DateTime.utc(2026, 10, 2, 12),
+        drive: _FakeRemoteDrive(),
+      );
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.uploaded);
+      expect(result.message, contains('首次上传'));
+    });
+
+    test('同设备 + 同库内容时间 → 无操作', () async {
+      final t = DateTime.utc(2026, 10, 2, 12);
+      final remoteBytes = await makeRemoteBackup(
+        remoteModifiedAt: t,
+        deviceId: 'same-machine',
+      );
+      final drive = _FakeRemoteDrive()
+        ..seed('cloudcine_backup_same.ccbak', remoteBytes);
+
+      final svc = localService(
+        localModifiedAt: t,
+        deviceId: 'same-machine',
+        drive: drive,
+      );
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.unchanged);
+      expect(drive.uploadedFiles, isEmpty);
+    });
+
+    test('不同设备 + 库内容时间差 < 60s → 报冲突', () async {
+      final t = DateTime.utc(2026, 10, 2, 12);
+      final remoteBytes = await makeRemoteBackup(
+        remoteModifiedAt: t.add(const Duration(seconds: 10)),
+        deviceId: 'other-machine',
+      );
+      final drive = _FakeRemoteDrive()
+        ..seed('cloudcine_backup_conflict.ccbak', remoteBytes);
+
+      final svc = localService(
+        localModifiedAt: t,
+        deviceId: 'local-machine',
+        drive: drive,
+      );
+      final result = await svc.sync();
+
+      expect(result.action, SyncAction.conflict);
+      expect(drive.uploadedFiles, isEmpty);
+    });
+  });
 }
 
 /// 从备份字节流中提取 manifest（复刻 service 内部逻辑，供测试自验）。
@@ -326,4 +494,150 @@ class _NoOpAdapter extends CloudDriveAdapter {
 
   @override
   Future<void> signOut() async {}
+}
+
+/// 支持「列目录 / 建目录 / 上传 / 读文件 / 删除」的内存网盘。
+///
+/// 只实现备份同步真正用到的那几个方法 —— 其余抛 `UnimplementedError`，
+/// 跑到了就说明调用点走错了路。
+///
+/// 它刻意**不做**分页：备份目录里的文件数量在测试量级下无所谓，
+/// 而分页逻辑本身在 `fake_drive.dart` 里已经被覆盖过了。
+class _FakeRemoteDrive extends CloudDriveAdapter {
+  static const String _root = 'root';
+  static const String _backupDirFid = 'backup-dir';
+
+  /// 远程文件：文件名 → 字节。
+  final Map<String, Uint8List> _files = {};
+
+  /// 备份目录当前是否存在（首次 `createFolder` 后为 true）。
+  bool _dirExists = false;
+
+  /// 记录每次上传的文件名，供断言「到底有没有上传」。
+  final List<String> uploadedFiles = [];
+
+  int _fidSeq = 0;
+
+  /// 预置一份远程备份。
+  void seed(String name, Uint8List bytes) {
+    _dirExists = true;
+    _files[name] = bytes;
+  }
+
+  Uint8List? bytesOf(String name) => _files[name];
+
+  @override
+  DriveProvider get provider => DriveProvider.quark;
+
+  @override
+  Capabilities get capabilities =>
+      const Capabilities(provider: DriveProvider.quark, canListDirectory: true);
+
+  @override
+  String get rootId => _root;
+
+  @override
+  Future<DrivePage> listDirectory({
+    required String dirId,
+    String? pageToken,
+    int? pageSize,
+  }) async {
+    if (dirId == _root) {
+      return DrivePage(
+        entries: [
+          if (_dirExists)
+            const DriveEntry(
+              id: _backupDirFid,
+              name: LibraryBackupService.defaultBackupDir,
+              isDirectory: true,
+            ),
+        ],
+      );
+    }
+    if (dirId == _backupDirFid) {
+      return DrivePage(
+        entries: [
+          for (final e in _files.entries)
+            DriveEntry(
+              id: 'fid-${e.key}',
+              name: e.key,
+              isDirectory: false,
+              sizeBytes: e.value.length,
+              modifiedAt: DateTime.utc(2026, 10, 2),
+            ),
+        ],
+      );
+    }
+    return const DrivePage(entries: []);
+  }
+
+  @override
+  Future<String> createFolder({
+    required String parentId,
+    required String name,
+  }) async {
+    _dirExists = true;
+    return _backupDirFid;
+  }
+
+  @override
+  Future<String> uploadFile({
+    required String parentId,
+    required String fileName,
+    required List<int> bytes,
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    _dirExists = true;
+    _files[fileName] = Uint8List.fromList(bytes);
+    uploadedFiles.add(fileName);
+    onProgress?.call(bytes.length, bytes.length);
+    return 'fid-new-${_fidSeq++}';
+  }
+
+  @override
+  Future<List<String>> deleteFiles({required List<String> fileIds}) async {
+    for (final fid in fileIds) {
+      _files.removeWhere((k, _) => 'fid-$k' == fid);
+    }
+    return fileIds;
+  }
+
+  @override
+  Future<Uint8List> readFileBytes(
+    String fileId, {
+    int maxBytes = 512 * 1024,
+  }) async {
+    final name = _files.keys.firstWhere(
+      (k) => 'fid-$k' == fileId,
+      orElse: () => throw StateError('远程没有这个 fid：$fileId'),
+    );
+    return _files[name]!;
+  }
+
+  @override
+  Future<CloudAccount?> restoreSession() async => null;
+
+  @override
+  Future<CloudAccount> authorize(AuthCredential credential) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> signOut() async {}
+
+  @override
+  Future<bool> ping() async => true;
+
+  @override
+  Future<StreamTicket> resolveStream(String fileId, {String? qualityId}) =>
+      throw UnimplementedError();
+
+  @override
+  Future<List<DriveEntry>> search({
+    required String keyword,
+    int limit = 100,
+    int offset = 0,
+  }) async => const <DriveEntry>[];
+
+  @override
+  Future<void> dispose() async {}
 }

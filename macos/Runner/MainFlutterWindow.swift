@@ -12,6 +12,10 @@ class MainFlutterWindow: NSWindow {
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: true)
 
+    // 主窗口标题栏：与用户可见名称保持一致（播放器子窗口的标题在
+    // `ChildWindowController` 里单独设为「云影 · 播放器」）。
+    self.title = "云影 CloudCine"
+
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     // PC 端播放器窗口是**另一个 Flutter 引擎**（desktop_multi_window 每窗口

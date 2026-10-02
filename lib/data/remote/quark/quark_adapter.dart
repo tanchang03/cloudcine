@@ -764,7 +764,7 @@ class QuarkAdapter implements CloudDriveAdapter {
 
     diag.warn('文件', '删除 ${fileIds.length} 个文件：${fileIds.join(", ")}');
 
-    final result = await _request(
+    await _request(
       () => _post(QuarkEndpoints.fileDelete, body: {
         'action_type': 2, // 永久删除
         'filelist': fileIds,
@@ -832,6 +832,11 @@ class QuarkAdapter implements CloudDriveAdapter {
         message: '上传预请求失败：没有返回 task_id',
       );
     }
+
+    // 记下预上传响应里有哪些键 —— 完成上传需要 callback / bucket /
+    // obj_key / upload_id / auth_info / upload_url，缺哪个一看便知。
+    diag.debug('上传', '预上传响应键：${preData.keys.toList()}'
+        '，callback=${preData.containsKey('callback') ? "有" : "无"}');
 
     // ② 计算哈希，尝试秒传
     final sha1 = _computeSha1(bytes);
@@ -943,11 +948,123 @@ class QuarkAdapter implements CloudDriveAdapter {
           '（${_formatBytes(end)}/${_formatBytes(size)}）');
     }
 
-    // ④ 完成上传
+    // ④ 完成分片上传（走 OSS CompleteMultipartUpload + callback，
+    //    不是夸克的 /file/upload/finish）。
+    //
+    // 参考夸克 PC 客户端行为：所有分片 PUT 成功后，向 OSS 提交
+    // CompleteMultipartUpload XML，并带 x-oss-callback 头让 OSS 回
+    // 调夸克服务端完成入库。走 /file/upload/finish 会报 43001。
+    final fid = await _completeMultipartUpload(
+      taskId: taskId,
+      bucket: bucket,
+      objKey: objKey,
+      uploadId: uploadId,
+      uploadUrlBase: uploadUrlBase,
+      authInfo: authInfo,
+      preData: preData,
+      etags: etags,
+    );
+
+    diag.info('上传', '「$fileName」上传完成 → fid=$fid');
+    return fid;
+  }
+
+  /// 完成 OSS 分片上传并触发 callback。
+  ///
+  /// 夸克的上传收尾是**两步**，缺一不可：
+  ///   1. 向 OSS 提交 `CompleteMultipartUpload` XML（带 `x-oss-callback`），
+  ///      让对象存储把分片合并成一个对象；
+  ///   2. 调 `/1/clouddrive/file/upload/finish`（body 只要 `task_id` +
+  ///      `obj_key`），通知夸克网盘把该对象登记成文件。
+  ///
+  /// 只做第 2 步会得到 `43001 request cpp error[complete file failed!]`
+  /// —— 服务端找不到可合并的对象，所以「完成」失败。
+  ///
+  /// 参考实现：`RemyYYZ/QuarkPan` 的 `complete_multipart_upload` +
+  /// `finish_upload` 两步法。
+  Future<String> _completeMultipartUpload({
+    required String taskId,
+    required String bucket,
+    required String objKey,
+    required String uploadId,
+    required String uploadUrlBase,
+    required Object? authInfo,
+    required Map<String, Object?> preData,
+    required List<Map<String, Object?>> etags,
+  }) async {
+    // 构造 OSS 基地址
+    final base = uploadUrlBase
+        .replaceAll('http://', '')
+        .replaceAll('https://', '');
+    final ossBase = 'https://$bucket.$base/$objKey';
+
+    // 1. 构造 CompleteMultipartUpload XML
+    //
+    // ⚠️ ETag 必须用**双引号**包起来 —— OSS 的 XML 规范要求原样回填
+    // 分片 PUT 响应里的 ETag（含引号）。不加引号会被判定为分片不匹配。
+    final xml = buildCompleteMultipartXml(etags);
+    final xmlBytes = utf8.encode(xml);
+
+    // 2. 计算 XML 的 Content-MD5（base64）
+    final contentMd5 = base64Encode(crypto.md5.convert(xmlBytes).bytes);
+
+    // 3. callback：base64(json.dumps(callback))，紧凑 JSON（无空格）
+    final callbackConfig = preData['callback'];
+    if (callbackConfig == null) {
+      throw const DriveException(
+        type: DriveErrorType.malformedResponse,
+        message: '上传预请求没有返回 callback，无法完成 OSS 合并上传',
+      );
+    }
+    final callbackBase64 =
+        base64Encode(utf8.encode(jsonEncode(callbackConfig)));
+
+    // 4. 向夸克申请「完成合并」的 auth_key
+    //
+    // auth_meta 的字段顺序必须与真实请求头一致，签名才算得对。
+    final ts = _ossTimestamp();
+    final authMeta = 'POST\n$contentMd5\napplication/xml\n$ts\n'
+        'x-oss-callback:$callbackBase64\n'
+        'x-oss-date:$ts\n'
+        'x-oss-user-agent:aliyun-sdk-js/6.6.1\n'
+        '/$bucket/$objKey?uploadId=$uploadId';
+
+    final authResult = await _request(
+      () => _post(QuarkEndpoints.uploadAuth, body: {
+        'auth_info': authInfo,
+        'auth_meta': authMeta,
+        'task_id': taskId,
+      }),
+      context: '完成上传授权',
+    );
+
+    final authKey = authResult.dataMap?['auth_key'] as String? ?? '';
+
+    // 5. POST XML 到 OSS（合并分片）
+    final completeUrl = '$ossBase?uploadId=$uploadId';
+    await _http.postBytes(
+      completeUrl,
+      body: xmlBytes,
+      headers: {
+        'Authorization': authKey,
+        'Content-MD5': contentMd5,
+        'Content-Type': 'application/xml',
+        'Referer': QuarkEndpoints.referer,
+        'x-oss-callback': callbackBase64,
+        'x-oss-date': ts,
+        'x-oss-user-agent': 'aliyun-sdk-js/6.6.1',
+      },
+      timeout: const Duration(seconds: 60),
+    );
+    diag.info('上传', 'OSS 分片合并完成');
+
+    // 6. 通知夸克网盘：把合并后的对象登记成文件
+    //
+    // body 只有 task_id + obj_key —— 不是 part_info_list。
     final finishResult = await _request(
       () => _post(QuarkEndpoints.uploadFinish, body: {
         'task_id': taskId,
-        'part_info_list': etags,
+        'obj_key': objKey,
       }),
       context: '完成上传',
     );
@@ -956,12 +1073,35 @@ class QuarkAdapter implements CloudDriveAdapter {
     if (fid == null || fid.isEmpty) {
       throw const DriveException(
         type: DriveErrorType.malformedResponse,
-        message: '上传完成响应中没有返回文件 ID',
+        message: '完成上传响应中没有返回文件 ID',
       );
     }
-
-    diag.info('上传', '「$fileName」上传完成 → fid=$fid');
     return fid;
+  }
+
+  /// 构造 OSS `CompleteMultipartUpload` 的 XML 请求体。
+  ///
+  /// ⚠️ 两条规则错了都不报错、只表现为「合并上传失败」：
+  ///   - 分片必须**按 part_number 升序**排列；
+  ///   - ETag 必须用**双引号**包起来（原样回填 PUT 响应里的值）。
+  static String buildCompleteMultipartXml(
+    List<Map<String, Object?>> parts,
+  ) {
+    final ordered = [...parts]..sort(
+        (a, b) => (a['part_number'] as int? ?? 0)
+            .compareTo(b['part_number'] as int? ?? 0),
+      );
+    final buffer = StringBuffer(
+      '<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n',
+    );
+    for (final entry in ordered) {
+      final pn = entry['part_number'] as int? ?? 0;
+      final etag = entry['etag'] as String? ?? '';
+      buffer.write('<Part>\n<PartNumber>$pn</PartNumber>\n'
+          '<ETag>"$etag"</ETag>\n</Part>\n');
+    }
+    buffer.write('</CompleteMultipartUpload>');
+    return buffer.toString();
   }
 
   /// 计算 SHA1（hex 小写）。

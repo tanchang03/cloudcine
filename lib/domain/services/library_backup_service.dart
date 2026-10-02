@@ -45,12 +45,14 @@ class LibraryBackupService {
     required String deviceId,
     required String deviceName,
     int schemaVersion = 6,
+    Future<DateTime?> Function()? localModifiedAt,
   })  : _adapter = adapter,
         _databasePath = databasePath,
         _posterCachePath = posterCachePath,
         _deviceId = deviceId,
         _deviceName = deviceName,
-        _schemaVersion = schemaVersion;
+        _schemaVersion = schemaVersion,
+        _localModifiedAt = localModifiedAt;
 
   final CloudDriveAdapter _adapter;
   final String _databasePath;
@@ -58,6 +60,14 @@ class LibraryBackupService {
   final String _deviceId;
   final String _deviceName;
   final int _schemaVersion;
+
+  /// 取「本地媒体库最后一次内容变更时间」的回调。
+  ///
+  /// 由组合根注入（查 `media_works.updated_at` 等列的最大值）。
+  /// 为 `null` 时 [exportBackup] 不写 `libraryModifiedAt`，
+  /// 同步会退化成拿 `createdAt` 比较 —— 那等于「永远本机新」，
+  /// 只适合单机场景。**生产环境必须注入**。
+  final Future<DateTime?> Function()? _localModifiedAt;
 
   /// 备份包的 magic bytes。
   static const List<int> _magic = [0x43, 0x43, 0x42, 0x4B]; // 'CCBK'
@@ -105,9 +115,10 @@ class LibraryBackupService {
         posterCount = entries.whereType<File>().length;
         if (posterCount > 0) {
           // 把海报目录打包：用简单的 length-prefix 格式
-          posterBytes = _packDirectory(posterDir);
+          final packed = _packDirectory(posterDir);
+          posterBytes = packed;
           diag.info('备份', '海报缓存 $posterCount 个文件 '
-              '${posterBytes!.length} 字节');
+              '${packed.length} 字节');
         }
       }
     }
@@ -126,14 +137,19 @@ class LibraryBackupService {
       'cloudcine.sqlite',
       if (posterBytes != null) 'posters/',
     ];
+    // 库内容变更时间：同步的 LWW 判据。取不到（空库 / 没注入回调）时为 null。
+    final modifiedAt = await _localModifiedAt?.call();
     final manifest = BackupManifest(
       deviceId: _deviceId,
       deviceName: _deviceName,
       createdAt: DateTime.now().toUtc(),
+      libraryModifiedAt: modifiedAt?.toUtc(),
       schemaVersion: _schemaVersion,
       fileNames: fileNames,
       note: note ?? (includeSettings ? null : '不含设置'),
     );
+    diag.info('备份', '清单：库内容变更时间='
+        '${modifiedAt?.toIso8601String() ?? "无（空库）"}');
 
     // 5. 组装字节流
     //
@@ -148,8 +164,9 @@ class LibraryBackupService {
     output.add(manifestBytes);
     output.add(dbLenBytes.buffer.asUint8List());
     output.add(dbBytesToWrite);
-    if (posterBytes != null) {
-      output.add(posterBytes!);
+    final packedPosters = posterBytes;
+    if (packedPosters != null) {
+      output.add(packedPosters);
     }
 
     final result = output.toBytes();
@@ -363,7 +380,7 @@ class LibraryBackupService {
   /// 返回备份包的字节流。
   Future<Uint8List> downloadBackup(RemoteBackupEntry entry) async {
     diag.info('备份', '下载备份「${entry.name}」（${entry.sizeBytes}B）');
-    final ticket = await _adapter.resolveStream(entry.fileId);
+    // readFileBytes 内部自己解析直链，不需要先 resolveStream。
     final bytes = await _adapter.readFileBytes(
       entry.fileId,
       maxBytes: 512 * 1024 * 1024, // 512MB 上限（含海报缓存时可能较大）
@@ -378,11 +395,15 @@ class LibraryBackupService {
 
   /// 同步本地与远程备份。
   ///
-  /// 策略（Last-Write-Wins）：
+  /// 策略（Last-Write-Wins，比的是**库内容变更时间**，不是备份文件时间）：
   /// - 远程比本地新 → 下载远程并恢复本地
   /// - 本地比远程新 → 导出本地并上传覆盖远程
   /// - 相同时间戳 → 无操作
   /// - 不同设备且时间戳差 < 60s → 冲突，交给用户
+  ///
+  /// ⚠️ **空库永远让远程赢**：本地库还没有任何内容时（[BackupManifest
+  /// .libraryModifiedAt] 为 `null`），直接走「下载恢复」。这是新机器的
+  /// 正路 —— 否则刚装好的机器会拿空库把网盘上的好备份覆盖掉。
   ///
   /// 返回同步结果描述。
   Future<SyncResult> sync({
@@ -399,7 +420,8 @@ class LibraryBackupService {
     );
     // 从本地字节流中提取 manifest 做时间戳对比
     final localManifest = _extractManifest(localBytes);
-    diag.info('同步', '本地备份时间：${localManifest.createdAt.toIso8601String()}');
+    diag.info('同步', '本地库内容变更时间：'
+        '${localManifest.libraryModifiedAt?.toIso8601String() ?? "无（空库）"}');
 
     // 2. 列出远程备份
     final remoteBackups = await listRemoteBackups(dirName: dirName);
@@ -413,7 +435,7 @@ class LibraryBackupService {
       );
       await uploadBackupToDrive(bytes, dirName: dirName);
       return SyncResult.uploaded(
-        localManifest.createdAt,
+        localManifest.effectiveModifiedAt,
         '首次上传到远程',
       );
     }
@@ -427,9 +449,34 @@ class LibraryBackupService {
     //    —— 实际场景中媒体库备份包通常在几 MB 到几十 MB，可接受。
     final remoteBytes = await downloadBackup(latestRemote);
     final remoteManifest = _extractManifest(remoteBytes);
-    diag.info('同步', '远程备份时间：${remoteManifest.createdAt.toIso8601String()}');
+    diag.info('同步', '远程库内容变更时间：'
+        '${remoteManifest.effectiveModifiedAt.toIso8601String()}');
 
-    // 6. 对比时间戳
+    // 6. 本地是空库 → 无条件让远程赢（新机器的正路）
+    if (!localManifest.hasLibraryContent) {
+      diag.info('同步', '本地是空库，直接下载恢复远程备份');
+      await importBackup(remoteBytes, restoreSettings: includeSettings);
+      return SyncResult.restored(
+        remoteManifest.effectiveModifiedAt,
+        '本地还没有媒体库，已从远程恢复',
+      );
+    }
+
+    // 7. 远程是空备份 → 绝不拿它覆盖本地（镜像情形：别人从新机器推过一次）
+    if (!remoteManifest.hasLibraryContent) {
+      diag.info('同步', '远程是空备份，忽略它并上传本地');
+      final bytes = await exportBackup(
+        includePosters: includePosters,
+        includeSettings: includeSettings,
+      );
+      await uploadBackupToDrive(bytes, dirName: dirName);
+      return SyncResult.uploaded(
+        localManifest.effectiveModifiedAt,
+        '远程备份是空库，已用本地覆盖',
+      );
+    }
+
+    // 8. 对比时间戳
     if (localManifest.conflictsWith(remoteManifest)) {
       return SyncResult.conflict(
         localManifest,
@@ -438,8 +485,8 @@ class LibraryBackupService {
       );
     }
 
-    final localNewer = localManifest.createdAt
-        .isAfter(remoteManifest.createdAt);
+    final localNewer =
+        localManifest.effectiveModifiedAt.isAfter(remoteManifest.effectiveModifiedAt);
 
     if (localNewer) {
       // 本地新 → 上传
@@ -450,11 +497,11 @@ class LibraryBackupService {
       );
       await uploadBackupToDrive(bytes, dirName: dirName);
       return SyncResult.uploaded(
-        localManifest.createdAt,
+        localManifest.effectiveModifiedAt,
         '本地比远程新，已上传覆盖远程',
       );
-    } else if (remoteManifest.createdAt
-        .isAfter(localManifest.createdAt)) {
+    } else if (remoteManifest.effectiveModifiedAt
+        .isAfter(localManifest.effectiveModifiedAt)) {
       // 远程新 → 下载恢复
       diag.info('同步', '远程比本地新，下载恢复本地');
       await importBackup(
@@ -462,7 +509,7 @@ class LibraryBackupService {
         restoreSettings: includeSettings,
       );
       return SyncResult.restored(
-        remoteManifest.createdAt,
+        remoteManifest.effectiveModifiedAt,
         '远程比本地新，已下载恢复本地',
       );
     } else {

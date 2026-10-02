@@ -333,6 +333,10 @@ class WorkScraper {
       // `upsertWorks` 的合并分支原样保留它们 —— 传 0 会把库里的数字抹掉。
       itemCount: work.itemCount,
       totalBytes: work.totalBytes,
+      // 与扫描无关、与刮削也无关，但它是「最近修改」排序的唯一依据。
+      // 不抄的话构造器默认 null，落库后这一列被置空，刮完的电影会从
+      // 列表前面直接跳到末尾（NULL 在 DESC 排序里垫底）。
+      lastModifiedAt: work.lastModifiedAt,
       firstSeenAt: work.firstSeenAt,
       lastPlayedAt: work.lastPlayedAt,
       updatedAt: _clock(),

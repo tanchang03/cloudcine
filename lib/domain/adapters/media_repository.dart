@@ -267,6 +267,14 @@ abstract class MediaRepository {
 
   /// 作品总数。
   Future<int> countWorks();
+
+  /// 本地媒体库**最后一次内容变更**的时间；空库返回 `null`。
+  ///
+  /// 只服务于备份同步的 Last-Write-Wins 判定。它必须回答「这台机器的库
+  /// 最后什么时候真的变过」，而**不能**用「现在几点」——
+  /// 后者会让本机在任何时刻都显得比远程新，于是同步永远只会上传，
+  /// 新机器一同步就把网盘上的好备份覆盖成空库。
+  Future<DateTime?> latestLibraryChangeAt();
 }
 
 /// 内存实现。**测试专用**：让扫描器与播放逻辑的单测不依赖 SQLite。
@@ -702,6 +710,24 @@ class InMemoryMediaRepository implements MediaRepository {
 
   @override
   Future<int> countWorks() async => _works.length;
+
+  @override
+  Future<DateTime?> latestLibraryChangeAt() async {
+    // 空库返回 null（而不是 epoch）—— 调用方据此判定「这台机器还没内容」，
+    // 从而让远程备份赢下 LWW。返回 epoch 也能工作，但 null 语义更直白。
+    if (_works.isEmpty && _items.isEmpty) return null;
+    DateTime? latest;
+    for (final w in _works.values) {
+      final t = w.updatedAt;
+      if (latest == null || t.isAfter(latest)) latest = t;
+    }
+    for (final i in _items.values) {
+      // 播放记录也算「库变过」：它决定「最近播放」，是要同步的内容。
+      final t = i.lastPlayedAt ?? i.firstSeenAt;
+      if (latest == null || t.isAfter(latest)) latest = t;
+    }
+    return latest;
+  }
 }
 
 /// 内存实现需要「改 firstSeenAt」这一个实体层不支持的操作。

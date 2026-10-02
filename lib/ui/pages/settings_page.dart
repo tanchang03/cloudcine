@@ -14,6 +14,7 @@ import '../../domain/services/library_backup_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
 import '../providers/library_providers.dart';
+import '../providers/library_refresh_providers.dart';
 import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
@@ -1082,6 +1083,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     : const Icon(Icons.sync_rounded, size: 16),
                 label: Text(_syncing ? '同步中…' : '同步'),
               ),
+              OutlinedButton.icon(
+                onPressed: _restoring
+                    ? null
+                    : () => unawaited(_doRestore()),
+                icon: _restoring
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.cloud_download_rounded, size: 16),
+                label: Text(_restoring ? '恢复中…' : '从网盘恢复'),
+              ),
             ],
           ),
           const SizedBox(height: 10),
@@ -1090,6 +1104,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             '「云影备份」目录，覆盖同名的旧备份。\n'
             '「同步」会比对本地与远程备份的时间戳：'
             '本地新则上传，远程新则下载恢复，相同则不操作。\n'
+            '「从网盘恢复」用于新机器：先在这里挑一份远程备份拉下来，'
+            '再让它接管后续同步。\n'
             '两台设备在 60 秒内同时备份会触发冲突提示。',
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
           ),
@@ -1144,8 +1160,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
       // 如果恢复了远程备份，需要刷新列表
       if (result.action == SyncAction.restored) {
-        ref.invalidate(workListProvider);
-        ref.invalidate(libraryStatsProvider);
+        _refreshLibraryViews();
       }
     } catch (e) {
       message = '同步失败：$e';
@@ -1157,6 +1172,73 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       _backupOk = ok;
       _backupMessage = message;
     });
+  }
+
+  /// 手动从网盘恢复：列出远程备份，让用户挑一份下载并覆盖本地。
+  ///
+  /// 这条通道是**新机器**的正路：新机器本地库是空的，`sync()` 会把刚导出
+  /// 的空库当成「比远程新」而反向覆盖，所以必须先手动拉一份下来。
+  Future<void> _doRestore() async {
+    setState(() {
+      _restoring = true;
+      _backupMessage = null;
+    });
+
+    try {
+      final service = ref.read(libraryBackupServiceProvider);
+      final entries = await service.listRemoteBackups();
+      if (!mounted) return;
+
+      if (entries.isEmpty) {
+        setState(() {
+          _restoring = false;
+          _backupOk = false;
+          _backupMessage = '网盘「${LibraryBackupService.defaultBackupDir}」'
+              '目录里还没有任何备份。';
+        });
+        return;
+      }
+
+      final picked = await showDialog<RemoteBackupEntry>(
+        context: context,
+        builder: (ctx) => _RemoteBackupPickerDialog(entries: entries),
+      );
+      if (picked == null) {
+        if (mounted) setState(() => _restoring = false);
+        return;
+      }
+
+      final bytes = await service.downloadBackup(picked);
+      final manifest = await service.importBackup(bytes);
+      if (!mounted) return;
+
+      _refreshLibraryViews();
+      setState(() {
+        _restoring = false;
+        _backupOk = true;
+        _backupMessage = '已从「${manifest.deviceName}」的备份恢复'
+            '（${manifest.createdAt.toLocal().toString().split('.').first}）。';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _restoring = false;
+        _backupOk = false;
+        _backupMessage = '恢复失败：$e';
+      });
+    }
+  }
+
+  /// 媒体库被整体替换后，把所有读取它的视图全部作废。
+  ///
+  /// 四个 provider 一个都不能少：列表、统计、两个角标计数。
+  /// 只作废列表的话，筛选面板上的「年代 / 类型」角标会停留在旧库的数字上。
+  void _refreshLibraryViews() {
+    ref.read(libraryWriteSignalProvider.notifier).bump();
+    ref.invalidate(workListProvider);
+    ref.invalidate(libraryStatsProvider);
+    ref.invalidate(decadeCountsProvider);
+    ref.invalidate(genreCountsProvider);
   }
 
   // -------------------------------------------------------------------
@@ -1348,5 +1430,61 @@ class _SliderRow extends StatelessWidget {
         ),
       ],
     );
+  }
+}
+
+/// 远程备份选择对话框。
+///
+/// 只展示「名字 / 大小 / 时间」三件事 —— manifest 里的设备名要下载整个包
+/// 才能读到，而列表可能有很多份，逐份下载代价太大。用户靠时间和体积
+/// 就能认出该挑哪一份（最新最大的那份通常就是）。
+class _RemoteBackupPickerDialog extends StatelessWidget {
+  const _RemoteBackupPickerDialog({required this.entries});
+
+  final List<RemoteBackupEntry> entries;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('选择要恢复的备份'),
+      content: SizedBox(
+        width: 460,
+        child: ListView.builder(
+          shrinkWrap: true,
+          itemCount: entries.length,
+          itemBuilder: (context, i) {
+            final e = entries[i];
+            final at = e.modifiedAt?.toLocal();
+            return ListTile(
+              dense: true,
+              leading: const Icon(Icons.inventory_2_outlined, size: 18),
+              title: Text(
+                e.name,
+                style: const TextStyle(fontSize: 12.5),
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(
+                '${_formatSize(e.sizeBytes)}'
+                '${at == null ? '' : ' · ${at.toString().split('.').first}'}',
+                style: const TextStyle(fontSize: 11, color: AppTheme.muted),
+              ),
+              onTap: () => Navigator.of(context).pop(e),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+      ],
+    );
+  }
+
+  static String _formatSize(int bytes) {
+    if (bytes < 1024) return '${bytes}B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    return '${(bytes / 1024 / 1024).toStringAsFixed(1)}MB';
   }
 }

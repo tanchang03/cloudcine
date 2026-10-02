@@ -59,9 +59,15 @@ class QuarkEndpoints {
   /// 响应 `data.finish=1` 时秒传命中，直接返回 `fid`。
   static const String uploadPre = '/1/clouddrive/file/upload/pre';
 
-  /// 上传完成（提交分片 ETag 列表）。
+  /// 上传完成的**第二步**：通知夸克把已合并的对象登记成文件。
   ///
-  /// 请求体：`{task_id, part_info_list: [{part_number, etag}]}`。
+  /// 请求体：`{task_id, obj_key}`。
+  ///
+  /// ⚠️ **不是** `{task_id, part_info_list}`。分片的真正合并由 OSS 的
+  /// `CompleteMultipartUpload` 完成（见 `QuarkAdapter._completeMultipartUpload`）。
+  /// 只调本端点、或把 body 写成 `part_info_list`，都会得到
+  /// `code=43001 request cpp error[complete file failed!]` —— 服务端找不到
+  /// 可合并的对象。这两步缺一不可，且顺序不能反。
   static const String uploadFinish = '/1/clouddrive/file/upload/finish';
 
   /// 更新文件哈希（秒传判定）。

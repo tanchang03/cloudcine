@@ -18,7 +18,11 @@ void main() {
   /// ⚠️ 必须**先走时间再喂值**：反过来（同一个时刻喂两个值）会让首尾两点
   /// 相距 0 秒，算出「瞬间涨了 N 秒」这种假速度 —— 那正是这一类估算最常
   /// 出的错，测试里也要跟着守规矩。
-  double? step(CacheSpeedMeter m, num seconds, [Duration by = const Duration(seconds: 1)]) {
+  double? step(
+    CacheSpeedMeter m,
+    num seconds, [
+    Duration by = const Duration(seconds: 1),
+  ]) {
     clock = clock.add(by);
     return m.accept(sec(seconds));
   }
@@ -128,6 +132,19 @@ void main() {
     expect(fast, closeTo(5.0, 0.2));
   });
 
+  test('一次大跳变不会被当成网速（块填充，不是下载）', () {
+    // 这是「缓冲时显示 1 GB/s」的直接成因：mpv 的 demuxer 是**成块**更新的，
+    // 相邻两个事件常常只隔几十毫秒，中间却跳了几百秒。取「相邻两点」算，
+    // 就是几千倍速。窗口要宽到这种块填充被平均掉。
+    final m = meter();
+    m.accept(sec(0));
+    expect(
+      step(m, 600, const Duration(milliseconds: 800)),
+      isNull,
+      reason: '0.8 秒里涨 600 秒会被算成 750×，是假数字',
+    );
+  });
+
   test('reset 之后重新起算', () {
     final m = meter();
     m.accept(sec(0));
@@ -142,5 +159,88 @@ void main() {
       speed = step(m, i);
     }
     expect(speed, closeTo(1.0, 0.01));
+  });
+
+  cacheBytesPerSecondTests();
+}
+
+/// 倍速 → 字节/秒 的换算，以及那道「物理上不可能就当没测到」的护栏。
+///
+/// 缓冲指示上的 KB/s 是**估算**（没有字节计数可用，只能拿码率去乘倍速），
+/// 所以它唯一能守住的是「不印一个用户一看就知道是假的数」。
+void cacheBytesPerSecondTests() {
+  const gb = 1024 * 1024 * 1024;
+
+  test('倍速 × 平均码率 = 字节速率', () {
+    final bytes = cacheBytesPerSecond(
+      rate: 3.0,
+      sizeBytes: 2 * gb,
+      duration: const Duration(minutes: 45),
+    );
+    // 2 GB / 2700 秒 ≈ 795 KB/s，3 倍速 ≈ 2.3 MB/s。
+    expect(bytes, closeTo(3 * 2 * gb / 2700, 1.0));
+  });
+
+  test('缺任何一环都不出数（而不是给 0）', () {
+    expect(
+      cacheBytesPerSecond(
+        rate: null,
+        sizeBytes: gb,
+        duration: const Duration(minutes: 10),
+      ),
+      isNull,
+    );
+    expect(
+      cacheBytesPerSecond(
+        rate: 2,
+        sizeBytes: null,
+        duration: const Duration(minutes: 10),
+      ),
+      isNull,
+    );
+    expect(
+      cacheBytesPerSecond(
+        rate: 2,
+        sizeBytes: 0,
+        duration: const Duration(minutes: 10),
+      ),
+      isNull,
+    );
+    expect(
+      cacheBytesPerSecond(rate: 2, sizeBytes: gb, duration: Duration.zero),
+      isNull,
+    );
+  });
+
+  test('本地块填充造成的 GB/s 级数字被挡掉', () {
+    // 真实成因见 [cacheBytesPerSecond] 的文档：media_kit 硬编码的 stream 层
+    // 缓存让下载与解复用解耦，demuxer 从**本地**灌数据，速度可以到 GB/s。
+    // 换算出来再像样也是假的 —— 宁可这一拍不显示速度。
+    final bytes = cacheBytesPerSecond(
+      rate: 12000,
+      sizeBytes: 8 * gb,
+      duration: const Duration(minutes: 120),
+    );
+    expect(bytes, isNull, reason: '算出来是 14 GB/s，超过护栏就该当作没测到');
+  });
+
+  test('千兆网量级的速度照常出数（护栏不误杀）', () {
+    final bytes = cacheBytesPerSecond(
+      rate: 20,
+      sizeBytes: 4 * gb,
+      duration: const Duration(minutes: 100),
+    );
+    expect(bytes, isNotNull);
+    expect(bytes!, lessThan(defaultMaxCacheBytesPerSecond.toDouble()));
+    expect(bytes, closeTo(20 * 4 * gb / 6000, 1.0));
+  });
+
+  test('缓存被消耗得比填充快时不报负网速', () {
+    final bytes = cacheBytesPerSecond(
+      rate: -0.5,
+      sizeBytes: 2 * gb,
+      duration: const Duration(minutes: 45),
+    );
+    expect(bytes, isNull, reason: '那是「不够用」，不是「负的下载速度」');
   });
 }

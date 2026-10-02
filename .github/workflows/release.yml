@@ -1,0 +1,403 @@
+name: Release
+
+# 推一个 v* 的 tag 就会自动：跑测试 → 构建 macOS + Windows + Android 交付物
+# → 发布到 Releases 页。
+#
+#   git tag v0.2.1
+#   git push origin v0.2.1
+#
+# 也可以手动触发（Actions → Release → Run workflow），
+# 手动触发只构建、不上架，产物在本次运行的 Artifacts 里，方便先试。
+#
+# ── 为什么是四个 job（三个构建 + 一个上架） ────────────────────────────────
+# build-macos / build-windows / build-android **只负责造产物并上传为 run artifact**，
+# 真正的上架交给最后那个 release job，它 needs 三个构建 job。
+#
+# 这样 Release **只有在三个平台都构建成功之后才会出现**。
+# 若沿用「macOS job 里直接 gh release create」的写法，Windows 一旦失败，
+# 下载页上就已经挂着一个缺 Windows 包的 Release 了 —— 而 tag 发出去就收不回来。
+#
+# ── Windows 交付物：MSI 安装包 + zip 免安装包 ─────────────────────────────
+# MSI 由 windows/packaging/ 下的 WiX v3 定义产出（按用户安装，不弹 UAC），
+# zip 是解压即用的兜底。两者由 build_package.ps1 一次生成，脚本同时被
+# ci.yml 复用 —— 每次推 main 就会验证一遍打包链路，而不是等发版才发现坏了。
+#
+# ── Android 交付物：一个通用 APK ──────────────────────────────────────────
+# 四种 ABI（arm64-v8a / armeabi-v7a / x86 / x86_64）都在同一个包里，手机与平板
+# 用同一个文件，用户不用挑。产物名与另外两个平台对齐：`cloudcine-<ver>-android.apk`，
+# 由 `tool/build_android.sh` 产出 —— 本机出包跑的是同一个脚本，避免两处逻辑分叉。
+#
+# ⚠️ 签名：配了 `ANDROID_KEYSTORE_BASE64` 那组 secret 就用它签，没配则退回 debug 签名。
+# debug 签名能侧载，但**每个 CI 产物的签名都不一样**，用户装新版会报「应用未安装」，
+# 得先卸载 —— 所以对外发布前请把密钥配上，见 build-android 里「配置发布签名」的说明。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # 创建 Release 需要写权限
+
+jobs:
+  build-macos:
+    name: 构建 macOS 安装包
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.0'
+          channel: stable
+          cache: true
+
+      # 出包前先跑测试。tag 一旦发出去就收不回来了，别把红的版本发出去。
+      - name: 静态分析
+        run: flutter analyze
+
+      - name: 单元测试
+        run: flutter test
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 确认 CocoaPods 可用
+        run: |
+          which pod || { echo "::error::找不到 pod，构建会被静默跳过"; exit 1; }
+          pod --version
+
+      # LANG / LC_ALL 必须显式设成 UTF-8（CocoaPods 1.17 + Ruby 4.x 在非 UTF-8 locale 下会抛
+      # "Unicode Normalization not appropriate for ASCII-8BIT"）。本机复现过一次，故在这里钉死。
+      - name: pod install
+        working-directory: macos
+        env:
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        run: pod install
+
+      # 生成 Xcode 工程配置（补 macos/Flutter/ephemeral/ 下的 xcfilelist，否则 xcodebuild 一开始就炸）。
+      - name: 生成 Xcode 工程配置
+        run: flutter build macos --release --config-only
+
+      # 显式钉死 ad-hoc 签名，不受任何 xcconfig 里可能的 Developer ID 影响。
+      - name: 构建（ad-hoc 签名）
+        run: |
+          xcodebuild \
+            -workspace macos/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -derivedDataPath build/macos \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            build
+
+      # 授权文件一旦分叉，会出现「debug 能播、release 不能播」这种只在打包后才暴露的问题。
+      - name: 校验产物授权
+        run: |
+          APP="build/macos/Build/Products/Release/CloudCine.app"
+          test -d "$APP" || { echo "::error::没找到产物"; exit 1; }
+
+          ENT=$(codesign -d --entitlements - "$APP" 2>&1)
+          echo "$ENT"
+
+          echo "$ENT" | grep -q 'com.apple.security.app-sandbox' \
+            || { echo "::error::产物缺少 app-sandbox 授权"; exit 1; }
+          echo "$ENT" | grep -q 'com.apple.security.network.client' \
+            || { echo "::error::产物缺少 network.client 授权"; exit 1; }
+          echo "$ENT" | grep -q 'com.apple.security.network.server' \
+            || { echo "::error::产物缺少 network.server 授权 —— 播放会失败"; exit 1; }
+          if echo "$ENT" | grep -q 'get-task-allow'; then
+            echo "::error::产物带了 get-task-allow 调试授权，不该出现在发布包里"
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=1 "$APP"
+
+      - name: 打包 dmg 与 zip
+        run: |
+          APP="build/macos/Build/Products/Release/CloudCine.app"
+          VERSION="$(grep '^version:' pubspec.yaml | cut -d' ' -f2 | cut -d'+' -f1)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+          # dmg：里面放一个指向 /Applications 的软链，用户拖一下就装好了。
+          # -volname 是挂载后在 Finder 里显示的卷名（安装窗口的标题），用**显示名**。
+          mkdir -p dist
+          cp -R "$APP" dist/
+          ln -s /Applications dist/Applications
+          hdiutil create \
+            -volname "云影 CloudCine" \
+            -srcfolder dist \
+            -ov -format UDZO \
+            "cloudcine-${VERSION}-macos.dmg"
+
+          # zip：dmg 之外的兜底，ditto 能正确保留 bundle 里的符号链接与属性。
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP" "cloudcine-${VERSION}-macos.zip"
+
+          ls -lh cloudcine-${VERSION}-macos.*
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudcine-macos
+          path: |
+            cloudcine-*-macos.dmg
+            cloudcine-*-macos.zip
+          if-no-files-found: error
+
+      - name: 写发布摘要
+        if: always()
+        run: |
+          {
+            echo '### macOS 构建结果'
+            echo ''
+            echo "- 版本：\`${VERSION}\`"
+            echo "- 签名：ad-hoc（未做 Apple 公证）"
+            echo "- 产物：\`cloudcine-${VERSION}-macos.dmg\` / \`.zip\`"
+            echo ''
+            echo '### 用户安装提示（首次打开会被 Gatekeeper 拦住）'
+            echo ''
+            echo '- **macOS 26 (Tahoe) 及以上**：`xattr -rd com.apple.quarantine /Applications/CloudCine.app`'
+            echo '  —— 该系统版本已移除「右键 → 打开」旁路，隐私与安全性里也可能没有「仍要打开」按钮'
+            echo '- **macOS 15 / 14**：右键点应用 → 打开 → 再点「打开」'
+            echo ''
+            echo '> 安装包为 ad-hoc 签名、未做 Apple 公证，被拦是正常现象，**不是文件损坏，不要删除应用**。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-windows:
+    name: 构建 Windows 交付物
+    # Flutter **不支持交叉编译到 Windows**，所以这里钉 windows-2022（理由同 ci.yml）。
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.0'
+          channel: stable
+          cache: true
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      # 本 job 不重复跑 analyze / test：发布门禁由 build-macos 承担，Windows 侧平台分支由
+      # ci.yml 的 windows-build 在每次推 main 时覆盖。本 job 的唯一职责是「把 Windows 产物造出来」。
+      - name: 构建 Release
+        run: flutter build windows --release
+
+      # 打包逻辑全在 windows/packaging/build_package.ps1 里，ci.yml 用的是同一份 ——
+      # 免得打包脚本坏掉要等到发版那一刻才发现。
+      - name: 打包 MSI 与 zip
+        shell: pwsh
+        run: pwsh -NoProfile -File windows/packaging/build_package.ps1
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudcine-windows
+          path: |
+            cloudcine-*-windows-x64.msi
+            cloudcine-*-windows-x64.zip
+          if-no-files-found: error
+
+      - name: 写发布摘要
+        if: always()
+        shell: pwsh
+        run: |
+          $lines = @(
+            '### Windows 构建结果'
+            ''
+            '- 交付物：`cloudcine-<version>-windows-x64.msi`（安装包）、`cloudcine-<version>-windows-x64.zip`（免安装）'
+            '- 安装位置：`%LOCALAPPDATA%\Programs\CloudCine` —— 按用户安装，不弹 UAC'
+            '- 运行要求：Windows 10 或更高，x64'
+            '- 已随包携带 VC++ 运行库，目标机器不需要另外装'
+            '- 未做代码签名，SmartScreen 首次运行可能提示「已保护你的电脑」→ 点「更多信息」→「仍要运行」'
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $lines
+
+  build-android:
+    name: 构建 Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 读取版本号
+        run: |
+          VERSION="$(grep '^version:' pubspec.yaml | cut -d' ' -f2 | cut -d'+' -f1)"
+          [ -n "$VERSION" ] || { echo "::error::读不到 pubspec.yaml 的 version"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.0'
+          channel: stable
+          cache: true
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # platforms;android-36：应用侧 `compileSdk = maxOf(flutter.compileSdkVersion, 36)`，
+      # 而 Flutter 3.29 给的是 35。cmake;3.22.1 / ndk;26.3.11579264：runner 镜像自带的
+      # 是更高版本，必须自己装。升 Flutter 时这些号要跟着改。
+      - name: 预装 Android SDK 组件
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" \
+            "platforms;android-36" \
+            "cmake;3.22.1" \
+            "ndk;26.3.11579264"
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      # ── 配置发布签名 ───────────────────────────────────────────────────────
+      # 四个 secret 都在就用正式密钥签名，缺任意一个都退回 debug 签名。
+      # 生成并上传密钥（在你自己机器上跑一次）：
+      #   keytool -genkeypair -v -keystore cloudcine-release.jks \
+      #     -keyalg RSA -keysize 2048 -validity 10000 -alias cloudcine
+      #   base64 -i cloudcine-release.jks | gh secret set ANDROID_KEYSTORE_BASE64
+      #   gh secret set ANDROID_STORE_PASSWORD
+      #   gh secret set ANDROID_KEY_ALIAS       # 上面 -alias 的值
+      #   gh secret set ANDROID_KEY_PASSWORD
+      #
+      # ⚠️ 也可以直接把本机 ~/.android/debug.keystore 传上去（alias=androiddebugkey、
+      # 两个密码都=android），CI 产物与你本机侧载过的包签名一致、可以互相覆盖。
+      #
+      # ⚠️ 密钥一旦用于对外发布就**不能换**：换了之后老用户装不上新版。
+      - name: 配置发布签名
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::没有配置 ANDROID_KEYSTORE_BASE64 —— 本次产物用 debug 签名，签名不固定、用户无法覆盖安装升级"
+            echo "SIGNING_KIND=debug" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/cloudcine-release.jks
+          cat > android/key.properties <<EOF
+          storeFile=cloudcine-release.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          echo "SIGNING_KIND=release" >> "$GITHUB_ENV"
+
+      - name: 构建 APK
+        run: bash tool/build_android.sh
+
+      # 产物层面的断言必须在发布前跑。这几条都是「错了就白发布」的项：
+      #   - 包名：装错包会变成另一个应用；
+      #   - INTERNET 权限：release 缺了就是**联网必失败且无弹窗**；
+      #   - libmpv 四个 ABI：Android 上唯一能播 libmpv 软解的那条路。
+      - name: 校验产物
+        run: |
+          APK="build/app/outputs/flutter-apk/cloudcine-${VERSION}-android.apk"
+          test -f "$APK" || { echo "::error::没找到 $APK"; exit 1; }
+
+          AAPT2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          "$AAPT2" dump badging "$APK" > badging.txt
+          grep -E "^(package|sdkVersion|targetSdkVersion|uses-permission)" badging.txt
+
+          grep -q "package: name='com.cloudcine.cloudcine'" badging.txt \
+            || { echo "::error::包名不是 com.cloudcine.cloudcine"; exit 1; }
+          grep -q "uses-permission: name='android.permission.INTERNET'" badging.txt \
+            || { echo "::error::release 清单里没有 INTERNET 权限，装上去连不上网盘"; exit 1; }
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            unzip -l "$APK" | grep -q "lib/$abi/libmpv.so" \
+              || { echo "::error::$abi 里没有 libmpv.so"; exit 1; }
+          done
+
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          "$APKSIGNER" verify --print-certs "$APK" | head -5
+
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudcine-android
+          path: build/app/outputs/flutter-apk/cloudcine-*-android.apk
+          if-no-files-found: error
+
+      - name: 写发布摘要
+        if: always()
+        run: |
+          if [ "${SIGNING_KIND:-}" = "release" ]; then
+            SIGN_LABEL='正式密钥（可以覆盖安装升级）'
+          else
+            SIGN_LABEL='debug 签名 —— ⚠️ 每次构建都不同，用户装新版必须先卸载'
+          fi
+          {
+            echo '### Android 构建结果'
+            echo ''
+            echo "- 版本：\`${VERSION}\`"
+            echo "- 产物：\`cloudcine-${VERSION}-android.apk\`（通用包，四种 ABI 都在里面）"
+            echo "- 签名：${SIGN_LABEL}"
+            echo '- 运行要求：Android 5.0 (API 21) 或更高；手机 / 平板均可'
+            echo ''
+            echo '### 用户安装提示'
+            echo ''
+            echo '- 手机 / 平板：用文件管理器点开 APK，系统问「未知来源应用」时允许一次'
+            if [ "${SIGNING_KIND:-}" != "release" ]; then
+              echo ''
+              echo '> ⚠️ **本次产物是 debug 签名、且每次构建的签名都不同** —— 用户装新版本时会报'
+              echo '> 「应用未安装」，必须先卸载旧版。要支持覆盖升级，请配置 `ANDROID_KEYSTORE_BASE64` 那组 secret。'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 发布到 Releases
+    # 只有三个平台都构建成功，Release 才会出现 —— 这是把上架单独拆成一个 job 的唯一理由。
+    needs: [build-macos, build-windows, build-android]
+    # 手动触发时 github.ref 是分支名而不是 tag，这时只构建、不上架，产物留在 Artifacts 里。
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载两个平台的产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 列出待发布文件
+        run: ls -lh dist
+
+      - name: 发布到 Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 安装指引放在自动生成的更新日志**之前**。
+          NOTES="$(cat .github/release-notes.md)"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "云影 CloudCine ${GITHUB_REF_NAME}" \
+            --notes "$NOTES" \
+            --generate-notes \
+            dist/*

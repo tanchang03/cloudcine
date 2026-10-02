@@ -288,4 +288,51 @@ class DioHttpClient implements HttpClientLike {
       rethrow;
     }
   }
+
+  /// POST 字节到 OSS（用于完成分片上传 callback）。
+  ///
+  /// 返回响应体字符串。
+  @override
+  Future<String> postBytes(
+    String url, {
+    required List<int> body,
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) async {
+    final label = 'POST(bytes) ${redactUrl(url)}';
+    diag.debug('HTTP', '$label 发起（${body.length}B）${_headerSummary(headers)}');
+
+    final started = DateTime.now();
+    try {
+      final resp = await _dio.post<String>(
+        url,
+        data: Stream.fromIterable([body]),
+        options: Options(
+          headers: {
+            ...?headers,
+            'Content-Length': body.length.toString(),
+          },
+          validateStatus: (s) => s != null && s >= 200 && s < 300,
+          sendTimeout: timeout ?? const Duration(seconds: 120),
+          receiveTimeout: timeout ?? const Duration(seconds: 30),
+        ),
+      );
+      final elapsed = DateTime.now().difference(started).inMilliseconds;
+      final status = resp.statusCode ?? 0;
+      final text = resp.data ?? '';
+      diag.info('HTTP', '$label → $status (${elapsed}ms, ${text.length}B)');
+      return text;
+    } on DioException catch (e) {
+      final elapsed = DateTime.now().difference(started).inMilliseconds;
+      diag.error(
+        'HTTP',
+        '$label → 请求未完成 (${elapsed}ms)',
+        error: '${e.type.name}: ${e.message}',
+      );
+      throw Exception('POST 失败：${e.type.name}: ${e.message}');
+    } catch (e, st) {
+      diag.error('HTTP', '$label → 抛出非 dio 异常', error: e, stackTrace: st);
+      rethrow;
+    }
+  }
 }

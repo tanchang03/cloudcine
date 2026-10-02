@@ -138,9 +138,33 @@ c = QuarkClient("; ".join(f"{k}={v}" for k, v in cookies.items()))
 - **只有两个缓存量**：`player.stream.buffer`（`demuxer-cache-time`，播放头前面缓存了多少
   **秒**）与 `player.stream.bufferingPercentage`（`cache-buffering-state`，初始填充 0~100，
   **填满后停在 100 不再变** —— 进度条只在 0<x<100 时可信）。
-- **拿不到字节数**：`Player` 上**没有** `getProperty`（`real.dart` 里有但没暴露到公开类）。
-  所以 KB/s 只能靠 `文件大小 ÷ 时长` 的平均码率去乘「每秒缓存多少秒」。为此 `PlayRequest`
-  带了 `sizeBytes`，显示时带 `≈`。
+- **`getProperty` / `observeProperty` 是公开的**（2026-10-02 更正）：早期笔记写「`real.dart`
+  里有但没暴露到公开类」，**是错的** —— `NativePlayer` 上这两个方法都没有下划线，
+  而 `NativePlayer` 本身可从 `package:media_kit/media_kit.dart` 拿到（`platform is NativePlayer`
+  一直是能编译的）。所以「拿不到任意 mpv 属性」这个前提不成立，别再据此下结论。
+  ⚠️ 但 **`setProperty` 丢掉了 mpv 的返回码**（`real.dart` 里 `mpv_set_property_string`
+  调完直接返回，没看结果）⇒ 属性名写错或选项不可运行期改时，失败**完全静默**。
+  凡是「设了但不确定生效」的属性，都要 `getProperty` **读回来自证**并记诊断日志
+  （`PlayerBufferConfig._confirmStreamCacheOff` 就是这么做的）。
+- **两层缓存：`demuxer-cache-time` 量不到网络**（2026-10-02）：media_kit 硬编码
+  `cache=yes` + `cache-on-disk=yes`，于是
+  `网络 → stream cache（字节，后台预读）→ 解复用 → demuxer cache（秒）`。
+  `demuxer-cache-time` 是**第二层**的时间跨度，数据来自本地（内存/落盘文件），
+  一次几百 MB 的块填充几十毫秒就灌完 ⇒ 换算出来是 GB/s 级，**与带宽无关**。
+  这就是「缓冲时显示 ≈1.0 GB/s」的根因（不是单位换算错）。
+  能测准的前提是 `PlayerBufferConfig.disableStreamCache`（`open()` 前 `cache=no`）。
+  兜底与完整推导见 `cacheBytesPerSecond` 的文档。
+- **网速优先直接读 mpv，不要估算**（2026-10-02）：`demuxer-cache-state.raw-input-rate`
+  就是**输入速率（字节/秒）**，取自输入层「未缓冲读取字节数」计数器的差分 —— 真实下载速率。
+  解析在 `core/utils/mpv_cache_state.dart` 的 `rawInputBytesPerSecond`（纯函数，8 例测试）。
+  轮询用 `getProperty`（1 Hz）而不是 `observeProperty`：这个属性是 node 类型、变更通知不保证发。
+  拿到就用，拿不到才退回下面的估算。
+  ⚠️ 字段名已直接在**随包的 libmpv 二进制**里核对过存在：
+  `strings .../Mpv.framework/Versions/A/Mpv | grep -Fx raw-input-rate`（本项目是 mpv **0.36.0**）。
+  这个招式比翻文档可靠 —— 文档抓不全，二进制不会骗人。
+- **估算兜底**：没有字节计数时，靠 `文件大小 ÷ 时长` 的平均码率去乘「每秒缓存多少秒」。
+  为此 `PlayRequest` 带了 `sizeBytes`，显示时带 `≈`。
+  ⚠️ `sizeBytes` 是**网盘原文件**体积 —— 手选低码率转码档时码率被高估若干倍（默认播原画时才对）。
 - `Player.open()` **不等文件加载完成**，所以「开播到出首帧」那段必须自己立一个
   `_awaitingFrame` 标志，靠 `videoParams / duration / position` 三条订阅里**先到的那个**
   清掉（没有哪个信号保证一定来）。
@@ -904,3 +928,101 @@ count）共用 `DriftMediaRepository._workConditions`，保证口径绝不漂移
 `test/ui/pages/library_empty_hint_test.dart` 逐情形钉住。
 
 
+## 夸克上传：收尾是两步，缺一即 43001（2026-10-02）
+
+### 症状
+`/1/clouddrive/file/upload/finish` → HTTP 400，
+`providerCode=43001`，`message=request cpp error[complete file failed!]`。
+前序全部成功：pre → hash → 每片 PUT 200 且都拿到 ETag。
+
+### 根因
+夸克的上传收尾**必须两步**，只做第二步就是上面这个错：
+
+1. **向 OSS 提交 `CompleteMultipartUpload` XML**（`POST {ossBase}?uploadId={id}`），
+   带 `x-oss-callback` 头 —— 对象存储真正把分片合并成一个对象；
+2. **再调 `/1/clouddrive/file/upload/finish`**，body 只要
+   `{task_id, obj_key}` —— 夸克把该对象登记成文件，响应里才有 fid。
+
+第 2 步的 body **不是** `part_info_list`（这是上一版的错，也导致 43001）。
+
+### 两条「错了不报错」的细节
+- **ETag 在 XML 里必须带双引号**：`<ETag>"8DA6BF..."</ETag>`。
+  OSS 要求原样回填 PUT 响应里的值（含引号）；不带引号会被判「分片不匹配」。
+  `HttpClientLike.putBytes` 返回的是**去引号**的值，所以拼 XML 时要补回来。
+- **分片必须按 `part_number` 升序**排列。
+
+两者都收进纯函数 `QuarkAdapter.buildCompleteMultipartXml`，
+`test/data/quark_upload_complete_test.dart` 6 例钉住。
+
+### 完成合并的 auth_meta（顺序必须与真实请求头一致）
+```
+POST\n{contentMd5}\napplication/xml\n{ossDate}\n
+x-oss-callback:{callbackB64}\nx-oss-date:{ossDate}\nx-oss-user-agent:{ua}\n
+/{bucket}/{objKey}?uploadId={uploadId}
+```
+- `contentMd5` = base64(md5(XML 字节))，同时作为 `Content-MD5` 头发出去。
+- `callbackB64` = base64(紧凑 JSON)，即 `preData['callback']` 的 jsonEncode。
+  必须**同一个字符串**既进 auth_meta 又进 `x-oss-callback` 头，签名才对得上。
+- 分片 PUT 的 auth_meta 没有 Content-MD5（那一行留空）。
+
+### 参考实现
+- `RemyYYZ/QuarkPan`（Python）：`complete_multipart_upload` + `finish_upload` 两步。
+- `imeiming/quark-drive`（Python）：OSS callback 写法（同样两步，finish 合并进 callback）。
+
+### 上传相关的 HTTP 能力
+`HttpClientLike` 有两个原始字节出口，别混用：
+- `putBytes` —— 分片上传，返回 ETag（已去引号）；
+- `postBytes` —— 完成合并 POST XML，返回响应体字符串。
+
+### 备份目录
+默认落在网盘根目录下的「云影备份」（`LibraryBackupService.defaultBackupDir`）。
+`ensureBackupDir` 先列根目录找同名文件夹，找不到才建。
+
+### 编排由测试钉住（`quark_upload_flow_test.dart`，2026-10-02 补）
+
+`quark_upload_complete_test.dart` 只钉 XML 的**形状**；真正出 43001 的是**编排** ——
+谁先谁后、每个端点收到什么 body。这类错误**不抛异常、只静默失败**，所以另起一文件锁住：
+
+- `post` 路径序列必须是 `pre → hash → auth×N → auth(合并) → finish`
+  —— 顺序即 43001 的成因（把 finish 提到 OSS 合并之前同样失败）；
+- `finish` 的 body **恰好** `{task_id, obj_key}`，且**不含** `part_info_list`；
+- 分片 PUT 的 `partNumber` 升序、每片带 `Authorization`；
+- OSS 合并**必须发生一次**，带 `x-oss-callback` / `Content-MD5` / `Content-Type: application/xml`，
+  XML 里 ETag 重新带上双引号、PartNumber 升序；
+- 秒传命中（hash `finish=true`）→ 直接返回 fid，**零** PUT、**零** OSS 合并；
+- 缺 `bucket`/`obj_key`/`upload_id` → 动分片**之前**就抛 `malformedResponse`；
+- 缺 `callback` → 合并阶段抛错（不是静默成功）；
+- `onProgress` 逐片递增、末次等于总大小。
+
+假客户端按 `post` / `putBytes` / `postBytes` 三类分别记账，所以能断言「哪些请求必须发生」。
+
+⚠️ 按项目约定验过**不空转**：临时把 finish 的 body 改回旧 bug（`part_info_list`）→
+测试确实变红（`+0 -1`，diff 显示 `Actual: {'part_info_list': [...]}`），随即还原。
+
+## 备份同步的新旧判定：比「库内容时间」，不比文件创建时间（2026-10-02）
+
+### 症状（差点造成数据丢失）
+新机器装好后点「同步」，**把远程那份好备份覆盖掉了**；本地空库也照样「胜出」。
+
+### 根因
+`BackupManifest` 里原来只有 `createdAt`（**备份包被创建的时刻**）。
+旧 `sync()` 直接拿 `createdAt` 比大小 ⇒ 刚导出的包时间戳永远最新
+⇒ `localNewer` 恒为 true ⇒ **同步永远只会「上传」，永远不会「下载」**。
+
+### 修法：给 manifest 加 `libraryModifiedAt`
+- 它是**库内容自己的修改时间**：`media_works.updated_at` / `media_items.first_seen_at`
+  / `media_items.last_played_at` 三者的最大值（`MediaRepository.latestLibraryChangeAt()`）。
+- 派生 `effectiveModifiedAt => libraryModifiedAt ?? createdAt`
+  （老包没这字段时退回旧口径，兼容）。
+- `sync()` 一律用 `effectiveModifiedAt` 判新旧。
+
+### 两个「空」守卫（对称，缺一个就会互相覆盖）
+- `!localManifest.hasLibraryContent`（本地空库/刚装）⇒ **拉远程**，绝不推。
+- `!remoteManifest.hasLibraryContent`（远程是空包）⇒ **推本地**，绝不被它覆盖。
+- `hasLibraryContent => libraryModifiedAt != null`。
+  ⚠️ 别用「文件列表里有没有 `posters/`」判空 —— 海报是**打进 payload** 的，
+  不在 `fileNames` 里，那样判会永远为 false（写错过一次，被测试逮住）。
+
+### 冲突与恢复
+- 不同设备 + 相差 <60s ⇒ `conflictsWith` 判冲突，交用户决定。
+- 新机器必须先手动「从网盘恢复」（设置页按钮）拉一份下来，再谈同步。

@@ -1,0 +1,248 @@
+name: CI
+
+# 每次推送到 main、以及每个 PR，都跑一遍静态分析 + 全部单元测试。
+# 目标：main 分支永远是绿的，不会出现「本地过了、合进去就红」。
+#
+# 三个 job：
+#   - analyze-and-test：macOS。开发机就是 macOS，日常回归全在这里。
+#   - windows-build：Windows。**唯一能编译 windows/runner 原生代码的地方** ——
+#     Flutter 不支持交叉编译到 Windows，`flutter build windows` 的宿主必须是
+#     Windows，所以在 Mac 上永远验不到那几处 C++。顺带也是唯一能验 WiX
+#     打包链路（MSI）的地方。
+#   - android-build：Linux。验 **APK 打包链路**（SDK 组件、libmpv 的四个 ABI、
+#     release 清单里的 INTERNET 权限）。这些只在 release.yml 里跑的话，坏掉
+#     要等 tag 推出去才发现 —— 而那时 tag 已经收不回来了。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'imgs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支连续推送时，取消掉上一次还没跑完的任务，省额度也更快看到结果。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-and-test:
+    name: 静态分析 + 单元测试
+    # 用 macOS 而不是 ubuntu：这是本项目唯一实测过的目标平台。
+    # 本项目是公开仓库，macOS runner 的额度不额外计费；
+    # 若将来改成私有仓库，macOS 分钟数按 10 倍计费，届时可换 ubuntu-latest
+    # （测试用的是 Flutter 内置测试字体，不依赖系统字体，跨平台结果一致）。
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.0'
+          channel: stable
+          cache: true
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 静态分析
+        run: flutter analyze
+
+      - name: 单元测试
+        run: flutter test --reporter expanded
+
+      # 授权文件一旦分叉，就会出现「debug 能播、release 不能播」这类
+      # 只在打包后才暴露的问题。这一步单独把结论打成摘要，方便一眼看到。
+      - name: 输出 macOS 授权摘要
+        if: always()
+        run: |
+          {
+            echo '### macOS 授权文件'
+            echo ''
+            echo '| build | 授权 |'
+            echo '|---|---|'
+            for f in DebugProfile Release; do
+              echo -n "| $f | "
+              plutil -convert json -o - "macos/Runner/$f.entitlements" \
+                | sed 's/[{}"]//g; s/,/ · /g'
+              echo ' |'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows-build:
+    name: Windows 构建 + 单元测试
+    # 为什么要有这个 job：Windows 版**没法在开发机（macOS）上构建** ——
+    # Flutter 不支持交叉编译到 Windows，`flutter build windows` 的宿主必须是
+    # Windows。所以 `windows/runner` 里那几处原生代码在 Mac 上永远编不到，只有这里能验。
+    #
+    # 主要价值是 `flutter build windows` 这一步，不是跑测试 ——
+    # 测试在 macOS job 里已经跑过一遍了。这里再跑一遍是为了覆盖平台相关的
+    # 分支：drift 加载哪个原生 sqlite、路径分隔符、文件名大小写敏感性。
+    #
+    # ⚠️ 钉 `windows-2022` 而不是 `windows-latest`，是被真实故障逼的：
+    # GitHub 把 `windows-latest` 迁到了 **Visual Studio 2026（主版本号 18）**，而 Flutter 3.29 的
+    # `cmakeGenerator` 只认到 17，于是退化成 `-G "Visual Studio 16 2019"`，报
+    # "could not find any instance of Visual Studio"。同一件事也适用于**你自己的 Windows 机器**。
+    runs-on: windows-2022
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.0'
+          channel: stable
+          cache: true
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 静态分析
+        run: flutter analyze
+
+      # 刻意**先构建再测试**：构建最可能因原生代码 / /W4 /WX 失败，早失败早看到。
+      - name: 构建 Release
+        run: flutter build windows --release
+
+      # `flutter test` 跑的是 Dart VM，不是打包好的应用，所以拿不到
+      # `sqlite3_flutter_libs` 装进产物目录的那份 sqlite3.dll。找不到它时
+      # `package:sqlite3` 会回退到系统自带的 `winsqlite3.dll`（版本更老），
+      # 迁移测试可能「Mac 上过、Windows 上不过」。这里把刚构建出来的那份挂到 PATH。
+      - name: 让测试用上应用自带的 sqlite3.dll
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build/windows -Recurse -Filter sqlite3.dll -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $dll) {
+            Write-Warning "产物里没找到 sqlite3.dll，测试将回退到系统的 winsqlite3.dll"
+            exit 0
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'sqlite3'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item $dll.FullName (Join-Path $dir 'sqlite3.dll')
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "已把 $($dll.FullName) 挂到 PATH：$dir"
+
+      - name: 单元测试
+        run: flutter test --reporter expanded
+
+      # 打包链路（WiX → MSI）如果只在 release.yml 里跑，意味着打包脚本
+      # 坏掉要等到发版那一刻才发现。这里复用同一个脚本跑一遍，提前到每次推 main。
+      - name: 验证打包链路（MSI + zip）
+        shell: pwsh
+        run: pwsh -NoProfile -File windows/packaging/build_package.ps1
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudcine-windows-x64
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: warn
+
+      - name: 上传打包产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudcine-windows-package
+          path: |
+            cloudcine-*-windows-x64.msi
+            cloudcine-*-windows-x64.zip
+          if-no-files-found: warn
+
+  android-build:
+    name: Android 构建 + 打包链路校验
+    # 为什么是 ubuntu 而不是 macos：Android 构建链在两个系统上完全一致，
+    # 而 ubuntu 镜像里预装的 Android SDK 更全、分钟数也更便宜。
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.0'
+          channel: stable
+          cache: true
+
+      # 与 release.yml 的 build-android 钉同一个 JDK（AGP 8.x 要 17+）。
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # ⚠️ 这个列表必须与 release.yml 的 build-android 里那一份**保持一致**
+      # （要改就两处一起改）。理由：runner 镜像里**没有** 26.3.11579264 这个 NDK
+      # 也**没有** cmake 3.22.1；而应用侧 `ndkVersion = flutter.ndkVersion`（Flutter 3.29 就是 26.3.11579264）、
+      # AGP 在不指定版本时固定要 cmake 3.22.1。升 Flutter 时这些号要跟着改。
+      - name: 预装 Android SDK 组件
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" \
+            "platforms;android-36" \
+            "cmake;3.22.1" \
+            "ndk;26.3.11579264"
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 静态分析
+        run: flutter analyze
+
+      # 用与本机出包、以及 release.yml 完全相同的那一个脚本。
+      - name: 构建 APK
+        run: bash tool/build_android.sh
+
+      # 断言「错了就白发布」、且**不会因为正常升级而变**的项。
+      - name: 校验产物
+        run: |
+          VERSION="$(grep '^version:' pubspec.yaml | cut -d' ' -f2 | cut -d'+' -f1)"
+          APK="build/app/outputs/flutter-apk/cloudcine-${VERSION}-android.apk"
+          test -f "$APK" || { echo "::error::没找到 $APK"; exit 1; }
+
+          AAPT2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          "$AAPT2" dump badging "$APK" > badging.txt
+          grep -E "^(package|sdkVersion|targetSdkVersion|uses-permission)" badging.txt
+
+          grep -q "package: name='com.cloudcine.cloudcine'" badging.txt \
+            || { echo "::error::包名不是 com.cloudcine.cloudcine"; exit 1; }
+
+          # Flutter 模板只在 debug/profile 清单里加 INTERNET —— release 缺了就是
+          # **联网必失败且没有任何弹窗**（踩过一次，现象看着像解码问题）
+          grep -q "uses-permission: name='android.permission.INTERNET'" badging.txt \
+            || { echo "::error::release 清单里没有 INTERNET 权限，装上去连不上网盘"; exit 1; }
+
+          # 四个 ABI 都必须在包里：Android 上唯一能播 libmpv 软解的那条路，
+          # 缺哪个 ABI，对应架构的设备就退回系统播放器、部分格式放不出来。
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            unzip -l "$APK" | grep -q "lib/$abi/libmpv.so" \
+              || { echo "::error::$abi 里没有 libmpv.so"; exit 1; }
+          done
+
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudcine-android
+          path: build/app/outputs/flutter-apk/cloudcine-*-android.apk
+          if-no-files-found: warn

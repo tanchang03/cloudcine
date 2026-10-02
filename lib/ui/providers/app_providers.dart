@@ -222,7 +222,8 @@ String _getDeviceName() {
 /// 备份同步服务。
 ///
 /// 依赖 [adapterRegistryProvider]（网盘上传/下载）、[appSupportDirProvider]
-/// （数据库路径）、[posterCacheDirProvider]（海报缓存路径）。
+/// （数据库路径）、[posterCacheDirProvider]（海报缓存路径），
+/// 以及 [mediaRepositoryProvider] 提供的「库内容最后变更时间」。
 final libraryBackupServiceProvider = Provider<LibraryBackupService>(
   (ref) {
     final registry = ref.watch(adapterRegistryProvider);
@@ -236,6 +237,10 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
       posterCachePath: posterPath,
       deviceId: _getDeviceId(),
       deviceName: _getDeviceName(),
+      // ⚠️ 必须注入：漏了的话同步会拿「备份文件生成时间」比较，
+      // 那等于本机永远比远程新 → 只会上传，新机器会把好备份冲成空库。
+      localModifiedAt: () =>
+          ref.read(mediaRepositoryProvider).latestLibraryChangeAt(),
     );
   },
 );

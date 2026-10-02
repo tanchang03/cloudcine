@@ -61,6 +61,15 @@ class _FakeHttp implements HttpClientLike {
       throw UnimplementedError();
 
   @override
+  Future<String> postBytes(
+    String url, {
+    required List<int> body,
+    Map<String, String>? headers,
+    Duration? timeout,
+  }) =>
+      throw UnimplementedError();
+
+  @override
   void close() {}
 }
 
@@ -511,12 +520,55 @@ void main() {
 
       expect(
         md!.posterUrl,
-        'https://img3.doubanio.com/view/photo/m_ratio_poster/public/p2902705337.jpg',
+        'https://qnmob3-sign.doubanio.com/view/photo/m_ratio_poster/public/p2902705337.jpg',
         reason: '搜索结果的 cover_url 被服务端套了 `imageView2/…/h/120/format/jpg`，'
             '是一条 120px 高的横条 —— 拿它当海报会是一道细缝。'
-            '海报只能取自详情接口。',
+            '海报只能取自详情接口。详情接口给的 `img*` 子域会被改写成'
+            '`qnmob3-sign`（见类文档坑 #6：img* 子域即使带 Referer 也 403/418）。',
       );
       expect(md.posterUrl, isNot(contains('h/120')));
+      expect(md.posterUrl, isNot(contains('img3.doubanio.com')));
+    });
+
+    test('详情 cover_url 的 img* 子域一律改写成 qnmob3-sign', () async {
+      // 2026-10-02 日志：同一张图 p2616542123.jpg，同一个 Referer 头，
+      // qnmob3-sign.doubanio.com → 200，img3.doubanio.com → 403，
+      // img9.doubanio.com → 418。详情接口给的 cover_url 用的正是 img* 子域，
+      // 不改写 → PosterCache 下载失败 → 刮削成功但没封面。
+      final http = _FakeHttp((call) async {
+        if (call.path.endsWith('/search')) {
+          return _ok(_searchBody(
+            subjects: [
+              _hit(id: '35170001', title: '吞噬星空', targetType: 'tv', year: '2023'),
+            ],
+          ));
+        }
+        return _ok(_detailBody(
+          id: '35170001',
+          type: 'tv',
+          title: '吞噬星空 第1季',
+          coverUrl:
+              'https://img9.doubanio.com/view/photo/m_ratio_poster/public/p2933465504.jpg',
+        ));
+      });
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(title: '吞噬星空', kind: MediaKind.episode, year: 2023),
+      );
+
+      expect(md, isNotNull);
+      expect(
+        md!.posterUrl,
+        'https://qnmob3-sign.doubanio.com/view/photo/m_ratio_poster/public/p2933465504.jpg',
+        reason: 'img9.doubanio.com 在日志里返回 418。改写成 qnmob3-sign 后'
+            '路径不变（m_ratio_poster），只是域名换了 —— PosterCache 下载时'
+            '带 Referer 就能拿到 200。',
+      );
     });
 
     test('详情缺字段时不抛：没有海报就 posterUrl 为 null', () async {
@@ -777,7 +829,8 @@ void main() {
       expect(
         DoubanScraper.imageHeaders()['Referer'],
         'https://movie.douban.com/',
-        reason: '实测 img*.doubanio.com 缺 Referer 一律返回 418。',
+        reason: '实测豆瓣图片 CDN 缺 Referer 一律返回 418。'
+            '（但 img* 子域带 Referer 仍可能 403，所以落库时还做了域名改写。）',
       );
     });
 
@@ -1289,6 +1342,15 @@ void main() {
             '实测 540×803 = 2:3）。搜索结果的 `cover_url` 是一条 120px 高的'
             '横条，落库会让详情页显示一张被拉扁的图。',
       );
+      expect(
+        md.posterUrl,
+        contains('qnmob3-sign.doubanio.com'),
+        reason: '详情接口返回的 `cover_url` 用的是 `img3.doubanio.com` 子域，'
+            '该子域即使带 Referer 也 403/418（2026-10-02 实测）。'
+            '_toMetadata 必须把它改写成 `qnmob3-sign.doubanio.com`，'
+            '否则 PosterCache 下载失败 → 手动刮削成功但没封面。',
+      );
+      expect(md.posterUrl, isNot(contains('img3.doubanio.com')));
       expect(md.onlineId, 'douban/movie/35000001');
       expect(md.source, ScrapeSource.online);
       expect(http.detailCalls.single.path, contains('/movie/35000001'));

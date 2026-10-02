@@ -160,6 +160,7 @@ void main() {
     double? posterFaceX = 0.32,
     ScrapeSource source = ScrapeSource.local,
     MediaCategory category = MediaCategory.anime,
+    DateTime? lastModifiedAt,
   }) =>
       MediaWork(
         key: 'show',
@@ -173,6 +174,7 @@ void main() {
         source: source,
         itemCount: 3,
         totalBytes: 12345,
+        lastModifiedAt: lastModifiedAt ?? DateTime(2026, 9, 28),
         lastPlayedAt: now.subtract(const Duration(days: 2)),
         updatedAt: now,
       );
@@ -243,6 +245,32 @@ void main() {
       expect(w.itemCount, 3);
       expect(w.totalBytes, 12345);
       expect(w.lastPlayedAt, now.subtract(const Duration(days: 2)));
+    });
+
+    test('刮削后 lastModifiedAt 原样保留 —— 不会跳到列表末尾', () async {
+      // 2026-10-02：用户反馈「手工刮削后影片排到了最后一个」。
+      // 根因是 _apply 漏抄 lastModifiedAt，构造器默认 null，
+      // 落库后 recentModified 倒序排里 NULL 垫底。
+      final fileTime = DateTime(2026, 9, 28, 10, 30);
+      final repo = await repoWith(
+        work(lastModifiedAt: fileTime),
+        [item(name: 'Show.S01E01.1080p.mkv')],
+      );
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      );
+
+      await subject.scrape(work(lastModifiedAt: fileTime));
+
+      expect(
+        repo.written.single.lastModifiedAt,
+        fileTime,
+        reason: 'lastModifiedAt 是网盘文件的修改时间，与刮削无关。'
+            '漏抄会让它变成 null，而 NULL 在 DESC 排序里垫底 —— '
+            '用户看到的是「刮完一部电影，它从前面跳到了最后」。',
+      );
     });
 
     test('海报换了 → 人脸锚点归零、缓存文件名清空', () async {

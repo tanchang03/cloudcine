@@ -929,6 +929,29 @@ class DriftMediaRepository implements MediaRepository {
     return row.read(expr) ?? 0;
   }
 
+  @override
+  Future<DateTime?> latestLibraryChangeAt() async {
+    // 取「作品 updated_at」与「媒体项 first_seen_at / last_played_at」的最大值。
+    // 三者都是「库真的变过」的证据，任何一个变了都该算数 ——
+    // 只看作品表会漏掉「只播过、还没归组」的时刻。
+    final workExpr = _db.mediaWorks.updatedAt.max();
+    final seenExpr = _db.mediaItems.firstSeenAt.max();
+    final playedExpr = _db.mediaItems.lastPlayedAt.max();
+
+    final workRow = await (_db.selectOnly(_db.mediaWorks)..addColumns([workExpr]))
+        .getSingle();
+    final itemRow = await (_db.selectOnly(_db.mediaItems)
+          ..addColumns([seenExpr, playedExpr]))
+        .getSingle();
+
+    DateTime? latest = workRow.read(workExpr);
+    for (final t in [itemRow.read(seenExpr), itemRow.read(playedExpr)]) {
+      if (t == null) continue;
+      if (latest == null || t.isAfter(latest)) latest = t;
+    }
+    return latest;
+  }
+
   // -------------------------------------------------------------------
   // 映射
   // -------------------------------------------------------------------

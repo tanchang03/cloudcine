@@ -39,7 +39,15 @@ class CacheSpeedMeter {
   ///
   /// 首尾两点挨得太近时，分母是一个舍入误差级别的数字，商会被放大成
   /// 几十倍 —— 宁可这一拍不显示，也不要闪一个假数字。
-  static const double _minSpanSeconds = 0.4;
+  ///
+  /// ⚠️ 1.5 秒不是「舍入误差」的量级，是被实测逼出来的：mpv 的
+  /// `demuxer-cache-time` 是**成块**更新的（一个切片、一批解复用结果），
+  /// 两个事件常常只隔几十毫秒。取 0.4 秒时，一次几百 MB 的块填充会被直接
+  /// 算成 GB/s —— 界面上那个「≈1.0 GB/s」就是这么来的（详见
+  /// [cacheBytesPerSecond] 的文档）。1.5 秒仍挡不住一次真正的块填充，
+  /// 但它至少挡住了最密集的那批尖峰；剩下的由 [cacheBytesPerSecond]
+  /// 的字节上限兜底。
+  static const double _minSpanSeconds = 1.5;
 
   /// 缓存量**回退**多少秒算「换了文件」。
   ///
@@ -91,4 +99,50 @@ class _Sample {
 
   final DateTime at;
   final double seconds;
+}
+
+/// 换算结果的护栏：超过这个字节速率就当没测到。
+///
+/// 256 MB/s ≈ 2 Gbps。网盘场景（公网 HTTPS）不可能持续到这个量级，
+/// 到了就说明测到的**不是下载速度**。
+const int defaultMaxCacheBytesPerSecond = 256 * 1024 * 1024;
+
+/// 把 [CacheSpeedMeter] 的倍速换算成字节/秒；缺任何一环、或结果明显不可能
+/// 时返回 `null`。
+///
+/// 换算靠平均码率：`文件大小 ÷ 时长`，再乘「每秒缓存多少秒视频」。
+/// 这是**估算**（VBR 片源会偏），所以调用方显示时带 `≈`。
+///
+/// ## 为什么必须有 [maxBytesPerSecond] 这道上限
+///
+/// `demuxer-cache-time` 量的是 **demuxer 层**缓存，而 media_kit 硬编码了
+/// `cache=yes`（`real.dart` 初始化选项），网络下载发生在它**下面**的 stream
+/// 层 —— 两层之间是解耦的：demuxer 从本地（内存 / `cache-on-disk` 的磁盘
+/// 文件）拿已经下好的字节，速度是 CPU 与磁盘的量级，跟带宽无关。于是一次
+/// 几百 MB 的块填充可以在几十毫秒内完成，倍速能到几千，乘上码率就是 GB/s。
+///
+/// 这不是舍入误差，是**口径错误**，靠加长平滑窗口治不了（窗口再长，一次
+/// 爆发也只占其中一小段）。根治要靠 `PlayerBufferConfig` 关掉 stream 层
+/// 缓存；这道上限是它没生效时的兜底 —— 宁可这一拍不显示速度，也不要印一个
+/// 用户一看就知道是假的「1.0 GB/s」。
+///
+/// [sizeBytes] 应当是**当前档位**的体积（播转码流时不能拿原文件大小来算，
+/// 否则码率被高估若干倍）；没有就传 null，调用方退回显示倍速。
+double? cacheBytesPerSecond({
+  required double? rate,
+  required int? sizeBytes,
+  required Duration duration,
+  int maxBytesPerSecond = defaultMaxCacheBytesPerSecond,
+}) {
+  if (rate == null || rate.isNaN || rate.isInfinite) return null;
+  if (sizeBytes == null || sizeBytes <= 0) return null;
+  final total = duration.inMicroseconds / Duration.microsecondsPerSecond;
+  if (total <= 0) return null;
+
+  final bytes = rate * (sizeBytes / total);
+  if (bytes.isNaN || bytes.isInfinite) return null;
+  // 负速率（缓存被消耗得比填充快）不出数：那是「不够用」，不是「负网速」。
+  if (bytes < 1) return null;
+  if (bytes > maxBytesPerSecond) return null;
+  return bytes;
 }

@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CloudCine 云影 —— Windows MSI 安装包定义（WiX Toolset v3）
+
+  用法见同目录的 build_package.ps1。这个文件本身不直接跑，需要由脚本传入三个变量：
+    -dProductVersion=<x.y.z>    来自 pubspec.yaml 的 version，去掉 +build 后缀
+    -dSourceDir=<绝对路径>      flutter build windows（release 模式）的产物目录（已补齐运行库）
+    -dAppIcon=<绝对路径>        同目录的 app_icon.ico
+    -dLicenseRtf=<绝对路径>     同目录的 license.rtf
+
+  ── 为什么装到 %LOCALAPPDATA%\Programs\CloudCine ─────────────────────────
+  InstallScope="perUser"。双击就装，不弹 UAC。安装包没有代码签名，走
+  perMachine 的话用户会先看到一个「未知发布者」的管理员授权窗口 —— 对一个
+  还没签名的应用来说，那一步的劝退效果比 SmartScreen 更强。
+  Chrome、VS Code 用的也是 per-user 安装。
+
+  ── 为什么目录 Id 不叫 ProgramsFolder ────────────────────────────────────
+  MSI 自己有一个标准目录属性就叫 ProgramsFolder，语义由 Windows Installer
+  内部决定。这里刻意用自定义 Id（CloudCineProgramsFolder）显式声明父子关系，
+  免得跟标准属性的解析规则打架。
+
+  ── 版本与升级 ───────────────────────────────────────────────────────────
+  Product/@Id="*" + 固定的 UpgradeCode + MajorUpgrade：每次构建生成新的
+  ProductCode，装新版时会自动卸掉旧版（先卸后装，避免文件占用导致装不上）。
+  UpgradeCode 一旦发布就**不能改** —— 改了等于换了一个产品，旧版不会被识别。
+
+  ── 图标 ─────────────────────────────────────────────────────────────────
+  用的是同目录 app_icon.ico，它是从 windows/runner/resources/app_icon.ico
+  裁出来的（只留 16/32/48 三个未压缩条目）。原始文件里那个 256x256 是 PNG
+  压缩格式，MSI 的 Icon 表对它支持不稳，所以不放进来。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <Product Id="*"
+           Name="云影 CloudCine"
+           Language="2052"
+           Version="$(var.ProductVersion)"
+           Manufacturer="CloudCine"
+           UpgradeCode="{A4E8C1D2-9B3F-4C7A-8D15-E2F3A6B9C0D1}">
+
+    <Package Id="*"
+             Keywords="Installer"
+             Description="云影 CloudCine —— 跨网盘在线影视播放器"
+             Comments="第三方独立开源客户端，与任何网盘服务商均无关联"
+             Manufacturer="CloudCine"
+             InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             InstallPrivileges="limited" />
+
+    <!-- 装新版时自动卸旧版；降级安装直接拒绝并给一句人话 -->
+    <MajorUpgrade DowngradeErrorMessage="本机已安装更新版本的云影 CloudCine，请先在「设置 → 应用」里卸载它，再装这个版本。" />
+
+    <!-- 所有内容打进 MSI 自带的 cab，交付物只有一个文件 -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- 应用跑不起来的最低系统。给一句明确的话，好过让用户看到一个
+         语焉不详的「安装失败」。 -->
+    <Condition Message="云影 CloudCine 需要 Windows 10 或更高版本。">VersionNT &gt;= 1000</Condition>
+
+    <!-- 「设置 → 应用」里那一行 -->
+    <Property Id="ARPPRODUCTICON" Value="CloudCineIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/tanchang03/cloudcine" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/tanchang03/cloudcine" />
+    <Property Id="ARPCOMMENTS" Value="第三方独立开源客户端，仅供播放你自己账号下、你有合法访问权的文件。" />
+
+    <!-- 告诉 WixUI_InstallDir 哪个目录是「可以改的安装目录」 -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <!-- 完成页多一段提示。首次启动会被 SmartScreen 拦一次，与其让用户
+         自己撞上去，不如在这里先说清楚怎么放行。 -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="云影 CloudCine 已安装完成，可以在开始菜单里找到它。首次启动若出现「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」即可 —— 安装包未做代码签名，这是正常现象，不是文件损坏。" />
+
+    <Icon Id="CloudCineIcon" SourceFile="$(var.AppIcon)" />
+
+    <!-- 安装向导里的许可页。不提供这个变量的话，许可页会拿不到正文。 -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="CloudCineProgramsFolder" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="CloudCine" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="CloudCine" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="{B3F7D9E0-2C5A-4D8B-9E12-6C4A7B1F0D35}">
+        <Shortcut Id="CloudCineStartMenuShortcut"
+                  Name="云影 CloudCine"
+                  Description="跨网盘在线影视播放器"
+                  Target="[INSTALLFOLDER]cloudcine.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="CloudCineIcon" />
+        <!-- 卸载时把这个开始菜单文件夹一并删掉（空了才删得掉） -->
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <!-- 安装目录本身也登记一下。MSI 的 RemoveFolders 动作本来就会删空目录，
+             但显式登记更稳：卸载后不会留下一个空的 CloudCine\ 目录。
+             （ICE64 也要求这样登记，不过那条 ICE 在本包里被压掉了 —— 它是
+             per-user 场景下的误报，理由见 build_package.ps1 里 -sice 那段。） -->
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <!-- 组件必须有 KeyPath。用注册表值而不是文件，卸载时不会因为
+             快捷方式被用户改过而留下残留。Root 用 HKMU：per-user 装映射到
+             HKCU，将来若改成 per-machine 会自动映射到 HKLM。 -->
+        <RegistryValue Root="HKMU" Key="Software\CloudCine" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature"
+             Title="云影 CloudCine"
+             Description="播放器本体、运行库与开始菜单快捷方式"
+             Level="1"
+             Absent="disallow"
+             ConfigurableDirectory="INSTALLFOLDER">
+      <!-- 由 heat.exe 扫描产物目录生成，见 build_package.ps1 -->
+      <ComponentGroupRef Id="CloudCineFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- 安装向导界面：欢迎 → 许可 → 选择目录 → 确认 → 进度 → 完成。
+         文案是简体中文（light 传 -cultures:zh-cn）。 -->
+    <UIRef Id="WixUI_InstallDir" />
+
+  </Product>
+</Wix>
