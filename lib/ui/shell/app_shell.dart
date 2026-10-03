@@ -1,17 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../providers/auth_providers.dart';
+import '../providers/download_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
 import '../widgets/tv_affordance.dart';
+import '../widgets/tv_focus.dart';
 
 /// 一级导航的侧栏外壳。
 ///
-/// 用 `StatefulShellRoute` 而不是普通 `ShellRoute`：三个一级入口
-/// （媒体库 / 扫描 / 设置）各自要**保住自己的状态** —— 切到设置再切回
-/// 媒体库时，海报墙的滚动位置与搜索词不该被重置。
+/// 用 `StatefulShellRoute` 而不是普通 `ShellRoute`：五个一级入口
+/// （媒体库 / 文件夹 / 扫描 / 下载 / 设置）各自要**保住自己的状态** —— 切到
+/// 设置再切回媒体库时，海报墙的滚动位置与搜索词不该被重置。
+///
+/// ⚠️ `_Sidebar._items` 的**顺序就是分支下标**（`shell.currentIndex`）。
+/// 增删入口时必须同时改 `app_router.dart` 里 `branches` 的顺序 ——
+/// 只改一处的表现是「点一个入口，高亮跳到另一个」，而页面确实切对了。
 class AppShell extends ConsumerWidget {
   const AppShell({super.key, required this.shell});
 
@@ -21,44 +28,248 @@ class AppShell extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return Scaffold(
       backgroundColor: Colors.transparent,
-      // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉
-      // （侧栏最左边那列字首当其冲）。
-      // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
-      body: Padding(
-        padding: AppTheme.safeAreaInsets(context),
-        child: Row(
-          children: [
-            _Sidebar(shell: shell),
-            const VerticalDivider(
-              width: 0.5,
-              thickness: 0.5,
-              color: AppTheme.line,
-            ),
-            Expanded(child: shell),
-          ],
+      // 方向键兜底的中转站：自己**不吃焦点、不参与遍历**，只在默认逻辑走不动时
+      // 把焦点送到侧栏。为什么需要它见 [_onShellKey]。
+      body: Focus(
+        canRequestFocus: false,
+        onKeyEvent: _onShellKey,
+        // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉
+        // （侧栏最左边那列字首当其冲）。
+        // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
+        child: Padding(
+          padding: AppTheme.safeAreaInsets(context),
+          child: Row(
+            children: [
+              _Sidebar(key: _sidebarKey, shell: shell),
+              const VerticalDivider(
+                width: 0.5,
+                thickness: 0.5,
+                color: AppTheme.line,
+              ),
+              Expanded(child: shell),
+            ],
+          ),
         ),
       ),
     );
   }
 }
 
+/// 侧栏那一列的根 widget —— 方向键兜底要在**它里面**找目标。
+///
+/// ⛔ 兜底**只能**在侧栏子树里找，不能在整个窗口里按几何找。理由见
+/// [_nearestSidebarFocus] 里那段：`IndexedStack` 把另外 4 个分支也留在树里，
+/// 它们的坐标和当前页**完全重合**，全窗口搜索会把焦点送到一个**看不见**的
+/// 同坐标节点上 —— 用户看到的是「焦点凭空消失了」。
+final GlobalKey _sidebarKey = GlobalKey(debugLabel: 'cloudcine-sidebar');
+
+/// 方向键兜底。
+///
+/// ## 为什么必须有这一层
+///
+/// `StatefulShellRoute.indexedStack` **给每个分支一个独立 `Navigator`**，于是
+/// 每个分支页有自己的 `FocusScope`。而 `FocusTraversalPolicy.inDirection`
+/// （`focus_traversal.dart:1070`）只在 `currentNode.nearestScope.traversalDescendants`
+/// 里找候选，**找不到就返回 false，不会向上冒泡到父 scope**。
+///
+/// 侧栏是分支页的**兄弟**（在外层 scope 里），所以从内容区按 ← 永远走不进去 ——
+/// 实测：焦点在内容区时那个候选表**只有 1 个节点**（它自己）。同一方向键在焦点
+/// 位于侧栏时就能走通，因为那时最近 scope 换成了外层那个。
+///
+/// 这是 `StatefulShellRoute` 的固有结构，不是接线错误：Tab 能跨（`_moveFocus`
+/// 会爬 scope 边界），**但真机遥控器没有 Tab**。
+///
+/// ## 只在「默认逻辑走不动」时出手
+///
+/// ① 先跑 `focusInDirection` —— 与框架默认的 `_DirectionalFocusAction`
+/// **逐字一致**（含「方向反过来时回到上一个位置」那套 `_popPolicyDataIfNeeded`）。
+/// 它返回 true 就说明框架自己找到了，直接放行，**内容区内部的方向键行为一点不变**。
+/// ② 只有它返回 false（真的没得走）才轮到兜底，而且**只往侧栏送**。
+KeyEventResult _onShellKey(FocusNode node, KeyEvent event) {
+  final direction = _arrowDirectionOf(event);
+  if (direction == null) return KeyEventResult.ignored;
+
+  final focus = FocusManager.instance.primaryFocus;
+  if (focus == null || focus.context == null) return KeyEventResult.ignored;
+
+  // ① 框架自己那套。
+  if (focus.focusInDirection(direction)) return KeyEventResult.handled;
+
+  // ② 兜底。
+  final next = _nearestSidebarFocus(focus, direction);
+  if (next == null) {
+    // 真的没得走 —— 交还给默认处理（例如 Ctrl+方向键的滚动），别把按键吞掉。
+    return KeyEventResult.ignored;
+  }
+  next.requestFocus();
+  return KeyEventResult.handled;
+}
+
+/// 这个按键是不是「往某个方向走」。
+///
+/// ⛔ 按住 Ctrl 的方向键在框架里是**滚动**（`ScrollIntent`），不是焦点移动 ——
+/// 抢过来会让「Ctrl+↑」在列表里翻不动页。
+TraversalDirection? _arrowDirectionOf(KeyEvent event) {
+  if (event is! KeyDownEvent && event is! KeyRepeatEvent) return null;
+  if (HardwareKeyboard.instance.isControlPressed) return null;
+  return switch (event.logicalKey) {
+    LogicalKeyboardKey.arrowLeft => TraversalDirection.left,
+    LogicalKeyboardKey.arrowRight => TraversalDirection.right,
+    LogicalKeyboardKey.arrowUp => TraversalDirection.up,
+    LogicalKeyboardKey.arrowDown => TraversalDirection.down,
+    _ => null,
+  };
+}
+
+/// 在**侧栏子树**里找 [direction] 方向上离 [from] 最近的那个可聚焦节点。
+///
+/// 筛选规则照抄框架的 `_sortAndFilterHorizontally` / `_sortAndFilterVertically`
+/// （`focus_traversal.dart:906` / `:932`），这样「什么算在那个方向上」的判据与
+/// 框架一致，不会出现「框架说没有、我说有」的错位：
+///   * 候选必须**整体**在方向上（左：`center.dx <= from.left`）；
+///   * 先挑「与 from 在垂直于方向轴上有重叠」的那批（带内），带内为空才放宽；
+///   * 带内按方向轴上的间距取最近，同距时按垂直偏移取最近 —— 后者保证结果稳定，
+///     不依赖焦点树的遍历顺序。
+FocusNode? _nearestSidebarFocus(FocusNode from, TraversalDirection direction) {
+  final root = _sidebarKey.currentContext;
+  if (root == null) return null;
+
+  final fromRect = from.rect;
+  if (fromRect.isEmpty) return null;
+
+  final candidates = <FocusNode>[];
+  for (final candidate in FocusManager.instance.rootScope.descendants) {
+    if (!candidate.canRequestFocus || candidate.skipTraversal) continue;
+    final context = candidate.context;
+    if (context == null) continue;
+    if (!_isInside(context, root)) continue;
+    final rect = candidate.rect;
+    if (rect.isEmpty) continue;
+
+    final onTheWay = switch (direction) {
+      TraversalDirection.left => rect.center.dx <= fromRect.left,
+      TraversalDirection.right => rect.center.dx >= fromRect.right,
+      TraversalDirection.up => rect.center.dy <= fromRect.top,
+      TraversalDirection.down => rect.center.dy >= fromRect.bottom,
+    };
+    if (onTheWay) candidates.add(candidate);
+  }
+  if (candidates.isEmpty) return null;
+
+  // 带内优先：从海报墙最左边按 ← 时，「高度上和这一排重叠」的那几项才是用户
+  // 心里想的那些，而不是侧栏最顶或最底那一项。
+  final band = switch (direction) {
+    TraversalDirection.left || TraversalDirection.right => Rect.fromLTRB(
+        double.negativeInfinity,
+        fromRect.top,
+        double.infinity,
+        fromRect.bottom,
+      ),
+    TraversalDirection.up || TraversalDirection.down => Rect.fromLTRB(
+        fromRect.left,
+        double.negativeInfinity,
+        fromRect.right,
+        double.infinity,
+      ),
+  };
+  final inBand = candidates
+      .where((candidate) => !candidate.rect.intersect(band).isEmpty)
+      .toList();
+  final pool = inBand.isEmpty ? candidates : inBand;
+
+  double alongAxis(FocusNode n) => switch (direction) {
+        TraversalDirection.left => fromRect.left - n.rect.right,
+        TraversalDirection.right => n.rect.left - fromRect.right,
+        TraversalDirection.up => fromRect.top - n.rect.bottom,
+        TraversalDirection.down => n.rect.top - fromRect.bottom,
+      };
+  double acrossAxis(FocusNode n) => switch (direction) {
+        TraversalDirection.left ||
+        TraversalDirection.right =>
+          (n.rect.center.dy - fromRect.center.dy).abs(),
+        TraversalDirection.up ||
+        TraversalDirection.down =>
+          (n.rect.center.dx - fromRect.center.dx).abs(),
+      };
+
+  pool.sort((a, b) {
+    final byAxis = alongAxis(a).compareTo(alongAxis(b));
+    if (byAxis != 0) return byAxis;
+    return acrossAxis(a).compareTo(acrossAxis(b));
+  });
+  return pool.first;
+}
+
+/// [node] 是不是 [ancestor] 的后代（含自身）。
+bool _isInside(BuildContext node, BuildContext ancestor) {
+  if (identical(node, ancestor)) return true;
+  var found = false;
+  node.visitAncestorElements((element) {
+    if (identical(element, ancestor)) {
+      found = true;
+      return false;
+    }
+    return true;
+  });
+  return found;
+}
+
 class _Sidebar extends ConsumerWidget {
-  const _Sidebar({required this.shell});
+  const _Sidebar({super.key, required this.shell});
 
   final StatefulNavigationShell shell;
 
+  /// ⚠️ 「文件夹」紧跟在「媒体库」后面是**刻意的**：两者都是「找片子」的
+  /// 入口（一个是按作品找、一个是按网盘位置找），挨着放用户才不会在
+  /// 侧栏里来回扫。
   static const List<({IconData icon, String label, String path})> _items = [
     (icon: Icons.grid_view_rounded, label: '媒体库', path: '/library'),
+    (icon: Icons.folder_rounded, label: '文件夹', path: '/folders'),
     (icon: Icons.radar_rounded, label: '扫描', path: '/scan'),
+    (icon: Icons.download_rounded, label: '下载', path: '/downloads'),
     (icon: Icons.settings_rounded, label: '设置', path: '/settings'),
   ];
+
+  /// 下载那一项在 `_items` 里的下标。
+  ///
+  /// 写成常量而不是字面量 `3`：角标要挂在**特定的那一项**上，而入口顺序
+  /// 是会被调整的 —— 调了顺序却忘了改这个数字，表现是「扫描那项上挂着一个
+  /// 下载数」，一个看起来像数据错了的界面 bug。
+  static const int _downloadsIndex = 3;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final auth = ref.watch(authControllerProvider).valueOrNull;
+    // 「进行中」的下载数（排队 + 下载中）。**不含已暂停 / 失败** ——
+    // 角标的意义是「有东西正在动」，把用户早就放弃的任务也算进去的话，
+    // 它会永远挂着，点进去却发现什么都没在下。
+    final downloading = ref.watch(downloadActiveCountProvider);
 
     return SizedBox(
-      width: AppTheme.sidebarWidth,
+      // TV 上加宽到 240：16sp 的标签 + 22px 的图标 + 焦点环需要地方，
+      // 桌面那 196 是按「鼠标精确点到 13sp 的小行」定的，电视上不够。
+      width: AppTheme.isTvLayout(context)
+          ? AppTheme.tvSidebarWidth
+          : AppTheme.sidebarWidth,
+      // ## ⚠️ 这一列的高度是**紧**的，改上面任何一项前先看这段
+      //
+      // 540 高的电视上可用高只有 540 − 过扫描 54 = **486**，要装下
+      // logo + 6 个入口 + 账号块。原来它**溢出 25px**：`诊断日志` 整行掉在
+      // 安全带外，而 Release 下溢出是**静默裁掉**的 —— 看起来像「那个入口
+      // 本来就没有」，可它还在焦点链里（遥控器按得到、屏幕上看不见）。
+      //
+      // 现在收紧了 tile 的内外上下内边距（每个 61 → 55），实测余量是
+      // **`Spacer` 的 23px**。⚠️ 要量余量就量 `Spacer` 的高度 ——
+      // `诊断日志` 是被它顶到底部的，量那个 tile 的 `bottom` 只反映尾部间距，
+      // 量不出余量。
+      //
+      // ⛔ 那个 `Spacer` **不是保险**：它是 flex，可用高不够时被压成 0，
+      // 然后溢出照旧发生。加东西之前先确认余量够。
+      //
+      // ⚠️ 残留的脆弱点：侧栏**没有**套 `AppTheme.tvTextScaler`，字跟着系统
+      // 字体缩放走。tile 高度是「图标 22 与文字取大」决定的，所以系统缩放
+      // 超过 ~1.4 时 5 个 tile 一起长高、余量被吃光。真遇到，修法是给这一列
+      // 夹住 `textScaler`（或把 `Column` 换成可滚动的），**不是**继续抠像素。
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -73,6 +284,7 @@ class _Sidebar extends ConsumerWidget {
               icon: _items[i].icon,
               label: _items[i].label,
               selected: shell.currentIndex == i,
+              badge: i == _downloadsIndex ? downloading : null,
               onTap: () => shell.goBranch(
                 i,
                 // 点已选中的项 = 「回到这个入口的根」，与大多数桌面应用一致。
@@ -95,7 +307,10 @@ class _Sidebar extends ConsumerWidget {
             selected: false,
             onTap: () => context.push('/diagnostics'),
           ),
-          const SizedBox(height: 10),
+          // ⛔ 底部只留 2：侧栏那一列在 540 高的电视上余量本来就紧（见上面
+          // `SizedBox` 上那段），过扫描内边距已经给了 27px 底边距，
+          // 这里再留 6 是纯浪费。
+          const SizedBox(height: 2),
         ],
       ),
     );
@@ -108,6 +323,7 @@ class _NavTile extends StatelessWidget {
     required this.label,
     required this.selected,
     required this.onTap,
+    this.badge,
   });
 
   final IconData icon;
@@ -115,11 +331,33 @@ class _NavTile extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
+  /// 右上角的数字角标。`null` 或 `0` 时不画。
+  ///
+  /// 挂在这里而不是让调用方拼一个 `Stack`：角标要跟**这一项**一起被
+  /// 选中态高亮、一起被 hover 背景覆盖，拼在外面的话它会浮在背景之上，
+  /// 看起来像一个掉在侧栏上的独立小方块。
+  final int? badge;
+
   @override
   Widget build(BuildContext context) {
+    final tv = AppTheme.isTvLayout(context);
     final color = selected ? AppTheme.text : AppTheme.muted;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+    final count = badge ?? 0;
+
+    final tile = Padding(
+      // ⛔ TV 上这圈上下内边距从 5 收到 4、里面那圈从 14 收到 12：
+      // 540 高的屏上 486 要装下 logo + 6 个入口 + 账号块，原来**溢出 25px**，
+      // 溢出的正是最底下那项「诊断日志」（它落到了安全带之外，而 Release 下
+      // 溢出是被**静默裁掉**的 —— 看起来像「那个入口本来就没有」，可它还在
+      // 焦点链里：遥控器按得到、屏幕上看不见）。
+      //
+      // 实测（不是算的）：每个 tile 61 → 55，`_Sidebar` 那个 `Column` 的
+      // **`Spacer` 余量 23px**（量 `Spacer` 自己的高度才对 —— `诊断日志` 是被
+      // 它顶到底部的，量它的 `bottom` 只反映尾部间距，量不出余量）。
+      padding: EdgeInsets.symmetric(
+        horizontal: tv ? 12 : 10,
+        vertical: tv ? 4 : 2,
+      ),
       child: Material(
         color: selected ? AppTheme.panel2 : Colors.transparent,
         borderRadius: BorderRadius.circular(8),
@@ -128,25 +366,62 @@ class _NavTile extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           hoverColor: AppTheme.panel2.withValues(alpha: 0.6),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+            // TV 上把这一行撑到 ~55：桌面那 ~38 意味着「两行挤在一起」，
+            // 遥控器上看不出焦点落在哪一行。
+            padding: EdgeInsets.symmetric(
+              horizontal: tv ? 16 : 10,
+              vertical: tv ? 12 : 9,
+            ),
             child: Row(
               children: [
-                Icon(icon, size: 17, color: color),
-                const SizedBox(width: 10),
+                Icon(icon, size: tv ? 22 : 17, color: color),
+                SizedBox(width: tv ? 14 : 10),
                 Text(
                   label,
                   style: TextStyle(
-                    fontSize: 13,
+                    fontSize: tv ? AppTheme.tvNavLabel : 13,
                     fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                     color: color,
                   ),
                 ),
+                if (count > 0) ...[
+                  const Spacer(),
+                  Container(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: tv ? 7 : 5,
+                      vertical: tv ? 3 : 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppTheme.accent,
+                      borderRadius: BorderRadius.circular(7),
+                    ),
+                    child: Text(
+                      // 两位数以上就不再精确了：99+ 已经足够说明「很多」，
+                      // 而三位数会把侧栏那一行撑开。
+                      count > 99 ? '99+' : '$count',
+                      style: TextStyle(
+                        fontSize: tv ? 12 : 9.5,
+                        fontWeight: FontWeight.w700,
+                        height: 1.35,
+                        color: AppTheme.bg,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
         ),
       ),
     );
+
+    if (!tv) return tile;
+
+    // TV 上补一层焦点环，且**必须画在子节点之上**：这个 tile 的 ink 落在它
+    // 自己的 `Material` 上，而 `_RenderInkFeatures.paint` 是先画 ink 再画
+    // 子节点 —— 把主题的 `focusColor` 调多亮都会被内容盖住。
+    // 完整理由见 [TvFocusable] 的类文档。
+    return TvFocusable(borderRadius: BorderRadius.circular(8), child: tile);
   }
 }
 
@@ -168,7 +443,11 @@ class _AccountBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 12, 6),
+      // ⛔ 上间距从 12 收到 8：侧栏那一列在 540 高的电视上本来就装不下
+      // （原来溢出 25px），这里是给「系统字体被放大」留的余量 ——
+      // 侧栏**没有**套 `AppTheme.tvTextScaler`，字会跟着系统缩放长高，
+      // 而 tile 的高度是「图标 22 与文字取大」决定的，缩放一大就整列变高。
+      padding: const EdgeInsets.fromLTRB(16, 8, 12, 6),
       child: Row(
         children: [
           Expanded(

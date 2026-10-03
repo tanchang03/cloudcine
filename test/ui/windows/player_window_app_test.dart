@@ -304,6 +304,36 @@ void main() {
       await drainTimers(tester);
     });
 
+    testWidgets('指针一进窗口就唤醒浮层 —— 不必先动一下鼠标', (tester) async {
+      // 「鼠标滑到播放器上」在原生侧是 pointer **add**（引擎的
+      // `mouseEntered:` → `kAdd`），而 `MouseRegion.onHover` 只在
+      // `PointerHoverEvent` 上回调 —— 滑进来就停住时只剩这一个事件。所以唤醒
+      // 必须挂在 `onEnter` 上，否则「窗口没焦点、鼠标划过去看一眼有哪些按钮」
+      // 这个最常见的动作什么都不会发生。
+      //
+      // ⚠️ 这里只能钉住 Dart 侧的那一半。另一半是原生侧的
+      // `controller.mouseTrackingMode = .always`（见 `MainFlutterWindow.swift`
+      // 的 `ChildWindowController.attach`）：窗口不是 key window 时，引擎默认
+      // 一个 hover 事件都不送，Dart 这边怎么写都叫不醒浮层 —— 而「窗口有没有
+      // 焦点」在 widget test 里造不出来。
+      await pumpPlayer(tester);
+      await tester.pump(const Duration(seconds: 4));
+      expect(find.byTooltip('全屏（F）'), findsNothing);
+
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      // 只 `addPointer`，**不 `moveTo`** —— 这就是「滑上去就停住」。
+      await mouse.addPointer(location: const Offset(100, 100));
+      addTearDown(mouse.removePointer);
+      await tester.pump();
+
+      expect(
+        find.byTooltip('全屏（F）'),
+        findsOneWidget,
+        reason: '指针进窗口却没唤醒浮层 —— 用户会觉得「没激活的播放器是死的」',
+      );
+      await drainTimers(tester);
+    });
+
     testWidgets('鼠标移出窗口就收起', (tester) async {
       await pumpPlayer(tester);
 
@@ -720,7 +750,9 @@ void main() {
 
       await openPlaylist(tester);
 
-      // 夹具里只有第 1 集存了续播点（30 / 45 分钟）。
+      // 夹具里只有第 1 集存了历史进度（30 / 45 分钟）。画进度条读的是
+      // `maxPosition` 而不是 `resumePosition`（后者看完会被清），见
+      // `PlaylistEntry.maxPosition`。
       expect(find.byType(LinearProgressIndicator), findsOneWidget);
       await drainTimers(tester);
     });
@@ -741,9 +773,13 @@ void main() {
               itemId: 'quark:fid-1',
               title: longTitle,
               subtitle: '1080P · MKV',
-              // 带续播点 = 面板会多画一条进度条，这一项就是**最高**的那种
+              // 有历史进度 = 面板会多画一条进度条，这一项就是**最高**的那种
               // 条目。溢出只要有一种组合能触发就会触发，所以拿它来验。
-              resumePosition: Duration(minutes: 5),
+              //
+              // ⚠️ 进度条看的是 `maxPosition`（只增不减），**不是**
+              // `resumePosition` —— 只给后者的话这一项会比预期矮一条，
+              // 用例仍然绿，但验的已经不是最高那一档了。
+              maxPosition: Duration(minutes: 5),
               duration: Duration(minutes: 45),
             ),
             // 同一列表里放一条短标题当**标尺**：直接断言高度比它高，就同时
@@ -966,7 +1002,11 @@ PlayRequest _playRequestWithPlaylist({List<PlaylistEntry>? playlist}) {
             itemId: 'quark:fid-1',
             title: '第 1 集',
             subtitle: '1080P · MKV',
+            // 续播点管**切集时从哪儿开始**（下面那组用例靠它验「看完从头」），
+            // 历史进度管**面板那条进度条**。两个都要给：只给前者的话这一集
+            // 在面板上不会画进度条（见 `PlaylistEntry.maxPosition`）。
             resumePosition: Duration(minutes: 30),
+            maxPosition: Duration(minutes: 30),
             duration: Duration(minutes: 45),
           ),
           PlaylistEntry(

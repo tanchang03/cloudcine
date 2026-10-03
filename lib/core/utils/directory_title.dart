@@ -85,6 +85,13 @@ abstract final class DirectoryTitle {
     RegExp(r'^\d+[\s._\-]*(基础|进阶|高级|扩展|实战|入门|提高|核心|选修)篇$'),
     // `第2章` / `第 12 节`
     RegExp(r'^第[\s]*\d+[\s]*(章|节|讲|课|期|篇|集|话)$'),
+    // 季 —— **结构**不是名字。`/进击的巨人/第三季/` 里的末级目录名若被当成
+    // 作品名，会得到一部叫「第三季」的作品，而且刮削会拿「第三季」去搜
+    // （前缀档必然误配）。2026-10-03 加：候选链会把每一级非容器目录名都
+    // 当作一个搜索词，这条漏了就是白花一次额度。
+    RegExp(r'^第[\s]*[一二三四五六七八九十\d]{1,3}[\s]*季$'),
+    // `S02` / `Season 1` / `season2` / `S 3`
+    RegExp(r'^s(eason)?[\s._\-]*\d{1,2}$'),
     // 纯编号（`day02/1/` 这种里层目录）
     RegExp(r'^\d+$'),
     // 日期：`2026-10-02` / `2026.10.2`
@@ -125,19 +132,40 @@ abstract final class DirectoryTitle {
   /// 返回值已经去掉书名号 / 括号 / 分隔符：它同时会被当作在线刮削的查询词，
   /// `姜松《家电维修视频教程》` 带着书名号去搜只会更难命中。
   static String? seriesTitleOf(String dirPath) {
+    final names = ancestorNames(dirPath);
+    return names.isEmpty ? null : names.first;
+  }
+
+  /// 这个目录路径上**每一级「像名字」的目录名**，从末级往上。
+  ///
+  /// 与 [seriesTitleOf] 是同一套判据的两个出口：那个只要第一级
+  /// （「这个目录该用哪一级的名字当作品名」），这个要全部
+  /// （「在线刮削还有哪些词可以试」）。
+  ///
+  /// ## 为什么做成两个方法而不是各写一遍循环
+  ///
+  /// 两处对「什么算容器」的理解一旦漂移，就会出现「归组用的是 A、
+  /// 刮削去搜的是 B」—— 而这种不一致**只在刮不到的时候才暴露**，
+  /// 排查时看到的现象是「目录名明明是对的，为什么不用它搜」。
+  ///
+  /// ## 调用方注意
+  ///
+  /// 返回的是**候选**，不是「都该发一次请求」。多一条就多一个搜索词，
+  /// 而豆瓣匿名额度实测只有约 10 个（见 `ScrapeQuery.fallbacks` 的取舍）。
+  static List<String> ancestorNames(String dirPath) {
     final segments = dirPath
         .split('/')
         .map((s) => s.trim())
         .where((s) => s.isNotEmpty)
         .toList();
 
+    final out = <String>[];
     for (var i = segments.length - 1; i >= 0; i--) {
-      final seg = segments[i];
-      if (isContainerSegment(seg)) continue;
-      final cleaned = _clean(seg);
-      if (cleaned != null) return cleaned;
+      if (isContainerSegment(segments[i])) continue;
+      final cleaned = _clean(segments[i]);
+      if (cleaned != null) out.add(cleaned);
     }
-    return null;
+    return out;
   }
 
   /// 清掉书名号 / 括号 / 多余分隔符。

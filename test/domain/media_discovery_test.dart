@@ -639,4 +639,96 @@ void main() {
       );
     });
   });
+
+  // -------------------------------------------------------------------
+  // 目录视图「直接播」的解析口径
+  // -------------------------------------------------------------------
+
+  /// 这一组守的是**第三条路**：目录视图里不先入库、直接点播。
+  ///
+  /// 它和「加入媒体库」造的是同一个东西，只是不写库。两处口径分叉的话，
+  /// 用户先直接播、后把它加进库，会得到两条 `groupKey` 不同的记录 ——
+  /// 同一部片子在海报墙上出现两格，而且没有任何报错。
+  group('parseTransientMedia（目录视图直接播）', () {
+    const movie = DriveEntry(
+      id: 'f1',
+      name: 'Movie.2024.1080p.mkv',
+      isDirectory: false,
+      sizeBytes: 1000,
+    );
+
+    test('目录路径归一成扫描器口径（带结尾斜杠）', () {
+      // 目录视图手上是 `crumb.path`（**不带**尾斜杠），而扫描器/发现写库时
+      // 一律带尾斜杠。不归一的话 `/电影` 与 `/电影/` 会变成两个键。
+      final withSlash = parseTransientMedia(
+        entry: movie,
+        provider: DriveProvider.quark,
+        dirPath: '/电影/',
+      );
+      final withoutSlash = parseTransientMedia(
+        entry: movie,
+        provider: DriveProvider.quark,
+        dirPath: '/电影',
+      );
+
+      expect(withSlash.item.dirPath, '/电影/');
+      expect(withoutSlash.item.dirPath, '/电影/');
+      expect(
+        withoutSlash.item.groupKey,
+        withSlash.item.groupKey,
+        reason: '同一条目、同一个目录，换个写法必须解析出同一个分组键',
+      );
+      expect(withoutSlash.item.id, 'quark:f1', reason: '主键仍按 fid 拼');
+    });
+
+    test('与「加入媒体库」落到的是同一条记录', () async {
+      final repo = InMemoryMediaRepository();
+      await buildService(repo).discoverFile(
+        DriveProvider.quark,
+        entry: movie,
+        dirPath: '/电影',
+        dirId: 'd1',
+      );
+      final stored = repo.items['quark:f1']!;
+
+      final transient = parseTransientMedia(
+        entry: movie,
+        provider: DriveProvider.quark,
+        dirPath: '/电影',
+      ).item;
+
+      expect(
+        transient.groupKey,
+        stored.groupKey,
+        reason: '两条路必须给出同一个分组键 —— 否则先直接播、后加入媒体库，'
+            '同一部片子会在库里出现两格',
+      );
+      expect(transient.id, stored.id);
+      expect(transient.dirPath, stored.dirPath);
+      expect(transient.title, stored.title);
+      expect(transient.year, stored.year);
+      expect(transient.resolution, stored.resolution);
+      expect(transient.sizeBytes, stored.sizeBytes);
+      expect(transient.thumbUrl, stored.thumbUrl);
+    });
+
+    test('解析结果与媒体项同源 —— 归组要的那一份不会跟条目分叉', () {
+      final media = parseTransientMedia(
+        entry: const DriveEntry(
+          id: 'f2',
+          name: 'Show.S01E03.1080p.mkv',
+          isDirectory: false,
+          sizeBytes: 2000,
+        ),
+        provider: DriveProvider.quark,
+        dirPath: '/剧乙',
+      );
+
+      expect(media.parsed.groupKey, media.item.groupKey);
+      expect(media.parsed.kind, media.item.kind);
+      expect(media.parsed.title, media.item.title);
+      expect(media.parsed.year, media.item.year);
+      expect(media.item.dirPath, '/剧乙/');
+    });
+  });
 }

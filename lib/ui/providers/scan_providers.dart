@@ -117,12 +117,28 @@ class ScanController extends Notifier<ScanState> {
   ScanCancellation? _cancel;
   bool _disposed = false;
 
+  /// 上一次「实时刷新列表」时看到的命中媒体数。判据是**它变了没有** ——
+  /// 一路扫下来没有新媒体项时（都是图片 / 其它文件），库没有任何变化，
+  /// 重取列表纯属白跑。
+  int _liveTracks = 0;
+
+  /// 上一次实时刷新的时刻。给高频的 `onProgress` 加一道时间闸门。
+  DateTime? _liveRefreshedAt;
+
+  /// 两次实时刷新之间的最小间隔。
+  ///
+  /// 小目录多的时候目录边界会一个接一个推进度，不节流就是几千次全表查询。
+  /// 400ms 在「看着卡片一批批长出来」与「别把库查爆」之间取一个折中。
+  static const Duration _liveRefreshInterval = Duration(milliseconds: 400);
+
   @override
   ScanState build() {
     // 重建时 `onDispose` 会先把上一轮的实例标记为已销毁，
     // 所以这里必须**复位** —— 否则热重载/失效一次之后，
     // 所有进度回调都会被 `_emit` 静默丢掉，进度条永远不动。
     _disposed = false;
+    _liveTracks = 0;
+    _liveRefreshedAt = null;
     ref.onDispose(() => _disposed = true);
     return const ScanState();
   }
@@ -150,6 +166,11 @@ class ScanController extends Notifier<ScanState> {
   }) async {
     if (state.running) return;
 
+    // 新一轮扫描：实时刷新的两道闸门各自复位 —— 上一次扫描的命中数若恰好
+    // 等于这一轮的第一个值，不复位就会把「第一批作品」这次刷新吞掉。
+    _liveTracks = 0;
+    _liveRefreshedAt = null;
+
     final settings = ref.read(settingsProvider).valueOrNull;
     final autoScrape = settings?.canAutoScrape ?? false;
 
@@ -165,7 +186,11 @@ class ScanController extends Notifier<ScanState> {
         pruneStale: pruneStale,
         scrape: autoScrape,
         cancel: token,
-        onProgress: (p) => _emit(ScanState(running: true, progress: p)),
+        onProgress: (p) {
+          _emit(ScanState(running: true, progress: p));
+          // 边扫边刷：媒体库列表跟着一批批长出来，而不是等整次扫描结束。
+          _liveRefresh(p);
+        },
       );
       _emit(ScanState(outcome: outcome));
       if (!_disposed) {
@@ -199,6 +224,38 @@ class ScanController extends Notifier<ScanState> {
         ref.invalidate(genreCountsProvider);
       }
     }
+  }
+
+  /// 扫描进行中，把「库里又长出了新作品」推给媒体库列表。
+  ///
+  /// ## 为什么需要它
+  ///
+  /// `ScanService` 每到一个目录边界就把这一批新分组写成作品行（「边扫边看」），
+  /// 但媒体库列表原先只在**整次扫描结束**时才重取 —— 扫一个几千目录的大库要
+  /// 几十分钟，期间媒体库页面一直显示扫描前的样子，看起来像卡死了。
+  /// 现在扫到一批就刷一次，卡片一批批长出来。
+  ///
+  /// ## 两道闸门，缺一不可
+  ///
+  ///   - **命中媒体数变了**（见 [_liveTracks]）：没扫到新媒体项时库没变；
+  ///   - **距上次刷新 ≥ [_liveRefreshInterval]**：给目录边界的密集推进度节流。
+  ///
+  /// 只推 [libraryListSignalProvider]，**不碰三组角标**：那三组各自是一次全表
+  /// `GROUP BY`，每 400ms 跑一遍会把扫描拖慢。角标仍由 `finally` 那一段在
+  /// 扫描结束后统一作废（那里也补了 `libraryWriteSignalProvider`，
+  /// 目录视图的「已入库」标记同样要跟着更新）。
+  void _liveRefresh(ScanProgress p) {
+    if (_disposed) return;
+    // `foundMedia` = 游标里的 `foundTracks`（累计命中的媒体项数）。
+    if (p.foundMedia == _liveTracks) return;
+
+    final now = DateTime.now();
+    final last = _liveRefreshedAt;
+    if (last != null && now.difference(last) < _liveRefreshInterval) return;
+
+    _liveTracks = p.foundMedia;
+    _liveRefreshedAt = now;
+    ref.read(libraryListSignalProvider.notifier).bump();
   }
 
   void _emit(ScanState next) {

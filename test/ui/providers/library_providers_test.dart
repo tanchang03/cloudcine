@@ -117,16 +117,23 @@ void main() {
           reason: '取消类型不该顺手把年份也清掉 —— 两组是两个独立的维度');
     });
 
-    test('clearExtra 只清面板里的两组', () {
+    test('clearExtra 只清面板里的三组', () {
       controller().setCategory(MediaCategory.anime);
       controller().setQuery('魔法');
       controller().toggleYear(2023);
       controller().toggleGenre('动画');
+      controller().toggleScrapedOnly();
 
       controller().clearExtra();
 
       expect(filter().years, isEmpty);
       expect(filter().genres, isEmpty);
+      expect(
+        filter().scrapedOnly,
+        isFalse,
+        reason: '它和年份 / 类型一样只在面板里有入口，不清的话用户点完'
+            '「清空筛选」列表还是空的',
+      );
       expect(filter().category, MediaCategory.anime,
           reason: '分类栏与搜索框在面板之外、各有自己的清除入口。'
               '面板上的「清空筛选」把它们一起抹掉，用户会莫名其妙地'
@@ -142,6 +149,29 @@ void main() {
 
       controller().toggleYear(2023);
       expect(filter().hasExtra, isTrue);
+    });
+
+    test('「已刮削」算进 hasExtra（否则面板上的「清空筛选」是灰的）', () {
+      controller().toggleScrapedOnly();
+      expect(filter().scrapedOnly, isTrue);
+      expect(
+        filter().hasExtra,
+        isTrue,
+        reason: '它只在面板里有入口。不算进 hasExtra 的话，只开着这一项时'
+            '「清空筛选」按钮会一直置灰 —— 用户看到列表被筛着，'
+            '却找不到任何能把它清掉的地方',
+      );
+
+      controller().toggleScrapedOnly();
+      expect(filter().scrapedOnly, isFalse, reason: '再点一次取消');
+    });
+
+    test('「已刮削」本身就算「有筛选条件」（空态不能指错方向）', () {
+      controller().toggleScrapedOnly();
+
+      expect(filter().isEmpty, isFalse);
+      expect(filter().isDefault, isFalse);
+      expect(filter().selectedCount, 1, reason: '一个开关算一项');
     });
 
     test('面板里的条件也算「有筛选条件」', () {

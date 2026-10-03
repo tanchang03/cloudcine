@@ -24,6 +24,7 @@ import '../../core/utils/text_encoding.dart';
 import '../../core/utils/track_labels.dart';
 import '../../data/stream/local_stream_relay.dart';
 import '../../domain/adapters/stream_relay.dart';
+import '../../domain/entities/playback_preference.dart';
 import '../../domain/entities/stream_ticket.dart';
 import '../../domain/services/cache_speed_meter.dart';
 import '../../domain/services/episode_queue.dart';
@@ -217,6 +218,28 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 没有哪个信号能保证一定来（比如某些流不会触发 video reconfig）。
   bool _awaitingFrame = false;
 
+  /// 正在**换一条流**（切清晰度 / 切集 / 刷新过期直链），而不是首次开播。
+  ///
+  /// ## 为什么不能复用 [_awaitingFrame]
+  ///
+  /// 两者的差别是「画面还在不在」：
+  ///   - 首次开播：画面本来就是黑的，[_awaitingFrame] 用一个**不透明**的罩子
+  ///     把黑盖住，用户看到的是「正在载入片源…」；
+  ///   - 换流：mpv 的视频输出**保留着上一帧**，罩子只需压一层半透明 ——
+  ///     全盖掉等于把用户正在看的那一帧也抹了，看起来就是「重新缓存了一遍」。
+  ///
+  /// 所以换流时不设 [_awaitingFrame]、不清缓冲，只立这个标记；收掉它的信号
+  /// 与 [_awaitingFrame] 同源（见 [_clearAwaitingFrame]）。
+  bool _switching = false;
+
+  /// 网盘字幕正文的预取缓存（fileId → 正文）。见 [_prefetchCloudSubtitles]。
+  ///
+  /// 换片 / 换集时清空：字幕是**跟着条目**的，留着上一部的正文既没用又占内存。
+  final Map<String, String> _subtitleTextCache = <String, String>{};
+
+  /// 正在预取的网盘字幕 fileId（防重复请求）。
+  final Set<String> _subtitlePrefetching = <String>{};
+
   /// 缓冲覆盖到的**绝对位置**（mpv 的 `demuxer-cache-time`）。
   ///
   /// ⚠️ 它是**时间戳**，不是「播放头前面还有多少秒」：mpv 手册写的是
@@ -343,6 +366,23 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 不挡一下会把同一份清单反复写进诊断日志 —— 而那份日志是给用户整段
   /// 复制粘贴的，刷屏会把它变得没法看。
   String? _loggedSubtitleInventory;
+
+  /// 这一条片子的播放偏好（逐文件，见 `PlaybackPreference`）。
+  ///
+  /// 与内置播放页（`player_page.dart`）**共用同一张表与同一套语义**：用户在这边
+  /// 换的字幕，下次在电视上打开同一集照样生效。窗口只**读它来还原**，用户改了
+  /// 什么就报回主窗口落库（见 [_savePreference]）—— 它自己不碰数据库。
+  PlaybackPreference _pref = const PlaybackPreference();
+
+  /// 音轨还原只做一次。
+  ///
+  /// 理由与内置播放页那份相同：`stream.tracks` 在换流与切轨时都会再发一遍，
+  /// 无闸的话用户刚手动切完就被顶回偏好里那一条 —— 表现是「切了没反应」，
+  /// 而日志里一切正常。
+  bool _audioRestored = false;
+
+  /// 字幕还原只做一次。同上。
+  bool _subtitleRestored = false;
 
   /// 当前选中的音轨 id（[AudioTrack.id]）。
   ///
@@ -711,9 +751,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 抬到 warn 只影响 `stream.log` 的流量（warn 级本来就很少），
     // `stream.error` 完全不受影响：media_kit 仍然只挑 `level == 'error'` 的。
     final player = Player(
-      configuration: const PlayerConfiguration(
+      configuration: PlayerConfiguration(
         logLevel: MPVLogLevel.warn,
-        bufferSize: PlayerBufferConfig.bufferSize,
+        // 独立播放窗口只存在于桌面（`supportsMultiWindow` 已排除 Android），
+        // 所以永远是桌面那一套。
+        bufferSize: PlayerBufferConfig.bufferSizeFor(tv: false),
         // ⚠️ 缺了它 media_kit 会把 `sub-visibility` 设成 `no`：**所有**字幕
         // 都不显示且不报错（`stream.track` 照常回报 `sid=1`）。位图字幕
         // （PGS）更是没有任何替代路径 —— Flutter 层的 `SubtitleView` 只吃
@@ -731,7 +773,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     );
 
     // 补 media_kit 构造参数管不到的 mpv 缓冲属性（demuxer-readahead-secs）。
-    unawaited(PlayerBufferConfig.apply(player));
+    unawaited(PlayerBufferConfig.apply(player, tv: false));
 
     // 进度回报。挂在 `position` 上而不是用计时器：位置流本身就是「播到哪了」
     // 的唯一真相，用计时器反而要在暂停时额外判断。
@@ -907,6 +949,195 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       _audioTracks = TrackLabels.realTracks(tracks.audio, (t) => t.id);
       _embeddedSubtitles = subs;
     });
+
+    // 轨道清单刚到手 —— 这是还原音轨 / 内嵌字幕的**唯一**时机：mpv 给每条轨
+    // 编的号只有这时才知道，而偏好里存的是特征（见 `TrackPreference`），
+    // 必须拿真实清单去比。
+    unawaited(_restoreFromPreference());
+  }
+
+  // -------------------------------------------------------------------
+  // 逐文件播放偏好：读它还原 / 用户改了就报回主窗口
+  // -------------------------------------------------------------------
+  //
+  // 与内置播放页（`player_page.dart`）**共用同一张表与同一套语义**：用户在这边
+  // 换的字幕，下次在电视上打开同一集照样生效 —— 反之亦然。窗口只读它来还原，
+  // 用户改了什么就报回主窗口落库（见 [_savePreference]），它自己不碰数据库。
+
+  /// 把 [_pref] 记着的音轨与字幕套回这次播放。
+  ///
+  /// 跑在 `stream.tracks` 的回调里（见 [_onTracks]），因为**只有那一刻**才知道
+  /// mpv 给每条轨编的号；而偏好里存的是特征，必须拿真实清单去比
+  /// （见 `TrackPreference` 的类文档）。
+  ///
+  /// 音轨与字幕各只尝试一次（[_audioRestored] / [_subtitleRestored]）：那个流
+  /// 在换流与切轨时都会再发一遍，无闸的话用户刚手动切完就被顶回偏好里那一条
+  /// —— 表现是「切了没反应」，而日志里一切正常。
+  Future<void> _restoreFromPreference() async {
+    final player = _player;
+    if (player == null || !mounted) return;
+    final pref = _pref;
+
+    if (!_audioRestored && _audioTracks.isNotEmpty) {
+      _audioRestored = true;
+      final index = TrackPreference.bestIndex(
+        pref.audio,
+        [
+          for (var i = 0; i < _audioTracks.length; i++)
+            TrackPreference(
+              // 音轨 id 直接用 mpv 的（`aid`）。两个播放器报的都是同一套号，
+              // 口径天然一致，不需要加来源前缀。
+              trackId: _audioTracks[i].id,
+              language: _audioTracks[i].language,
+              title: _audioTracks[i].title,
+              index: i,
+            ),
+        ],
+      );
+      if (index != null) {
+        diag.info('播放窗口', '按上次的选择还原音轨：${_audioTracks[index].id}');
+        await player.setAudioTrack(_audioTracks[index]);
+      } else if (pref.audio != null) {
+        // 匹配不上就**什么都不做**：那说明这一集没有那条轨（换了集、或者换了
+        // 片源版本）。让 mpv 用它自己的默认（发布者标了 `default` 的那条）
+        // 比我们硬套一条语言都对不上的更对。
+        diag.info(
+          '播放窗口',
+          '音轨偏好没匹配上（候选 ${_audioTracks.length} 条），沿用播放器默认',
+        );
+      }
+    }
+
+    if (_subtitleRestored) return;
+
+    // 「关掉字幕」也是一个要记住的选择。不还原的话，用户在一部片里关掉字幕，
+    // 下次打开又被挂上一条 —— 而他明明关过。
+    if (!pref.subtitlesEnabled) {
+      _subtitleRestored = true;
+      _clearExternalSubtitle();
+      await player.setSubtitleTrack(SubtitleTrack.no());
+      diag.info('播放窗口', '按上次的选择保持字幕关闭');
+      return;
+    }
+
+    final sub = pref.subtitle;
+    if (sub == null) {
+      // 没记过具体某一条 → 交给 mpv 自己的默认，别多此一举。
+      _subtitleRestored = true;
+      return;
+    }
+
+    // 网盘字幕：正文在主窗口，走与用户手点**完全同一条路**
+    //（[_applySubtitleChoice]）—— 取正文、挂上去、记选中态都在那一处，
+    // 另写一遍必然漏掉其中一步。
+    final cloudFileId = _cloudFileIdOf(sub);
+    if (cloudFileId != null) {
+      _subtitleRestored = true;
+      diag.info('播放窗口', '按上次的选择还原网盘字幕：$cloudFileId');
+      await _applySubtitleChoice(player, _SubtitleChoice.cloud(cloudFileId));
+      return;
+    }
+
+    // 内嵌轨：清单得先到。没到就**不落闸**，等下一次 `stream.tracks`。
+    if (_embeddedSubtitles.isEmpty) return;
+    _subtitleRestored = true;
+    final index = TrackPreference.bestIndex(
+      sub,
+      [
+        for (var i = 0; i < _embeddedSubtitles.length; i++)
+          TrackPreference(
+            // id 带来源前缀，与内置播放页同一个口径（那边是 `embedded#N`）。
+            // 不带的话「内嵌第 2 条」与「网盘第 2 条」在偏好里长得一模一样，
+            // 两个播放器读同一个库时会互相顶掉。
+            trackId: 'embedded#${_embeddedSubtitles[i].id}',
+            language: _embeddedSubtitles[i].language,
+            title: _embeddedSubtitles[i].title,
+            index: i,
+          ),
+      ],
+    );
+    if (index == null) {
+      diag.info(
+        '播放窗口',
+        '字幕偏好没匹配上（内嵌 ${_embeddedSubtitles.length} 条），沿用播放器默认',
+      );
+      return;
+    }
+    diag.info('播放窗口', '按上次的选择还原内嵌字幕：${_embeddedSubtitles[index].id}');
+    _clearExternalSubtitle();
+    await player.setSubtitleTrack(
+      SubtitleTrack(_embeddedSubtitles[index].id, null, null),
+    );
+  }
+
+  /// 偏好里那条字幕如果是**网盘字幕**，返回它的 `fileId`；否则返回 `null`。
+  ///
+  /// 判据是 id 前缀：内置播放页给网盘字幕编的 id 是 `<itemId>#<fileId>`
+  /// （见 `SubtitleService._buildTrack`），内嵌轨是 `embedded#<sid>`。
+  ///
+  /// ⚠️ 两种来源必须分得开，否则「上次选的是网盘 ASS」会被当成「内嵌第 N 条」
+  /// 还原 —— 图形字幕（PGS/VobSub）在本机 libmpv 上经常解不出来，用户看到的
+  /// 是「字幕又没了」。
+  ///
+  /// 注意这里**只认当前这一条片子的前缀**：从同剧别的集继承来的偏好里带的是
+  /// 那一集的 `itemId`，返回 `null`，于是自动落到内嵌轨那条路上去（那一集的
+  /// 网盘字幕文件与这一集本来就不是同一个）。
+  String? _cloudFileIdOf(TrackPreference preference) {
+    final id = preference.trackId;
+    final itemId = _currentRequest?.itemId;
+    if (id == null || itemId == null || itemId.isEmpty) return null;
+    final prefix = '$itemId#';
+    if (!id.startsWith(prefix)) return null;
+    final fileId = id.substring(prefix.length);
+    return fileId.isEmpty ? null : fileId;
+  }
+
+  /// 用户在本窗口改了某项播放设置 —— 就地更新 [_pref] 并报回主窗口落库。
+  ///
+  /// 与内置播放页同一套做法：**值没变就直接返回**。白跑一次写库 + 一次跨引擎
+  /// 往返，只为了让库里那串 JSON 重新排一遍序，没有任何意义。
+  ///
+  /// ## 为什么报的是**整份**而不是「改了哪一项」
+  ///
+  /// 主窗口收到就整份覆盖写，不必实现一套合并语义 —— 「哪些字段该保留」一旦有
+  /// 两处实现（两边各一套 patch 规则），必然漂移成「保存字幕时把画质抹了」这种
+  /// 查不出来的 bug。而整份里那些用户没动过的项**本来就是从库里读出来的**
+  /// （见 [_adoptRequest]），覆盖写不会丢任何东西。
+  void _savePreference(PlaybackPreference Function(PlaybackPreference) update) {
+    final next = update(_pref);
+    if (next == _pref) return;
+    setState(() => _pref = next);
+    unawaited(_reportPreference(next));
+  }
+
+  /// 把偏好报回主窗口，由它写进库。
+  ///
+  /// 播放窗口**刻意不碰数据库**：它跑在另一个 Flutter 引擎里，拿不到主窗口的
+  /// 仓储，连 `groupKey` 都不知道。所以只能走通道 —— 与 [_saveAudioEffect]、
+  /// 片头标记同一条边界。
+  ///
+  /// 失败**不影响本次播放**（设置早就生效了），只记一条日志。但必须留痕：否则
+  /// 用户下次开窗口发现设置又变回去了，而日志里一条线索都没有。
+  Future<void> _reportPreference(PlaybackPreference preference) async {
+    final request = _currentRequest;
+    // 手输直链 / 内置自检视频这类**没有库记录**的播放：没有 itemId 就没有行可以
+    // 挂，报过去也会被主窗口丢掉（见 `player_window_bridge.dart` 那个 case）。
+    if (request == null || request.itemId.isEmpty) return;
+    if (!_channelReady) {
+      diag.warn('播放', '跨窗口通道不可用，播放偏好存不下来（本次播放已生效）');
+      return;
+    }
+    try {
+      await playerWindowChannel.invokeMethod<void>(
+        PlayerBridgeMethod.savePlaybackPreference,
+        <String, Object?>{
+          'itemId': request.itemId,
+          'preference': preference.toJson(),
+        },
+      );
+    } catch (e) {
+      diag.warn('播放', '播放偏好没能报回主窗口（本次播放已生效）：$e');
+    }
   }
 
   /// 当前选中的轨变了。
@@ -934,9 +1165,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   }
 
   /// 第一帧已经出来了 —— 收掉加载指示。
+  ///
+  /// 换流那条路（[_switching]）也由它收：两者的「有画面了」信号是同一批
+  /// （见 [_ensurePlayer] 里 `videoParams` / `duration` / `position` 那三条订阅）。
   void _clearAwaitingFrame() {
-    if (!mounted || !_awaitingFrame) return;
-    setState(() => _awaitingFrame = false);
+    if (!mounted) return;
+    if (!_awaitingFrame && !_switching) return;
+    setState(() {
+      _awaitingFrame = false;
+      _switching = false;
+    });
   }
 
   // -------------------------------------------------------------------
@@ -1259,11 +1497,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // ⚠️ 这里**不能**走 [_adoptRequest]：它会重置 [_refreshGuard]，
       // 而把重试计数清零正好等于把这个闸废掉 —— 一条永远刷不好的链会变成
       // 无限重试。换片才该重置。
+      //
+      // 刷链 = 同一条流的地址换了，画面上的东西一点没变 —— 保留上一帧。
       await _openStream(
         fresh.url,
         fresh.describe(),
         headers: fresh.headers,
         startAt: position,
+        keepLastFrame: true,
       );
     } finally {
       _refreshing = false;
@@ -1415,11 +1656,22 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       );
       if (fresh == null) return;
       _currentRequest = fresh;
+      // 记进这部片的偏好。判据是**回来的那条链实际落在哪一档**
+      // （`fresh.qualityId`），不是我们请求的那一档：主窗口在目标档取不到地址时
+      // 会回退到别的档，记下请求值会让下次打开去选一个取不到地址的档位 ——
+      // 表现是「一进播放页就报错」，而用户上次只是随手点了一下。
+      final freshQuality = fresh.qualityId;
+      if (freshQuality != null && freshQuality.isNotEmpty) {
+        _savePreference((p) => p.withQuality(freshQuality));
+      }
+      // 换档：同一部片子的另一条流，用户视线里的位置没变 —— 保留上一帧、
+      // 不清缓冲，只给一个「正在切换…」的半透明提示（见 [_openStream]）。
       await _openStream(
         fresh.url,
         fresh.describe(),
         headers: fresh.headers,
         startAt: position,
+        keepLastFrame: true,
       );
     } finally {
       _refreshing = false;
@@ -1449,7 +1701,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         reason: '用户切换剧集 → ${entry.title}',
       );
       if (fresh == null) return;
-      await _adoptRequest(fresh, startAt: start);
+      // 切集：与切档同理 —— 上一集的画面还在，保留它、给半透明提示，
+      // 不要「黑一下再重新缓冲」。
+      await _adoptRequest(fresh, startAt: start, keepLastFrame: true);
     } finally {
       _refreshing = false;
     }
@@ -1470,7 +1724,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// [startAt] 不给就用请求自带的 `startPosition`（切集时要显式给 ——
   /// 那条路的起点是我们算出来的，与请求里带的不是同一个值）。
-  Future<void> _adoptRequest(PlayRequest request, {Duration? startAt}) async {
+  ///
+  /// [keepLastFrame] 透传给 [_openStream]：切集时为 true（保留上一集画面），
+  /// 从主窗口新开播时为 false（没有上一帧可留）。
+  Future<void> _adoptRequest(
+    PlayRequest request, {
+    Duration? startAt,
+    bool keepLastFrame = false,
+  }) async {
     // 把片名写到窗口标题栏。原生侧建窗时给的是默认标题「云影 · 播放器」，
     // 这里换成真实的片名 —— 任务栏/Dock 上才分得清是哪个窗口。
     unawaited(setChildWindowTitle(request.title));
@@ -1497,6 +1758,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 必然对不上时间轴。留在菜单里等于给用户埋一个坑。
       _localSubtitle = null;
       _activeLocalPath = null;
+      // 网盘字幕的**预取缓存**跟着条目走，换集就没有意义了：留着既没用又占内存。
+      _subtitleTextCache.clear();
       // 音效**只在换片/换集时**从请求里取。
       //
       // ⚠️ 不能放在 `if` 外面：刷新直链也走这个方法，而那条路拿的是同一个
@@ -1504,6 +1767,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 落库还没回来时来一次刷新，就会把选择**悄悄改回**请求里带的旧值。
       // （换片才取，与上面那批「换集清理」同一套时机。）
       _audioEffect = PlayerAudioEffect.parse(request.audioEffect);
+      // 逐文件偏好**同一时机**取，理由与上面音效那段完全一样：刷新直链拿的
+      // 是同一个条目的新请求，此时重取会把用户刚在本窗口改的字幕/音轨**悄悄
+      // 改回**库里那份旧值。
+      //
+      // 注意这里**只播种、不改写**：请求里那份是主窗口从库里读出来的，用户没
+      // 动过的项就原样带着。所以后面报回去时「整份覆盖写」不会抹掉任何一项
+      // —— 详见 [_savePreference]。
+      _pref = request.preference ?? const PlaybackPreference();
+      _audioRestored = false;
+      _subtitleRestored = false;
     }
 
     _currentRequest = request;
@@ -1515,6 +1788,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       request.describe(),
       headers: request.headers,
       startAt: startAt ?? request.startPosition,
+      keepLastFrame: keepLastFrame,
     );
   }
 
@@ -1533,6 +1807,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _activeOnlineSubtitleId = null;
     _localSubtitle = null;
     _activeLocalPath = null;
+    // 预取的网盘字幕正文同样没有归属了（见 [_adoptRequest] 里那段说明）。
+    _subtitleTextCache.clear();
     _progressThrottle.reset();
     _refreshGuard.reset();
     await _play(uri, label);
@@ -1554,27 +1830,40 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 之所以要把这一步单独拆出来给 [_refreshTicket] 用：直链过期导致的报错
   /// 经常在上一次 `open()` **还没返回时**就到达了，那时 `_busy` 是 true，
   /// 走 [_play] 会被静默吞掉 —— 表现就是「刷新功能明明写了却从不生效」。
+  ///
+  /// [keepLastFrame] 给**换流**（切清晰度 / 切集 / 刷新直链）用：这些操作里
+  /// mpv 的视频输出还挂着上一帧，不该用不透明的罩子盖掉、也不该清缓冲 ——
+  /// 否则用户看到的就是「重新缓存了一遍」。首次开播不给（画面本来就是黑的，
+  /// 要罩住它）。详见 [_switching]。
   Future<void> _openStream(
     String uri,
     String label, {
     Map<String, String> headers = const <String, String>{},
     Duration startAt = Duration.zero,
+    bool keepLastFrame = false,
   }) async {
     if (!mounted) return;
     setState(() {
       _busy = true;
-      // 从这一刻到「解出第一帧」之间画面是**黑的**，而 `open()` 不等文件加载
-      // 完成 —— 这段正是「刚打开视频时黑屏」的那几秒，加载指示要盖住它。
-      // 收掉它的信号见 [_clearAwaitingFrame]。
-      _awaitingFrame = true;
-      // 换片源 = 上一次的缓存量与增速全部作废。不清的话缓冲指示会带着
-      // 上一部片子的「已缓存 10 秒」出现，然后突然跳回 0。
-      _cacheEnd = Duration.zero;
-      _cacheRate = null;
-      _cacheRateAt = null;
-      _cacheFill = null;
-      _netBytesPerSecond = null;
-      _cacheMeter.reset();
+      // 换流时**不在这里**立 [_switching]：这之后还要先做中继预热（可能几百
+      // 毫秒），而那段时间旧会话还开着、**旧流还在正常播** —— 画面上不该有
+      // 任何指示，否则等于凭空告诉用户「卡了」。真正该立标记的时刻是
+      // `open()` 之前，见下面那处。
+      _switching = false;
+      if (!keepLastFrame) {
+        // 从这一刻到「解出第一帧」之间画面是**黑的**，而 `open()` 不等文件加载
+        // 完成 —— 这段正是「刚打开视频时黑屏」的那几秒，加载指示要盖住它。
+        // 收掉它的信号见 [_clearAwaitingFrame]。
+        _awaitingFrame = true;
+        // 换片源 = 上一次的缓存量与增速全部作废。不清的话缓冲指示会带着
+        // 上一部片子的「已缓存 10 秒」出现，然后突然跳回 0。
+        _cacheEnd = Duration.zero;
+        _cacheRate = null;
+        _cacheRateAt = null;
+        _cacheFill = null;
+        _netBytesPerSecond = null;
+        _cacheMeter.reset();
+      }
     });
     try {
       _ensurePlayer();
@@ -1618,7 +1907,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // [PlaybackMedia]：mpv 的 `start` 属性会**残留**到下一个文件。
       // 网盘直链先过一遍本地中继（多连接并发预取）。拿不到就**原样直连**：
       // 中继失败一律静默，最坏只是「没变快」，绝不是「播不了」。
-      final source = await _prepareSource(uri, label, headers);
+      final source = await _prepareSource(uri, label, headers, startAt: startAt);
+      // 到这里旧中继会话已经关了（`_prepareSource` 的最后一步），旧流随时会断；
+      // 接下来这一句 `open()` 会让 mpv 丢掉当前流。**从这一刻起**才该立
+      // 「正在切换…」—— 上一帧还在画面上，所以用半透明罩，别盖掉它。
+      if (keepLastFrame && mounted) {
+        setState(() => _switching = true);
+      }
       // 音效每次开流前重新下发。理由与内置播放页那份相同：`audio-channels`
       // 是 mpv 的按文件选项，换一条 URL（换集 / 切清晰度 / 刷新直链都走这里）
       // 会回到默认值 —— 只设一次的话第二集开始音效就悄悄失效了，
@@ -1637,7 +1932,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     } catch (e, st) {
       // 开流失败就永远等不到第一帧了 —— 必须自己收掉加载指示，否则它会一直
       // 挂在画面上，把「播放失败」的提示也盖住。
-      if (mounted) setState(() => _awaitingFrame = false);
+      // [_switching] 也要一起收：换流失败时它同样等不到「有画面了」的信号。
+      if (mounted) {
+        setState(() {
+          _awaitingFrame = false;
+          _switching = false;
+        });
+      }
       diag.error('播放窗口', 'open 失败：$label', error: e, stackTrace: st);
       // 必须走 [_toast]：这里直接用 `ScaffoldMessenger.of(context)` 在这个
       // 组件里**一定失败**（理由见 [_messengerKey]）—— 而这条正是
@@ -1656,8 +1957,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   Future<({String url, Map<String, String> headers})> _prepareSource(
     String uri,
     String label,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    Duration startAt = Duration.zero,
+  }) async {
     // 先把主窗口投过来的配置应用上（见 `PlayRequest.streamRelay`）。
     // 不应用的话这里只能用自己的默认值，「在设置页关掉中继」对独立窗口就
     // 不生效 —— 而用户不可能知道这两条路是分开的，只会觉得开关时灵时不灵。
@@ -1667,20 +1969,27 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       connections: request?.relayConnections ?? 8,
     );
 
-    // 换源 = 上一条中继会话作废。必须放在**这里**而不是「播新片」那条路：
-    // 换清晰度、刷新过期直链走的也都是 `_openStream`，只关在播新片那里的话，
-    // 用户切一次清晰度就多留一条后台预取的会话，几次之后带宽被它们吃光 ——
-    // 表现是「越播越卡，而且跟画质无关」。
-    await _releaseRelay();
+    // 换源 = 上一条中继会话作废。但它**先记下来、不立刻关**：新会话要先建起来、
+    // 把起播点附近预取上，再关旧的。顺序反过来的话，「新会话还是空的 + 旧会话
+    // 已经关了」这一小段里 mpv 什么都拿不到 —— 那正是「切一下就卡一下」。
+    //
+    // 放在**这里**而不是「播新片」那条路：换清晰度、刷新过期直链走的也都是
+    // `_openStream`，只关在播新片那里的话，用户切一次清晰度就多留一条后台
+    // 预取的会话，几次之后带宽被它们吃光 —— 表现是「越播越卡，跟画质无关」。
+    final previousToken = _relayToken;
+    _relayToken = null;
 
     final parsed = Uri.tryParse(uri);
     final size = _currentRequest?.sizeBytes;
+    final direct = (url: uri, headers: headers);
     // 没有请求头 = 本地文件 / 内置自检视频，本来就不走网络。
     if (parsed == null || size == null || size <= 0 || headers.isEmpty) {
-      return (url: uri, headers: headers);
+      await _closeRelayToken(previousToken);
+      return direct;
     }
     if (!isRelayableUrl(parsed)) {
-      return (url: uri, headers: headers);
+      await _closeRelayToken(previousToken);
+      return direct;
     }
 
     final endpoint = await _relay.open(
@@ -1691,19 +2000,48 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         supportsRange: true,
       ),
       label: label,
+      // 告诉中继「播放器大概从哪儿开始读」：切集 / 切清晰度时起点常在中后段，
+      // 让预取窗口直接摆过去，省掉开流后那一次上游往返。
+      startOffset: _byteOffsetFor(startAt, size),
     );
     if (endpoint == null) {
-      return (url: uri, headers: headers);
+      await _closeRelayToken(previousToken);
+      return direct;
     }
     _relayToken = endpoint.token;
+
+    // 只有「换流」（存在旧会话）才等预热：这期间**旧流还在播**，等待是白赚的；
+    // 而全新开播时没有旧流垫着，等它就是白白拖慢出画。
+    if (previousToken != null) {
+      final ready = await warmUpRelay(_relay, endpoint.token);
+      diag.info('播放窗口', ready ? '新中继已预热，关闭旧会话' : '新中继预热超时，直接切换');
+    }
+    await _closeRelayToken(previousToken);
+
     // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
     // 中继服务，它会在发往上游时自己带上。
     return (url: endpoint.uri.toString(), headers: const <String, String>{});
   }
 
-  Future<void> _releaseRelay() async {
-    final token = _relayToken;
-    _relayToken = null;
+  /// 把续播点换算成**大致**字节偏移，给中继当预取起点的提示。
+  ///
+  /// 用「时长比例 × 文件大小」近似。VBR 片源上会有偏差，但这里只是**提示**：
+  /// 中继拿它摆预取窗口，播放器随后的真实 Range 请求会立刻把窗口拉正，
+  /// 偏了只多下一点、不会播错。
+  ///
+  /// 时长还没解出来（全新开播）时返回 0，等于不提示 —— 那时本来就从头播。
+  int _byteOffsetFor(Duration startAt, int length) {
+    final total = _player?.state.duration.inMilliseconds ?? 0;
+    if (startAt <= Duration.zero || total <= 0) return 0;
+    final ratio = (startAt.inMilliseconds / total).clamp(0.0, 1.0);
+    return (length * ratio).round();
+  }
+
+  /// 关掉一条指定会话（而不是「当前会话」）。见 [_prepareSource] 的换源顺序。
+  ///
+  /// 它替代了原来那个「关当前会话」的写法：换源时必须能**先开新的、再关旧的**，
+  /// 所以关闭动作要按 token 指名道姓，而不是看 `_relayToken` 现在指着谁。
+  Future<void> _closeRelayToken(String? token) async {
     if (token == null) return;
     await _relay.close(token);
   }
@@ -1963,6 +2301,19 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 整窗**一个** region：控制栏与剧集列表都在它内部，所以它们在树上
       // 的位置不影响「鼠标在动」这件事。
       onHover: (_) => _pokeChrome(),
+      // 指针**进入窗口**也要唤醒浮层 —— 光有 `onHover` 不够。
+      //
+      // 引擎把 `mouseEntered` 翻成 pointer **add**（`FlutterViewController` 的
+      // `mouseEntered:` → `kAdd`），而 `MouseRegion.onHover` 只在
+      // `PointerHoverEvent` 上回调：鼠标滑进来后**立刻停住**（只来了一个 add、
+      // 没有后续 move）时浮层不会出现。而「滑到画面上看一眼有哪些按钮」正是
+      // 最常见的动作，所以这条必须有。
+      //
+      // ⚠️ 它同时也是**窗口没焦点**时的那条路：原生侧把子窗口的
+      // `mouseTrackingMode` 设成了 `.always`（见 `MainFlutterWindow.swift` 的
+      // `ChildWindowController.attach`），否则窗口不是 key window 时引擎一个
+      // hover 事件都不送过来，这一整块浮层就再也叫不醒。
+      onEnter: (_) => _pokeChrome(),
       // 移出窗口 → 立刻收起。这就是「鼠标移除窗口，标题和播放栏隐藏」。
       onExit: (_) => _hideChrome(),
       child: Row(
@@ -1979,7 +2330,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
                 // 缓冲 / 加载指示。放在控制栏**之前**（画在它下面）：它不吃
                 // 点击，但如果画在控制栏上面，会把「正在缓冲」盖在按钮上。
-                if (_awaitingFrame || _buffering)
+                if (_awaitingFrame || _buffering || _switching)
                   Positioned.fill(child: _buildLoadingVeil()),
 
                 // 剧集面板的入口：贴在画面区右边缘的一条竖长条。
@@ -2149,10 +2500,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 覆盖两段黑屏：
   ///   - [_awaitingFrame]：开流到解出第一帧之间。`Player.open()` **不等文件
   ///     加载完成**，这段画面是全黑的，也是最该给反馈的几秒；
-  ///   - [_buffering]：播到一半缓存见底，mpv 停下来等数据。
+  ///   - [_buffering]：播到一半缓存见底，mpv 停下来等数据；
+  ///   - [_switching]：换流（切清晰度 / 切集 / 刷链）。上一帧还在画面上，
+  ///     所以底色与 [_buffering] 同为半透明 —— 只是文案不同，让用户知道
+  ///     这是他自己刚点的操作，而不是网络出问题。
   ///
   /// 两段的底色**不一样**：等首帧时画面本来就是黑的，用不透明底色把它盖掉；
-  /// 中途卡顿则只压一层半透明 —— 那一帧画面还在，全盖掉等于把进度也抹了。
+  /// 中途卡顿 / 换流则只压一层半透明 —— 那一帧画面还在，全盖掉等于把进度也抹了。
   Widget _buildLoadingVeil() {
     final fill = _cacheFill;
     // mpv 的填充百分比一旦到 100 就再也不变，那时进度条只会顶在那儿假装
@@ -2180,7 +2534,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
               ),
               const SizedBox(height: 14),
               Text(
-                _awaitingFrame ? '正在载入片源…' : '正在缓冲…',
+                _awaitingFrame
+                    ? '正在载入片源…'
+                    : _switching
+                        ? '正在切换…'
+                        : '正在缓冲…',
                 style: const TextStyle(fontSize: 13, color: Colors.white),
               ),
               const SizedBox(height: 6),
@@ -2740,6 +3098,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 只会看起来「本来就是这么设计的」。
   Widget _buildEpisodeTile(PlaylistEntry entry, {required bool current}) {
     return EpisodeTile(
+      // ⚠️ 按**条目**给键，不是按位置。缩略图那一格是有状态的（异步取图），
+      // 无键时 `ListView.builder` 会让「第 3 行的 State」跟着**索引**走 ——
+      // 换一部剧之后第 3 行就顶着上一部剧第 3 集的图，直到新图下载完。
+      // 键让 State 跟着条目走，换剧时直接重建。
+      key: ValueKey(entry.itemId),
       entry: entry,
       current: current,
       progress: episodeProgressOf(entry),
@@ -2973,6 +3336,30 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 不在这里 setState 记「已选中」：成功与否由 `stream.track` 回报
     // （见 [_activeAudioId]）。
     await player.setAudioTrack(picked);
+    // 记进这部片的偏好。
+    //
+    // ⚠️ 与「切清晰度」「切字幕」不同，这里**不等成功确认就记**：候选全部来自
+    // mpv 自己报的轨道清单，切一条清单里存在的轨不会失败（清晰度那条要服务端
+    // 重新取链，才需要等 `activeQualityId` 确认）。
+    var index = -1;
+    for (var i = 0; i < _audioTracks.length; i++) {
+      if (_audioTracks[i].id == picked.id) {
+        index = i;
+        break;
+      }
+    }
+    _savePreference(
+      (p) => p.withAudio(
+        TrackPreference(
+          trackId: picked.id,
+          language: picked.language,
+          title: picked.title,
+          // 下标一并存下：有些片源一条语言标记都不写，那时「用户选的是第几条」
+          // 是唯一能跨集对上号的依据（见 `TrackPreference`）。
+          index: index < 0 ? null : index,
+        ),
+      ),
+    );
   }
 
   /// 「音效」菜单 —— 输出的声道 / 直通模式。
@@ -3018,6 +3405,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     await PlayerAudioEffect.apply(player, picked);
     // 报回主窗口落库 —— 播放窗口刻意不碰数据库（见本类的类文档）。
     unawaited(_saveAudioEffect(picked));
+    // 同时记进**这部片**的偏好。两个都要写：`saveAudioEffect` 改的是这台设备
+    // 的全局默认（下次开别的片也用它），这里记的是「这部片被单独调过」——
+    // 两者语义不同，见 `PlaybackPreference.audioEffect`。
+    _savePreference((p) => p.withAudioEffect(picked.value));
   }
 
   /// 把音效选择报回主窗口，由它写进设置库。
@@ -3058,6 +3449,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     final navigator = Navigator.of(buttonContext, rootNavigator: true);
     final anchor = globalRectOf(buttonContext);
     if (anchor == null) return;
+
+    // 菜单一打开就在后台预取**网盘字幕**正文：用户浏览菜单这几秒通常足够取完，
+    // 等他真点下去就是瞬时挂上，而不是「点了没反应」（那正是被读成
+    // 「切字幕要重新缓存」的那一下）。在线字幕不在预取范围（按次计费）。
+    _prefetchCloudSubtitles();
 
     while (true) {
       // 弹菜单这件事单独一个方法：它只收已经取好的 navigator 与锚点，
@@ -3140,6 +3536,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       case _SubtitleKind.off:
         _clearExternalSubtitle();
         await player.setSubtitleTrack(SubtitleTrack.no());
+        // 「关掉字幕」本身也是一个要记住的选择（见
+        // `PlaybackPreference.subtitlesEnabled`）—— 不记的话，用户在一部片里
+        // 关掉字幕，下次打开又被自动挂上一条，而他明明关过。
+        _savePreference((p) => p.withSubtitle(null));
         return;
 
       case _SubtitleKind.embedded:
@@ -3154,13 +3554,41 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         await player.setSubtitleTrack(
           SubtitleTrack('${picked.trackId}', null, null),
         );
+        // 记进这部片的偏好。`language` / `title` / `index` 从清单里现取 ——
+        // 只存一个 `sid` 是没用的：换一集之后那个号指的是完全另一条轨
+        // （见 `TrackPreference` 的类文档）。
+        final embeddedId = picked.trackId;
+        var embeddedIndex = -1;
+        for (var i = 0; i < _embeddedSubtitles.length; i++) {
+          if (_embeddedSubtitles[i].id == '$embeddedId') {
+            embeddedIndex = i;
+            break;
+          }
+        }
+        final embeddedTrack =
+            embeddedIndex < 0 ? null : _embeddedSubtitles[embeddedIndex];
+        _savePreference(
+          (p) => p.withSubtitle(
+            TrackPreference(
+              // 来源前缀与内置播放页同一个口径（那边也是 `embedded#N`）——
+              // 少了它就分不出「内嵌第 2 条」与「网盘第 2 条」。
+              trackId: 'embedded#$embeddedId',
+              language: embeddedTrack?.language,
+              title: embeddedTrack?.title,
+              index: embeddedIndex < 0 ? null : embeddedIndex,
+            ),
+          ),
+        );
         return;
 
       case _SubtitleKind.cloud:
         final fileId = picked.fileId;
         if (fileId == null) return;
         final brief = _cloudSubtitleOf(fileId);
-        final text = await _fetchSubtitleText(fileId);
+        // 预取命中就免掉这次跨窗口往返 + 网盘下载 —— 用户点下去即挂上。
+        // 没命中才现取（见 [_prefetchCloudSubtitles]）。
+        final text =
+            _subtitleTextCache[fileId] ?? await _fetchSubtitleText(fileId);
         if (text == null) {
           if (mounted) _toast('这条网盘字幕取不下来（详见诊断日志）');
           return;
@@ -3178,6 +3606,31 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
             language: brief?.language,
           ),
         );
+        // 记进这部片的偏好。id 用与内置播放页相同的 `<itemId>#<fileId>`
+        // （见 `SubtitleService._buildTrack`）—— 同一个网盘文件在整部剧里
+        // id 稳定，所以这一项**跨集也能对上**（还原时见 [_cloudFileIdOf]）。
+        final cloudItemId = _currentRequest?.itemId;
+        if (cloudItemId != null && cloudItemId.isNotEmpty) {
+          final cloudBriefs =
+              _currentRequest?.subtitles ?? const <SubtitleBrief>[];
+          var cloudIndex = -1;
+          for (var i = 0; i < cloudBriefs.length; i++) {
+            if (cloudBriefs[i].fileId == fileId) {
+              cloudIndex = i;
+              break;
+            }
+          }
+          _savePreference(
+            (p) => p.withSubtitle(
+              TrackPreference(
+                trackId: '$cloudItemId#$fileId',
+                language: brief?.language,
+                title: brief?.label,
+                index: cloudIndex < 0 ? null : cloudIndex,
+              ),
+            ),
+          );
+        }
         return;
 
       case _SubtitleKind.online:
@@ -3202,6 +3655,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
             language: brief?.language,
           ),
         );
+        // ⛔ **不记进偏好**：在线字幕按次计费（OpenSubtitles 免费档只有个位数
+        // 额度），下次自动还原等于替用户烧额度 —— 而他这次未必想看那条。
+        // 代价是「下次打开回到上一条记住的字幕」，这是刻意接受的取舍。
         return;
 
       case _SubtitleKind.local:
@@ -3226,6 +3682,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
             // 不是规范）。不给比猜错好 —— mpv 会用它去做「按语言自动选轨」。
           ),
         );
+        // ⛔ **不记进偏好**：路径是为**这一集**挑的，下一集几乎必然对不上
+        // 时间轴；而且文件很可能已经被删掉或挪走 —— 那时还原会**静默失败**
+        //（`_readLocalSubtitle` 返回 null），mpv 停在「没有字幕」，
+        // 比干脆不还原更糟。
         return;
 
       case _SubtitleKind.searchOnline:
@@ -3327,6 +3787,49 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     }
     diag.info('窗口', '在线字幕候选 ${hits.length} 条，重新打开菜单');
     return true;
+  }
+
+  /// 预取**网盘字幕**的正文。字幕菜单打开时调用。
+  ///
+  /// ## 为什么要预取
+  ///
+  /// 挂一条网盘字幕要先向主窗口要它的字节（[_fetchSubtitleText]，一次跨窗口
+  /// 往返 + 一次网盘下载），再交给 mpv。放在「用户点下之后」做，就是
+  /// 「点了没反应」的那一秒 —— 而播放其实**没有中断**，用户却会把它读成
+  /// 「切字幕要重新缓存」。
+  ///
+  /// 预取只是把这段等待**提前**：菜单一打开就开始取，用户浏览菜单的几秒通常
+  /// 足够；等他真点了，[_applySubtitleChoice] 直接命中 [_subtitleTextCache]。
+  ///
+  /// ## ⚠️ 只预取网盘字幕
+  ///
+  /// **在线字幕不预取**：那条路要走字幕站的下载地址、按次计费，把菜单里所有
+  /// 候选都拉一遍等于替用户烧额度（见 [_fetchOnlineSubtitleText] 的说明）。
+  ///
+  /// **本地字幕也不预取**：它的正文每次都**重新读**，好让用户在外部改过时间轴
+  /// 之后能生效（见 [_applySubtitleChoice] 里 `_SubtitleKind.local` 那段）。
+  ///
+  /// 失败无所谓 —— 真选中时会再取一次，那时才弹提示。
+  void _prefetchCloudSubtitles() {
+    for (final brief in _currentRequest?.subtitles ?? const <SubtitleBrief>[]) {
+      final id = brief.fileId;
+      if (id.isEmpty) continue;
+      if (_subtitleTextCache.containsKey(id)) continue;
+      if (!_subtitlePrefetching.add(id)) continue;
+      unawaited(_prefetchOneSubtitle(brief));
+    }
+  }
+
+  Future<void> _prefetchOneSubtitle(SubtitleBrief brief) async {
+    try {
+      final text = await _fetchSubtitleText(brief.fileId);
+      if (text == null || text.isEmpty || !mounted) return;
+      // 不 setState：缓存不参与绘制，只在用户真选中时被读一次。
+      _subtitleTextCache[brief.fileId] = text;
+      diag.debug('播放窗口', '网盘字幕已预取：${brief.label}');
+    } finally {
+      _subtitlePrefetching.remove(brief.fileId);
+    }
   }
 
   /// 向主窗口要一条网盘字幕的正文。失败返回 null。
@@ -3959,8 +4462,9 @@ class EpisodeTile extends StatelessWidget {
             // 「正在播放」动效。只画在当前这一集上 —— 静态标记（左侧竖线、
             // 背景色、加粗）已经有三处了，**动**才是那个缺掉的信号。
             //
-            // 放在行尾而不是压在缩略图上：缩略图是**作品海报**（网盘不给逐集
-            // 预览图），每行都是同一张，盖住它等于把唯一的视觉锚点弄脏。
+            // 放在行尾而不是压在缩略图上：缩略图现在是**这一集自己的画面**
+            // （见 [PlaylistEntry.thumbnailUrl]），盖住它等于把用户用来分辨
+            // 「这是哪一集」的那点信息弄脏。
             if (current) ...[
               const SizedBox(width: 8),
               const NowPlayingBars(size: 14),
@@ -3971,40 +4475,117 @@ class EpisodeTile extends StatelessWidget {
     );
   }
 
-  /// 缩略图。
+  /// 缩略图那一格。
   ///
-  /// ⚠️ 用的是**作品海报**，不是这一集的截图 —— 网盘不给逐集预览图，
-  /// 我们也没有在列表里逐集解码首帧的能力（那要为每一集起一次 seek）。
-  /// 没有海报时（没开在线刮削、刮削失败、离线）退回占位图。
-  Widget _buildThumbnail() {
-    final url = entry.thumbnailUrl;
+  /// 只负责**摆位置**（96×54、圆角），内容交给 [_EpisodeThumbnail] ——
+  /// 那一格要异步去主窗口取图，而 [EpisodeTile] 本身保持无状态是刻意的：
+  /// 它被 `ListView.builder` 按索引重建，状态挂在它身上会跟着**位置**走
+  /// （换一部剧时第 3 行的 State 留给新的第 3 集，显示上一部剧的图）。
+  Widget _buildThumbnail() =>
+      _EpisodeThumbnail(entry: entry, current: current);
+}
+
+/// 剧集行里那一格缩略图（96×54）。
+///
+/// ## 为什么是异步的
+///
+/// 夸克缩略图**缺 Cookie 一律 401**，而播放窗口在另一个引擎里、拿不到凭证
+/// 也没有主窗口那套 HTTP 配置。所以这里只能把地址报给主窗口，由它下载
+/// （并落进海报缓存）之后回一个**本地路径**，再用 `Image.file` 显示 ——
+/// 见 `PlayerBridgeMethod.fetchThumbnail`。
+///
+/// ## 三级降级，每一级都有明确的视觉结果
+///
+///   1. 解析中 → 占位图（**不是**留白，否则列表会「先空一下再长出来」）；
+///   2. 拿到路径 → `Image.file`；
+///   3. 没有地址 / 取不到 → 占位图。
+///
+/// ⚠️ 取不到**不重试**：一屏七八行同时要图，逐行重试只会把夸克的 QPS 额度
+/// 烧在一件用户根本不会注意到的事情上（占位图本来就是这个列表的既有形态）。
+class _EpisodeThumbnail extends StatefulWidget {
+  const _EpisodeThumbnail({required this.entry, required this.current});
+
+  final PlaylistEntry entry;
+
+  /// 是不是正在播的那一集。只影响占位图的底色。
+  final bool current;
+
+  /// 这一格的宽度。`_episodeTileHeight` 的注释里按它算过行高（54 + 16），
+  /// 改这里要一起核。
+  static const double width = 96;
+
+  /// 这一格的高度。
+  static const double height = 54;
+
+  @override
+  State<_EpisodeThumbnail> createState() => _EpisodeThumbnailState();
+}
+
+class _EpisodeThumbnailState extends State<_EpisodeThumbnail> {
+  /// 主窗口回过来的**本地文件路径**。null = 还没有 / 取不到（都显示占位图）。
+  String? _path;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_resolve());
+  }
+
+  @override
+  void didUpdateWidget(_EpisodeThumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 换集 / 换剧时地址会变。不重解析的话那一行会一直显示上一集（或上一部
+    // 剧）的图 —— 而这恰好把「用缩略图区分集数」变成了**误导**。
+    if (oldWidget.entry.thumbnailUrl != widget.entry.thumbnailUrl ||
+        oldWidget.entry.itemId != widget.entry.itemId) {
+      setState(() => _path = null);
+      unawaited(_resolve());
+    }
+  }
+
+  Future<void> _resolve() async {
+    final url = widget.entry.thumbnailUrl;
+    if (url == null || url.isEmpty) return;
+    final path = await fetchEpisodeThumbnail(widget.entry.itemId, url);
+    // 解析期间这一行可能已经被滚出屏幕（列表在回收），那时不能 setState。
+    if (!mounted) return;
+    setState(() => _path = path);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final path = _path;
     return ClipRRect(
       borderRadius: BorderRadius.circular(6),
       child: SizedBox(
-        width: 96,
-        height: 54,
-        child: url == null
-            ? _buildThumbPlaceholder()
-            : Image.network(
-                url,
+        width: _EpisodeThumbnail.width,
+        height: _EpisodeThumbnail.height,
+        child: path == null
+            ? _buildPlaceholder()
+            : Image.file(
+                File(path),
                 fit: BoxFit.cover,
-                // ⚠️ 必须兜住失败：海报是 TMDB 的外链，离线、没配 API Key、
-                // 图片被删都会走到这里。不兜的话整个列表会变成一片红色报错块。
-                errorBuilder: (_, _, _) => _buildThumbPlaceholder(),
-                loadingBuilder: (context, child, p) =>
-                    p == null ? child : _buildThumbPlaceholder(),
+                // ⚠️ **必须限解码尺寸**：夸克给的是 640×360（约 12 KB），
+                // 而这一格只有 96×54。全尺寸解码一张约 0.9 MB，一屏七八行、
+                // 一部剧几十集 —— Flutter 的图片缓存默认上限 100 MB，一滚就
+                // 被挤爆，表现是「滚动时缩略图反复重新解码」。
+                // 按 2 倍图算（视网膜屏上正好清晰，再大也看不出来）。
+                cacheWidth: (_EpisodeThumbnail.width * 2).round(),
+                // 文件可能被「清理海报缓存」删掉、也可能本身就是坏图。
+                // 不兜的话整行会变成一块红色报错块。
+                errorBuilder: (_, _, _) => _buildPlaceholder(),
               ),
       ),
     );
   }
 
-  Widget _buildThumbPlaceholder() {
+  Widget _buildPlaceholder() {
     return DecoratedBox(
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: current
+          colors: widget.current
               ? <Color>[AppTheme.accent.withValues(alpha: 0.5), Colors.black54]
               : const <Color>[Colors.white24, Colors.black54],
         ),
@@ -4016,14 +4597,41 @@ class EpisodeTile extends StatelessWidget {
   }
 }
 
+/// 向主窗口要一张缩略图的**本地路径**。
+///
+/// 播放窗口自己下不了这张图：夸克缩略图缺 Cookie 一律 401，而凭证、HTTP
+/// 配置与海报缓存都在主窗口那边（见 `PlayerBridgeMethod.fetchThumbnail`）。
+///
+/// 取不到一律返回 `null`（通道不通、主窗口没装回调、图真的下不来）——
+/// 调用方退回占位图即可。**刻意不区分失败原因**：对用户来说它们的视觉结果
+/// 完全一样，而面板一屏七八行，任何一条提示都会变成刷屏。
+Future<String?> fetchEpisodeThumbnail(String itemId, String url) async {
+  if (url.isEmpty) return null;
+  try {
+    return await playerWindowChannel.invokeMethod<String>(
+      PlayerBridgeMethod.fetchThumbnail,
+      <String, Object?>{'itemId': itemId, 'url': url},
+    );
+  } catch (e) {
+    diag.debug('播放窗口', '取缩略图失败（该行退回占位图）：$e');
+    return null;
+  }
+}
+
 /// 这一集看过多少（0..1）。
+///
+/// ## 分子用 `maxPosition`，不是 `resumePosition`
+///
+/// 续播点看完会被清成 0，用它当分子的话「刚看完的一集」会画成 0% —— 而它是
+/// 唯一该显示满格的那一行。历史最大位置只增不减、永不清除。
+/// （与详情页文件列表底下那条进度条同一口径，见 `PlaylistEntry.maxPosition`。）
 ///
 /// 时长未知时返回 0 —— 画一条满格或半格的**假**进度比不画更误导。
 /// 抽成顶层纯函数是为了能直接单测「时长未知不画假进度」这条。
 double episodeProgressOf(PlaylistEntry entry) {
   final total = entry.duration.inMilliseconds;
   if (total <= 0) return 0;
-  return (entry.resumePosition.inMilliseconds / total).clamp(0.0, 1.0);
+  return (entry.maxPosition.inMilliseconds / total).clamp(0.0, 1.0);
 }
 
 /// 清晰度选择菜单。
@@ -4096,7 +4704,10 @@ class _AudioEffectMenuPanel extends StatelessWidget {
       title: '音效',
       maxWidth: 300,
       children: [
-        for (final p in PlayerAudioEffect.all)
+        // ⚠️ 用 `selectable` 而不是 `all`：macOS 上「直通」会把整部片卡死，
+        // 列出来只会变成一条「点了没反应」的反馈。理由见
+        // `PlayerAudioEffect.passthroughAvailable`。
+        for (final p in PlayerAudioEffect.selectable)
           ListTile(
             dense: true,
             visualDensity: VisualDensity.compact,

@@ -59,6 +59,17 @@ class StreamTicket {
   /// 换一条流（清晰度切换）。地址与体积一起换，避免新旧信息混在一起。
   ///
   /// 请求头与过期时间沿用原票据：夸克各档位流走同一个 CDN、同一套签名参数。
+  ///
+  /// ## ⚠️ 体积**不沿用旧值**：拿不到就留 `null`
+  ///
+  /// 这里原来写的是 `quality.estimatedBytes ?? contentLength` —— 服务端没给
+  /// 这一档体积时**沿用上一条流的**。而换档时上一条流是**原画**，体积就是原
+  /// 文件大小，于是「原画 17.09 GiB 的块布局」被套到「4.38 GiB 的 4K 转码流」
+  /// 上：本地中继按错的总长切块、发越界的 `Range`，上游回 `416`，表现是
+  /// **切到 4K 就黑屏**（有声音没画面，或直接报错）。
+  ///
+  /// 留 `null` 才是诚实的。下游看到「长度未知」会**跳过本地中继、直连播放** ——
+  /// 少一点加速，但至少能播（见 `PlaybackController._prepareSource`）。
   StreamTicket withQuality(QualityOption quality) {
     final url = quality.url;
     if (url == null) return this;
@@ -66,7 +77,7 @@ class StreamTicket {
       url: url,
       headers: headers,
       expiresAt: expiresAt,
-      contentLength: quality.estimatedBytes ?? contentLength,
+      contentLength: quality.estimatedBytes,
       supportsRange: supportsRange,
       contentType: contentType,
       qualities: qualities,

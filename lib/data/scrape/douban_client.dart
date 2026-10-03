@@ -492,6 +492,17 @@ class DoubanScraper implements MetadataScraper {
   ///     否则会把综艺（豆瓣记为 `tv`）误判；
   ///   - **热度**：`rating.count` 做**同分时的兜底**，让「第一季」赢过
   ///     「年番3」这类只有几千人评的分支。
+  ///
+  /// ## 宽松档（[ScrapeQuery.requireExactTitle]）不走打分
+  ///
+  /// 无年份的电影没有年份可消歧，闸门只认精确同名（见 `scrape_match.dart`）。
+  /// 这条路上不看分数，改为要求：**第一条影视候选**（跳过书 / 音乐 / 游戏
+  /// 之后的第一个）必须是精确同名。
+  ///
+  /// ⚠️ **不要求「唯一」**：实测（2026-10-03）「奥德赛」在豆瓣上有 2 条精确
+  /// 同名、TMDB 上 4 条，加唯一会把正主也挡掉。也不退回「分数最高」——
+  /// 那是 0.6 档的老路，会收下 `特洛伊奥德赛`(0.68) 这类**别的片子**。
+  /// 详细理由见 `TmdbScraper._pickVerified` 的同一段。
   static _Candidate? _pickBest(
     List<_Candidate> candidates,
     ScrapeQuery query,
@@ -499,10 +510,15 @@ class DoubanScraper implements MetadataScraper {
     _Candidate? best;
     var bestScore = 0.0;
 
+    // 宽松档用：所有过闸门的候选，以及「第一位影视条目」。
+    final accepted = <_Candidate>[];
+    _Candidate? firstVideo;
+
     for (final c in candidates) {
       // 非影视条目（书 / 音乐 / 游戏）直接排除。实测搜「繁花」的前两条
       // 就是两本书，不排掉会把它们当成候选去算分。
       if (c.targetType != 'movie' && c.targetType != 'tv') continue;
+      firstVideo ??= c;
 
       // 与 TMDB 同一道闸门（见 `scrape_match.dart`）：标题对不上、或年份差
       // 得太多的候选**直接出局**，而不是靠打分把它压到第二名 ——
@@ -514,9 +530,15 @@ class DoubanScraper implements MetadataScraper {
         queryYear: query.year,
         resultTitle: c.title,
         resultYear: c.year,
+        requireExactTitle: query.requireExactTitle,
       );
       if (!match.accepted) {
         diag.debug('刮削', '豆瓣跳过候选 "${c.title}"：${match.reason}');
+        continue;
+      }
+
+      if (query.requireExactTitle) {
+        accepted.add(c);
         continue;
       }
 
@@ -526,6 +548,23 @@ class DoubanScraper implements MetadataScraper {
         best = c;
         bestScore = score;
       }
+    }
+
+    if (query.requireExactTitle) {
+      if (accepted.isEmpty || !identical(accepted.first, firstVideo)) {
+        diag.info(
+          '刮削',
+          '豆瓣 "${query.title}" 宽松档未采纳：第一条影视候选不是精确同名'
+              '（共 ${accepted.length} 条精确同名）',
+        );
+        return null;
+      }
+      diag.info(
+        '刮削',
+        '豆瓣 "${query.title}" 宽松档命中：精确同名 ${accepted.length} 条，'
+            '取第一条「${accepted.first.title}」',
+      );
+      return accepted.first;
     }
 
     if (best != null) {

@@ -60,6 +60,38 @@ void main() {
     );
   });
 
+  test('「已刮削」与年份 / 类型一起在筛 → 提示语把两组都点出来', () {
+    const filter = LibraryFilter(scrapedOnly: true, years: {1995});
+
+    final hint = libraryEmptyHint(filter);
+
+    expect(hint.action, LibraryEmptyAction.clearExtra);
+    expect(
+      hint.body,
+      contains('已刮削'),
+      reason: '提示语要说出**实际在筛的每一组**。只说「清掉年份 / 类型」的话，'
+          '用户点完那个按钮列表还是空的（开关还开着），而提示语根本没提它',
+    );
+    expect(hint.body, contains('年份'));
+  });
+
+  test('只开了「已刮削」而没有别的条件 → 这一支在页面上另有专门的空态', () {
+    // 页面会先命中 `_NoScrapedState`（「还没有刮削过的作品」），不会走到这里。
+    // 这条断言只是钉住：万一哪天那一支被删掉，退回到通用提示时它至少还是
+    // 一句**说得通**的话，而不是让用户去清一组他没选过的条件。
+    const filter = LibraryFilter(scrapedOnly: true);
+
+    final hint = libraryEmptyHint(filter);
+
+    expect(hint.action, LibraryEmptyAction.clearExtra);
+    expect(hint.body, contains('已刮削'));
+    expect(
+      hint.body,
+      isNot(contains('年份')),
+      reason: '这个条件下用户一个年份都没选过',
+    );
+  });
+
   test('只有搜索词 → 只清搜索词，分类栏不动', () {
     const filter = LibraryFilter(
       category: MediaCategory.series,

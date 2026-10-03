@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../domain/entities/media_item.dart';
 import '../pages/auth_page.dart';
 import '../pages/auth_qr_login_page.dart';
 import '../pages/diagnostics_page.dart';
+import '../pages/downloads_page.dart';
+import '../pages/folder_page.dart';
 import '../pages/library_page.dart';
 import '../pages/player_page.dart';
 import '../pages/scan_page.dart';
@@ -73,6 +76,10 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (_, state) => PlayerPage(
           itemId: state.uri.queryParameters['item'] ?? '',
           qualityId: state.uri.queryParameters['quality'],
+          // 直接播（未入库）时条目对象随导航带过来。安全 cast：`extra` 是
+          // 个 `Object?`，别的调用方塞进别的东西时**退回按 id 查库**，
+          // 而不是在这里抛一个类型错误。
+          item: state.extra is MediaItem ? state.extra as MediaItem : null,
         ),
       ),
 
@@ -88,9 +95,30 @@ final routerProvider = Provider<GoRouter>((ref) {
               GoRoute(path: '/library', builder: (_, __) => const LibraryPage()),
             ],
           ),
+          // 「文件夹」与「媒体库」是**并列**的一级入口，不是一个页面里的两个
+          // 视图：前者读网盘实时目录、按位置组织，后者读本地索引、按作品
+          // 组织。合成一页时媒体库页头得为它挂上一堆用不着的分支，而用户在
+          // 「媒体库」这个名字下面也不会想到网盘目录在那里。
+          StatefulShellBranch(
+            routes: [
+              GoRoute(path: '/folders', builder: (_, __) => const FolderPage()),
+            ],
+          ),
           StatefulShellBranch(
             routes: [
               GoRoute(path: '/scan', builder: (_, __) => const ScanPage()),
+            ],
+          ),
+          // ⚠️ 分支顺序**必须**与 `app_shell.dart` 里 `_items` 的顺序一致：
+          // 侧栏那个 `shell.currentIndex == i` 的判据是按**下标**对的，
+          // 两处顺序不一致的表现是「点『下载』高亮的是『设置』」——
+          // 而页面确实切过去了，所以看起来像高亮坏了。
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: '/downloads',
+                builder: (_, __) => const DownloadsPage(),
+              ),
             ],
           ),
           StatefulShellBranch(

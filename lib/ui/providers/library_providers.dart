@@ -7,10 +7,51 @@ import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/entities/subtitle_track.dart';
+import '../../domain/services/item_sort.dart';
 import '../../domain/services/missing_media.dart';
 import '../../domain/services/play_target.dart';
 import 'app_providers.dart';
 import 'library_refresh_providers.dart';
+import 'settings_providers.dart';
+
+/// 媒体库的两种呈现方式。
+///
+/// ## 为什么只有「封面 / 列表」两种
+///
+/// 这两个视图读的是**同一批数据**（已入库的作品），只是排布不同 —— 所以
+/// 搜索、分类栏、排序、筛选、多选在这里**完全共用**，不能各写一套。
+///
+/// ## 「文件夹」为什么不在这个枚举里
+///
+/// 它曾经是这里的第三个取值，现在已经是侧栏上并列的一级入口
+/// （`ui/pages/folder_page.dart`）：它读的是**网盘实时目录**而不是本地索引，
+/// 搜索语义（只筛当前这一层）、排序口径（排的是网盘条目）、可用动作
+/// （发现 / 下载 / 未入库直接播）也都自成一套 —— 与媒体库没有一处共用。
+/// 合成一个页面时，媒体库页头得为另一个视图挂上一堆自己用不着的分支，
+/// 而用户在「媒体库」这个名字下面也根本不会想到网盘目录在这里。
+enum LibraryView {
+  /// 海报墙（大图）
+  posters('封面'),
+
+  /// 紧凑列表（小缩略图 + 文字行）
+  list('列表');
+
+  const LibraryView(this.label);
+
+  final String label;
+}
+
+class LibraryViewController extends Notifier<LibraryView> {
+  @override
+  LibraryView build() => LibraryView.posters;
+
+  void set(LibraryView view) => state = view;
+}
+
+final libraryViewProvider =
+    NotifierProvider<LibraryViewController, LibraryView>(
+  LibraryViewController.new,
+);
 
 /// 媒体库筛选与排序条件。
 ///
@@ -20,6 +61,7 @@ class LibraryFilter {
   const LibraryFilter({
     this.category,
     this.playedOnly = false,
+    this.scrapedOnly = false,
     this.sort = WorkSort.recentModified,
     this.query = '',
     this.years = const <int>{},
@@ -48,6 +90,26 @@ class LibraryFilter {
   /// 只会让用户不知道列表到底在筛什么。
   final bool playedOnly;
 
+  /// 只看**刮削过**的作品 —— 筛选面板上的「已刮削」那一项。
+  ///
+  /// ## 为什么它与 [playedOnly] 同属「视图」，却放在筛选面板里
+  ///
+  /// 它和 [playedOnly] 一样是**正交的一维**：一部片子既在「电影」栏里，
+  /// 也可能刮过、也可能没刮过，所以不能做成 [MediaCategory] 的一个取值。
+  ///
+  /// 区别只在入口：`playedOnly` 有自己的分类栏按钮（用户找「我看过的」
+  /// 是去分类栏找），而「哪些还没刮」是**筛选**语义 —— 用户是先决定
+  /// 「我要看已刮削的」，再在这一批里挑年份 / 类型。所以它进面板，
+  /// 并且和年份 / 类型一起被「清空筛选」清掉（它没有别的清除入口）。
+  ///
+  /// ## 判据是 `source == online`
+  ///
+  /// **不是** `MediaWork.isScraped`：那一位是 `online || manual`，回答的是
+  /// 「要不要被自动刮削覆盖」；而用户点过「自定义」的行恰恰**清掉了**在线
+  /// 信息（片名是他自己敲的），不该算「已刮削」。完整理由见
+  /// `MediaRepository.listWorks` 的 [MediaWork] 判据说明。
+  final bool scrapedOnly;
+
   final WorkSort sort;
 
   final String query;
@@ -65,7 +127,20 @@ class LibraryFilter {
   final Set<String> genres;
 
   /// 筛选面板里是否有生效的条件（决定「筛选」按钮要不要亮标记）。
-  bool get hasExtra => years.isNotEmpty || genres.isNotEmpty;
+  ///
+  /// 三组：年份 / 类型 / 已刮削。[scrapedOnly] 也算在内 —— 它同样只在面板里
+  /// 有入口，不跟着「清空筛选」一起清的话，用户点完那个按钮列表还是空的，
+  /// 而面板上已经看不出是哪儿在筛（空态提示里那句「清掉年份 / 类型再看看」
+  /// 也会变成假话）。
+  bool get hasExtra => years.isNotEmpty || genres.isNotEmpty || scrapedOnly;
+
+  /// 面板里**勾着的**条件项数（「筛选」按钮上的那个数字 / 底部的「已选 N 项」）。
+  ///
+  /// 年份与类型按**个数**算（勾两个年份就是 2），[scrapedOnly] 是一个开关、
+  /// 算 1 项。两处调用必须共用这一份口径 —— 各算一遍的话，会出现
+  /// 「按钮上写 3、面板底部写 2」这种自相矛盾的样子。
+  int get selectedCount =>
+      years.length + genres.length + (scrapedOnly ? 1 : 0);
 
   /// 「一个内容筛选都没设」。
   ///
@@ -88,6 +163,7 @@ class LibraryFilter {
   LibraryFilter copyWith({
     MediaCategory? category,
     bool? playedOnly,
+    bool? scrapedOnly,
     WorkSort? sort,
     String? query,
     Set<int>? years,
@@ -97,6 +173,7 @@ class LibraryFilter {
     return LibraryFilter(
       category: clearCategory ? null : (category ?? this.category),
       playedOnly: playedOnly ?? this.playedOnly,
+      scrapedOnly: scrapedOnly ?? this.scrapedOnly,
       sort: sort ?? this.sort,
       query: query ?? this.query,
       // 空集合是一个**合法取值**（「这一维不限」），所以不能像 category 那样
@@ -111,6 +188,7 @@ class LibraryFilter {
       other is LibraryFilter &&
       other.category == category &&
       other.playedOnly == playedOnly &&
+      other.scrapedOnly == scrapedOnly &&
       other.sort == sort &&
       other.query == query &&
       // Set 没重写 `==`（默认是**引用**相等），直接比会漏掉
@@ -122,6 +200,7 @@ class LibraryFilter {
   int get hashCode => Object.hash(
         category,
         playedOnly,
+        scrapedOnly,
         sort,
         query,
         // 与顺序无关：`{2023, 2010}` 和 `{2010, 2023}` 是同一份条件。
@@ -132,6 +211,7 @@ class LibraryFilter {
   @override
   String toString() {
     final extra = [
+      if (scrapedOnly) '已刮削',
       if (years.isNotEmpty) '年份 ${(years.toList()..sort()).join("/")}',
       if (genres.isNotEmpty) genres.join("/"),
     ];
@@ -195,12 +275,23 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
     state = state.copyWith(genres: next);
   }
 
-  /// 清空筛选面板里的两组条件（年份 + 类型）。
+  /// 切换「只看已刮削」。
   ///
-  /// **只清这两组**：分类栏与搜索框在面板之外、各有自己的清除入口，
+  /// 与年份 / 类型同属面板里那一组条件 —— 它没有别的清除入口，所以
+  /// [clearExtra] 要连它一起清（见 [LibraryFilter.hasExtra]）。
+  void toggleScrapedOnly() =>
+      state = state.copyWith(scrapedOnly: !state.scrapedOnly);
+
+  /// 清空筛选面板里的三组条件（年份 + 类型 + 已刮削）。
+  ///
+  /// **只清这三组**：分类栏与搜索框在面板之外、各有自己的清除入口，
   /// 面板上的「清空筛选」把它们一起抹掉会让用户莫名其妙地丢掉搜索词。
   void clearExtra() {
-    state = state.copyWith(years: const <int>{}, genres: const <String>{});
+    state = state.copyWith(
+      years: const <int>{},
+      genres: const <String>{},
+      scrapedOnly: false,
+    );
   }
 
   void clear() => state = const LibraryFilter();
@@ -314,6 +405,36 @@ class MissingMediaController {
     );
   }
 
+  /// **批量**移除（目录视图的「批量删除」用）。
+  ///
+  /// ## 为什么不让调用方循环调 [remove]
+  ///
+  /// 唯一区别是**刷新只做一次**。逐条调的话，删 200 个文件就要跑 200 遍
+  /// [_refresh]（每遍 7 次 invalidate + 一次写库信号），而每一次信号都会让
+  /// 目录视图的「已入库」叠加层重算一遍 —— 用户看到的是删完之后界面卡住
+  /// 好几秒。
+  ///
+  /// ## 为什么不复用 `deleteItemsNotIn`
+  ///
+  /// 那个方法的白名单口径是「本次扫描实际扫到的 id 集合」，语义是
+  /// 「把库里没扫到的全清掉」。拿它来删用户点名的这几个，得先反算出
+  /// 「全库减去这几个」，而只要有一次读漏了就会**删掉用户没点名的文件**。
+  /// 这里逐条走 [_removeSingle]，代价是几条 SQLite 语句，换的是
+  /// 「删的就是用户勾的那些」这件事不依赖任何反算。
+  ///
+  /// 返回真正从库里删掉的条数（不在库里的那些不算）。
+  Future<int> removeMany(Iterable<MediaItem> items) async {
+    final repo = _ref.read(mediaRepositoryProvider);
+    final keys = <String>{};
+    var removed = 0;
+    for (final item in items) {
+      if (await _removeSingle(repo, item)) removed++;
+      keys.add(item.groupKey);
+    }
+    if (removed > 0) _refreshMany(keys);
+    return removed;
+  }
+
   /// 按 [scope] 移除，并让所有读这张表的 provider 重取。
   ///
   /// 返回是否真的动了库 —— 调用方（播放页）据此决定要不要关掉自己。
@@ -365,8 +486,16 @@ class MissingMediaController {
   ///   - `libraryWriteSignalProvider`：目录视图的「已入库」叠加层读的是
   ///     同一张 `media_items` 表，不喊一声的话，删掉的文件在那儿还标记着
   ///     「已在库」，而点它只会再失败一次。
-  void _refresh(String workKey) {
-    _ref.invalidate(workDetailProvider(workKey));
+  void _refresh(String workKey) => _refreshMany({workKey});
+
+  /// 一次刷掉**多个作品**（批量删除那条路走这里）。
+  ///
+  /// 作品详情页是 family，只能按 key 逐个作废；其余几个是全局的，**无论
+  /// 删了几个文件都只作废一次** —— 这是 [removeMany] 存在的全部意义。
+  void _refreshMany(Set<String> workKeys) {
+    for (final key in workKeys) {
+      _ref.invalidate(workDetailProvider(key));
+    }
     _ref.invalidate(workListProvider);
     _ref.invalidate(categoryCountsProvider);
     _ref.invalidate(yearCountsProvider);
@@ -411,11 +540,30 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
   // 所以海报墙不会闪一下转圈。
   ref.watch(playbackLibraryLinkProvider);
 
+  // 「库刚长出新东西」—— 扫描中每建出一批作品行、批量刮削每刮完一部，
+  // 写入方就推一下这个信号，列表随之重取。
+  //
+  // ## 为什么是信号，而不是让写入方 `invalidate(workListProvider)`
+  //
+  // 两个理由，缺一不可：
+  //   1. **方向**：扫描控制器住在 `scan_providers.dart`，它 import 本文件；
+  //      本文件再反向 import 它取 `workListProvider` 会绕成一个环。信号放在
+  //      `library_refresh_providers.dart`（叶子）里，方向永远是单向的；
+  //   2. **粒度**：它只驱动**这一份列表**（与 `libraryStatsProvider`），
+  //      不会顺带把目录视图那棵要读全表的 `folderTreeProvider` 拖下水 ——
+  //      理由见 `LibraryListSignal` 的类文档。
+  //
+  // 刷新是**高频**的（扫描中按时间节流、批量刮削每部一次），所以这里必须
+  // 接受「一次信号 = 一次 listWorks」。好在它只查 `media_works` 一张表，
+  // 且 Riverpod 会把上一次的值留在 `AsyncLoading` 里，列表不会闪白。
+  ref.watch(libraryListSignalProvider);
+
   final filter = ref.watch(libraryFilterProvider);
   final query = filter.query.trim();
   final works = await ref.watch(mediaRepositoryProvider).listWorks(
         category: filter.category,
         playedOnly: filter.playedOnly,
+        scrapedOnly: filter.scrapedOnly,
         query: query.isEmpty ? null : query,
         // 空集合与 `null` 在仓储里是同一件事（「这一维不限」），
         // 但显式传 `null` 让 SQL 侧连条件都不用拼。
@@ -480,29 +628,35 @@ final playedCountProvider = FutureProvider<int>((ref) {
   );
 });
 
-/// 筛选面板两组选项的**共同作用域**：当前分类 / 「最近播放」/ 搜索词。
+/// 筛选面板两组选项的**共同作用域**：分类 / 「最近播放」/「已刮削」/ 搜索词。
 ///
-/// ## 为什么只 `select` 这三个
+/// ## 为什么是这四个
 ///
 /// 面板上的角标要严格等于「**把年份 / 类型清空后**列表里的条数」——
-/// 这样每一个选项点下去都至少有结果。所以它跟着这三个条件收窄，
+/// 这样每一个选项点下去都至少有结果。所以它跟着这四个条件收窄，
 /// 却**不能**跟着 `years` / `genres` 收窄：否则用户每勾一个类型，
 /// 剩下的类型角标就会跟着变，勾到第二个时列表已经空了。
 ///
+/// `scrapedOnly` 进这一组、`years` / `genres` 不进，是因为它们不是同一类
+/// 条件：前者是面板顶部那个开关，改的是「这一份列表里有哪些作品」——
+/// 年份 / 类型正是在它筛出来的那批作品里再分面。把它排除在外的话，
+/// 用户打开「已刮削」后会看到一堆只在**没刮过**的作品里存在的年份，
+/// 点下去是空列表，而面板的全部承诺就是「点下去至少有一条」。
+///
 /// 用 `select` 而不是直接 `watch(libraryFilterProvider)` 是必须的：
 /// 后者会让「勾一个年份」也触发一次统计查询（白跑两遍全表扫描）。
-/// 记录（record）有结构相等，所以只有这三个值真的变了才会重算。
-({MediaCategory? category, bool playedOnly, String query}) _facetScope(
-  Ref ref,
-) {
-  final (category, playedOnly, query) = ref.watch(
+/// 记录（record）有结构相等，所以只有这四个值真的变了才会重算。
+({MediaCategory? category, bool playedOnly, bool scrapedOnly, String query})
+    _facetScope(Ref ref) {
+  final (category, playedOnly, scrapedOnly, query) = ref.watch(
     libraryFilterProvider.select(
-      (f) => (f.category, f.playedOnly, f.query),
+      (f) => (f.category, f.playedOnly, f.scrapedOnly, f.query),
     ),
   );
   return (
     category: category,
     playedOnly: playedOnly,
+    scrapedOnly: scrapedOnly,
     query: query.trim().isEmpty ? '' : query.trim(),
   );
 }
@@ -525,6 +679,7 @@ final yearCountsProvider = FutureProvider<Map<int, int>>((ref) async {
     () => ref.watch(mediaRepositoryProvider).countWorksByYear(
           category: scope.category,
           playedOnly: scope.playedOnly,
+          scrapedOnly: scope.scrapedOnly,
           query: scope.query.isEmpty ? null : scope.query,
         ),
   );
@@ -544,6 +699,7 @@ final genreCountsProvider = FutureProvider<Map<String, int>>((ref) async {
     () => ref.watch(mediaRepositoryProvider).countWorksByGenre(
           category: scope.category,
           playedOnly: scope.playedOnly,
+          scrapedOnly: scope.scrapedOnly,
           query: scope.query.isEmpty ? null : scope.query,
         ),
   );
@@ -582,12 +738,24 @@ class WorkDetail {
     required this.work,
     required this.items,
     this.mergedSources = const [],
+    this.maxPositions = const {},
   });
 
   final MediaWork work;
 
   /// 全部文件，已按「季 → 集 → 名称」排序
   final List<MediaItem> items;
+
+  /// 每条文件的**历史最大播放位置**（`itemId → 看过的最远位置`）。
+  ///
+  /// ## 为什么不用 `resumePositionMs`
+  ///
+  /// 那是**续播点**：看完会被清成 NULL。用它画进度条的话，用户刚看完一集
+  /// 回来，那一行会显示成「没看过」（0%）—— 恰好是他最想看到 100% 的时刻。
+  /// 这一列只增不减、永不清除，所以看完的一集稳定停在 100%。
+  ///
+  /// 缺键 = 从没播过（进度条不画），与「播了但不足 1 秒」是同一件事。
+  final Map<String, Duration> maxPositions;
 
   /// 已被折叠进这一部的**其他作品行**（跨目录归一的产物）。
   ///
@@ -616,6 +784,14 @@ class WorkDetail {
 
 final workDetailProvider =
     FutureProvider.family<WorkDetail?, String>((ref, key) async {
+  // 播放进度一变就重取 —— 文件列表底下那条细进度条要跟着长。
+  //
+  // ⚠️ 这会让**整页**每 10 秒重取一次（作品 / 文件 / 归一来源 / 进度四份）。
+  // 代价可接受：进度信号只在用户停在某个详情页上时才有人监听，而播放中
+  // 那一页通常被播放页盖着（不布局、不绘制）。见 `PlaybackProgressSignal`
+  // 为什么不能与 `PlaybackLibraryLink` 合并。
+  ref.watch(playbackProgressSignalProvider);
+
   final repo = ref.watch(mediaRepositoryProvider);
   var work = await repo.workByKey(key);
   if (work == null) return null;
@@ -634,8 +810,37 @@ final workDetailProvider =
 
   final items = await repo.itemsForWork(work.key);
   final merged = await repo.mergedSourcesOf(work.key);
-  return WorkDetail(work: work, items: items, mergedSources: merged);
+  // 历史进度单独查一次（`itemsForWork` 只物化行本身，不带旁表数据）。
+  // 与 `items` 一起在这个 provider 里取，是为了让「文件列表 + 每行进度」
+  // 永远来自同一次读 —— 分成两个 provider 的话，刷新时机不同会让进度条
+  // 比列表晚一拍，看起来像闪了一下。
+  final maxPositions = await repo.maxPositions(
+    items.map((i) => i.id).toList(growable: false),
+  );
+  return WorkDetail(
+    work: work,
+    items: items,
+    mergedSources: merged,
+    maxPositions: maxPositions,
+  );
 });
+
+/// 详情页「文件」列表当前的排序方式（**真源在设置里**，这里只是给它一个名字）。
+///
+/// ## 为什么是 `Provider` 而不是页面内的 `setState`
+///
+/// 与 `_DetailBody` 里那个「现在在看哪一季」不同：那一个只是**本次停留内**的
+/// 展示筛选，而排序是**用户对列表的长期偏好** —— 他切成「剧集顺序」之后，
+/// 下一次点开任何一部作品都该还是剧集顺序。做成页面内状态的话，用户每进
+/// 一个详情页都要重新切一次，而且会觉得「设置没生效」。
+///
+/// 与 `folderSortModeProvider` 同构（同样的理由：设置还没读出来时先退回默认，
+/// 不让列表按错的顺序闪一下）。
+final itemSortModeProvider = Provider<ItemSortMode>(
+  (ref) =>
+      ref.watch(settingsProvider).valueOrNull?.itemSortMode ??
+      ItemSortMode.modifiedDesc,
+);
 
 /// 某个媒体项的字幕引用（扫描期建立的，不含正文）。
 final itemSubtitlesProvider =
@@ -644,7 +849,12 @@ final itemSubtitlesProvider =
 });
 
 /// 媒体库规模统计（设置页 / 空态提示用）。
+///
+/// 页头那句「N 个视频 · M 部作品」读的就是它，所以它也要跟着
+/// [libraryListSignalProvider] 走 —— 扫描中作品一行行长出来时，这个数字
+/// 得跟着变。它只是两条 `COUNT(*)`，比列表查询轻得多。
 final libraryStatsProvider = FutureProvider<({int items, int works})>((ref) async {
+  ref.watch(libraryListSignalProvider);
   final repo = ref.watch(mediaRepositoryProvider);
   return _timedQuery(
     '规模统计（文件数 + 作品数）',

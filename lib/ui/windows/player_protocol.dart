@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import '../../core/utils/file_names.dart';
 import '../../core/utils/filename_parser.dart';
 import '../../core/utils/player_audio_effect.dart';
+import '../../domain/entities/playback_preference.dart';
 import '../../domain/services/intro_marker.dart';
 import '../../domain/services/missing_media.dart';
 
@@ -268,13 +269,21 @@ class SubtitleSearchRequest {
 ///
 /// ## 为什么续播点在这里是**原始值**
 ///
-/// [resumePosition] 是库里存的原始位置，面板上用它画进度条（「这一集看到
-/// 一半」）。而真正切过去时的起点要过一遍「快看完了就从头」的取舍 ——
-/// 那一步由 `PlaybackResume.startFrom` 做，**由播放窗口在切集时算**：
-/// 它手里有 [resumePosition] 与 [duration]，算完把结果当位置报回主窗口。
+/// [resumePosition] 是库里存的原始位置。真正切过去时的起点要过一遍
+/// 「快看完了就从头」的取舍 —— 那一步由 `PlaybackResume.startFrom` 做，
+/// **由播放窗口在切集时算**：它手里有 [resumePosition] 与 [duration]，
+/// 算完把结果当位置报回主窗口。
 ///
-/// 之所以不在主窗口算好塞进来：同一个字段要同时服务「显示」和「起播」两个
-/// 用途，而两者的口径不同 —— 混在一起会让进度条显示成 0（看着像没看过）。
+/// 之所以不在主窗口算好塞进来：算过之后是「起播位置」，而面板要显示的是
+/// 「看过没有」，两者的口径不同 —— 混在一起会让进度条显示成 0
+/// （看着像没看过）。
+///
+/// ## 为什么显示用的是**另一个**字段
+///
+/// 进度条读 [maxPosition]（历史最大位置，只增不减、永不清除），**不是**
+/// [resumePosition]。后者会被清掉：一集看完就被写回 `null`，于是「刚看完的
+/// 那一集」在面板上什么都不显示 —— 恰好是唯一该显示满格的那一行。
+/// 两个字段各司其职：一个管「从哪儿接着播」，一个管「看过没有」。
 @immutable
 class PlaylistEntry {
   const PlaylistEntry({
@@ -284,6 +293,7 @@ class PlaylistEntry {
     this.subtitle = '',
     this.thumbnailUrl,
     this.resumePosition = Duration.zero,
+    this.maxPosition = Duration.zero,
     this.duration = Duration.zero,
     this.isExtra = false,
   });
@@ -317,13 +327,43 @@ class PlaylistEntry {
   /// 副标题（`2160P · MKV · H.265 · 12.3 GB`）。可能为空。
   final String subtitle;
 
-  /// 缩略图地址。**是作品海报，不是这一集的截图** —— 网盘不给逐集预览图，
-  /// 我们也没有解码首帧的能力（那要在播放窗口里跑一次 seek，代价太大）。
-  /// `null` 时 UI 用集号占位。
+  /// 这一集的缩略图地址。
+  ///
+  /// ## 优先这一集自己的网盘缩略图
+  ///
+  /// 夸克**逐文件**都生成过预览图（扫描时就落进了 `media_items.thumb_url`，
+  /// 见 `MediaItem.thumbUrl`），所以这一行本来就该用**这一集那一张**。
+  ///
+  /// 早先这里一律塞**作品海报**：面板里几十行长得一模一样，而缩略图存在的
+  /// 全部意义就是「扫一眼认出这是哪一集」—— 同一张图等于把这个功能白送掉。
+  ///
+  /// ## 拿不到时退回作品海报
+  ///
+  /// 夸克对**约 30% 的视频还没生成预览图**（实测，见 `WorkPoster.fromItems`），
+  /// 那些条目没有自己的图。此时显示「这部作品的某一张网盘帧」仍然比一块
+  /// 灰色占位有信息量，所以 `desktop_play.dart` 会把作品海报作为兜底填进来。
+  /// 两个来源都没有才是 `null`，UI 那时才用占位图。
+  ///
+  /// ⚠️ 地址**不能直接 `Image.network`**：夸克缩略图缺 Cookie 一律 401，而
+  /// 播放窗口跑在**另一个引擎**里、拿不到凭证（也没有主窗口那套 HTTP 配置）。
+  /// 所以这里只带地址，真正的下载由主窗口做
+  /// （`PlayerBridgeMethod.fetchThumbnail`），播放窗口拿回的是**本地文件路径**。
   final String? thumbnailUrl;
 
-  /// 库里存的续播点（原始值，见类文档）。
+  /// 库里存的续播点（原始值，见类文档）。**起播用**。
   final Duration resumePosition;
+
+  /// 库里存的**历史最大位置**。**显示用**（面板那条细进度条）。
+  ///
+  /// ## 为什么不能拿 [resumePosition] 画进度条
+  ///
+  /// 续播点会被**清掉**：一集看完（`PlaybackResume.isFinished`）它就被写回
+  /// `null`。用它画进度条的话，用户刚看完一集回到面板上，那一行**什么都不
+  /// 显示** —— 看起来像没看过，而它恰恰是唯一该显示满格的行。
+  ///
+  /// 这一列只增不减、永不清除，所以「看过的一集」在面板上稳定停在满格。
+  /// 详情页「文件」列表底下那条进度条读的是同一列（`maxPositions`）。
+  final Duration maxPosition;
 
   /// 这一集的时长。未知时是 [Duration.zero]。
   final Duration duration;
@@ -340,8 +380,17 @@ class PlaylistEntry {
   /// 文件名以外的信息，重算必然与库里的口径漂移。
   final bool isExtra;
 
-  /// 有没有看过一点。面板据此决定要不要画那条细进度条。
-  bool get hasProgress => resumePosition > Duration.zero;
+  /// 面板该不该画那条细进度条。
+  ///
+  /// ## 两个条件缺一不可
+  ///
+  ///   1. **看过一点** —— 判据取 [maxPosition] 而不是 [resumePosition]：
+  ///      后者看完会被清成 0，于是「看完的那一集」会被判成「没看过」；
+  ///   2. **时长已知** —— 拿不到分母时 `episodeProgressOf` 只能返回 0，
+  ///      画出来是一条**空的槽**，读起来就是「没看过」，而它其实看过。
+  ///      宁可什么都不画（与详情页文件列表那条进度条同一口径）。
+  bool get hasProgress =>
+      maxPosition > Duration.zero && duration > Duration.zero;
 
   /// 面板第一行（主标题）：**文件名优先**，上游没给时退回 [title]。
   ///
@@ -401,6 +450,7 @@ class PlaylistEntry {
         'subtitle': subtitle,
         'thumbnailUrl': thumbnailUrl,
         'resumePositionMs': resumePosition.inMilliseconds,
+        'maxPositionMs': maxPosition.inMilliseconds,
         'durationMs': duration.inMilliseconds,
         'isExtra': isExtra,
       };
@@ -416,6 +466,9 @@ class PlaylistEntry {
     final subtitle = raw['subtitle'];
     final thumbnail = raw['thumbnailUrl'];
     final resume = raw['resumePositionMs'];
+    // 缺这一项时退回续播点：它是历史最大位置的**下界**，所以「退回它」得到
+    // 的是一条偏短但不会说谎的进度条，而退回 0 会让看过的一集显示成没看过。
+    final max = raw['maxPositionMs'] ?? resume;
     final duration = raw['durationMs'];
     // 缺这一项时按「不是花絮」处理：老版本主窗口投过来的请求里没有它，
     // 而把每一集都当成花絮的后果是**自动连播整个失效**（一直往后扫到结尾），
@@ -436,6 +489,9 @@ class PlaylistEntry {
       resumePosition: Duration(
         milliseconds: resume is int && resume > 0 ? resume : 0,
       ),
+      maxPosition: Duration(
+        milliseconds: max is int && max > 0 ? max : 0,
+      ),
       duration: Duration(
         milliseconds: duration is int && duration > 0 ? duration : 0,
       ),
@@ -453,6 +509,7 @@ class PlaylistEntry {
           other.subtitle == subtitle &&
           other.thumbnailUrl == thumbnailUrl &&
           other.resumePosition == resumePosition &&
+          other.maxPosition == maxPosition &&
           other.duration == duration &&
           other.isExtra == isExtra;
 
@@ -464,14 +521,16 @@ class PlaylistEntry {
         subtitle,
         thumbnailUrl,
         resumePosition,
+        maxPosition,
         duration,
         isExtra,
       );
 
   @override
   String toString() =>
-      'PlaylistEntry($title, ${resumePosition.inSeconds}s/${duration.inSeconds}s'
-      '${isExtra ? ", 花絮" : ""})';
+      'PlaylistEntry($title, 续播 ${resumePosition.inSeconds}s'
+      '/看过 ${maxPosition.inSeconds}s'
+      '/时长 ${duration.inSeconds}s${isExtra ? ", 花絮" : ""})';
 }
 
 /// 主窗口 → 播放窗口的「播这个」请求。
@@ -509,6 +568,7 @@ class PlayRequest {
     this.autoPlayNext = true,
     this.skipIntro = true,
     this.audioEffect = PlayerAudioEffect.defaultPreset,
+    this.preference,
     this.introStartMs,
     this.introEndMs,
     this.streamRelay = true,
@@ -620,6 +680,25 @@ class PlayRequest {
   /// 主窗口某次忘了带这个字段时最坏结果只是「没上混」，而不是「声音变哑」。
   final String audioEffect;
 
+  /// 逐文件的播放偏好：音轨、字幕、字幕开关。
+  ///
+  /// ## 为什么它必须随请求过来
+  ///
+  /// 与 [autoPlayNext] / [skipIntro] / [audioEffect] 同一条理由：播放窗口跑在
+  /// **另一个 Flutter 引擎**里，读不到主窗口的数据库。不带的话，用户上次给
+  /// 这部片选的粤语 / 那条字幕，在独立窗口里**永远不会被还原** —— 而用户
+  /// 不可能知道这两条路是分开的，只会觉得「记住设置」时灵时不灵。
+  ///
+  /// ## ⚠️ 里面只有「轨道级」的那三项
+  ///
+  /// [PlaybackPreference.qualityId] 与 [PlaybackPreference.audioEffect] 在请求里
+  /// **已经各有一个专用字段**（[qualityId] / [audioEffect]，而且主窗口已经
+  /// 把它们算成了「本次真正要用的值」）。播放窗口只读
+  /// [PlaybackPreference.audio] / [PlaybackPreference.subtitle] /
+  /// [PlaybackPreference.subtitlesEnabled]，**别去读那两个** —— 同一件事有
+  /// 两条来源，迟早出现「一处改了另一处没改」的静默不一致。
+  final PlaybackPreference? preference;
+
   /// 用户**手标**的片头区间（毫秒）。`null` = 没标过。
   ///
   /// ## 为什么手标区间要传过来，而文件章节不用
@@ -670,6 +749,9 @@ class PlayRequest {
         'autoPlayNext': autoPlayNext,
         'skipIntro': skipIntro,
         'audioEffect': audioEffect,
+        // 整体作为一个嵌套对象过去（而不是拆成三个平铺键）：它是一个
+        // 完整概念，平铺会让「哪几个键属于偏好」在两侧各有一份清单。
+        'preference': preference?.toJson(),
         'introStartMs': introStartMs,
         'introEndMs': introEndMs,
         'streamRelay': streamRelay,
@@ -778,6 +860,9 @@ class PlayRequest {
       audioEffect: rawAudioEffect is String && rawAudioEffect.isNotEmpty
           ? rawAudioEffect
           : PlayerAudioEffect.defaultPreset,
+      // 读不懂就当没记过（`PlaybackPreference.fromJson` 自己容错）。一条畸形
+      // 的偏好不该让整部片播不了 —— 与上面几个列表「逐项容错」同一条原则。
+      preference: PlaybackPreference.fromJson(raw['preference']),
     );
   }
 
@@ -808,6 +893,7 @@ class PlayRequest {
           other.streamRelay == streamRelay &&
           other.relayConnections == relayConnections &&
           other.audioEffect == audioEffect &&
+          other.preference == preference &&
           mapEquals(other.headers, headers) &&
           listEquals(other.qualities, qualities) &&
           listEquals(other.playlist, playlist) &&
@@ -829,6 +915,7 @@ class PlayRequest {
         streamRelay,
         relayConnections,
         audioEffect,
+        preference,
         Object.hashAllUnordered(
           headers.entries.map((e) => Object.hash(e.key, e.value)),
         ),

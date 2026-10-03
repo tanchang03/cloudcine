@@ -10,6 +10,7 @@ import '../../core/utils/text_encoding.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/remote/subtitle/opensubtitles_client.dart';
 import '../../domain/entities/drive_provider.dart';
+import '../../domain/entities/playback_preference.dart';
 import '../../domain/services/missing_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../../domain/services/subtitle_query.dart';
@@ -106,6 +107,27 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     } catch (e) {
       diag.error('播放', '续播位置落库失败：$e');
     }
+
+    // 历史最大位置。**规则与上面那条恰好相反**：看完也**不清**，而且只增
+    // 不减（`saveMaxPosition` 自己在 SQL 层用 `max()` 保证）。
+    //
+    // 详情页「文件」列表底下那条细进度条读的就是它。不能复用续播点：看完的
+    // 那一集续播点会被上面清成 NULL，用它画进度条等于「刚看完的一集显示
+    // 0%」—— 恰好是用户最想看到 100% 的时刻。
+    //
+    // ⚠️ 放在上面那个 `rememberPosition` 闸门**之后**：用户关掉「记住播放
+    // 进度」时，任何进度都不该被记下来，进度条自然也就不该出现。
+    //
+    // 独立一段、独立 try —— 它失败不该让「续播点写失败」这条日志说谎。
+    try {
+      await repo.saveMaxPosition(report.itemId, report.position);
+      // 写完再推刷新信号（理由同 `app_providers.dart`：先推的话详情页会读到
+      // 还没落盘的值，进度条永远慢一拍）。只影响详情页，不影响海报墙 ——
+      // 那是 `playbackLibraryLinkProvider` 的事，两者分工见那个文件。
+      ref.read(playbackProgressSignalProvider.notifier).bump();
+    } catch (e) {
+      diag.error('播放', '历史进度落库失败：$e');
+    }
   };
 
   // -------------------------------------------------------------------
@@ -122,7 +144,12 @@ final playerBridgeHostProvider = Provider<void>((ref) {
   onTicketRefresh = (request) async {
     try {
       final item =
-          await ref.read(mediaRepositoryProvider).itemById(request.itemId);
+          await ref.read(mediaRepositoryProvider).itemById(request.itemId) ??
+              // 库里没有这一行时，可能是**目录视图里直接播的**那一条
+              // （没入库）。主窗口在开播时把它登记在了这张表里，取回来就
+              // 能照常刷新 —— 否则用户在片长过半时遇到直链过期，只会看到
+              // 一句「刷新失败」，而那条链其实完全刷得出来。
+              recallTransientItem(request.itemId);
       if (item == null) {
         // 条目被删、或被重扫换过 id 时会走到这。
         diag.warn('窗口', '刷新直链失败：库里找不到 ${request.itemId}');
@@ -186,6 +213,36 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     return ref
         .read(missingMediaControllerProvider)
         .remove(item, scope: request.scope);
+  };
+
+  // -------------------------------------------------------------------
+  // 服务八：剧集面板的缩略图
+  // -------------------------------------------------------------------
+  //
+  // 与取字幕同一条边界：夸克缩略图**缺 Cookie 一律 401**（而且它每个响应
+  // 轮换 `__puus`，陈旧 Cookie 是 `401 auth expired`），播放窗口在另一个
+  // 引擎里拿不到凭证。
+  //
+  // ⚠️ 走 `PosterCache` 而不是自己下，是为了**白捡磁盘缓存**：媒体库里
+  // 已经显示过的缩略图早就落盘了（文件名里带 URL 散列，见 `fileNameFor`），
+  // 于是打开剧集面板这一步对大部分条目**一次网络都不发**。这也正是
+  // 「不把请求头塞进 `PlayRequest`、让播放窗口自己 `Image.network`」的理由
+  // —— 那条路每次开窗都得重下，还会绕开主窗口的 HTTP 配置。
+  //
+  // `pathFor` 自己会记日志、失败返回 null，这里只兜住它可能抛的那一层
+  // （缓存目录不可写之类），免得把一条平台通道异常甩到播放窗口去。
+  onFetchThumbnail = (itemId, url) async {
+    try {
+      return await ref.read(posterCacheProvider).pathFor(
+            // 空 itemId（老版本主窗口投来的请求）退化成用 URL 当键：
+            // 文件名难看一点，但图仍然取得回来、也仍然会命中缓存。
+            key: itemId.isEmpty ? url : itemId,
+            url: url,
+          );
+    } catch (e, st) {
+      diag.error('窗口', '取缩略图失败', error: e, stackTrace: st);
+      return null;
+    }
   };
 
   // -------------------------------------------------------------------
@@ -373,16 +430,49 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     }
   };
 
+  // -------------------------------------------------------------------
+  // 播放窗口的「音轨 / 字幕 / 字幕开关」选了什么
+  // -------------------------------------------------------------------
+  //
+  // 与音效、片头标记同一条边界：播放窗口在**另一个引擎**里，读不到库。
+  // 它把「这部片现在是什么状态」整份报回来，落库在这边做。
+  //
+  // ⚠️ 这里必须自己把 `itemId` 翻成 `groupKey` —— 播放窗口连 groupKey 是什么
+  // 都不知道（它只从 `PlayRequest` 拿到 itemId）。而同剧继承的回退查询要用
+  // 这一列，所以**只有主窗口能写对**。
+  onSavePlaybackPreference =
+      (String itemId, PlaybackPreference preference) async {
+    try {
+      final repo = ref.read(mediaRepositoryProvider);
+      final item = await repo.itemById(itemId);
+      if (item == null) {
+        // 条目被删、或被重扫换过 id。**不写**：写了就是一条挂不到任何文件上
+        // 的孤儿偏好，而它在任何界面上都看不到。
+        diag.warn('窗口', '播放偏好保存失败：库里找不到 $itemId');
+        return;
+      }
+      await repo.savePlaybackPreference(itemId, item.groupKey, preference);
+      diag.info('窗口', '播放偏好已保存：$itemId → $preference');
+    } catch (e, st) {
+      // 与音效同一条边界：不抛、不弹提示。播放窗口那边早就生效了，
+      // 落库只决定「下次还记不记得」—— 为一次写库失败给用户报错，
+      // 与他的操作（换条字幕）毫无关系。
+      diag.error('窗口', '播放偏好没能存下来（本次播放已生效）', error: e, stackTrace: st);
+    }
+  };
+
   ref.onDispose(() {
     onPlaybackProgress = null;
     onTicketRefresh = null;
     onFetchSubtitleText = null;
+    onFetchThumbnail = null;
     onSearchOnlineSubtitles = null;
     onFetchOnlineSubtitle = null;
     onSaveIntroRange = null;
     onQueryMissingMedia = null;
     onRemoveMissingMedia = null;
     onSaveAudioEffect = null;
+    onSavePlaybackPreference = null;
   });
 });
 

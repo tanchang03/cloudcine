@@ -239,7 +239,7 @@ class WorkScraper {
         item.name,
         dirPath: item.dirPath,
       );
-      final query = ScrapeQuery.fromParsed(parsed);
+      final query = ScrapeQuery.fromParsed(parsed, dirPath: item.dirPath);
       if (query != null) return query;
     }
     return null;

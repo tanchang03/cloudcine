@@ -41,9 +41,13 @@ void main() {
   });
 
   /// 造一个存着 [items] / [works] 的 **v5 老库**，返回它的库文件。
+  ///
+  /// [resumeByFileId] 用来给老库预置续播点（键是 `fileId`）—— v15 迁移要从
+  /// 它回填历史最大位置的下界，所以必须能造出「老库里已经有续播点」的状态。
   Future<File> makeOldV5Database({
     required List<MediaItem> items,
     required List<MediaWork> works,
+    Map<String, Duration> resumeByFileId = const {},
   }) async {
     final file = File('${dir.path}/cloudcine.sqlite');
 
@@ -52,6 +56,10 @@ void main() {
     final repo = DriftMediaRepository(seed);
     await repo.upsertItems(items, now: now);
     await repo.upsertWorks(works, now: now);
+    for (final e in resumeByFileId.entries) {
+      final target = items.firstWhere((i) => i.fileId == e.key);
+      await repo.saveResumePosition(target.id, e.value);
+    }
     addTearDown(seed.close);
 
     // 第二步：降回 v5 —— 删掉 v6/v7/v8 才有的列 + 改版本号。
@@ -100,6 +108,15 @@ void main() {
     // DROP，否则 reopen 时 `ADD COLUMN face_anchor_x` 撞 duplicate。
     await seed.customStatement(
       'ALTER TABLE media_items DROP COLUMN face_anchor_x',
+    );
+    // v15：`media_items` 的历史最大播放位置。同样是一条规矩 —— 加列就要在这里
+    // DROP，否则 reopen 时 `ADD COLUMN max_position_ms` 撞 duplicate。
+    //
+    // ⚠️ v14 的 `playback_prefs`、v16 的 `download_tasks` 那种**新表**不用管：
+    // `Migrator.createTable` 发的是 `CREATE TABLE IF NOT EXISTS`，本来就不会撞
+    // —— 只有加**列**才需要在这里配一行。
+    await seed.customStatement(
+      'ALTER TABLE media_items DROP COLUMN max_position_ms',
     );
     await seed.customStatement('PRAGMA user_version = 5');
     await seed.close();
@@ -273,6 +290,54 @@ void main() {
       list.single.subtitleLine.contains('季'),
       isFalse,
       reason: '0 或 1 季写在卡片上都是废话，只有 >= 2 才有信息量',
+    );
+  });
+
+  test('v15 迁移：历史最大位置从续播点回填 —— 老条目不再显示「没看过」', () async {
+    final file = await makeOldV5Database(
+      items: [item('ep1', groupKey: 'w'), item('ep2', groupKey: 'w')],
+      works: [work('w', itemCount: 2)],
+      resumeByFileId: {'ep1': const Duration(minutes: 12)},
+    );
+
+    final repo = await reopen(file);
+    final items = await repo.itemsForWork('w');
+    final ep1 = items.firstWhere((i) => i.fileId == 'ep1');
+    final ep2 = items.firstWhere((i) => i.fileId == 'ep2');
+
+    final max = await repo.maxPositions([ep1.id, ep2.id]);
+
+    expect(
+      max[ep1.id],
+      const Duration(minutes: 12),
+      reason: '续播点是历史最大位置的**下界**：库里存着「看到 12 分钟」，就说明'
+          '用户至少到过 12 分钟。不回填的话，升级后所有老条目在详情页都显示'
+          '「没看过」—— 而它们其实看过，只是那一刻之前我们没记过这个量。',
+    );
+    expect(
+      max.containsKey(ep2.id),
+      isFalse,
+      reason: '没播过的条目不能被回填出一条记录：NULL 才是「没看过」，'
+          '补一个 0 会让它的行底下出现一条空进度条。',
+    );
+  });
+
+  test('v15 迁移：回填的是下界，之后播得更远会正常推进', () async {
+    final file = await makeOldV5Database(
+      items: [item('ep1', groupKey: 'w')],
+      works: [work('w', itemCount: 1)],
+      resumeByFileId: {'ep1': const Duration(minutes: 12)},
+    );
+
+    final repo = await reopen(file);
+    final ep1 = (await repo.itemsForWork('w')).single;
+
+    await repo.saveMaxPosition(ep1.id, const Duration(minutes: 40));
+
+    expect(
+      (await repo.maxPositions([ep1.id]))[ep1.id],
+      const Duration(minutes: 40),
+      reason: '回填值必须走同一条「只增不减」的路 —— 它只是初始值，不是天花板。',
     );
   });
 }

@@ -121,6 +121,57 @@ class DiscoveryOutcome {
       '${wasCancelled ? ", 已取消" : (error == null ? "" : ", 出错：$error")})';
 }
 
+/// 从「网盘上的一个条目 + 它所在的目录」解析出媒体项 —— **不写库**。
+///
+/// 返回的两样东西是同一个解析结果的两种用法：[item] 用来起播或入库，
+/// [parsed] 用来归组（`WorkSeedBook.add` 要它）。合成一次返回是为了让
+/// 「解析」这件事在一处发生 —— 拆成两次调用的话，两边迟早会传进不同的
+/// `dirPath`（一个带结尾斜杠、一个不带），而那是静默的：同一个文件会解析出
+/// 两个不同的 `groupKey`。
+///
+/// ## 为什么必须是**一份**实现
+///
+/// 有两条路会拿同一个文件造 `MediaItem`：
+///
+///   1. 目录视图里点「加入媒体库」（`MediaDiscoveryService._discoverFile`）；
+///   2. 目录视图里**直接点播**（不先入库）—— 那条路只需要一个能起播的对象，
+///      不需要往库里写任何东西。
+///
+/// 两处各写一遍的话，`groupKey` / `title` / `resolution` 这些解析结果会慢慢
+/// 分叉，而分叉是**静默**的：用户先直接播了一部片、再把它加进媒体库，会得到
+/// 两条 `groupKey` 不同的记录 —— 同一部片子在海报墙上出现两格，或者「最近
+/// 播放」里那一条点进去是空的。所以判据只有这一份，两条路都调它。
+///
+/// ## 与 `MediaItem.fromEntry` 的分工
+///
+/// 那个工厂收的是**已经解析好**的 `ParsedMediaName`；这里多做的只有两件事：
+/// 把 [dirPath] 归一到扫描器口径（**带结尾斜杠**，见 `drivePathWithTrailingSlash`），
+/// 以及调解析器。路径不归一的话，直接播的那一条 `dirPath` 会是 `/电影`，
+/// 入库的那一条是 `/电影/` —— 目录视图按路径归并时同一个目录会裂成两个键。
+///
+/// [now] 只在造对象时用（`firstSeenAt` / `updatedAt`）；不写库，所以它没有
+/// 持久化含义，调用方不必为了它去取时钟。
+({MediaItem item, ParsedMediaName parsed}) parseTransientMedia({
+  required DriveEntry entry,
+  required DriveProvider provider,
+  required String dirPath,
+  MediaFilenameParser parser = const MediaFilenameParser(),
+  DateTime? now,
+}) {
+  final rootPath = drivePathWithTrailingSlash(dirPath);
+  final parsed = parser.parse(entry.name, dirPath: rootPath);
+  return (
+    item: MediaItem.fromEntry(
+      entry: entry,
+      provider: provider,
+      dirPath: rootPath,
+      parsed: parsed,
+      now: now,
+    ),
+    parsed: parsed,
+  );
+}
+
 /// **局部发现**：把某个目录（含子目录）或某个文件里的媒体补进媒体库。
 ///
 /// ## 它解决什么问题
@@ -149,9 +200,14 @@ class DiscoveryOutcome {
 ///
 /// ## 共用的部分
 ///
-/// 条目分类（[classifyEntry]）、归组与作品行构造（[WorkSeedBook]）、
-/// 字幕配对（[SubtitleIndexer]）与全盘扫描**是同一份实现**。两处各写一遍
-/// 会让同一个文件走两条路得到不同的分组键或分类，而那是静默的。
+/// 条目分类（[classifyEntry]）、解析与媒体项构造（[parseTransientMedia]）、
+/// 归组与作品行构造（[WorkSeedBook]）、字幕配对（[SubtitleIndexer]）与全盘扫描
+/// **是同一份实现**。两处各写一遍会让同一个文件走两条路得到不同的分组键或
+/// 分类，而那是静默的。
+///
+/// [parseTransientMedia] 那条还多一个调用方：目录视图里**不先入库、直接点播**
+/// （见 `play_action.dart` 的 `playDriveEntry`）。它不写库，但解析口径必须与
+/// 这里完全一致 —— 否则用户先直接播、后加入媒体库，会得到两条不同的记录。
 class MediaDiscoveryService {
   MediaDiscoveryService({
     required DriveAdapterRegistry registry,
@@ -508,17 +564,17 @@ class MediaDiscoveryService {
       );
     }
 
-    final parsed = parser.parse(
-      entry.name,
-      dirPath: rootPath,
-    );
-    final item = MediaItem.fromEntry(
+    // 解析口径与「目录视图里直接点播」**共用同一份**（见 [parseTransientMedia]）：
+    // 两处各写一遍的话，同一个文件在库里和在内存里会是两条不同的记录。
+    final parsedMedia = parseTransientMedia(
       entry: entry,
       provider: provider,
       dirPath: rootPath,
-      parsed: parsed,
+      parser: parser,
       now: _clock(),
     );
+    final parsed = parsedMedia.parsed;
+    final item = parsedMedia.item;
 
     final known = await _knownIds(rootPath);
     final isNew = !known.contains(item.id);

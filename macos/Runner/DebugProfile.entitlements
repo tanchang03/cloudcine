@@ -28,6 +28,16 @@
 	-->
 	<key>com.apple.security.files.user-selected.read-only</key>
 	<true/>
+	<!--
+	  **写**用户通过文件选择器挑中的位置（目录视图里非媒体文件的「下载」）。
+	  与上面那条的区别只有读 / 写：`getSaveLocation` 弹出的是 NSSavePanel，
+	  用户点「下载」之后我们要往他选的那个路径写字节。
+	  沙箱已关闭，实际同样不受约束；写在这里是为了**万一以后重开沙箱**时
+	  不再踩同一个坑（那时缺这一条的表现是：面板能弹、路径能拿到，
+	  紧接着的写入失败，而且报的不是权限错）。
+	-->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
 	<!-- ⛔ 这里**不要**加 keychain-access-groups。
 	     它属于「需要描述文件的能力项」：一旦写上，签名就变成「受限签名」，
 	     ad-hoc 签名下 macOS 的 taskgated 会直接判定签名无效并把进程

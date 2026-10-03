@@ -13,6 +13,7 @@ import 'package:cloudcine/domain/entities/media_item.dart';
 import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:cloudcine/domain/entities/quality_option.dart';
 import 'package:cloudcine/domain/entities/stream_ticket.dart';
+import 'package:cloudcine/domain/services/media_discovery.dart';
 import 'package:cloudcine/ui/providers/app_providers.dart';
 import 'package:cloudcine/ui/windows/desktop_play.dart';
 import 'package:cloudcine/ui/windows/player_bridge_host.dart';
@@ -42,11 +43,18 @@ void main() {
     // 的用例仍然拿到一个非 null 的处理器。
     onPlaybackProgress = null;
     onTicketRefresh = null;
+    onFetchThumbnail = null;
+    // 未入库条目的登记表同样是进程级状态（见 `desktop_play.dart`）：
+    // 不清的话，上一条用例登记过的条目会让下一条「两个来源都没有」的用例
+    // 意外地刷出链来。
+    debugClearTransientItems();
   });
 
   tearDown(() {
     onPlaybackProgress = null;
     onTicketRefresh = null;
+    onFetchThumbnail = null;
+    debugClearTransientItems();
   });
 
   // -------------------------------------------------------------------
@@ -231,22 +239,30 @@ void main() {
       expect(request.startPosition, Duration.zero);
     });
 
-    test('设置里关了「记住播放进度」→ 既不续播', () async {
+    test('设置里关了「记住播放进度」→ 不续播，但**历史进度照旧显示**', () async {
       final harness = await _Harness.create(rememberPosition: false);
       addTearDown(harness.dispose);
-      final item = _episode(durationMs: 45 * 60 * 1000);
-      await harness.repository.upsertItems(<MediaItem>[item]);
-      await harness.repository.saveResumePosition(item.id, const Duration(minutes: 12));
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', episode: 1, durationMs: 45 * 60 * 1000),
+        _episode(fileId: 'f2', episode: 2, durationMs: 45 * 60 * 1000),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.saveResumePosition(items[0].id, const Duration(minutes: 12));
+      await harness.repository.saveMaxPosition(items[0].id, const Duration(minutes: 20));
 
-      final request = await buildPlayRequest(harness.read, item);
+      final request = await buildPlayRequest(harness.read, items[0]);
 
       expect(request.startPosition, Duration.zero);
-      // 剧集列表上的进度条也要跟着消失 —— 那个开关是「别记我看过哪儿」，
-      // 不只是「别续播」。
+      // 续播点不带过去 —— 那个开关管的是**起播行为**（别记我看过哪儿）。
       expect(
         request.playlist.map((e) => e.resumePosition),
         everyElement(Duration.zero),
       );
+      // 但已经躺在库里的历史进度照旧带过去：进度条是**记录**，不是行为。
+      // 跟着开关一起清掉的话，用户一关它，面板上所有进度条会同时消失 ——
+      // 看起来像是把历史抹了。
+      expect(request.playlist[0].maxPosition, const Duration(minutes: 20));
+      expect(request.playlist[0].hasProgress, isTrue);
     });
 
     test('显式给了起点就用它，**不套**「接近结尾就从片头」', () async {
@@ -294,30 +310,63 @@ void main() {
       );
       expect(request.playlist[1].itemId, items[1].id);
       expect(request.playlist[1].duration, const Duration(minutes: 46));
-      // 缩略图是**作品海报**（网盘不给逐集预览图，见 PlaylistEntry 的文档）。
+      // 这几条自己都没有网盘缩略图（夹具没给 `thumbUrl`）→ 退回作品海报。
+      // 「每一集用自己那一张」由下面那组用例单独钉（见
+      // `PlaylistEntry.thumbnailUrl`）。
       expect(request.playlist[1].thumbnailUrl, 'https://img.example.com/p.jpg');
     });
 
-    test('每一集的续播点跟着列表一起带上（面板要画进度条）', () async {
+    test('每一集的两种进度都跟着列表一起带上（面板画的是历史最大位置）', () async {
       final harness = await _Harness.create();
       addTearDown(harness.dispose);
 
       final items = <MediaItem>[
-        _episode(fileId: 'f1', episode: 1),
-        _episode(fileId: 'f2', episode: 2),
+        _episode(fileId: 'f1', episode: 1, durationMs: 45 * 60 * 1000),
+        _episode(fileId: 'f2', episode: 2, durationMs: 45 * 60 * 1000),
       ];
       await harness.repository.upsertItems(items);
+      // 第 1 集看到 7 分钟，一路看到过 20 分钟。
       await harness.repository.saveResumePosition(
         items[0].id,
         const Duration(minutes: 7),
       );
+      await harness.repository.saveMaxPosition(
+        items[0].id,
+        const Duration(minutes: 20),
+      );
 
       final request = await buildPlayRequest(harness.read, items[1]);
 
+      // 两个字段各司其职：一个管「从哪儿接着播」，一个管「面板那条进度条」。
       expect(request.playlist[0].resumePosition, const Duration(minutes: 7));
+      expect(request.playlist[0].maxPosition, const Duration(minutes: 20));
       expect(request.playlist[0].hasProgress, isTrue);
       // 没看过的那些不该凭空多出一条进度条。
       expect(request.playlist[1].hasProgress, isFalse);
+    });
+
+    test('看完的那一集：续播点已清，进度条**仍然是满的**', () async {
+      // 这是整个 `maxPosition` 存在的理由。面板若读续播点，用户刚看完一集
+      // 回到面板上，那一行什么都不显示 —— 而它是唯一该显示满格的那一行。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', episode: 1, durationMs: 45 * 60 * 1000),
+        _episode(fileId: 'f2', episode: 2, durationMs: 45 * 60 * 1000),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.saveResumePosition(items[0].id, null); // 看完 → 清
+      await harness.repository.saveMaxPosition(
+        items[0].id,
+        const Duration(minutes: 45),
+      );
+
+      final request = await buildPlayRequest(harness.read, items[1]);
+
+      expect(request.playlist[0].resumePosition, Duration.zero);
+      expect(request.playlist[0].maxPosition, const Duration(minutes: 45));
+      expect(request.playlist[0].hasProgress, isTrue);
     });
 
     test('只有一项时列表为空 —— 电影不该弹出一个只有自己的列表', () async {
@@ -521,6 +570,100 @@ void main() {
   });
 
   // -------------------------------------------------------------------
+  // 剧集列表的缩略图
+  // -------------------------------------------------------------------
+
+  group('buildPlayRequest 的剧集缩略图', () {
+    test('每一集用**自己那一张**网盘缩略图，不是整列表共用一张作品海报', () async {
+      // 共用一张的话面板里几十行长得一模一样，而缩略图存在的**全部**意义
+      // 就是「扫一眼认出这是哪一集」—— 这一条错了不会报错，只会看起来
+      // 「本来就是这么设计的」。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(
+          fileId: 'f1',
+          episode: 1,
+          thumbUrl: 'https://drive.example.com/thumb-f1',
+        ),
+        _episode(
+          fileId: 'f2',
+          episode: 2,
+          thumbUrl: 'https://drive.example.com/thumb-f2',
+        ),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work()]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(
+        request.playlist.map((e) => e.thumbnailUrl).toList(),
+        <String>[
+          'https://drive.example.com/thumb-f1',
+          'https://drive.example.com/thumb-f2',
+        ],
+        reason: '两集必须是两张不同的图；都等于作品海报就退回改之前的行为',
+      );
+    });
+
+    test('这一集自己没有预览图 → 退回作品海报，不是空着', () async {
+      // 夸克对约 30% 的视频还没生成预览图（见 `WorkPoster.fromItems`）。
+      // 那些行显示「这部作品的某一张网盘帧」仍然比一块灰占位有信息量。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(
+          fileId: 'f1',
+          episode: 1,
+          thumbUrl: 'https://drive.example.com/thumb-f1',
+        ),
+        _episode(fileId: 'f2', episode: 2),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work()]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(request.playlist[0].thumbnailUrl, 'https://drive.example.com/thumb-f1');
+      expect(request.playlist[1].thumbnailUrl, 'https://img.example.com/p.jpg');
+    });
+
+    test('作品海报也是空白 → 留 null，不要造一个空地址下去', () async {
+      // 空白地址会让播放窗口那边去请求一条没头没尾的 URL，而失败与
+      // 「本来就没有图」在 UI 上是同一件事 —— 不如一开始就如实说没有。
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final items = <MediaItem>[
+        _episode(fileId: 'f1', episode: 1),
+        _episode(fileId: 'f2', episode: 2),
+      ];
+      await harness.repository.upsertItems(items);
+      await harness.repository.upsertWorks(<MediaWork>[_work(posterUrl: '   ')]);
+
+      final request = await buildPlayRequest(harness.read, items[0]);
+
+      expect(request.playlist.map((e) => e.thumbnailUrl), everyElement(isNull));
+    });
+
+    test('单集（电影）不拼列表，也不去查海报 —— 那些工作全是白做的', () async {
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      final item = _episode(thumbUrl: 'https://drive.example.com/thumb-f1');
+      await harness.repository.upsertItems(<MediaItem>[item]);
+      await harness.repository.upsertWorks(<MediaWork>[_work()]);
+
+      final request = await buildPlayRequest(harness.read, item);
+
+      expect(request.playlist, isEmpty);
+    });
+  });
+
+  // -------------------------------------------------------------------
   // playerBridgeHostProvider：把两个回调装上
   // -------------------------------------------------------------------
 
@@ -537,6 +680,9 @@ void main() {
       // 「刷不出来」，而这是全链路里唯一一处能把回调装上的地方。
       expect(onTicketRefresh, isNotNull);
       expect(onPlaybackProgress, isNotNull);
+      // 剧集面板的缩略图同理：没装上 → 每一行都退回灰占位图，
+      // 而用户只会觉得「这软件没有缩略图」，不会想到是回调没装。
+      expect(onFetchThumbnail, isNotNull);
     });
 
     test('找到条目 → 带上档位与位置去取链', () async {
@@ -609,6 +755,88 @@ void main() {
 
       expect(onTicketRefresh, isNull);
       expect(onPlaybackProgress, isNull);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // 未入库条目的直链刷新（目录视图「直接播」）
+  // -------------------------------------------------------------------
+
+  /// 这一组守的是**目录视图里直接播**那条路的最后一环。
+  ///
+  /// 那条路的条目不在库里（`playDriveEntry` 不写库），而「直链过期自动续播」
+  /// 是**播放窗口发起、主窗口执行**的：主窗口只收到一个 `itemId`，去查库
+  /// 必然查不到。没有这层登记的话，用户播到一半会遇到「直链刷新失败，
+  /// 请看诊断日志」—— 而那条链完全刷得出来，只是我们忘了自己播过什么。
+  group('未入库条目的直链刷新（登记表）', () {
+    test('库里没有、登记表里有 → 照样刷得出来，且与原请求同源', () async {
+      final harness = await _Harness.create(
+        drive: _FakeDrive(ticket: _ticket(withSuper: true)),
+      );
+      addTearDown(harness.dispose);
+
+      // 目录视图里「直接播」造出来的那一条：只活在内存里，库里**没有**它。
+      final transient = _transientItem();
+      rememberTransientItem(transient);
+
+      harness.container.read(playerBridgeHostProvider);
+
+      final fresh = await onTicketRefresh!(
+        TicketRefreshRequest(
+          itemId: transient.id,
+          qualityId: 'super',
+          position: const Duration(minutes: 12),
+        ),
+      );
+
+      expect(
+        fresh,
+        isNotNull,
+        reason: '这一条虽然没入库，但主窗口开播时登记过它 —— 拿不到新链的话，'
+            '用户在片长过半时只能看到「刷新失败」，而那条链明明刷得出来',
+      );
+      expect(fresh!.itemId, transient.id);
+      // 档位与位置同样不能丢：与「已入库」那条路同一套要求。
+      expect(harness.drive.requestedQualityIds, <String?>['super']);
+      expect(fresh.qualityId, 'super');
+      expect(fresh.startPosition, const Duration(minutes: 12));
+      // 片名跟着登记的那一条走（`buildPlayRequest` 从 `item.displayTitle` 取）。
+      // 空片名会让播放窗口的标题栏在一次刷新后变成空白。
+      expect(fresh.title, transient.displayTitle);
+      expect(fresh.title, isNotEmpty);
+    });
+
+    test('两个来源都没有 → 返回 null，且不白取一次链', () async {
+      final harness = await _Harness.create();
+      addTearDown(harness.dispose);
+
+      harness.container.read(playerBridgeHostProvider);
+
+      final fresh = await onTicketRefresh!(
+        const TicketRefreshRequest(itemId: 'quark:从没播过'),
+      );
+
+      expect(fresh, isNull);
+      expect(
+        harness.drive.requestedQualityIds,
+        isEmpty,
+        reason: '两个来源都没有时**不该**去取链 —— 取回来也没人要',
+      );
+    });
+
+    test('登记表有上限：挤掉最旧的，不跟着会话一直长', () {
+      // 用户在目录视图里连点十几条是常事。无上限的话这份进程级状态会一直长，
+      // 而刷新只可能发生在**正在播的那一条**上。
+      for (var i = 0; i < 40; i++) {
+        rememberTransientItem(_transientItem(fileId: 'fid-$i'));
+      }
+
+      expect(recallTransientItem('quark:fid-39'), isNotNull, reason: '最近那条还在');
+      expect(
+        recallTransientItem('quark:fid-0'),
+        isNull,
+        reason: '最旧的被挤掉 —— 它早就没在播了，留着只是占内存',
+      );
     });
   });
 
@@ -741,6 +969,7 @@ MediaItem _episode({
   int? season,
   int? episode,
   int? durationMs,
+  String? thumbUrl,
 }) {
   return MediaItem(
     provider: DriveProvider.quark,
@@ -755,18 +984,38 @@ MediaItem _episode({
     season: season,
     episode: episode,
     durationMs: durationMs,
+    thumbUrl: thumbUrl,
     firstSeenAt: DateTime(2026, 9, 30),
     updatedAt: DateTime(2026, 9, 30),
   );
 }
 
-MediaWork _work({String title = '流浪地球2'}) => MediaWork(
+/// 目录视图里「直接播」造出来的那一条：只活在内存里，库里**没有**它。
+///
+/// 刻意走 `parseTransientMedia`（而不是手搓一个 `MediaItem`）：那条路正是
+/// 产品代码造它的方式，手搓的话用例验的是一个不存在的东西。
+MediaItem _transientItem({String fileId = 'fid-1'}) => parseTransientMedia(
+      entry: DriveEntry(
+        id: fileId,
+        name: '流浪地球2.2023.2160p.mkv',
+        isDirectory: false,
+        sizeBytes: 1234,
+      ),
+      provider: DriveProvider.quark,
+      dirPath: '/电影/流浪地球2 (2023)',
+    ).item;
+
+MediaWork _work({
+  String title = '流浪地球2',
+  String? posterUrl = 'https://img.example.com/p.jpg',
+}) =>
+    MediaWork(
       key: 'movie:流浪地球2:2023',
       provider: DriveProvider.quark,
       kind: MediaKind.movie,
       title: title,
       source: ScrapeSource.local,
-      posterUrl: 'https://img.example.com/p.jpg',
+      posterUrl: posterUrl,
       itemCount: 3,
       updatedAt: DateTime(2026, 9, 30),
     );

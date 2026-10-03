@@ -47,6 +47,25 @@ abstract class CloudDriveAdapter {
   /// 这是 App 启动时的入口：先 `restoreSession()`，拿到 `null` 就引导授权。
   Future<CloudAccount?> restoreSession();
 
+  /// 重新拉一次账号信息（**不碰凭证存储**）。
+  ///
+  /// 存在的理由只有一个：`CloudAccount` 里的**已用容量是一份快照** ——
+  /// 它在授权/恢复会话那一刻取到，之后用户传片、删片都不会自己更新。
+  /// 界面上要显示「还剩多少空间」就必须有一条重新问一次的路径。
+  ///
+  /// ## 为什么不能直接用 [restoreSession] 刷新
+  ///
+  /// 语义不同，而且对夸克**有害**：`restoreSession()` 会先从安全存储里重新读
+  /// 一份凭证。夸克在每个响应里轮换 `__puus` 且**刻意不落库**
+  /// （见 `QuarkAdapter._absorbRotatedCookies`），所以存储里那份是登录时的旧值
+  /// —— 用它刷新等于把内存里最新的 Cookie 换回旧的。
+  ///
+  /// 默认实现退回 [restoreSession]：对「凭证只存在内存里、没有轮换 Cookie」
+  /// 的实现方，两者本来就等价。需要区分的实现方自行覆写（夸克就是）。
+  ///
+  /// 未授权时应抛 `DriveException(unauthorized)`；调用方负责先判断有没有会话。
+  Future<CloudAccount?> refreshAccount() => restoreSession();
+
   /// 用一份新凭证授权并持久化。
   ///
   /// 实现应**先校验再落库**：校验失败抛 `DriveException(unauthorized)`，
@@ -197,7 +216,13 @@ abstract class CloudDriveAdapter {
   /// 删除文件/文件夹。
   ///
   /// [fileIds] 是要删除的 fid 列表。
-  /// 返回被删除的 fid 列表（供调用方核对）。
+  ///
+  /// 返回**本次请求认定删掉了**的 fid。⚠️ 这是**请求粒度**的，不是逐条
+  /// 核实过的：服务端若在同一批里跳过了某几个（无权限、已在回收站、
+  /// fid 已失效），响应里没有可读的逐条结果，调用方也无从分辨。
+  ///
+  /// 所以调用方**不能**把它读成「这些一定已经不在网盘上了」，只能读成
+  /// 「这些的删除请求成功了」—— 数量可以拿去汇报，不要拿去对账。
   ///
   /// ⚠️ 这是**不可逆**操作 —— 网盘的回收站策略由服务端决定。
   /// 调用方必须在 UI 层做二次确认。
@@ -207,6 +232,42 @@ abstract class CloudDriveAdapter {
     throw const DriveException(
       type: DriveErrorType.unsupported,
       message: '该网盘不支持删除文件',
+    );
+  }
+
+  /// 把一批文件/文件夹移动到目标目录。
+  ///
+  /// [fileIds] 是要移动的 fid 列表；[targetFolderId] 是目标目录 fid
+  /// （`'0'` 表示根目录）。
+  ///
+  /// 返回**本次请求认定移动成功**的 fid。语义与 [deleteFiles] 完全一样：
+  /// **请求粒度**，不是逐条核实过的，只能拿去汇报、不要拿去对账。
+  ///
+  /// ## 三件调用方必须自己保证的事
+  ///
+  ///   1. **目标不能是被移动项自己、也不能在它的子树里**。把 `/电影` 移进
+  ///      `/电影/科幻` 要么被服务端拒绝、要么造出一个自引用的目录，
+  ///      两种结果都不好看。这个判断只需要路径，所以放在纯值对象里
+  ///      （`DriveMovePlan.invalidTargetReason`），适配器不重复做一遍。
+  ///   2. **同名冲突**：目标目录里已有同名项时服务端会怎么办，我们没有实测
+  ///      过 —— 这条接口的请求体里**没有**覆盖开关，所以「会不会被改名 /
+  ///      被覆盖」都是未知。界面必须按「可能覆盖」写提示，不能说成
+  ///      「一定不会动到已有文件」。
+  ///   3. **一次别超过 `driveMaxFidsPerRequest` 个**。超了不保证被拒，
+  ///      但一旦超时，用户什么信息都拿不到。
+  ///
+  /// ⚠️ 移动**不改 fid**：移动之后文件的网盘 ID 与移动前相同。所以本地索引
+  /// 里那些行**不会变成死索引**（按 fid 查得到、播放也照常），但它们的
+  /// `dirPath` 会指向旧位置，要等下一次扫描才修正。
+  ///
+  /// 默认实现抛 `unsupported`。
+  Future<List<String>> moveFiles({
+    required List<String> fileIds,
+    required String targetFolderId,
+  }) {
+    throw const DriveException(
+      type: DriveErrorType.unsupported,
+      message: '该网盘不支持移动文件',
     );
   }
 

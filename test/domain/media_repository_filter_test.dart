@@ -35,12 +35,14 @@ typedef Spec = ({
   String title,
   int? year,
   List<String> genres,
+  ScrapeSource source,
 });
 
 /// 一份筛选条件。
 typedef Filter = ({
   MediaCategory? category,
   bool playedOnly,
+  bool scrapedOnly,
   String? query,
   Set<int>? years,
   Set<String>? genres,
@@ -49,6 +51,9 @@ typedef Filter = ({
 void main() {
   final ts = DateTime(2026, 10, 1);
 
+  // `source` 三档都放进来：`online` 才算「已刮削」，`manual` 是用户点过
+  // 「自定义」之后的状态（在线信息已被清空），`local` 是纯文件名解析。
+  // 三者的分界正是 `scrapedOnly` 最容易被两个实现做出不同口径的地方。
   final specs = <Spec>[
     (
       key: 'nolan',
@@ -57,6 +62,7 @@ void main() {
       title: '奥本海默',
       year: 2023,
       genres: ['剧情', '历史'],
+      source: ScrapeSource.online,
     ),
     (
       key: 'pulp',
@@ -65,6 +71,7 @@ void main() {
       title: '低俗小说',
       year: 1994,
       genres: ['犯罪', '剧情'],
+      source: ScrapeSource.local,
     ),
     (
       key: 'gits',
@@ -73,6 +80,7 @@ void main() {
       title: '攻壳机动队',
       year: 1995,
       genres: ['动画', '科幻'],
+      source: ScrapeSource.online,
     ),
     (
       key: 'anime-word',
@@ -81,6 +89,7 @@ void main() {
       title: '动画片大全',
       year: 2021,
       genres: ['动画片'],
+      source: ScrapeSource.local,
     ),
     (
       key: 'no-year',
@@ -89,6 +98,7 @@ void main() {
       title: '某剧',
       year: null,
       genres: ['剧情'],
+      source: ScrapeSource.local,
     ),
     (
       key: 'bare',
@@ -97,6 +107,16 @@ void main() {
       title: '没刮过的片',
       year: null,
       genres: <String>[],
+      source: ScrapeSource.local,
+    ),
+    (
+      key: 'custom',
+      kind: MediaKind.movie,
+      category: MediaCategory.movie,
+      title: '自定义过的片',
+      year: 2019,
+      genres: <String>[],
+      source: ScrapeSource.manual,
     ),
   ];
 
@@ -119,7 +139,7 @@ void main() {
               category: Value(s.category.name),
               year: Value(s.year),
               genres: Value(jsonEncode(s.genres)),
-              source: 'local',
+              source: s.source.name,
               updatedAt: ts,
             ),
           );
@@ -134,6 +154,7 @@ void main() {
           category: s.category,
           year: s.year,
           genres: s.genres,
+          source: s.source,
           updatedAt: ts,
         ),
     ]);
@@ -143,20 +164,30 @@ void main() {
 
   /// 一份筛选条件。
   final filters = <Filter>[
-    (category: null, playedOnly: false, query: null, years: null, genres: null),
-    (category: MediaCategory.movie, playedOnly: false, query: null, years: null, genres: null),
-    (category: MediaCategory.anime, playedOnly: false, query: null, years: null, genres: null),
-    (category: null, playedOnly: false, query: null, years: {2023}, genres: null),
-    (category: null, playedOnly: false, query: null, years: {1994}, genres: null),
-    (category: null, playedOnly: false, query: null, years: {1994, 2023}, genres: null),
-    (category: null, playedOnly: false, query: null, years: null, genres: {'剧情'}),
-    (category: null, playedOnly: false, query: null, years: null, genres: {'动画'}),
-    (category: null, playedOnly: false, query: null, years: null, genres: {'动画片'}),
-    (category: null, playedOnly: false, query: null, years: null, genres: {'动画', '科幻'}),
-    (category: MediaCategory.anime, playedOnly: false, query: null, years: null, genres: {'动画'}),
-    (category: MediaCategory.movie, playedOnly: false, query: null, years: {2023}, genres: {'剧情'}),
-    (category: null, playedOnly: false, query: '小说', years: null, genres: null),
-    (category: null, playedOnly: false, query: '某剧', years: null, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: null),
+    (category: MediaCategory.movie, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: null),
+    (category: MediaCategory.anime, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: {2023}, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: {1994}, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: {1994, 2023}, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: {'剧情'}),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: {'动画'}),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: {'动画片'}),
+    (category: null, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: {'动画', '科幻'}),
+    (category: MediaCategory.anime, playedOnly: false, scrapedOnly: false, query: null, years: null, genres: {'动画'}),
+    (category: MediaCategory.movie, playedOnly: false, scrapedOnly: false, query: null, years: {2023}, genres: {'剧情'}),
+    (category: null, playedOnly: false, scrapedOnly: false, query: '小说', years: null, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: false, query: '某剧', years: null, genres: null),
+    // 「已刮削」单独一项，以及与分类 / 年份 / 类型 / 搜索的每一种组合 ——
+    // 判据写错（比如漏掉 `manual` 也要排除）只会让两个实现各筛各的。
+    (category: null, playedOnly: false, scrapedOnly: true, query: null, years: null, genres: null),
+    (category: MediaCategory.anime, playedOnly: false, scrapedOnly: true, query: null, years: null, genres: null),
+    (category: MediaCategory.movie, playedOnly: false, scrapedOnly: true, query: null, years: null, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: true, query: null, years: {1995}, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: true, query: null, years: {2019}, genres: null),
+    (category: null, playedOnly: false, scrapedOnly: true, query: null, years: null, genres: {'剧情'}),
+    (category: null, playedOnly: false, scrapedOnly: true, query: null, years: null, genres: {'动画', '科幻'}),
+    (category: null, playedOnly: false, scrapedOnly: true, query: '奥本', years: null, genres: null),
   ];
 
   Future<List<String>> keys(
@@ -167,6 +198,7 @@ void main() {
     final list = await repo.listWorks(
       category: f.category,
       playedOnly: f.playedOnly,
+      scrapedOnly: f.scrapedOnly,
       query: f.query,
       years: f.years,
       genres: f.genres,
@@ -193,11 +225,13 @@ void main() {
       final a = await real.countWorksByYear(
         category: f.category,
         playedOnly: f.playedOnly,
+        scrapedOnly: f.scrapedOnly,
         query: f.query,
       );
       final b = await fake.countWorksByYear(
         category: f.category,
         playedOnly: f.playedOnly,
+        scrapedOnly: f.scrapedOnly,
         query: f.query,
       );
       expect(b, a, reason: '条件 $f 的年份分布：真身 $a，替身 $b');
@@ -207,6 +241,7 @@ void main() {
         final hit = await keys(real, (
           category: f.category,
           playedOnly: f.playedOnly,
+          scrapedOnly: f.scrapedOnly,
           query: f.query,
           years: {entry.key},
           genres: null,
@@ -221,11 +256,13 @@ void main() {
       final a = await real.countWorksByGenre(
         category: f.category,
         playedOnly: f.playedOnly,
+        scrapedOnly: f.scrapedOnly,
         query: f.query,
       );
       final b = await fake.countWorksByGenre(
         category: f.category,
         playedOnly: f.playedOnly,
+        scrapedOnly: f.scrapedOnly,
         query: f.query,
       );
       expect(b, a, reason: '条件 $f 的类型分布：真身 $a，替身 $b');
@@ -234,6 +271,7 @@ void main() {
         final hit = await keys(real, (
           category: f.category,
           playedOnly: f.playedOnly,
+          scrapedOnly: f.scrapedOnly,
           query: f.query,
           years: null,
           genres: {entry.key},
@@ -248,6 +286,7 @@ void main() {
       expect((await keys(repo, (
         category: null,
         playedOnly: false,
+        scrapedOnly: false,
         query: null,
         years: <int>{},
         genres: <String>{},

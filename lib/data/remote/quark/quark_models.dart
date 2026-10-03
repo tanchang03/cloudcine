@@ -152,8 +152,24 @@ class QuarkMapper {
 
   /// 账号信息 → [CloudAccount] 的可选字段。
   ///
-  /// 夸克 `/member` 返回的非敏感字段（PoC 已确认）：
+  /// 夸克 PC 自用接口 `/member` 返回的非敏感字段（PoC 已确认）：
   /// `member_type`、`use_capacity`、`total_capacity`、`nickname`。
+  ///
+  /// ## 容量为什么要多认两个名字
+  ///
+  /// 夸克同一份数据在**两套接口**上名字不同：
+  ///
+  /// | 接口 | 总容量 | 已用 |
+  /// |---|---|---|
+  /// | PC 自用 `/1/clouddrive/member`（本项目走的） | `total_capacity` | `use_capacity` |
+  /// | 开放平台 `/open/v1/user/get_vip_info` | `capacity` | `used` |
+  ///
+  /// 两者不可混用（鉴权方式不同），但**字段名互为备选**没有代价：多认一个名字
+  /// 只在服务端改口径时救一次场，认错了也只是拿不到值、退回不显示容量条。
+  /// 只认一个名字的话，那天界面上会静静地少一行，没有任何报错。
+  ///
+  /// `member_info` 那层嵌套同理 —— `member_type` 已经出现过包在里面的时候，
+  /// 容量跟着一起包进去是完全可能的。
   static CloudAccount mergeAccountInfo(
     CloudAccount base,
     Map<String, Object?> memberData,
@@ -163,18 +179,32 @@ class QuarkMapper {
         _asString(memberData['user_name']);
 
     final memberInfo = memberData['member_info'];
-    var memberType = _asString(memberData['member_type']);
-    if (memberType == null && memberInfo is Map) {
-      memberType = _asString(memberInfo['member_type']);
+
+    /// 先在顶层找，再在 `member_info` 里找。
+    ///
+    /// 不做 `cast` 视图 —— 那是个**惰性**转换，真去取一个非 String 键时会抛，
+    /// 而这里的字段名全部来自服务端，抛了只能看到一个与容量毫无关系的异常。
+    Object? pick(List<String> keys) {
+      for (final k in keys) {
+        final top = memberData[k];
+        if (top != null) return top;
+        if (memberInfo is Map) {
+          final nested = memberInfo[k];
+          if (nested != null) return nested;
+        }
+      }
+      return null;
     }
+
+    final memberType = _asString(pick(const ['member_type']));
 
     return base.copyWith(
       displayName: nickname,
       userId: _asString(memberData['user_id']) ??
           _asString(memberData['uid']) ??
           base.userId,
-      storageUsedBytes: _asInt(memberData['use_capacity']),
-      storageTotalBytes: _asInt(memberData['total_capacity']),
+      storageUsedBytes: _asInt(pick(const ['use_capacity', 'used'])),
+      storageTotalBytes: _asInt(pick(const ['total_capacity', 'capacity'])),
       memberLabel: memberType,
     );
   }

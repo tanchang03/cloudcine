@@ -20,6 +20,16 @@
 ///   1. **年份硬闸门**：两边都有年份且相差 ≥ [ScrapeMatch.maxYearGap] → 淘汰；
 ///   2. **标题相似度**：精确 / 前缀 / 包含 / 字符 bigram 的 Dice 系数。
 ///
+/// ## 无年份的电影走第三道：**只认精确同名**
+///
+/// 上面第 1 道在「查询侧没年份」时**完全失效**，于是只剩标题相似度。而
+/// 第 2 道的 0.6 档是**为「有年份」定的**，前缀档（0.65+）在那里无条件通过
+/// —— 无年份时它会把 `奥德赛` 配到 `奥德赛：归来`、`英雄` 配到 `英雄本色`。
+/// 所以这类查询（见 `ScrapeQuery.requireExactTitle`）改用
+/// [ScrapeMatch.evaluate] 的 `requireExactTitle`：精确同名才放行，
+/// 且由调用方再加「排第一位」。命中不了就退回手动通道 ——
+/// 与「宁可漏刮」同一条口径。
+///
 /// ## 为什么是「宁可漏刮」
 ///
 /// 漏刮只是没有在线海报（还有夸克缩略图兜底，用户仍看得到画面）；
@@ -146,6 +156,21 @@ class ScrapeMatchResult {
 /// [queryAlternateTitle] 是中文名搜不到时用的备用词（通常是英文名）。
 /// 结果里的 `title` 与 `originalTitle` **都要比**：用英文名搜的时候，
 /// `language=zh-CN` 会让结果标题是中文，而原名才是英文。
+///
+/// ## 两档判据
+///
+///   - **严格档**（[requireExactTitle] 为 `false`，默认）：年份硬闸门 +
+///     标题相似度分档（[strongSimilarity] / [weakSimilarity]）。适用于
+///     「查询里带年份」或「剧集（季集号自能定位）」；
+///   - **宽松档**（[requireExactTitle] 为 `true`）：**只认精确同名**。
+///     适用于无年份的电影 —— 它没有年份可消歧，沿用 0.6 档会让前缀误配
+///     无条件通过（`奥德赛` → `奥德赛：归来` 0.86）。详见
+///     `ScrapeQuery.requireExactTitle`。
+///
+/// ⚠️ 宽松档只解决「闸门放不放行」，**不解决歧义**：多条精确同名
+/// （实测「奥德赛」TMDB 4 条、豆瓣 2 条）时闸门本身分辨不了，得由调用方加
+/// 「**第一位**必须是精确同名」这条（见 `TmdbScraper._pickVerified` /
+/// `DoubanScraper._pickBest`）。
 class ScrapeMatch {
   const ScrapeMatch._();
 
@@ -157,9 +182,15 @@ class ScrapeMatch {
   static const int maxYearGap = 2;
 
   /// 到这个相似度就无条件接受。
+  ///
+  /// ⚠️ **只在严格档生效**。它是**为「有年份」定的档** —— 那里有年份硬闸门
+  /// 兜底，标题相似度只是辅助，所以前缀档可以放得松。无年份的电影走
+  /// [requireExactTitle] 那条（精确同名），**不用**这个阈值。
   static const double strongSimilarity = 0.6;
 
   /// 到这个相似度算「沾边」，必须有年份兜底才接受。
+  ///
+  /// ⚠️ 同样**只在严格档生效**。
   static const double weakSimilarity = 0.35;
 
   static ScrapeMatchResult evaluate({
@@ -169,6 +200,7 @@ class ScrapeMatch {
     required String resultTitle,
     String? resultOriginalTitle,
     int? resultYear,
+    bool requireExactTitle = false,
   }) {
     final gap = (queryYear != null && resultYear != null)
         ? (queryYear - resultYear).abs()
@@ -195,6 +227,23 @@ class ScrapeMatch {
         final s = titleSimilarity(q, r);
         if (s > best) best = s;
       }
+    }
+
+    // 3) **宽松档**（无年份的电影）：只认**精确同名**。
+    //
+    //    `titleSimilarity == 1` 当且仅当归一化后完全相等（见那边的实现：
+    //    相等早退返回 1，其余各档都够不到 1）。
+    //
+    //    为什么不能沿用下面的 0.6 档：那个阈值是**为「有年份」定的**
+    //    —— 那里的主力判据是上面的年份硬闸门，标题相似度只是辅助。
+    //    没有年份时它挡不住前缀误配：实测 `奥德赛` → `奥德赛：归来` 0.86、
+    //    `英雄` → `英雄本色` 0.825，全部无条件通过 —— 而那正是「静默刮错」。
+    if (requireExactTitle) {
+      return ScrapeMatchResult(
+        best >= 1 ? ScrapeMatchVerdict.accept : ScrapeMatchVerdict.rejectTitle,
+        best,
+        gap,
+      );
     }
 
     if (best >= strongSimilarity) {

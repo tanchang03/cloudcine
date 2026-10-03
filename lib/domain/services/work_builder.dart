@@ -108,19 +108,41 @@ class WorkSeedBook {
 
   /// 收一条**已识别为视频**的媒体项。
   ///
-  /// 返回 `false` 表示这条项解析不出可信片名（`ScrapeQuery.fromParsed`
-  /// 为空），因此**不归组**：它仍然会作为媒体项入库，只是没有作品行。
+  /// 返回 `false` 表示这条项**连片名都提不出来**（`hasUsableTitle` 为假），
+  /// 因此**不归组**：它仍然会作为媒体项入库，只是没有作品行。
   /// 这是刻意的 —— 宁可让它在库里以文件名示人，也不要拿半个名字去
   /// 建一个注定要重刮的作品。
+  ///
+  /// ## 归组门槛（[ParsedMediaName.hasUsableTitle]）必须**宽于**刮削门槛
+  /// （[ParsedMediaName.isConfident]）
+  ///
+  /// ⛔ 这两个门槛曾经是同一个 —— 这里直接拿 `ScrapeQuery.fromParsed` 的
+  /// 空值当「不归组」的判据。后果是**静默丢数据**：
+  ///
+  /// 2026-10-03，`/来自：分享/奥德赛/1080P.mkv`：文件名整串只有一个分辨率
+  /// 标记，片名靠目录名兜底成「奥德赛」，`kind=movie` 而 `year=null` →
+  /// `isConfident=false` → `ScrapeQuery` 为 null → 不归组 → `media_works`
+  /// 一条都没有 → 媒体库页面（读 `listWorks`）空空如也，而目录视图里那一条
+  /// 还标着「已入库」且能播。日志里报的却是「发现成功：媒体 1（新增 1）,
+  /// 作品 0」—— 用户看不出哪里错了。
+  ///
+  /// 所以现在的规则是：**片名像个名字就先建作品行**，年份/类型不够可信只
+  /// 让它**不进 `_queries`**（不刮削）。不刮削只是没海报，本地片名照样能用。
+  ///
+  /// ⚠️ 这也让「同一部电影被拆成两条」的口径保持一致：只要片名解析得出，
+  /// 同一个文件走全盘扫描与走文件夹「发现」都会归到同一组。
   bool add({
     required ParsedMediaName parsed,
     required MediaItem item,
     required String dirPath,
   }) {
-    final query = ScrapeQuery.fromParsed(parsed);
-    if (query == null) return false;
-
-    _queries.putIfAbsent(parsed.groupKey, () => query);
+    final query = ScrapeQuery.fromParsed(parsed, dirPath: dirPath);
+    if (query != null) {
+      _queries.putIfAbsent(parsed.groupKey, () => query);
+    } else if (!parsed.hasUsableTitle) {
+      // 片名提不出来，或只是一串编号/分辨率 → 不归组（原行为，一字不动）。
+      return false;
+    }
 
     final seed = _seeds.putIfAbsent(
       parsed.groupKey,

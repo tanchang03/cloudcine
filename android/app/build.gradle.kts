@@ -1,3 +1,4 @@
+import java.io.File
 import java.io.FileInputStream
 import java.util.Properties
 
@@ -97,4 +98,82 @@ android {
 
 flutter {
     source = "../.."
+}
+
+// ── 品牌化产物名（APK）──────────────────────────────────────────────────────
+//
+// **为什么必须在这里做**：`flutter build apk` 的产物名由 Flutter 工具链
+// **定死** —— `flutter.groovy:1418-1445` 在 `assembleRelease.doLast` 里把 AGP 的
+// 输出 `copy` 到 `outputs/flutter-apk/`，再用 `rename` **强制**改成
+// `app-<abi>?-<flavor>?-<mode>.apk`。所以在 Gradle 里改 AGP 的 `outputFileName`
+// 是无效的：`outputs/apk/release/` 下会多一个副本，而
+// `outputs/flutter-apk/app-release.apk` 纹丝不动 —— 偏偏后者才是
+// `flutter build apk` 报给用户、`flutter install` 会去装的那一个。
+//
+// **做法是「再复制一份」而不是「改名」**：Flutter 工具是按**精确文件名**
+// `app-<mode>.apk` 去 `flutter-apk/` 里找产物的（`gradle.dart:132-143` 造名字、
+// `:1010-1022` 逐个 `existsSync()`），原文件一旦不在，它会直接报
+// 「Gradle build failed to produce an .apk file」。反过来，同一目录里多一个
+// **别的名字**的文件对它毫无影响 —— 这条是读过工具源码确认过的。
+//
+// 用 `finalizedBy` 而不是 `doLast`：doLast 的先后取决于 Flutter 插件注册的
+// 时机（它在 `applicationVariants.all` 里注册，而 variant 由 AGP 在
+// afterEvaluate 之后才建），而 finalizer 由 Gradle 保证在主任务**完成之后**才跑，
+// 那时源文件一定已经就位。
+//
+// 命名与另外两个平台对齐：
+//   macOS    cloudcine-<ver>-macos.dmg / .zip
+//   Windows  cloudcine-<ver>-windows-x64.msi / .zip
+//   Android  cloudcine-<ver>-b<versionCode>-android.apk   ← 本段
+// ⚠️ 只有 Android 多带一个 `-b<versionCode>`：`versionName` 可以不变而
+// `versionCode` 必须递增（`pubspec.yaml` 的 `version: X.Y.Z+B`），只带名字会让
+// 「同名不同内容」的两个包无法分辨，而这恰恰是 Android 上最常见的发版方式。
+// ⚠️ 文件名刻意保持 **ASCII 小写**（与 dmg / msi 一致）：`adb push`、CI 缓存、
+// 旧版 Windows 处理中文与空格的方式各不相同，而产物名不需要好看 ——
+// 好看的显示名在应用里（`AndroidManifest.xml` 的 `android:label="云影 CloudCine"`）。
+//
+// 产物落在 `build/app/outputs/flutter-apk/`（与 `app-release.apk` 并排），
+// 好处是 `flutter clean` 会一并清掉，CI 里也已经被现有的 artifact glob 覆盖。
+
+listOf("Release", "Debug", "Profile").forEach { capitalized ->
+    val buildMode = capitalized.lowercase()
+    // 版本号在配置期就取好：与 `defaultConfig` 里用的是同一个源
+    // （Flutter 工具从 pubspec 的 `version: X.Y.Z+B` 注入），不二次解析 pubspec。
+    val appVersionName = flutter.versionName
+    val appVersionCode = flutter.versionCode
+
+    val brandApk = tasks.register("brand${capitalized}Apk") {
+        group = "flutter"
+        description = "把 $buildMode 的 APK 另存一份品牌名（不替换 app-$buildMode.apk）"
+        doLast {
+            val apkDir = project.layout.buildDirectory.dir("outputs/flutter-apk").get().asFile
+            // Flutter 的命名是 `app-<abi>?-<flavor>?-<mode>.apk`；没有
+            // `--split-per-abi` 时就是 `app-$buildMode.apk` 一个。
+            val sources = apkDir.listFiles { file ->
+                file.isFile && file.name.startsWith("app-") && file.name.endsWith("-$buildMode.apk")
+            }.orEmpty()
+
+            if (sources.isEmpty()) {
+                logger.lifecycle("brand${capitalized}Apk：$apkDir 下没有 app-*-$buildMode.apk，跳过")
+            } else {
+                sources.forEach { source ->
+                    // 去掉前后缀，剩下的就是 ABI（普通构建为空串）。
+                    val abi = source.name.removePrefix("app-").removeSuffix("-$buildMode.apk")
+                    val abiSuffix = if (abi.isEmpty()) "" else "-$abi"
+                    val branded = File(
+                        apkDir,
+                        "cloudcine-$appVersionName-b$appVersionCode$abiSuffix-android.apk",
+                    )
+                    source.copyTo(branded, overwrite = true)
+                    logger.lifecycle("品牌产物：${branded.relativeTo(project.rootProject.projectDir)}")
+                }
+            }
+        }
+    }
+
+    // 用 matching 而不是 named：AGP 到 afterEvaluate 之后才建 assembleRelease
+    // 这些任务，配置期直接 named 会抛「task not found」。
+    tasks.matching { it.name == "assemble$capitalized" }.configureEach {
+        finalizedBy(brandApk)
+    }
 }

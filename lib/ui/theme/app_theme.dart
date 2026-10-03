@@ -76,6 +76,50 @@ class AppTheme {
   static const double tvSafeHorizontal = 48;
   static const double tvSafeVertical = 27;
 
+  // -------------------------------------------------------------------
+  // TV 专用尺寸
+  //
+  // 桌面那套（侧栏 196、正文 12.5、图标 17）是按「鼠标能精确点到很小的行」
+  // 定的。电视上没有一个数字是够的：隔着三米，13sp 的字等于没有，
+  // 而 17px 的图标连焦点环都画不下。这一组是 TV 分支的**唯一真源** ——
+  // 页面里不要再写死第二份。
+  // -------------------------------------------------------------------
+
+  /// TV 上的侧栏宽度。
+  ///
+  /// 240 占 960 的 25%，纵向仍留 75% 给内容（符合官方「导航放一侧、纵向
+  /// 留给内容」）。加宽不是为了好看，是为了让 16sp 的标签 + 24px 的图标
+  /// + 焦点环**放得进去**。
+  static const double tvSidebarWidth = 240;
+
+  /// TV 上一级导航条目的高度。
+  ///
+  /// 48 是 Material 的最小触摸/焦点目标，也是官方 TV 规范的下限。桌面那一行
+  /// 只有 ~38 —— 遥控器上那意味着「两行挤在一起，看不出焦点落在哪一行」。
+  static const double tvNavItemHeight = 56;
+
+  /// TV 上的页头大标题。官方 TV 规范是浏览页大标题 44sp，但那是指「整个
+  /// 浏览页的分区标题」；本应用侧栏已经承担了分区，这里 24 足够。
+  static const double tvHeaderTitle = 24;
+
+  /// TV 上的副标题（「12 个视频 · 3 部作品」这类）。
+  static const double tvHeaderSubtitle = 14;
+
+  /// TV 上一级导航的条目文字。桌面是 13 —— 那是「鼠标悬停一下就知道是哪一
+  /// 项」的字号，电视上隔着三米完全读不了。
+  static const double tvNavLabel = 16;
+
+  /// TV 上按钮上的文字。桌面是 12.5，电视上必须 ≥ 15。
+  static const double tvActionLabel = 15;
+
+  /// TV 上一个**动作控件**应有的高度。
+  ///
+  /// 48 不是随手定的：它是官方 TV 规范里「焦点框最小边长」的值，也正是
+  /// Material 的 `IconButton` 默认最小尺寸 —— 所以这里不是要放大什么，
+  /// 而是**防止有人把它改小**（`folder_browser` 的行内按钮就显式压到了 28，
+  /// 那是为了让列表行不被撑高，属于另一回事）。
+  static const double tvActionHeight = 48;
+
   /// 「这台设备是电视」的判据。
   ///
   /// Flutter 没有暴露 Android 的 leanback 标志，只能靠尺寸推断：
@@ -86,6 +130,27 @@ class AppTheme {
       MediaQuery.sizeOf(context).width >= 960;
 
   /// 页面内容要避开的过扫描区域。非 TV 上返回 `EdgeInsets.zero`。
+  ///
+  /// ## ⛔ 谁负责加它 —— 不是「加了壳就都有了」
+  ///
+  /// `AppShell` 在 `app_shell.dart` 里（`build` 的 `body:` 那一层）给**壳内**
+  /// 那五个一级页面统一加了这一层。
+  /// ⚠️ 这里刻意**不写行号**：那层 `Focus`/`Padding` 一改行号就飘，而这个引用
+  /// 已经因为侧栏焦点兜底飘过一次了（`34` → `40`）。认「`AppShell.build` 的
+  /// `body:`」这个结构，别认行号。
+  /// 但 `/auth`、`/auth/qr`、`/work`、`/diagnostics` 都是
+  /// `StatefulShellRoute` **之外**的一级路由（见 `app_router.dart`）——
+  /// 它们把整个屏幕换掉，**拿不到壳那一层内边距**，必须自己加。
+  ///
+  /// 不加的后果有两层，第二层更难受：
+  ///   1. 最左那列（返回键、页头文字）落进过扫描带里被切掉；
+  ///   2. 电视上从媒体库点进详情页，内容会**整体左移 48px** ——
+  ///      页头本来就该在同一个位置，跳一下会让人以为换了个应用。
+  ///
+  /// ⚠️ 两种页面**不需要**加，别顺手加上去：
+  ///   - 内容本身**居中且有 maxWidth**（`AuthPage` 是 `maxWidth: 460`）——
+  ///     它本来就落在安全区里，加了只是白白缩窄；
+  ///   - **全屏视频**（`/play`）—— 加了会变成黑边。
   static EdgeInsets safeAreaInsets(BuildContext context) => isTvLayout(context)
       ? const EdgeInsets.symmetric(
           horizontal: tvSafeHorizontal,

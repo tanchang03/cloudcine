@@ -284,12 +284,14 @@ class _CountingRepo extends DriftMediaRepository {
   Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) {
     yearCalls++;
     return super.countWorksByYear(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
     );
   }
@@ -298,12 +300,14 @@ class _CountingRepo extends DriftMediaRepository {
   Future<Map<String, int>> countWorksByGenre({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) {
     genreCalls++;
     return super.countWorksByGenre(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
     );
   }

@@ -21,6 +21,71 @@ class PageHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // TV 上**操作区独占一行**，不再挤在标题右侧。
+    //
+    // 桌面那排版（标题在左、六个操作挤在右边一行）是为鼠标定的：一眼扫过去，
+    // 鼠标直接点目标。遥控器下它的代价极高 —— 960 的屏去掉 96 过扫描和 240
+    // 侧栏只剩 624，六个控件挤在里面，焦点从海报墙按 ↑ 上来会落在**最右边**
+    // 那个，用户要连按 ← 才能到最左边；而且每个只有 17px 图标，隔三米看不出
+    // 是什么。
+    //
+    // 竖排之后：操作区有整行 624 可用，且「从海报墙上按一次 ↑」就到 ——
+    // 那正是遥控器唯一能做的事。
+    if (AppTheme.isTvLayout(context)) {
+      return Padding(
+        // 比桌面那版（18/14）压一点：TV 上垂直空间比水平更宝贵，而页头
+        // 现在多了整整一行。
+        padding: const EdgeInsets.fromLTRB(22, 14, 22, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                fontSize: AppTheme.tvHeaderTitle,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.text,
+              ),
+            ),
+            if (subtitle != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                subtitle!,
+                style: const TextStyle(
+                  fontSize: AppTheme.tvHeaderSubtitle,
+                  color: AppTheme.dim,
+                ),
+              ),
+            ],
+            if (actions.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              // ⚠️ **必须是 `Wrap`，不能是 `Row`** —— 这一处实测溢出 145px。
+              //
+              // 媒体库页头这一行有六个控件（视图切换 / 搜索框 / 排序 / 筛选 /
+              // 选择 / 刷新）。桌面版把它们横排在标题右侧，因为总宽度够；电视上
+              // 页面只拿到 624（960 − 过扫描 96 − 侧栏 240），页头自己再吃掉
+              // 44 的内边距 → **580**。`Row` 在 580 里塞不下这六个，会溢出
+              // 145px：Debug 下是一块黄黑斜纹，Release 下溢出部分**直接被裁掉**，
+              // 看起来就像「筛选和刷新这两个按钮本来就没有」—— 而它们其实还在
+              // 焦点链里，遥控器按得到、屏幕上却看不见，用户只会以为遥控器坏了。
+              //
+              // 换行之后：所有控件都留在可见区内，宽度不够就自然折到第二行。
+              // TV 上页头多一行毫无代价（本来就已经为操作区单独占了一行），
+              // 而少一个看不见的按钮是实打实的可用性事故。
+              Wrap(
+                // 比页里那些 `SizedBox(width: 4/8)` 间隔稍大一点：折行后行内
+                // 控件各自独立成块，间距太小会让人读不出「这是几个不同的动作」。
+                spacing: 8,
+                runSpacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: actions,
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(22, 18, 22, 14),
       child: Row(
@@ -53,6 +118,80 @@ class PageHeader extends StatelessWidget {
           ),
           ...actions,
         ],
+      ),
+    );
+  }
+}
+
+/// 页头右侧的搜索框（媒体库与文件夹共用）。
+///
+/// ## 为什么两处必须共用一份
+///
+/// 它坐在 `PageHeader` 的同一行、紧挨着图标按钮，任何一处改宽度 / 改圆角 /
+/// 改提示色，切页时都能看出「跳」一下。而两处各写一份的话，这种漂移是慢慢
+/// 发生的、不会有人报 bug。
+///
+/// ⚠️ 高度是**写死的 32**，故意不进 `tvTextScaler`：页头那一行（含搜索框）
+/// 不能在 TV 上放大字号 —— 一个固定高度的输入框一旦被放大字号，里面的字会
+/// 顶破 32 的框、触发 `RenderFlex` 溢出。要放大也得先让这个 `SizedBox`
+/// 改吸收高度（海报网格那类没有固定高的容器才套了 `tvTextScaler`）。
+class HeaderSearchBox extends StatelessWidget {
+  const HeaderSearchBox({
+    super.key,
+    required this.controller,
+    required this.onChanged,
+    required this.hint,
+  });
+
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
+
+  /// 提示词必须说清**搜的是什么**：两处的搜索范围完全不同 ——
+  /// 媒体库搜库里已入库的作品 / 文件，文件夹只筛**当前这一层**网盘目录。
+  final String hint;
+
+  @override
+  Widget build(BuildContext context) {
+    final tv = AppTheme.isTvLayout(context);
+    return SizedBox(
+      // TV 上缩窄：页头的操作区现在横排六个控件，624 的宽度要留得下。
+      width: tv ? 180 : 220,
+      // 高度仍然**写死**（理由见类文档：固定高的框才吃得住字号，不能套
+      // `tvTextScaler`）。TV 上从 32 抬到 44 —— 15sp 的字在 32 高的框里会顶破。
+      height: tv ? 44 : 32,
+      child: TextField(
+        controller: controller,
+        onChanged: onChanged,
+        style: TextStyle(
+          fontSize: tv ? AppTheme.tvActionLabel : 12.5,
+          color: AppTheme.text,
+        ),
+        cursorHeight: tv ? 18 : 14,
+        decoration: InputDecoration(
+          isDense: true,
+          hintText: hint,
+          hintStyle: TextStyle(fontSize: tv ? 14 : 12, color: AppTheme.dim),
+          prefixIcon: Icon(Icons.search_rounded, size: tv ? 20 : 15),
+          prefixIconConstraints: BoxConstraints(
+            minWidth: tv ? 40 : 30,
+            minHeight: tv ? 40 : 30,
+          ),
+          filled: true,
+          fillColor: AppTheme.panel,
+          contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: AppTheme.line, width: 0.5),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: AppTheme.line, width: 0.5),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: AppTheme.accent, width: 0.8),
+          ),
+        ),
       ),
     );
   }

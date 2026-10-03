@@ -6,6 +6,7 @@ import '../../core/utils/drive_paths.dart';
 import '../../core/utils/file_names.dart';
 import '../../domain/entities/drive_entry.dart';
 import '../../domain/entities/drive_provider.dart';
+import '../../domain/services/folder_sort.dart';
 import '../../domain/services/media_discovery.dart';
 import '../../domain/services/media_entry_classifier.dart';
 import '../../domain/services/scan_service.dart';
@@ -14,6 +15,7 @@ import 'folder_providers.dart';
 import 'library_providers.dart';
 import 'library_refresh_providers.dart';
 import 'scan_providers.dart';
+import 'settings_providers.dart';
 
 /// 文件夹视图浏览的网盘。
 ///
@@ -79,37 +81,80 @@ class DriveCrumb {
 }
 
 /// 一个网盘目录的列表内容。
+///
+/// ## 为什么是「三组」而不是「两组 + 一个计数」
+///
+/// 这里原先只列**可入库的视频**，其余文件（字幕 / 图片 / 文档 / 压缩包）
+/// 用一个 `otherFileCount` 交代存在。理由当时是「列出一堆点了加不进库的
+/// `cover.jpg` / `.srt` 只会让用户以为功能坏了」。
+///
+/// 现在这条理由不成立了：**目录视图就是「网盘上有什么」的视图**，用户把
+/// 一个 `.zip` / 一份 `.pdf` 传上来，就是想在同一个地方看见它、拿回去。
+/// 只给一个数字等于告诉他「有 3 个文件，但不告诉你是什么、也不让你动」。
+///
+/// 所以三组都列出来，差别只在**行上的动作**：目录→进、视频→播、
+/// 其他文件→下载（见 `downloadDriveEntry`）。
 class DriveListing {
   const DriveListing({
     required this.crumb,
     required this.folders,
     required this.videos,
-    required this.otherFileCount,
+    required this.others,
     this.truncated = false,
   });
 
   final DriveCrumb crumb;
 
-  /// 子目录，自然序。
+  /// 子目录，**自然序**（名称）。
+  ///
+  /// ⚠️ 这里给的是**基线顺序**，不是最终显示顺序。用户在工具条上选的排序
+  /// 方式由 `sortListing` 在渲染时叠加上去（见 [driveListingProvider] 的注释：
+  /// 排序**不能**放进这个 provider）。
   final List<DriveEntry> folders;
 
-  /// **可入库的视频**，自然序。
+  /// **可播放的视频**（`EntryRole.video`），**自然序**（名称）。
   ///
-  /// 只列视频，与「扫描会把什么写进媒体库」严格对齐 —— 列出一堆点了
-  /// 加不进库的 `cover.jpg` / `.srt` 只会让用户以为功能坏了。
-  /// 其余文件的条数由 [otherFileCount] 单独交代。
+  /// 判据与「扫描会把什么写进媒体库」严格对齐（共用 `classifyEntry`）——
+  /// 列表里说「这是视频」的东西，点「加入媒体库」就一定加得进去。
   final List<DriveEntry> videos;
 
-  /// 本层里既不是目录也不是视频的文件数（字幕 / 图片 / 文档…）。
-  final int otherFileCount;
+  /// 其余文件：字幕 / 图片 / 蓝光镜像 / 文档 / 压缩包…
+  ///
+  /// 它们**不入库、不能播**，但可以**下载**。分组判据同样来自
+  /// `classifyEntry`（非目录、非视频的那几类）。
+  final List<DriveEntry> others;
+
+  /// 本层里既不是目录也不是视频的文件数。
+  ///
+  /// 保留成派生值而不是构造参数：老调用点（页头副标题）读的是「有多少个
+  /// 非视频文件」这个数，而现在这个数就是 [others] 的长度。
+  int get otherFileCount => others.length;
 
   /// 条目太多、没列完。UI 要如实说出来，否则「怎么少了几部片子」
   /// 会被当成 bug。
   final bool truncated;
 
-  bool get isEmpty => folders.isEmpty && videos.isEmpty;
+  bool get isEmpty => folders.isEmpty && videos.isEmpty && others.isEmpty;
 
-  int get total => folders.length + videos.length + otherFileCount;
+  int get total => folders.length + videos.length + others.length;
+
+  /// 这一层的构成，给人看的一行字：`12 个子目录 · 8 个视频 · 3 个其他文件`。
+  ///
+  /// **为 0 的那几段不写**：`0 个视频` 与「没有视频」是同一件事，而一个
+  /// 全是字幕的目录写成「0 个子目录 · 0 个视频 · 3 个其他文件」只会让这一行
+  /// 变长，不增加任何信息。
+  ///
+  /// 放在实体上而不是各处自己拼：目录视图的**面包屑**与**页头副标题**都要
+  /// 说这句话，两处各写一遍的话，将来加一类条目（比如「音频」）只会改一处，
+  /// 另一处静默地少说一段。
+  String get summary {
+    final parts = <String>[
+      if (folders.isNotEmpty) '${folders.length} 个子目录',
+      if (videos.isNotEmpty) '${videos.length} 个视频',
+      if (others.isNotEmpty) '${others.length} 个其他文件',
+    ];
+    return parts.isEmpty ? '空目录' : parts.join(' · ');
+  }
 }
 
 /// 列一个目录时每页取多少条。夸克对 `_size` 有上限，100 是实测可用的值。
@@ -188,7 +233,7 @@ final driveListingProvider =
     //
     // 当时的注释写「写库之后重列一次：列表本身没变，但『已入库』标记会变」——
     // 后半句是错的：`DriveListing` 里**没有任何字段来自本地库**（子目录、
-    // 视频、非视频计数全部来自网盘响应）。「已入库」标记来自另外两个
+    // 视频、其他文件全部来自网盘响应）。「已入库」标记来自另外两个
     // provider —— `_DriveFileRow` 读 `indexedFileIdsProvider`、
     // `_FolderRow` 读 `folderTreeProvider` —— 而它们各自 watch 那个信号。
     //
@@ -212,7 +257,7 @@ final driveListingProvider =
 
     final folders = <DriveEntry>[];
     final videos = <DriveEntry>[];
-    var others = 0;
+    final others = <DriveEntry>[];
     for (final entry in entries) {
       switch (classifyEntry(entry)) {
         case EntryRole.directory:
@@ -223,21 +268,50 @@ final driveListingProvider =
         case EntryRole.image:
         case EntryRole.discImage:
         case EntryRole.other:
-          others++;
+          // ⚠️ 三组分法只影响**怎么排、行上给什么动作**，不影响
+          // 「什么能入库」—— 那条判据仍然只有 `classifyEntry` 一处，
+          // 而且仍然只有 `video` 会被写进媒体库。别让这里的分类回流到
+          // 扫描 / 发现那两条路径上。
+          others.add(entry);
       }
     }
 
+    // 只排成**自然序**（基线），不在这里读用户选的排序方式。
+    //
+    // ⚠️ 别把 `folderSortModeProvider` watch 进这个 provider：改了排序方式
+    // 就会**把整个目录重新列一遍**（一个 3000 项的目录是 30 次请求，全打在
+    // 夸克那条约 3 QPS 的安全线上），而排序本来只要在渲染时重排一下列表就够。
+    // 用户看到的差别是「点一下排序卡两秒」和「立刻生效」。
     folders.sort((a, b) => naturalCompare(a.name, b.name));
     videos.sort((a, b) => naturalCompare(a.name, b.name));
+    others.sort((a, b) => naturalCompare(a.name, b.name));
 
     return DriveListing(
       crumb: crumb,
       folders: folders,
       videos: videos,
-      otherFileCount: others,
+      others: others,
       truncated: pageToken != null,
     );
   },
+);
+
+/// 目录视图当前的排序方式（**真源在设置里**，这里只是给它一个名字）。
+///
+/// ## 为什么单独一个 provider，而不是各处自己读设置
+///
+/// 「目录视图按什么排」有两个入口：面包屑那一行的排序按钮、设置页里的
+/// 默认值。两处**读写同一份**（都落到 `SettingKeys.folderSortMode`），所以
+/// 在工具条上切一次 = 改了设置页里那一项 —— 这是刻意的：两处各存一份的话，
+/// 用户在设置页设成「名称」，下次打开目录视图却又是按时间排的，那种
+/// 「设置没生效」比根本没有这个设置更让人费解。
+///
+/// 设置还没读出来时退回默认（修改时间倒序），与 `FolderSortMode.parse`
+/// 同口径 —— 目录视图不该因为一次异步读而先按错的顺序闪一下。
+final folderSortModeProvider = Provider<FolderSortMode>(
+  (ref) =>
+      ref.watch(settingsProvider).valueOrNull?.folderSortMode ??
+      FolderSortMode.modifiedTime,
 );
 
 /// **已入库文件**的 id 集合（本地索引的叠加层）。

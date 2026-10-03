@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
 import '../../domain/entities/auth_credential.dart';
 import '../../domain/entities/cloud_account.dart';
@@ -107,6 +108,45 @@ class AuthController extends AsyncNotifier<AuthState> {
       final message = '授权失败：$e';
       _emit(_current.copyWith(busy: false, error: message));
       return message;
+    }
+  }
+
+  /// 重新拉一次账号信息。
+  ///
+  /// ## 为什么需要它
+  ///
+  /// [AuthState.account] 里的**已用容量是一份快照** —— 它在授权/恢复会话那一刻
+  /// 取到，之后用户传片、删片、清理空间都不会自己更新。文件夹页头那条容量条
+  /// 要显示「还剩多少」，就必须有一条重新问一次的路径。
+  ///
+  /// ## 为什么失败时**不写 error**
+  ///
+  /// 容量条是文件夹页上的**附属信息**，不是那一页的功能。为了一次容量刷新
+  /// 失败把 `AuthState.error` 置上，侧栏与登录页会冒出「授权失败」—— 而会话
+  /// 其实好好的，用户会跑去重新登录一次。所以这里只记诊断日志，界面保持原值。
+  ///
+  /// 未授权时直接返回：这一条只服务于「已经在用」的账号。
+  Future<void> refreshAccount() async {
+    if (!_current.isAuthorized) return;
+    final adapter =
+        ref.read(adapterRegistryProvider).adapterFor(DriveProvider.quark);
+    if (adapter == null) return;
+
+    try {
+      final account = await adapter.refreshAccount();
+      if (account == null) return;
+
+      // ⚠️ 必须**重新取一次**最新状态，不能用 await 之前那份快照拼回去：
+      // 这是一次网络往返，期间用户完全可能已经点了「退出登录」——
+      // 拼旧快照会把刚清掉的会话又装回来，表现是「点了退出，账号却还在」，
+      // 而且网越慢越容易撞上。
+      final latest = _current;
+      if (!latest.isAuthorized) return;
+      _emit(latest.copyWith(account: account));
+    } on DriveException catch (e) {
+      diag.warn('会话', '刷新账号信息失败：${e.message}');
+    } catch (e) {
+      diag.warn('会话', '刷新账号信息失败：$e');
     }
   }
 

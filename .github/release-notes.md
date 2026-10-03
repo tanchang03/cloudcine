@@ -6,7 +6,7 @@
 |---|---|---|
 | macOS | `cloudcine-x.y.z-macos.dmg`（或 `.zip`） | macOS 10.15 (Catalina) 或更高，Apple Silicon / Intel 均可 |
 | Windows | `cloudcine-x.y.z-windows-x64.msi`（或 `.zip`） | Windows 10 (x64) 或更高 |
-| Android | `cloudcine-x.y.z-android.apk` | Android 5.0 (API 21) 或更高；手机 / 平板 |
+| Android | `cloudcine-x.y.z-bN-android.apk` | Android 5.0 (API 21) 或更高；手机 / 平板 |
 
 ---
 
@@ -66,7 +66,9 @@
 
 ## Android 安装（手机 / 平板）
 
-1. 下载 `cloudcine-x.y.z-android.apk`。**这是通用包**：`arm64-v8a`、`armeabi-v7a`、
+1. 下载 `cloudcine-x.y.z-bN-android.apk`（`N` 是**构建号**，即 `pubspec.yaml` 里
+   `version: x.y.z+N` 中 `+` 后面那个数 —— Android 靠它判断「哪个更新」，同一版本名
+   可以发多次）。**这是通用包**：`arm64-v8a`、`armeabi-v7a`、
    `x86`、`x86_64` 四种架构都在里面，不用挑，手机和不同架构的设备装的是同一个文件。
 
 2. 用文件管理器点开这个 APK。系统会提示「未知来源应用」，

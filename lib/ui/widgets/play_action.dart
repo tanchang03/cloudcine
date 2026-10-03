@@ -3,7 +3,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/error/drive_error.dart';
+import '../../domain/entities/drive_entry.dart';
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/media_item.dart';
+import '../../domain/services/media_discovery.dart';
+import '../../domain/services/media_entry_classifier.dart';
 import '../../domain/services/missing_media.dart';
 import '../windows/desktop_play.dart';
 import 'missing_media_dialog.dart';
@@ -48,5 +52,68 @@ Future<void> playItem(
     }
   }
   if (!context.mounted) return;
-  await context.push('/play?item=${Uri.encodeComponent(item.id)}');
+  // `extra` 带的是**对象本身**，不是 id：未入库的条目（目录视图直接点播）
+  // 库里没有这一行，内置播放页拿 id 去查会查不到（见 `PlayerPage` 的
+  // `item` 字段）。已经入库的条目带上它也无害 —— 同一个对象，省一次点查。
+  await context.push(
+    '/play?item=${Uri.encodeComponent(item.id)}',
+    extra: item,
+  );
+}
+
+/// 「播网盘上的这一个文件」—— **不需要它已经在媒体库里**。
+///
+/// ## 为什么要有这条入口
+///
+/// 目录视图列的是**网盘上的东西**，而媒体库只装「扫过 / 发现过的东西」。
+/// 两者之间那段差额（新上传的、上次扫漏的、别人分享过来还没入库的）原先
+/// 只能「先点『加入媒体库』、再点播放」。而用户点播放的意图是**看片**，
+/// 不是整理媒体库；那个中间步骤还会真的改库（多一条记录、多一部作品），
+/// 而他可能只是想先看一眼画质对不对。
+///
+/// ## 它**不写库**
+///
+/// 这里造的 `MediaItem` 只活在内存里（[parseTransientMedia]），一行都不落。
+/// 起播链本来就不依赖本地库：`PlaybackController.open` 只收一个 `MediaItem`，
+/// 直链由 `adapter.resolveStream(fid)` 现取。
+///
+/// 代价是**六项能力静默降级**（库里没有这一行）：续播点、剧集连播、同目录
+/// 字幕、逐片播放偏好、片头标记、直链过期自动续播。最后一项由
+/// [rememberTransientItem] 补上（见那张表的文档）；其余五项本来就要求
+/// 「库里认得这一条」，用户没入库就不该指望它们。
+///
+/// ## 为什么非视频一律拒绝
+///
+/// UI 只对视频行给入口，这里是**防御**：别让一个 `cover.jpg` 或一个 `.srt`
+/// 变成一次注定失败的取链（会拿一个图片 fid 去打 `play/info`）。判据与
+/// 扫描 / 发现共用 [classifyEntry]。
+Future<void> playDriveEntry(
+  BuildContext context,
+  WidgetRef ref, {
+  required DriveProvider provider,
+  required DriveEntry entry,
+  required String dirPath,
+}) async {
+  if (classifyEntry(entry) != EntryRole.video) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text('这不是可播放的视频文件'),
+      ),
+    );
+    return;
+  }
+
+  final item = parseTransientMedia(
+    entry: entry,
+    provider: provider,
+    dirPath: dirPath,
+  ).item;
+
+  // 记一份给「直链过期自动续播」用：那条路发生在**另一个引擎**里，只能回
+  // 主窗口问，而主窗口查库查不到这一条（它没入库）。见 `desktop_play.dart`
+  // 里 `_transientItems` 的文档。
+  rememberTransientItem(item);
+
+  await playItem(context, ref, item);
 }

@@ -121,6 +121,35 @@ final class ChildWindowController: NSObject, NSWindowDelegate {
       debugPrint("cloudcine: 子窗口还没挂到 NSWindow 上，跳过窗口控制注册")
       return
     }
+
+    // 鼠标追踪模式：**播放窗口必须在没焦点时也能收到 hover**。
+    //
+    // 引擎的默认值是 `InKeyWindow`（见 `FlutterViewController.h` 里
+    // `mouseTrackingMode` 的说明），它给视图挂的 `NSTrackingArea` 带的是
+    // `NSTrackingActiveInKeyWindow` —— 也就是「**只有本窗口是 key window** 时
+    // 才把 hover 事件送进 Flutter」。对播放器这个默认值是错的：用户把播放窗口
+    // 搁在一边、焦点留在主窗口或别的应用上，鼠标滑到画面上时 Dart 侧一个 hover
+    // 都收不到，控制栏与剧集列表按钮就不出来 —— 而 `PlayerWindowApp` 的整套
+    // 浮层正是靠 hover 唤醒的（见 `_pokeChrome`）。用户反馈的症状正是
+    // 「窗口不是当前焦点时，鼠标滑到播放器上什么反应都没有」。
+    //
+    // `.always` 对应 AppKit 的 `NSTrackingActiveAlways`：按 Apple 文档
+    // 「不论第一响应者、窗口状态还是**应用状态**，owner 都收消息」。这正是
+    // Finder 工具栏那种原生手感 —— 窗口没激活，鼠标划过去照样高亮
+    // （flutter/flutter#185426 里维护者也是这么说的，并建议至少给多窗口场景
+    // 这么设；引擎自己的多窗口建出来的 controller 没有别的口子能配它）。
+    //
+    // ⚠️ 它只管 **hover**（进入 / 移动 / 离开）。点击仍然要先激活窗口，但引擎的
+    // `FlutterView.acceptsFirstMouse` 返回 YES，所以「第一次点击」会同时完成
+    // 激活与派发，不会出现「点一下只是激活、再点一下才生效」。
+    //
+    // ⚠️ 引擎切换追踪模式时**不会**先摘掉旧的那个 tracking area（只有设成
+    // `None` 才摘，见 `configureTrackingArea`）。viewDidLoad 已经按默认值挂过
+    // 一个，所以这里挂完会同时存在两个：窗口是 key 时 hover 事件会到两次。
+    // 不处理它：两次事件的位置完全相同，Dart 侧 `_pokeChrome()` 幂等；而
+    // 「指针进入」在引擎里本来就有去重（`flutter_state_is_added` 时丢弃 kAdd）。
+    controller.mouseTrackingMode = .always
+
     let channel = FlutterMethodChannel(
       name: kChildWindowChannelName,
       binaryMessenger: controller.engine.binaryMessenger

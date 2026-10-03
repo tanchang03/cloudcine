@@ -8,8 +8,10 @@ import '../../data/remote/subtitle/opensubtitles_client.dart';
 import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/tmdb_client.dart';
 import '../../domain/entities/cloud_account.dart';
+import '../../domain/entities/download_task.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/quality_option.dart';
+import '../../domain/services/folder_sort.dart';
 import '../../domain/services/library_backup_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
@@ -132,6 +134,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 const SizedBox(height: 14),
                 _scanSection(current),
                 const SizedBox(height: 14),
+                _folderSection(current),
+                const SizedBox(height: 14),
+                _downloadSection(current),
+                const SizedBox(height: 14),
                 _scrapeSection(current),
                 const SizedBox(height: 14),
                 _playbackSection(current),
@@ -194,6 +200,136 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             '夸克实测约 3 QPS 安全，默认 350ms 就是照这个定的。'
             '调成 0 会关闭节流，只建议在目录很少时用。',
             style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // 文件夹视图
+  // -------------------------------------------------------------------
+
+  /// 目录视图（「文件夹」）的列表顺序。
+  ///
+  /// ## 为什么单独一节，而不是塞进「扫描」
+  ///
+  /// 扫描决定的是**往库里写什么**（发网盘请求、改数据库），而这里只决定
+  /// **这一层怎么列** —— 换排序方式不发一个请求、不动一行数据。混在扫描
+  /// 那一节里，用户会以为改完要重扫一遍才能生效。
+  ///
+  /// 它与目录视图工具条上那个排序按钮**读写同一份设置**
+  /// （`SettingKeys.folderSortMode`）：在这里改完，回目录视图立刻是新的顺序，
+  /// 反过来也一样。两处各存一份的话，用户会觉得「设置没生效」。
+  Widget _folderSection(AppSettings s) {
+    return SectionCard(
+      title: '文件夹视图',
+      description: '目录视图列的是**网盘上的实时目录**（不是已扫描的媒体库），'
+          '这里只决定它按什么顺序列。',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SizedBox(
+                width: 110,
+                child: Text(
+                  '排序方式',
+                  style: TextStyle(fontSize: 12.5, color: AppTheme.text),
+                ),
+              ),
+              Expanded(
+                child: DropdownButton<FolderSortMode>(
+                  value: s.folderSortMode,
+                  isExpanded: true,
+                  underline: const SizedBox.shrink(),
+                  dropdownColor: AppTheme.panel2,
+                  style: const TextStyle(fontSize: 12.5, color: AppTheme.text),
+                  items: [
+                    for (final mode in FolderSortMode.values)
+                      DropdownMenuItem(value: mode, child: Text(mode.label)),
+                  ],
+                  onChanged: (v) => unawaited(
+                    ref.read(settingsProvider.notifier).set(
+                          folderSortMode: v ?? FolderSortMode.modifiedTime,
+                        ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            s.folderSortMode == FolderSortMode.modifiedTime
+                ? '按网盘上的修改时间**倒序**，刚传上去的片子在第一行。'
+                    '时间相同的按名称排。'
+                : '按名称**自然序**（`第2期` 排在 `第10期` 前面）。',
+            style: const TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '两种方式下**子目录都排在视频前面** —— 排序只决定组内顺序，'
+            '不会把子目录冲到列表各处。网盘没给修改时间的条目垫底。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // 下载
+  // -------------------------------------------------------------------
+
+  /// 下载这一节。
+  ///
+  /// ## 为什么单独一节，而不是塞进「文件夹视图」
+  ///
+  /// 那一节管的是**怎么列**（排序），这一节管的是**怎么下**（并发数）。
+  /// 合成一节的话，「并发连接数」（中继，为了一条流播得动）与
+  /// 「并发下载数」（同时下几个文件）会挨在一起，而这两个数字只是**名字像**，
+  /// 调一个完全不会影响另一个 —— 挨着放必然被读成同一件事。
+  Widget _downloadSection(AppSettings s) {
+    return SectionCard(
+      title: '下载',
+      description: '在文件夹视图里点下载，任务会进「下载」那一页排队。'
+          '暂停 / 继续 / 取消都在那里，关掉应用也不会丢 —— 下次打开是「已暂停」，'
+          '点继续就从断点接着下。',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _SliderRow(
+            label: '同时下载的文件数',
+            valueLabel: '${s.downloadConcurrency} 个',
+            value: s.downloadConcurrency.toDouble(),
+            min: 1,
+            max: kMaxDownloadConcurrency.toDouble(),
+            divisions: kMaxDownloadConcurrency - 1,
+            onChanged: (v) => unawaited(
+              ref
+                  .read(settingsProvider.notifier)
+                  .set(downloadConcurrency: v.round()),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '下载是**大块顺序读**，每个任务自己就能把带宽吃满 —— 开太多只是让'
+            '每一个都变慢，还会让网盘侧看到「同一账号短时间开了十几个大文件」。'
+            '改这一项**不会掐断**正在下的任务，新的并发位才按新值分配。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => context.go('/downloads'),
+              icon: const Icon(Icons.download_rounded, size: 15),
+              label: const Text('查看下载记录', style: TextStyle(fontSize: 12)),
+              style: TextButton.styleFrom(
+                minimumSize: const Size(0, 32),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+              ),
+            ),
           ),
         ],
       ),

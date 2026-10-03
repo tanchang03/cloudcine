@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/item_sort.dart';
 import '../../domain/services/work_levels.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
@@ -47,7 +50,19 @@ class WorkDetailPage extends ConsumerWidget {
 
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: Column(
+      // ⛔ **壳外的整幅页要自己让开过扫描区**：`/work` 是 `StatefulShellRoute`
+      // **之外**的一级路由（见 `app_router.dart`），它把整屏换掉，于是拿不到
+      // `AppShell` 在 `app_shell.dart` 的 `body:` 那一层加的内边距
+      // （⚠️ 不写行号 —— 那层一改行号就飘）。
+      //
+      // 不加的后果有两层，第二层更难受：最左边那个返回键会落进过扫描带里被切掉；
+      // 而电视上从媒体库点进这一页时，内容会**整体左移 48px** —— 页头本该在
+      // 同一个位置，跳一下会让人以为换了个应用。实测：不加时这一页拿满 960，
+      // 顶栏左内边距只有 10。理由与「哪两种页面不需要加」见
+      // `AppTheme.safeAreaInsets` 的文档。
+      body: Padding(
+        padding: AppTheme.safeAreaInsets(context),
+        child: Column(
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(10, 8, 14, 0),
@@ -79,6 +94,16 @@ class WorkDetailPage extends ConsumerWidget {
           ),
           Expanded(
             child: detail.when(
+              // ⚠️ **不能**删这两个开关，否则播放中这一页每 10 秒白一下。
+              //
+              // 依赖变化（进度刷新信号）在 Riverpod 里是 **reload**，
+              // `skipLoadingOnReload` 默认 `false` —— 也就是默认会切到
+              // `loading:` 分支。而播放页报进度是每 10 秒一次，用户会看到
+              // 一个不停闪转圈的详情页。
+              //
+              // 关掉它保留上一份数据：进度条晚半秒更新，比整页闪一下好得多。
+              // 首次加载没有上一份数据，仍然正常显示转圈。
+              skipLoadingOnReload: true,
               loading: () => const Center(
                 child: SizedBox(
                   width: 22,
@@ -104,6 +129,7 @@ class WorkDetailPage extends ConsumerWidget {
             ),
           ),
         ],
+      ),
       ),
     );
   }
@@ -155,6 +181,16 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
         visible.where((i) => i.isSampleOrExtra).toList(growable: false);
     final primary =
         features.isNotEmpty ? features.first : (visible.isEmpty ? null : visible.first);
+
+    // 列表**显示**顺序。
+    //
+    // ⚠️ `primary` 是在这一步**之前**算的 —— 排序只改列表长什么样，不改
+    // 「点播放会播哪一条」。让播放按钮跟着排序走的话，用户切一次「修改时间
+    // 倒序」就变成「点播放播最新上传的那个文件」，而那几乎从不是他想要的
+    // （他要的是续播那一集 / 第一集）。这条口径与 `PlayTarget.resolve` 一致。
+    final sortMode = ref.watch(itemSortModeProvider);
+    final shownFeatures = sortItems(features, sortMode);
+    final shownExtras = sortItems(extras, sortMode);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 4, 24, 32),
@@ -218,34 +254,57 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
             _SectionTitle(
               title: '文件',
               count: features.length,
-              trailing: features.length > 1
-                  ? Text(
-                      '共 ${features.length} 个 · 点任意一行播放',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: AppTheme.dim,
-                      ),
-                    )
-                  : null,
+              // 「点任意一行播放」只在多行时才有意义；排序开关同理 ——
+              // 只有一个文件时没有任何可排的东西，画出来是纯噪音
+              // （与 `WorkLevels`「少于 2 个选项不画」同一条口径）。
+              //
+              // ⚠️ 门槛用 `visible.length` 而不是 `features.length`：这一格
+              // 可能只有 1 条正片但有好几条花絮，那时列表里仍然有多行，
+              // 排序开关必须画得出来（它同时作用于下面那一节）。
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (visible.length > 1) ...[
+                    const Text(
+                      '点任意一行播放',
+                      style: TextStyle(fontSize: 11, color: AppTheme.dim),
+                    ),
+                    const SizedBox(width: 12),
+                  ],
+                  if (visible.length > 1) const _ItemSortMenu(),
+                ],
+              ),
             ),
             const SizedBox(height: 8),
-            for (var i = 0; i < features.length; i++)
+            for (var i = 0; i < shownFeatures.length; i++)
               MediaItemRow(
-                item: features[i],
+                item: shownFeatures[i],
                 index: i,
                 workTitle: work.title,
+                // 历史最大位置（不是续播点，见 `WorkDetail.maxPositions`）。
+                // 缺键 = 没播过，行底不画进度条。
+                watched: detail.maxPositions[shownFeatures[i].id],
               ),
           ],
           if (extras.isNotEmpty) ...[
             const SizedBox(height: 22),
-            _SectionTitle(title: '花絮 / 样片', count: extras.length),
+            _SectionTitle(
+              title: '花絮 / 样片',
+              count: extras.length,
+              // 整格都是花絮（一条正片都没有）时，上面那一节压根不画 ——
+              // 排序开关要落在这里，否则这一页有排序能力却没有任何入口。
+              trailing: features.isEmpty && visible.length > 1
+                  ? const _ItemSortMenu()
+                  : null,
+            ),
             const SizedBox(height: 8),
-            for (var i = 0; i < extras.length; i++)
+            for (var i = 0; i < shownExtras.length; i++)
               MediaItemRow(
-                item: extras[i],
+                item: shownExtras[i],
                 index: i,
                 dim: true,
                 workTitle: work.title,
+                watched: detail.maxPositions[shownExtras[i].id],
               ),
           ],
         ],
@@ -274,6 +333,96 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
     final kept = _partKey;
     if (kept != null && keys.contains(kept)) return kept;
     return WorkLevels.keyOf(parts, widget.detail.primary) ?? parts.first.key;
+  }
+}
+
+/// 「文件」列表的排序开关。
+///
+/// ## 为什么详情页需要这个（而目录视图那个不够用）
+///
+/// 两个列表**排的是两种东西**，所以是两个互不相干的设置：
+///
+///   - 目录视图（`folder_browser.dart` 的 `_SortMenu`）排的是**网盘上的实时
+///     目录条目** —— 子目录、视频、字幕、压缩包混在一起；
+///   - 这一个排的是**已入库的媒体文件** —— 一部剧的 N 集，本来就排好了
+///     「季 → 部 → 集」。
+///
+/// 合成一个控件、共用一份状态的话，用户在目录视图切成「名称」，回到详情页
+/// 就会看到按文件名排的集 —— 而集号在文件名里未必是自然序（`第10集` 会排到
+/// `第2集` 前面）。
+///
+/// ## 三个选项里为什么必须留着「剧集顺序」
+///
+/// 见 `ItemSortMode`：只给「时间正序 / 倒序」就等于把原有的剧集顺序弄丢了，
+/// 看剧时最常用的动作会变成「每次进详情页先手动切一次」。
+///
+/// ## 为什么默认「修改时间倒序」
+///
+/// 这一页除了看剧，另一个高频用途是**核对刚传上去的东西入库没有**。
+/// 与目录视图的默认值同口径（`FolderSortMode.modifiedTime`）。
+///
+/// ## 选择结果**落库**
+///
+/// 走 `settingsProvider`（`SettingKeys.itemSortMode`）而不是页面内 `setState`：
+/// 它是用户对列表的长期偏好，不是「这一次停留的临时筛选」（对比 `_seasonKey`
+/// 那个「现在在看哪一季」—— 那个换一部作品就该重置）。
+class _ItemSortMenu extends ConsumerWidget {
+  const _ItemSortMenu();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final mode = ref.watch(itemSortModeProvider);
+    return PopupMenuButton<ItemSortMode>(
+      tooltip: '文件排序方式',
+      initialValue: mode,
+      position: PopupMenuPosition.under,
+      onSelected: (v) => unawaited(
+        ref.read(settingsProvider.notifier).set(itemSortMode: v),
+      ),
+      itemBuilder: (context) => [
+        for (final option in ItemSortMode.values)
+          PopupMenuItem(
+            value: option,
+            height: 34,
+            child: Row(
+              children: [
+                Icon(
+                  option == mode
+                      ? Icons.check_rounded
+                      : Icons.check_box_outline_blank,
+                  size: 14,
+                  color: option == mode ? AppTheme.accent : Colors.transparent,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  option.label,
+                  style: const TextStyle(fontSize: 12.5, color: AppTheme.text),
+                ),
+              ],
+            ),
+          ),
+      ],
+      // TV 上 `PopupMenuButton` 靠遥控器也能进（页头与目录视图那两个排序按钮
+      // 就是同一套），所以这里只把「当前是什么排序」写成看得见的字 ——
+      // 一个光秃秃的 ⇅ 图标在电视上猜不出它排的是哪一维、现在排的是什么。
+      child: SizedBox(
+        height: 28,
+        child: Row(
+          children: [
+            const Icon(
+              Icons.swap_vert_rounded,
+              size: 15,
+              color: AppTheme.muted,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              mode.label,
+              style: const TextStyle(fontSize: 12, color: AppTheme.muted),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 

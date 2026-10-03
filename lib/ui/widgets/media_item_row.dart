@@ -5,7 +5,35 @@ import '../../domain/entities/media_item.dart';
 import '../theme/app_theme.dart';
 import 'common_widgets.dart';
 import 'copy_button.dart';
+import 'modified_time_column.dart';
 import 'play_action.dart';
+
+/// 这一条文件「看过多少」（0..1）。**不该画进度条时返回 `null`**。
+///
+/// ## 为什么是 `null` 而不是 `0`
+///
+/// 两种「画不出来」的情况：
+///   - [watched] 为空（从没播过）；
+///   - 时长未知（`item.durationMs` 为空 —— 夸克没给 `duration`）。
+///
+/// 后一种返回 `0` 的话，一条**确实看过**的记录会画成 0% 的空槽 —— 用户看到
+/// 的是「白看了」，而这与「没看过」在屏幕上完全一样。返回 `null` 让调用方
+/// **什么都不画**，至少不撒谎。
+///
+/// ## 用的是历史最大位置，不是续播点
+///
+/// [watched] 传 `WorkDetail.maxPositions` 里的值（只增不减、永不清除），
+/// **不是** `resumePositionMs`（看完会被清成 NULL）—— 否则用户刚看完一集
+/// 回来，那一行会显示 0%，恰好是他最想看到 100% 的时刻。
+///
+/// 不做「接近结尾就吸附成 100%」的处理：那会让一个只看了 92% 的条目
+/// 谎报成看完。真的播完时上报的位置本来就贴着时长，`clamp` 兜住越界即可。
+double? itemProgressOf(MediaItem item, Duration? watched) {
+  if (watched == null || watched <= Duration.zero) return null;
+  final totalMs = item.durationMs;
+  if (totalMs == null || totalMs <= 0) return null;
+  return (watched.inMilliseconds / totalMs).clamp(0.0, 1.0);
+}
 
 /// 一行媒体文件。
 ///
@@ -26,9 +54,16 @@ class MediaItemRow extends ConsumerWidget {
     this.onLocate,
     this.locateTooltip = '在目录中显示',
     this.workTitle,
+    this.watched,
   });
 
   final MediaItem item;
+
+  /// 这一条**看过的最远位置**（见 [itemProgressOf]）。`null` = 没播过。
+  ///
+  /// 由调用方从 `WorkDetail.maxPositions` 取好传进来 —— 这一行不自己去查库：
+  /// 列表一屏几十行，每行各查一次会把「一次批量查询」变成 N 次。
+  final Duration? watched;
 
   /// 所属**作品行**的标题（刮削后的剧名），只用于主标题的组装。
   ///
@@ -54,6 +89,7 @@ class MediaItemRow extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final resolution = item.resolution;
+    final progress = itemProgressOf(item, watched);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -64,130 +100,193 @@ class MediaItemRow extends ConsumerWidget {
           onTap: () => playItem(context, ref, item),
           borderRadius: BorderRadius.circular(9),
           hoverColor: AppTheme.panel2,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: Row(
-              children: [
-                if (index != null)
-                  SizedBox(
-                    width: 34,
-                    child: Text(
-                      '${index! + 1}'.padLeft(2, '0'),
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontFamily: 'Menlo',
-                        color: dim ? AppTheme.dim : AppTheme.muted,
-                      ),
-                    ),
-                  ),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        // ⚠️ **不能**用 `item.displayTitle` 一把梭：提不出集号时
-                        // 它就是片名，而这一整屏都是同一部剧。真实样本
-                        // `/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4`…
-                        // 全被顶成同一个目录名，12 行主标题一模一样，只有下面
-                        // 那条暗色的网盘路径能看出区别。
-                        //
-                        // 取 `withTitle` 而不是 `compact`：有集号时**要**保留
-                        // 片名 —— 同一集常有多个版本（翡翠台 / MyTVSuper），
-                        // 版本之间只有片名不同（见 `RowLabelStyle`）。
-                        item.rowLabel(RowLabelStyle.withTitle,
-                            workTitle: workTitle),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w500,
-                          color: dim ? AppTheme.muted : AppTheme.text,
-                        ),
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        item.technicalSummary.isEmpty
-                            ? item.name
-                            : item.technicalSummary,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: AppTheme.dim,
-                        ),
-                      ),
-                      if (showPath) ...[
-                        const SizedBox(height: 3),
-                        // 网盘上的真实位置。**必须显示出来**，不能只藏在
-                        // 复制按钮后面 —— 用户来这里的一大半目的是核对
-                        // 「这一集在网盘上到底是哪个文件」，而上面那行是
-                        // **解析出来的片名**，和真实文件名可能差很远。
-                        Text(
-                          item.netdiskPath,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 10.5,
+          child: Stack(
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                child: Row(
+                  children: [
+                    if (index != null)
+                      SizedBox(
+                        width: 34,
+                        child: Text(
+                          '${index! + 1}'.padLeft(2, '0'),
+                          style: TextStyle(
+                            fontSize: 11.5,
                             fontFamily: 'Menlo',
-                            color: AppTheme.dim,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                if (resolution != null) ...[
-                  const SizedBox(width: 10),
-                  TagChip(
-                    label: resolution.marketingLabel,
-                    color: AppTheme.resolutionColor(resolution),
-                  ),
-                ],
-                if (onLocate != null) ...[
-                  const SizedBox(width: 4),
-                  Tooltip(
-                    message: locateTooltip,
-                    child: Material(
-                      color: Colors.transparent,
-                      borderRadius: BorderRadius.circular(6),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(6),
-                        onTap: onLocate,
-                        child: const Padding(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 4,
-                          ),
-                          child: Icon(
-                            Icons.my_location_rounded,
-                            size: 14,
-                            color: AppTheme.muted,
+                            color: dim ? AppTheme.dim : AppTheme.muted,
                           ),
                         ),
                       ),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            // ⚠️ **不能**用 `item.displayTitle` 一把梭：提不出集号时
+                            // 它就是片名，而这一整屏都是同一部剧。真实样本
+                            // `/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4`…
+                            // 全被顶成同一个目录名，12 行主标题一模一样，只有下面
+                            // 那条暗色的网盘路径能看出区别。
+                            //
+                            // 取 `withTitle` 而不是 `compact`：有集号时**要**保留
+                            // 片名 —— 同一集常有多个版本（翡翠台 / MyTVSuper），
+                            // 版本之间只有片名不同（见 `RowLabelStyle`）。
+                            item.rowLabel(
+                              RowLabelStyle.withTitle,
+                              workTitle: workTitle,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w500,
+                              color: dim ? AppTheme.muted : AppTheme.text,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            item.technicalSummary.isEmpty
+                                ? item.name
+                                : item.technicalSummary,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: AppTheme.dim,
+                            ),
+                          ),
+                          if (showPath) ...[
+                            const SizedBox(height: 3),
+                            // 网盘上的真实位置。**必须显示出来**，不能只藏在
+                            // 复制按钮后面 —— 用户来这里的一大半目的是核对
+                            // 「这一集在网盘上到底是哪个文件」，而上面那行是
+                            // **解析出来的片名**，和真实文件名可能差很远。
+                            Text(
+                              item.netdiskPath,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 10.5,
+                                fontFamily: 'Menlo',
+                                color: AppTheme.dim,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
                     ),
-                  ),
-                ],
-                const SizedBox(width: 4),
-                // 每一行都能单独复制**这一条**的完整网盘路径。
-                // 作品级那一块给的是目录，而用户真正要发给别人的往往是
-                // 某个具体文件的位置。
-                CopyTextButton(
-                  text: item.netdiskPath,
-                  label: '复制这个文件的网盘路径',
-                  tvLabel: '复制路径',
-                  icon: Icons.content_copy_rounded,
+                    if (resolution != null) ...[
+                      const SizedBox(width: 10),
+                      TagChip(
+                        label: resolution.marketingLabel,
+                        color: AppTheme.resolutionColor(resolution),
+                      ),
+                    ],
+                    // 网盘上的**修改时间**。单列 + 右对齐，与目录视图同一个
+                    // widget（`ModifiedTimeColumn`）—— 时间戳对齐在同一条竖线上，
+                    // 竖着扫一眼就能看出「哪几集是刚传上去的」。
+                    //
+                    // 为什么它值得占一列：这一页的排序默认就是「修改时间倒序」，
+                    // 用户切到时间序之后，**必须能看见每一行的时间**才能核对
+                    // 排得对不对 —— 只让列表换顺序、却不显示依据，等于让他
+                    // 盲猜。`null`（网盘没给）显示 `—`，不参与排序（垫底）。
+                    const SizedBox(width: 10),
+                    ModifiedTimeColumn(modifiedAt: item.modifiedAt),
+                    if (onLocate != null) ...[
+                      const SizedBox(width: 4),
+                      Tooltip(
+                        message: locateTooltip,
+                        child: Material(
+                          color: Colors.transparent,
+                          borderRadius: BorderRadius.circular(6),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(6),
+                            onTap: onLocate,
+                            child: const Padding(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 4,
+                              ),
+                              child: Icon(
+                                Icons.my_location_rounded,
+                                size: 14,
+                                color: AppTheme.muted,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(width: 4),
+                    // 每一行都能单独复制**这一条**的完整网盘路径。
+                    // 作品级那一块给的是目录，而用户真正要发给别人的往往是
+                    // 某个具体文件的位置。
+                    CopyTextButton(
+                      text: item.netdiskPath,
+                      label: '复制这个文件的网盘路径',
+                      tvLabel: '复制路径',
+                      icon: Icons.content_copy_rounded,
+                    ),
+                    const SizedBox(width: 4),
+                    const Icon(
+                      Icons.play_circle_outline_rounded,
+                      size: 19,
+                      color: AppTheme.muted,
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 4),
-                const Icon(
-                  Icons.play_circle_outline_rounded,
-                  size: 19,
-                  color: AppTheme.muted,
+              ),
+              // 「看过多少」压在这一行的**底边**上（见 [_WatchedBar]）。
+              if (progress != null)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: _WatchedBar(fraction: progress),
                 ),
-              ],
-            ),
+            ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 行底那条「看过多少」的细进度条。
+///
+/// ## 为什么压底边，而不是塞进文字列
+///
+/// 塞进文字列（像播放窗口剧集面板那样）会让**看过的行比没看过的行高几像素** ——
+/// 一屏几十行就会参差不齐，右侧的时间列也跟着上下跳。压底边则完全不参与布局：
+/// 有没有进度，行高都一模一样。
+class _WatchedBar extends StatelessWidget {
+  const _WatchedBar({required this.fraction});
+
+  /// 0..1（见 [itemProgressOf]）。
+  final double fraction;
+
+  /// 条子高度。3px 与播放窗口剧集面板里那条一致，两处看到的是同一个东西。
+  static const double height = 3;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      // 跟着面板自己的圆角走，否则满格时两个下角会露出方角。
+      borderRadius: const BorderRadius.only(
+        bottomLeft: Radius.circular(9),
+        bottomRight: Radius.circular(9),
+      ),
+      child: LinearProgressIndicator(
+        value: fraction,
+        minHeight: height,
+        // 槽用比面板深一档的颜色，**不是透明**：只看了一两分钟时进度条本身
+        // 只有几个像素宽，没有槽的话那一行看起来像什么都没有。
+        backgroundColor: AppTheme.panel2,
+        valueColor: const AlwaysStoppedAnimation<Color>(AppTheme.accent),
       ),
     );
   }

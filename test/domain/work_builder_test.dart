@@ -22,6 +22,7 @@ void main() {
     String? thumb,
     double? faceX,
     int size = 1000,
+    String dirPath = '/电影/',
   }) =>
       MediaItem.fromEntry(
         entry: DriveEntry(
@@ -33,8 +34,8 @@ void main() {
           faceAnchorX: faceX,
         ),
         provider: DriveProvider.quark,
-        dirPath: '/电影/',
-        parsed: const MediaFilenameParser().parse(name),
+        dirPath: dirPath,
+        parsed: const MediaFilenameParser().parse(name, dirPath: dirPath),
         now: now,
       );
 
@@ -63,6 +64,60 @@ void main() {
       expect(book.groupCount, 0);
     });
 
+    test('片名可信但缺年份的电影也要归组 —— 否则它在媒体库里永久看不到', () {
+      // 现场（2026-10-03）：`/来自：分享/奥德赛/1080P.mkv`。文件名整串只有
+      // 一个分辨率标记，片名靠**目录名**兜底成「奥德赛」，于是
+      // `kind=movie` + `year=null` → 旧判据 `isConfident=false`
+      // → `ScrapeQuery.fromParsed` 为 null → 这里直接 return false
+      // → `media_works` 一条都没有 → 媒体库页面（读 `listWorks`）空空如也，
+      // 而目录视图里那一条还标着「已入库」且能播。用户完全无从下手。
+      const dirPath = '/来自：分享/奥德赛/';
+      final parsed = const MediaFilenameParser().parse(
+        '1080P.mkv',
+        dirPath: dirPath,
+      );
+
+      expect(parsed.title, '奥德赛', reason: '片名是从目录名兜底来的');
+      expect(parsed.year, isNull);
+      expect(
+        parsed.isConfident,
+        isFalse,
+        reason: '`isConfident` 为 false = 走**宽松档**（闸门改判精确同名），'
+            '**不是**「不刮削」—— 这两件事在 2026-10-03 之前是同一件，'
+            '现在分开了',
+      );
+
+      final book = WorkSeedBook();
+      expect(
+        book.add(
+          parsed: parsed,
+          item: item('1080P.mkv', dirPath: dirPath),
+          dirPath: dirPath,
+        ),
+        isTrue,
+        reason: '不建作品行 = 这条媒体在媒体库里永久看不到（列表读的是作品行）',
+      );
+      expect(book.groupCount, 1);
+
+      final works = book.buildDirty(provider: DriveProvider.quark, now: now);
+      expect(works.single.title, '奥德赛');
+      expect(works.single.source, ScrapeSource.local);
+      expect(works.single.year, isNull);
+      expect(
+        book.queries,
+        hasLength(1),
+        reason: '缺年份也**要**刮削（2026-10-03 起）：查询词照发，但走宽松档 —— '
+            '闸门要求精确同名、且它得排在候选第一位，命中不了就退回手动。'
+            '旧行为「缺年份就不刮」把这类片子彻底挡在在线源之外',
+      );
+      expect(
+        book.queries.values.single.requireExactTitle,
+        isTrue,
+        reason: '没有年份可消歧，闸门必须换成「精确同名」；'
+            '沿用 0.6 档会把「奥德赛」配到「奥德赛：归来」',
+      );
+    });
+
     test('同一组的多条累加到同一个种子上', () {
       final book = bookWith([
         item('Show.S01E01.1080p.mkv', size: 100),
@@ -79,6 +134,20 @@ void main() {
       final book = bookWith([item('Show.S01E01.1080p.mkv')]);
       final parsed = const MediaFilenameParser().parse('Show.S01E01.1080p.mkv');
       expect(book.queries.keys.single, parsed.groupKey);
+    });
+
+    test('扫描期把 dirPath 交给查询链 —— 与详情页同一条路（2026-10-03）', () {
+      // 文件名自称独立发行物（自带裸年份）→ 解析层不归组 → 只能靠刮削层
+      // 拿目录名兜一次。`WorkSeedBook.add` 漏传 `dirPath` 不会报错，
+      // 只会让扫描期的这条兜底永远不生效。
+      final book = bookWith(
+        [item('126 纯享-仙踪.2026.1080p.mkv', dirPath: '/来自：分享/仙逆/')],
+        dirPath: '/来自：分享/仙逆/',
+      );
+
+      final q = book.queries.values.single;
+      expect(q.title, '126 纯享-仙踪');
+      expect(q.fallbacks.map((f) => f.title), ['仙逆']);
     });
 
     test('分类看目录路径 —— 网盘上「动漫」几乎总写在目录名里', () {

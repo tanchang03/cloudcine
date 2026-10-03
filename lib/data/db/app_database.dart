@@ -15,7 +15,15 @@ part 'app_database.g.dart';
 /// 全部数据都在本机：媒体项、作品元数据、字幕引用、续扫游标、设置。
 /// **网盘侧只读** —— 本应用不上传、不移动、不删除、不分享用户的文件。
 @DriftDatabase(
-  tables: [MediaItems, MediaWorks, SubtitleRefs, ScanCursors, Settings],
+  tables: [
+    MediaItems,
+    MediaWorks,
+    SubtitleRefs,
+    ScanCursors,
+    Settings,
+    PlaybackPrefs,
+    DownloadTasks,
+  ],
 )
 class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
@@ -58,8 +66,21 @@ class AppDatabase extends _$AppDatabase {
   ///     `thumbUrl` 同源成对。作品级那份（`posterFaceX`）在刮到在线海报
   ///     时会被清掉，所以「清掉刮削 → 封面回落到网盘缩略图」那一刻，
   ///     锚点只能从文件行找回。
+  /// v14：新增 `playback_prefs` 表 —— **逐文件**的播放偏好（画质 / 音轨 /
+  ///     字幕 / 字幕开关 / 音效）。与前面几版加列不同，这一次是**新表**：
+  ///     旧库升级后表是空的（语义正好是「这些文件都还没记过偏好」），
+  ///     表现与升级前完全一致（全部走全局默认），所以不需要回填。
+  /// v15：`media_items.maxPositionMs` —— **历史最大播放位置**（只增不减），
+  ///     详情页「文件」列表靠它画每条的进度条。不能用 `resumePositionMs`
+  ///     画：那一列看完会被清成 `NULL`，进度条会归零。
+  ///     这一版**要回填**：续播点是历史最大位置的一个**下界**（看到过 12 分钟
+  ///     就说明至少到过 12 分钟），不回填的话升级后所有老条目都显示「没看过」。
+  /// v16：新增 `download_tasks` 表 —— 下载记录（排队 / 下载中 / 已暂停 /
+  ///     已完成 / 失败 + 已下字节）。与 v14 的 `playback_prefs` 同一种改动：
+  ///     **新表**，旧库升级后是空的，语义正好是「还没有任何下载任务」，
+  ///     不需要回填。
   @override
-  int get schemaVersion => 13;
+  int get schemaVersion => 16;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -230,6 +251,47 @@ class AppDatabase extends _$AppDatabase {
             // 把锚点找回来。
             await m.addColumn(mediaItems, mediaItems.faceAnchorX);
             diag.info('数据库', '索引库已升级到 v13（文件级封面人物锚点）');
+          }
+          if (from < 14) {
+            // 新表。旧库里没有任何偏好数据可搬（偏好是用户看片时点出来的，
+            // 而旧版本根本不记），所以**不需要回填**：建一张空表，语义正好是
+            // 「这些文件都还没记过偏好」，播放行为与升级前完全一致。
+            //
+            // ⚠️ 别在这里做「从全局设置回填一条默认偏好」这种事：那会让
+            // 所有片子都突然多出一条「用户改过」的记录，而用户从没改过 ——
+            // 后果是他之后在设置页改全局默认档位，已经播过的片子全部不跟随。
+            await m.createTable(playbackPrefs);
+            diag.info('数据库', '索引库已升级到 v14（逐文件播放偏好）');
+          }
+          if (from < 15) {
+            // ⚠️ 这一版**必须回填**，与 v13 那种「没法回填、也不该编一个值」
+            // 的列不同。
+            //
+            // 续播点是历史最大位置的**下界**：库里存着「看到 12 分钟」，
+            // 就说明用户至少到过 12 分钟。不回填的话，升级后所有老条目在
+            // 详情页都显示「没看过」—— 而它们其实看过，只是那一刻之前
+            // 我们没记过这个量。
+            //
+            // 这只是下界、不是精确值（看完的那一集续播点已被清成 NULL，
+            // 那一段进度找不回来）。取「已知的下界」比显示 0 诚实。
+            await m.addColumn(mediaItems, mediaItems.maxPositionMs);
+            await customStatement('''
+              UPDATE media_items
+              SET max_position_ms = resume_position_ms
+              WHERE resume_position_ms IS NOT NULL
+            ''');
+            diag.info('数据库', '索引库已升级到 v15（历史最大播放位置，已从续播点回填下界）');
+          }
+          if (from < 16) {
+            // 新表。旧库里没有任何下载记录可搬（下载记录是用户点出来的，
+            // 而旧版本根本不记），所以**不需要回填**：建一张空表，语义正好是
+            // 「还没有任何下载任务」。
+            //
+            // ⚠️ 别在这里「顺手把 media_items 里下过的东西补成一条已完成」：
+            // 那些行没有本地目标路径（我们从来没记过），补出来的记录点「打开
+            // 所在目录」会跳到一个不存在的位置 —— 一个凭空出现的坏按钮。
+            await m.createTable(downloadTasks);
+            diag.info('数据库', '索引库已升级到 v16（下载任务表）');
           }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，

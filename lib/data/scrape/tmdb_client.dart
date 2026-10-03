@@ -228,11 +228,13 @@ class TmdbScraper implements MetadataScraper {
     if (results.isNotEmpty) {
       final hit = await _pickVerified(results, query, title, isTv);
       if (hit != null) return hit;
-      // 有结果、但一条都没过闸门 —— 这正是「刮错片子」被拦下来的现场，
+      // 有结果、但一条都没被采纳 —— 这正是「刮错片子」被拦下来的现场，
       // 必须留下痕迹，否则用户只会觉得「怎么什么都刮不到」。
+      // （宽松档下还可能是因为「精确同名不唯一 / 不在第一位」，
+      //   `_pickVerified` 自己会再记一条更具体的。）
       diag.info(
         '刮削',
-        'TMDB "$title" 返回 ${results.length} 条，全部未通过匹配闸门，按未命中处理',
+        'TMDB "$title" 返回 ${results.length} 条，没有一条可作为命中，按未命中处理',
       );
       return null;
     }
@@ -251,7 +253,7 @@ class TmdbScraper implements MetadataScraper {
     return null;
   }
 
-  /// 在结果里挑**第一条通过匹配闸门**的，返回它的元数据；都不通过则 `null`。
+  /// 在结果里挑出**能作为命中**的那一条；没有则 `null`。
   ///
   /// ## 为什么不能是 `results.first`
   ///
@@ -263,12 +265,36 @@ class TmdbScraper implements MetadataScraper {
   /// `results.first` 照单全收 —— 年份差 32 年，代码毫无察觉。
   ///
   /// 闸门判据见 [ScrapeMatch]。
+  ///
+  /// ## 宽松档（[ScrapeQuery.requireExactTitle]）再收一道
+  ///
+  /// 无年份的电影没有年份可消歧，闸门只认精确同名 —— 但**精确同名本身
+  /// 不解决歧义**，所以这里再加一条：**排第一位的必须是精确同名**。
+  ///
+  /// ## 为什么是「第一条精确」而不是「精确同名必须唯一」
+  ///
+  /// 实测（2026-10-03）：「奥德赛」在 TMDB 上有 **4 条**精确同名（豆瓣 2 条）。
+  /// 加「唯一」会把这条正主也挡掉 —— 而它恰恰是最需要救的那一类。
+  ///
+  /// ## 为什么也不是「取第一条过 0.6 的」（用户最初的提案）
+  ///
+  /// 同一次实测里，被 0.6 档放行、但其实**是别的片子**的有：
+  /// `特洛伊奥德赛`(0.68)、`奥德赛：史诗的诞生`(0.78)、`《奥德赛》序章`(0.86)。
+  /// 「取第一个过闸门的」会把这些照单收下，且**不报错**。
+  ///
+  /// 「第一条必须精确同名」两头都堵住：既挡住上面这些前缀误配，又用数据源
+  /// 自己的相关度排序在多个同名条目里选一个（TMDB 把最热门的排最前）。
+  /// 第一条都不是精确同名，就说明数据源也没把握 —— 交回手动通道。
   Future<ScrapedMetadata?> _pickVerified(
     List<Map<String, Object?>> items,
     ScrapeQuery query,
     String matchedQuery,
     bool isTv,
   ) async {
+    // 宽松档要数「精确同名有几条」（用于日志），所以先把过闸门的都收下来，
+    // 不能像严格档那样见一条就返回。
+    final accepted = <Map<String, Object?>>[];
+
     for (final item in items) {
       final title = _stringOf(item['title']) ?? _stringOf(item['name']) ?? '';
       final original =
@@ -284,6 +310,7 @@ class TmdbScraper implements MetadataScraper {
         resultTitle: title,
         resultOriginalTitle: original,
         resultYear: resultYear,
+        requireExactTitle: query.requireExactTitle,
       );
 
       if (!match.accepted) {
@@ -294,9 +321,30 @@ class TmdbScraper implements MetadataScraper {
         );
         continue;
       }
-      return _toMetadata(item, query, matchedQuery, isTv);
+      accepted.add(item);
     }
-    return null;
+
+    if (accepted.isEmpty) return null;
+
+    if (query.requireExactTitle) {
+      if (!identical(accepted.first, items.first)) {
+        diag.info(
+          '刮削',
+          'TMDB "$matchedQuery" 宽松档未采纳：第一条不是精确同名'
+              '（共 ${accepted.length} 条精确同名）',
+        );
+        return null;
+      }
+      final picked =
+          _stringOf(accepted.first['title']) ?? _stringOf(accepted.first['name']);
+      diag.info(
+        '刮削',
+        'TMDB "$matchedQuery" 宽松档命中：精确同名 ${accepted.length} 条，'
+            '取第一条「$picked」',
+      );
+    }
+
+    return _toMetadata(accepted.first, query, matchedQuery, isTv);
   }
 
   /// 取 TMDB 响应里的 `results` 数组。

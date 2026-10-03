@@ -15,9 +15,11 @@ import '../../core/utils/player_buffer_progress.dart';
 import '../../core/utils/player_subtitle_config.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/track_labels.dart';
+import '../../core/utils/tv_device.dart';
 import '../adapters/cloud_drive_adapter.dart';
 import '../adapters/stream_relay.dart';
 import '../entities/media_item.dart';
+import '../entities/playback_preference.dart';
 import '../entities/quality_option.dart';
 import '../entities/stream_ticket.dart';
 import '../entities/subtitle_track.dart';
@@ -81,7 +83,7 @@ class PlaybackController extends ChangeNotifier {
     _bindPlayerStreams();
     // 补 media_kit 构造参数管不到的 mpv 缓冲属性（demuxer-readahead-secs）。
     // setProperty 内部等播放器初始化完成再设，不需要在 open() 之前同步等待。
-    unawaited(PlayerBufferConfig.apply(player));
+    unawaited(PlayerBufferConfig.apply(player, tv: isTvDevice()));
   }
 
   final DriveAdapterRegistry _registry;
@@ -111,8 +113,11 @@ class PlaybackController extends ChangeNotifier {
   /// `sub-visibility` 设成 `no`，**所有**字幕都不显示且不报错（位图字幕如 PGS
   /// 更是没有任何替代路径）。原因见 `player_subtitle_config.dart`。
   final mk.Player player = mk.Player(
-    configuration: const mk.PlayerConfiguration(
-      bufferSize: PlayerBufferConfig.bufferSize,
+    configuration: mk.PlayerConfiguration(
+      // TV 上换一套更小的缓冲：桌面那套（1 GB + 无限预读）在电视盒子上会把
+      // 内存和 eMMC 写满，实测表现就是卡帧 + 音画不同步。
+      // 判据与理由都在 `PlayerBufferConfig` 的类文档里。
+      bufferSize: PlayerBufferConfig.bufferSizeFor(tv: isTvDevice()),
       libass: PlayerSubtitleConfig.useLibass,
     ),
   );
@@ -158,8 +163,30 @@ class PlaybackController extends ChangeNotifier {
   List<SubtitleTrack> _externalSubtitles = const [];
   List<SubtitleTrack> _embeddedSubtitles = const [];
   List<mk.AudioTrack> _embeddedAudio = const [];
+
+  /// 正在后台预取正文的字幕 id（防重入）。见 [prefetchCloudSubtitles]。
+  final Set<String> _prefetching = <String>{};
   String? _activeSubtitleId;
   bool _subtitlesEnabled = true;
+
+  /// 本次播放要还原的偏好（来自库）。`null` = 这一条没记过，全走默认。
+  ///
+  /// **只影响「初始状态」**：打开时决定用哪一档画质、字幕开关、以及要不要
+  /// 按特征把音轨 / 字幕切到用户上次选的那一条。之后用户在菜单里改的东西
+  /// 由 UI 层负责落库 —— 本类不碰数据库，理由与 [onPositionTick] 相同。
+  PlaybackPreference? _preference;
+
+  /// 音轨偏好是否已经尝试应用过。
+  ///
+  /// ## 为什么必须有这个闸
+  ///
+  /// `stream.tracks` 是**流**：打开文件、探到新信息、切轨都会再发一遍。
+  /// 不设闸的话，用户手动切到另一条音轨之后，下一次轨道回报又会把他的选择
+  /// **拉回**偏好里那一条 —— 表现是「音轨菜单点了没反应，自己跳回去」，
+  /// 而日志里看不出任何异常。
+  ///
+  /// 只在 `open()` 里归零：同一次播放期间只还原一次。
+  bool _audioRestored = false;
 
   bool _buffering = false;
   bool _playing = false;
@@ -377,6 +404,9 @@ class PlaybackController extends ChangeNotifier {
   /// [preferredQualityId] 是设置里的默认档位（可为空 = 原画优先）。
   /// [introMarker] 是**库里手标**的片头区间（兜底，可为空）。
   /// [skipIntro] 来自设置；`false` 时连章节也不读（省一次属性查询）。
+  /// [preference] 是这一条**上次的播放选择**（音轨 / 字幕 / 字幕开关），
+  /// 由调用方从库里读出来；`null` = 没记过，全走默认。画质不在里面 ——
+  /// 调用方已经把它折进 [preferredQualityId] 了。
   Future<void> open(
     MediaItem item, {
     List<SubtitleTrack> subtitles = const [],
@@ -384,6 +414,7 @@ class PlaybackController extends ChangeNotifier {
     bool autoLoadSubtitles = true,
     IntroMarker? introMarker,
     bool skipIntro = true,
+    PlaybackPreference? preference,
   }) async {
     _item = item;
     _error = null;
@@ -396,7 +427,20 @@ class PlaybackController extends ChangeNotifier {
     _embeddedSubtitles = const [];
     _embeddedAudio = const [];
     _activeSubtitleId = null;
-    _subtitlesEnabled = autoLoadSubtitles;
+    // 字幕开关：**偏好优先于全局设置**。
+    //
+    // 两者语义不同：`autoLoadSubtitles` 是「没记过时要不要自动挑一条」，
+    // 而偏好里那一位是「用户上次在这部片上有没有开着字幕」—— 后者更具体，
+    // 也是用户在一部片里主动关掉字幕之后**期望下次还记得**的那件事。
+    _subtitlesEnabled = preference?.subtitlesEnabled ?? autoLoadSubtitles;
+    // 偏好**每次 open 都要重设**：换集时新一集可能继承同作品另一条的选择，
+    // 也可能自己有一条。留着上一集的，表现就是「换集后字幕还停在上一集
+    // 选的那条」—— 而内嵌轨号在两集之间根本不是同一个东西。
+    _preference = preference;
+    // 音轨还原的闸跟着归零。不归零的话第二集永远不会再尝试还原
+    // （第一集已经把它置位了）—— 而「只有第一集记得音轨」正是最难察觉的
+    // 那种半失效。
+    _audioRestored = false;
     // 片头状态**每次打开都要归零**。漏了「已探测」标志的后果很隐蔽：
     // 换集之后永远不再读章节，于是「只有第一集跳片头」—— 而第一集恰好
     // 是最不需要跳的那一集（用户是从头开始看的）。
@@ -458,13 +502,15 @@ class PlaybackController extends ChangeNotifier {
   Future<void> _loadIntoPlayer(
     StreamTicket ticket, {
     Duration startAt = Duration.zero,
+    bool keepBufferView = false,
   }) async {
     diag.info(
       '播放',
       '交给播放器：${ticket.redactedUrl} '
       '请求头=${ticket.headers.keys.toList()} '
       '档位=${_activeQualityId ?? "-"} '
-      '起播=${startAt.inSeconds}s',
+      '起播=${startAt.inSeconds}s'
+      '${keepBufferView ? " 保留缓冲视图" : ""}',
     );
     // 换源 = 缓存作废：mpv 是从零重新攒的，旧值属于上一条 URL。不清的话
     // 新流一开播，进度条上就挂着上一条流（可能是另一个码率）的缓冲终点 ——
@@ -474,10 +520,18 @@ class PlaybackController extends ChangeNotifier {
     // ⚠️ 必须放在**这个**入口上，不能只放在 `open()` 里：`switchQuality`
     // 换的是同一部片子的另一档转码，走的是本方法而不是 `open()`，
     // 只清 open() 的话「切清晰度」这条路的缓冲层就会残留。
-    _cacheEnd = Duration.zero;
-    notifyListeners();
+    //
+    // [keepBufferView] 是**切清晰度**专用的例外：那是「同一部片子换一档」，
+    // 用户视线里的位置一点没变，把缓冲层瞬间抹到 0 只会让他以为「重新开始
+    // 缓存了」。留着旧值不会画错 —— mpv 换源后立刻报 `paused-for-cache`，
+    // [PlayerBufferProgress.fraction] 在 stalled 时本来就把缓冲层收回到播放
+    // 头；而新流自己的 `demuxer-cache-time` 一两拍内就会把旧值覆盖掉。
+    if (!keepBufferView) {
+      _cacheEnd = Duration.zero;
+      notifyListeners();
+    }
 
-    final source = await _prepareSource(ticket);
+    final source = await _prepareSource(ticket, startAt: startAt);
 
     // 音效每次开流前**重新下发一遍**。
     //
@@ -502,35 +556,77 @@ class PlaybackController extends ChangeNotifier {
   /// 中继不是总能成立（源流不支持 Range、长度未知、端口绑不上、是 HLS），
   /// 拿不到就**原样直连** —— 直连至少能播，所以失败一律静默，只记日志。
   /// 用户看到的最坏情况是「没变快」，绝不是「播不了」。
-  Future<_PlaybackSource> _prepareSource(StreamTicket ticket) async {
-    // 换源 = 上一条中继会话作废。必须在这里关，不能靠调用方：
-    // `switchQuality` 走的也是 `_loadIntoPlayer`，只关在 `open()` 里的话
-    // 切一次清晰度就多留一条后台预取的会话。
-    await _releaseRelay();
+  Future<_PlaybackSource> _prepareSource(
+    StreamTicket ticket, {
+    Duration startAt = Duration.zero,
+  }) async {
+    // 旧会话先**记下来但不立刻关**：新会话要先建起来、把起播点附近预取上，
+    // 再关旧的。顺序反过来的话，「新会话还是空的 + 旧会话已经关了」这一小段
+    // 里 mpv 什么都拿不到，正是「切一下就卡一下」的那一瞬。
+    final previousToken = _relayToken;
+    _relayToken = null;
 
     final relay = _relay;
     final length = ticket.contentLength;
+    final direct = _PlaybackSource(ticket.url.toString(), ticket.headers);
     if (relay == null || length == null || length <= 0) {
-      return _PlaybackSource(ticket.url.toString(), ticket.headers);
+      await _closeRelayToken(previousToken);
+      return direct;
     }
     if (!isRelayableUrl(ticket.url)) {
-      return _PlaybackSource(ticket.url.toString(), ticket.headers);
+      await _closeRelayToken(previousToken);
+      return direct;
     }
 
-    final endpoint = await relay.open(ticket, label: _item?.displayTitle);
+    final endpoint = await relay.open(
+      ticket,
+      label: _item?.displayTitle,
+      // 告诉中继「播放器大概从哪儿开始读」：续播 / 换清晰度时起点常在中后段，
+      // 让预取窗口直接摆过去，省掉开流后那一次上游往返。
+      startOffset: _byteOffsetFor(startAt, length),
+    );
     if (endpoint == null) {
-      return _PlaybackSource(ticket.url.toString(), ticket.headers);
+      await _closeRelayToken(previousToken);
+      return direct;
     }
     _relayToken = endpoint.token;
     diag.info('播放', '已交给本地中继：${(length / 1073741824).toStringAsFixed(2)} GiB');
+
+    // 只有「换源」（存在旧会话）才等预热：这期间**旧流还在播**，等待是白赚的；
+    // 而全新开播时没有旧流垫着，等它就是白白拖慢出画。
+    if (previousToken != null) {
+      final ready = await warmUpRelay(relay, endpoint.token);
+      diag.info('播放', ready ? '新中继已预热，关闭旧会话' : '新中继预热超时，直接切换');
+    }
+    await _closeRelayToken(previousToken);
+
     // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
     // 中继服务，它自己会在发往上游时带上。
     return _PlaybackSource(endpoint.uri.toString(), const <String, String>{});
   }
 
+  /// 把续播点换算成**大致**字节偏移，给中继当预取起点的提示。
+  ///
+  /// 用「时长比例 × 文件大小」近似。VBR 片源上会有偏差，但这里只是**提示**：
+  /// 中继拿它摆预取窗口，播放器随后的真实 Range 请求会立刻把窗口拉正，
+  /// 偏了只多下一点、不会播错。
+  ///
+  /// 时长还没解出来（全新开播）时返回 0，等于不提示 —— 那时本来就从头播。
+  int _byteOffsetFor(Duration startAt, int length) {
+    final total = _duration.inMilliseconds;
+    if (startAt <= Duration.zero || total <= 0) return 0;
+    final ratio = (startAt.inMilliseconds / total).clamp(0.0, 1.0);
+    return (length * ratio).round();
+  }
+
   Future<void> _releaseRelay() async {
     final token = _relayToken;
     _relayToken = null;
+    await _closeRelayToken(token);
+  }
+
+  /// 关掉一条指定会话（而不是「当前会话」）。见 [_prepareSource] 的换源顺序。
+  Future<void> _closeRelayToken(String? token) async {
     final relay = _relay;
     if (token == null || relay == null) return;
     await relay.close(token);
@@ -589,7 +685,10 @@ class PlaybackController extends ChangeNotifier {
       // 被丢掉（`Player.open()` 不等文件加载完成），所以「切清晰度回片头」
       // 是个已经存在的行为，只是没人把它和续播失败联系起来。实测见
       // [PlaybackMedia] 的类文档。
-      await _loadIntoPlayer(next, startAt: resumeAt);
+      //
+      // `keepBufferView`：同一部片子换一档，视线里的位置没变 —— 不该让缓冲层
+      // 瞬间抹到 0（那看起来就是「重新缓存」）。详见 [_loadIntoPlayer]。
+      await _loadIntoPlayer(next, startAt: resumeAt, keepBufferView: true);
 
       if (!wasPlaying) await player.pause();
 
@@ -616,6 +715,9 @@ class PlaybackController extends ChangeNotifier {
       // 但同一个文件章节不会变，重探一次没有坏处，还能顺带刷诊断日志）。
       introMarker: _intro.manual,
       skipIntro: _intro.enabled,
+      // 重试也要带上偏好：否则「票据过期 → 重试成功」之后字幕 / 音轨会
+      // 悄悄回到默认，而用户只会觉得是自己记错了。
+      preference: _preference,
     );
   }
 
@@ -623,14 +725,68 @@ class PlaybackController extends ChangeNotifier {
   // 字幕
   // -------------------------------------------------------------------
 
-  /// 自动挑一条字幕加载。
+  /// 挑一条字幕加载。**先按上次的选择，匹配不上才取第一条。**
   ///
-  /// 排序已由 [SubtitleTrack.preferenceScore] 定好（中文优先、非强制优先、
-  /// 文本字幕优先），所以「第一条」就是最合适的那条。
+  /// ## 为什么必须走特征匹配，而不是拿存下来的 id 直接设轨
+  ///
+  /// 内嵌轨的 id 是 mpv 给**这一条流**编的号，换一集就完全不是一回事 ——
+  /// 直接设 `sid=3` 的后果是「第二集挂上了一条完全不相干的字幕」（或者
+  /// 干脆没挂上），而用户只看到「字幕怎么自己变了」。
+  ///
+  /// 匹配不上时退回「第一条」：那条的排序由 [SubtitleTrack.preferenceScore]
+  /// 定好（中文优先、非强制优先、文本字幕优先），是「没记过」时最合适的默认。
   Future<void> _autoLoadSubtitle() async {
     final all = allSubtitles;
     if (all.isEmpty) return;
-    await selectSubtitle(all.first);
+    final index = TrackPreference.bestIndex(
+      _preference?.subtitle,
+      [
+        for (var i = 0; i < all.length; i++)
+          TrackPreference.ofSubtitle(all[i], index: i),
+      ],
+    );
+    await selectSubtitle(index == null ? all.first : all[index]);
+  }
+
+  /// 预取**网盘字幕**的正文。字幕菜单打开时调用。
+  ///
+  /// ## 为什么要预取
+  ///
+  /// 选中一条网盘字幕要先把字节取回来再解码（[SubtitleResolver.load]），
+  /// 那是一次网络往返。把它放在「用户点下之后」，就是「点了没反应」的那一秒 ——
+  /// 而播放其实**没有中断**，用户却会把它读成「切字幕要重新缓存」。
+  ///
+  /// 预取只是把这次往返**提前**：菜单一打开就开始取，用户浏览菜单的这几秒
+  /// 通常足够；等他真点了，[selectSubtitle] 直接命中 [SubtitleResolver] 的
+  /// 缓存，是瞬时的。
+  ///
+  /// ## ⚠️ 只预取网盘字幕
+  ///
+  /// **在线字幕不预取**：那条路要走字幕站的下载地址、按次计费，把菜单里
+  /// 所有候选都拉一遍等于替用户烧额度（理由见 `player_window_app.dart`
+  /// 在线字幕那一段）。
+  ///
+  /// **本地字幕也不预取**：它的正文每次都**重新读**，好让用户在外部改过
+  /// 时间轴之后能生效。
+  ///
+  /// 失败无所谓 —— 真选中时会再试一次，那时才走 `_notice` 给用户提示。
+  void prefetchCloudSubtitles() {
+    for (final track in _externalSubtitles) {
+      if (track.origin != SubtitleOrigin.cloudFile) continue;
+      if (!_prefetching.add(track.id)) continue;
+      unawaited(_prefetchOne(track));
+    }
+  }
+
+  Future<void> _prefetchOne(SubtitleTrack track) async {
+    try {
+      await _subtitleResolver.load(track);
+      diag.debug('字幕', '预取完成：${track.displayLabel}');
+    } catch (e) {
+      diag.debug('字幕', '预取失败（${track.displayLabel}）：$e');
+    } finally {
+      _prefetching.remove(track.id);
+    }
   }
 
   /// 选中一条字幕。传 `null` 表示关闭字幕。
@@ -780,6 +936,11 @@ class PlaybackController extends ChangeNotifier {
     _activeSubtitleId = null;
     _embeddedSubtitles = const [];
     _embeddedAudio = const [];
+    // 偏好与「音轨已还原」的闸一起清：这一次播放已经结束了，留着会让
+    // 下一次 `open()` 之前的那段时间里，某个晚到的轨道回报按旧偏好去切轨。
+    // （`open()` 本来就会重设它们，这里清是为了让「停止之后」这个状态干净。）
+    _preference = null;
+    _audioRestored = false;
     // 片头状态跟着一起清。**手标区间与开关不清**：它们是这一部作品的播放
     // 偏好，与「这次播放结束了」无关 —— 清了会让「退出播放页再进来」
     // 第一次不跳片头。下一次 `open()` 会拿到 UI 传来的新值覆盖它们。
@@ -825,9 +986,14 @@ class PlaybackController extends ChangeNotifier {
 
   /// 切换「音效」预设。
   ///
-  /// **立即生效、不用重开流**：`audio-channels` / `audio-spdif` 都是 mpv 的
-  /// 运行期可改属性（实测 `mpv_set_property_string` 返回成功），改完 mpv 自己
-  /// 重配音频输出。重开流反而会把用户正在看的位置丢掉。
+  /// **立即生效、不用重开流**：`audio-channels` 是 mpv 的运行期可改属性，
+  /// 改完 mpv 自己重配音频输出。重开流反而会把用户正在看的位置丢掉。
+  ///
+  /// ⚠️ `audio-spdif` **不是**这样：播放中改它对当前这条流毫无影响（实测
+  /// `current-ao` 仍是 `coreaudio`、位置照常前进），它只在**开流时**参与音频链
+  /// 的搭建。而且它在 macOS 上会让音频链整个建不起来、把整部片卡死 ——
+  /// 详见 `PlayerAudioEffect` 的类文档，那里也解释了为什么这里不能再把
+  /// 「两个属性都是运行期可改」当成一句话写。
   ///
   /// ⚠️ 与「音轨」无关，别把两者合并 —— 理由见 `PlayerAudioEffect` 的类文档。
   Future<void> setAudioEffect(AudioEffectPreset preset) async {
@@ -1050,7 +1216,67 @@ class PlaybackController extends ChangeNotifier {
     if (_subtitlesEnabled && _activeSubtitleId == null) {
       unawaited(_autoLoadSubtitle());
     }
+
+    // 音轨同理：内嵌音轨清单也是**流式**出现的，第一次回报时可能还没有
+    // （那时 `_embeddedAudio` 是空的，匹配无从谈起）。
+    _maybeRestoreAudio();
   }
+
+  /// 按偏好把音轨切到用户上次选的那一条。**每次播放只尝试一次。**
+  ///
+  /// ## 为什么不做「重试到匹配上为止」
+  ///
+  /// 匹配不上就说明**这一集没有那条轨**（换了一集、或者换了个片源版本）。
+  /// 反复重试只会每来一次轨道回报就翻一次菜单高亮，而结果永远是失败 ——
+  /// 所以不管成没成，闸都落下。
+  ///
+  /// ## 为什么没有偏好时**什么都不做**
+  ///
+  /// 那是「用户从没在这部片上选过音轨」，正确行为是让 mpv 用它自己的默认
+  /// （通常是发布者标记为 default 的那条）。我们自己挑第一条反而会**盖掉**
+  /// 那个更权威的选择。
+  void _maybeRestoreAudio() {
+    if (_audioRestored) return;
+    final pref = _preference?.audio;
+    if (pref == null) return;
+    final tracks = _embeddedAudio;
+    if (tracks.isEmpty) return;
+
+    _audioRestored = true;
+    final index = TrackPreference.bestIndex(
+      pref,
+      [
+        for (var i = 0; i < tracks.length; i++)
+          _audioPreferenceOf(tracks[i], index: i),
+      ],
+    );
+    if (index == null) {
+      diag.info('播放', '音轨偏好没匹配上（候选 ${tracks.length} 条），沿用播放器默认');
+      return;
+    }
+    diag.info('播放', '按上次的选择还原音轨：${tracks[index].id}');
+    // 这里直接调 `player` 而不是 `selectAudioTrack`：后者会
+    // `notifyListeners()`，而本方法跑在 `stream.tracks` 的回调里 ——
+    // 在回调里触发重建是最容易踩到「重入」的地方。mpv 自己会通过
+    // `stream.track` 回报选中态，UI 照样会更新。
+    unawaited(player.setAudioTrack(tracks[index]));
+  }
+
+  /// 把 mpv 的音轨对象摊成可匹配特征。
+  ///
+  /// 与 `TrackPreference.ofSubtitle` 分开写：那边吃的是领域实体
+  /// `SubtitleTrack`，这边吃的是 media_kit 的类型，而领域实体不该反向依赖
+  /// media_kit。
+  static TrackPreference _audioPreferenceOf(
+    mk.AudioTrack track, {
+    required int index,
+  }) =>
+      TrackPreference(
+        trackId: track.id,
+        language: track.language,
+        title: track.title,
+        index: index,
+      );
 
   /// 只保留**真实存在的轨道**，剔除 media_kit 硬塞进来的合成轨。
   ///

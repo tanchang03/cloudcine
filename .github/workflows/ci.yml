@@ -213,9 +213,16 @@ jobs:
       # 断言「错了就白发布」、且**不会因为正常升级而变**的项。
       - name: 校验产物
         run: |
-          VERSION="$(grep '^version:' pubspec.yaml | cut -d' ' -f2 | cut -d'+' -f1)"
-          APK="build/app/outputs/flutter-apk/cloudcine-${VERSION}-android.apk"
-          test -f "$APK" || { echo "::error::没找到 $APK"; exit 1; }
+          # 产物名由 android/app/build.gradle.kts 末尾的 brandReleaseApk 决定
+          # （`cloudcine-<versionName>-b<versionCode>-android.apk`）。这里用 glob
+          # 而不是拼名字 —— 拼名字等于把命名规则抄成第二份实现，改一处就分叉。
+          APK="$(ls -1 build/app/outputs/flutter-apk/cloudcine-*-android.apk 2>/dev/null | head -1 || true)"
+          test -n "$APK" || {
+            echo "::error::没找到品牌化产物（build/app/outputs/flutter-apk/cloudcine-*-android.apk）"
+            ls -lh build/app/outputs/flutter-apk/ || true
+            exit 1
+          }
+          echo "APK=$APK" >> "$GITHUB_ENV"
 
           AAPT2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
           "$AAPT2" dump badging "$APK" > badging.txt

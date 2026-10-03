@@ -33,6 +33,7 @@ class RelayStats {
     required this.activeWorkers,
     required this.upstreamFailures,
     required this.upstreamRequests,
+    required this.upstreamConnects,
   });
 
   /// 累计从网盘拉到的字节数。
@@ -46,6 +47,14 @@ class RelayStats {
 
   final int upstreamFailures;
   final int upstreamRequests;
+
+  /// **新建上游连接**的次数（不是并发数，是累计开过多少条连接）。
+  ///
+  /// 这是判断「连接复用到底有没有生效」的唯一客观指标：
+  /// 复用正常时它应当**远小于** [upstreamRequests]（理想情况等于 worker 数，
+  /// 一块接一块复用同一条 TCP/TLS）；若两者量级接近，说明每块都在重连 ——
+  /// 每 2 MiB 一次 TLS 握手，净吞吐被握手间隙切成锯齿，高码率原画必卡。
+  final int upstreamConnects;
 
   /// 失败率。没发过请求时是 0 —— 「没试过」不等于「都失败了」。
   double get failureRate =>
@@ -96,7 +105,20 @@ bool isRelayableUrl(Uri url) {
 /// 而不是给用户弹一个「播放失败」。
 abstract class StreamRelay {
   /// 为 [ticket] 建一条本地中继。**返回 null 表示不可用**（调用方回退直连）。
-  Future<RelayEndpoint?> open(StreamTicket ticket, {String? label});
+  ///
+  /// [startOffset] 是**播放器即将从哪个字节开始读**（续播点换算成字节）。
+  /// 中继据此把预取窗口放到那儿，而不是永远从文件头开始 —— 换清晰度 /
+  /// 换集时续播点常在中后段，从 0 预取的那几百 MiB 全是白下的，而播放器
+  /// 真正要的那一块还得现拉。给 0 就是「从文件头开始」，是默认行为。
+  ///
+  /// ⚠️ 它只是一个**提示**，不是契约：换算用「时长比例 × 文件大小」近似，
+  /// 对 VBR 片源会有偏差。中继把它当成预取窗口的起点，播放器随后的真实
+  /// Range 请求会立刻把窗口拉正，所以偏了只多下一点、不会播错。
+  Future<RelayEndpoint?> open(
+    StreamTicket ticket, {
+    String? label,
+    int startOffset = 0,
+  });
 
   /// 某条会话的实时统计。会话已关闭返回 null。
   RelayStats? statsOf(String token);
@@ -121,4 +143,44 @@ abstract class StreamRelay {
 
   /// 关掉整个代理（含监听端口与全部会话）。
   Future<void> dispose();
+}
+
+/// 等 [token] 这条会话**预取到足够开播的数据**（或超时）。返回是否达标。
+///
+/// ## 它解决什么
+///
+/// 换清晰度 / 换集时，新会话刚建出来时缓存是空的。如果紧接着就 `open()`，
+/// 播放器的第一次 Range 请求要等**一次完整的上游往返 + 一个块的下载**才拿到
+/// 数据 —— 这段时间画面是停的，用户看到的就是「切一下就卡一下」。
+///
+/// 把这段等待**提前到 `open()` 之前**，代价就消失了：这期间**旧流还在播**，
+/// 用户什么都不缺；等新会话备好了再切，播放器的第一个请求直接命中缓存。
+///
+/// ## 为什么是「轮询 statsOf」而不是加一个回调
+///
+/// 加回调要在 [StreamRelay] 上多一个成员，所有实现都得跟着改；而这里只需要
+/// 一个**有上界**的就绪判断。用现成的 [StreamRelay.statsOf] 轮询既够用，
+/// 又让这条逻辑对任何实现都成立 —— 拿不到统计（返回 null）就当没备好，
+/// 由 [timeout] 兜底。
+///
+/// ## 参数
+///
+/// [minBytes] 是「备好」的门槛。默认 1 MiB：够覆盖一次首读与连接建立，
+/// 又不至于在慢网下拖太久 —— 真正的量由 [timeout] 封顶。
+Future<bool> warmUpRelay(
+  StreamRelay relay,
+  String token, {
+  int minBytes = 1 << 20,
+  Duration timeout = const Duration(milliseconds: 700),
+  Duration pollInterval = const Duration(milliseconds: 30),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (true) {
+    final stats = relay.statsOf(token);
+    // 会话没了（被关掉 / 建不起来）：不再等，交给调用方照常开流。
+    if (stats == null) return false;
+    if (stats.downloadedBytes >= minBytes) return true;
+    if (!DateTime.now().isBefore(deadline)) return false;
+    await Future<void>.delayed(pollInterval);
+  }
 }

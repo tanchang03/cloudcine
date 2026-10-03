@@ -489,7 +489,7 @@ escape                                              →  DismissIntent
   fake（`SettingsStore` 是真类不是接口、`PosterCache` 要一个 `HttpClientLike` 替身、
   还要 fake 掉 `AuthController` 与两个目录 provider），成本高于这两行接线本身。
   本项目现有页面测试的取向也是「测抽出来的部件」（如 `LogPathRow`）。
-* `_SearchBox` 那个 `height: 32` 只是**读代码看到的**，没有测试钉住；
+* `HeaderSearchBox`（原 `_SearchBox`）那个 `height: 32` 只是**读代码看到的**，没有测试钉住；
   P1-3 动手前请先补一条。
 
 ---
@@ -623,7 +623,7 @@ TV 判定可用 `package:flutter/services.dart` 之外的方式：
 > 抽成 `AppTheme.tvPosterAspect = 0.8`，只在 TV 上生效（桌面仍是标准海报比例 `2/3`）——
 > 写死在 `library_page` 里的话，将来「TV 卡片该多高」就没有唯一真源了。
 > ⚠️ 动手前先读 §6.0 里「没动海报墙的列数」那一条 —— 这里缩的是**卡片**不是列数，
-> 但两者都会改变「一屏看到几张」，得一起算。另外 `_SearchBox` 写死了 `height: 32`，
+> 但两者都会改变「一屏看到几张」，得一起算。另外 `HeaderSearchBox` 写死了 `height: 32`，
 > 所以放大字号**不能**顺手给媒体库头部套 `tvTextScaler`。
 
 **P1-4 解决「TV 上配不了 / 改不了文字」这一类。** ✅ **已完成，走的是 (c)。**

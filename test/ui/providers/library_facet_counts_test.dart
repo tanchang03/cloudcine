@@ -48,6 +48,7 @@ void main() {
     required String title,
     int? year,
     List<String> genres = const [],
+    String source = 'online',
   }) async {
     await db.into(db.mediaWorks).insert(
           MediaWorksCompanion.insert(
@@ -57,7 +58,7 @@ void main() {
             title: title,
             year: Value(year),
             genres: Value(jsonEncode(genres)),
-            source: 'online',
+            source: source,
             updatedAt: now,
           ),
         );
@@ -131,5 +132,31 @@ void main() {
     await seedLegacy(key: 'b', kind: 'movie', title: '乙', year: 2023);
 
     expect(await container.read(yearCountsProvider.future), {1995: 1, 2023: 1});
+  });
+
+  test('开了「已刮削」之后，年份角标只剩刮过的那些作品', () async {
+    await seedLegacy(key: 'scraped', kind: 'movie', title: '刮过的', year: 2001);
+    await seedLegacy(
+      key: 'bare',
+      kind: 'movie',
+      title: '没刮过的',
+      year: 1999,
+      source: 'local',
+    );
+
+    // 先确认两行都在 —— 少了这条，「收窄之后只剩 2001」可能只是因为
+    // 1999 那一行压根没进去（比如 `year` 拼错了）。
+    expect(await container.read(yearCountsProvider.future), {2001: 1, 1999: 1});
+
+    container.read(libraryFilterProvider.notifier).toggleScrapedOnly();
+
+    expect(
+      await container.read(yearCountsProvider.future),
+      {2001: 1},
+      reason: '面板上的角标必须跟着「已刮削」收窄 —— 否则用户会看到 1999 这个'
+          '只属于没刮过的片子的年份，点下去是空列表，而面板的全部承诺就是'
+          '「点下去至少有一条」。这条断言盯的是 provider 有没有把开关传下去'
+          '（仓储那一侧由 `library_filter_query_test` 负责）',
+    );
   });
 }

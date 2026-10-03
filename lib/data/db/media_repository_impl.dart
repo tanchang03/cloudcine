@@ -12,6 +12,7 @@ import '../../core/utils/video_formats.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/entities/playback_preference.dart';
 import '../../domain/entities/work_poster.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/entities/drive_provider.dart';
@@ -74,6 +75,13 @@ class DriftMediaRepository implements MediaRepository {
         'DELETE FROM subtitle_refs WHERE item_id NOT IN '
         '(SELECT id FROM media_items)',
       );
+      // 播放偏好同样按「孤儿」口径清。挂在同一条 DELETE 后面而不是各写
+      // 一遍删除条件：判据（哪些 item_id 还在库里）只有一份，两边写两遍
+      // 迟早会漂移成「字幕清了、偏好没清」—— 那种残留没有任何界面能看到。
+      await _db.customStatement(
+        'DELETE FROM playback_prefs WHERE item_id NOT IN '
+        '(SELECT id FROM media_items)',
+      );
     }
     return deleted;
   }
@@ -91,6 +99,12 @@ class DriftMediaRepository implements MediaRepository {
     // 「有媒体项、没作品行」，见 `MediaItems.groupKey` 的注释）。所以这里
     // 必须手动清 —— 漏掉的话它们会永远躺在表里，在任何界面上都看不到。
     await (_db.delete(_db.subtitleRefs)
+          ..where((t) => t.itemId.equals(itemId)))
+        .go();
+    // 播放偏好挂在同一条文件上，同样没有外键。不清的话，下次扫描如果网盘上
+    // 又出现了**同一个 fid**（用户删了又传回来），那部片会莫名其妙地带着
+    // 上一次的设置开始播 —— 用户完全无法解释这件事。
+    await (_db.delete(_db.playbackPrefs)
           ..where((t) => t.itemId.equals(itemId)))
         .go();
 
@@ -119,6 +133,13 @@ class DriftMediaRepository implements MediaRepository {
     await _deleteSubtitleRefsFor(
       rows.map((r) => r.read(_db.mediaItems.id)).whereType<String>().toList(),
     );
+
+    // 播放偏好按 **`group_key`** 删，而不是按上面那串 item_id —— 偏好行上
+    // 记着「当时它属于哪部作品」，所以即使某个 fid 早被重扫换掉、它的偏好
+    // 还挂在库里，也能被这一次一并带走，不留孤儿。
+    await (_db.delete(_db.playbackPrefs)
+          ..where((t) => t.groupKey.isIn(keyList)))
+        .go();
 
     final deleted = await (_db.delete(_db.mediaItems)
           ..where((t) => t.groupKey.isIn(keyList)))
@@ -675,6 +696,82 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<void> saveMaxPosition(String itemId, Duration position) async {
+    // 零 / 负位置是**无操作**，不是「写 0」：这一列的意思是「看过的最远
+    // 位置」，写 0 等于把一次「播了 0 秒」当成绩录下来 —— 而它只增不减，
+    // 那一行就再也回不到「没看过」了。
+    if (position <= Duration.zero) return;
+
+    // 只增不减必须由**一条**语句保证。若拆成「先读旧值、再比、再写」，两次
+    // 落库并发（内置页每 10 秒一次 tick，换条 / 关窗时还可能补一次）就会
+    // 让较小的那个后写、把进度条往回拉。
+    //
+    // `max(a, b)` 是 SQLite 的多参数标量函数（不是聚合），配合 `COALESCE`
+    // 把 NULL 当 0 处理 —— 老行升级后这一列可能仍是 NULL（从没播过的）。
+    // ⚠️ 参数是**原始值**（`List<Object?>`），不是 `Variable`：drift 的
+    // `customStatement` 自己负责绑定，塞 `Variable` 进去会在执行时抛
+    // 「Allowed parameters must either be null or bool, int, num, String…」。
+    await _db.customStatement(
+      'UPDATE media_items SET max_position_ms = max(COALESCE(max_position_ms, 0), ?) '
+      'WHERE id = ?',
+      <Object?>[position.inMilliseconds, itemId],
+    );
+  }
+
+  @override
+  Future<PlaybackPreference?> playbackPreferenceFor(
+    String itemId, {
+    String? groupKey,
+  }) async {
+    // 第一级：本文件。`isEmpty` 的行按「没记过」处理，落到第二级去 ——
+    // 这一列有 `DEFAULT '{}'`，所以「有行但内容是空对象」是可能的状态
+    // （比如某个未来版本写了空偏好），不该让它把同剧继承挡住。
+    final own = await (_db.select(_db.playbackPrefs)
+          ..where((t) => t.itemId.equals(itemId))
+          ..limit(1))
+        .getSingleOrNull();
+    final parsedOwn = own == null
+        ? null
+        : PlaybackPreference.fromJsonString(own.prefs);
+    if (parsedOwn != null && !parsedOwn.isEmpty) return parsedOwn;
+
+    final key = groupKey;
+    if (key == null || key.isEmpty) return null;
+
+    // 第二级：同一部作品里**最近改过**的那一条。
+    //
+    // ⚠️ 排序必须在 SQL 里做（`ORDER BY updated_at DESC LIMIT 1`）而不是取
+    // 回来在 Dart 里挑：一部剧 24 集，取回来再挑就是 24 次 JSON 解析，
+    // 而这段代码在**每次打开播放页**的热路径上。
+    final rows = await (_db.select(_db.playbackPrefs)
+          ..where((t) => t.groupKey.equals(key) & t.itemId.equals(itemId).not())
+          ..orderBy([(t) => OrderingTerm.desc(t.updatedAt)])
+          ..limit(8))
+        .get();
+    for (final row in rows) {
+      final parsed = PlaybackPreference.fromJsonString(row.prefs);
+      if (parsed != null && !parsed.isEmpty) return parsed;
+    }
+    return null;
+  }
+
+  @override
+  Future<void> savePlaybackPreference(
+    String itemId,
+    String groupKey,
+    PlaybackPreference preference,
+  ) async {
+    await _db.into(_db.playbackPrefs).insertOnConflictUpdate(
+          PlaybackPrefsCompanion(
+            itemId: Value(itemId),
+            groupKey: Value(groupKey),
+            prefs: Value(preference.toJsonString()),
+            updatedAt: Value(DateTime.now()),
+          ),
+        );
+  }
+
+  @override
   Future<void> setWorkCategory(String key, MediaCategory? category) async {
     if (category != null) {
       await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
@@ -791,6 +888,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaKind? kind,
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -800,12 +898,13 @@ class DriftMediaRepository implements MediaRepository {
   }) async {
     final q = _db.select(_db.mediaWorks);
 
-    // 分类 / 搜索 / 「播过没有」三件事走共用表达式 —— 两个计数查询要用
-    // 同一份条件（理由见 `_workConditions`）。
+    // 分类 / 搜索 / 「播过没有」/ 「刮过没有」走共用表达式 —— 两个计数查询
+    // 要用同一份条件（理由见 `_workConditions`）。
     final base = _workConditions(
       kind: kind,
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
     );
     if (base != null) q.where((_) => base);
@@ -972,7 +1071,7 @@ class DriftMediaRepository implements MediaRepository {
     };
   }
 
-  /// 作品列表的**基础筛选条件**（分类 / 搜索 / 「播过没有」/ 结构）。
+  /// 作品列表的**基础筛选条件**（分类 / 搜索 / 「播过没有」/ 「刮过没有」/ 结构）。
   ///
   /// 返回 `null` 表示「一条都不限」—— 调用方可以据此完全跳过 `WHERE`，
   /// 而不是塞一个恒真表达式进去。
@@ -991,6 +1090,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaKind? kind,
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) {
     final t = _db.mediaWorks;
@@ -1011,6 +1111,13 @@ class DriftMediaRepository implements MediaRepository {
     // **不是**「比某个时间新」：后者会把「上个月看过」也算成没看过，
     // 而这一栏的意思是「我看过的」，不是「我最近看的」（排序负责「最近」）。
     if (playedOnly) add(t.lastPlayedAt.isNotNull());
+
+    // 「已刮削」。判据是 `source = 'online'`，**不是** `MediaWork.isScraped`
+    // （那一位还含 `manual`，而「自定义」恰恰会清掉在线信息）。
+    //
+    // 与内存实现的 `w.source == ScrapeSource.online` 必须同口径：两边不一致
+    // 会让「用替身跑过的用例在真库上失败」变成一个谜。
+    if (scrapedOnly) add(t.source.equals(ScrapeSource.online.name));
 
     if (category != null) add(_categoryCondition(category));
 
@@ -1250,6 +1357,7 @@ class DriftMediaRepository implements MediaRepository {
   Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) async {
     // 只读 `year` 一列：作品表有十几列，为了一组数字把整行物化是浪费。
@@ -1265,6 +1373,7 @@ class DriftMediaRepository implements MediaRepository {
     final cond = _workConditions(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
     );
     if (cond != null) q.where(cond);
@@ -1283,6 +1392,7 @@ class DriftMediaRepository implements MediaRepository {
   Future<Map<String, int>> countWorksByGenre({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) async {
     // 类型存在 `genres` 列（JSON 数组文本）里，SQL 数不出来 ——
@@ -1292,6 +1402,7 @@ class DriftMediaRepository implements MediaRepository {
     final cond = _workConditions(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
     );
     if (cond != null) q.where(cond);
@@ -1427,6 +1538,26 @@ class DriftMediaRepository implements MediaRepository {
     final out = <String, Duration>{};
     for (final row in await query.get()) {
       final ms = row.read(_db.mediaItems.resumePositionMs);
+      final id = row.read(_db.mediaItems.id);
+      if (id == null || ms == null || ms <= 0) continue;
+      out[id] = Duration(milliseconds: ms);
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<String, Duration>> maxPositions(List<String> itemIds) async {
+    if (itemIds.isEmpty) return const <String, Duration>{};
+
+    // 与 [resumePositions] 同形，只换一列：详情页文件列表要拿它画进度条，
+    // 两者都是「一次问几十个 id」的量级，所以同样只取两列。
+    final query = _db.selectOnly(_db.mediaItems)
+      ..addColumns([_db.mediaItems.id, _db.mediaItems.maxPositionMs])
+      ..where(_db.mediaItems.id.isIn(itemIds));
+
+    final out = <String, Duration>{};
+    for (final row in await query.get()) {
+      final ms = row.read(_db.mediaItems.maxPositionMs);
       final id = row.read(_db.mediaItems.id);
       if (id == null || ms == null || ms <= 0) continue;
       out[id] = Duration(milliseconds: ms);

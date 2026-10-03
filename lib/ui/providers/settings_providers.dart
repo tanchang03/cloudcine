@@ -1,6 +1,9 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/db/settings_store.dart';
+import '../../domain/entities/download_task.dart';
+import '../../domain/services/folder_sort.dart';
+import '../../domain/services/item_sort.dart';
 import 'app_providers.dart';
 
 /// 应用设置的只读快照。
@@ -31,6 +34,9 @@ class AppSettings {
     this.logLevel = 'info',
     this.streamRelay = true,
     this.relayConnections = 8,
+    this.folderSortMode = FolderSortMode.modifiedTime,
+    this.itemSortMode = ItemSortMode.modifiedDesc,
+    this.downloadConcurrency = kDefaultDownloadConcurrency,
   });
 
   /// 是否允许联网刮削（总开关）。
@@ -134,6 +140,38 @@ class AppSettings {
   /// 本地中继的并发连接数。改它**只影响之后新建的会话**，正在播的不受影响。
   final int relayConnections;
 
+  /// 目录视图（「文件夹」）列表的排序方式。**默认按修改时间倒序**。
+  ///
+  /// 它是一个**默认值**而不是「当前视图的状态」：目录视图工具条上的切换
+  /// 直接改的就是它（两处读写同一个设置，见 `folderSortModeProvider`）。
+  /// 做成一份而不是两份的理由 —— 用户把「名称」设成习惯之后，下次打开
+  /// 目录视图却又是按时间排的，那种「设置没生效」比没有设置更让人费解。
+  final FolderSortMode folderSortMode;
+
+  /// 作品详情页「文件」列表的排序方式。**默认按修改时间倒序**。
+  ///
+  /// 与 [folderSortMode] 分开存（理由见 `SettingKeys.itemSortMode`）：两者排的
+  /// 是两种东西（网盘实时目录 / 已入库的媒体文件）。
+  ///
+  /// ⚠️ 它**不影响「点播放会播哪一集」**。那个目标由 `PlayTarget.resolve`
+  /// 按「续播点 → 播过的那集 → 第一集」决定，与列表显示顺序无关 ——
+  /// 让播放按钮跟着排序走的话，切一次「时间倒序」就会变成「点播放播最新
+  /// 上传的那个文件」，而那几乎从不是用户想要的。
+  final ItemSortMode itemSortMode;
+
+  /// 同时最多跑几个下载任务。默认 5，上限 10。
+  ///
+  /// ## 它**不**等同于 [relayConnections]
+  ///
+  /// 那一项是「一条流内部开几条连接」（为了播得动），这一项是「同时下几个
+  /// 文件」。合成一个的话，用户为了多下几个文件把它调大，会顺手把播放那条流
+  /// 也改成十几路并发 —— 而两者对网盘的压力完全不同。
+  ///
+  /// 改它只影响**之后**的调度：已经跑着的任务不会被掐断，新空出来的并发位
+  /// 才会按新值分配（见 `DownloadQueue.pump`）。理由与中继那一项一致 ——
+  /// 拨一下滑块就把正在下的东西停掉，是没人预料得到的因果。
+  final int downloadConcurrency;
+
   /// 在线刮削是否**真的**能用：总开关打开 **且** 至少配了一个数据源。
   ///
   /// 两个条件缺一不可，而 UI 上必须把它们合成一个判断 —— 只开开关不填
@@ -173,6 +211,9 @@ class AppSettings {
     String? logLevel,
     bool? streamRelay,
     int? relayConnections,
+    FolderSortMode? folderSortMode,
+    ItemSortMode? itemSortMode,
+    int? downloadConcurrency,
   }) {
     return AppSettings(
       onlineScrape: onlineScrape ?? this.onlineScrape,
@@ -197,6 +238,9 @@ class AppSettings {
       logLevel: logLevel ?? this.logLevel,
       streamRelay: streamRelay ?? this.streamRelay,
       relayConnections: relayConnections ?? this.relayConnections,
+      folderSortMode: folderSortMode ?? this.folderSortMode,
+      itemSortMode: itemSortMode ?? this.itemSortMode,
+      downloadConcurrency: downloadConcurrency ?? this.downloadConcurrency,
     );
   }
 
@@ -260,6 +304,19 @@ class AppSettings {
           (int.tryParse(v[SettingKeys.relayConnections] ?? '') ?? 8)
               .clamp(1, 16)
               .toInt(),
+      // 目录视图排序。判据（含默认值）只在 `FolderSortMode.parse` 一处 ——
+      // 读不懂的值一律退回「修改时间倒序」，不抛异常。
+      folderSortMode: FolderSortMode.parse(v[SettingKeys.folderSortMode]),
+      // 详情页文件列表排序。同上：判据只在 `ItemSortMode.parse` 一处。
+      itemSortMode: ItemSortMode.parse(v[SettingKeys.itemSortMode]),
+      // 并发下载数。卡在 1..10：0 会让下载队列空转（永远没有空位），
+      // 而几十个并发大文件一定会触发网盘风控 —— 两种都是「用户只是想快点，
+      // 结果变成了别的故障」。与 `relayConnections` 同一套写法。
+      downloadConcurrency:
+          (int.tryParse(v[SettingKeys.downloadConcurrency] ?? '') ??
+                  kDefaultDownloadConcurrency)
+              .clamp(1, kMaxDownloadConcurrency)
+              .toInt(),
     );
   }
 }
@@ -296,6 +353,9 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       SettingKeys.logLevel,
       SettingKeys.streamRelay,
       SettingKeys.relayConnections,
+      SettingKeys.folderSortMode,
+      SettingKeys.itemSortMode,
+      SettingKeys.downloadConcurrency,
     ]);
 
     return AppSettings.fromValues(v);
@@ -324,6 +384,9 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     String? logLevel,
     bool? streamRelay,
     int? relayConnections,
+    FolderSortMode? folderSortMode,
+    ItemSortMode? itemSortMode,
+    int? downloadConcurrency,
   }) async {
     final store = ref.read(settingsStoreProvider);
     final current = state.valueOrNull ?? const AppSettings();
@@ -400,6 +463,18 @@ class SettingsController extends AsyncNotifier<AppSettings> {
         '${relayConnections.clamp(1, 16)}',
       );
     }
+    if (folderSortMode != null) {
+      await store.write(SettingKeys.folderSortMode, folderSortMode.value);
+    }
+    if (itemSortMode != null) {
+      await store.write(SettingKeys.itemSortMode, itemSortMode.value);
+    }
+    if (downloadConcurrency != null) {
+      await store.write(
+        SettingKeys.downloadConcurrency,
+        '${downloadConcurrency.clamp(1, kMaxDownloadConcurrency)}',
+      );
+    }
 
     state = AsyncData(
       current.copyWith(
@@ -424,6 +499,10 @@ class SettingsController extends AsyncNotifier<AppSettings> {
         logLevel: logLevel,
         streamRelay: streamRelay,
         relayConnections: relayConnections?.clamp(1, 16).toInt(),
+        folderSortMode: folderSortMode,
+        itemSortMode: itemSortMode,
+        downloadConcurrency:
+            downloadConcurrency?.clamp(1, kMaxDownloadConcurrency).toInt(),
       ),
     );
   }

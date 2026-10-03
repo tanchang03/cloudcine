@@ -176,10 +176,45 @@ class ParsedMediaName {
     return kind == MediaKind.episode ? cleaned : '$cleaned$yearPart';
   }
 
-  /// 解析是否拿到了「足够可信」的结果（用于决定要不要走在线刮削）。
+  /// 解析是否拿到了「足够可信」的结果 —— 决定在线刮削走**哪一档闸门**。
+  ///
+  /// ⚠️ 它**不**管「要不要建作品行」（见 [hasUsableTitle]），也**不再**决定
+  /// 「要不要刮削」：2026-10-03 起为假时不再直接放弃，而是走**宽松档** ——
+  /// 仍然发请求，但闸门要求精确同名且唯一（见 `ScrapeQuery.requireExactTitle`）。
+  /// 理由：无年份的电影在旧实现里**一次都刮不到**（`/来自：分享/奥德赛/`
+  /// 就是现场），而闸门本来就该是「换判据」，不是「一刀切拒绝」。
   bool get isConfident => kind != MediaKind.unknown &&
       (title ?? '').isNotEmpty &&
       (year != null || kind == MediaKind.episode);
+
+  /// 片名是否**像个名字**（含字母或汉字，且不止一个字符）。
+  ///
+  /// 这是**归组 / 建作品行**的门槛，与 [isConfident]（**在线刮削档位**的门槛）
+  /// 是**两件事**，⛔ 别合并。两者的代价完全不对等：
+  ///
+  ///   - 不刮削 = 没有海报与简介，本地片名照样能用；
+  ///   - 不建作品 = 这条媒体在媒体库里**永久看不到**（列表读的是作品行），
+  ///     而目录视图里它还标着「已入库」、还能播 —— 用户完全无从下手，
+  ///     且**没有任何报错**。
+  ///
+  /// 现场（2026-10-03）：`/来自：分享/奥德赛/1080P.mkv`。文件名整串只有一个
+  /// 分辨率标记，片名靠目录名兜底成「奥德赛」，于是 `kind=movie` 而
+  /// `year=null` → [isConfident] 为 false → 作品行一条都不建 → 媒体库空的。
+  ///
+  /// 两个条件的口径都**照抄现有实现**，不另立一套：
+  ///
+  ///   - 「含字母或汉字」= `MediaFilenameParser._isStandaloneRelease` 对
+  ///     「真名字」的判据（`159.mkv`、`1080p.mkv` 提出来的编号/分辨率不算名字）；
+  ///   - 「不止一个字符」= `DirectoryTitle.isContainerSegment` 对「单字符不是
+  ///     名字」的判据（`a.mkv` 不该建出一部叫「a」的作品）。
+  bool get hasUsableTitle {
+    final t = title?.trim();
+    if (t == null || t.isEmpty) return false;
+    if (!RegExp(r'[a-z\u4e00-\u9fff]', caseSensitive: false).hasMatch(t)) {
+      return false;
+    }
+    return t.length >= 2;
+  }
 
   @override
   String toString() => 'ParsedMediaName(${kind.name}, "$title", '
@@ -333,8 +368,8 @@ class MediaFilenameParser {
   ///
   /// 两条都要满足：
   ///
-  ///   1. 片名是**真名字**（含字母或汉字）。`159.mkv`、`1080p.mp4` 提出来的
-  ///      是编号/分辨率，不是名字 —— 它们最需要目录名来救；
+  ///   1. 片名是**真名字**（含字母或汉字），**或者**是一串编号但**自带年份**
+  ///      （见下面 [hasWord] 那一段）；
   ///   2. 它**自带年份或季集结构**。`天龙八部…S01E01.1997…` 这类文件名自己
   ///      就说得清清楚楚，用目录名去顶反而会把 `S01E01` 抹掉。
   ///
@@ -348,9 +383,26 @@ class MediaFilenameParser {
   }) {
     final t = title;
     if (t == null || t.isEmpty) return false;
-    if (!RegExp(r'[a-z\u4e00-\u9fff]', caseSensitive: false).hasMatch(t)) {
-      return false;
-    }
+
+    final hasWord =
+        RegExp(r'[a-z\u4e00-\u9fff]', caseSensitive: false).hasMatch(t);
+
+    // 纯数字片名：**自带年份**时才当它是真名字。
+    //
+    // 2026-10-03 现场：`/来自：分享/逃出白垩纪 (2023) 4K HDR & Dv/`
+    // `65.2023.2160p.WEB-DL.DDP5.1.DV.HDR.H.265-FLUX.mkv`。
+    // 那部电影的片名**就是** `65`（2023，Adam Driver 主演）。旧规则
+    // 「没有字母汉字就不是名字」把它判成编号 → 目录名顶掉它 → 查询词变成
+    // `逃出白垩纪 2023 4K HDR & Dv`（目录名里的年份与画质标记没被清掉）
+    // → 两个在线源都搜不到。而 `65` + 年份 2023 本来是一击即中的查询。
+    //
+    // 为什么**要求自带年份**：`159.mkv`、`1080p.mp4` 提出来的确实是编号/
+    // 分辨率，而它们**没有年份** —— 那条守卫（2026-10-02「182 → 希腊纪录片」
+    // 事故）不能丢。何况现在还有候选链兜着：万一 `159.2023.mkv` 里的 159
+    // 真是课程编号，主查询落空后会自动改用目录名再搜一次
+    // （见 `ScrapeQuery.fallbacks`）。
+    if (!hasWord) return year != null;
+
     return year != null || kind == MediaKind.episode;
   }
 
@@ -767,20 +819,65 @@ class MediaFilenameParser {
   /// 长得一模一样。规则是**优先取标记区之后出现的年份**（发布组命名的
   /// 习惯是 `片名.年份.分辨率...`），只有在标记区里找不到时才回退到
   /// 全串里的第一个。
+  ///
+  /// ## 括号里的完整日期不算（2026-10-03）
+  ///
+  /// `[2026-02-01]` 是发布者写的**上传/整理日期**，不是出品年份。以前它会
+  /// 被当成 `year=2026` 落库，于是
+  /// `/来自：分享/仙逆/126 纯享-仙踪-[4K][HEVC][2026-02-01].mp4` 拿到一个
+  /// 假年份，`_isStandaloneRelease` 据此判它「自称独立发行物」—— 目录名
+  /// `仙逆` 被顶掉，自动刮削拿着垃圾片名 `126 纯享-仙踪` 去搜，必然一无所获
+  /// （同目录另外 6 个文件名里带 `仙逆` 的都刮到了）。
+  ///
+  /// 假年份还有第二重代价：它让 `isConfident` 为真 → 查询走**严格档**
+  /// （闸门只要求 0.6 相似度）→ 更容易刮错片子。
+  ///
+  /// ⚠️ 两道判据缺一不可，见 [isDateYear]：**括号里**的日期才丢，
+  /// 裸写的 `2023-05-12` 是发行日期，它的年份仍然是有用的筛选条件。
+  ///
+  /// ⚠️ 只跳过**年份本身**，不动 `_markerPatterns` —— 那里决定「片名在哪
+  /// 截断」，`2026-09-27` 仍然必须把 `奔跑吧` 截出来（否则片名会变成
+  /// `奔跑吧 2026-09-27 第12期`）。
   static int? _pickYear(String cleaned, int markerStart) {
     final re = RegExp(r'(?<![0-9])(19\d{2}|20\d{2})(?![0-9])');
 
-    if (markerStart >= 0) {
-      final tail = cleaned.substring(markerStart);
-      final m = re.firstMatch(tail);
-      final y = m == null ? null : int.tryParse(m.group(1)!);
-      if (y != null) return _saneYear(y);
+    /// 这个位置的年份是不是「括号里的完整日期」？
+    ///
+    /// 两道都要满足：
+    ///
+    ///   1. 后面紧跟 `-MM-DD` / `.MM.DD` / `_MM_DD`。`\d{1,2}` 与
+    ///      `(?![0-9])` 是**配套**的：`Movie.2023.1080p.mkv` 里的 `.1080`
+    ///      咬不动（四位数字过不了 `\d{1,2}`，也过不了 `(?![0-9])`），
+    ///      `2012.2009.1080p.mkv` 同理 —— 这两个的年份必须留下；
+    ///   2. 年份**紧跟在括号后面**。裸写的 `2023-05-12` 是发行日期，
+    ///      其年份与 TMDB 的 `year`（发行年）口径一致，要留下。
+    bool isDateYear(int start) {
+      final after = cleaned.substring(start + 4);
+      if (!RegExp(r'^\s*[-_.]\s*\d{1,2}\s*[-_.]\s*\d{1,2}(?![0-9])')
+          .hasMatch(after)) {
+        return false;
+      }
+      final before = cleaned.substring(0, start).trimRight();
+      if (before.isEmpty) return false;
+      return const {'[', '【', '(', '（'}.contains(before[before.length - 1]);
     }
-    for (final m in re.allMatches(cleaned)) {
-      final y = _saneYear(int.parse(m.group(1)!));
+
+    /// 从 [from] 起找第一个**不是括号日期**的年份。
+    int? scan(int from) {
+      for (final m in re.allMatches(cleaned)) {
+        if (m.start < from) continue;
+        if (isDateYear(m.start)) continue;
+        final y = _saneYear(int.parse(m.group(1)!));
+        if (y != null) return y;
+      }
+      return null;
+    }
+
+    if (markerStart >= 0) {
+      final y = scan(markerStart);
       if (y != null) return y;
     }
-    return null;
+    return scan(0);
   }
 
   static int? _saneYear(int y) {

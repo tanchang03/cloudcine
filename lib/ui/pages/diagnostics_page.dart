@@ -39,7 +39,14 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: ValueListenableBuilder<int>(
+      // ⛔ **壳外的整幅页要自己让开过扫描区**：`/diagnostics` 是
+      // `StatefulShellRoute` **之外**的一级路由（见 `app_router.dart`），
+      // 拿不到 `AppShell` 那层内边距。不加的话电视上最左那列（返回键、每条
+      // 日志的开头几个字）会落进过扫描带被切掉 —— 而日志正是要一行行读的。
+      // 理由与「哪两种页面不需要加」见 `AppTheme.safeAreaInsets` 的文档。
+      body: Padding(
+        padding: AppTheme.safeAreaInsets(context),
+        child: ValueListenableBuilder<int>(
         valueListenable: diag.revision,
         builder: (context, _, __) {
           final all = diag.lines;
@@ -146,6 +153,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
             ],
           );
         },
+      ),
       ),
     );
   }
@@ -358,7 +366,7 @@ class _RelayStatusPanelState extends ConsumerState<RelayStatusPanel> {
               const Icon(Icons.hub_outlined, size: 15, color: AppTheme.accent),
               const SizedBox(width: 8),
               Text(
-                '本地中继 · ${stats.activeWorkers} 条连接在拉',
+                '本地中继 · ${stats.activeWorkers} 路在拉',
                 style: const TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
@@ -403,6 +411,7 @@ class _RelayStatusPanelState extends ConsumerState<RelayStatusPanel> {
               Text(
                 '缓存 ${formatBytes(stats.cachedBytes)}'
                 ' · 上游请求 ${stats.upstreamRequests}'
+                ' · 连接 ${stats.upstreamConnects} 条'
                 '${stats.upstreamFailures == 0 ? "" : " · 失败 ${stats.upstreamFailures}"}',
                 style: TextStyle(
                   fontSize: 11,

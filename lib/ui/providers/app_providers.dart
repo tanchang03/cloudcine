@@ -205,14 +205,31 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
     // 由 `playerBridgeHostProvider` 在落库的同一处报告。
     ref.read(playbackLibraryLinkProvider.notifier).report(item.id);
 
+    final repo = ref.read(mediaRepositoryProvider);
+
     unawaited(
-      ref
-          .read(mediaRepositoryProvider)
-          .markPlayed(item.id, DateTime.now())
-          .catchError((Object e) {
+      repo.markPlayed(item.id, DateTime.now()).catchError((Object e) {
         // 落库失败不该打断播放，但也不能静默 —— 否则「续播位置丢了」
         // 会变成一个无从查起的问题。
         diag.error('播放', '播放进度落库失败：$e');
+      }),
+    );
+
+    // 「历史最大位置」—— 作品详情页文件列表底下那条细进度条读的就是它。
+    //
+    // ⚠️ 这条**必须写**，哪怕 macOS 上播放走的是独立窗口：内置播放页是
+    // Android TV 上**唯一**的播放路径，漏了它电视上就永远没有进度条
+    // （而且不会报错，只是那条线从来不出现）。
+    //
+    // 与 `markPlayed` 分开两次写：那一个记「什么时候看的」（决定列表顺序），
+    // 这一个记「看到哪儿了」（决定进度条）。一个失败不该带走另一个。
+    unawaited(
+      repo.saveMaxPosition(item.id, position).then((_) {
+        // ⚠️ 写完**再**推刷新信号：反过来的话，详情页收到信号去读库时
+        // 这一笔还没落盘，进度条永远慢一拍（每 10 秒白刷一次）。
+        ref.read(playbackProgressSignalProvider.notifier).bump();
+      }).catchError((Object e) {
+        diag.error('播放', '历史进度落库失败：$e');
       }),
     );
   };

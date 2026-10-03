@@ -509,4 +509,113 @@ void main() {
       );
     });
   });
+
+  group('候选链：文件名 → 目录名（2026-10-03）', () {
+    // 现场：`/来自：分享/仙逆/126 纯享-仙踪-[4K][HEVC][2026-02-01].mp4`。
+    // 文件名里没有作品名，`仙逆` 只写在目录上。
+    const chain = ScrapeQuery(
+      title: '126 纯享-仙踪',
+      kind: MediaKind.movie,
+      year: 2026,
+      fallbacks: [
+        ScrapeQuery(
+          title: '仙逆',
+          kind: MediaKind.episode,
+          requireExactTitle: true,
+        ),
+      ],
+    );
+
+    test('主查询落空 → 换兜底词再搜一次，命中就用它', () async {
+      final seen = <String>[];
+      final online = _Fake('tmdb', run: (q) async {
+        seen.add(q.title);
+        return q.title == '仙逆' ? _meta('仙逆') : null;
+      });
+      final pipeline = ScraperPipeline([
+        online,
+        _Fake('local', run: (_) async => _meta('LOCAL')),
+      ]);
+
+      final r = await pipeline.scrape(chain);
+
+      expect(r!.title, '仙逆');
+      expect(seen, ['126 纯享-仙踪', '仙逆'],
+          reason: '兜底是「前面全落空才试」，不是「每条都试」—— 并发起跑会把 '
+              '3 条候选的额度一次全花掉，而豆瓣匿名额度只有约 10 个搜索词');
+    });
+
+    test('主查询命中 → 兜底一次请求都不发', () async {
+      final seen = <String>[];
+      final online = _Fake('tmdb', run: (q) async {
+        seen.add(q.title);
+        return _meta('HIT:${q.title}');
+      });
+      final pipeline = ScraperPipeline([
+        online,
+        _Fake('local', run: (_) async => _meta('LOCAL')),
+      ]);
+
+      final r = await pipeline.scrape(chain);
+
+      expect(r!.title, 'HIT:126 纯享-仙踪');
+      expect(seen, ['126 纯享-仙踪']);
+    });
+
+    test('⚠️ 整条链都落空 → 本地兜底仍然只用**主查询**', () async {
+      final local = _Fake('local', run: (q) async => _meta('LOCAL:${q.title}'));
+      final pipeline = ScraperPipeline([
+        _Fake('tmdb', run: (_) async => null),
+        local,
+      ]);
+
+      final r = await pipeline.scrape(chain);
+
+      expect(
+        r!.title,
+        'LOCAL:126 纯享-仙踪',
+        reason: '本地兜底是「文件名解析」。拿目录名去兜会把作品改名成「仙逆」，'
+            '而那是**没海报也没简介**的一次改名 —— 用户只会觉得'
+            '「刮了一次，名字反而变了」',
+      );
+      expect(local.calls, 1, reason: '兜底只跑一次，不是每条候选后面都跑一遍');
+    });
+
+    test('没有兜底时行为一字不变', () async {
+      final seen = <String>[];
+      final pipeline = ScraperPipeline([
+        _Fake('tmdb', run: (q) async {
+          seen.add(q.title);
+          return null;
+        }),
+        _Fake('local', run: (q) async => _meta('LOCAL:${q.title}')),
+      ]);
+
+      final r = await pipeline.scrape(_q);
+
+      expect(seen, ['某片']);
+      expect(r!.title, 'LOCAL:某片');
+    });
+
+    test('兜底词也走同一条优先级规则（不是「谁先返回算谁」）', () async {
+      final high = _Fake(
+        'high',
+        run: (q) async => q.title == '仙逆' ? _meta('HIGH:仙逆') : null,
+      );
+      final low = _Fake(
+        'low',
+        run: (q) async => q.title == '仙逆' ? _meta('LOW:仙逆') : null,
+      );
+      final pipeline = ScraperPipeline([
+        high,
+        low,
+        _Fake('local', run: (_) async => _meta('LOCAL')),
+      ]);
+
+      final r = await pipeline.scrape(chain);
+
+      expect(r!.title, 'HIGH:仙逆',
+          reason: '候选链只改「用哪个词」，不改「按优先级取第一个成功的」');
+    });
+  });
 }

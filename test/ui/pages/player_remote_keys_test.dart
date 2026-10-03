@@ -255,6 +255,115 @@ void main() {
     });
   });
 
+  group('TV 设置面板的开关（resolveTvPanelKey）', () {
+    test('菜单键在面板关着时唤出、开着时收起', () {
+      expect(
+        resolveTvPanelKey(
+          key: LogicalKeyboardKey.contextMenu,
+          panelOpen: false,
+          stageFocused: onStage,
+        ),
+        TvPanelKeyAction.open,
+      );
+      expect(
+        resolveTvPanelKey(
+          key: LogicalKeyboardKey.contextMenu,
+          panelOpen: true,
+          stageFocused: onStage,
+        ),
+        TvPanelKeyAction.close,
+      );
+    });
+
+    test('菜单键不挑焦点 —— 焦点在控制栏上时按它也该开面板', () {
+      // 这条是「遥控器上除了方向键与 OK 之外只有菜单键」那类盒子的兜底：
+      // 用户可能正停在控制栏的某个按钮上，此时按菜单键要的仍然是「开设置」。
+      expect(
+        resolveTvPanelKey(
+          key: LogicalKeyboardKey.contextMenu,
+          panelOpen: false,
+          stageFocused: onWidget,
+        ),
+        TvPanelKeyAction.open,
+      );
+    });
+
+    test('画面上的 ↑ 唤出面板 —— 与 YouTube / Netflix 的约定一致', () {
+      expect(
+        resolveTvPanelKey(
+          key: LogicalKeyboardKey.arrowUp,
+          panelOpen: false,
+          stageFocused: onStage,
+        ),
+        TvPanelKeyAction.open,
+      );
+    });
+
+    test('焦点在控制栏上时 ↑ 不接管 —— 那是「走回上一行」，不是「弹面板」', () {
+      expect(
+        resolveTvPanelKey(
+          key: LogicalKeyboardKey.arrowUp,
+          panelOpen: false,
+          stageFocused: onWidget,
+        ),
+        TvPanelKeyAction.none,
+        reason: '接管了的话，用户在控制栏里想按 ↑ 回到上面那一行，'
+            '结果弹出一个面板 —— 而他根本没打算开设置',
+      );
+    });
+
+    test('面板已经开着时 ↑ 不接管（那属于面板内部的换行）', () {
+      expect(
+        resolveTvPanelKey(
+          key: LogicalKeyboardKey.arrowUp,
+          panelOpen: true,
+          stageFocused: onStage,
+        ),
+        TvPanelKeyAction.none,
+      );
+    });
+
+    test('↓ 绝不接管 —— 从画面走到控制栏（去够「设置」按钮）靠的就是它', () {
+      // ⛔ 这条是整套 TV 交互的**咽喉**：一旦 ↓ 被面板抢走，焦点就再也下不到
+      // 控制栏，而控制栏上有「设置」按钮 —— 没有菜单键的遥控器上，那是唯一
+      // 一条进设置面板的路。抢了它 = 那类盒子上选集 / 画质 / 字幕全打不开。
+      for (final panelOpen in [true, false]) {
+        for (final focused in [onStage, onWidget]) {
+          expect(
+            resolveTvPanelKey(
+              key: LogicalKeyboardKey.arrowDown,
+              panelOpen: panelOpen,
+              stageFocused: focused,
+            ),
+            TvPanelKeyAction.none,
+            reason: '↓ 被接管了（panelOpen=$panelOpen, stageFocused=$focused）',
+          );
+        }
+      }
+    });
+
+    test('别的键一概不管 —— 尤其是 select / ←/→，它们有播放语义', () {
+      for (final key in [
+        LogicalKeyboardKey.select,
+        LogicalKeyboardKey.enter,
+        LogicalKeyboardKey.arrowLeft,
+        LogicalKeyboardKey.arrowRight,
+        LogicalKeyboardKey.space,
+        LogicalKeyboardKey.escape,
+      ]) {
+        expect(
+          resolveTvPanelKey(
+            key: key,
+            panelOpen: false,
+            stageFocused: onStage,
+          ),
+          TvPanelKeyAction.none,
+          reason: '$key 被面板抢走的话，播放/暂停与快退快进就失灵了',
+        );
+      }
+    });
+  });
+
   test('没有映射的键一律放行，不吞按键', () {
     for (final key in [
       LogicalKeyboardKey.keyA,

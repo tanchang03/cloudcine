@@ -383,4 +383,89 @@ void main() {
       );
     });
   });
+
+  group('宽松档（无年份的电影）：只认精确同名', () {
+    // 无年份时年份硬闸门完全失效，只剩标题相似度 —— 而 0.6 那个档是
+    // **为「有年份」定的**（那时年份才是主力判据）。实测前缀档会放行
+    // 另一部片子，且是静默的。所以这类查询改用精确同名。
+    bool acceptsRelaxed({
+      required String queryTitle,
+      String? queryAlternateTitle,
+      int? queryYear,
+      required String resultTitle,
+      String? resultOriginalTitle,
+      int? resultYear,
+    }) =>
+        ScrapeMatch.evaluate(
+          queryTitle: queryTitle,
+          queryAlternateTitle: queryAlternateTitle,
+          queryYear: queryYear,
+          resultTitle: resultTitle,
+          resultOriginalTitle: resultOriginalTitle,
+          resultYear: resultYear,
+          requireExactTitle: true,
+        ).accepted;
+
+    test('精确同名 → 接受', () {
+      expect(acceptsRelaxed(queryTitle: '奥德赛', resultTitle: '奥德赛'), isTrue);
+    });
+
+    test('⚠️ 前缀同名 → 淘汰（严格档会无条件放行的正是这一档）', () {
+      expect(
+        acceptsRelaxed(queryTitle: '奥德赛', resultTitle: '奥德赛：归来'),
+        isFalse,
+        reason: '严格档下它是 0.86、无条件通过。无年份时没有年份兜底，'
+            '「一个名字是另一个的前缀」既可能是同一部（仙逆 / 仙逆第一季）、'
+            '也可能是**另一部片子**（奥德赛 / 奥德赛：归来）—— 分不开就只能拒',
+      );
+      expect(
+        acceptsRelaxed(queryTitle: '英雄', resultTitle: '英雄本色'),
+        isFalse,
+        reason: '这两部片子毫无关系，却在严格档下拿 0.825 通过',
+      );
+    });
+
+    test('包含 / Dice 各档同样不认', () {
+      expect(
+        acceptsRelaxed(queryTitle: '流浪地球2', resultTitle: '流浪地球2 3D版'),
+        isFalse,
+      );
+      expect(acceptsRelaxed(queryTitle: 'Se7en', resultTitle: 'Seven'), isFalse);
+    });
+
+    test('跨书写系统也不再兜底 —— 那条兜底**必须有年份**', () {
+      expect(
+        acceptsRelaxed(
+          queryTitle: '流浪地球2',
+          resultTitle: 'The Wandering Earth II',
+        ),
+        isFalse,
+        reason: '「中文词 × 任意英文片名」相似度天然为 0，没有年份就等于没有判据',
+      );
+    });
+
+    test('备用词精确同名也算命中', () {
+      expect(
+        acceptsRelaxed(
+          queryTitle: '某中文名',
+          queryAlternateTitle: 'Some English Name',
+          resultTitle: 'Some English Name',
+        ),
+        isTrue,
+      );
+    });
+
+    test('⚠️ 年份硬闸门仍然生效（两边都有年份时）', () {
+      final r = ScrapeMatch.evaluate(
+        queryTitle: '某片',
+        queryYear: 2026,
+        resultTitle: '某片',
+        resultYear: 1994,
+        requireExactTitle: true,
+      );
+
+      expect(r.accepted, isFalse);
+      expect(r.verdict, ScrapeMatchVerdict.rejectYear);
+    });
+  });
 }

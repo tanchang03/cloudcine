@@ -70,6 +70,7 @@ void main() {
   Future<List<String>> keysOf({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -77,6 +78,7 @@ void main() {
     final list = await repo.listWorks(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
       years: years,
       genres: genres,
@@ -169,6 +171,50 @@ void main() {
     });
   });
 
+  group('listWorks · 已刮削筛选', () {
+    setUp(() async {
+      await seed(key: 'scraped', title: '刮过的片', source: 'online');
+      await seed(key: 'bare', title: '没刮过的片', source: 'local');
+      // 「自定义」：用户点过之后在线信息被整份清掉，`source` 落到 manual。
+      await seed(key: 'custom', title: '自定义过的片', source: 'manual');
+    });
+
+    test('只保留 source = online 的作品', () async {
+      expect(
+        await keysOf(scrapedOnly: true),
+        ['scraped'],
+        reason: '判据是**有没有刮到过在线数据**，不是「有没有元数据」。'
+            '「自定义」那一行的片名是用户自己敲的、在线信息已被清空，'
+            '把它算成「已刮削」会让用户点开发现海报和简介都是空的',
+      );
+    });
+
+    test('关掉这一项就一条都不筛', () async {
+      expect(await keysOf(scrapedOnly: false), hasLength(3));
+      expect(await keysOf(), hasLength(3), reason: '默认必须是关的');
+    });
+
+    test('与年份 / 类型取交集', () async {
+      await seed(
+        key: 'scraped-2021',
+        title: '刮过的 2021',
+        year: 2021,
+        genres: const ['动画'],
+        source: 'online',
+      );
+      await seed(
+        key: 'local-2021',
+        title: '没刮过的 2021',
+        year: 2021,
+        genres: const ['动画'],
+        source: 'local',
+      );
+
+      expect(await keysOf(scrapedOnly: true, years: {2021}), ['scraped-2021']);
+      expect(await keysOf(scrapedOnly: true, genres: {'动画'}), ['scraped-2021']);
+    });
+  });
+
   group('listWorks · 与其它条件取交集', () {
     test('年份 + 类型 + 分类是「与」的关系', () async {
       await seed(
@@ -254,6 +300,19 @@ void main() {
     test('跟着搜索词收窄', () async {
       expect(await repo.countWorksByYear(query: '科幻'), {2023: 1});
     });
+
+    test('跟着「已刮削」收窄', () async {
+      // 同一年里两部片子，一部刮过、一部没刮过。
+      await seed(key: 'scraped', title: 'S', year: 2001, source: 'online');
+      await seed(key: 'bare', title: 'B', year: 2001, source: 'local');
+
+      expect(
+        await repo.countWorksByYear(scrapedOnly: true),
+        {2001: 1},
+        reason: '角标必须等于「打开已刮削之后点这个年份」的条数。不跟着收窄的话，'
+            '用户会看到一个只有没刮过的片子才有的年份，点下去是空列表',
+      );
+    });
   });
 
   group('countWorksByGenre', () {
@@ -284,6 +343,16 @@ void main() {
         await repo.countWorksByGenre(category: MediaCategory.anime),
         {'动画': 1},
       );
+    });
+
+    test('跟着「已刮削」收窄', () async {
+      await seed(
+        key: 'scraped',
+        title: 'S',
+        genres: const ['剧情'],
+        source: 'online',
+      );
+      expect(await repo.countWorksByGenre(scrapedOnly: true), {'剧情': 1});
     });
   });
 
@@ -375,6 +444,45 @@ void main() {
       final counts = await repo.countWorksByYear();
       final both = await keysOf(years: counts.keys.toSet());
       expect(both.length, counts.values.fold<int>(0, (s, n) => s + n));
+    });
+
+    test('「已刮削」下的年份 / 类型角标也等于实际条数', () async {
+      // 这个 group 的 setUp 里全是**没刮过**的行，只拿它们跑 `scrapedOnly`
+      // 会得到空表 —— 下面的循环一次都不执行，那条不变量会以「零次比较」的
+      // 方式通过（正是它要防的那种失败）。所以这里另起一批混着的数据。
+      await seed(
+        key: 's1',
+        kind: 'movie',
+        category: 'movie',
+        title: '刮过的一',
+        year: 2021,
+        genres: const ['剧情'],
+        source: 'online',
+      );
+      await seed(
+        key: 's2',
+        kind: 'movie',
+        category: 'movie',
+        title: '刮过的二',
+        year: 1995,
+        genres: const ['剧情', '科幻'],
+        source: 'online',
+      );
+
+      final years = await repo.countWorksByYear(scrapedOnly: true);
+      final genres = await repo.countWorksByGenre(scrapedOnly: true);
+
+      expect(years, isNotEmpty, reason: '年份角标空了，下面的循环等于没跑');
+      expect(genres, isNotEmpty, reason: '类型角标空了，下面的循环等于没跑');
+
+      for (final entry in years.entries) {
+        final hit = await keysOf(scrapedOnly: true, years: {entry.key});
+        expect(hit.length, entry.value, reason: '${entry.key} 年');
+      }
+      for (final entry in genres.entries) {
+        final hit = await keysOf(scrapedOnly: true, genres: {entry.key});
+        expect(hit.length, entry.value, reason: entry.key);
+      }
     });
   });
 }

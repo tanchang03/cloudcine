@@ -90,6 +90,32 @@ class MediaItems extends Table {
   /// 而换算正是这类字段最容易出错的地方（`inSeconds` 截断 vs 四舍五入）。
   IntColumn get resumePositionMs => integer().nullable()();
 
+  /// **历史最大播放位置**（毫秒）。`null` = 从没播过。
+  ///
+  /// ## 与 [resumePositionMs] 的分工（两者都是「看到哪儿了」，但不是一个东西）
+  ///
+  ///   - [resumePositionMs] 回答「**这次**该从哪儿接着播」—— 它会变，也会被
+  ///     清掉（看完清、位置太靠前当没看过）；
+  ///   - 这一列回答「**这一集我看过没有 / 看到哪儿了**」—— **只增不减**，
+  ///     也永远不清。
+  ///
+  /// ## 为什么不能用续播点画进度条
+  ///
+  /// 详情页的文件列表要靠它画每一条的进度条。拿续播点画会有两个必然的错：
+  /// 看完的一集续播点被清成了 `NULL` → 进度条归零，界面上「看过」这件事
+  /// 直接消失；用户回拖重看一段 → 进度条跟着退回去。
+  ///
+  /// ## 为什么是「只增不减」
+  ///
+  /// 它记的是**历史最远位置**，不是播放头当前位置。回拖、重看都不该让它
+  /// 倒退 —— 一旦倒退，这个条就不再回答「我看过没有」了。
+  ///
+  /// ## 为什么写完不清
+  ///
+  /// 它没有「过期」的概念：看过就是看过。清掉只会让用户在列表里
+  /// 认不出哪些集已经看过。
+  IntColumn get maxPositionMs => integer().nullable()();
+
   /// 网盘服务端生成的视频预览图地址（夸克 `preview_url` / `thumbnail`）。
   ///
   /// **只存地址，不存图片** —— 图片由 `PosterCache` 按需下载并落盘。
@@ -350,6 +376,123 @@ class ScanCursors extends Table {
 
   @override
   Set<Column> get primaryKey => {provider};
+}
+
+/// 播放偏好表（**逐文件**）。
+///
+/// 「上次播这部片时选了什么」—— 画质、音轨、字幕、字幕开关、音效。
+/// 下次打开同一个文件就还原回去，而不是每次都回到全局默认。
+///
+/// ## 为什么是独立一张表，而不是往 `media_items` 上加几列
+///
+///   1. `media_items` 的行是**扫描的产物**：`upsertItems` 会整行重写，
+///      重扫一次就把用户的选择冲掉了 —— 而 `mergeWorkForUpsert` 那条
+///      「旧值优先」的保护通道是给作品级的元数据用的，媒体项这边没有
+///      对应的机制。独立一张表就不存在被扫描覆盖的问题。
+///   2. 偏好的写入频率（用户点一次菜单）与扫描（几千行批量）差几个数量级，
+///      混在同一张表里会让扫描的批量写多背一批无关列。
+///
+/// ## 为什么 `prefs` 存 JSON 而不是拆成一列一项
+///
+/// 与 `ScanCursors.pendingDirs` 同一条理由：这张表**没有任何按字段查询的
+/// 需求**（只会按 `item_id` 精确取、或按 `group_key` 取最新一条），而
+/// 偏好项是会长大的（将来可能加「字幕字体大小」「跳过片尾」）。拆成列的话
+/// 每加一项都要一次 schema 迁移，而迁移写错是静默的数据损坏。
+@DataClassName('PlaybackPrefRow')
+class PlaybackPrefs extends Table {
+  /// 主键：媒体项 id（`provider:fileId`）。
+  TextColumn get itemId => text()();
+
+  /// 归组键（`MediaItem.groupKey`）。
+  ///
+  /// 存在的唯一理由是**同剧继承**：某一集没记过偏好时，回退到同一部作品
+  /// 里最近改过的那一条（用户给第 1 集选了粤语，第 2 集打开也该是粤语）。
+  ///
+  /// 冗余存一份而不是 JOIN `media_items`：回退查询发生在**每次打开播放页**
+  /// 的热路径上，而 `media_items` 是被折叠归一反复改动的表（`group_key`
+  /// 虽然不搬，但行会被删）。这里存的是「记下这条偏好时它属于哪部作品」，
+  /// 是个历史事实，不需要跟着变。
+  TextColumn get groupKey => text()();
+
+  /// 偏好本体，`PlaybackPreference.toJson` 的字符串。空对象 `{}` = 没记过。
+  TextColumn get prefs => text().withDefault(const Constant('{}'))();
+
+  /// 最后修改时间。**同剧继承的排序依据**（取最新一条）。
+  DateTimeColumn get updatedAt => dateTime()();
+
+  @override
+  Set<Column> get primaryKey => {itemId};
+}
+
+/// 下载任务表（**下载记录视图**的唯一数据源）。
+///
+/// ## 为什么要落库，而不是只放在内存里
+///
+/// 「下载」在这里不是一次几秒钟的动作：网盘上一部 4K 原盘是几十 GB，
+/// 用户按下开始之后会去干别的、关掉应用、第二天再打开。只放内存的话，
+/// 关一次窗口就等于**把已经下了一半的几十 GB 悄悄丢掉**（`.part` 还在
+/// 磁盘上，但没有任何东西记得它属于哪个文件、该从第几个字节接下去）。
+///
+/// 所以每个任务的**目标路径**与**已下字节**都必须落库：前者决定
+/// 「继续时往哪个文件追加」，后者决定「Range 从哪开始」。
+///
+/// ## 为什么主键是 `provider:fileId` 而不是自增 id
+///
+/// 与 `MediaItems.id` 同口径。取这个的自然结果是**同一个文件天然去重**：
+/// 在目录视图里对同一个 `.zip` 连点两次下载，得到的是同一条记录被重新排队，
+/// 而不是两条记录同时往同一个文件里写 —— 后者会把文件写成互相交错的垃圾。
+///
+/// 代价是「同一个文件想存两份到不同位置」做不到。这个取舍是刻意的：
+/// 那种需求在网盘客户端里几乎不存在，而它换来的「不会自己写坏自己」
+/// 是每天都在生效的。
+///
+/// ## `receivedBytes` 是**进度快照**，不是真源
+///
+/// 真源是磁盘上那个 `.part` 文件的实际长度（见 `DriveDownloadService`）。
+/// 这一列按秒节流写入，进程被杀时最多丢一秒的进度；续传时服务会拿
+/// `.part` 的真实长度**覆盖**它 —— 因为它可能比真实值**大**
+/// （写完还没落盘就崩），而拿一个偏大的偏移去发 `Range` 会得到 416。
+@DataClassName('DownloadTaskRow')
+class DownloadTasks extends Table {
+  /// 主键：`provider:fileId`（见 `DownloadTask.idFor`）
+  TextColumn get id => text()();
+
+  /// 所属网盘（`DriveProvider.name`）
+  TextColumn get provider => text()();
+
+  /// 网盘侧文件 ID
+  TextColumn get fileId => text()();
+
+  /// 文件名（含扩展名）。展示用。
+  TextColumn get name => text()();
+
+  /// 网盘上的目录路径（归一化，不带尾斜杠）。展示用 ——
+  /// 同一个 `a.zip` 在 `/电影/` 与 `/备份/` 下是两个东西，不给路径就分不清。
+  TextColumn get dirPath => text().withDefault(const Constant('/'))();
+
+  /// **本地目标路径**（绝对路径）。续传时 `.part` 由它派生（`'$savePath.part'`）。
+  TextColumn get savePath => text()();
+
+  /// 文件总字节数。网盘没给时为 `null`，此时进度条只能是不确定态。
+  IntColumn get sizeBytes => integer().nullable()();
+
+  /// 已落盘字节数（进度快照，真源见类文档）。
+  IntColumn get receivedBytes => integer().withDefault(const Constant(0))();
+
+  /// 状态（`DownloadStatus.name`）。
+  ///
+  /// 存枚举名而不是序号：加一个状态时序号会整体错位，旧数据会**静默**
+  /// 变成另一个状态（与 `media_items.resolution` 存 label 同一条理由）。
+  TextColumn get status => text()();
+
+  /// 失败原因（面向用户的一句话）。成功 / 未失败时为 `null`。
+  TextColumn get error => text().nullable()();
+
+  DateTimeColumn get createdAt => dateTime()();
+  DateTimeColumn get updatedAt => dateTime()();
+
+  @override
+  Set<Column> get primaryKey => {id};
 }
 
 /// 通用键值设置表。

@@ -52,6 +52,22 @@ class QuarkEndpoints {
   /// `action_type=2` 为永久删除；`filelist` 是 fid 列表。
   static const String fileDelete = '/1/clouddrive/file/delete';
 
+  /// 移动文件/文件夹（批量）。
+  ///
+  /// 请求体：`{action_type, to_pdir_fid, filelist, exclude_fids}`。
+  /// `action_type=1` 为移动；`to_pdir_fid` 是目标目录 fid。
+  ///
+  /// ⚠️ 与 [fileDelete] **同族**（同一个 `action_type` + `filelist` 组合），
+  /// 所以字段名可以从 delete 那条直接推。但**别照抄官方开放平台文档**：
+  /// `open-api-drive.quark.cn` 的 `/open/v1/file/move` 用的是
+  /// `fid_list` + `fid_list≤100`，字段名与本网关**不一样**，两套网关
+  /// 不能混（鉴权也不同，见 `QuarkEndpoints.pcGateway` 的注释）。
+  ///
+  /// ⚠️ 一次最多带 100 个 fid（来源是官方 `file/move` 的 `fid_list` 上限，
+  /// 社区实现与本网关同族接口都按这个数）。见
+  /// `driveMaxFidsPerRequest`。
+  static const String fileMove = '/1/clouddrive/file/move';
+
   /// 上传预请求（秒传判定 + 分片地址分配）。
   ///
   /// 请求体含 `file_name`、`size`、`pdir_fid`、`format_type`、

@@ -1,4 +1,5 @@
 import 'package:cloudcine/core/utils/player_audio_effect.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// 「音效」预设 → mpv 属性的映射。
@@ -108,6 +109,88 @@ void main() {
     test('四个预设的名字互不相同（菜单里要按名字认）', () {
       final labels = PlayerAudioEffect.all.map(PlayerAudioEffect.label).toSet();
       expect(labels.length, PlayerAudioEffect.all.length);
+    });
+  });
+
+  // ## 为什么这一组非有不可
+  //
+  // macOS 上把 `audio-spdif` 下发出去，mpv 的音频输出就永远建不起来，而音频是
+  // mpv 的主时钟 —— **整部片一动不动**（位置冻在起点、画面不动），不是「没声音」。
+  // 更糟的是它只在**开流时**生效：播放中改它毫无效果，于是用户会以为没问题，
+  // 下次打开才发现播不了（实测与复现配方见 `player_audio_effect.dart` 类文档）。
+  //
+  // 所以这里守的是三条**都不报错**的规则：读出来的档位、菜单里列的档位、
+  // 真正会下发到 mpv 的属性。任何一条漏掉，症状都是「用户打不开影片」。
+  group('平台守卫：macOS 上「直通」必须失效', () {
+    test('macOS：直通读作跟随片源，且不会下发 audio-spdif', () {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      expect(PlayerAudioEffect.passthroughAvailable, isFalse);
+
+      // ① 库里存着的 `passthrough`（老用户装过这个版本）必须读成 auto。
+      //    否则菜单勾着「直通」、实际按「跟随片源」在放，两边对不上。
+      expect(
+        PlayerAudioEffect.parse(AudioEffectPreset.passthrough.value),
+        AudioEffectPreset.auto,
+        reason: '老设置里的 passthrough 没被折掉，会继续下发 spdif → 影片卡死',
+      );
+
+      // ② 真会送到 mpv 的那份属性里不能再有 spdif 名单。
+      //    断言走「normalize → mpvProperties」这条链，而不是直接断言
+      //    `mpvProperties(passthrough)`：后者是纯映射表，故意不含平台判断
+      //    （守卫的位置见 `PlayerAudioEffect.apply`）。
+      expect(
+        PlayerAudioEffect.mpvProperties(
+          PlayerAudioEffect.normalize(AudioEffectPreset.passthrough),
+        )['audio-spdif'],
+        'no',
+        reason: '只要还有一条路径把 spdif 名单下发出去，macOS 上影片就会卡死',
+      );
+
+      // ③ 菜单里不能再列它 —— 列出来就必须点得动。
+      expect(
+        PlayerAudioEffect.selectable,
+        isNot(contains(AudioEffectPreset.passthrough)),
+        reason: 'macOS 上把「直通」列在菜单里，用户点了就是「没反应」',
+      );
+      expect(
+        PlayerAudioEffect.selectable.length,
+        PlayerAudioEffect.all.length - 1,
+      );
+    });
+
+    test('macOS：另外三档一个字都不许动', () {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      // 守卫是**只针对直通**的。写成「macOS 上随便折成 auto」的话，
+      // 「环绕上混」和「立体声」会一起静默失效 —— 同样是点了没反应。
+      for (final p in <AudioEffectPreset>[
+        AudioEffectPreset.auto,
+        AudioEffectPreset.upmix,
+        AudioEffectPreset.stereo,
+      ]) {
+        expect(PlayerAudioEffect.parse(p.value), p);
+        expect(PlayerAudioEffect.normalize(p), p);
+        expect(PlayerAudioEffect.selectable, contains(p));
+      }
+    });
+
+    test('其他平台仍然保留直通（别把守卫写宽了）', () {
+      // 只在 macOS 上关掉它，是因为**只有 macOS 上有实测证据**。
+      // 顺手把这条写成用例：以后有人「顺手」把守卫扩大到全平台时，这里会红。
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      expect(PlayerAudioEffect.passthroughAvailable, isTrue);
+      expect(
+        PlayerAudioEffect.parse(AudioEffectPreset.passthrough.value),
+        AudioEffectPreset.passthrough,
+      );
+      expect(PlayerAudioEffect.normalize(AudioEffectPreset.passthrough),
+          AudioEffectPreset.passthrough);
+      expect(PlayerAudioEffect.selectable, PlayerAudioEffect.all);
     });
   });
 }

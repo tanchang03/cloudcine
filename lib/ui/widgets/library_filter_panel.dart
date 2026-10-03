@@ -103,7 +103,7 @@ class _FilterButton extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final filter = ref.watch(libraryFilterProvider);
-    final selected = filter.years.length + filter.genres.length;
+    final selected = filter.selectedCount;
     final active = selected > 0;
 
     // 有生效条件时整颗按钮变强调色并带数字：用户从别的地方回到媒体库，
@@ -112,7 +112,7 @@ class _FilterButton extends ConsumerWidget {
     final color = active ? AppTheme.accent : AppTheme.muted;
 
     return Tooltip(
-      message: '按年份 / 类型筛选',
+      message: '按年份 / 类型 / 刮削状态筛选',
       child: Material(
         color: active
             ? AppTheme.accent.withValues(alpha: open ? 0.22 : 0.14)
@@ -173,7 +173,7 @@ class _FilterPanel extends ConsumerWidget {
     final genres = ref.watch(genreCountsProvider);
     final notifier = ref.read(libraryFilterProvider.notifier);
 
-    final selected = filter.years.length + filter.genres.length;
+    final selected = filter.selectedCount;
 
     return SizedBox(
       key: const Key('library-filter-panel'),
@@ -212,6 +212,19 @@ class _FilterPanel extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // 放在最上面：它改的是「这一份列表里有哪些作品」，
+                  // 下面两组年份 / 类型是在它筛出来的那批里再分面 ——
+                  // 阅读顺序与作用域顺序一致（理由见 `_facetScope`）。
+                  const _SectionTitle('刮削'),
+                  // 只有一颗、也**不给数量角标**：年份 / 类型那些数字的承诺
+                  // 是「点下去至少有这么条结果」，而这是个开关 —— 它要么筛
+                  // 要么不筛，多印一个数字只会让人以为它和年份一样可以多选。
+                  _FilterChip(
+                    label: '已刮削',
+                    selected: filter.scrapedOnly,
+                    onTap: notifier.toggleScrapedOnly,
+                  ),
+                  const SizedBox(height: 15),
                   const _SectionTitle('年份'),
                   _YearChips(counts: years, filter: filter),
                   const SizedBox(height: 15),

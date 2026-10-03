@@ -127,6 +127,23 @@ class ScraperPipeline {
   ///
   /// 返回结果里带上 `matchedQuery`，便于排查「刮错了片子」——
   /// 很多时候是片名解析错了，而不是刮削器错了。
+  ///
+  /// ## 候选链：文件名 → 目录名（逐级向上）
+  ///
+  /// [ScrapeQuery.fallbacks] 非空时**串行、命中即停**地一条条试。理由：
+  ///
+  ///   - **串行**：每往后一条就多花一次搜索词，而豆瓣匿名额度只有约 10 个
+  ///     （见类文档）。并发起跑会把 3 条候选的额度一次全花掉，即使第一条
+  ///     就命中 —— 而这条链的意义恰恰是「前面命中时后面根本不该发请求」；
+  ///   - **命中即停**：与「按优先级取第一个成功的」同一条思路，先到先得。
+  ///
+  /// ## 兜底（本地文件名解析）**只用主查询**
+  ///
+  /// 本地兜底永远成功，所以它排在链的最后、且**不参与逐条尝试**。这一条
+  /// 很容易写错成「每条候选后面都跑一遍兜底」—— 那会让「在线源全落空」时
+  /// 拿**目录名**去当作品名（`ScrapeQuery.fallbacks` 那几条就是这么来的），
+  /// 结果是作品被改成一个既没海报也没简介的目录名，用户只会觉得
+  /// 「刮了一次，名字反而变了」。
   Future<ScrapedMetadata?> scrape(ScrapeQuery query) async {
     if (scrapers.isEmpty) return null;
 
@@ -146,24 +163,11 @@ class ScraperPipeline {
       }
     }
 
-    if (enabled.isNotEmpty) {
-      // 同时起跑。**必须一次性建完所有 future**：写成 `await` 循环就退化成
-      // 串行了，而这个方法的全部意义就在于并发。
-      final futures = <Future<ScrapedMetadata?>>[
-        for (final s in enabled) _attempt(s, query),
-      ];
-
-      // 再按优先级依次取结果。
-      for (var i = 0; i < futures.length; i++) {
-        final result = await futures[i];
-        if (result != null) {
-          diag.info(
-            '刮削',
-            '${enabled[i].id} 命中：$query → "${result.title}"'
-            '${result.year == null ? "" : " (${result.year})"}',
-          );
-          return result;
-        }
+    for (final q in [query, ...query.fallbacks]) {
+      final hit = await _race(enabled, q);
+      if (hit != null) return hit;
+      if (!identical(q, query)) {
+        diag.info('刮削', '候选链："${q.title}" 也没命中，到此为止');
       }
     }
 
@@ -172,6 +176,37 @@ class ScraperPipeline {
       return null;
     }
     return _attempt(fallback, query);
+  }
+
+  /// 让所有启用的竞速者**同时起跑**，再**按优先级**取第一个成功的。
+  ///
+  /// 拆分出来只为了 [scrape] 能对着候选链逐条调用 —— 并发与排序的语义
+  /// 一个字都没变（见 [scrape] 类文档里的「两种源的两种跑法」）。
+  Future<ScrapedMetadata?> _race(
+    List<MetadataScraper> enabled,
+    ScrapeQuery query,
+  ) async {
+    if (enabled.isEmpty) return null;
+
+    // 同时起跑。**必须一次性建完所有 future**：写成 `await` 循环就退化成
+    // 串行了，而这个方法的全部意义就在于并发。
+    final futures = <Future<ScrapedMetadata?>>[
+      for (final s in enabled) _attempt(s, query),
+    ];
+
+    // 再按优先级依次取结果。
+    for (var i = 0; i < futures.length; i++) {
+      final result = await futures[i];
+      if (result != null) {
+        diag.info(
+          '刮削',
+          '${enabled[i].id} 命中：$query → "${result.title}"'
+          '${result.year == null ? "" : " (${result.year})"}',
+        );
+        return result;
+      }
+    }
+    return null;
   }
 
   /// 当前可做手动搜索的源（已启用且**能出候选**的）。

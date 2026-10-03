@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:media_kit/media_kit.dart';
 
 import '../diagnostics/diag_log.dart';
@@ -48,7 +49,37 @@ import '../diagnostics/diag_log.dart';
 ///   - `audio-channels`：输出的声道布局；
 ///   - `audio-spdif`：把压缩码流原样交给输出设备（HDMI 功放）。
 ///
-/// 两者都在 mpv 0.36 上实测可设（`mpv_set_property_string` 返回成功）。
+/// ## ⛔ `audio-spdif`（直通）在 macOS 上**会把整部片卡死**，别下发
+///
+/// 2026-10-03 实测（用产物里的真 libmpv，`vo=null` + E-AC-3 5.1 素材）：
+///
+///   - `audio-spdif=no`：`time-pos` 正常前进；
+///   - `audio-spdif=ac3,eac3,dts,truehd,dts-hd`：mpv 挑出 `spdif_eac3`
+///     （libavformat/spdifenc）当解码器后，**音频输出永远建不起来** ——
+///     verbose 日志里连 `[ao] Trying audio driver` 都没有，停在
+///     `[ad] In: profile=-99 samplerate=44100`。
+///   - 音频是 mpv 的**主时钟**。音频链不走，视频就永远等它 →
+///     `core-idle=yes`、`time-pos` 冻在起点。**表现是整部片卡死，不是「没声音」。**
+///   - ⚠️ **不是**「设备不支持直通」那一步：加 `ao=null`（压根不需要设备）
+///     同样卡死 —— mpv 不会退回解码，而是直接停住。
+///   - 只有编码落在名单里的音轨才中招（E-AC-3 / AC-3 / DTS / TrueHD）。
+///     AAC 音轨、以及夸克的转码 HLS 流（AAC）不受影响 —— 这正是
+///     「同一部片，4K 档能播、原画档卡死」的原因。
+///
+/// ⚠️ 而且**播放中改它毫无效果**：`set_property_string("audio-spdif", …)`
+/// 对当前这条流没有影响（`current-ao` 仍是 `coreaudio`，位置照常前进），
+/// 它只在**开流时**参与音频链的搭建。所以「播放中选直通」看着一切正常，
+/// 值却已落库，**下次打开才卡死** —— 这也是 `setAudioEffect` 那句
+/// 「立即生效、不用重开流」必须按平台打折的原因。
+///
+/// 因此 [passthroughAvailable] 在 macOS 上为 `false`：[parse] 会把直通读成
+/// [AudioEffectPreset.auto]（界面上显示的就是真正会用的那一档），菜单也不再
+/// 列它，[apply] 另有一道守卫兜底。
+/// 想恢复它，得先换一份音频链能走通的 libmpv —— **换之前不要摘掉这三处守卫**。
+///
+/// 顺带记一条同源的教训：`mpv_set_property_string` **返回成功不代表用得了**。
+/// 本文件顶部 `af set` 那条坑与这条是同一类 —— 判断能力只能靠**跑一遍看结果**，
+/// 不能靠返回值。
 enum AudioEffectPreset {
   /// 跟随片源：只下混、不上混。**默认**。
   auto,
@@ -82,13 +113,48 @@ abstract final class PlayerAudioEffect {
   /// 全部预设，按菜单里的显示顺序。
   static const List<AudioEffectPreset> all = AudioEffectPreset.values;
 
+  /// 「杜比 / DTS 直通」在当前平台上是否真的可用。
+  ///
+  /// macOS 上是 `false`：理由见类文档 —— 本库的 libmpv 走 spdif 直通时音频
+  /// 输出建不起来，会把**整部片**卡死（不是「没声音」）。判定走
+  /// `defaultTargetPlatform`（与 `SecretBackend.forPlatform` 同一套口径），
+  /// 好处是 `flutter test` 里能用 `debugDefaultTargetPlatformOverride` 直接测。
+  ///
+  /// ⚠️ 只挡 macOS，因为**只有 macOS 上有实测证据**。Android / Windows 上的
+  /// 直通还没测过，保持原样 —— 宁可留着，也别凭猜测砍掉用户可能用得上的功能。
+  static bool get passthroughAvailable =>
+      !kIsWeb && defaultTargetPlatform != TargetPlatform.macOS;
+
+  /// 菜单里该列的预设。
+  ///
+  /// **列出来就必须做得到**：把一个点不动的档位摆在菜单里，等于给用户埋一个
+  /// 「功能没做」的印象 —— 这正是本文件顶部 `af set` 那条坑的教训。
+  static List<AudioEffectPreset> get selectable => passthroughAvailable
+      ? all
+      : all.where((p) => p != AudioEffectPreset.passthrough).toList();
+
+  /// 把预设折到「当前平台真的会用的那一档」。
+  ///
+  /// 目前只有一条规则：直通不可用时退回 [AudioEffectPreset.auto]。
+  /// **纯函数、无副作用**，所以能直接单测。
+  static AudioEffectPreset normalize(AudioEffectPreset p) =>
+      (p == AudioEffectPreset.passthrough && !passthroughAvailable)
+          ? AudioEffectPreset.auto
+          : p;
+
   /// 从设置库读出来的字符串还原。**任何读不懂的值都退回默认**，
   /// 不抛异常：设置库是用户能手动改的（也能被旧版本写坏），
   /// 为一个字符串把播放器拦在启动之前不值得。
+  ///
+  /// ⚠️ 它的契约是「还原成一个**能用的**档位」，不是「原样翻译字符串」：
+  /// 读出来还要过一遍 [normalize]。所以 macOS 上库里存着的 `passthrough`
+  /// 会读成 `auto` —— 这样**菜单勾的和实际下发的是同一档**，不会再出现
+  /// 「显示着直通、其实按跟随片源在放」。老设置仍然读得回来（枚举值与
+  /// `parse` 入口都没动），换回支持直通的引擎后它自己就恢复。
   static AudioEffectPreset parse(String? raw) {
     if (raw == null) return AudioEffectPreset.auto;
     for (final p in all) {
-      if (p.value == raw) return p;
+      if (p.value == raw) return normalize(p);
     }
     return AudioEffectPreset.auto;
   }
@@ -154,7 +220,18 @@ abstract final class PlayerAudioEffect {
     final platform = player.platform;
     if (platform is! NativePlayer) return;
 
-    final props = mpvProperties(preset);
+    // 最后一道守卫。正常路径上 `preset` 已经过 [parse] / [normalize]，走不到
+    // 这里；但 `setAudioEffect` 是公开 API，而这里漏一次的代价是**整部片卡死**
+    // —— 一条日志换一次「播不了」，很划算。
+    final effective = normalize(preset);
+    if (effective != preset) {
+      diag.warn(
+        '音效',
+        '「${label(preset)}」在当前平台不可用，已按「${label(effective)}」下发',
+      );
+    }
+
+    final props = mpvProperties(effective);
     try {
       for (final entry in props.entries) {
         await platform.setProperty(entry.key, entry.value);
@@ -164,7 +241,7 @@ abstract final class PlayerAudioEffect {
       diag.debug('音效', '设置音效属性失败：$e');
       return;
     }
-    await _confirmChannels(platform, preset, props['audio-channels']!);
+    await _confirmChannels(platform, effective, props['audio-channels']!);
   }
 
   /// 读回 `audio-channels`，确认真的生效了。

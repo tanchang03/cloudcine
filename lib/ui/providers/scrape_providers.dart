@@ -12,6 +12,7 @@ import '../../domain/services/work_merge_service.dart';
 import '../../domain/services/work_scraper.dart';
 import 'app_providers.dart';
 import 'library_providers.dart';
+import 'library_refresh_providers.dart';
 import 'settings_providers.dart';
 
 /// 在线刮削的**源配置**（只包含影响「用哪些源、打哪个地址」的那几项）。
@@ -453,6 +454,285 @@ class WorkScrapeController extends Notifier<WorkScrapeState> {
 final workScrapeControllerProvider =
     NotifierProvider<WorkScrapeController, WorkScrapeState>(
   WorkScrapeController.new,
+);
+
+// ---------------------------------------------------------------------------
+// 批量刮削：媒体库页的「刮削媒体库」按钮
+// ---------------------------------------------------------------------------
+
+/// 库里**还没在线刮过**的作品 —— 批量刮削的目标。
+///
+/// ## 判据是 `source == local`
+///
+/// 三个取值（见 `ScrapeSource`）在这里各有一个明确的去向：
+///
+///   - `local`：文件名解析的产物，**还没被在线源刮过** —— 正是要刮的；
+///   - `online`：已经刮过了，跳过；
+///   - `manual`：用户点过「自定义」，亲手敲了片名 / 分类。**批量刮削必须
+///     跳过它**。[WorkScraper.scrape] 走的是 `overrideManual: true`（那是给
+///     详情页那个按钮用的：用户亲手点、明确要求覆盖），批量通道沿用同一个
+///     开关就会把用户手敲的片名与分类**一次性冲掉**，而且不报错 ——
+///     这正是「我明明改过的片子，点了一下刮削全变回去了」的来源。
+///
+/// 另外跳过**已被折叠走的别名行**（`mergedInto` 非空）：它的文件已经算在
+/// 目标那一部下面，再刮一次只会把同一份元数据写进一行列表里看不见的记录。
+///
+/// 抽成顶层函数是为了让「按钮上的数字」与「真正会刮的条数」共用同一个筛法
+/// —— 两处各写一遍的话，会出现「按钮写着 128、进度跑到 130 才停」这种对不上。
+List<MediaWork> unscrapedOf(List<MediaWork> all) => all
+    .where((w) => !w.isMergedAway && w.source == ScrapeSource.local)
+    .toList(growable: false);
+
+/// 「还有多少部没刮过」——「刮削媒体库」按钮上的数字。
+///
+/// ## 为什么刮削进行中不要 watch 它
+///
+/// 它每次都要 `allWorks()` **读全表**再在 Dart 里过滤。刮削中每部都会推一次
+/// 列表信号（为了「一个一个出现」的动态感），那时再重算它就是每部一次全表
+/// 读 —— 而刮削中的按钮显示的是控制器自己的 `done/total`，用不到这个数字。
+/// 所以调用方在刮削（或扫描）进行中**不要 watch** 它（见 `library_page.dart`）。
+final unscrapedCountProvider = FutureProvider<int>((ref) async {
+  // 库变了就重算：扫描结束、刮削结束、删除作品…
+  ref.watch(libraryListSignalProvider);
+  final all = await ref.watch(mediaRepositoryProvider).allWorks();
+  return unscrapedOf(all).length;
+});
+
+/// 「刮削媒体库」的进度快照。
+class LibraryScrapeState {
+  const LibraryScrapeState({
+    this.running = false,
+    this.total = 0,
+    this.done = 0,
+    this.scraped = 0,
+    this.missed = 0,
+    this.currentTitle,
+    this.cancelRequested = false,
+    this.finished = false,
+  });
+
+  final bool running;
+
+  /// 本次要刮的总数（点下按钮那一刻定下的）。
+  final int total;
+  final int done;
+
+  /// 在线源命中并落库的部数。
+  final int scraped;
+
+  /// 在线源没命中的部数（含「文件名解析不出片名」那种压根没发请求的）。
+  final int missed;
+
+  /// 正在刮哪一部。进度条旁边显示它，用户才知道不是卡住了。
+  final String? currentTitle;
+
+  /// 用户点了「停止」。协作式：当前这一部的网络请求跑完才生效。
+  final bool cancelRequested;
+
+  /// 这一轮已经结束（跑完或停下）。
+  final bool finished;
+
+  /// 进度比例；总数为 0（或还没开始）时返回 `null`，调用方据此不画确定进度条。
+  double? get fraction =>
+      total <= 0 ? null : (done / total).clamp(0.0, 1.0);
+
+  /// 一句话摘要。
+  String get summary {
+    if (running) return '正在刮削 $done/$total · 命中 $scraped';
+    if (!finished) return '';
+    final head = cancelRequested ? '已停止' : '刮削完成';
+    return '$head：$done/$total · 命中 $scraped · 未命中 $missed';
+  }
+}
+
+/// 批量刮削控制器。
+///
+/// ## 与详情页「刮削」按钮的分工
+///
+/// 详情页那个是**一次一部、用户亲手点**（`WorkScrapeController`）；这里是
+/// **一次一批、只刮没刮过的**（媒体库页的按钮）。两者共用同一个
+/// [workScraperProvider]，所以熔断 / 节流状态是延续的。
+///
+/// ## 为什么它不碰 `WorkScrapeState.runningKey`
+///
+/// 那个互斥位是「同一部作品不能有两笔写操作并发」。批量刮削跑的时候，
+/// 用户不可能同时在详情页对**同一部**再点一次（列表里那一部正在被刮，
+/// 而 UI 上批量按钮已经禁用）—— 真正要挡的是「两边同时写库」，
+/// 那由**媒体库页**在扫描 / 刮削进行时禁用对应按钮来保证（见 `library_page`）。
+class LibraryScrapeController extends Notifier<LibraryScrapeState> {
+  bool _cancelRequested = false;
+  bool _disposed = false;
+
+  @override
+  LibraryScrapeState build() {
+    _disposed = false;
+    ref.onDispose(() => _disposed = true);
+    return const LibraryScrapeState();
+  }
+
+  /// 请求停止（协作式）。
+  void cancel() {
+    if (!state.running) return;
+    _cancelRequested = true;
+    _emit(
+      LibraryScrapeState(
+        running: true,
+        total: state.total,
+        done: state.done,
+        scraped: state.scraped,
+        missed: state.missed,
+        currentTitle: state.currentTitle,
+        cancelRequested: true,
+      ),
+    );
+  }
+
+  /// 收起结束后那条结果提示（媒体库页活动条上的「关闭」）。
+  ///
+  /// 进行中调用是空操作：正在跑的进度条不该被关掉。
+  void dismiss() {
+    if (state.running) return;
+    _emit(const LibraryScrapeState());
+  }
+
+  /// 开始一轮批量刮削。
+  ///
+  /// ## 与扫描互斥
+  ///
+  /// 两边都写 `media_works`，同时跑会互相覆盖。**由调用方**（媒体库页）在
+  /// 扫描运行时禁用按钮；这里只挡住「自己已经在跑」。
+  Future<void> start() async {
+    if (state.running) return;
+    _cancelRequested = false;
+    _emit(const LibraryScrapeState(running: true));
+
+    final List<MediaWork> targets;
+    try {
+      targets = unscrapedOf(
+        await ref.read(mediaRepositoryProvider).allWorks(),
+      );
+    } catch (e) {
+      diag.warn('刮削', '批量刮削：读取未刮削作品失败，取消本轮', error: e);
+      _emit(const LibraryScrapeState());
+      return;
+    }
+    if (_disposed) return;
+
+    if (targets.isEmpty) {
+      _emit(const LibraryScrapeState(finished: true));
+      return;
+    }
+
+    final scraper = ref.read(workScraperProvider);
+    var done = 0;
+    var scraped = 0;
+    var missed = 0;
+
+    _emit(LibraryScrapeState(running: true, total: targets.length));
+
+    for (final work in targets) {
+      if (_cancelRequested || _disposed) break;
+
+      WorkScrapeOutcome outcome;
+      try {
+        outcome = await scraper.scrape(work);
+      } catch (e) {
+        // `WorkScraper.scrape` 的契约是「永不抛异常」，但这里是**批量**循环：
+        // 万一有一部真的抛了，不该让后面几十部跟着一起断掉。
+        diag.warn('刮削', '批量刮削：${work.key} 抛异常，按未命中处理', error: e);
+        outcome = const WorkScrapeOutcome(
+          status: WorkScrapeStatus.notFound,
+          channel: ScrapeChannel.auto,
+        );
+      }
+      if (_disposed) break;
+
+      done++;
+      if (outcome.status == WorkScrapeStatus.scraped) {
+        scraped++;
+      } else {
+        missed++;
+      }
+
+      _emit(
+        LibraryScrapeState(
+          running: true,
+          total: targets.length,
+          done: done,
+          scraped: scraped,
+          missed: missed,
+          currentTitle: work.title,
+        ),
+      );
+
+      // 每刮完一部就让媒体库列表重取一次 —— 用户要的正是「一个一个刮削成功」
+      // 的动态感，而不是等整批跑完才一起冒出来。
+      //
+      // 只推**列表信号**（不是 `libraryWriteSignalProvider`）：后者会连带
+      // 触发目录视图那棵要读全表的 `folderTreeProvider`，而刮削只改
+      // `media_works` 的元数据、`media_items` 一个字都没变。见 `LibraryListSignal`。
+      ref.read(libraryListSignalProvider.notifier).bump();
+    }
+
+    // 自动归一：与扫描结束同一条规则（设置开着才做），放在**全部落库之后** ——
+    // 归一要比较不同作品之间的 `onlineId`，一部刚刮完、另一部早在上一轮就
+    // 刮好了，只有等这一轮全部写完才看得全。用户点了停止就不做（半份数据上
+    // 归一会漏合）。
+    if (!_disposed && !_cancelRequested) {
+      final enabled =
+          ref.read(settingsProvider).valueOrNull?.autoMergeByOnlineId ?? false;
+      if (enabled) {
+        try {
+          await WorkMergeService(library: ref.read(mediaRepositoryProvider))
+              .mergeAll();
+        } catch (e) {
+          diag.warn('刮削', '批量刮削后的自动归一失败，跳过', error: e);
+        }
+      }
+    }
+
+    _refreshAfterAll();
+    _emit(
+      LibraryScrapeState(
+        total: targets.length,
+        done: done,
+        scraped: scraped,
+        missed: missed,
+        cancelRequested: _cancelRequested,
+        finished: true,
+      ),
+    );
+  }
+
+  void _emit(LibraryScrapeState next) {
+    if (_disposed) return;
+    state = next;
+  }
+
+  /// 整轮结束后的完整刷新。
+  ///
+  /// 三组筛选角标（分类 / 年份 / 类型）各自是一次全表统计，**不能**跟着每部
+  /// 都跑 —— 所以它们只在这里统一作废。`workListProvider` 那一份虽然每部都
+  /// 被信号刷过，这里再作废一次是为了兜住「一部都没刮成」（循环一次都没进，
+  /// 信号也就一次没推）的情形。
+  void _refreshAfterAll() {
+    if (_disposed) return;
+    ref.invalidate(workListProvider);
+    ref.invalidate(libraryStatsProvider);
+    ref.invalidate(unscrapedCountProvider);
+    ref.invalidate(categoryCountsProvider);
+    ref.invalidate(yearCountsProvider);
+    ref.invalidate(genreCountsProvider);
+    ref.invalidate(playedCountProvider);
+    // 目录视图的「已入库」叠加层读的是同一张表。刮削不改「哪些文件已入库」，
+    // 但顺手推一下，让任何读库的视图都与列表对齐。
+    ref.read(libraryWriteSignalProvider.notifier).bump();
+  }
+}
+
+final libraryScrapeControllerProvider =
+    NotifierProvider<LibraryScrapeController, LibraryScrapeState>(
+  LibraryScrapeController.new,
 );
 
 /// 设置里的地址留空时回退到默认值。

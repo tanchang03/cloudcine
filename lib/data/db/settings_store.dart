@@ -190,6 +190,30 @@ class SettingKeys {
   /// 本地中继的并发连接数。默认 8，上限 16。
   static const String relayConnections = 'relay_connections';
 
+  /// 目录视图（「文件夹」）列表的排序方式。取值见 `FolderSortMode`
+  /// （`modifiedTime` / `fileName`）。
+  ///
+  /// 默认是**修改时间倒序**。与其它「缺失即用默认」的设置一样，判据只写在
+  /// `FolderSortMode.parse` 一处 —— 它只认两个枚举名，其余（`null`、老版本
+  /// 写坏的值、手工改过的）一律退回默认。在这里再写一遍 `== '...'` 只会
+  /// 多出一处会漂移的默认值真源。
+  static const String folderSortMode = 'folder_sort_mode';
+
+  /// 作品详情页「文件」列表的排序方式。取值见 `ItemSortMode`
+  /// （`episodeOrder` / `modifiedDesc` / `modifiedAsc`）。
+  ///
+  /// 默认是**修改时间倒序**。判据（含默认值）只写在 `ItemSortMode.parse`
+  /// 一处，理由与 [folderSortMode] 完全相同 —— 在这里再写一遍 `== '...'`
+  /// 只会多出一处会漂移的默认值真源。
+  ///
+  /// ## 与 [folderSortMode] 分开存是**刻意**的
+  ///
+  /// 两者排的是两种东西：目录视图列的是**网盘实时目录**（子目录 + 各种
+  /// 文件），详情页列的是**已入库的媒体文件**（一部剧的 N 集）。合成一个
+  /// 键的话，用户在目录视图把排序切成「名称」再进详情页，看到的会是按
+  /// 文件名排的集 —— 而集号在文件名里未必是自然序。
+  static const String itemSortMode = 'item_sort_mode';
+
   /// 备份同步的网盘目录名。空串 = 用默认目录名「云影备份」。
   static const String backupDirName = 'backup_dir_name';
 
@@ -199,6 +223,39 @@ class SettingKeys {
 
   /// 上次备份同步时间（ISO8601）。
   static const String lastBackupAt = 'last_backup_at';
+
+  /// 同时最多跑几个下载任务。默认 5，上限 10。
+  ///
+  /// ## 为什么与「中继并发连接数」是两回事
+  ///
+  /// `relayConnections` 是**一条流**内部的连接数（为了一条视频播得动），
+  /// 这一项是**同时下几个文件**。合成一个键的话，用户为了「多下几个文件」
+  /// 把数字调大，会顺手把播放那条流也改成十几路并发 —— 而两者对网盘的
+  /// 压力完全不同（一个文件几十 GB，十几路并发取链会被风控）。
+  ///
+  /// ## 为什么默认 5、上限 10
+  ///
+  /// 下载是**大块顺序读**，每个任务自己就能把带宽吃满；开太多只是让每个
+  /// 任务都变慢，还会让网盘侧看到「同一账号短时间开了十几个大文件」。
+  /// 10 是实测还能保持稳定的上界。设成 0 会让下载永远不动（队列空转），
+  /// 所以下限是 1 —— 判据写在 `AppSettings.fromValues` 里做 clamp。
+  static const String downloadConcurrency = 'download_concurrency';
+
+  /// 最近用过的**移动目标目录**，JSON 数组（`[{fid,name,path}, …]`）。
+  ///
+  /// ## 为什么这个要落库，而不是每次重新选
+  ///
+  /// 整理网盘的真实动作是**反复的**：把这一批散片移进「待整理」、再把那一批
+  /// 移进「电影」，中间要来回进出好几个目录。不记的话，每移一批都要在
+  /// 目录树里重新点五六层 —— 而这个动作本身很快，找目录反而成了主要成本。
+  ///
+  /// ## 为什么是「值本身」而不是别的键名约定
+  ///
+  /// 它是一份**缓存**，不是偏好：读不懂（旧版本格式、手工改坏、被别的
+  /// 程序写过）必须一律退回空列表，绝不能抛 —— 抛出去的后果是文件夹页
+  /// 打不开，而用户丢掉的只是「最近记录」。判据只写在
+  /// `MoveTargetsController._parse` 一处。
+  static const String moveTargetRecents = 'move_target_recents';
 }
 
 /// 通用键值设置存储。

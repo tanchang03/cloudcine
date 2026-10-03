@@ -687,6 +687,127 @@ void main() {
       expect(md, isNotNull);
       expect(md!.year, 2023);
     });
+
+    test('宽松档（无年份的电影）：精确同名排第一 → 命中', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(
+              id: 1368337,
+              title: '奥德赛',
+              originalTitle: 'The Odyssey',
+              releaseDate: '2026-07-17',
+            ),
+            // 后面跟着「沾边」的候选：它不精确同名，不该影响判定。
+            _movieJson(id: 2, title: '奥德赛：归来', releaseDate: '2024-01-01'),
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          title: '奥德赛',
+          kind: MediaKind.movie,
+          requireExactTitle: true,
+        ),
+      );
+
+      expect(
+        md,
+        isNotNull,
+        reason: '无年份的电影（`/来自：分享/奥德赛/1080P.mkv`）以前**一次都刮不到**，'
+            '因为 `isConfident` 直接把它挡在门外。现在放行：只要第一条就是'
+            '精确同名、且精确同名只有这一条',
+      );
+      expect(md!.onlineId, 'movie/1368337');
+    });
+
+    test('宽松档：只有前缀同名 → null（严格档会无条件放行的正是这一档）', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(id: 2, title: '奥德赛：归来', releaseDate: '2024-01-01'),
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          title: '奥德赛',
+          kind: MediaKind.movie,
+          requireExactTitle: true,
+        ),
+      );
+
+      expect(
+        md,
+        isNull,
+        reason: '「奥德赛：归来」在严格档下拿 0.86（> 0.6）**无条件通过** —— '
+            '而那正是静默刮错：用户会看到另一部片子的标题、简介和海报。'
+            '无年份时没有年份可兜底，只能要求精确同名',
+      );
+    });
+
+    test('宽松档：精确同名但**不在第一位** → null', () async {
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(id: 680, title: '低俗小说', releaseDate: '1994-09-10'),
+            _movieJson(id: 1368337, title: '奥德赛', releaseDate: '2026-07-17'),
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          title: '奥德赛',
+          kind: MediaKind.movie,
+          requireExactTitle: true,
+        ),
+      );
+
+      expect(
+        md,
+        isNull,
+        reason: '精确同名却不排第一 = TMDB 认为别的更相关。'
+            '宽松档没有年份可仲裁，这种「可疑」就宁可放弃（宁可漏刮）',
+      );
+    });
+
+    test('宽松档：**多条**精确同名 → 取第一条（**不要求唯一**）', () async {
+      // 实测 2026-10-03：搜「奥德赛」时 TMDB 返回 **4 条**精确同名
+      // （豆瓣 2 条）。加「唯一」会把这条正主也挡掉 —— 而它正是最需要救的
+      // 那一类。
+      final http = _server(
+        search: () => <String, Object?>{
+          'results': [
+            _movieJson(id: 1, title: '英雄', releaseDate: '2002-12-19'),
+            _movieJson(id: 2, title: '英雄', releaseDate: '2007-01-01'),
+          ],
+        },
+      );
+      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          title: '英雄',
+          kind: MediaKind.movie,
+          requireExactTitle: true,
+        ),
+      );
+
+      expect(md, isNotNull);
+      expect(
+        md!.onlineId,
+        'movie/1',
+        reason: '同名不同年在无年份时本来就分不出是哪一部。这时借数据源'
+            '自己的相关度排序（TMDB 把最热门的排最前）比「干脆不刮」更有用 —— '
+            '而「唯一」判据会让「奥德赛」这种 4 条同名的正主永远刮不到',
+      );
+    });
   });
 
   group('TmdbScraper 手动通道（search / resolve）', () {

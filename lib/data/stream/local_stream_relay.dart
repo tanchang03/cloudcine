@@ -10,6 +10,7 @@ import '../../domain/adapters/stream_relay.dart';
 import '../../domain/entities/stream_ticket.dart';
 import 'chunk_cache.dart';
 import 'chunk_layout.dart';
+import 'relay_reader_arbiter.dart';
 
 /// 网盘直链的**本地中继**：把一条源站连接变成 N 条并发连接 + 本地缓存。
 ///
@@ -22,6 +23,33 @@ import 'chunk_layout.dart';
 ///
 /// 这里补上那一段：loopback HTTP 服务 + 按块并发预取 + LRU 缓存。mpv 从
 /// `127.0.0.1` 读，单连接的上限被 [LocalStreamRelay.connections] 倍绕过。
+///
+/// ## ⚠️ 连接必须复用（否则等于没并发）
+///
+/// 早期实现**每取一个 2 MiB 块就新建一条 `HttpClient`、取完立刻 `close`**。
+/// 对 17 GiB 的片子那是**上万次 TCP+TLS 握手**：每块都有一段「连接建不起来、
+/// 吞吐为 0」的间隙，聚合吞吐被切成锯齿，稳态净速率贴着甚至低于片源码率
+/// （实测片源 19.74 Mbps = 2.47 MiB/s，而单连接被限在 ~2.43 MiB/s）。
+/// 结果就是「下行看着有 5 MB/s，画面仍播一会卡一会」——那 5 MB/s 是毛值。
+///
+/// 现在每个 worker **长期持有一条连接**（[HttpClient] 默认 keep-alive），
+/// 一块接一块复用同一条 TCP/TLS，握手成本从「每块一次」降到「每 worker 一次」。
+/// 判断复用有没有生效看 [RelayStats.upstreamConnects]：它应远小于
+/// [RelayStats.upstreamRequests]。
+///
+/// ## ⚠️ 预取窗口必须跟着「正在播的那条流」（seek 卡顿的根因）
+///
+/// 一条会话上会**同时挂着好几个读取器**（实测 3~4 个），而播放器拖进度条时
+/// **不会关掉旧连接** —— 旧读取器留在原地继续被喂。早期实现里预取窗口的锚点是
+/// 整个会话唯一的一个，任何读取器请求任何块都会覆盖它，于是 seek 之后锚点在
+/// 旧位置与新位置之间反复拉锯：**实测 69 秒内 78% 的上游带宽喂给了已经不看
+/// 的旧位置**，新位置只拿到约 0.8 MiB/s（片源需要 2.37 MiB/s）→「拖完进度条
+/// 看一会卡一会」，几十秒后才自己恢复。正常起播不卡，正是因为那时只有一条
+/// 读取器，锚点没得争。
+///
+/// 修法是给「谁有权推动窗口」立规矩，见 [RelayReaderArbiter]：靠**请求范围
+/// 长度**认出「在放片子」的读取器，最新的那个说了算；被抛弃的旧连接需求降级到
+/// 低优先队列，只能捡余量。
 ///
 /// ## 它不解决什么
 ///
@@ -67,10 +95,19 @@ class LocalStreamRelay implements StreamRelay {
 
   HttpServer? _server;
   int _tokenSeq = 0;
+
+  /// 读取器编号。**每个 HTTP 请求一个**，用来分辨「同一个播放器的多个并行连接」
+  /// 与「seek 之后新开的那条」。见 [RelayReaderArbiter]。
+  int _readerSeq = 0;
+
   final Map<String, _RelaySession> _sessions = <String, _RelaySession>{};
 
   @override
-  Future<RelayEndpoint?> open(StreamTicket ticket, {String? label}) async {
+  Future<RelayEndpoint?> open(
+    StreamTicket ticket, {
+    String? label,
+    int startOffset = 0,
+  }) async {
     if (!enabled) return null;
 
     final total = ticket.contentLength;
@@ -96,6 +133,7 @@ class LocalStreamRelay implements StreamRelay {
         cache: ChunkCache(maxBytes: maxCacheBytes),
         connections: connections,
         prefetchChunks: math.max(1, prefetchBytes ~/ chunkSize),
+        startOffset: startOffset,
       );
       _sessions[token] = session;
       session.start();
@@ -106,7 +144,8 @@ class LocalStreamRelay implements StreamRelay {
         '已接管 ${label ?? ticket.redactedUrl}：'
         '${(total / 1073741824).toStringAsFixed(2)} GiB，'
         '$connections 连接 × ${(chunkSize / 1048576).round()} MiB 块，'
-        '预取 ${(prefetchBytes / 1048576).round()} MiB',
+        '预取 ${(prefetchBytes / 1048576).round()} MiB'
+        '${startOffset > 0 ? "，起点 ${(startOffset / 1048576).round()} MiB" : ""}',
       );
       return RelayEndpoint(uri: uri, token: token, contentLength: total);
     } catch (e) {
@@ -138,7 +177,7 @@ class LocalStreamRelay implements StreamRelay {
       unawaited(request.response.close().catchError((Object _) {}));
       return;
     }
-    unawaited(_serve(request, session));
+    unawaited(_serve(request, session, ++_readerSeq));
   }
 
   /// 从路径里取会话标识：`/s3` → `s3`。
@@ -148,7 +187,17 @@ class LocalStreamRelay implements StreamRelay {
     return path.startsWith('/') ? path.substring(1) : path;
   }
 
-  Future<void> _serve(HttpRequest request, _RelaySession session) async {
+  /// 服务一个读取器（一个 HTTP 请求）。[reader] 是它的身份 —— 用来让中继
+  /// 分辨「谁在推动预取窗口」，见 [RelayReaderArbiter]。
+  ///
+  /// ⚠️ **seek 时旧连接不一定断**。实测（真 libmpv）播放器拖进度条后旧读取器
+  /// 会留在原地继续被喂，所以「旧读取器会自己消失」这个假设不成立 —— 必须靠
+  /// 身份判定把它降级，否则 8 路 worker 会一直分给已经不看的位置。
+  Future<void> _serve(
+    HttpRequest request,
+    _RelaySession session,
+    int reader,
+  ) async {
     final response = request.response;
     try {
       final total = session.totalLength;
@@ -162,6 +211,10 @@ class LocalStreamRelay implements StreamRelay {
           ..headers.set(HttpHeaders.contentLengthHeader, 0);
         return;
       }
+
+      // 登记这个读取器。范围够长才算「在放片子」，才有资格推动预取窗口 ——
+      // 读 MKV `Cues` 的探索引（请求文件尾那一小段）不算，见 [RelayReaderArbiter]。
+      session.attachReader(reader, range.length);
 
       response
         ..statusCode = requested == null ? HttpStatus.ok : HttpStatus.partialContent
@@ -180,7 +233,7 @@ class LocalStreamRelay implements StreamRelay {
       response.headers.chunkedTransferEncoding = false;
 
       if (request.method != 'HEAD') {
-        await for (final bytes in session.read(range)) {
+        await for (final bytes in session.read(range, reader)) {
           response.add(bytes);
           // 每块刷一次：不 flush 的话数据会攒在 dart:io 的缓冲里，
           // mpv 那边就是「缓冲条不动、等半天才突然涨一截」。
@@ -192,6 +245,8 @@ class LocalStreamRelay implements StreamRelay {
       // 不是错误。只记 debug，别惊动用户。
       diag.debug('中继', '响应中断（通常是播放器换源/seek）：$e');
     } finally {
+      // 当前读取器走了必须让位，否则锚点再没人推动、窗口冻在原地。
+      session.release(reader);
       await response.close().catchError((Object _) {});
     }
   }
@@ -215,6 +270,7 @@ class LocalStreamRelay implements StreamRelay {
     var workers = 0;
     var failures = 0;
     var requests = 0;
+    var connects = 0;
     for (final session in _sessions.values) {
       final s = session.stats;
       downloaded += s.downloadedBytes;
@@ -222,6 +278,7 @@ class LocalStreamRelay implements StreamRelay {
       workers += s.activeWorkers;
       failures += s.upstreamFailures;
       requests += s.upstreamRequests;
+      connects += s.upstreamConnects;
     }
     return RelayStats(
       downloadedBytes: downloaded,
@@ -229,6 +286,7 @@ class LocalStreamRelay implements StreamRelay {
       activeWorkers: workers,
       upstreamFailures: failures,
       upstreamRequests: requests,
+      upstreamConnects: connects,
     );
   }
 
@@ -281,6 +339,7 @@ class _RelaySession {
     required this.cache,
     required this.connections,
     required this.prefetchChunks,
+    required this.startOffset,
   });
 
   final String token;
@@ -293,9 +352,32 @@ class _RelaySession {
   final int connections;
   final int prefetchChunks;
 
+  /// 播放器**即将开始读**的字节偏移（续播点换算）。见 [StreamRelay.open]。
+  ///
+  /// 只在 [start] 里用一次：把预取窗口摆到那儿。之后窗口跟着播放器真实的
+  /// Range 请求走（[_ensure] 会重设 [_prefetchBase]），这个初值就不再有影响。
+  final int startOffset;
+
   /// 播放器此刻就要的块（插队，优先于顺序预取）。
   final Queue<int> _priority = Queue<int>();
   final Set<int> _queued = <int>{};
+
+  /// **已被抛弃的旧读取器**的需求。见 [ReaderDemand.stale]。
+  ///
+  /// 与 [_priority] 分开排队是必须的：混在一起的话，被拖走的旧连接会和正在播的
+  /// 那条流**一比一地抢 worker**（实测旧位置吃掉 78% 带宽）。这里的需求只在
+  /// 预取窗口已经填满、没有别的活干时才服务 —— 也就是「白捡的余量」。
+  final Queue<int> _stale = Queue<int>();
+  final Set<int> _queuedStale = <int>{};
+
+  /// 判定「哪个读取器有权推动预取窗口」。纯状态机，见 [RelayReaderArbiter]。
+  ///
+  /// 阈值取「一个预取窗口的字节数」：mpv 播放时的 Range 是开放式的（几个 GiB），
+  /// 读 MKV `Cues` 的探索引只有一两块，两者差好几个数量级，不会误判。
+  late final RelayReaderArbiter _arbiter = RelayReaderArbiter(
+    window: prefetchChunks,
+    minStreamBytes: prefetchChunks * layout.chunkSize,
+  );
 
   /// 预取窗口的起点（块序号），跟着播放器的请求走。
   int _prefetchBase = 0;
@@ -310,6 +392,11 @@ class _RelaySession {
   int _downloaded = 0;
   int _requests = 0;
   int _failures = 0;
+
+  /// 累计**新建**过多少条上游连接。复用生效时它约等于 worker 数，
+  /// 远小于 [_requests]；量级接近就说明每块都在重连（TLS 握手锯齿）。
+  int _connects = 0;
+
   bool _closed = false;
 
   int get totalLength => layout.totalLength;
@@ -320,22 +407,44 @@ class _RelaySession {
         activeWorkers: _inflight.length,
         upstreamFailures: _failures,
         upstreamRequests: _requests,
+        upstreamConnects: _connects,
       );
 
   void start() {
+    // 把预取窗口摆到**播放器即将读的位置**，而不是永远从 0 开始。
+    //
+    // 换清晰度 / 换集时续播点常在中后段：从文件头预取的几百 MiB 一行都用不上，
+    // 而播放器真正要的那一块还得等一次上游往返。摆对了位置，「开流到出画」
+    // 这一段就少掉那次往返。
+    //
+    // 摆错了也没有代价：播放器紧接着发来的真实 Range 请求会在 [_ensure] 里
+    // 把 [_prefetchBase] 重设成正确位置，窗口立刻跟过去。
+    if (startOffset > 0) {
+      final index = layout.indexOf(
+        startOffset.clamp(0, layout.totalLength - 1),
+      );
+      if (layout.isValidIndex(index)) {
+        _prefetchBase = index;
+        _scan = index;
+        _arbiter.seed(index);
+      }
+    }
     for (var i = 0; i < connections; i++) {
       unawaited(_worker());
     }
   }
 
   /// 取出一段字节流。**按需拉取 + 插队**，块没到就等着。
-  Stream<Uint8List> read(ByteRange range) async* {
+  ///
+  /// [reader] 是这个读取器的身份 —— 决定它的需求进哪个队列、能不能推动预取
+  /// 窗口。见 [RelayReaderArbiter]。
+  Stream<Uint8List> read(ByteRange range, int reader) async* {
     var offset = range.start;
     final end = range.end;
     while (offset <= end) {
       if (_closed) return;
       final index = layout.indexOf(offset);
-      final data = await _ensure(index);
+      final data = await _ensure(index, reader);
       if (data == null) {
         throw Exception('取块 $index 失败（上游错误 $_failures 次）');
       }
@@ -347,14 +456,35 @@ class _RelaySession {
     }
   }
 
+  /// 登记一个读取器（一个 HTTP 请求）。[rangeLength] 是它这次要读的字节数。
+  void attachReader(int reader, int rangeLength) =>
+      _arbiter.attach(reader, stream: _arbiter.isStream(rangeLength));
+
+  /// 一个读取器结束了：让出「当前读取器」的身份。
+  void release(int reader) => _arbiter.release(reader);
+
   /// 保证第 [index] 块就绪。已缓存就立刻返回，否则插队并等它到。
-  Future<Uint8List?> _ensure(int index) {
+  Future<Uint8List?> _ensure(int index, int reader) {
     final cached = cache.get(index);
     if (cached != null) return Future<Uint8List?>.value(cached);
 
-    // 预取窗口跟着播放位置走：这是「顺序播放时数据已经在那儿」的来源。
-    _prefetchBase = index;
-    if (!_queued.contains(index) && !_inflight.contains(index)) {
+    // ⚠️ **本文件最关键的一处判定。** 预取窗口跟着「谁」走，见
+    // [RelayReaderArbiter]。改成「谁请求谁就推动窗口」的话，拖进度条之后旧连接
+    // 会把窗口一路拽回旧位置，8 路 worker 被来回改派 —— 实测 seek 后 69 秒内
+    // 78% 带宽喂给了已经不看的地方，新位置饿死，就是「看一会卡一会」。
+    final demand = _arbiter.decide(readerId: reader, index: index);
+    if (demand == ReaderDemand.anchor) {
+      final jumped = (index - _prefetchBase).abs() > prefetchChunks;
+      _prefetchBase = index;
+      if (jumped) _onAnchorJumped(index);
+    }
+
+    if (demand == ReaderDemand.stale) {
+      if (!_queuedStale.contains(index) && !_inflight.contains(index)) {
+        _stale.addLast(index);
+        _queuedStale.add(index);
+      }
+    } else if (!_queued.contains(index) && !_inflight.contains(index)) {
       _priority.addLast(index);
       _queued.add(index);
     }
@@ -363,24 +493,101 @@ class _RelaySession {
     return waiter.future;
   }
 
-  Future<void> _worker() async {
-    while (!_closed) {
-      final index = _take();
-      if (index == null) {
-        // ⚠️ 必须是**异步** Completer。`.sync()` 会在 `complete()` 的调用栈
-        // 里直接跑本 worker 的后续代码，而那一刻 `_notifyWorkers` 还在遍历
-        // `_idleWorkers` —— 于是一次唤醒就抛 Concurrent modification，
-        // 整条流的预取从此停摆（worker 全死，但没人报错）。
-        final idle = Completer<void>();
-        _idleWorkers.add(idle);
-        await idle.future;
-        continue;
+  /// 预取窗口整个换了地方（真 seek，不是顺读）。
+  ///
+  /// 三件事必须一起做，否则「换了位置」只是把锚点写对、缓存和队列还在拖后腿：
+  ///
+  /// 1. **旧位置的排队降级**（不是丢弃）：留在主队列里它们会和正在播的那条流
+  ///    一比一抢 worker。丢弃则会让那些 `_ensure` 永远不返回，读取器就那么吊着。
+  /// 2. **清掉缓存**：旧位置的块一行都用不上了，留着只会占满 LRU，把新位置的
+  ///    预取窗口挤成「下了就淘汰、淘汰了再下」。
+  /// 3. **把新窗口里的等待提升回主队列**：跳转后的第一块往往在降级之前就已经
+  ///    排过队了，不提升的话播放器要等一个「低优先」才拿到起播那块。
+  void _onAnchorJumped(int index) {
+    while (_priority.isNotEmpty) {
+      final queued = _priority.removeFirst();
+      _queued.remove(queued);
+      if (_queuedStale.contains(queued) || _inflight.contains(queued)) continue;
+      _stale.addLast(queued);
+      _queuedStale.add(queued);
+    }
+    cache.clear();
+
+    final windowEnd = math.min(layout.chunkCount, index + prefetchChunks);
+    final keep = Queue<int>();
+    while (_stale.isNotEmpty) {
+      final queued = _stale.removeFirst();
+      _queuedStale.remove(queued);
+      if (_inflight.contains(queued)) continue;
+      if (queued >= index && queued < windowEnd && !_queued.contains(queued)) {
+        _priority.addLast(queued);
+        _queued.add(queued);
+      } else if (!_queuedStale.contains(queued)) {
+        keep.addLast(queued);
+        _queuedStale.add(queued);
       }
-      await _fetch(index);
+    }
+    _stale.addAll(keep);
+
+    diag.info(
+      '中继',
+      '播放位置跳到块 $index'
+      '（约 ${(index * layout.chunkSize / 1048576).round()} MiB）：'
+      '预取窗口改锚，旧位置的排队已降级、缓存已清空',
+    );
+  }
+
+  Future<void> _worker() async {
+    // 每个 worker **长期持有一条连接**，一块接一块复用 —— 这是「不再每 2 MiB
+    // 重连」的关键。复用把上万次 TLS 握手压到 worker 数量级，净喂流从
+    // 「猛灌→握手间隙归零」的锯齿变平稳，稳态才追得上高码率原画。
+    HttpClient? client;
+    try {
+      while (!_closed) {
+        final index = _take();
+        if (index == null) {
+          // ⚠️ 必须是**异步** Completer。`.sync()` 会在 `complete()` 的调用栈
+          // 里直接跑本 worker 的后续代码，而那一刻 `_notifyWorkers` 还在遍历
+          // `_idleWorkers` —— 于是一次唤醒就抛 Concurrent modification，
+          // 整条流的预取从此停摆（worker 全死，但没人报错）。
+          final idle = Completer<void>();
+          _idleWorkers.add(idle);
+          await idle.future;
+          continue;
+        }
+        client ??= _openClient();
+        if (!await _fetch(index, client)) {
+          // 连接级失败：丢掉这条，下一块重建（只影响本 worker）。
+          client.close(force: true);
+          client = null;
+        }
+      }
+    } finally {
+      client?.close(force: true);
     }
   }
 
-  /// 挑下一个要拉的块：先插队，再顺序预取。
+  /// 新建一条**直连**的上游连接，并计入 [_connects]。
+  HttpClient _openClient() {
+    _connects++;
+    final client = HttpClient();
+    // ⚠️ 必须直连：`dart:io` 默认会读 `http_proxy` 环境变量，而本机那份
+    // 代理配置是为命令行工具准备的，走它会把网盘直链也一起代理掉 ——
+    // 表现是「扫描正常、播放奇慢」，且看不出原因。
+    client.findProxy = (Uri _) => 'DIRECT';
+    client.connectionTimeout = const Duration(seconds: 20);
+    // keep-alive 是 `HttpClient` 的默认行为；把空闲回收放宽一点，别让连续
+    // 取块之间那几百毫秒的空档把连接回收掉 —— 回收了就等于又要握手。
+    client.idleTimeout = const Duration(seconds: 30);
+    return client;
+  }
+
+  /// 挑下一个要拉的块：**先插队，再顺序预取，最后才是被抛弃的旧读取器。**
+  ///
+  /// 三段顺序是刻意的。旧读取器的需求排在**最后**：只要预取窗口还有没拉到的块，
+  /// worker 就一直在为「正在播的那条流」干活，旧连接只能捡余量。反过来（把它们
+  /// 和主队列混在一起）它们会和正在播的那条流一比一抢 worker —— 实测旧位置能
+  /// 吃掉 78% 的上游带宽。
   int? _take() {
     while (_priority.isNotEmpty) {
       final index = _priority.removeFirst();
@@ -391,92 +598,97 @@ class _RelaySession {
     }
 
     final windowEnd = math.min(layout.chunkCount, _prefetchBase + prefetchChunks);
-    if (_prefetchBase >= windowEnd) return null;
-    if (_scan < _prefetchBase || _scan >= windowEnd) _scan = _prefetchBase;
+    if (_prefetchBase < windowEnd) {
+      if (_scan < _prefetchBase || _scan >= windowEnd) _scan = _prefetchBase;
+      for (var i = 0; i < windowEnd - _prefetchBase; i++) {
+        final index = _scan;
+        _scan = _scan + 1 >= windowEnd ? _prefetchBase : _scan + 1;
+        if (cache.contains(index) || _inflight.contains(index)) continue;
+        return index;
+      }
+    }
 
-    for (var i = 0; i < windowEnd - _prefetchBase; i++) {
-      final index = _scan;
-      _scan = _scan + 1 >= windowEnd ? _prefetchBase : _scan + 1;
+    while (_stale.isNotEmpty) {
+      final index = _stale.removeFirst();
+      _queuedStale.remove(index);
+      if (!layout.isValidIndex(index)) continue;
       if (cache.contains(index) || _inflight.contains(index)) continue;
       return index;
     }
     return null;
   }
 
-  Future<void> _fetch(int index) async {
+  /// 取第 [index] 块并落缓存。
+  ///
+  /// 返回 **false 表示这条上游连接已坏**，调用方应重建它；
+  /// true 表示连接仍可继续复用（含「上游给了响应但状态/长度不对」）。
+  Future<bool> _fetch(int index, HttpClient client) async {
     _inflight.add(index);
     _requests++;
     try {
-      final data = await _fetchChunk(index);
+      final data = await _fetchChunk(index, client);
       _downloaded += data.lengthInBytes;
       cache.put(index, data);
       _settle(index, data);
+      return true;
     } catch (e) {
       _failures++;
       diag.warn('中继', '取块 $index 失败：$e');
       _settle(index, null);
+      // 只有「上游给了响应但状态/长度不对」才保留连接（[_UpstreamException]）；
+      // socket / TLS / 读中断一律按连接已坏处理，让调用方重建。
+      return e is _UpstreamException;
     } finally {
       _inflight.remove(index);
       _notifyWorkers();
     }
   }
 
+  Future<Uint8List> _fetchChunk(int index, HttpClient client) async {
+    final range = layout.rangeOf(index);
+    final request = await client.getUrl(source);
+    for (final entry in headers.entries) {
+      if (_hopByHop.contains(entry.key.toLowerCase())) continue;
+      request.headers.set(entry.key, entry.value);
+    }
+    request.headers.set(HttpHeaders.rangeHeader, 'bytes=${range.start}-${range.end}');
+    // ⚠️ 禁用压缩：Range 与 gzip 同时用，服务端给的是**整条压缩流的一个
+    // 区间**，根本解不出来。夸克实测对 identity 正常返回 206。
+    request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+
+    final response = await request.close();
+    if (response.statusCode != HttpStatus.partialContent &&
+        response.statusCode != HttpStatus.ok) {
+      await response.drain<void>();
+      throw _UpstreamException('上游返回 ${response.statusCode}');
+    }
+
+    // `HttpClientResponse` 是 `Stream<List<int>>`，不是 `Uint8List` ——
+    // 强转会在某些平台拿到 `_Uint8ArrayView` 之外的实现时炸掉。
+    final pieces = <List<int>>[];
+    var total = 0;
+    await for (final piece in response) {
+      pieces.add(piece);
+      total += piece.length;
+    }
+    final expected = layout.lengthOf(index);
+    // 服务端无视 Range 返回了整条流：照单全收会把几个 GiB 塞进缓存。
+    if (total > expected) {
+      throw _UpstreamException('上游忽略了 Range（给了 $total 字节，只要 $expected）');
+    }
+
+    final out = Uint8List(total);
+    var p = 0;
+    for (final piece in pieces) {
+      out.setRange(p, p + piece.length, piece);
+      p += piece.length;
+    }
+    return out;
+  }
+
   void _settle(int index, Uint8List? data) {
     final waiter = _waiters.remove(index);
     if (waiter != null && !waiter.isCompleted) waiter.complete(data);
-  }
-
-  Future<Uint8List> _fetchChunk(int index) async {
-    final range = layout.rangeOf(index);
-    final client = HttpClient();
-    // ⚠️ 必须直连：`dart:io` 默认会读 `http_proxy` 环境变量，而本机那份
-    // 代理配置是为命令行工具准备的，走它会把网盘直链也一起代理掉 ——
-    // 表现是「扫描正常、播放奇慢」，且看不出原因。
-    client.findProxy = (Uri _) => 'DIRECT';
-    client.connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.getUrl(source);
-      for (final entry in headers.entries) {
-        if (_hopByHop.contains(entry.key.toLowerCase())) continue;
-        request.headers.set(entry.key, entry.value);
-      }
-      request.headers.set(HttpHeaders.rangeHeader, 'bytes=${range.start}-${range.end}');
-      // ⚠️ 禁用压缩：Range 与 gzip 同时用，服务端给的是**整条压缩流的一个
-      // 区间**，根本解不出来。夸克实测对 identity 正常返回 206。
-      request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
-
-      final response = await request.close();
-      if (response.statusCode != HttpStatus.partialContent &&
-          response.statusCode != HttpStatus.ok) {
-        await response.drain<void>();
-        throw HttpException('上游返回 ${response.statusCode}');
-      }
-
-      // `HttpClientResponse` 是 `Stream<List<int>>`，不是 `Uint8List` ——
-      // 强转会在某些平台拿到 `_Uint8ArrayView` 之外的实现时炸掉。
-      final pieces = <List<int>>[];
-      var total = 0;
-      await for (final piece in response) {
-        pieces.add(piece);
-        total += piece.length;
-      }
-      final expected = layout.lengthOf(index);
-      // 服务端无视 Range 返回了整条流：照单全收会把几个 GiB 塞进缓存。
-      if (total > expected) {
-        throw HttpException('上游忽略了 Range（给了 $total 字节，只要 $expected）');
-      }
-
-      final out = Uint8List(total);
-      var p = 0;
-      for (final piece in pieces) {
-        out.setRange(p, p + piece.length, piece);
-        p += piece.length;
-      }
-      return out;
-    } finally {
-      client.close(force: true);
-    }
   }
 
   /// 逐跳首部：由连接本身决定，不能原样转发给上游。
@@ -506,7 +718,23 @@ class _RelaySession {
       if (!waiter.isCompleted) waiter.complete(null);
     }
     _waiters.clear();
+    _priority.clear();
+    _queued.clear();
+    _stale.clear();
+    _queuedStale.clear();
     cache.clear();
     _notifyWorkers();
   }
+}
+
+/// 上游**给了响应**，但状态码或长度不对（非 206/200、或无视 Range 给了整条流）。
+///
+/// 与 socket / TLS 失败区分开：这条路径说明**连接本身是好的**，不该因此把
+/// 连接池里的连接丢掉重建 —— 否则一次 416 就会连累其它正在复用的 worker。
+class _UpstreamException implements Exception {
+  _UpstreamException(this.message);
+  final String message;
+
+  @override
+  String toString() => message;
 }

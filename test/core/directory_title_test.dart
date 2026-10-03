@@ -155,4 +155,71 @@ void main() {
       );
     });
   });
+
+  group('ancestorNames：全部候选目录名（2026-10-03）', () {
+    // 在线刮削的兜底词来源。与 `seriesTitleOf` 是**同一套判据的两个出口**：
+    // 那个只要第一级（归组用），这个要全部（刮削还有哪些词可以试）。
+    // 两处各写一遍循环的话，「什么算容器」迟早会漂移，而漂移的表现是
+    // 「目录名明明是对的，为什么不用它搜」—— 只在刮不到时才暴露。
+
+    test('第一级必须与 seriesTitleOf 一致', () {
+      const paths = [
+        '/来自：分享/仙逆/',
+        '/来自：分享/尚硅谷嵌入式全套教程/01_尚硅谷嵌入式技术之C语言/4.视频/day01/',
+        '/x/姜松《家电维修视频教程》/',
+        '/来自：分享/',
+        '/电影/',
+      ];
+      for (final p in paths) {
+        final names = DirectoryTitle.ancestorNames(p);
+        expect(
+          names.isEmpty ? null : names.first,
+          DirectoryTitle.seriesTitleOf(p),
+          reason: '$p —— 两个出口一旦不一致，归组用的是 A、刮削去搜的是 B',
+        );
+      }
+    });
+
+    test('从末级往上，跳过容器名', () {
+      expect(
+        DirectoryTitle.ancestorNames('/来自：分享/仙逆/'),
+        ['仙逆'],
+        reason: '`来自：分享` 是分享路径噪音，拿它去搜只会搜到一堆无关条目',
+      );
+      expect(
+        DirectoryTitle.ancestorNames(
+          '/来自：分享/尚硅谷嵌入式全套教程/01_尚硅谷嵌入式技术之C语言/4.视频/day01/',
+        ),
+        ['01 尚硅谷嵌入式技术之C语言', '尚硅谷嵌入式全套教程'],
+        reason: '`4.视频`、`day01` 都是容器，要跳过；再往上的两级都是真名字',
+      );
+    });
+
+    test('季目录也是容器 —— 否则会冒出一部叫「第三季」的作品', () {
+      expect(DirectoryTitle.isContainerSegment('第三季'), isTrue);
+      expect(DirectoryTitle.isContainerSegment('第2季'), isTrue);
+      expect(DirectoryTitle.isContainerSegment('Season 1'), isTrue);
+      expect(DirectoryTitle.isContainerSegment('S02'), isTrue);
+
+      expect(
+        DirectoryTitle.ancestorNames('/来自：分享/日漫精选/进击的巨人/第三季/'),
+        ['进击的巨人', '日漫精选'],
+        reason: '拿「第三季」去搜 TMDB 是白花一个搜索词，'
+            '而且前缀档必然把它配到某个同名条目上',
+      );
+    });
+
+    test('一路都是容器 → 空列表（调用方据此不发兜底请求）', () {
+      expect(DirectoryTitle.ancestorNames('/来自：分享/'), isEmpty);
+      expect(DirectoryTitle.ancestorNames('/电影/'), isEmpty);
+      expect(DirectoryTitle.ancestorNames(''), isEmpty);
+    });
+
+    test('顺序是「从近到远」—— 越近的目录越可能是这一集所属的作品', () {
+      expect(
+        DirectoryTitle.ancestorNames('/来自：分享/日漫精选/进击的巨人/'),
+        ['进击的巨人', '日漫精选'],
+      );
+    });
+  });
 }

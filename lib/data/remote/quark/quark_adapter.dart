@@ -161,6 +161,17 @@ class QuarkAdapter implements CloudDriveAdapter {
     return member;
   }
 
+  /// 重新拉一次 `/member`，**不动凭证存储**。
+  ///
+  /// 与 [restoreSession] 的差别就是这一句：后者会把安全存储里那份登录时的
+  /// 凭证重新装回内存，把已经轮换过的新 `__puus` 覆盖掉。
+  @override
+  Future<CloudAccount?> refreshAccount() async {
+    final account = await _fetchMember();
+    _account = account;
+    return account;
+  }
+
   @override
   Future<CloudAccount> authorize(AuthCredential credential) async {
     if (credential.isEmpty) {
@@ -758,6 +769,19 @@ class QuarkAdapter implements CloudDriveAdapter {
   /// 删除文件/文件夹。
   ///
   /// ⚠️ 不可逆操作。调用方必须做 UI 二次确认。
+  ///
+  /// ## 返回值是**入参回显**，不是逐条核实的结果
+  ///
+  /// 夸克的删除响应只有信封（`code` / `status` / `message`），没有可读的
+  /// 逐条结果 —— 这里也没有去翻 `data`（参考实现里这个接口没有文档）。
+  /// 于是**只能**在信封 `code == 0` 时把整批报成已删除。
+  ///
+  /// 这留下一种**看不见**的偏差：服务端在同一批里跳过了某几个（无权限、
+  /// 已在回收站、fid 已失效），我们照旧报成功。所以这个数量是「请求成功
+  /// 了几条」，不是「网盘上真的少了几条」。
+  ///
+  /// ⚠️ 别把这里改成「删完立刻重列目录来核对」：删除在服务端未必立刻可见，
+  /// 刚删完就重列很可能**仍然看得到**，那会把成功报成失败 —— 比少报更糟。
   @override
   Future<List<String>> deleteFiles({required List<String> fileIds}) async {
     if (fileIds.isEmpty) return const [];
@@ -774,6 +798,40 @@ class QuarkAdapter implements CloudDriveAdapter {
     );
 
     diag.info('文件', '已删除 ${fileIds.length} 个文件');
+    return fileIds;
+  }
+
+  /// 把一批文件/文件夹移动到目标目录。
+  ///
+  /// 请求体与 [deleteFiles] **同族**（`action_type` + `filelist`），差别只在
+  /// `action_type=1` 且多一个 `to_pdir_fid`。字段名见
+  /// `QuarkEndpoints.fileMove` —— 别照抄官方开放平台那套 `fid_list`。
+  ///
+  /// ⚠️ 返回值同样是**入参回显**，理由与 [deleteFiles] 一字不差：夸克的移动
+  /// 响应也只有信封（`code` / `status` / `message`），没有逐条结果可读。
+  /// 所以「报成功了几条」不等于「网盘上真的动了几条」。
+  @override
+  Future<List<String>> moveFiles({
+    required List<String> fileIds,
+    required String targetFolderId,
+  }) async {
+    if (fileIds.isEmpty) return const [];
+
+    diag.info('文件', '移动 ${fileIds.length} 个文件 → 目录 $targetFolderId');
+
+    await _request(
+      () => _post(QuarkEndpoints.fileMove, body: {
+        'action_type': 1, // 移动
+        // 空串当作根目录：调用方可能从 `DriveCrumb` 直接取 id，而根目录的
+        // 显示名是 `/`、id 才是 `'0'`。漏了这一句的后果是「移动到根目录」
+        // 发出去一个空 fid，服务端报错而用户看不懂。
+        'to_pdir_fid': targetFolderId.isEmpty ? rootId : targetFolderId,
+        'filelist': fileIds,
+        'exclude_fids': [],
+      }),
+      context: '移动文件',
+    );
+
     return fileIds;
   }
 
@@ -1177,8 +1235,26 @@ class QuarkAdapter implements CloudDriveAdapter {
     );
 
     final data = result.dataMap;
-    if (data == null) return base;
-    return QuarkMapper.mergeAccountInfo(base, data);
+    if (data == null) {
+      diag.warn('会话', '账号信息响应里没有 data（拿不到容量）');
+      return base;
+    }
+    final merged = QuarkMapper.mergeAccountInfo(base, data);
+
+    // 容量解析不出来时把**响应里实际有哪些键**记下来。
+    //
+    // 这是本项目反复踩过的那类坑：TMDB / 豆瓣的响应形状与夸克信封不同，
+    // 照夸克信封去读**不报错、只是静默得空**。这里同理 —— 夸克哪天把
+    // `total_capacity` 挪个位置，界面上只是少一行容量条，没有任何报错，
+    // 而「少了哪一行」从代码里看不出来。所以只打一次键名（不含值）。
+    if (!merged.hasStorageInfo) {
+      diag.warn(
+        '会话',
+        '账号信息里没有可用容量（total_capacity）：'
+        '本次响应的键 = ${data.keys.join(", ")}',
+      );
+    }
+    return merged;
   }
 
   /// 统一请求包装：注入公共参数与请求头，校验业务码，归一化异常。

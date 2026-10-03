@@ -941,9 +941,14 @@ genres 给了真人秀才保住综艺 / genres 说不出语义时按结构重判
 测试钉了两条：非 2xx → `null`；**200 但 body 是 `{"code":500,...}` → 也是 `null`**。
 
 
-## 筛选面板：年代 / 类型（2026-10-01）
+## 筛选面板：年份 / 类型 / 已刮削（2026-10-01，2026-10-03 增补）
 
-`lib/ui/widgets/library_filter_panel.dart` + `LibraryFilter.decades` / `.genres`。
+`lib/ui/widgets/library_filter_panel.dart` + `LibraryFilter.years`（**具体年份**）/
+`.genres` / `.scrapedOnly`。
+
+> ⚠️ 本节写于 2026-10-01，当时这一维还是**年代**（`decades`，`1990` 表示 1990-1999）。
+> 后来改成了**具体年份**（`years`，`1990` 只匹配 1990 年上映的那一部）。
+> 下面凡出现「年代」二字的地方一律按**年份**读，`1990 年代` 这类例子等价于「选了 1995」。
 
 ### 为什么是浮层，为什么是 `MenuAnchor`
 
@@ -967,9 +972,14 @@ genres 给了真人秀才保住综艺 / genres 说不出语义时按结构重判
 
 这是整块功能唯一的承诺：**面板上每一个选项，点下去至少有一条结果**。
 
-所以计数要跟着 `category` / `playedOnly` / `query` 收窄，却**不能**跟着
-`decades` / `genres` 收窄 —— 否则用户每勾一个类型，剩下的类型角标就跟着变，
-勾到第二个时列表已经空了。
+所以计数要跟着 `category` / `playedOnly` / **`scrapedOnly`** / `query` 收窄，
+却**不能**跟着 `years` / `genres` 收窄 —— 否则用户每勾一个类型，剩下的类型角标
+就跟着变，勾到第二个时列表已经空了。
+
+`scrapedOnly` 进这一组、`years` / `genres` 不进，不是双标：那个开关改的是「这一份
+列表里有哪些作品」，年份 / 类型正是在它筛出来的那批里再分面。不传下去的话，打开
+「已刮削」后用户会看到一堆只在**没刮过**的作品里存在的年份，点下去是空列表 ——
+而面板唯一的承诺就是「点下去至少有一条」。
 
 代价（已告知用户）：面板选项会跟着当前分类 / 搜索词收窄。
 
@@ -985,9 +995,10 @@ count）共用 `DriftMediaRepository._workConditions`，保证口径绝不漂移
 - 类型存在 `genres` 列（JSON 数组文本）里，匹配必须 **`LIKE '%"类型"%'`** ——
   **引号是关键**：不带引号时「动画」会命中「动画片」。转义按 SQL 的
   `"` → `""`。
-- 年代是 `year >= d0 AND year < d0+10` 的 OR 组；`year IS NULL` **不命中任何
-  年代**（所以面板会缺一项，而不是把没年份的算进 1970 年代）。
-- 多选之间一律**「或」**：一部片子只属于一个年代，取交集恒为空；类型同理。
+- 年份是 `year IN (...)` 的等值匹配；`year IS NULL` **不命中任何年份**
+  （所以面板会缺一项，而不是把没年份的算进某个桶）。
+- 多选之间一律**「或」**：一部片子只属于一个年份，取交集恒为空；类型同理。
+- 「已刮削」是 `source = 'online'` 的等值匹配，与上面几维**取交集**。
 
 ### 三条一致性陷阱（都踩过、都有测试钉住）
 
@@ -1009,8 +1020,8 @@ count）共用 `DriftMediaRepository._workConditions`，保证口径绝不漂移
 「该重算」与「**不该**重算」两个方向都钉住。
 
 **③ 已选条件在切换分类后可能不在 `counts` 里 → 必须照样画出来。**
-`setCategory` **不碰** `decades` / `genres`（刻意：切回去时用户的勾还在）。
-于是「在电影栏选了 1990 年代 → 切到动漫栏（一部 90 年代都没有）」时，
+`setCategory` **不碰** `years` / `genres` / `scrapedOnly`（刻意：切回去时用户的勾还在）。
+于是「在电影栏选了 1995 → 切到动漫栏（一部 1995 年的都没有）」时，
 这一项不在 `counts` 里。只画 `counts` 里有的项的话，那颗 chip 会**整个消失**，
 而它仍然是生效的条件：用户看到按钮上写着「已选 2 项」、列表却是空的，却找不到
 那第二个条件在哪 —— 唯一的出路是「清空筛选」，把另外那个还想留的条件一起抹掉。
@@ -1026,10 +1037,16 @@ count）共用 `DriftMediaRepository._workConditions`，保证口径绝不漂移
 
 | 在用的条件 | 提示语 | 按钮 | 清掉什么 |
 |---|---|---|---|
-| 年代/类型 + 搜索词 | 没有同时匹配「X」与所选年代/类型的作品 | 清空筛选条件 | 两者，**保留分类** |
-| 只有年代/类型 | 当前筛选条件下一条都没筛到 | 清空筛选 | 面板两组，**保留分类** |
+| 面板条件 + 搜索词 | 没有同时匹配「X」与所选〈**实际在筛的那几组**〉的作品 | 清空筛选条件 | 两者，**保留分类** |
+| 只有面板条件 | 当前筛选条件下一条都没筛到 | 清空筛选 | 面板**三组**，**保留分类** |
 | 只有搜索词 | 没有匹配「X」的作品 | 清空搜索 | 搜索词，**保留分类** |
 | 都没有（只切了分类） | 这个分类下暂时没有作品 | 回到全部 | 全部复位 |
+
+⚠️ 「所选〈…〉」由 `libraryEmptyHint` 里的 `facets` 按**实际在筛的那几组**拼，
+不能写死「年份 / 类型」—— 只开着「已刮削」时，那句话会变成让用户去清一组他
+根本没选过的条件。另外「**只**开着已刮削」在页面上另有专门的空态
+`_NoScrapedState`（走不到 hint 那一支）：这不是「条件太紧」，而是库里还没有
+刮削过的作品，该说的是「去刮一部」。
 
 两个为什么：
 
@@ -1044,6 +1061,42 @@ count）共用 `DriftMediaRepository._workConditions`，保证口径绝不漂移
 而搜索框已经是空的了。
 
 `test/ui/pages/library_empty_hint_test.dart` 逐情形钉住。
+
+### 「已刮削」的判据：`source == 'online'`，不是 `MediaWork.isScraped`（2026-10-03）
+
+`isScraped` 是 `online || manual`，回答的是「这一行**要不要被自动刮削覆盖**」——
+那是 `mergeWorkForUpsert` 的保护位。而这里问的是「有没有刮到过在线数据」，两者在
+「用户点过『自定义』」的行上分道扬镳：`customizeWork` 会把在线信息整份清掉
+（`source → manual`、`scrapedAt → null`、`onlineId → null`），那一行**不该**算
+「已刮削」—— 用户点开它会发现海报和简介都是空的。
+
+`scrapedAt` 只由在线刮削写（`WorkSeed.build` / `WorkScraper._apply`），与
+`source = 'online'` 是同一件事的两列；取 `source` 是因为那一列的文档本来就写着
+「刮削的幂等依据」。两个实现必须同口径：drift 侧 `t.source.equals('online')`、
+内存侧 `w.source == ScrapeSource.online`。
+
+**它进 `_facetScope`，`years` / `genres` 不进**（理由见上面的「角标口径」）。
+**没有数量角标**：年份 / 类型那些数字的承诺是「点下去至少有这么条结果」，
+而这是个开关 —— 多印一个数字只会让人以为它和年份一样可以多选。
+
+其余三处漏一处就是「做了一半」：
+
+- **`hasExtra` / `clearExtra()`**：它只在面板里有入口（不像分类栏与搜索框各有自己
+  的清除按钮）。漏了的话，只开着这一项时「清空筛选」按钮是**灰的**，用户看到列表
+  被筛着却找不到地方关。
+- **`selectedCount`**：按钮上的数字与面板底部「已选 N 项」共用这一份口径；各算一遍
+  会出现「按钮写 3、底部写 2」这种自相矛盾的样子。
+- **提示语与空态**：见上面那张表。
+
+测试落点：`test/data/library_filter_query_test.dart`（真库口径 + 「角标 == 点下去
+之后的条数」那条不变量）、`test/domain/media_repository_filter_test.dart`（真身 vs
+替身逐条件比对，`source` 三档都放了）、
+`test/ui/providers/library_facet_counts_test.dart`（provider 有没有把开关传下去）、
+`test/ui/widgets/library_filter_panel_test.dart`（交互与角标）。
+
+⚠️ 顺手记一个坑：面板上现在同时有「刮削」分组标题、「已刮削」chip 和那句
+「刮削一次就能拿到上映年份」，所以**别再写宽松的 `find.textContaining('刮削')`**
+（会命中三处）。要验提示语就匹配整句。
 
 
 ## 夸克上传：收尾是两步，缺一即 43001（2026-10-02）
@@ -1238,6 +1291,20 @@ in SDK, PATH, or by cmake.dir property`，而 `~/Library/Android/sdk/cmake/3.22.
 （别退回 1.8.22、也别跳 2.2 —— 2.2 删了 `kotlinOptions`，`app/build.gradle.kts` 还在用）。
 NDK 同理：12 个插件声明依赖 `27.0.12077973`，`app/build.gradle.kts` 已从 `flutter.ndkVersion`（26.3.x）
 改成钉死 27 —— 于是**本机 / CI 必须装 `ndk;27.0.12077973`**，否则配置期直接 `NDK not configured`。
+
+### 产物名与版本号：文件名被 Flutter 工具链**定死**
+
+`flutter build apk` 的产物名不由 AGP 决定 —— `flutter.groovy:1418-1445` 在
+`assembleRelease.doLast` 里 `copy` + `rename`。
+
+- ⛔ **改 AGP 的 `outputFileName` 无效**：只会让 `outputs/apk/release/` 多出一个副本，
+  而 `flutter build apk` 报给用户的、`flutter install` 会去装的，仍然是
+  `flutter-apk/app-release.apk`（工具按**精确名** `app-<mode>.apk` 找，
+  `gradle.dart:132-143` / `:1010-1022`）。
+- ✅ 做法：`android/app/build.gradle.kts` 里给 `assemble<Mode>` 挂 **finalizer**
+  （⛔ 别用 `doLast` —— 它的执行顺序取决于 Flutter 插件的注册时机），
+  **复制**（⛔ 不能改名）成 `cloudcine-<versionName>-b<versionCode>-android.apk`。
+- 版本号在**配置期**取 `flutter.versionName` / `flutter.versionCode`。
 
 ### 收尾验证（别只看「BUILD SUCCESSFUL」）
 `aapt2 dump badging <apk>` 要能看到 `leanback-launchable-activity` 与
@@ -2042,6 +2109,32 @@ sqlite3 -noheader -separator $'\t' "file:$DB?mode=ro" \
   `player_window_app._openStream` 各一处）。
 - 存储值就是枚举名（`auto` / `upmix` / `stereo` / `passthrough`），改名等于让老用户的设置失效。
 
+### ⛔ 实测：「杜比 / DTS 直通」在 macOS 上**必卡死**（2026-10-03）
+
+用户报「选了直通能播，关掉再打开就播不了，改回跟随片源又好了」。查下来**不是**记忆
+机制的锅，是 `audio-spdif` 本身：
+
+- 只要片源音轨编码落在 `ac3,eac3,dts,truehd,dts-hd` 里，mpv 会挑出
+  `spdif_<codec>`（libavformat/spdifenc）当解码器，然后**音频输出（AO）永远建不起来**
+  —— 日志里连 `[ao] Trying audio driver` 都没有，停在 `[ad] In: profile=-99 samplerate=44100`。
+- 音频是 mpv 的**主时钟**。音频链不走，视频就永远等它 → `core-idle=yes`、`time-pos` 冻在
+  起点不动。**表现是整部片卡死，不是「没声音」**。
+- 所以「第一次能播」是假象：`audio-spdif` 是**开流时**才生效的选项，播放中 `setProperty`
+  改它对**当前这条流毫无影响**（实测：位置照常前进、`current-ao` 仍是 `coreaudio`）。
+  于是「播放中选直通」看着正常，值却已落库（全局默认 + 本片偏好都写），
+  下次打开就在 `open()` 之前把 `audio-spdif` 下发了 → 卡死。改回「跟随片源」再打开就好。
+- ⚠️ `PlayerAudioEffect.apply` 里那个「读回 `audio-channels` 确认生效」的自检**抓不到它**：
+  `audio-spdif` 确实设上了，读回 `audio-channels` 也是对的 —— 坏的只有播放。
+  这与 `af set` 那条教训是同一个：**「设得上」不等于「用得了」**。
+- ⚠️ 也**不是**「设备不支持直通」：`ao=null`（压根不需要设备）同样卡死，
+  说明卡在 mpv 音频链初始化阶段，而不是 AO 打开那一步。
+
+复现配方（C 驱动，见本文件「用 C 直接调 mpv」）：造一个 E-AC-3 5.1 的 mkv，
+`audio-spdif=ac3,eac3,dts,truehd,dts-hd` + `vo=null`，`time-pos` 会一直停在 0.00、
+`core-idle=yes`；换成 `audio-spdif=no` 或换 AAC 片源就正常前进。
+对照组：`aid=no`（无音轨）+ `vo=null` 时位置按实时前进 —— 证明 `vo=null` 本身有节奏，
+上面那个 0.00 是真卡住，不是「没东西给它对时」。
+
 ### 跨引擎：设置投递进去、改动回报出来
 
 独立播放窗口跑在**另一个 Flutter 引擎**里，读不到主窗口的设置库：
@@ -2051,6 +2144,1330 @@ sqlite3 -noheader -separator $'\t' "file:$DB?mode=ro" \
 - ⚠️ 两个播放器（`player_window_app.dart` + `player_page.dart`）**都要接**，
   只改一个 = 用户看到「功能没做」。
 
+## 原画加速：本地多路中继（2026-10-03）
+
+代码：`lib/data/stream/local_stream_relay.dart`（会话 + worker）、
+`lib/data/stream/relay_reader_arbiter.dart`（纯函数判定器）、
+`lib/data/stream/chunk_cache.dart`、`lib/data/stream/chunk_layout.dart`。
+
+### 它解决什么、不解决什么
+
+夸克原画直链是**单条 TCP、顺序读**，而网盘对单连接有吞吐上限（实测 ~2.43 MiB/s 突发、
+3.36 MiB/s 持续），片源却是 19.74 Mbps = **2.37 MiB/s** —— 稳态贴着上限跑，必然
+「缓冲看着不少、却每隔几十秒卡一下」。中继把一条源站连接变成 **N 条并发 Range 连接 +
+本地 LRU 缓存**，mpv 从 `127.0.0.1` 读，单连接上限被 N 倍绕过。
+
+**不解决**：用户到网盘的总带宽不够。这时并发也救不了，应当如实显示真实速率、
+让用户切转码档，而不是假装缓冲充裕。
+
+⚠️ 只服务**原画**：`.m3u8` 由 `isRelayableUrl` 排除（HLS 分片是相对地址，
+中继会把拼地址的基准改成 `127.0.0.1`，拼出来的全指向自己 → 播不了）。
+
+### ⛔ 雷一：每取一块就新建连接 = 等于没并发（已修）
+
+早期实现**每取一个 2 MiB 块就新建一条 `HttpClient`、取完立刻 `close`**。
+对 17 GiB 的片子那是**上万次 TCP+TLS 握手**，聚合吞吐被切成锯齿。
+修法：每个 worker **长期持有一条连接**（`HttpClient` 默认 keep-alive），
+`idleTimeout` 放宽到 30s（连续取块之间那几百毫秒空档不能把连接回收掉）。
+
+判据看 `RelayStats.upstreamConnects`：它应**远小于** `upstreamRequests`（约等于 worker 数）。
+单测 `test/data/stream/local_stream_relay_test.dart` 里那条端到端用例除了数计数器，
+还**按远端端口去重**数真实 TCP 连接 —— 只数计数器可能被实现骗过。
+
+### ⛔ 雷二：预取锚点只跟「正在播的那条流」（seek 卡顿的根因）
+
+#### 现象
+
+起播流畅（修复雷一之后），但**一拖进度条就「看一会卡一会」**，几十秒后才自己恢复。
+
+#### 实测方法（可复现）
+
+真 `LocalStreamRelay`（8 连接 × 2 MiB 块、预取/缓存 256 MiB）指向一个**记录型 loopback
+代理**，代理转发到**真实夸克原画直链**并给每个 Range 打毫秒时间戳；真 `libmpv`
+（`/tmp/mpv_probe3`，90s、第 20 秒 `seek absolute 1500`）走中继播放；
+每 2 秒打印一次中继统计。环境变量 `CACHE`（默认 `no`）、`SEEK_TO`。
+
+#### 实测结论
+
+一条会话上 mpv **同时挂着 3~4 个 HTTP 读取器**，而拖进度条时 **mpv 不关旧连接** ——
+旧读取器留在原地继续被喂（实测 4 次 `SERVE-start`，seek 时**没有一次** `SERVE-end`，
+全部到测试结束才断）。
+
+而预取窗口的锚点原本是**整个会话唯一的一个**，任何读取器请求任何块都会覆盖它，
+于是 seek 后锚点在旧/新位置之间反复拉锯（实测打印）：
+
+```
+ENSURE 1779 anchor=1779   ← 读取器 C（seek 到 1500s）把锚点拉到新位置
+ENSURE   92 anchor=92     ← 旧读取器 A 又把它拽回旧位置
+ENSURE  108 anchor=108
+ENSURE 1797 anchor=1797   ← C 再拉过去
+ENSURE  134 anchor=134    ← 又被拽回来
+```
+
+**修复前后对照**（同一份 17.09 GiB 原画，seek 到 1500s，90s 观测）：
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| seek 后喂给**旧位置**的上游带宽占比 | **81%**（318 MiB） | **13%**（40 MiB） |
+| 新位置平均速率（片源需 2.37 MiB/s） | 0.87 MiB/s | **3.36 MiB/s** |
+| seek 后位置最长不动 | **34 秒** | 10 秒（正常重缓冲） |
+| 卡顿 `paused-for-cache` | **6 次** | **1 次** |
+| 70 秒内推进的播放时长 | 13.1 秒 | **57.9 秒** |
+
+也顺手排除了一个猜测：`cache=no` **不是**原因 —— `cache=auto` 下同样冻住 34 秒。
+
+**起播为什么不卡**：那时只有**一条**读取器，锚点没得争。两场景的差别就在这。
+
+#### 判定规则（`relay_reader_arbiter.dart`，纯函数、有单测）
+
+靠**请求范围的长度**认出「在放片子」的读取器，不靠到达顺序、也不靠猜：
+
+- **在放片子**：mpv/ffmpeg 一律发**开放式** Range（`bytes=N-`，直到文件尾），
+  范围动辄几个 GiB → `isStream` 要求范围 ≥ 一个预取窗口（`prefetchChunks × chunkSize`）。
+- **探索引**：读 MKV `Cues` 会请求**文件尾那一小段**（实测 `bytes=18351436158-`，
+  只有 2 块，0.86 MiB）。它读几十毫秒就走，**绝不能**让它把窗口挪到文件末尾 ——
+  那会让正在播的位置饿死。它照常服务（进主队列），但**永远不推动锚点**。
+
+规则：① 当前读取器（最新到达的「在放片子」的）→ 锚点跟着它，它自己跳远就是 seek；
+② 别的读取器落在窗口里 → 同一条流的并行连接，**只许向前推、绝不往回拖**；
+③ 别的「在放片子」的读取器位置远离窗口 → 多半是已被抛弃的旧连接，**不动锚点，
+需求降级到 `_stale` 低优先队列**；④ 探索引 → 主队列、不动锚点；⑤ 没有当前读取器
+（起播 / 当前读取器已结束）→ 谁先来谁是。
+
+⚠️ 旧读取器的需求是**降级不是丢弃**：丢弃会让那些 `_ensure` 永远不返回，读取器就那么吊着。
+它排在**预取窗口之后**，只在窗口已填满、没别的活干时才服务 —— 也就是白捡的余量。
+
+⚠️ 当前读取器结束必须 `release` 让位，否则锚点再没人推动、窗口冻在原地 ——
+表现是「画面停住不动，日志里却没有任何错误」。
+
+真跳远时 `_onAnchorJumped(index)` 三件事必须**一起**做：把旧位置的排队降级、
+`cache.clear()`（旧块一行用不上，留着只会把新窗口挤成「下了就淘汰」）、
+把新窗口里的等待**提升回主队列**（跳转后的第一块往往在降级前就排过队了）。
+
+### 回归测试
+
+`test/data/stream/local_stream_relay_test.dart` 的
+`seek：旧连接不得抢走新位置的预取带宽`：合成 40 MiB 源、1 MiB 块、2 连接、
+8 MiB 预取窗口；开一条 `bytes=0-` 的长读取器并**持续消费**（不消费就不会提出需求，
+也就复现不了争抢），再开一条 `bytes=30MiB-`，断言 seek 之后**前 8 次上游请求里
+落在旧位置的不超过 2 次**（`connections` —— 只可能是 seek 那一刻已经在上游路上的）。
+
+⚠️ seek 目标**不能太靠文件尾**：拖到 38 MiB 只剩 2 MiB 范围，会被 `isStream`
+当成探索引，就测不到东西了。
+
+**验证过它确实有判别力**：临时把 `_ensure` 里的判定改成恒返回 `ReaderDemand.anchor`
+（= 修复前的行为），该用例变红（前 8 次里 5 次喂旧位置）；还原后连跑 5 次全绿。
+
+### 探针脚本
+
+一次性诊断夹具（真实中继 + 真实直链 + 真 mpv + 记录型代理）已从 `test/` 移除 ——
+它**联网、依赖真实票据**，留在 `test/` 会让 `flutter test` 每次去跑 90 秒真网络，
+票据过期后直接红。副本在 `/tmp/qk/keep/`（`seek_probe_test.dart`、`mpv_probe3.c`）。
+⚠️ 探针**不要放进 `test/` 默认目录**，要跑就 `flutter test <显式路径>`。
+
+配套的 `mpv_probe3.c` 参数：`<url> <secs> [hwdec] [vo] [start] [cache] [maxbytes] [seekAt] [seekTo]`，
+会统计 `paused-for-cache` 次数；跑之前要设 `DYLD_FRAMEWORK_PATH` 指向
+`build/macos/Build/Products/Debug/cloudcine.app/Contents/Frameworks`。
 
 
+
+
+
+## 播放窗口没焦点时的 hover（2026-10-03）
+
+**症状**：播放器窗口不是当前焦点窗口时，鼠标滑到画面上什么反应都没有 ——
+控制条与剧集列表按钮都不出来（浮层整套都靠 hover 唤醒）。
+
+**根因是两处，缺一不可**：
+1. 引擎给视图挂的 `NSTrackingArea` 带的是 `NSTrackingActiveInKeyWindow` ——
+   `FlutterViewController.mouseTrackingMode` 的**默认值是 `InKeyWindow`**，
+   即「只有本窗口是 key window 时才把 hover 送进 Flutter」。窗口一不是 key，
+   Dart 侧一个 hover 都收不到。
+2. 就算事件到了：引擎把 `mouseEntered:` 翻成 pointer **add**（`kAdd`），而
+   `MouseRegion.onHover` 只在 `PointerHoverEvent` 上回调 —— 「滑进来就停住」
+   只剩这一个事件，浮层照样不出现。
+
+**修法**：
+- 原生 `MainFlutterWindow.swift` 的 `ChildWindowController.attach`：
+  `controller.mouseTrackingMode = .always`（= AppKit `NSTrackingActiveAlways`，
+  Apple 文档：「不论第一响应者、窗口状态还是**应用状态**都收消息」）。
+  `FlutterViewController.h` 里这个属性就是为这件事留的口子，引擎自己建的多窗口
+  controller 没别的办法配它（flutter/flutter#185426）。
+- Dart `_buildPlayer()` 那个整窗 `MouseRegion`：除 `onHover` 外再挂
+  `onEnter: (_) => _pokeChrome()`。
+
+**别忘的几条**：
+- ⛔ 它只管 **hover**。点击仍要先激活窗口，但 `FlutterView.acceptsFirstMouse`
+  返回 YES，所以第一次点击会同时完成激活与派发，不会「点两下才生效」。
+- ⚠️ 引擎切追踪模式时**不摘旧 area**（只有设成 `None` 才摘，见
+  `configureTrackingArea`）→ 同时存在两个 area，窗口是 key 时 hover 到两次。
+  无害：位置相同、`_pokeChrome()` 幂等，且引擎对重复 kAdd 自带去重。
+- ⚠️ 「窗口有没有焦点」在 widget test 里造不出来：测试只钉住 Dart 那一半
+  （`test/ui/windows/player_window_app_test.dart` 的「指针一进窗口就唤醒浮层」，
+  只 `addPointer` 不 `moveTo`），原生那一半只能真机验。
+- 主窗口（库页海报卡片的 hover）**没动**，仍是引擎默认的 `InKeyWindow`。
+
+### 万一「应用整体不活跃」时还是不灵（下一步该查什么）
+
+`mouseTrackingMode = .always` 的依据是 Apple 对 `NSTrackingActiveAlways` 的措辞
+（「不论第一响应者、窗口状态还是**应用状态**都收消息」）+ Flutter 自己的头文件注释
+（「Hover events will be sent to Flutter regardless of window and app focus」）。
+**没在本机做运行时验证**（那要劫持真实光标几秒，会打扰用户）。
+
+如果用户反馈「焦点在别的应用上时滑过去仍然没反应」，下一步是加一层兜底：
+在 `ChildWindowController` 里装
+`NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved])`（**应用不活跃**时
+它才收得到别的应用的事件），配合 `NSEvent.addLocalMonitorForEvents`（应用活跃时
+走它，否则漏掉「主窗口是 key、播放窗口不是」那一档）。回调里用
+`NSEvent.mouseLocation` 与 `window.frame` 判进出，跨通道通知 Dart
+（`_pokeChrome` / `_hideChrome`）。
+- 鼠标事件的 global monitor **不需要**辅助功能权限（键盘事件才需要）。
+- ⚠️ 别用「轮询 `NSEvent.mouseLocation`」的定时器方案：能跑，但白烧 CPU。
+- ⚠️ 两个 monitor 覆盖的集合是**互补**的（global 收不到自己应用的事件），
+  只装一个会漏一半。
+
+## 详情页文件列表的播放进度条：为什么不能用续播点（2026-10-03）
+
+口径（用户选定）：**历史最大位置**。新增 `media_items.max_position_ms`（schema
+**v15**），迁移时**从续播点回填下界**（续播点是历史最大位置的下界；不回填的话
+升级后所有老条目在详情页都显示「没看过」，而它们其实看过）。
+
+### 两列的分工（不能互推）
+
+| | `resumePositionMs` | `maxPositionMs` |
+|---|---|---|
+| 回答 | **这次**从哪儿接着播 | **这一集看过没有 / 看到哪儿了** |
+| 变化 | 会变，看完**清成 NULL** | **只增不减、永不清除** |
+| 写入 | 独立窗口 `onPlaybackProgress`（认 `rememberPosition` 开关） | 两条路都写 |
+| 读出 | 剧集面板 / `PlayTarget.resolve` | 详情页文件列表的进度条 |
+
+用续播点画进度条的话，用户刚看完一集回到详情页，那一行显示 **0%** —— 恰好是他
+最想看到 100% 的时刻。这是整件事存在的唯一理由。
+
+### 三个必须记住的实现点
+
+1. **只增不减要靠一条 SQL**，不能「先读、再比、再写」：`onPositionTick` 每 10 秒
+   一次，换条 / 关窗时还可能补一次，两个并发落库会让较小的那个后写、把进度条
+   往回拉。drift 版是
+   `UPDATE media_items SET max_position_ms = max(COALESCE(max_position_ms, 0), ?) WHERE id = ?`。
+   ⚠️ SQLite 的 `max()`：**两参数是标量函数**（取大者），单参数是**聚合函数** ——
+   写成 `max(?)` 就变成对整表求最大值，不报错，只是把别人的进度盖到自己头上。
+2. **进度条压在行底边**（`Stack` + `Positioned`），不塞进文字列：塞进去会让看过的
+   行比没看过的行高几像素，一屏几十行参差不齐，右侧的时间列也跟着上下跳。
+   `media_item_row_test.dart` 里有一条用例专门比两种行高**必须相等**。
+3. **时长未知时返回 `null`（不画），不是 `0`**：一条确实看过、但夸克没给
+   `duration` 的记录，画成 0% 的空槽 = 「白看了」，而它与「没看过」在屏幕上
+   完全一样。宁可什么都不画。
+
+### 刷新通路：为什么要**两个**信号
+
+- `PlaybackLibraryLink`（既有）：说「**谁**在播」，**只在换条时**推 —— 它驱动
+  海报墙「最近播放」的顺序，每次都推会让海报墙每 10 秒重建一遍。
+- `PlaybackProgressSignal`（新增，同文件）：说「**播到哪儿了**」，**每次落库都推**
+  —— 只驱动 `workDetailProvider`。
+
+合成一个必然二选一：要么进度条不刷新，要么海报墙每 10 秒抖一次。两个信号都放在
+`library_refresh_providers.dart` 这个**谁都不依赖的叶子文件**里（组合根要引用它，
+方向不能倒过来）。
+
+写入方**必须先写完库再推信号**：反过来的话详情页收到信号去读库时这一笔还没落盘，
+进度条永远慢一拍。
+
+两条写入路都要补：`app_providers.dart` 的 `onPositionTick`（内置播放页 ——
+**Android TV 上唯一的播放路径**，漏了它电视上永远没有进度条）与
+`player_bridge_host.dart` 的 `onPlaybackProgress`（独立窗口）。
+
+### 两个踩到的坑（都是新测试当场抓到的，`flutter analyze` 看不见）
+
+**坑 1：drift 的 `customStatement` 收的是原始值，不是 `Variable`。**
+写成 `[Variable.withInt(x), Variable.withString(id)]` 会在**执行时**抛
+`Invalid argument (params[1]): Allowed parameters must either be null or bool,
+int, num, String or List<int>.: Instance of 'Variable<int>'` —— 静态分析完全
+看不出来，只有真的跑一次 SQLite 才报。正确写法是 `<Object?>[ms, itemId]`。
+
+**坑 2：Riverpod 的 refresh / reload 语义（我之前记反了）。**
+- `ref.invalidate` / `ref.refresh` → **refresh** → `when(skipLoadingOnRefresh:)`，
+  默认 **true**（不闪）；
+- **依赖变化**（`ref.watch` 的那个值变了）→ **reload** →
+  `when(skipLoadingOnReload:)`，默认 **false** → **会**走 `loading:` 分支。
+
+所以「让 provider watch 一个每 10 秒推一次的信号」的默认表现是**整页每 10 秒
+白一下转圈**。修法：给 `work_detail_page.dart` 的 `detail.when` 显式加
+`skipLoadingOnReload: true`（保留上一份数据；首次加载没有上一份值，仍正常转圈）。
+`work_detail_progress_test.dart` 有一条用例专门断言「推信号时没有
+`CircularProgressIndicator`」。
+
+### 测试落点
+
+- `test/domain/media_repository_max_position_test.dart` —— 契约（内存实现）
+- `test/data/db_max_position_test.dart` —— **真 SQLite**，守那条 `max()` SQL
+  （只测内存版的话，SQL 写错不会有任何用例变红，而它是真机上唯一跑的一份）
+- `test/ui/widgets/media_item_row_test.dart` —— 纯函数 + 行高不变
+- `test/ui/pages/work_detail_progress_test.dart` —— 接对行 / 看完仍满格 /
+  推信号不闪圈
+- `test/data/db_migration_last_modified_test.dart` —— v15 回填下界
+
+### 同一个 bug 的姊妹界面：剧集面板（已一并修掉）
+
+独立播放窗口的**剧集面板**原先也用 `resumePosition` 画进度条 —— 同一个毛病：
+看完的一集在面板上什么都不显示。修法与详情页同源：`PlaylistEntry` 新增
+`maxPosition`（跨引擎协议 + 主窗口 `_buildPlaylist`），进度条改读它。
+
+两个字段在面板上**各司其职**，都不能删：
+
+| | 用途 | 谁算 |
+|---|---|---|
+| `resumePosition` | **切集时从哪儿开始**（要过 `PlaybackResume.startFrom` 的取舍） | 播放窗口在切集时算，把结果报回主窗口 |
+| `maxPosition` | **面板那条进度条** | 只读，主窗口填 |
+
+⛔ 别把两者合成一个字段：合成之后要么进度条对看完的一集是空的，要么切集会从
+头开始 —— 两种都不会报错。
+
+另外两处跟着收紧：
+
+- `PlaylistEntry.hasProgress` 现在要求「看过一点 **且时长已知**」：拿不到分母时
+  进度只能是 0，画出来是一条**空的槽**，读起来就是「没看过」。与详情页那条
+  进度条同一口径（宁可什么都不画）。
+- `maxPositionMs` 在 `fromJson` 里**缺失时退回 `resumePositionMs`**：后者是前者
+  的下界，退回它得到的是一条偏短但不说谎的进度条，退回 0 会把看过的一集显示成
+  没看过。
+
+⚠️ **产品决策（用户可否决）**：「记住播放进度」这个开关**只管起播行为，不管显示**。
+关掉它之后续播点不带过去（`startAt` 走 0），但已经躺在库里的历史进度**照旧显示**
+（面板与详情页都是）。跟着开关一起清掉的话，用户一关它所有进度条会同时消失 ——
+看起来像把历史抹了。`desktop_play_test.dart` 里有一条用例钉住这个口径
+（那条用例原先断言的是续播点为空，但夹具只有 1 个条目 → 列表为空 →
+`everyElement` 恒真，等于什么都没测；已顺手改成真的有两个条目）。
+
+---
+
+## 自动刮削「怎么都刮不到」：两类假信号骗过了守卫（2026-10-03）
+
+一天里用户报了两个现场，**形态完全不同、根因同类**：解析层有一条「这个文件
+自己说得清不清楚」的守卫（`_isStandaloneRelease`），它决定了**目录名能不能
+顶掉文件名**。守卫被一个**假信号**骗到时，结果不是报错，而是「查询词变成垃圾
+→ 两个在线源都搜不到」，用户只能看到「刮不出来」。
+
+⛔ **排查顺序**：先把文件名与 `dirPath` 丢进 `MediaFilenameParser.parse` 打印
+`title / kind / year / groupKey` 与 `ScrapeQuery.fromParsed(...)`，再去看日志里
+那一行 `ScrapeQuery(...)` 长什么样。**日志里的查询词就是答案** ——
+九成问题在「查询词本身是垃圾」，不在网络、不在额度、不在闸门。
+
+### 现场一：`[2026-02-01]` 冒充出品年份
+
+```
+/来自：分享/仙逆/126 纯享-仙踪-[4K][HEVC][2026-02-01].mp4
+```
+
+同目录 49 个视频、6 个作品，**只有这一个刮不出来**（另外 6 个文件名里带
+`仙逆` 的都刮到了）。
+
+**根因链**：`[2026-02-01]` 是发布者写的**上传日期** → `_pickYear` 当成出品年份
+`2026` → `_isStandaloneRelease`（第 2 条判据「自带年份」）判这个文件
+「自称独立发行物」→ 目录名 `仙逆` **被顶掉** → 查询词是垃圾片名
+`126 纯享-仙踪` → TMDB 去年份重试仍然零结果，豆瓣零结果。
+
+假年份还有第二重代价：它让 `isConfident` 为真 → 查询走**严格档**（闸门只要
+0.6 相似度）→ 更容易刮错片子。
+
+**修复**：`_pickYear` 跳过**括号里的完整日期**。
+
+⚠️ 两道判据缺一不可，只写「后面跟着 `-MM-DD`」是不够的：
+
+1. 后面紧跟 `-MM-DD` / `.MM.DD` / `_MM_DD`。`\d{1,2}` 与 `(?![0-9])` **配套**：
+   `Movie.2023.1080p.mkv` 里的 `.1080` 咬不动（四位数字过不了 `\d{1,2}`），
+   `2012.2009.1080p.mkv` 同理 —— 这两个的年份必须留下；
+2. 年份**紧跟在括号后面**（`[` / `【` / `(` / `（`）。裸写的 `2023-05-12` 是
+   发行日期，其年份与 TMDB 的 `year`（发行年）口径一致，**要留下**。
+
+⚠️ **只跳过「年份」这个取值，`_markerPatterns` 一个字都不能动**：那里决定
+「片名在哪截断」，`2026-09-27` 仍然必须把 `奔跑吧` 截出来（否则片名会变成
+`奔跑吧 2026-09-27 第12期`）。
+
+**修完的效果**：`year=null` → 目录名生效 → `title=仙逆`、`kind=episode`、
+`groupKey=仙逆` → 与已有的 `仙逆renegadeimmortal` 刮到同一条 TMDB 条目 →
+自动归一（`onlineId` 相同 + `kind` 相同）能把它折进去。
+
+### 现场二：纯数字片名被判成「编号」
+
+```
+/来自：分享/逃出白垩纪 (2023) 4K HDR & Dv/65.2023.2160p.WEB-DL.DDP5.1.DV.HDR.H.265-FLUX.mkv
+```
+
+那部电影的片名**就是** `65`（2023，Adam Driver 主演；中文名《逃出白垩纪》）。
+
+**根因链**：`_isStandaloneRelease` 第 1 条判据是「片名含字母或汉字」——
+`65` 过不了 → 判成编号 → 目录名顶掉它 → 查询词变成
+`逃出白垩纪 2023 4K HDR & Dv`（目录名里的**年份与画质标记都没被清掉**）→
+两个源都搜不到。
+
+⚠️ 而且目录名归组会把 `kind` 改成 `episode` → 去搜 `/search/tv`，而这是一部
+**电影** → 必然搜不到，**且不报错**。
+
+**修复**：纯数字片名改成「**自带年份**才算真名字」。
+
+```dart
+if (!hasWord) return year != null;          // 纯数字：自带年份才放行
+return year != null || kind == MediaKind.episode;
+```
+
+- `65` + 2023 → 保住片名与 `movie` → 查询 `ScrapeQuery("65", movie, y=2023)`
+  → `/search/movie?query=65&year=2023` → 一击即中；
+- `159.mkv`（**无年份**）→ 仍然要靠目录名救 —— 2026-10-02「182 → 希腊纪录片」
+  事故的那条守卫没丢。
+
+### 兜底：多来源候选链（用户要求的「一步步尝试」）
+
+用户原话：「将文件名、文件所在目录、上级目录等信息作为尝试刮削的逻辑，从严格
+到宽松，一步一步尝试」。
+
+`ScrapeQuery.fromParsed(parsed, dirPath: ...)` 现在生成 **`fallbacks`**：
+**文件名 → 所在目录 → 上级目录**。
+
+- 目录来源用 `DirectoryTitle.ancestorNames(dirPath)`：从末级往上，跳过容器名，
+  **最多 2 级**（每多一条就多花一个搜索词，而豆瓣匿名额度只有约 10 个）；
+- 目录候选一律 `kind = episode`（`DirectoryTitle` 的口径：目录名是**系列名**）
+  + `requireExactTitle = true`（没有年份也没有季集号，闸门只剩标题相似度，
+  0.6 档会放行 `特洛伊奥德赛` 0.68 这种别的片子）；
+- **不带** `alternateTitle`（目录名极少中英混排）、**不带** `year`
+  （目录名里的年份多是「合集整理于某年」，当过滤条件会把正主筛掉）；
+- 与主查询**同名**的目录名不生成（`/…/仙逆/仙逆.S01E01.mkv` 很常见，那是白花
+  一次额度）；
+- `ScraperPipeline.scrape` **串行、命中即停**（并发起跑会把整条链的额度一次
+  全花掉，而链的意义恰恰是「前面命中时后面根本不该发请求」）；
+- ⛔ **本地兜底只用主查询**。这一条最容易写错成「每条候选后面都跑一遍兜底」
+  —— 那会让「在线源全落空」时拿**目录名**去当作品名，结果是作品被改成一个
+  既没海报也没简介的目录名，用户只会觉得「刮了一次，名字反而变了」。
+
+**为什么挂在 `ScrapeQuery` 上、而不是新造一个「查询链」类型**：链的持有者是
+`WorkSeedBook._queries`（`Map<String, ScrapeQuery>`）与 `WorkScraper._queryFor`，
+两处都是「一个作品一条查询」；新造类型要把这两处的类型与全部调用点一起改，
+换来的只是「`ScrapeQuery` 里不会出现 `ScrapeQuery`」这一条形式上的洁癖。
+⚠️ 兜底自己**不再带兜底**（链只有一层深，`scrape` 的循环因此不递归）。
+
+### 顺带：季目录也是容器
+
+`第三季` / `第2季` / `Season 1` / `S02` 已加进 `DirectoryTitle._containerPatterns`。
+不加的话：`/进击的巨人/第三季/` 会冒出一部叫「第三季」的作品，而且候选链会
+拿「第三季」去搜一次 TMDB（前缀档必然误配）。
+
+### 还没做、待用户拍板：目录名里的年份与画质标记
+
+`DirectoryTitle._clean` 只去书名号 / 括号 / 分隔符，所以
+
+```
+seriesTitleOf('/来自：分享/逃出白垩纪 (2023) 4K HDR & Dv/')
+  = '逃出白垩纪 2023 4K HDR & Dv'
+```
+
+这个串**同时是归组键与查询词**。对「文件名不给年份」的片子
+（`/…/逃出白垩纪 (2023) 4K HDR & Dv/65.mkv`）仍然会拿它去搜，必然搜不到。
+
+⛔ **别直接用 `_parseDotted` 截断**（最省事的写法）：`_markerPatterns` 把
+`web` / `hd` / `bd` / `ts` / `dv` / `cam` 都当标记，于是
+`极客时间 Web 协议详解` 会被截成 `极客时间`（`directory_title_test` 里那条
+「去掉书名号与括号噪音」的用例正是拦这个的）。
+要做就得是**只从右往左、遇到第一个非标记词就停**的收敛规则，且要单独跑一遍
+全量测试看分组键变化。
+
+### 测试落点
+
+| 规则 | 文件 |
+| --- | --- |
+| 括号日期不算年份 / 纯数字片名 | `test/core/filename_parser_test.dart` |
+| `ancestorNames` 与 `seriesTitleOf` 同源、季目录是容器 | `test/core/directory_title_test.dart` |
+| `fallbacks` 的形状（剧集 / 精确同名档 / 去重 / 最多 2 级） | `test/domain/scrape_query_test.dart` |
+| 串行命中即停、本地兜底只用主查询 | `test/domain/scraper_pipeline_test.dart` |
+| 两个调用点都传 `dirPath` | `test/domain/work_builder_test.dart`、`test/domain/work_scraper_test.dart` |
+
+## 目录视图的多选批量删除（2026-10-03）
+
+用户要求原话：「文件夹列表支持多选媒体文件或文件夹，执行批量删除动作用来清理云盘空间」。
+
+### 不需要逆向任何新接口
+
+`QuarkAdapter.deleteFiles`（`POST /1/clouddrive/file/delete`，`action_type=2`
+**永久删除**、`filelist` = fid 列表）**早就实现了**，此前只有备份清理在用。
+本地媒体库那侧也有现成的「网盘上文件没了 → 从库里移除」路径
+（`MissingMediaController`，带字幕引用 / 续播点 / 播放偏好 / 作品计数的
+全套清理）。所以这一轮是**接线 + UI**，一行逆向都不用做。
+
+⚠️ 排查时先 `grep deleteFiles`：这类「以为要从零写」的功能，多半已经有一半
+在别的调用点底下躺着。
+
+### 三条做错就静默坏数据的判据
+
+**① 勾选只存 fid，且换目录必须清空。**
+列表每次重列网盘给的都是新对象，存 `DriveEntry` 等于「刷新一下选择就丢了」。
+更要紧的是工具条上「已选 N 项」是用户**唯一**能核对「我要删什么」的地方 ——
+跨目录残留的勾选会让他在看不见那些条目的情况下把它们删掉。
+界面上的实现是**多选时收起面包屑与「上一级」**（让约束看得见），
+`ref.listen(currentCrumbProvider)` 里清空只是兜底（`_emptyState` 的
+「回到根目录」还留着）。
+
+**② 「全选」勾的是屏幕上那些，不是这一层的全部。**
+判据抽成了顶层函数 `displayEntries(listing, query, mode)`，
+**列表与全选共用这一份**。各写一遍的话，用户筛出三个文件、点全选、按删除，
+删掉的是同目录另外两百个 —— 而数字对得上（他看到的就是「已选 203 项」），
+界面上完全看不出错。
+
+**③ 只清「服务端确认删掉」的那些索引。**
+失败的批次如果也照清，用户会得到「文件还在网盘上，媒体库里却没了」，
+要回来得重扫。目录的清理**只能按路径前缀**（索引里没有「目录」这个概念，
+它记的是文件的 `dirPath`）：用 `crumb.child(dir).path`，
+⛔ **不能用 `entry.path`** —— 那个只有扫描器遍历时才填，列目录拿到的条目里
+通常是 `null`，静默匹配不到任何东西。
+
+### 分块与失败处置（`DriveCleanupController`）
+
+每请求 100 个 fid（夸克没公开上限；`file/move` 的 `fid_list` 是 100）。
+定成 100 不是为了绕上限，是**控制失败时的爆炸半径**：一次带 3000 个 fid 超时
+的话用户什么信息都拿不到，只能全部重来。
+
+⛔ **凭证失效 / 断网要中止后续批次，并把「没发出去的」也算进失败数。**
+这两类错误不是按批次的，继续打只是多几十个注定失败的请求（夸克那条约 3 QPS
+的线本来就很紧）。而把没发出去的算成成功是**撒谎**：用户以为清干净了，
+它们还在网盘上占着空间。
+⚠️ 但 `rateLimited` **不能**中止 —— 限流是可以继续试的，第 1 批失败不代表
+第 2 批也会失败。两条分支分别由 `FakeDriveAdapter` 的 `deleteFailsWith`
+（每一批都抛）与 `deleteFailsOnBatch`（只让第 N 批抛）构造。
+
+### 一个 UI 决定：多选时把行上的动作按钮**收起来**
+
+不是「留着但禁用」。目录行的「下载全部」在勾选模式里看起来像「确认选择」，
+而它实际会开始下整个目录；视频行的「播放」同理会误触。
+一行只有一个主要含义 —— 这条原则在 `_DriveFileRow` 的类文档里已经写过一次。
+
+### 测试落点
+
+| 规则 | 文件 |
+| --- | --- |
+| 分块边界 / 下界体积 / 文案（部分失败必须报数） | `test/domain/drive_cleanup_test.dart` |
+| 多选状态的不变量（exit 同时清空、`==` 按集合内容比） | `test/ui/providers/folder_selection_test.dart` |
+| 分块、致命错误中止、索引清理（含目录子树、失败不清） | `test/ui/providers/drive_cleanup_controller_test.dart` |
+| 弹窗正文（名字摊开、未知体积不写 0 B、不可撤销） | `test/ui/widgets/drive_delete_dialog_test.dart` |
+| 工具条、点行=勾选、长按进入、全选只勾可见 | `test/ui/pages/folder_page_test.dart` |
+
+⚠️ **Flutter 测试坑**：`find.byType(FilledButton)` **不匹配**
+`FilledButton.icon` —— 后者是子类 `_FilledButtonWithIcon`，而 `byType` 比的是
+运行时的**确切**类型。用它找会得到 `Bad state: No element`，看起来像按钮
+根本没渲染出来。改用
+`find.byWidgetPredicate((w) => w is FilledButton)`。
+
+### 待用户验证（本机没法验的两条）
+
+1. 夸克删除**是不是真的不进回收站**。项目里 `action_type=2` 的注释一直写
+   「永久删除」（备份清理在用），但那是社区逆向的结论，官方无公开文档。
+   弹窗按**不可撤销**写，属于偏保守的一侧。
+2. **删一个目录 fid 会不会连带删掉整个子树**。若服务端不这么做，
+   表现是「删完刷新，那个目录还在」—— 是**看得见**的失败，不会静默坏数据。
+
+---
+
+## 批量删除的复核：返回值语义与限流缺口（2026-10-03 晚）
+
+改完批量删除后自查了一轮。**只动了注释，没动行为**，但两条结论值得留着。
+
+### 一、`deleteFiles` 返回的是**入参回显**，不是核实结果
+
+```dart
+await _request(() => _post(QuarkEndpoints.fileDelete, body: {...}), context: '删除文件');
+return fileIds;   // ← 入参原样返回
+```
+
+夸克的删除响应只有信封（`code` / `status` / `message`），没有可读的逐条结果
+（参考实现里这个接口无文档，我们也没去翻 `data`）。于是**只能**在
+`code == 0` 时把整批报成已删除。
+
+⚠️ 这留下一种**看不见**的偏差：服务端在同一批里跳过了某几个（无权限、
+已在回收站、fid 已失效），我们照旧报成功。所以这个数量是「请求成功了几条」，
+**不是**「网盘上真的少了几条」。
+
+**原先有两处注释把它说成核实过的**，已改（三处一起改）：
+- `CloudDriveAdapter.deleteFiles`（抽象层）原文「返回被删除的 fid 列表
+  （供调用方核对）」—— 回显里没有任何可供核对的信息，这句是**误导**；
+- `DriveCleanupController._purgeLibrary` 原文「只处理**服务端确认删掉**的那些」
+  —— 是「请求成功」，不是「逐条确认」。
+
+⛔ **别把这里改成「删完立刻重列目录来核对」**。删除在服务端未必立刻可见，
+刚删完就重列**很可能仍然看得到** → 会把**成功报成失败**。那比少报更糟：
+少报只让用户多按一次重试，误报会让用户以为功能坏了。
+
+`_purgeLibrary` 另补了一句「**宁可清早不可清晚**」的不对称理由：清早了
+（清了其实还在网盘上的索引行）下次扫描会重建回来；清晚了（留一条指向已删
+文件的死索引）要等用户点到它才会暴露。
+
+### 二、适配器里两个桶**都只包读接口**，写操作一律裸奔
+
+实测（`grep _listBucket|_linkBucket`）：
+
+| 桶 | 速率 | 包住的方法 |
+|---|---|---|
+| `_listBucket` | 3 QPS | `listDirectory`、`search` |
+| `_linkBucket` | 1 QPS（burst 2） | 4 条取链路由 |
+
+**所有写操作走裸 `_request`**：`deleteFiles`(778)、`createDirectory`(748)、
+`uploadFile` 的 pre/hash/auth/finish(817/860/927/1043/1075)、`moveFiles`。
+
+所以「删除没有节流」与 `createDirectory` / `uploadFile` 是**一致的** ——
+项目既有口径是「**被循环调用的读接口**才进桶」，写接口都是用户单次触发。
+
+`DriveCleanupController` 的批次循环是这个口径下的**第一个例外**：一个**写**
+操作被循环 N 次（`maxIdsPerRequest = 100`，3000 项 = 30 次连发、无任何间隔）。
+
+- **已有兜底**：`rateLimited` 是**可续**的按批失败（controller 只对
+  `unauthorized` / `network` 提前 break 并放弃后续批次），所以顶到限流的后果是
+  「部分失败 + 如实提示 + 刷新后剩下的还在、可重选重试」，**不是**数据损坏。
+- **若补节流**，架构上一致的位置是**适配器里加第三个桶**（与
+  `_listBucket`/`_linkBucket` 同层，`TokenBucket(ratePerSecond: 3.0)` 即可让
+  首批不等待、后续按 333ms 排），**不是**在 controller 里用 `RequestThrottle`
+  —— 后者的类文档明写自己是「列目录请求的最小间隔节流器」，拿它管写操作会把
+  它的职责搞浑。
+- **代价**：3000 项从 ~6–12s（自然往返时间已经不小）变成有 ~10s 硬下限。
+  单次删除（`LibraryBackupService` 覆盖旧备份那一处）不受影响 —— 桶空时首次
+  请求直接放行。
+
+### 结论：**先不加**（2026-10-03 21:12 用户拍板）
+
+理由：现实批量（几百项 = 几批）的自然往返耗时**已经接近 3 QPS**，节流加不了
+多少保护；而顶到限流的后果是「部分失败 + 如实提示 + 刷新后剩下的还在、
+可重选重试」，不是数据损坏。等真的撞到再补，那时也有证据。
+
+⚠️ 真要补时，按上面那条位置（**适配器里第三个桶**），**别**用
+`RequestThrottle` —— 它是列目录专用的，混用会让两个概念都变模糊。
+
+
+## 标识符索引：播放器与刮削（2026-10-03 从 MEMORY.md 下沉）
+
+> 起因：`MEMORY.md` 贴到 8000 字符注入上限，把「标识符级的细节」下沉到这里，
+> `MEMORY.md` 只留红线与指针。本节是**索引**，机理与实测见上面各专章。
+
+### 播放器
+- **缓冲条**共用 `buffered_slider.dart`，入参是 **0..1 比例**（不是秒）。
+  ⛔ `demuxer-cache-time` 是**绝对时间戳**（不是「前面还有多少秒」）；时长未知时返回 **null**。
+- 音轨源必须过 `TrackLabels.realTracks` 剔掉 media_kit 的合成轨；
+  **选中态以 `player.stream.track` 的回报为准**（不做乐观更新，见 §为什么选中态不做乐观更新）。
+- 搜索走 `subtitle_query.dart`，**绝不能拿 `displayTitle` 去搜**。
+- **剧集面板**缩略图必须走 `fetchThumbnail` → 主窗口 `PosterCache`（自己下必 401）；
+  面板主标题 = **原始文件名**。
+- **音效 ≠ 音轨**（与片源无关，见 §「音效」是播放端的事）：
+  ⛔ Avfilter 里**没有**可用音频滤镜、**`af set` 的返回值不能当依据**；
+  ⛔ **macOS `audio-spdif` 直通必卡死 → 别下发**。
+- **逐影片播放偏好**：表 `playback_prefs`（**v14**）。
+  读 = 本文件 → 同 `groupKey` 取**非空**的最新一条；写 = **整条覆盖**。
+  **音量 / 倍速仍全局**；轨道存**特征**、语言归一，匹配不上就退回默认。
+  ⛔ **只记用户改过的项**、失败不记；⛔ **在线 / 本地字幕不记**；
+  ⛔ **别把画质 / 音效对齐到「实际在用的值」**。
+- **播放进度两列**（不能合并）：`resumePositionMs`（续播点，看完**清**，管起播）
+  vs `maxPositionMs`（历史最大位置，**v15**，**只增不减、永不清**，管显示）。
+  详情页与剧集面板都读**后者**。刷新信号与 `PlaybackLibraryLink` 要**分开**。
+
+### 刮削与封面
+- `posterFaceX` 与 `posterUrl` **必须成对**；`keptWidth` 必须 `LayoutBuilder` 现算。
+- 熔断只计**网络层**失败；TMDB / 豆瓣的响应形状**≠ 夸克信封**（照夸克信封读会**静默得空**）。
+- **TMDB `/search/*` 是模糊搜索**，必须过 `ScrapeMatch` 闸门。
+- **「自定义」**：`customizeWork` **整行写、不过 merge**；只清**刮来的** `genres`
+  （`genresManual` 的行连类型带锁一起留），`categoryManual` 只在**改了分类**时才锁。
+- **刮削候选链**：`ScrapeQuery.fallbacks` = 文件名 → **目录名逐级向上**
+  （`DirectoryTitle.ancestorNames`，跳容器、最多 2 级）；目录候选恒 `episode`
+  + **精确同名档**、不带 `alternateTitle` / `year`。
+  `ScraperPipeline.scrape` **串行、命中即停**。
+  ⛔ **本地兜底只用主查询**（拿目录名去兜 = 把作品改名成目录名）。
+  ⛔ 两个调用点（`WorkSeedBook.add` / `WorkScraper._queryFor`）**都要传 `dirPath`**。
+- **两条解析层守卫**（都是现场踩出来的，不报错、只搜不到）：
+  - `_pickYear` 里**括号内的完整日期**（`[2026-02-01]`）**不算**年份（裸写的 `2023-05-12` 算）；
+  - `_isStandaloneRelease` 里**纯数字片名只有自带年份**才算真名字（`65.2023…` 是电影《65》）。
+
+## 电视（Android TV）分支（10-03 晚 / 10-04 上午）
+
+> 起因：Android TV 包实测四类问题 —— ① PC 交互模式不适合电视 ② 原画卡帧、
+> 音画不同步 ③ 主界面排版乱且遥控器够不到 ④ 播放器里只能「聚焦到按钮再按 OK
+> 弹菜单」。用户拍板路线：**TV 走独立布局分支**（桌面代码不动）+ 播放器改
+> **右侧纵向面板** + **TV 专用播放参数与诊断输出**（真机本机验不了）。
+
+### 判据：`isTvLayout` 与「页面实得宽度」
+
+- `AppTheme.isTvLayout(context)` = `defaultTargetPlatform == android &&
+  MediaQuery.sizeOf(context).width >= 960`。960 是官方 TV 设计稿的逻辑宽，
+  手机是 360–430，分界线不误伤手机，也不给平板套黑边。
+- ⛔ **判据读的是 view 宽（960），不是页面实得宽度。** 真实链路被吃掉两层：
+  过扫描 `tvSafeHorizontal=48`×2 + 侧栏 `tvSidebarWidth=240` → `LibraryPage`
+  实得 **624**；页头自己再有 22×2 内边距 → 操作区只剩 **580**。
+- ⛔ 写 TV 测试时**不能只把 `tester.view.physicalSize` 设成 960 就让页面占满**：
+  那样凭空多给 336px，测出来的「没溢出」是假的。要 `MediaQuery` 说 960（判据为真）
+  的同时把页面 `SizedBox` 到 624。
+
+### ⛔ 过扫描内边距**全项目只有一处**，壳外的整幅页得自己加
+
+`AppTheme.safeAreaInsets` 在**壳那一层**只有一处调用 —— `app_shell.dart` 的 `build` 里
+`body:` 那一层（⚠️ 别写行号：这个引用已经飘过一次，`:34` → `:40`），
+管的是壳内那五个一级页面。`/auth`、`/auth/qr`、`/work`、`/diagnostics` 都在
+`StatefulShellRoute` **之外**（见 `app_router.dart`），它们把整屏换掉 →
+**拿不到那层内边距**，必须自己加。
+
+- 实测（修之前）：`/work` 拿满 **960**（不是 624），返回键 `left=10`，而过扫描带是
+  `tvSafeHorizontal=48` —— 返回键那一角正落在会被切掉的那一圈里。
+- 后果有两层，第二层更难受：① 最左那列（返回键、页头文字）被切；② 从媒体库点进
+  详情页，内容**整体左移 48px** —— 页头本来就该在同一个位置，跳一下会让人以为
+  换了个应用。
+- ⛔ **`/work` 的实得宽度是 960 不是 624**：写它的排版测试必须用 960。拿 624 去铺，
+  测的是一个这页**永远不会有**的屏宽（而且比真实更严，会掩盖真实宽度下的问题）。
+- ⚠️ **两种页面别顺手加**：① 内容居中且有 `maxWidth`（`AuthPage` 是 460）—— 本来
+  就落在安全区里，加了只是白白缩窄；② **全屏视频**（`/play`）—— 加了会变黑边。
+- ⚠️ `AuthQrLoginPage`（`/auth/qr`）**只给顶栏加、整页不加**：这一页的主角是那个
+  320 的二维码，整页套一层会平白多出 54px 滚动量、把它推出首屏 —— 而缺一角的码
+  **永远扫不出来，并且看起来完全正常**，比「返回键被切一角」严重得多。
+- 反向对照（证明用例有牙）：把 `/work` 的 padding 临时改回 `EdgeInsets.zero`，
+  用例立刻红在 `Expected: a value greater than or equal to <47.5>` / `Actual: <10.0>`。
+
+#### 播放器的覆盖层同样要避让 —— 但**结论比看起来轻**
+
+`/play` 是唯一**故意不加**页面级内边距的页面（全屏视频，加了变黑边），很容易被
+顺推成「播放器里也不用管」—— 其实是两件事：**画面**满屏，浮在上面的**控件**
+仍要避让。三处：
+
+| 位置 | 改法 |
+|---|---|
+| 右侧面板 `TvPanelShell` | 只加**右边**（内容内边距），`Container` 本身不动 |
+| 顶栏 | 内容内边距 + **高度**一起加 `safe.top` |
+| 控制栏 | 内容内边距 + **高度**一起加 `safe.bottom` |
+
+- ⛔ 面板**只缩内容、不缩 `Container`**：面板底色与左边那条描边要一直铺到屏幕
+  边缘（贴右是它的设计）。把整块面板往里挪 48px 会变成一块浮在画面中间的
+  卡片，右边留一条露出视频的缝。
+- ⛔ 两条 bar **高度要跟着加**，只加内边距会把内容挤扁，反而更糟。
+- ⛔⛔ **面板上下不要加**（只加右边）—— 这是量出来的取舍，不是漏了：
+  面板是**按「7 行正好塞满」做的**。实测（960×540）：
+  表头 56 + 分隔线 0.5 + 底部提示 60（那行折成两行）+ 7×60 = 536.5，
+  面板只有 540 高 → **只剩 3.5px 余量**。上下各加 27 之后视口从 423.5 掉到
+  369.5 → **溢出 50.5px**，第 7 行「片头」被推出屏幕，而**电视上没有滚动条**，
+  用户不会知道下面还有一行。
+  相权之下：标题上沿被切几像素，比整个设置项消失轻得多。
+  想两全得改设计（行高 60→52、或把底部提示压成一行）—— 那是产品决定。
+  → 用例：`player_tv_panel_test.dart` 里 `maxScrollExtent == 0`
+  （「一屏装得下」）。⚠️ 它比量某一行的高度稳，也不受 `ListView.cacheExtent`
+  （会预建屏幕外的行）干扰。
+- ⚠️ **实测推翻了我自己的估算**：我原以为行值（右对齐）会被切掉一大截，
+  实测（960 宽、`right: 0`）行内最右那个箭头在 **x=914.25**、安全线 912 ——
+  **只探进去约 2px**；行值本身还在箭头左边约 30px，压根没到边。
+  所以这是「擦线」不是「字没了」。仍然避让的理由：① 这点余量随面板宽度 /
+  行内边距一变就成真切；② 全项目都按 48/27，播放器不该是唯一例外。
+  → **教训：别拿算术当测量。** 行内多一层 `Padding` 就让估算偏了二十几像素，
+  差点据此写出一条「修了个 28px 大毛病」的假战功。
+- 顶栏（返回键起于 `x=8`、宽约 38）与**整个**最左 48px 带重叠；
+  控制栏自身只有 6px 底内边距 vs 最下 27px 带。
+- ⚠️ 后两处**没有自动化用例** —— 播放页在 `flutter test` 里起不来
+  （`PlaybackController` 的 `Player` 是**字段初始化器**，一构造就启 libmpv；
+  子类也绕不开，Dart 照样跑父类字段初始化器）。只有面板那条有断言。
+  - ⛔ **实测把这条路彻底钉死了**（写了个一次性探针，用完已删）：
+    `mk.Player()` 在 `flutter test` 里抛
+    `MediaKit.ensureInitialized must be called before using any API`；
+    补上 `MediaKit.ensureInitialized()` 之后**仍然抛**
+    `Cannot find Mpv.framework/Mpv. Please ensure it's presence in the
+    Frameworks folder of the application.`
+    ⇒ 不是「初始化顺序没搞对」，是**本机测试环境里根本没有 libmpv**。
+    所以想让 `PlayerPage` 可测，必须①给整个 mpv 面抽一层接口，②把
+    `Video(controller: ...)` 那个渲染面也做成可替换的 —— 不是加个可选参数的事。
+    ⚠️ 别再去试「override 掉 `playbackControllerProvider`」：页面把它类型写成
+    具体类 `PlaybackController`，而**任何**构造都会跑那个字段初始化器。
+- 落点：`test/ui/widgets/player_tv_panel_test.dart` 的「面板内容要让开电视的
+  过扫描带」。⚠️ 它同时钉「面板**外框**仍贴到屏幕右缘」，防止有人把避让
+  做成「挪面板」。反向对照：把 `right: safe.right` 改回 `0` → 红在
+  `Expected: a value less than or equal to <912.5>` / `Actual: <914.25>`。
+- ⚠️ 该用例要 `debugDefaultTargetPlatformOverride`，而它**不在 `material.dart`
+  的转出里** → 必须显式 `import 'package:flutter/foundation.dart';`
+  （不加报 `Setter not found`，看起来像拼错了名字）。
+
+### ⛔ 页头操作区必须是 `Wrap`（实测溢出 145px）
+
+`PageHeader` 的 TV 分支把 `actions` 放在**标题下方独立一行**。这一行**必须是
+`Wrap`、不能是 `Row`**：媒体库页头有六个控件（视图切换 / 搜索框 / 排序 / 筛选 /
+选择 / 刷新），在 580 里 `Row` **实测溢出 145px**。Debug 下是黄黑斜纹；
+**Release 下溢出部分直接被裁掉** —— 看起来就像「筛选和刷新这两个按钮本来就
+没有」，而它们仍在焦点链里，遥控器按得到、屏幕上看不见 → 会被误报成「遥控器坏了」。
+`Wrap(spacing: 8, runSpacing: 6, crossAxisAlignment: center)` 即可（页里那些
+`SizedBox(width: 4/8)` 间隔会与 `spacing` 叠加，不必去改各页）。
+
+### 播放器：遥控器菜单键 → 右侧纵向面板
+
+- 形态：右侧 344 宽纵向面板。`player_tv_panel.dart` 只管画（行列表 / 选集网格 /
+  循环导航），`player_tv_overlay.dart` 管状态与「改值」（行值从 `PlaybackController`
+  现算，动作回调给播放页）。**不铺满整屏** —— 换字幕 / 换画质的唯一反馈就是画面本身。
+- 七行：选集 / 画质 / 字幕 / 音轨 / 音效 / 倍速 / 片头。↑↓ 换行（**循环**，
+  `nextTvRowIndex` 靠 Dart 的欧几里得 `%`：`(-1) % 6 == 5`，`total<=0` 返 0 不返 -1）、
+  ←→ 改值、OK 激活、菜单键或返回键收起。
+- ⛔ **菜单键 = `LogicalKeyboardKey.contextMenu`**（Android `KEYCODE_MENU`=82）。
+  但**很多遥控器没有菜单键** → 必须有第二条路：控制栏的「设置」按钮
+  （`_TvSettingsButton`，高度取 `tvActionHeight=48`）+ 舞台上按 ↑。
+- ⛔ **BACK 由 `PopScope(canPop: !_tvPanelOpen)` 拦**，不能在 `onPopInvoked` 里
+  再 push —— TV 上 BACK 既是唯一退出键也是唯一取消键。
+- 「片头」行**只跳不标**：手标要把播放头定位到某一秒，遥控器做不到；标记留桌面。
+- 选集换集**不循环**（第一集没有「上一集」，绕到最后一集是纯困惑）；
+  画质切换**跳过 `!isAvailable` 的档位**（按下去只会弹提示，用户要按第二次才知道
+  刚才那下没生效），最多绕一圈，全不可用则什么都不做。
+- 改值**不直接调控制器**：画质 / 字幕切完还要**落库且只在真的切成功之后**，
+  那段规则在播放页手里，面板重做一遍就是两份会漂的「只在成功时记」。
+
+### 面板开关的路由抽成了纯函数 `resolveTvPanelKey`
+
+与 `resolveRemoteKey` 同规格：判断在纯函数里（都在 `player_page.dart`），
+`_handleTvPanelKey` 只负责执行。落点 `test/ui/pages/player_remote_keys_test.dart`。
+
+- ⛔ **必须在 `resolveRemoteKey` 之前判**：后者那条「沉浸模式下任何认识的键 →
+  `showControls`」会把菜单键吃掉 → 沉浸时按菜单键只会把控制栏叫回来，
+  面板永远打不开，而菜单键正是这条需求点名要用的键。
+- 菜单键（`contextMenu`）**不挑焦点**，开 / 关同一个键。
+- ↑ 只在「面板关着 **且** 焦点真在画面上」时接管 —— 焦点已经进了控制栏时，
+  ↑ 是「走回上一行」，接管它会把这件事变成「弹出一个面板」。
+- ⛔ **↓ 绝不接管**。这是整套 TV 交互的**咽喉**：↓ 是从画面走到控制栏的唯一通路，
+  而控制栏上有「设置」按钮 —— 那正是**没有菜单键的遥控器上唯一一条进面板的路**。
+  抢了 ↓ 就等于「那类盒子上选集 / 画质 / 字幕全打不开」，且不报任何错。
+
+### TV 播放参数（`player_buffer_config.dart` 两套）
+
+| 参数 | 桌面 | TV |
+|---|---|---|
+| `demuxer-max-bytes` | 1 GB | 256 MB |
+| `demuxer-readahead-secs` | 9999 | 60 |
+| `cache`（流层字节缓存） | 关 | **开** |
+| `video-sync` | audio | audio |
+| **`hwdec`（硬件解码）** | **不下发**（mpv 默认 `no`） | **`auto-safe`** |
+
+#### ⛔ 卡帧有**两条独立的路**，缓冲参数只管其中一条
+
+上一轮只调了缓冲，以为就完了 —— 漏了另一半：
+
+| 症状 | 真正的原因 | 谁负责 |
+|---|---|---|
+| 卡帧 | **数据没到位**（网络抖动 / eMMC 写入抢带宽） | 上面那套缓冲参数 |
+| 卡帧 + 音画不同步 | **解码跟不上** | **`hwdec`** |
+
+- 事实：mpv 的 `hwdec` **默认是 `no`（纯软解）**，而 media_kit 那张默认属性表
+  （`media_kit-1.2.6/lib/src/player/native/player/real.dart` 里 `properties` 那个
+  映射，约 2389–2416 行）**也没有这一项** —— 全项目搜 `hwdec` 一处都没有。
+  于是电视盒子一直在**软解**高码率原画，而那颗 SoC 通常只够软解 1080p。
+  解码跟不上音频 → mpv 跳帧追主时钟 → 「嘴动了声没动」。
+- ⛔ 取值必须是 **`auto-safe`**，不能是 `auto` / `mediacodec`：
+  - `auto` 会连**不安全**的 API 一起试（崩溃 / 花屏）；
+  - 写死 `mediacodec` 是**直通**路径，要求渲染端配合，配不上就是**黑屏**；
+  - `auto-safe` 只用安全列表（Android 上解析成 `mediacodec-copy`：解码走硬件、
+    帧拷回内存再上屏），配不上时**回落到软解** —— 最坏情况等于没改。
+- ⛔ 桌面返回 **`null`（不下发）**，不是 `'no'`：下发 `'no'` 也是改桌面行为
+  （把默认显式化，且挡住将来给桌面开硬解）。用例专门钉这一条。
+- `PlayerConfiguration` **没有**任意属性 map（只有 `vo` / `osc` / `bufferSize` /
+  `libass` / `title` / `muted` / `pitch` / …），所以只能走
+  `PlayerBufferConfig.apply` 里的 `setProperty` —— 与上面几项同一个时刻。
+- 诊断：策略那行现在带 `hwdec=`。⚠️ 但它记的是**请求值**，不是**实际生效**的
+  解码器。要知道真的有没有启用，得读 mpv 的 **`hwdec-current`**（要在起播**之后**
+  读，`apply` 那一刻还没开始解码）—— 这一步**没做**，见下方待办。
+
+- ⛔ 桌面那一套的值**一个都没动**（`disableStreamCache=true` 是为了让屏上的 KB/s
+  读数是真的）。有测试专门钉「桌面值不许变」。
+- ⛔ TV 上必须**显式下发 `cache=yes`**：media_kit 还硬写着 `cache-on-disk=yes`，
+  1 GB demuxer 缓存 + 磁盘缓存会把 1–2 GB 内存 / 慢 eMMC 的盒子写爆 ——
+  表现就是**原画卡帧 + 音画不同步**。
+- `tv_device.dart` 提供**无 context 的** `isTvDevice()`：`PlaybackController` 构造
+  `Player` 时还没有任何 widget，而 mpv 的流层缓存**只在 `loadSource` 那一刻生效**，
+  晚一步设置等于没设。它读 `PlatformDispatcher.instance.views`。
+  - ⚠️ 已知盲区：盒子报的逻辑宽 <960 会判成非 TV；诊断日志那行「策略=TV/桌面」是出口。
+  - ⚠️ `flutter test` 里 `tester.view.physicalSize` **不影响**
+    `PlatformDispatcher.instance.views`（恒 2400×1800@3.0 → 逻辑 800）。
+    所以判据抽成纯函数 `isTvSize({platform, logicalWidth})` 才测得到；
+    `isTvDevice()` 只留一条冒烟用例，注释里写明它**证明不了** TV 分支
+    （永远为假的断言比没有断言更糟）。
+
+### 音轨 / 字幕文案：只有 `TrackLabels` 一处
+
+⛔ 桌面内置播放页、独立播放窗口、TV 面板**三处**都要显示同一个音轨名。
+一开始 TV 面板自带一份「`chi`→中文」的表、桌面 `_AudioMenu` 也自带一份
+（`_languageLabel`），于是**同一个标记在三处显示成三种样子**
+（`中文` / `简体中文` / 原样 `chi`），而这三处永远不会同时出现在一块屏上 → 没人会发现。
+现已全部委托 `TrackLabels.audioTitle / audioDetail / languageLabel`
+（`_trackDetail` 那份手拼的「codec · channels · kbps」也一并删掉）。
+同理**倍速档位只有一份** `kPlaybackRates`（定义在 `player_tv_overlay.dart`，
+桌面 `_RateMenu` 引用它）。
+→ 「只有一处实现」**不要靠断言**：把重复的那组用例直接删掉即可
+（`test/core/track_labels_test.dart` 覆盖得更全，含 `und` / 空串 / 未知标记）。
+
+### 面板按键语义（`test/ui/widgets/player_tv_panel_test.dart` 的「按键」两组）
+
+不需要 libmpv 就能测：面板是纯 widget，`PlayerTvPanel` / `PlayerTvEpisodeGrid`
+的 `onSelectedChanged` / `onAdjust` / `onActivate` / `onClose` 全是回调。
+
+已钉住的六条：↑↓ 换行（含循环）且选中态**移走**、←→ 作用于**选中那一行**、
+**OK 认 `select`**（Android TV 的确定键）、菜单键与 Esc 都收起、放行数字键与
+媒体键、每次按键都报「有操作」。选集网格另有三条：点格交出**下标**、
+**OK 能激活聚焦的格子**、菜单键是「回行列表」而不是关掉整个面板。
+
+⚠️ **实测确认**：`LogicalKeyboardKey.select` → `ActivateIntent` →
+`InkWell.onTap` 这条路**靠 `WidgetsApp` 默认快捷键表成立**（不用自己绑），
+所以电视上「按 OK 选一集」是通的。这一条以前只是假设，现在有断言了。
+
+#### ⛔ 写这类测试踩到的两个坑（都不是代码错，是测试自己错）
+
+1. **`tester.sendKeyEvent` 不 pump。** 只派发事件、不重建下一帧，于是
+   `onSelectedChanged` 里的 `setState` 不会反映出来 —— 「↓ 之后 ←→ 该作用在
+   第二行」的断言会看到第一行，红得像代码错了。封装一个
+   `press(tester, key) { await sendKeyEvent(key); await pump(); }`。
+2. **探针只记 `KeyDownEvent`。** 想验证「某个键被面板吃掉、没有冒泡出去」时，
+   在外层 `Focus` 里记 `event.logicalKey` 会把 **key-up** 也记进来 ——
+   而面板对 key-up 一律 `ignored`（它只处理 KeyDown/KeyRepeat），于是
+   「方向键被吃掉了」这条断言永远失败，看起来像「方向键漏出去了」。
+
+### 测试落点
+- `test/ui/pages/library_tv_layout_test.dart` —— **TV 页头不溢出 + 每个操作都落在可见区内
+  + 页头/分类条/海报墙三块区域都走得到**（平台靠 `debugDefaultTargetPlatformOverride`，
+  复位**写在测试体的 `finally` 里**）。
+- `test/ui/pages/tv_pages_layout_test.dart` —— **其余全部一级入口 + 最密的详情页**
+  （下载 / 设置 / 扫描 / 文件夹 / 作品详情，各 1 条；文件夹页另有一条可达性）。
+  同一套 624×486 铺法；**壳外页（`/work`、`/diagnostics`）那一条用 960**，见上节。
+  另有 1 条专测**壳外页的过扫描内边距**（返回键 `left >= tvSafeHorizontal`）。
+- `test/support/focus_reach.dart` —— 「够不够得到」的共用判定（见下）。
+  ⚠️ 它的 `walkReachability` 默认走 **Tab**，而 Tab **跨得了** scope 边界、方向键
+  跨不了 —— **测跨侧栏/跨 Navigator 的可达性必须自己发方向键**，别用它。
+- `test/ui/shell/sidebar_focus_test.dart` —— **侧栏（壳）本身**的可达性：
+  真 `AppShell` + 真 `StatefulShellRoute`，**6 条全过、无 `skip`**
+  （方向键兜底 + 高度溢出两条缺陷的回归保护）。
+  ⚠️ 它是唯一铺**整个壳**的测试文件，页面测试都用 624 宽把侧栏扣掉了。
+- `test/ui/widgets/player_tv_panel_test.dart` —— 行循环 / 格子文案 / 面板不铺满整屏 / **按键语义**。
+- `test/core/utils/player_buffer_config_test.dart`、`test/core/utils/tv_device_test.dart`。
+
+#### ⚠️ 排版测试最大的陷阱：**空态下的「不溢出」是废话**
+把页面单独铺出来时，它极可能走的是**空态 / 错误态**（没登录、目录没列出来、
+库里没作品）—— 而危险的那一行 `Row` 那时**根本不存在**。于是「没有溢出」
+恒真，一条假绿测试会一直躺在那儿，将来真溢出了也不会响。
+
+**做法：每条排版用例里都补一句内容断言**，确认带按钮的那一行真的铺出来了：
+`find.text('开始扫描')`（扫描页）、`find.textContaining('第3季')`（文件夹页，
+靠 `test/support/fake_drive.dart` 的 `FakeDriveAdapter` 铺一层真目录）、
+`find.textContaining('进击的巨人')`（详情页）、`find.textContaining('.bin')`（下载页）。
+
+另外两条实测：
+- 扫描页那行 `Row` 中间只有 `Spacer` —— ⚠️ **`Spacer` 是 flex 子项，只能吃剩余
+  空间、不能把别人挤小**：定宽部分一旦超过 580，它先被压成 0，然后溢出照旧发生。
+  别把它当保险。
+- 文件夹页工具条的面包屑那一截靠 `Expanded` + 横向滚动兜着（再长的路径也挤不爆），
+  定宽的是面包屑**之外**那两个按钮。
+
+#### 「够不够得到」是**另一件事**，得单独测（`test/support/focus_reach.dart`）
+
+排版不溢出 ≠ 用得了。诉求原话是「**很多区域遥控器方式无法触达**」——
+`test/ui/tv_remote_probe_test.dart` 证明的是「Flutter 的焦点机制成立」，用的却是
+**自造的、形状相同的 widget**；它证明不了真页面上接线接对了（少包一个
+`TvFocusable`、或哪块被顺手 `ExcludeFocus` 包住，它不会响）。
+
+- **判据不能是 `Focus.of(...).hasFocus`**：`TvFocusable` 是
+  `Focus(canRequestFocus: false)` **只负责观察**，真正吃焦点的是里面那个
+  `InkWell`。`Focus.of` 拿到的是那个观察者，**永远 false** —— 会得到一条一直红的
+  假警报。正确做法：从 `FocusManager.instance.primaryFocus` 出发**往上走祖先链**
+  找目标（`focusedInside`）。
+- **目标要挑对方向**：`TvFocusable` / `TvIconLabel` 包着 `InkWell` → 用它们当目标；
+  文件夹的行是**裸 `InkWell`**，行里那段文字是它的**后代**，拿文字去找永远找不到
+  → 要用 `find.ancestor(of: 文字, matching: InkWell).first`。
+- **走 Tab，不走方向键**：方向键的可达性依赖几何（网格里 ↓ 落哪一格取决于间距），
+  换个 `posterAspect` 就飘；Tab 走阅读顺序，稳定枚举「这一页上哪些东西能拿到焦点」。
+  真机遥控器没有 Tab，这里只当**可达性代理**。
+  ⛔ **但这条代理在「跨侧栏」这件事上会骗人** —— 见下面的
+  `#### ⛔ 侧栏：Tab 到得了，方向键到不了（scope 隔离）`。
+- ⛔ **必须做一次反向对照**：临时把页面整个包进 `ExcludeFocus`，确认它**真的会红**
+  （实测会，且报出那句诊断）。否则一条恒绿的假测试会一直躺在那儿。
+- ⚠️ **`ListView` 懒加载**：624×486 下文件夹页只建得出前几条（实测到 `S01E04`，
+  默认修改时间倒序所以它是第一条）。断言「某一行可达」时**必须挑已经建出来的那一行**，
+  挑 `S01E01` 会得到「找不到」—— 那是它压根没被建，不是焦点问题。
+
+#### 还有一条：**够得到 ≠ 看得见**
+
+可达性只证明焦点**走得到**。而走得到但**看不见焦点在哪**，在电视上和够不到是
+同一种坏 —— 用户只能盲按。
+
+焦点环的显示条件比可达性苛刻：
+
+    TvFocusable._showRing = _focused && highlightMode == traditional
+
+而 Android 上 `highlightMode` 默认是 `touch`，**收到第一个按键事件才翻成
+traditional**（`tv_focus.dart` 类文档）。所以「焦点环没出现」有两个完全不同的
+原因 —— 焦点没到位，或者档位还没翻 —— 只有断言能区分。
+
+- 判据：`find.byWidgetPredicate((w) => w is AnimatedScale && w.scale > 1.0)`。
+  全项目**只有海报卡**传 `focusScale: 1.05`（`library_page.dart:1096`，grep 可证），
+  而它与焦点环由**同一个** `_showRing` 控制 → 「存在 scale > 1」=「焦点环正在画」。
+- ⛔ 用例里**必须先断言「还没按键时 `findsNothing`」**：少了这句，在「焦点环压根
+  没接 highlightMode」时断言照样绿 —— 而那正是桌面上「鼠标点过的卡片留一圈环」
+  的成因。
+- 实测：`tester.sendKeyEvent` 在 `flutter test` 里**确实会让 highlightMode 翻档**
+  （`walkReachability` 发的 Tab 就够了），不必手工去改 `highlightStrategy`。
+- 反向对照：把 `focusScale` 改成 `1.0` → 立刻红并报出「焦点环没画出来…」。
+- 落点：`test/ui/pages/library_tv_layout_test.dart` 的「焦点落到海报上时**看得见**」。
+
+#### ⛔ 侧栏：Tab 到得了，方向键到不了（scope 隔离）
+
+用户 10-04 问的：「确认一下左侧导航菜单是否能够通过遥控器方向键获取点击焦点？」
+**当时的答案是不能**，两条缺陷**当天下午都已修好**（修法见本节末）。
+下表左列是「修之前」的实测，右列是现状：
+
+| 动作 | 修前 | 现状 |
+|---|---|---|
+| 侧栏**内部** ↓ / ↑ 走六个入口 | ✅ 正常（↓ 从「媒体库」一路到底到「诊断日志」） | ✅ |
+| 焦点在侧栏时按 → 进内容区 | ✅ 正常 | ✅ |
+| OK 键（`select`）按在侧栏项上切分支 | ✅ 正常 | ✅ |
+| **焦点在内容区时按 ← / ↑ 进侧栏** | ❌ **走不进去**（连按 12 次 ← 原地不动） | ✅ **靠壳层兜底** |
+| 侧栏在 540 高下是否溢出 | ❌ **溢出 25px** | ✅ 不溢出（`Spacer` 余量 23px） |
+
+**根因不是几何。** 侧栏那 6 项完全符合 `←` 的筛选条件
+（`node.rect.center.dx <= target.left`；侧栏 tile 的 InkWell 是
+`(60,100.5,276,151.5)`，内容区从 `x=288.5` 起）。真正的原因是：
+
+    StatefulShellRoute.indexedStack 给**每个分支一个独立 Navigator**
+    → 每个分支页有自己的 FocusScope
+    → FocusTraversalPolicy.inDirection（focus_traversal.dart:1070）只在
+      currentNode.nearestScope.traversalDescendants 里找候选，
+      **找不到就 return false，不向上冒泡到父 scope**
+    → 侧栏是分支页的**兄弟**，在外层 scope 里，永远不在候选表里
+
+两条硬证据（探针打的）：
+1. 焦点在内容区时 `nearestScope.traversalDescendants` **只有 1 个节点**（它自己）；
+   同一个方向键在焦点位于侧栏时就能走通 —— **同一个键，结果只取决于焦点在哪一边**。
+2. 祖先链：`c0 → _ModalScopeState FocusScope(分支) → Navigator → FocusTraversalGroup
+   → _ModalScopeState FocusScope(壳) → Navigator → …`，侧栏在**外层**那个 scope。
+
+⛔ **Tab 能跨，方向键不能。** `_moveFocus` 会爬 scope 边界，`inDirection` 不会。
+所以上面那条「Tab 当可达性代理」在这里**失效**：Tab 从内容区能走到侧栏，
+遥控器走不到。**跨侧栏/跨 Navigator 的可达性必须用方向键测。**
+
+修法（**已实施**，在 `lib/ui/shell/app_shell.dart`）：壳层包一层
+`Focus(canRequestFocus: false, onKeyEvent: _onShellKey)`，键处理**三步**：
+
+1. `_arrowDirectionOf(event)` 只认**裸**方向键。⛔ `isControlPressed` 时必须返回
+   `null` —— 框架默认表里 `Ctrl+方向键` 是 `ScrollIntent`（`app.dart:1248`），
+   兜底抢了它就把「Ctrl+← 滚一屏」吃掉。
+2. 先跑 `focus.focusInDirection(dir)`，**与框架默认逐字一致**；返回 true 就结束。
+   所以**内容区内部**的方向键行为一个字节都没变。
+3. 只有它返回 false（=「最近那个 scope 里确实没有」）才走几何兜底
+   `_nearestSidebarFocus`：在与 `inDirection` **同样的规则**下（同向 + 垂直带相交 +
+   先比轴向距离、再比横向偏移）在**侧栏子树**里挑一个。
+
+⛔ **兜底的候选集必须限定在侧栏子树里，不能搜整个窗口** —— 最容易写错的一处：
+`IndexedStack` 给每个分支套 `Visibility.maintain(visible: i == index)`，它把
+`maintainState/Size/Semantics/Interactivity` **全设为 true**，于是 5 个分支**全都留在
+焦点树里且 rect 完全相同**。搜全窗口时几何上「最近」的可能是某个**看不见的**分支里的
+节点，焦点会跳到屏幕上不存在的地方。判「在子树里」用 `visitAncestorElements` 沿祖先链
+`identical` 比 element（`_isInside`）。
+
+（另一条路 b「把侧栏塞进分支页的 scope」结构上做不到，没走。）
+
+**顺带：侧栏在 540 高下溢出 25px（真缺陷，已修）。**
+修前：`constraints: BoxConstraints(w=240.0, 0.0<=h<=486.0)` → `overflowed by 25 pixels`。
+「诊断日志」的 `TvFocusable` 是 `(48, 467, 288, 528)`，安全带下沿只有 **513**
+—— 整行掉在安全带外，底部离屏幕边只剩 12px。Debug 下黄黑斜纹，**Release 静默裁掉**：
+看起来像「那个入口本来就没有」，而它还在焦点链里 —— 遥控器按得到、屏幕上看不见。
+⚠️ `_Sidebar` 的 `Column` 里那个 `Spacer` 是 flex，可用高不够时它被压成 0，
+**不会救场**。
+
+修法（**已实施**）：收紧 `_NavTile` 的内外上下内边距（外圈 `5→4`、内圈 `14→12`）、
+`_Sidebar` 底部 `SizedBox` `10→2`、`_AccountBlock` 名字那圈 `top 12→8`。
+实测每个 tile **61 → 55**，`诊断日志` 落到 `(48, 456, 288, 511)`，**`Spacer` 余量 23px**。
+
+⛔ **余量要量 `Spacer` 的高度，不是量最后那个 tile 的 `bottom`**：`诊断日志` 是被
+`Spacer` **顶到底部**的，它的 `bottom` **永远贴在安全带下沿**，量它只反映尾部间距。
+我第一版按「收紧 36px、原来缺 25px ⇒ 余量 11px」算，**实测只有 2px** —— 就是量错了对象。
+（测试里量 `Spacer` 还要**指定是侧栏那一列里的那个**：`_NavTile` 内部另有一个
+`Spacer`，角标非空时才画。）
+
+⚠️ **残留脆弱点**：侧栏**没有**套 `AppTheme.tvTextScaler`，字跟着系统字体缩放走，
+而 tile 高度是「图标 22 与文字取大」决定的 —— 系统缩放超过 ~1.4 时 5 个 tile 一起长高、
+23px 被吃光。真遇到，修法是给这一列**夹住 `textScaler`**（或把 `Column` 换成可滚动的），
+**不是**继续抠像素。
+
+⚠️ **别把「我期望的顺序」当成「应有的几何」**：从「媒体库」按 ↑ **永远到不了**
+「诊断日志」（`↑` 的候选是 `center.dy <= 目标.top`，而它在最底下）。那是正确的
+几何，不是缺陷 —— 我第一版断言就写过头了。
+
+落点：`test/ui/shell/sidebar_focus_test.dart`（**6 条全过、无 `skip`**；其中两条
+原来 `skip` 的正是上面那两个缺陷，修完转正 —— ⛔ **别删**，它们是那两处修复唯一的回归保护）。
+立的是**真 `AppShell`**（真 `GoRouter` + 真 `StatefulShellRoute.indexedStack`，
+只有分支页是占位）。
+
+- ⛔ 内容区桩页要给**上下两块**（`_StubBranch` 收 `List<FocusNode>`），不是一块：
+  只有一块时「按几何找」和「无脑 focus 第一项」两种实现**都能过**那条 ← 用例。
+  现在断言 `fromTop < fromBottom`（从上半块进侧栏 vs 从下半块，落点高度必须不同）。
+- 反向对照：`_onShellKey` 开头插 `if (1 == 1) return KeyEventResult.ignored;` →
+  **只有** ← 那条红（轨迹 `[x=289 y=27]`），其余 5 条绿 —— 证明兜底真的接上了、
+  且没污染内容区。
+- ⚠️ `testWidgets` 的 `skip` 只收 `bool?`，**不接受 String**（`test` 那个才收）
+  —— 理由只能写在用例名与文档注释里。（这条现在只是备忘：本文件已无 `skip`。）
+- ⚠️ 溢出那个 `FlutterError` 曾经会在**每一条**铺壳的用例里冒出来，当时用
+  `pumpShell` 的 `drainKnownOverflow` 吸掉；**溢出真修好之后那个补丁已删** ——
+  ⛔ 别再加回来，它会掩盖以后新出现的溢出。
+- ⚠️ 拿侧栏某一项的焦点宿主**不能用 `Focus.of(tester.element(navTile(...)))`**：
+  `TvFocusable` 的 element 是那个 `Focus` 的**父**，`Focus.of` 往上找只会找到更外层的。
+  按几何从 `FocusManager.instance.rootScope.descendants` 里捞（`tileNode`）。
+- ⚠️ 侧栏那 6 个 tile 的焦点宿主是 `InkWell`（`TvFocusable` 只是**观察**焦点画环、
+  自己 `canRequestFocus: false`）；⛔ 而「退出登录」那个 `IconButton` **没有**包
+  `TvFocusable`，**没有焦点环** —— 真机上要单独验它。
+
+#### 已排查、确认**没问题**的（别再重复查）
+
+- `library_filter_panel.dart` 的裸 `MenuAnchor`：**已补** `PopScope`（面板开着时
+  BACK 关面板）与底部显式「关闭」按钮 —— 遥控器没有 Esc，这两条是 TV 上唯一出口。
+  全库只剩这一个 `MenuAnchor`。
+- **多选入口都有按钮**：文件夹页工具条有「多选」（`folder_browser.dart:472`），
+  媒体库页头有「选择」。`onLongPress` 在注释里已写明是**桌面/触摸的快捷入口** ——
+  遥控器上长按不成立（OK 键发的是 key 事件 + KeyRepeat，不是长按手势）。
+- `_DetailButton`（「简介」）**常驻显示**，`_hovered` 只改底色深浅；注释里已写明
+  理由：触摸设备没有 hover，只在悬停时出现的按钮等于不存在。
+- `_WorkCard` **有** `TvFocusable`（焦点环 + `focusScale: 1.05`）。
+- ⚠️ **唯一残留的 PC 味道**：海报上那个「暗罩 + 播放图标」只认 hover，TV 上永不出现。
+  **刻意没改** —— 焦点环 + 1.05 放大已是标准 TV 焦点指示，而在**聚焦**的卡片上压
+  一层 32% 暗罩反而会挡住用户正在看的那张封面。这是设计取舍，留给用户定。
+
+### 待用户真机验证（本机验不了）
+1. 原画卡帧 / 音画不同步是否真缓解 —— 看诊断日志里「策略=TV」那行确认参数下发了。
+2. 遥控器菜单键是否真映射到 `contextMenu`（各厂商盒子有差异）。
+3. 没有菜单键的盒子用「设置」按钮 / 舞台上按 ↑ 是否好使。
+4. 壳外页（详情页 / 诊断页）补的过扫描内边距在真机上观感对不对 ——
+   重点看「从媒体库点进详情页，页头会不会跳」。
+5. **侧栏焦点 / 高度（已按上面那节修好，本机只有单元测试背书，请真机复核）**：
+   a) 一进媒体库，按遥控器**方向键**能不能把焦点挪到左侧导航栏（**预期：能** ——
+      修前走不进去，现在靠壳层兜底；⛔ 这是兜底唯一无法在本机真机等价验证的一条）；
+   b) 侧栏最底下那项「诊断日志」在电视上**看不看得见**（**预期：完整可见** ——
+      修前溢出 25px，Release 下会被静默裁掉）；
+   c) 能不能用遥控器把焦点挪到「退出登录」—— ⛔ 它**没包 `TvFocusable`**，
+      **没有焦点环**，本机测不到「看得见看不见」，只能真机看。
+
+---
+
+## 杜比视界（DV）片源颜色错乱：libmpv 没编译 libplacebo（2026-10-04）
+
+**症状**：同一份 DV 片源，夸克自带播放器颜色正常，云影**偏绿 / 偏紫**
+（注意不是「发灰、发白」——那是 HDR→SDR 色调映射的问题，是另一回事）。
+
+**机制**：Dolby Vision 的像素**不是 YCbCr**。Profile 5 用的是 Dolby 私有的
+**IPT-PQ-C2**，播放器必须读 HEVC 里 type 62 的 **RPU** 元数据再做 IPT→RGB。
+mpv 里**只有 libplacebo 会做这件事**（`pl_map_avframe` +
+`PL_COLOR_SYSTEM_DOLBYVISION`），入口是 `vo=gpu-next`。跳过 RPU 就等于把 IPT
+当成 YCbCr BT.2020 PQ 去解 → 颜色全错。
+
+**实测证据（本机产物，不用猜）**
+
+| 平台 | 产物 | 结论 |
+|---|---|---|
+| macOS | `media_kit_libs_macos_video 1.1.4` 的 `Mpv.xcframework/.../Mpv` | `strings` 读出 **`mpv 0.36.0`**；waf 配置含 `-Dlibplacebo=disabled -Dvulkan=disabled`（同时有 `-Dgl=enabled -Dgl-cocoa=enabled -Dvideotoolbox-gl=enabled`） |
+| Android | `media_kit_libs_android_video 1.3.8` → `android/build.gradle` 写死下载 `media-kit/libmpv-android-video-build` **v1.1.7** | 该 tag 的 `buildscripts/scripts/mpv.sh` 同样是 `-Dvulkan=disabled -Dlibplacebo=disabled`；**v1.1.8 / v1.1.11 也没改** |
+
+- **最硬的判据**：`strings Mpv | grep -c "gpu-next"` = **0**。二进制里根本没有
+  这个 vo —— `VideoControllerConfiguration.vo` 传 `gpu-next` 进去也是**静默无效**。
+- **源码级旁证**：mpv v0.36.0 `meson.build:932-939`，`vo_gpu_next.c` 只在
+  `features['libplacebo']` 且 `libplacebo >= 5.264.0` 时才进 sources。
+
+**⛔ 别把「DV 坏了」推广成「所有 HDR 都坏了」**：mpv 0.36 的
+`video/out/gpu/video.c`（legacy `vo=gpu`，`vo=libmpv` 内部走的就是它）
+**不 include libplacebo**，是自带 GLSL 的渲染器，`--tone-mapping` /
+`--hdr-compute-peak` 都在。`-Dlibplacebo=disabled` 只砍掉 `vo=gpu-next`，
+**没砍掉 HDR10 的色调映射**。这解释了「为什么 HDR10 片源正常、只有 DV 炸」。
+
+**本项目现状：一处都没配**（改颜色目前**没有旋钮**）
+
+- 桌面 `playback_controller.dart` / `player_window_app.dart` 都只写
+  `VideoControllerConfiguration(enableHardwareAcceleration: true)` →
+  默认 `vo=libmpv` + `hwdec=auto`（`media_kit_video` 的
+  `lib/src/video_controller/native_video_controller/real.dart:119-122`）。
+- Android 默认 `vo=gpu` + `opengl-es=yes` + `gpu-context=android` +
+  `hwdec=auto-safe`（`android_video_controller/real.dart:186-208`）。
+- `lib/` 全树 grep `'vo'|gpu-api|gpu-context|tone-mapping|target-prim|target-trc|hwdec`
+  → **零命中**。
+
+**症状轻重由 profile 决定（三种不能混为一谈）**
+
+| profile | 无 DV 支持时的表现 |
+|---|---|
+| **P5**（单层 IPT，流媒体 WEB-DL 常见） | 颜色彻底错 → **就是本症状** |
+| **P8.1**（HDR10 兼容基底） | 退化成 HDR10，颜色大致对 |
+| **P7**（UHD 蓝光双层 FEL/MEL） | 只解 BL，HDR10 观感，非 DV |
+
+⚠️ 库里同批 DV 片源大多是 WEB-DL 的 `DV.HDR`（P8.1 面大）。**profile 必须先验**，
+别默认是 P5。
+
+**怎么验 profile（排查第一步）**
+
+- `ffprobe -show_streams <file>` 看 `side_data_list` 的
+  `Dolby Vision configuration` / `dv_profile`。
+- libavcodec 会打 `Found Dolby Vision config record: profile %d level %d`
+  （本机 Mpv 二进制里确实有这个字符串）。⚠️ 但它是 **verbose** 级，而两个播放器的
+  `PlayerConfiguration.logLevel` 分别是 `warn`（独立窗口）/ 默认 `error`（内置页）
+  → **当前收不到**，要看得临时抬级。
+- mpv 0.36 只暴露 `video-params/primaries`、`/gamma`、`/colormatrix`、
+  `/colorlevels`（**没有 DV 专用属性**）。
+
+**修法（按代价排，都还没做）**
+
+1. **自编译带 libplacebo ≥ 5.264 的 libmpv** → 用 `vo=gpu-next`。
+   macOS 可行且不必上 MoltenVK：mpv 0.36 的 `video/out/gpu_next/context.c`
+   里有 `#include <libplacebo/opengl.h>` + `pl_opengl_create()` ——
+   **OpenGL 后端就能跑 gpu-next**（`--gpu-api=opengl --gpu-context=cocoa`）。
+   ⚠️ `media_kit_libs_macos_video` **最新就是 1.1.4**，升级包没用，得换 framework。
+2. **HDR10 兜底**：对 P8.1 / P7 有效，**对 P5 无效** —— 治不了本症状。
+3. 只告知用户「DV P5 不支持」：诚实，但不解决问题。
+
+---
+
+## ⛔ 修正（同日稍晚）：上面「选项 1（自编译 libmpv + `vo=gpu-next`）」在 macOS 上**不可达**
+
+上面写「自编译带 libplacebo 的 libmpv → 用 `vo=gpu-next`」。**编出来也没用**：
+media_kit 桌面端走的是 mpv 的 **render API**，而 render API 里**根本没有 gpu-next 这个后端**。
+
+三处源码即可定案（均已实际下载核对，非推测）：
+- `media_kit_video-1.3.1/lib/src/video_controller/native_video_controller/real.dart:121`
+  → 桌面端写死 `vo: 'libmpv'`。
+- `video/out/vo_libmpv.c` 的 `render_backends[]`，**v0.36.0 / v0.37.0 / v0.38.0 / v0.40.0 / master 全部**
+  只有 `{ &render_backend_gpu, &render_backend_sw }` —— 没有任何 gpu-next 入口。
+- `video/out/gpu/libmpv_gpu.c` 里 `render_backend_gpu` 的实现直接
+  `p->renderer = gl_video_init(...)` —— **写死 gl_video（= 老的 `vo=gpu`）**，master 亦然。
+
+→ 所以 `VideoControllerConfiguration(vo: 'gpu-next')` 在 macOS 上**永远不会生效**。
+（`mpv/render.h` 有说明：一旦建了 render context，vo 就被固定；只有不建 render context
+时才允许 vo 自己开窗。media_kit 桌面端一定会建。）
+
+### 平台不对称（很关键）
+Android 侧 media_kit 用的是**真窗口 vo**，不是 render API：
+`android_video_controller/real.dart:194-205` 设 `vo: 'gpu'` + `gpu-context: 'android'` +
+`opengl-es: 'yes'` + `wid`（Android Surface），且 `widListener()` 会**运行时重设 `vo`**。
+→ 「自建带 libplacebo 的 libmpv + 换 `vo=gpu-next`」**只在 Android 侧架构上可行**
+（要 fork `media_kit_libs_android_video` 替换 .so）；**macOS 侧此路不通**。
+
+## 夸克客户端为什么颜色正常：它不用 mpv，用的是 Apple 平台栈
+
+实测 `/Applications/Quark.app`（7.3.5.1009）：
+- 是 **Chromium 壳**（`Contents/Frameworks/Quark Framework.framework`，进程带 `--type=renderer`）。
+- `otool -L` 链接 **AVFoundation / VideoToolbox / CoreMedia / CoreVideo / AudioToolbox**。
+- 二进制里有 `dolby vision profile 0/5/7/8/9`、`dvh1.`、`dvhe.`、
+  `Dolby Vision video track with track_id=`、
+  `Dolby Vision codec string when constructing the SourceBuffer`
+  → 即 **Chromium `<video>` + MSE**，DV 交给 Apple 的解码/显示栈处理。
+
+⛔ **但「改 hwdec 就能修」是错的 —— 已实测排除**：
+把 `/tmp/01_head.mkv` 的同一帧分别用
+(a) 纯软件解码 与 (b) `ffmpeg -hwaccel videotoolbox`（debug 日志确认
+`Format videotoolbox_vld chosen by get_format()` +
+`Format videotoolbox_vld requires hwaccel hevc_videotoolbox initialisation`）
+导出 PNG，两者 **`cmp` 逐字节完全相同**。
+→ **VideoToolbox 的原始解码不做 DV 转换**（只给你同样的 IPT-PQ 基础层），
+转换发生在更上层（AVFoundation / `AVSampleBufferDisplayLayer` 那一段）。
+所以 `hwdec=videotoolbox` / `videotoolbox-copy` 都救不了颜色，**别在这上面试参数**。
+
+## DV P5 探测配方（若要做「检测 + 提示」）
+
+⚠️ MKV 里的 DV 信号**不在** hvcC 的 `dvcC` box —— **直接搜 `dvcC` 字面量会读错**
+（实测 `01.mkv` 头里能搜到两处 `dvcC`，但那是 Matroska `BlockAddIDType` 的取值，
+它前面 4 字节并不是 box size）。正确做法是解析 **Matroska `BlockAdditionMapping`**。
+
+实测 `01.mkv` 偏移 4389 起，用 EBML 逐层解出来的结果（与 ffprobe 输出完全一致）：
+```
+@4389  0x41E4 BlockAdditionMapping   size=34
+   0x41E7 BlockAddIDType       = 0x64766343  ("dvcC")
+   0x41ED BlockAddIDExtraData  (24 字节) = 01 00 0a 4d 00 00 00 …
+          dv_version=1.0  dv_profile=5  dv_level=9  rpu=1 el=0 bl=1  compat_id=0
+```
+- 只有 `BlockAddIDType` == `0x64766343`("dvcC") 或 `0x64767643`("dvvC") 才认。
+- `BlockAddIDExtraData` 前几字节即 **DOVI configuration record**：
+  `[0]`=version_major，`[1]`=version_minor，**`[2] >> 1` = dv_profile**，
+  `[3]` 低 3 位依次 rpu/el/bl，`[4] >> 4` = bl_signal_compatibility_id。
+- 只需文件头若干 KB（`Tracks` 元素在很前面；实测 8 MiB 头绰绰有余）。
+- 探测入口可复用下载模块的 Range 取头（`resolveStream` + `Range: bytes=0-…`），
+  **不必**等 mpv 起播。
+
+---
+
+## 换内核验证：libmdk（fvp）能不能救 DV P5（2026-10-04 下午）
+
+### 结论：mdk 的 DV 支持是**真代码**，不是宣传语
+`mdk-sdk` 的 GitHub 仓库只是二进制分发（仅 30 个文件、无源码），所以照老办法
+**对预编译产物取证**：
+
+- 下 `mdk-sdk-apple.tar.xz`（33.6 MB，nightly）→
+  `lib/mdk.xcframework/macos-arm64_x86_64/mdk.framework/Versions/A/mdk`（3.4 MB）
+  里 `strings` 直接能看到 **Metal shader 源码**：
+  ```
+  { // dovi reshape. YCC=>IPT
+  { // Dolby Vision FEL LINEAR_DZ residual
+  s = coeffs[3] == 0.0 ? reshape_poly(coeffs, s) : reshape_mmr(coeffs, sig, %d ARGV_CB(cb));
+  vec3 el_centered = el_sig.rgb - cb.dovi_nlq.offset;
+  /***%before_rgb%***/ // before convert. for dolby vision
+  ```
+  外加**完整的 RPU 解析/校验栈**（`RPU validation failed: …`，含 `RPU_COEFF_FIXED`、
+  `DOVI_MAX_DM_ID`、`DolbyVisionMetadata::Mapping::ReshapingCurve::MaxPieces`、
+  `mmr_order_minus1`、`nlq_method_idc` 等）
+  → **RPU 的 reshaping 多项式 + MMR 在 GPU shader 里应用**，等价于 libplacebo 在
+  `vo=gpu-next` 里做的事，但 mdk 内置。
+- Changelog 印证：「Dolby Vision Profile 7 FEL support」「Simplify dolby vision reshape」
+  「Metal: fix constant buffer layout, e.g. dovi profile8 mmr」。
+- **它认得我们的文件**：`bin/window` 日志直接打印
+  `Dolby Vision 1.0 Profile 5 Level 9,  BL RPU`。
+
+### ⛔ 但**不能**用 mdk 的 CLI 做无 GUI 验证（三条路都堵）
+1. `bin/Thumbnail -from <ms> file` 能出 PNG，但**不走渲染器**（取的是解码帧）：
+   与 ffmpeg 软解同帧 `psnr` = **48 dB**（≈逐像素相同）→ 里面没有 DV 处理。
+   **DV 在渲染阶段（shader）做，任何「抓解码帧」的路径都不会有 DV。**
+2. 自写 `Player::snapshot()`（离屏）→ **必 SIGSEGV**。三种写法都崩：
+   `setRenderAPI(&MetalRenderAPI())` 只给类型（文档说离屏可用）、自备 `req.data` 缓冲、
+   不调 `setRenderAPI` 走默认 GL。`renderVideo()` 本身是正常的（返回
+   5.2/5.9/6.6/7.3 秒的时间戳，离屏渲染确实在跑），只是 snapshot 拿不到。
+3. `bin/window`（真窗口播放器）窗口**在我的沙箱里不出现**：日志有
+   `PlatformSurface::Event::Resize 1920x1080`（NSWindow 建了），但
+   `CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly)` 里始终找不到，
+   沙箱内外一样 → 窗口级 `screencapture -l <id>` 抓不到。
+   （⚠️ 用户自己从终端跑应该能正常出窗口。）
+
+→ **颜色对不对只能用户在真机肉眼看**，我这边无法自动取证。
+
+### 接入 fvp 的三个坑（PoC 实测）
+1. ⛔ **macOS 上必须显式 `fvp.registerWith(options: {'platforms': ['macos']})`**，
+   否则 `video_player` 用官方 `video_player_avfoundation`（Apple 那套栈），测的不是 mdk。
+2. ⛔ fvp 的 macOS podspec 依赖 CocoaPods 的 `mdk ~> 0.39.0`，source 是
+   `https://sourceforge.net/projects/mdk-sdk/files/nightly/mdk-sdk-apple.tar.xz`。
+   本机对这条 URL 的**跳转链偶发 TLS 失败**（`SSL_ERROR_SYSCALL`）→ `pod install` 直接失败。
+   实测完整跟随跳转是能成的（`http=200 size=33599232`，落到
+   `pilotfiber.dl.sourceforge.net`），**重试通常就好**；一直失败用
+   `master.dl.sourceforge.net/project/mdk-sdk/nightly/mdk-sdk-apple.tar.xz` 兜底。
+3. PoC 的 entitlements 必须 `app-sandbox = false`（模板默认 true → 读不到 `/tmp` 片源）。
+
+### PoC 位置与跑法
+- 工程：`/Users/tandy/workbuddy-ai/dv_poc`（**在主仓库之外**，不动 cloudcine 的 pubspec）。
+- 片源：`/tmp/dv_poc_source.mkv`（390 MB / 115 秒 / 3840x1920，DV P5 元数据完好）。
+- 跑：`cd /Users/tandy/workbuddy-ai/dv_poc && flutter run -d macos`，界面里点「播放」。
+- 看点：肤色、暗部、整体色调，与夸克客户端同一时间点对比。
+
+### ✅ 结果（2026-10-04 12:18，用户肉眼确认）：**颜色正常 → 换内核路线成立**
+libmdk 内核能正确渲染 DV P5。至此「换内核」不再是可行性问题，只是**迁移工作量**问题。
+
+### 构建 PoC 踩到的坑（都已解决，照抄即可）
+1. ⛔ **坑 1 的根因**：fvp 的 pubspec 里 macOS 平台**只有 `pluginClass: FvpPlugin`，没有
+   `dartPluginClass`**（只有 linux/windows/ohos/elinux 有 `VideoPlayerRegistrant`）。
+   所以 macOS 上 fvp **不会**自动注册 → 不显式 `registerWith` 就静默走 Apple 那套栈，
+   **测试结果假阴性**。这是本项目最容易踩的一个。
+2. ⛔ **`pod install` 的 `Encoding::CompatibilityError` 是 locale 问题，但只影响手跑**：
+   `LANG/LC_ALL/LC_CTYPE` 全空 → Ruby 的 `Dir.pwd` 是 ASCII-8BIT →
+   CocoaPods `config.rb:167` 的 `unicode_normalize` 抛
+   `Unicode Normalization not appropriate for ASCII-8BIT`。
+   **但 `flutter build macos` 内部 `_runPodInstall` 自己已经传了 `LANG=en_US.UTF-8`**
+   （`flutter_tools/lib/src/macos/cocoapods.dart:359`）→ **build 不受影响**；
+   只有**手跑 `pod install`** 才要自己 `export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8`。
+3. ⛔ **别指望「先手动 pod install 再 build」能省掉那一步**：`processPods` 的
+   `dependenciesChanged` **默认 true** → `_shouldRunPodInstall` 直接 return true
+   （`cocoapods.dart:180 / 336`）→ **每次 build 都重跑 pod install**。
+4. ⛔ **真正的拦路虎是沙箱**：PoC 在 workspace 根之外，必须 `dangerouslyDisableSandbox`。
+   否则报 `Operation not permitted` 于 `Pods/Manifest.lock`、`Pods.xcodeproj/xcuserdata/...`。
+   ⚠️ **`run_in_background` + 绕过沙箱 组合不生效**（后台跑仍是沙箱内）→ 要前台跑。
+5. ⛔ **profile 里的 gvm 会让命令「跑之前就 exit 1」**（`ERROR: GVM_ROOT not set`，stdout 空）。
+   非 Flutter 命令（如 `pod install`）用**干净 shell** 绕开最省事：
+   `/bin/zsh -f -c 'export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"; cd … && pod install'`。
+   Flutter 命令则显式给 `/opt/homebrew/Caskroom/flutter/3.29.0/flutter/bin/flutter`。
+
+### 构建成功的判据与取证（别只看退出码）
+- 判据：stdout 末尾 `✓ Built build/macos/Build/Products/Debug/dv_poc.app`。
+- 链接取证（**必须对 `dv_poc.debug.dylib`，不是主二进制**）：
+  `otool -L .../Contents/MacOS/dv_poc.debug.dylib | grep -iE 'mdk|fvp'` 应看到
+  `@rpath/mdk.framework/Versions/A/mdk (… current version 0.39.0)` 与 `@rpath/fvp.framework/…`；
+  `Contents/Frameworks/` 下应有 `mdk.framework`、`fvp.framework`。
+- ⚠️ **别拿 mdk 日志当判据**：应用内**看不到** `Dolby Vision … Profile 5` 那行
+  （默认日志级别不够，`bin/window` 才有）→ 起播成功与否要看界面，不是日志。
 

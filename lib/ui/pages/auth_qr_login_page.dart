@@ -311,13 +311,29 @@ class _AuthQrLoginPageState extends ConsumerState<AuthQrLoginPage> {
 
   @override
   Widget build(BuildContext context) {
+    // 过扫描边距**只加在顶栏上**，整页不加 —— 理由见下面那处 `Padding`。
+    final safe = AppTheme.safeAreaInsets(context);
+
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: SafeArea(
         child: Column(
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 14, 0),
+              // ⛔ 只给顶栏加，**整页不加**。这一页的主角是那个 320 的二维码，
+              // 它必须一进来就**完整可见**（缺一角的码永远扫不出来，而且看起来
+              // 完全正常）。整页套一层过扫描边距会平白多出 54px 滚动量，
+              // 把二维码推出首屏 —— 那是比「返回键被切一角」严重得多的回归。
+              //
+              // 而顶栏确实需要：那个返回键在 x=10、y=8，正好落进过扫描带里。
+              // `/auth/qr` 与 `/work`、`/diagnostics` 一样在 `StatefulShellRoute`
+              // 之外，拿不到 `AppShell` 那层内边距（见 `AppTheme.safeAreaInsets`）。
+              padding: EdgeInsets.fromLTRB(
+                10 + safe.left,
+                8 + safe.top,
+                14 + safe.right,
+                0,
+              ),
               child: Row(
                 children: [
                   TvIconLabel(

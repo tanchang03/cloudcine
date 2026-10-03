@@ -21,6 +21,25 @@ String formatBytes(int? bytes, {int fractionDigits = 1}) {
   return '${value.toStringAsFixed(digits)} ${units[unit]}';
 }
 
+/// 网盘容量的展示文案：`1.5 TB / 2.0 TB · 剩 512.0 GB`。
+///
+/// 三段都是用户真正要问的：**总共多少、用了多少、还剩多少**。只给前两段的话
+/// 「还能不能传上去」得自己心算，而这正是这一行存在的理由。
+///
+/// ⚠️ 剩余量**夹在 0**：服务端给出的两份数字来自同一响应，但配额降档、会员
+/// 到期这类时刻仍可能凑出 `used > total`。减出负数会让界面显示
+/// 「剩 -3 GB」这种自相矛盾的话，用户会当成 bug 报上来。
+///
+/// [totalBytes] 非正数时返回**空串**而不是 `0 B / 0 B` —— 调用方据此整行不画
+/// （见 `DriveStorageMeter`）。把「不知道」画成「0」会被读成「网盘满了」。
+String formatStorageUsage(int usedBytes, int totalBytes) {
+  if (totalBytes <= 0) return '';
+  final used = usedBytes < 0 ? 0 : usedBytes;
+  final remaining = totalBytes > used ? totalBytes - used : 0;
+  return '${formatBytes(used)} / ${formatBytes(totalBytes)}'
+      ' · 剩 ${formatBytes(remaining)}';
+}
+
 /// 把时长格式化成 `mm:ss` 或 `h:mm:ss`。
 ///
 /// `null` 返回 `--:--`，与播放器占位一致。
@@ -28,7 +47,8 @@ String formatBytes(int? bytes, {int fractionDigits = 1}) {
 /// ⚠️ **目前没有任何界面在用这个函数。** 页面与组件用的是
 /// `ui/theme/app_theme.dart` 里的同名函数（分钟不补零、零值给 `--:--`），
 /// 两者输出不一致 —— 改这里不会影响界面，改界面也不会走到这里。
-/// 这个版本只被 `test/core/format_test.dart` 覆盖着，别按它去推界面的显示。
+/// 这个版本目前没有用例覆盖（`test/core/format_test.dart` 只覆盖本文件里
+/// 的 `formatRelativeTime` / `formatDateTimeMinute`），别按它去推界面的显示。
 String formatDuration(Duration? d) {
   if (d == null) return '--:--';
   final negative = d.isNegative;
@@ -83,4 +103,19 @@ String formatRelativeTime(DateTime time, {DateTime? now}) {
   final m = time.month.toString().padLeft(2, '0');
   final d = time.day.toString().padLeft(2, '0');
   return '$y-$m-$d';
+}
+
+/// 精确到分钟的时刻：`2026-10-03 16:41`。
+///
+/// 与 [formatRelativeTime] 配套用：相对时间（`3 天前`）负责「扫一眼看新旧」，
+/// 这一份负责回答「到底是哪一刻」—— 目录视图把它放在 tooltip 里，
+/// 因为把完整时刻印进列表会让那一列宽到比文件名还长。
+///
+/// ⚠️ 不补时区、不做本地化：时间戳全部来自网盘（夸克给的是本地时区的
+/// 字符串，解析后就是本机时间）。加一层 `toLocal()` 只会在别的时区上
+/// 把同一个时刻显示成两个不同的值。
+String formatDateTimeMinute(DateTime time) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${time.year.toString().padLeft(4, '0')}-${two(time.month)}-'
+      '${two(time.day)} ${two(time.hour)}:${two(time.minute)}';
 }

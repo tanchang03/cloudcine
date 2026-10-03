@@ -95,4 +95,56 @@ void main() {
       expect(ticket.pickActiveQualityId(), 'origin');
     });
   });
+
+  group('StreamTicket.withQuality', () {
+    QualityOption withSize(String id, {int? bytes}) => QualityOption(
+          id: id,
+          label: id,
+          url: Uri.parse('https://cdn/$id.mkv'),
+          estimatedBytes: bytes,
+        );
+
+    test('服务端给了这一档体积时用它', () {
+      final ticket = StreamTicket(
+        url: Uri.parse('https://cdn/origin.mkv'),
+        contentLength: 17 * 1024 * 1024 * 1024,
+      );
+
+      final next = ticket.withQuality(
+        withSize('4k', bytes: 4 * 1024 * 1024 * 1024),
+      );
+
+      expect(next.contentLength, 4 * 1024 * 1024 * 1024);
+      expect(next.url, Uri.parse('https://cdn/4k.mkv'));
+    });
+
+    test('服务端没给体积时留 null —— **绝不沿用上一条流的体积**', () {
+      // ⚠️ 这条断言钉的是「切到 4K 就黑屏」的根因，不要改回去。
+      //
+      // 旧实现是 `quality.estimatedBytes ?? contentLength`：换档时上一条流是
+      // 原画，于是「原画 17 GiB 的块布局」被套到 4 GiB 的转码流上 ——
+      // 本地中继按错的总长切块、发越界的 Range，上游回 416，画面就没了。
+      //
+      // 留 null 会让 `_prepareSource` 看到「长度未知」而**跳过中继、直连播放**：
+      // 少一点加速，但至少能播。
+      final ticket = StreamTicket(
+        url: Uri.parse('https://cdn/origin.mkv'),
+        contentLength: 17 * 1024 * 1024 * 1024,
+      );
+
+      final next = ticket.withQuality(withSize('4k'));
+
+      expect(next.contentLength, isNull);
+    });
+
+    test('没有地址的档位原样返回，不改票据', () {
+      final ticket = StreamTicket(url: Uri.parse('https://cdn/origin.mkv'));
+
+      final next = ticket.withQuality(
+        const QualityOption(id: '4k', label: '4K'),
+      );
+
+      expect(next, same(ticket));
+    });
+  });
 }

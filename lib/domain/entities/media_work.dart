@@ -1,3 +1,4 @@
+import '../../core/utils/directory_title.dart';
 import '../../core/utils/filename_parser.dart';
 import '../../core/utils/format.dart';
 import '../../core/utils/media_category.dart';
@@ -551,9 +552,20 @@ class ScrapeQuery {
     this.year,
     this.season,
     this.episode,
+    this.requireExactTitle = false,
+    this.fallbacks = const [],
   });
 
-  /// 由文件名解析结果构造。解析不可信（片名空 / 类型未知）时返回 `null`。
+  /// 由文件名解析结果构造。**片名都提不出来时返回 `null`**（没有可查的东西）。
+  ///
+  /// ## 两档查询
+  ///
+  ///   - **严格档**（[requireExactTitle] 为 `false`）：解析可信 —— 有年份的
+  ///     电影，或带季集结构的剧集。交给常规闸门（年份硬闸门 + 标题相似度分档）；
+  ///   - **宽松档**（[requireExactTitle] 为 `true`）：**没有年份的电影**。
+  ///     它在 2026-10-03 之前被直接拒掉（`isConfident` 为假 → 返回 `null`），
+  ///     于是 `/来自：分享/奥德赛/1080P.mkv` 这类片子**永远刮不出来**。
+  ///     现在放行，但把闸门换得更紧 —— 理由见 [requireExactTitle]。
   ///
   /// ## 为什么做成工厂而不是让调用方各拼各的
   ///
@@ -561,9 +573,24 @@ class ScrapeQuery {
   /// 「刮削」按钮（`WorkScraper`）。两处只要有一处漏了 `alternateTitle`、
   /// 或者年份的取值口径不同，同一个作品在两处就会**查出不同的结果** ——
   /// 而这是静默的：用户只会觉得「这个按钮有时候不准」。
-  static ScrapeQuery? fromParsed(ParsedMediaName parsed) {
+  ///
+  /// [dirPath] 是**这个文件所在目录**（带尾斜杠）。传了它才会生成
+  /// [fallbacks]（文件名搜不到时改用目录名再搜）—— 理由见 [_fallbacksOf]。
+  /// 两个调用点都必须传：漏了不会报错，只会让那条兜底永远不生效。
+  static ScrapeQuery? fromParsed(ParsedMediaName parsed, {String? dirPath}) {
     final title = parsed.title;
-    if (!parsed.isConfident || title == null || title.isEmpty) return null;
+    if (title == null || title.isEmpty) return null;
+    // 类型都认不出来 = 这条文件名除了技术标记什么都没有（`S01E01.1080p.mkv`）。
+    // 拿它去搜必然搜到别的片子 —— 这是**没有可查的东西**，不是档位问题。
+    if (parsed.kind == MediaKind.unknown) return null;
+
+    // 走到这里 `!isConfident` 只剩一种情形：**电影且没有年份** ——
+    // 剧集不靠年份消歧（季集号自己就能定位），有年份的电影属于严格档。
+    final relaxed = !parsed.isConfident;
+    // 宽松档仍然要求「片名像个名字」：`159`、`1080p` 这类串不是名字，
+    // 搜出去只会带回一堆编号相同的无关条目（2026-10-02「182」事故的同类）。
+    if (relaxed && !parsed.hasUsableTitle) return null;
+
     return ScrapeQuery(
       title: title,
       alternateTitle: _alternateOf(parsed),
@@ -571,8 +598,67 @@ class ScrapeQuery {
       year: parsed.year,
       season: parsed.season,
       episode: parsed.episode,
+      requireExactTitle: relaxed,
+      fallbacks: _fallbacksOf(parsed, dirPath),
     );
   }
+
+  /// 目录名兜底的**最大条数**（文件所在目录 + 上级目录）。
+  ///
+  /// 每多一条就多花一个搜索词，而豆瓣的匿名额度实测只有约 10 个
+  /// （见 `ScraperPipeline` 的类文档）。两级正好覆盖用户能一眼说清楚的
+  /// 那两件事；再往上基本都是 `/来自：分享/动漫/` 这类栏目名，
+  /// 本来就被 `DirectoryTitle.isContainerSegment` 挡掉了。
+  static const int _maxDirFallbacks = 2;
+
+  /// 文件名搜不到时的备用查询：**文件所在目录 → 上级目录**（逐级向上）。
+  ///
+  /// ## 为什么需要
+  ///
+  /// 2026-10-03 现场：`/来自：分享/仙逆/126 纯享-仙踪-[4K][HEVC][2026-02-01].mp4`
+  /// 的文件名里没有作品名，只有「编号 + 描述」；`仙逆` 只写在目录上。
+  /// 解析层本该用目录名归组（见 `MediaFilenameParser.parse`），但那一层
+  /// 依赖一串前置判据，任何一条失手就会退回垃圾片名 —— 而**刮削是最后一
+  /// 道防线**：它手上直接有这个文件的完整路径，不必受归组结论的牵连。
+  ///
+  /// ## 为什么目录候选一律当**剧集**、且走**宽松档**
+  ///
+  ///   - 目录名是**系列名**（`DirectoryTitle` 的口径），所以按剧集搜
+  ///     （TMDB 的 `/search/tv`）—— 一部剧/动画的名字几乎只可能是剧名；
+  ///   - 目录名没有年份、也没有季集号，闸门只剩标题相似度，而
+  ///     `strongSimilarity = 0.6` 是为「有年份」定的档 —— 所以必须换成
+  ///     **精确同名**（与无年份电影同一条理由，见 [requireExactTitle]）。
+  ///
+  /// ## 三处刻意的省略
+  ///
+  ///   - **不设 `alternateTitle`**：目录名极少中英混排，带上只会把一次
+  ///     失败变成两次请求；
+  ///   - **不设 `year`**：目录名里的年份几乎都是「合集整理于某年」，
+  ///     当过滤条件用会把正主筛掉；
+  ///   - **不与主查询重名**：`/…/仙逆/仙逆.S01E01.mkv` 这种「目录名就是
+  ///     片名」的布局很常见，那条兜底与主查询完全等价，白花一次额度。
+  static List<ScrapeQuery> _fallbacksOf(ParsedMediaName parsed, String? dirPath) {
+    if (dirPath == null || dirPath.isEmpty) return const [];
+    final own = _normalizeName(parsed.title);
+
+    final out = <ScrapeQuery>[];
+    for (final name in DirectoryTitle.ancestorNames(dirPath)) {
+      if (out.length >= _maxDirFallbacks) break;
+      if (_normalizeName(name) == own) continue;
+      out.add(
+        ScrapeQuery(
+          title: name,
+          kind: MediaKind.episode,
+          requireExactTitle: true,
+        ),
+      );
+    }
+    return out;
+  }
+
+  /// 「同一个名字」的判定口径 —— 与 `ParsedMediaName.groupKey` 一致。
+  static String _normalizeName(String? s) =>
+      (s ?? '').toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
 
   /// 中英混排时把另一半作为备用查询词。
   ///
@@ -607,10 +693,54 @@ class ScrapeQuery {
   final int? season;
   final int? episode;
 
+  /// **宽松档**：这条查询没有年份可用于消歧（无年份的电影），因此闸门改用
+  /// **归一化精确同名**这条判据，并且调用方还要求这条命中**排在该源候选的
+  /// 第一位**（见 `TmdbScraper._pickVerified` 与 `DoubanScraper._pickBest`）。
+  ///
+  /// ## 为什么不是「取第一个过闸门的」
+  ///
+  /// 无年份时闸门只剩标题相似度，而 `strongSimilarity = 0.6` 是**为「有年份」
+  /// 定的档**（那里的主力判据是年份硬闸门，标题只是辅助）。实测 2026-10-03
+  /// 搜「奥德赛」时，被 0.6 档放行、但**是别的片子**的有：`特洛伊奥德赛`
+  /// 0.68、`奥德赛：史诗的诞生` 0.78、`《奥德赛》序章` 0.86 —— 「取第一条」
+  /// 会把它们照单收下，而那是**静默刮错**（标题/简介/评分/海报换成另一部
+  /// 片子的，且不报错）。
+  ///
+  /// ## 为什么也不要求「精确同名唯一」
+  ///
+  /// 同一次实测：「奥德赛」在 TMDB 上有 **4 条**精确同名（豆瓣 2 条）。
+  /// 要求唯一会把正主也挡掉。所以只要求**第一条精确同名** —— 既挡住上面的
+  /// 前缀误配，又借数据源自己的相关度排序在多个同名条目里挑一个（TMDB 把
+  /// 最热门的排最前）。第一条都不精确，就交回手动通道。
+  final bool requireExactTitle;
+
+  /// 本条失败后**按顺序再试**的候选查询（空 = 没有兜底）。
+  ///
+  /// 目前只有一个来源：[fromParsed] 从 `dirPath` 生成的目录名候选。
+  ///
+  /// ## 为什么挂在 `ScrapeQuery` 上、而不是新造一个「查询链」类型
+  ///
+  /// 链的持有者是 `WorkSeedBook._queries`（`Map<String, ScrapeQuery>`）与
+  /// `WorkScraper._queryFor`，两处都是「一个作品一条查询」。新造一个类型
+  /// 就要把这两处的类型、以及它们的所有调用点一起改 —— 换来的只是
+  /// 「`ScrapeQuery` 里不会出现 `ScrapeQuery`」这一条形式上的洁癖。
+  ///
+  /// ⚠️ **兜底自己不再带兜底**（[fromParsed] 造出来的那几条 `fallbacks`
+  /// 恒为空）。链只有一层深，`ScraperPipeline.scrape` 的循环也就没有递归。
+  final List<ScrapeQuery> fallbacks;
+
   bool get isEpisode => kind == MediaKind.episode;
+
+  /// 这条查询会实际发出的搜索词条数（含兜底）。
+  ///
+  /// 给测试与「这次刮削花了多少额度」的排查用 —— 豆瓣匿名额度只有约 10 个，
+  /// 而链每多一条就多花一个词。
+  int get attemptCount => 1 + fallbacks.length;
 
   @override
   String toString() =>
       'ScrapeQuery("$title"${alternateTitle == null ? "" : " / $alternateTitle"}, '
-      '${kind.name}, y=$year, s=$season, e=$episode)';
+      '${kind.name}, y=$year, s=$season, e=$episode'
+      '${requireExactTitle ? ", 精确同名档" : ""}'
+      '${fallbacks.isEmpty ? "" : ", 兜底 ${fallbacks.map((f) => f.title).join(" → ")}"})';
 }

@@ -422,13 +422,17 @@ void main() {
     });
 
     test('文件名解析不出可信片名 → noQuery，不发请求', () async {
+      // ⚠️ 文件名必须是**真的提不出片名**的那种：`1080p.WEB-DL.mkv` 整串只有
+      // 技术标记。`video.mkv` 看着像「没信息」，其实解析出来就是片名
+      // 「video」—— 2026-10-03 起它走**宽松档**（无年份的电影），
+      // 于是这条用例就测不到「真的什么都提不出来」了。
       // ⚠️ 目录名必须是**容器名**（`/电影/`）：2026-10-02 起「目录名可信且
       // 文件自己说不清楚」时，整目录会按目录名归组 —— 用默认的
       // `/动漫/Show/` 的话，`video.mkv` 会被救成一部叫「Show」的作品，
       // 这条用例就测不到「真的什么都提不出来」了。
       final repo = await repoWith(
         work(),
-        [item(name: 'video.mkv', dirPath: '/电影/')],
+        [item(name: '1080p.WEB-DL.mkv', dirPath: '/电影/')],
       );
       final scraper = _Fixed('fake', online());
       final subject = WorkScraper(
@@ -507,10 +511,11 @@ void main() {
     });
 
     test('queryFor 解析不出片名 → null，让对话框退回库里已有的标题', () async {
-      // 同上：目录名得是容器名，否则目录名会兜底成一个可信片名。
+      // 同上：文件名要**真的**提不出片名（`video.mkv` 其实解析得出片名
+      // 「video」，2026-10-03 起走宽松档），目录名得是容器名。
       final repo = await repoWith(
         work(),
-        [item(name: 'video.mkv', dirPath: '/电影/')],
+        [item(name: '1080p.WEB-DL.mkv', dirPath: '/电影/')],
       );
       final subject = WorkScraper(
         library: repo,
@@ -519,6 +524,37 @@ void main() {
       );
 
       expect(await subject.queryFor(work()), isNull);
+    });
+
+    test('无年份的电影 → 给出**宽松档**查询（与自动刮削同一个词）', () async {
+      // 现场：`/来自：分享/奥德赛/1080P.mkv` —— 文件名只有一个分辨率标记，
+      // 片名靠目录名兜底成「奥德赛」，但没有年份。
+      final repo = await repoWith(work(), [
+        item(name: '1080P.mkv', dirPath: '/来自：分享/奥德赛/'),
+      ]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      );
+
+      final q = await subject.queryFor(work());
+
+      expect(
+        q,
+        isNotNull,
+        reason: '旧实现这里返回 null（`isConfident` 为假），对话框只能退回'
+            '库里已存的标题。现在给出查询词，且它**就是自动刮削用的那一个** —— '
+            '两处不同会让用户觉得「手动搜得到、自动搜不到」',
+      );
+      expect(q!.title, '奥德赛');
+      expect(q.year, isNull);
+      expect(
+        q.requireExactTitle,
+        isTrue,
+        reason: '没有年份可消歧 → 闸门要求精确同名，且第一条必须精确'
+            '（见 ScrapeQuery.requireExactTitle）',
+      );
     });
 
     test('目录名可信时 queryFor 给出「目录名」查询 —— 与扫描期同一条解析路径', () async {
@@ -544,6 +580,32 @@ void main() {
       expect(q!.title, '姜松 家电维修视频教程');
       expect(q.kind, MediaKind.episode);
       expect(q.alternateTitle, isNull);
+    });
+
+    test('文件名自称独立发行物时，目录名接在后面当**兜底** —— 别漏传 dirPath', () async {
+      // 现场（2026-10-03）：`/来自：分享/仙逆/126 纯享-仙踪-[4K][HEVC][2026-02-01].mp4`。
+      // 解析层已经能用目录名归组（见 `filename_parser_test`），但这里刻意用
+      // **裸年份**让文件名「自称独立发行物」→ 归组不生效 → 只能靠**刮削层**
+      // 拿目录名兜一次。`_queryFor` 漏传 `dirPath` 不会报错，
+      // 只会让这条兜底永远不生效 —— 现象就是「怎么都刮不到」。
+      final repo = await repoWith(work(), [
+        item(
+          name: '126 纯享-仙踪.2026.1080p.mkv',
+          dirPath: '/来自：分享/仙逆/',
+        ),
+      ]);
+      final subject = WorkScraper(
+        library: repo,
+        pipeline: ScraperPipeline([_Fixed('fake', online())]),
+        clock: () => now,
+      );
+
+      final q = await subject.queryFor(work());
+
+      expect(q!.title, '126 纯享-仙踪');
+      expect(q.fallbacks.map((f) => f.title), ['仙逆'],
+          reason: '两个调用点（扫描期 `WorkSeedBook.add` 与这里）都必须传 '
+              '`dirPath`，否则同一个文件走两条路会得到不同的查询');
     });
 
     test('searchCandidates 把各源候选汇总返回', () async {

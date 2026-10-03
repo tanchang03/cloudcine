@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/player_audio_effect.dart';
+import '../../domain/entities/playback_preference.dart';
 import 'player_protocol.dart';
 import 'window_launch.dart';
 
@@ -69,6 +70,33 @@ abstract final class PlayerBridgeMethod {
   /// 有 `fast_gbk` 的那一侧做，而播放窗口刻意不背这些依赖。
   static const String fetchSubtitleText = 'fetchSubtitleText';
 
+  /// 播放窗口 → 主窗口：「把这张网盘缩略图给我」，回**本地文件路径**。
+  ///
+  /// 参数是 `{'itemId': <String>, 'url': <String>}`，返回本地绝对路径；
+  /// 取不到时返回 `null`（播放窗口据此退回占位图）。
+  ///
+  /// ## 为什么缩略图也要过主窗口
+  ///
+  /// 与 [fetchSubtitleText] 同一条理由：夸克缩略图**缺 Cookie 一律 401**，
+  /// 而且它每个响应轮换 `__puus`，陈旧 Cookie 是 `401 auth expired`。播放
+  /// 窗口拿不到凭证，也没有主窗口那套 HTTP 配置（代理、超时、限流）。
+  ///
+  /// ⚠️ 顺带一个不那么明显的好处：主窗口那边有 `PosterCache`，**媒体库里
+  /// 已经显示过的缩略图早就落盘了**。于是「打开剧集面板」这一步对大部分
+  /// 条目是零网络 —— 这是把图交给主窗口取、而不是把请求头塞进 `PlayRequest`
+  /// 让播放窗口自己下的关键差别。
+  ///
+  /// ## 为什么回**路径**而不是字节
+  ///
+  /// `PosterCache` 按 URL 落盘、并且把并发请求合成一次。回路径等于让剧集
+  /// 面板白捡两层缓存（磁盘 + 播放窗口自己的 `Image` 缓存）；回字节的话
+  /// 每次开窗都得重下，而一部剧几十集就是几十次带 Cookie 的往返。
+  ///
+  /// [itemId]（`quark:<fid>`）只是缓存文件名的键（见
+  /// `PosterCache.fileNameFor`）：用 fid 而不是整条 URL 当键，缓存文件才
+  /// 可读、也才在换了图片地址时仍然指得准同一集。
+  static const String fetchThumbnail = 'fetchThumbnail';
+
   /// 播放窗口 → 主窗口：「去字幕站上搜一下」。
   ///
   /// 参数是 [SubtitleSearchRequest.toJson]，返回 [OnlineSubtitleBrief] 的
@@ -132,6 +160,35 @@ abstract final class PlayerBridgeMethod {
   /// 引擎里读不到它。不回传的话，用户在播放窗口里选的音效只在**这一次**有效
   /// —— 下次开窗口又变回设置里那一档，而用户完全不知道为什么。
   static const String saveAudioEffect = 'saveAudioEffect';
+
+  /// 播放窗口 → 主窗口：「用户给这部片换了音轨 / 字幕 / 字幕开关，存下来」。
+  ///
+  /// 参数是 `{'itemId': <String>, 'preference': <PlaybackPreference.toJson>}`，
+  /// 返回 `null`（与 [saveAudioEffect] 一样是**单向通知**：播放窗口那边早已
+  /// 生效，落库只决定「下次还记不记得」）。
+  ///
+  /// ## 为什么传的是**整份**偏好而不是「改了哪一项」
+  ///
+  /// 播放窗口手里本来就有一份完整的偏好（打开时从请求里拿的），用户每改一项
+  /// 就地更新。传整份的代价是几十字节，换来的是**主窗口不需要实现合并语义** ——
+  /// 而「哪些字段该保留」这件事一旦有两处实现（两边各一套 patch 规则），
+  /// 必然漂移成「主窗口保存时把某几项抹掉了」这种查不出来的 bug。
+  ///
+  /// ⚠️ 播放窗口**只播种、不改写**：它拿到请求时把这份偏好原样存下来（见
+  /// `player_window_app.dart` 的 `_adoptRequest`），之后用户改哪一项才更新
+  /// 哪一项。而请求里那份**本来就是主窗口从库里读出来的**，所以主窗口收到就
+  /// **直接整份覆盖写**也不会丢掉用户没动过的项 —— 不必再读一遍库做合并，
+  /// 也就不会出现「一次字幕切换把用户选的画质抹成 NULL」这种事。
+  ///
+  /// ⛔ 反过来，**别让播放窗口把画质 / 音效「对齐到本次实际在用的值」再报
+  /// 回来**：本次实际在用的大多数时候只是**全局默认**（用户从没为这部片选
+  /// 过），写进库就等于把它钉死成这部片的覆盖值 —— 之后用户改全局默认，这部
+  /// 片再也不跟着变，而他完全不知道为什么。
+  ///
+  /// 音效另有一条 [saveAudioEffect]：那条写的是**全局默认**（这台设备怎么接
+  /// 音箱），这条写的是**这部片的覆盖**。两个都要写，理由见
+  /// `PlaybackPreference.audioEffect` 的文档。
+  static const String savePlaybackPreference = 'savePlaybackPreference';
 }
 
 /// 跨引擎通道上的**错误码**。
@@ -191,6 +248,20 @@ Future<PlayRequest?> Function(TicketRefreshRequest request)? onTicketRefresh;
 /// 那会被读成「点了没反应」。
 Future<String?> Function(String fileId)? onFetchSubtitleText;
 
+/// 播放窗口要一张网盘缩略图时，主窗口该做什么。
+///
+/// 与 [onFetchSubtitleText] 同样的理由必须由 UI 层装上（需要海报缓存、
+/// HTTP 客户端与凭证）。
+///
+/// 返回**本地绝对路径**；`null` 表示取不到（断网、Cookie 失效、地址已过期）——
+/// 播放窗口拿到 `null` 应当**安静退回占位图**，不要重试：面板一展开就是
+/// 七八行同时要图，逐行重试只会把夸克的 QPS 额度烧在一件用户根本不会
+/// 注意到的事情上（占位图本来就是这个列表的既有形态）。
+///
+/// ⚠️ [itemId] 可能是**空串**（请求来自老版本主窗口、或那一集没有库记录）：
+/// 那时缓存键退化成 URL 本身，图照样取得回来，只是文件名不好看。
+Future<String?> Function(String itemId, String url)? onFetchThumbnail;
+
 /// 播放窗口要在字幕站上搜字幕时，主窗口该做什么。
 ///
 /// 返回**空列表**表示「确实搜不到」；抛异常表示「这次请求没成」。
@@ -225,6 +296,20 @@ Future<IntroRangeSnapshot?> Function(IntroRangeSaveRequest request)?
 /// mpv 属性），落库只是「下次还记得」—— 拿不到结果也不该拦住用户。
 /// 所以回调失败只记日志，不回传错误。
 Future<void> Function(AudioEffectPreset preset)? onSaveAudioEffect;
+
+/// 播放窗口把「这部片的音轨 / 字幕 / 字幕开关」报回来时，主窗口该做什么。
+///
+/// 与 [onSaveAudioEffect] 同样的理由必须由 UI 层装上（要拿仓储）。
+///
+/// **没有返回值**：与 [onSaveAudioEffect] 同一条边界 —— 播放窗口那边已经
+/// 生效了，落库只决定「下次还记不记得」。为一次写库失败给用户弹一个错误，
+/// 与他的操作（换条字幕）毫无关系。
+///
+/// ⚠️ [itemId] 可能是空串（手输直链、内置自检视频这些没有库记录的播放）。
+/// 那种情况下**不要写库**：没有 itemId 就没有行可以挂，硬造一条只会留下一堆
+/// 永远对不上任何文件的孤儿偏好。
+Future<void> Function(String itemId, PlaybackPreference preference)?
+    onSavePlaybackPreference;
 
 /// 播放窗口问「这一条是不是已经没了」时，主窗口该做什么。
 ///
@@ -369,6 +454,40 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       }
       return text;
 
+    case PlayerBridgeMethod.fetchThumbnail:
+      final thumbArgs = call.arguments;
+      if (thumbArgs is! Map) {
+        diag.warn('窗口', '收到畸形的缩略图请求，忽略：$thumbArgs');
+        return null;
+      }
+      final thumbUrl = thumbArgs['url'];
+      if (thumbUrl is! String || thumbUrl.isEmpty) {
+        diag.warn('窗口', '收到没有地址的缩略图请求，忽略');
+        return null;
+      }
+      final fetchThumb = onFetchThumbnail;
+      if (fetchThumb == null) {
+        diag.warn('窗口', '播放窗口要缩略图，但没有装上取图回调');
+        return null;
+      }
+      // 用 debug 而不是 info：面板一展开就是好几行同时来，info 会刷屏，
+      // 而这条日志的排查价值远不如「取字幕」那条（那是一条用户主动的动作）。
+      final thumbItemId = thumbArgs['itemId'];
+      diag.debug(
+        '窗口',
+        '播放窗口要缩略图 itemId=${thumbItemId is String ? thumbItemId : "-"}',
+      );
+      final thumbPath = await fetchThumb(
+        thumbItemId is String ? thumbItemId : '',
+        thumbUrl,
+      );
+      if (thumbPath == null) {
+        // 不当作错误：约 30% 的视频夸克还没生成预览图，断网时更是整屏如此。
+        diag.debug('窗口', '缩略图没取到，面板那一行退回占位图');
+        return null;
+      }
+      return thumbPath;
+
     case PlayerBridgeMethod.searchOnlineSubtitles:
       final request = SubtitleSearchRequest.fromJson(call.arguments);
       if (request.isEmpty) {
@@ -485,6 +604,35 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       }
       diag.info('窗口', '播放窗口把音效改成了「${PlayerAudioEffect.label(preset)}」');
       await saveEffect(preset);
+      return null;
+
+    case PlayerBridgeMethod.savePlaybackPreference:
+      // 与音效同一条边界：单向通知，畸形输入**忽略而不抛**。
+      final args = call.arguments;
+      if (args is! Map) {
+        diag.warn('窗口', '收到畸形的播放偏好参数，忽略：$args');
+        return null;
+      }
+      final itemId = args['itemId'];
+      if (itemId is! String || itemId.isEmpty) {
+        // 手输直链 / 内置自检视频这类**没有库记录**的播放。不写库：
+        // 没有 itemId 就没有行可以挂，硬造一条只会留下永远对不上任何
+        // 文件的孤儿偏好。这是正常情况，用 debug 级别记一下即可。
+        diag.debug('窗口', '播放偏好没有 itemId（无库记录的播放），不保存');
+        return null;
+      }
+      final preference = PlaybackPreference.fromJson(args['preference']);
+      if (preference == null) {
+        diag.warn('窗口', '收到解不开的播放偏好，忽略：${args['preference']}');
+        return null;
+      }
+      final savePref = onSavePlaybackPreference;
+      if (savePref == null) {
+        diag.warn('窗口', '播放窗口要保存播放偏好，但没有装上保存回调');
+        return null;
+      }
+      diag.info('窗口', '播放窗口报回播放偏好：$itemId → $preference');
+      await savePref(itemId, preference);
       return null;
 
     default:

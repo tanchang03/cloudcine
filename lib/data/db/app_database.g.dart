@@ -325,6 +325,17 @@ class $MediaItemsTable extends MediaItems
     type: DriftSqlType.int,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _maxPositionMsMeta = const VerificationMeta(
+    'maxPositionMs',
+  );
+  @override
+  late final GeneratedColumn<int> maxPositionMs = GeneratedColumn<int>(
+    'max_position_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
   static const VerificationMeta _thumbUrlMeta = const VerificationMeta(
     'thumbUrl',
   );
@@ -401,6 +412,7 @@ class $MediaItemsTable extends MediaItems
     updatedAt,
     lastPlayedAt,
     resumePositionMs,
+    maxPositionMs,
     thumbUrl,
     faceAnchorX,
     videoWidth,
@@ -626,6 +638,15 @@ class $MediaItemsTable extends MediaItems
         ),
       );
     }
+    if (data.containsKey('max_position_ms')) {
+      context.handle(
+        _maxPositionMsMeta,
+        maxPositionMs.isAcceptableOrUnknown(
+          data['max_position_ms']!,
+          _maxPositionMsMeta,
+        ),
+      );
+    }
     if (data.containsKey('thumb_url')) {
       context.handle(
         _thumbUrlMeta,
@@ -798,6 +819,10 @@ class $MediaItemsTable extends MediaItems
         DriftSqlType.int,
         data['${effectivePrefix}resume_position_ms'],
       ),
+      maxPositionMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}max_position_ms'],
+      ),
       thumbUrl: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
         data['${effectivePrefix}thumb_url'],
@@ -900,6 +925,32 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
   /// 而换算正是这类字段最容易出错的地方（`inSeconds` 截断 vs 四舍五入）。
   final int? resumePositionMs;
 
+  /// **历史最大播放位置**（毫秒）。`null` = 从没播过。
+  ///
+  /// ## 与 [resumePositionMs] 的分工（两者都是「看到哪儿了」，但不是一个东西）
+  ///
+  ///   - [resumePositionMs] 回答「**这次**该从哪儿接着播」—— 它会变，也会被
+  ///     清掉（看完清、位置太靠前当没看过）；
+  ///   - 这一列回答「**这一集我看过没有 / 看到哪儿了**」—— **只增不减**，
+  ///     也永远不清。
+  ///
+  /// ## 为什么不能用续播点画进度条
+  ///
+  /// 详情页的文件列表要靠它画每一条的进度条。拿续播点画会有两个必然的错：
+  /// 看完的一集续播点被清成了 `NULL` → 进度条归零，界面上「看过」这件事
+  /// 直接消失；用户回拖重看一段 → 进度条跟着退回去。
+  ///
+  /// ## 为什么是「只增不减」
+  ///
+  /// 它记的是**历史最远位置**，不是播放头当前位置。回拖、重看都不该让它
+  /// 倒退 —— 一旦倒退，这个条就不再回答「我看过没有」了。
+  ///
+  /// ## 为什么写完不清
+  ///
+  /// 它没有「过期」的概念：看过就是看过。清掉只会让用户在列表里
+  /// 认不出哪些集已经看过。
+  final int? maxPositionMs;
+
   /// 网盘服务端生成的视频预览图地址（夸克 `preview_url` / `thumbnail`）。
   ///
   /// **只存地址，不存图片** —— 图片由 `PosterCache` 按需下载并落盘。
@@ -969,6 +1020,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     required this.updatedAt,
     this.lastPlayedAt,
     this.resumePositionMs,
+    this.maxPositionMs,
     this.thumbUrl,
     this.faceAnchorX,
     this.videoWidth,
@@ -1040,6 +1092,9 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     }
     if (!nullToAbsent || resumePositionMs != null) {
       map['resume_position_ms'] = Variable<int>(resumePositionMs);
+    }
+    if (!nullToAbsent || maxPositionMs != null) {
+      map['max_position_ms'] = Variable<int>(maxPositionMs);
     }
     if (!nullToAbsent || thumbUrl != null) {
       map['thumb_url'] = Variable<String>(thumbUrl);
@@ -1127,6 +1182,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           resumePositionMs == null && nullToAbsent
               ? const Value.absent()
               : Value(resumePositionMs),
+      maxPositionMs:
+          maxPositionMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(maxPositionMs),
       thumbUrl:
           thumbUrl == null && nullToAbsent
               ? const Value.absent()
@@ -1182,6 +1241,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
       lastPlayedAt: serializer.fromJson<DateTime?>(json['lastPlayedAt']),
       resumePositionMs: serializer.fromJson<int?>(json['resumePositionMs']),
+      maxPositionMs: serializer.fromJson<int?>(json['maxPositionMs']),
       thumbUrl: serializer.fromJson<String?>(json['thumbUrl']),
       faceAnchorX: serializer.fromJson<double?>(json['faceAnchorX']),
       videoWidth: serializer.fromJson<int?>(json['videoWidth']),
@@ -1222,6 +1282,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
       'lastPlayedAt': serializer.toJson<DateTime?>(lastPlayedAt),
       'resumePositionMs': serializer.toJson<int?>(resumePositionMs),
+      'maxPositionMs': serializer.toJson<int?>(maxPositionMs),
       'thumbUrl': serializer.toJson<String?>(thumbUrl),
       'faceAnchorX': serializer.toJson<double?>(faceAnchorX),
       'videoWidth': serializer.toJson<int?>(videoWidth),
@@ -1260,6 +1321,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     DateTime? updatedAt,
     Value<DateTime?> lastPlayedAt = const Value.absent(),
     Value<int?> resumePositionMs = const Value.absent(),
+    Value<int?> maxPositionMs = const Value.absent(),
     Value<String?> thumbUrl = const Value.absent(),
     Value<double?> faceAnchorX = const Value.absent(),
     Value<int?> videoWidth = const Value.absent(),
@@ -1298,6 +1360,8 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
         resumePositionMs.present
             ? resumePositionMs.value
             : this.resumePositionMs,
+    maxPositionMs:
+        maxPositionMs.present ? maxPositionMs.value : this.maxPositionMs,
     thumbUrl: thumbUrl.present ? thumbUrl.value : this.thumbUrl,
     faceAnchorX: faceAnchorX.present ? faceAnchorX.value : this.faceAnchorX,
     videoWidth: videoWidth.present ? videoWidth.value : this.videoWidth,
@@ -1354,6 +1418,10 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           data.resumePositionMs.present
               ? data.resumePositionMs.value
               : this.resumePositionMs,
+      maxPositionMs:
+          data.maxPositionMs.present
+              ? data.maxPositionMs.value
+              : this.maxPositionMs,
       thumbUrl: data.thumbUrl.present ? data.thumbUrl.value : this.thumbUrl,
       faceAnchorX:
           data.faceAnchorX.present ? data.faceAnchorX.value : this.faceAnchorX,
@@ -1397,6 +1465,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           ..write('updatedAt: $updatedAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('resumePositionMs: $resumePositionMs, ')
+          ..write('maxPositionMs: $maxPositionMs, ')
           ..write('thumbUrl: $thumbUrl, ')
           ..write('faceAnchorX: $faceAnchorX, ')
           ..write('videoWidth: $videoWidth, ')
@@ -1437,6 +1506,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
     updatedAt,
     lastPlayedAt,
     resumePositionMs,
+    maxPositionMs,
     thumbUrl,
     faceAnchorX,
     videoWidth,
@@ -1476,6 +1546,7 @@ class MediaItemRow extends DataClass implements Insertable<MediaItemRow> {
           other.updatedAt == this.updatedAt &&
           other.lastPlayedAt == this.lastPlayedAt &&
           other.resumePositionMs == this.resumePositionMs &&
+          other.maxPositionMs == this.maxPositionMs &&
           other.thumbUrl == this.thumbUrl &&
           other.faceAnchorX == this.faceAnchorX &&
           other.videoWidth == this.videoWidth &&
@@ -1513,6 +1584,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
   final Value<DateTime> updatedAt;
   final Value<DateTime?> lastPlayedAt;
   final Value<int?> resumePositionMs;
+  final Value<int?> maxPositionMs;
   final Value<String?> thumbUrl;
   final Value<double?> faceAnchorX;
   final Value<int?> videoWidth;
@@ -1549,6 +1621,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     this.updatedAt = const Value.absent(),
     this.lastPlayedAt = const Value.absent(),
     this.resumePositionMs = const Value.absent(),
+    this.maxPositionMs = const Value.absent(),
     this.thumbUrl = const Value.absent(),
     this.faceAnchorX = const Value.absent(),
     this.videoWidth = const Value.absent(),
@@ -1586,6 +1659,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     required DateTime updatedAt,
     this.lastPlayedAt = const Value.absent(),
     this.resumePositionMs = const Value.absent(),
+    this.maxPositionMs = const Value.absent(),
     this.thumbUrl = const Value.absent(),
     this.faceAnchorX = const Value.absent(),
     this.videoWidth = const Value.absent(),
@@ -1630,6 +1704,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Expression<DateTime>? updatedAt,
     Expression<DateTime>? lastPlayedAt,
     Expression<int>? resumePositionMs,
+    Expression<int>? maxPositionMs,
     Expression<String>? thumbUrl,
     Expression<double>? faceAnchorX,
     Expression<int>? videoWidth,
@@ -1667,6 +1742,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       if (updatedAt != null) 'updated_at': updatedAt,
       if (lastPlayedAt != null) 'last_played_at': lastPlayedAt,
       if (resumePositionMs != null) 'resume_position_ms': resumePositionMs,
+      if (maxPositionMs != null) 'max_position_ms': maxPositionMs,
       if (thumbUrl != null) 'thumb_url': thumbUrl,
       if (faceAnchorX != null) 'face_anchor_x': faceAnchorX,
       if (videoWidth != null) 'video_width': videoWidth,
@@ -1706,6 +1782,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     Value<DateTime>? updatedAt,
     Value<DateTime?>? lastPlayedAt,
     Value<int?>? resumePositionMs,
+    Value<int?>? maxPositionMs,
     Value<String?>? thumbUrl,
     Value<double?>? faceAnchorX,
     Value<int?>? videoWidth,
@@ -1743,6 +1820,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
       updatedAt: updatedAt ?? this.updatedAt,
       lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
       resumePositionMs: resumePositionMs ?? this.resumePositionMs,
+      maxPositionMs: maxPositionMs ?? this.maxPositionMs,
       thumbUrl: thumbUrl ?? this.thumbUrl,
       faceAnchorX: faceAnchorX ?? this.faceAnchorX,
       videoWidth: videoWidth ?? this.videoWidth,
@@ -1844,6 +1922,9 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
     if (resumePositionMs.present) {
       map['resume_position_ms'] = Variable<int>(resumePositionMs.value);
     }
+    if (maxPositionMs.present) {
+      map['max_position_ms'] = Variable<int>(maxPositionMs.value);
+    }
     if (thumbUrl.present) {
       map['thumb_url'] = Variable<String>(thumbUrl.value);
     }
@@ -1895,6 +1976,7 @@ class MediaItemsCompanion extends UpdateCompanion<MediaItemRow> {
           ..write('updatedAt: $updatedAt, ')
           ..write('lastPlayedAt: $lastPlayedAt, ')
           ..write('resumePositionMs: $resumePositionMs, ')
+          ..write('maxPositionMs: $maxPositionMs, ')
           ..write('thumbUrl: $thumbUrl, ')
           ..write('faceAnchorX: $faceAnchorX, ')
           ..write('videoWidth: $videoWidth, ')
@@ -5560,6 +5642,1067 @@ class SettingsCompanion extends UpdateCompanion<SettingRow> {
   }
 }
 
+class $PlaybackPrefsTable extends PlaybackPrefs
+    with TableInfo<$PlaybackPrefsTable, PlaybackPrefRow> {
+  @override
+  final GeneratedDatabase attachedDatabase;
+  final String? _alias;
+  $PlaybackPrefsTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _itemIdMeta = const VerificationMeta('itemId');
+  @override
+  late final GeneratedColumn<String> itemId = GeneratedColumn<String>(
+    'item_id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _groupKeyMeta = const VerificationMeta(
+    'groupKey',
+  );
+  @override
+  late final GeneratedColumn<String> groupKey = GeneratedColumn<String>(
+    'group_key',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _prefsMeta = const VerificationMeta('prefs');
+  @override
+  late final GeneratedColumn<String> prefs = GeneratedColumn<String>(
+    'prefs',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+    defaultValue: const Constant('{}'),
+  );
+  static const VerificationMeta _updatedAtMeta = const VerificationMeta(
+    'updatedAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> updatedAt = GeneratedColumn<DateTime>(
+    'updated_at',
+    aliasedName,
+    false,
+    type: DriftSqlType.dateTime,
+    requiredDuringInsert: true,
+  );
+  @override
+  List<GeneratedColumn> get $columns => [itemId, groupKey, prefs, updatedAt];
+  @override
+  String get aliasedName => _alias ?? actualTableName;
+  @override
+  String get actualTableName => $name;
+  static const String $name = 'playback_prefs';
+  @override
+  VerificationContext validateIntegrity(
+    Insertable<PlaybackPrefRow> instance, {
+    bool isInserting = false,
+  }) {
+    final context = VerificationContext();
+    final data = instance.toColumns(true);
+    if (data.containsKey('item_id')) {
+      context.handle(
+        _itemIdMeta,
+        itemId.isAcceptableOrUnknown(data['item_id']!, _itemIdMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_itemIdMeta);
+    }
+    if (data.containsKey('group_key')) {
+      context.handle(
+        _groupKeyMeta,
+        groupKey.isAcceptableOrUnknown(data['group_key']!, _groupKeyMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_groupKeyMeta);
+    }
+    if (data.containsKey('prefs')) {
+      context.handle(
+        _prefsMeta,
+        prefs.isAcceptableOrUnknown(data['prefs']!, _prefsMeta),
+      );
+    }
+    if (data.containsKey('updated_at')) {
+      context.handle(
+        _updatedAtMeta,
+        updatedAt.isAcceptableOrUnknown(data['updated_at']!, _updatedAtMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_updatedAtMeta);
+    }
+    return context;
+  }
+
+  @override
+  Set<GeneratedColumn> get $primaryKey => {itemId};
+  @override
+  PlaybackPrefRow map(Map<String, dynamic> data, {String? tablePrefix}) {
+    final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
+    return PlaybackPrefRow(
+      itemId:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}item_id'],
+          )!,
+      groupKey:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}group_key'],
+          )!,
+      prefs:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}prefs'],
+          )!,
+      updatedAt:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.dateTime,
+            data['${effectivePrefix}updated_at'],
+          )!,
+    );
+  }
+
+  @override
+  $PlaybackPrefsTable createAlias(String alias) {
+    return $PlaybackPrefsTable(attachedDatabase, alias);
+  }
+}
+
+class PlaybackPrefRow extends DataClass implements Insertable<PlaybackPrefRow> {
+  /// 主键：媒体项 id（`provider:fileId`）。
+  final String itemId;
+
+  /// 归组键（`MediaItem.groupKey`）。
+  ///
+  /// 存在的唯一理由是**同剧继承**：某一集没记过偏好时，回退到同一部作品
+  /// 里最近改过的那一条（用户给第 1 集选了粤语，第 2 集打开也该是粤语）。
+  ///
+  /// 冗余存一份而不是 JOIN `media_items`：回退查询发生在**每次打开播放页**
+  /// 的热路径上，而 `media_items` 是被折叠归一反复改动的表（`group_key`
+  /// 虽然不搬，但行会被删）。这里存的是「记下这条偏好时它属于哪部作品」，
+  /// 是个历史事实，不需要跟着变。
+  final String groupKey;
+
+  /// 偏好本体，`PlaybackPreference.toJson` 的字符串。空对象 `{}` = 没记过。
+  final String prefs;
+
+  /// 最后修改时间。**同剧继承的排序依据**（取最新一条）。
+  final DateTime updatedAt;
+  const PlaybackPrefRow({
+    required this.itemId,
+    required this.groupKey,
+    required this.prefs,
+    required this.updatedAt,
+  });
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    map['item_id'] = Variable<String>(itemId);
+    map['group_key'] = Variable<String>(groupKey);
+    map['prefs'] = Variable<String>(prefs);
+    map['updated_at'] = Variable<DateTime>(updatedAt);
+    return map;
+  }
+
+  PlaybackPrefsCompanion toCompanion(bool nullToAbsent) {
+    return PlaybackPrefsCompanion(
+      itemId: Value(itemId),
+      groupKey: Value(groupKey),
+      prefs: Value(prefs),
+      updatedAt: Value(updatedAt),
+    );
+  }
+
+  factory PlaybackPrefRow.fromJson(
+    Map<String, dynamic> json, {
+    ValueSerializer? serializer,
+  }) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return PlaybackPrefRow(
+      itemId: serializer.fromJson<String>(json['itemId']),
+      groupKey: serializer.fromJson<String>(json['groupKey']),
+      prefs: serializer.fromJson<String>(json['prefs']),
+      updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
+    );
+  }
+  @override
+  Map<String, dynamic> toJson({ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return <String, dynamic>{
+      'itemId': serializer.toJson<String>(itemId),
+      'groupKey': serializer.toJson<String>(groupKey),
+      'prefs': serializer.toJson<String>(prefs),
+      'updatedAt': serializer.toJson<DateTime>(updatedAt),
+    };
+  }
+
+  PlaybackPrefRow copyWith({
+    String? itemId,
+    String? groupKey,
+    String? prefs,
+    DateTime? updatedAt,
+  }) => PlaybackPrefRow(
+    itemId: itemId ?? this.itemId,
+    groupKey: groupKey ?? this.groupKey,
+    prefs: prefs ?? this.prefs,
+    updatedAt: updatedAt ?? this.updatedAt,
+  );
+  PlaybackPrefRow copyWithCompanion(PlaybackPrefsCompanion data) {
+    return PlaybackPrefRow(
+      itemId: data.itemId.present ? data.itemId.value : this.itemId,
+      groupKey: data.groupKey.present ? data.groupKey.value : this.groupKey,
+      prefs: data.prefs.present ? data.prefs.value : this.prefs,
+      updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
+    );
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('PlaybackPrefRow(')
+          ..write('itemId: $itemId, ')
+          ..write('groupKey: $groupKey, ')
+          ..write('prefs: $prefs, ')
+          ..write('updatedAt: $updatedAt')
+          ..write(')'))
+        .toString();
+  }
+
+  @override
+  int get hashCode => Object.hash(itemId, groupKey, prefs, updatedAt);
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is PlaybackPrefRow &&
+          other.itemId == this.itemId &&
+          other.groupKey == this.groupKey &&
+          other.prefs == this.prefs &&
+          other.updatedAt == this.updatedAt);
+}
+
+class PlaybackPrefsCompanion extends UpdateCompanion<PlaybackPrefRow> {
+  final Value<String> itemId;
+  final Value<String> groupKey;
+  final Value<String> prefs;
+  final Value<DateTime> updatedAt;
+  final Value<int> rowid;
+  const PlaybackPrefsCompanion({
+    this.itemId = const Value.absent(),
+    this.groupKey = const Value.absent(),
+    this.prefs = const Value.absent(),
+    this.updatedAt = const Value.absent(),
+    this.rowid = const Value.absent(),
+  });
+  PlaybackPrefsCompanion.insert({
+    required String itemId,
+    required String groupKey,
+    this.prefs = const Value.absent(),
+    required DateTime updatedAt,
+    this.rowid = const Value.absent(),
+  }) : itemId = Value(itemId),
+       groupKey = Value(groupKey),
+       updatedAt = Value(updatedAt);
+  static Insertable<PlaybackPrefRow> custom({
+    Expression<String>? itemId,
+    Expression<String>? groupKey,
+    Expression<String>? prefs,
+    Expression<DateTime>? updatedAt,
+    Expression<int>? rowid,
+  }) {
+    return RawValuesInsertable({
+      if (itemId != null) 'item_id': itemId,
+      if (groupKey != null) 'group_key': groupKey,
+      if (prefs != null) 'prefs': prefs,
+      if (updatedAt != null) 'updated_at': updatedAt,
+      if (rowid != null) 'rowid': rowid,
+    });
+  }
+
+  PlaybackPrefsCompanion copyWith({
+    Value<String>? itemId,
+    Value<String>? groupKey,
+    Value<String>? prefs,
+    Value<DateTime>? updatedAt,
+    Value<int>? rowid,
+  }) {
+    return PlaybackPrefsCompanion(
+      itemId: itemId ?? this.itemId,
+      groupKey: groupKey ?? this.groupKey,
+      prefs: prefs ?? this.prefs,
+      updatedAt: updatedAt ?? this.updatedAt,
+      rowid: rowid ?? this.rowid,
+    );
+  }
+
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    if (itemId.present) {
+      map['item_id'] = Variable<String>(itemId.value);
+    }
+    if (groupKey.present) {
+      map['group_key'] = Variable<String>(groupKey.value);
+    }
+    if (prefs.present) {
+      map['prefs'] = Variable<String>(prefs.value);
+    }
+    if (updatedAt.present) {
+      map['updated_at'] = Variable<DateTime>(updatedAt.value);
+    }
+    if (rowid.present) {
+      map['rowid'] = Variable<int>(rowid.value);
+    }
+    return map;
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('PlaybackPrefsCompanion(')
+          ..write('itemId: $itemId, ')
+          ..write('groupKey: $groupKey, ')
+          ..write('prefs: $prefs, ')
+          ..write('updatedAt: $updatedAt, ')
+          ..write('rowid: $rowid')
+          ..write(')'))
+        .toString();
+  }
+}
+
+class $DownloadTasksTable extends DownloadTasks
+    with TableInfo<$DownloadTasksTable, DownloadTaskRow> {
+  @override
+  final GeneratedDatabase attachedDatabase;
+  final String? _alias;
+  $DownloadTasksTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _idMeta = const VerificationMeta('id');
+  @override
+  late final GeneratedColumn<String> id = GeneratedColumn<String>(
+    'id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _providerMeta = const VerificationMeta(
+    'provider',
+  );
+  @override
+  late final GeneratedColumn<String> provider = GeneratedColumn<String>(
+    'provider',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _fileIdMeta = const VerificationMeta('fileId');
+  @override
+  late final GeneratedColumn<String> fileId = GeneratedColumn<String>(
+    'file_id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _nameMeta = const VerificationMeta('name');
+  @override
+  late final GeneratedColumn<String> name = GeneratedColumn<String>(
+    'name',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _dirPathMeta = const VerificationMeta(
+    'dirPath',
+  );
+  @override
+  late final GeneratedColumn<String> dirPath = GeneratedColumn<String>(
+    'dir_path',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+    defaultValue: const Constant('/'),
+  );
+  static const VerificationMeta _savePathMeta = const VerificationMeta(
+    'savePath',
+  );
+  @override
+  late final GeneratedColumn<String> savePath = GeneratedColumn<String>(
+    'save_path',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _sizeBytesMeta = const VerificationMeta(
+    'sizeBytes',
+  );
+  @override
+  late final GeneratedColumn<int> sizeBytes = GeneratedColumn<int>(
+    'size_bytes',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _receivedBytesMeta = const VerificationMeta(
+    'receivedBytes',
+  );
+  @override
+  late final GeneratedColumn<int> receivedBytes = GeneratedColumn<int>(
+    'received_bytes',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(0),
+  );
+  static const VerificationMeta _statusMeta = const VerificationMeta('status');
+  @override
+  late final GeneratedColumn<String> status = GeneratedColumn<String>(
+    'status',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _errorMeta = const VerificationMeta('error');
+  @override
+  late final GeneratedColumn<String> error = GeneratedColumn<String>(
+    'error',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _createdAtMeta = const VerificationMeta(
+    'createdAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> createdAt = GeneratedColumn<DateTime>(
+    'created_at',
+    aliasedName,
+    false,
+    type: DriftSqlType.dateTime,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _updatedAtMeta = const VerificationMeta(
+    'updatedAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> updatedAt = GeneratedColumn<DateTime>(
+    'updated_at',
+    aliasedName,
+    false,
+    type: DriftSqlType.dateTime,
+    requiredDuringInsert: true,
+  );
+  @override
+  List<GeneratedColumn> get $columns => [
+    id,
+    provider,
+    fileId,
+    name,
+    dirPath,
+    savePath,
+    sizeBytes,
+    receivedBytes,
+    status,
+    error,
+    createdAt,
+    updatedAt,
+  ];
+  @override
+  String get aliasedName => _alias ?? actualTableName;
+  @override
+  String get actualTableName => $name;
+  static const String $name = 'download_tasks';
+  @override
+  VerificationContext validateIntegrity(
+    Insertable<DownloadTaskRow> instance, {
+    bool isInserting = false,
+  }) {
+    final context = VerificationContext();
+    final data = instance.toColumns(true);
+    if (data.containsKey('id')) {
+      context.handle(_idMeta, id.isAcceptableOrUnknown(data['id']!, _idMeta));
+    } else if (isInserting) {
+      context.missing(_idMeta);
+    }
+    if (data.containsKey('provider')) {
+      context.handle(
+        _providerMeta,
+        provider.isAcceptableOrUnknown(data['provider']!, _providerMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_providerMeta);
+    }
+    if (data.containsKey('file_id')) {
+      context.handle(
+        _fileIdMeta,
+        fileId.isAcceptableOrUnknown(data['file_id']!, _fileIdMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_fileIdMeta);
+    }
+    if (data.containsKey('name')) {
+      context.handle(
+        _nameMeta,
+        name.isAcceptableOrUnknown(data['name']!, _nameMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_nameMeta);
+    }
+    if (data.containsKey('dir_path')) {
+      context.handle(
+        _dirPathMeta,
+        dirPath.isAcceptableOrUnknown(data['dir_path']!, _dirPathMeta),
+      );
+    }
+    if (data.containsKey('save_path')) {
+      context.handle(
+        _savePathMeta,
+        savePath.isAcceptableOrUnknown(data['save_path']!, _savePathMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_savePathMeta);
+    }
+    if (data.containsKey('size_bytes')) {
+      context.handle(
+        _sizeBytesMeta,
+        sizeBytes.isAcceptableOrUnknown(data['size_bytes']!, _sizeBytesMeta),
+      );
+    }
+    if (data.containsKey('received_bytes')) {
+      context.handle(
+        _receivedBytesMeta,
+        receivedBytes.isAcceptableOrUnknown(
+          data['received_bytes']!,
+          _receivedBytesMeta,
+        ),
+      );
+    }
+    if (data.containsKey('status')) {
+      context.handle(
+        _statusMeta,
+        status.isAcceptableOrUnknown(data['status']!, _statusMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_statusMeta);
+    }
+    if (data.containsKey('error')) {
+      context.handle(
+        _errorMeta,
+        error.isAcceptableOrUnknown(data['error']!, _errorMeta),
+      );
+    }
+    if (data.containsKey('created_at')) {
+      context.handle(
+        _createdAtMeta,
+        createdAt.isAcceptableOrUnknown(data['created_at']!, _createdAtMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_createdAtMeta);
+    }
+    if (data.containsKey('updated_at')) {
+      context.handle(
+        _updatedAtMeta,
+        updatedAt.isAcceptableOrUnknown(data['updated_at']!, _updatedAtMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_updatedAtMeta);
+    }
+    return context;
+  }
+
+  @override
+  Set<GeneratedColumn> get $primaryKey => {id};
+  @override
+  DownloadTaskRow map(Map<String, dynamic> data, {String? tablePrefix}) {
+    final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
+    return DownloadTaskRow(
+      id:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}id'],
+          )!,
+      provider:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}provider'],
+          )!,
+      fileId:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}file_id'],
+          )!,
+      name:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}name'],
+          )!,
+      dirPath:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}dir_path'],
+          )!,
+      savePath:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}save_path'],
+          )!,
+      sizeBytes: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}size_bytes'],
+      ),
+      receivedBytes:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.int,
+            data['${effectivePrefix}received_bytes'],
+          )!,
+      status:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}status'],
+          )!,
+      error: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}error'],
+      ),
+      createdAt:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.dateTime,
+            data['${effectivePrefix}created_at'],
+          )!,
+      updatedAt:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.dateTime,
+            data['${effectivePrefix}updated_at'],
+          )!,
+    );
+  }
+
+  @override
+  $DownloadTasksTable createAlias(String alias) {
+    return $DownloadTasksTable(attachedDatabase, alias);
+  }
+}
+
+class DownloadTaskRow extends DataClass implements Insertable<DownloadTaskRow> {
+  /// 主键：`provider:fileId`（见 `DownloadTask.idFor`）
+  final String id;
+
+  /// 所属网盘（`DriveProvider.name`）
+  final String provider;
+
+  /// 网盘侧文件 ID
+  final String fileId;
+
+  /// 文件名（含扩展名）。展示用。
+  final String name;
+
+  /// 网盘上的目录路径（归一化，不带尾斜杠）。展示用 ——
+  /// 同一个 `a.zip` 在 `/电影/` 与 `/备份/` 下是两个东西，不给路径就分不清。
+  final String dirPath;
+
+  /// **本地目标路径**（绝对路径）。续传时 `.part` 由它派生（`'$savePath.part'`）。
+  final String savePath;
+
+  /// 文件总字节数。网盘没给时为 `null`，此时进度条只能是不确定态。
+  final int? sizeBytes;
+
+  /// 已落盘字节数（进度快照，真源见类文档）。
+  final int receivedBytes;
+
+  /// 状态（`DownloadStatus.name`）。
+  ///
+  /// 存枚举名而不是序号：加一个状态时序号会整体错位，旧数据会**静默**
+  /// 变成另一个状态（与 `media_items.resolution` 存 label 同一条理由）。
+  final String status;
+
+  /// 失败原因（面向用户的一句话）。成功 / 未失败时为 `null`。
+  final String? error;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+  const DownloadTaskRow({
+    required this.id,
+    required this.provider,
+    required this.fileId,
+    required this.name,
+    required this.dirPath,
+    required this.savePath,
+    this.sizeBytes,
+    required this.receivedBytes,
+    required this.status,
+    this.error,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    map['id'] = Variable<String>(id);
+    map['provider'] = Variable<String>(provider);
+    map['file_id'] = Variable<String>(fileId);
+    map['name'] = Variable<String>(name);
+    map['dir_path'] = Variable<String>(dirPath);
+    map['save_path'] = Variable<String>(savePath);
+    if (!nullToAbsent || sizeBytes != null) {
+      map['size_bytes'] = Variable<int>(sizeBytes);
+    }
+    map['received_bytes'] = Variable<int>(receivedBytes);
+    map['status'] = Variable<String>(status);
+    if (!nullToAbsent || error != null) {
+      map['error'] = Variable<String>(error);
+    }
+    map['created_at'] = Variable<DateTime>(createdAt);
+    map['updated_at'] = Variable<DateTime>(updatedAt);
+    return map;
+  }
+
+  DownloadTasksCompanion toCompanion(bool nullToAbsent) {
+    return DownloadTasksCompanion(
+      id: Value(id),
+      provider: Value(provider),
+      fileId: Value(fileId),
+      name: Value(name),
+      dirPath: Value(dirPath),
+      savePath: Value(savePath),
+      sizeBytes:
+          sizeBytes == null && nullToAbsent
+              ? const Value.absent()
+              : Value(sizeBytes),
+      receivedBytes: Value(receivedBytes),
+      status: Value(status),
+      error:
+          error == null && nullToAbsent ? const Value.absent() : Value(error),
+      createdAt: Value(createdAt),
+      updatedAt: Value(updatedAt),
+    );
+  }
+
+  factory DownloadTaskRow.fromJson(
+    Map<String, dynamic> json, {
+    ValueSerializer? serializer,
+  }) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return DownloadTaskRow(
+      id: serializer.fromJson<String>(json['id']),
+      provider: serializer.fromJson<String>(json['provider']),
+      fileId: serializer.fromJson<String>(json['fileId']),
+      name: serializer.fromJson<String>(json['name']),
+      dirPath: serializer.fromJson<String>(json['dirPath']),
+      savePath: serializer.fromJson<String>(json['savePath']),
+      sizeBytes: serializer.fromJson<int?>(json['sizeBytes']),
+      receivedBytes: serializer.fromJson<int>(json['receivedBytes']),
+      status: serializer.fromJson<String>(json['status']),
+      error: serializer.fromJson<String?>(json['error']),
+      createdAt: serializer.fromJson<DateTime>(json['createdAt']),
+      updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
+    );
+  }
+  @override
+  Map<String, dynamic> toJson({ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return <String, dynamic>{
+      'id': serializer.toJson<String>(id),
+      'provider': serializer.toJson<String>(provider),
+      'fileId': serializer.toJson<String>(fileId),
+      'name': serializer.toJson<String>(name),
+      'dirPath': serializer.toJson<String>(dirPath),
+      'savePath': serializer.toJson<String>(savePath),
+      'sizeBytes': serializer.toJson<int?>(sizeBytes),
+      'receivedBytes': serializer.toJson<int>(receivedBytes),
+      'status': serializer.toJson<String>(status),
+      'error': serializer.toJson<String?>(error),
+      'createdAt': serializer.toJson<DateTime>(createdAt),
+      'updatedAt': serializer.toJson<DateTime>(updatedAt),
+    };
+  }
+
+  DownloadTaskRow copyWith({
+    String? id,
+    String? provider,
+    String? fileId,
+    String? name,
+    String? dirPath,
+    String? savePath,
+    Value<int?> sizeBytes = const Value.absent(),
+    int? receivedBytes,
+    String? status,
+    Value<String?> error = const Value.absent(),
+    DateTime? createdAt,
+    DateTime? updatedAt,
+  }) => DownloadTaskRow(
+    id: id ?? this.id,
+    provider: provider ?? this.provider,
+    fileId: fileId ?? this.fileId,
+    name: name ?? this.name,
+    dirPath: dirPath ?? this.dirPath,
+    savePath: savePath ?? this.savePath,
+    sizeBytes: sizeBytes.present ? sizeBytes.value : this.sizeBytes,
+    receivedBytes: receivedBytes ?? this.receivedBytes,
+    status: status ?? this.status,
+    error: error.present ? error.value : this.error,
+    createdAt: createdAt ?? this.createdAt,
+    updatedAt: updatedAt ?? this.updatedAt,
+  );
+  DownloadTaskRow copyWithCompanion(DownloadTasksCompanion data) {
+    return DownloadTaskRow(
+      id: data.id.present ? data.id.value : this.id,
+      provider: data.provider.present ? data.provider.value : this.provider,
+      fileId: data.fileId.present ? data.fileId.value : this.fileId,
+      name: data.name.present ? data.name.value : this.name,
+      dirPath: data.dirPath.present ? data.dirPath.value : this.dirPath,
+      savePath: data.savePath.present ? data.savePath.value : this.savePath,
+      sizeBytes: data.sizeBytes.present ? data.sizeBytes.value : this.sizeBytes,
+      receivedBytes:
+          data.receivedBytes.present
+              ? data.receivedBytes.value
+              : this.receivedBytes,
+      status: data.status.present ? data.status.value : this.status,
+      error: data.error.present ? data.error.value : this.error,
+      createdAt: data.createdAt.present ? data.createdAt.value : this.createdAt,
+      updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
+    );
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('DownloadTaskRow(')
+          ..write('id: $id, ')
+          ..write('provider: $provider, ')
+          ..write('fileId: $fileId, ')
+          ..write('name: $name, ')
+          ..write('dirPath: $dirPath, ')
+          ..write('savePath: $savePath, ')
+          ..write('sizeBytes: $sizeBytes, ')
+          ..write('receivedBytes: $receivedBytes, ')
+          ..write('status: $status, ')
+          ..write('error: $error, ')
+          ..write('createdAt: $createdAt, ')
+          ..write('updatedAt: $updatedAt')
+          ..write(')'))
+        .toString();
+  }
+
+  @override
+  int get hashCode => Object.hash(
+    id,
+    provider,
+    fileId,
+    name,
+    dirPath,
+    savePath,
+    sizeBytes,
+    receivedBytes,
+    status,
+    error,
+    createdAt,
+    updatedAt,
+  );
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is DownloadTaskRow &&
+          other.id == this.id &&
+          other.provider == this.provider &&
+          other.fileId == this.fileId &&
+          other.name == this.name &&
+          other.dirPath == this.dirPath &&
+          other.savePath == this.savePath &&
+          other.sizeBytes == this.sizeBytes &&
+          other.receivedBytes == this.receivedBytes &&
+          other.status == this.status &&
+          other.error == this.error &&
+          other.createdAt == this.createdAt &&
+          other.updatedAt == this.updatedAt);
+}
+
+class DownloadTasksCompanion extends UpdateCompanion<DownloadTaskRow> {
+  final Value<String> id;
+  final Value<String> provider;
+  final Value<String> fileId;
+  final Value<String> name;
+  final Value<String> dirPath;
+  final Value<String> savePath;
+  final Value<int?> sizeBytes;
+  final Value<int> receivedBytes;
+  final Value<String> status;
+  final Value<String?> error;
+  final Value<DateTime> createdAt;
+  final Value<DateTime> updatedAt;
+  final Value<int> rowid;
+  const DownloadTasksCompanion({
+    this.id = const Value.absent(),
+    this.provider = const Value.absent(),
+    this.fileId = const Value.absent(),
+    this.name = const Value.absent(),
+    this.dirPath = const Value.absent(),
+    this.savePath = const Value.absent(),
+    this.sizeBytes = const Value.absent(),
+    this.receivedBytes = const Value.absent(),
+    this.status = const Value.absent(),
+    this.error = const Value.absent(),
+    this.createdAt = const Value.absent(),
+    this.updatedAt = const Value.absent(),
+    this.rowid = const Value.absent(),
+  });
+  DownloadTasksCompanion.insert({
+    required String id,
+    required String provider,
+    required String fileId,
+    required String name,
+    this.dirPath = const Value.absent(),
+    required String savePath,
+    this.sizeBytes = const Value.absent(),
+    this.receivedBytes = const Value.absent(),
+    required String status,
+    this.error = const Value.absent(),
+    required DateTime createdAt,
+    required DateTime updatedAt,
+    this.rowid = const Value.absent(),
+  }) : id = Value(id),
+       provider = Value(provider),
+       fileId = Value(fileId),
+       name = Value(name),
+       savePath = Value(savePath),
+       status = Value(status),
+       createdAt = Value(createdAt),
+       updatedAt = Value(updatedAt);
+  static Insertable<DownloadTaskRow> custom({
+    Expression<String>? id,
+    Expression<String>? provider,
+    Expression<String>? fileId,
+    Expression<String>? name,
+    Expression<String>? dirPath,
+    Expression<String>? savePath,
+    Expression<int>? sizeBytes,
+    Expression<int>? receivedBytes,
+    Expression<String>? status,
+    Expression<String>? error,
+    Expression<DateTime>? createdAt,
+    Expression<DateTime>? updatedAt,
+    Expression<int>? rowid,
+  }) {
+    return RawValuesInsertable({
+      if (id != null) 'id': id,
+      if (provider != null) 'provider': provider,
+      if (fileId != null) 'file_id': fileId,
+      if (name != null) 'name': name,
+      if (dirPath != null) 'dir_path': dirPath,
+      if (savePath != null) 'save_path': savePath,
+      if (sizeBytes != null) 'size_bytes': sizeBytes,
+      if (receivedBytes != null) 'received_bytes': receivedBytes,
+      if (status != null) 'status': status,
+      if (error != null) 'error': error,
+      if (createdAt != null) 'created_at': createdAt,
+      if (updatedAt != null) 'updated_at': updatedAt,
+      if (rowid != null) 'rowid': rowid,
+    });
+  }
+
+  DownloadTasksCompanion copyWith({
+    Value<String>? id,
+    Value<String>? provider,
+    Value<String>? fileId,
+    Value<String>? name,
+    Value<String>? dirPath,
+    Value<String>? savePath,
+    Value<int?>? sizeBytes,
+    Value<int>? receivedBytes,
+    Value<String>? status,
+    Value<String?>? error,
+    Value<DateTime>? createdAt,
+    Value<DateTime>? updatedAt,
+    Value<int>? rowid,
+  }) {
+    return DownloadTasksCompanion(
+      id: id ?? this.id,
+      provider: provider ?? this.provider,
+      fileId: fileId ?? this.fileId,
+      name: name ?? this.name,
+      dirPath: dirPath ?? this.dirPath,
+      savePath: savePath ?? this.savePath,
+      sizeBytes: sizeBytes ?? this.sizeBytes,
+      receivedBytes: receivedBytes ?? this.receivedBytes,
+      status: status ?? this.status,
+      error: error ?? this.error,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
+      rowid: rowid ?? this.rowid,
+    );
+  }
+
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    if (id.present) {
+      map['id'] = Variable<String>(id.value);
+    }
+    if (provider.present) {
+      map['provider'] = Variable<String>(provider.value);
+    }
+    if (fileId.present) {
+      map['file_id'] = Variable<String>(fileId.value);
+    }
+    if (name.present) {
+      map['name'] = Variable<String>(name.value);
+    }
+    if (dirPath.present) {
+      map['dir_path'] = Variable<String>(dirPath.value);
+    }
+    if (savePath.present) {
+      map['save_path'] = Variable<String>(savePath.value);
+    }
+    if (sizeBytes.present) {
+      map['size_bytes'] = Variable<int>(sizeBytes.value);
+    }
+    if (receivedBytes.present) {
+      map['received_bytes'] = Variable<int>(receivedBytes.value);
+    }
+    if (status.present) {
+      map['status'] = Variable<String>(status.value);
+    }
+    if (error.present) {
+      map['error'] = Variable<String>(error.value);
+    }
+    if (createdAt.present) {
+      map['created_at'] = Variable<DateTime>(createdAt.value);
+    }
+    if (updatedAt.present) {
+      map['updated_at'] = Variable<DateTime>(updatedAt.value);
+    }
+    if (rowid.present) {
+      map['rowid'] = Variable<int>(rowid.value);
+    }
+    return map;
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('DownloadTasksCompanion(')
+          ..write('id: $id, ')
+          ..write('provider: $provider, ')
+          ..write('fileId: $fileId, ')
+          ..write('name: $name, ')
+          ..write('dirPath: $dirPath, ')
+          ..write('savePath: $savePath, ')
+          ..write('sizeBytes: $sizeBytes, ')
+          ..write('receivedBytes: $receivedBytes, ')
+          ..write('status: $status, ')
+          ..write('error: $error, ')
+          ..write('createdAt: $createdAt, ')
+          ..write('updatedAt: $updatedAt, ')
+          ..write('rowid: $rowid')
+          ..write(')'))
+        .toString();
+  }
+}
+
 abstract class _$AppDatabase extends GeneratedDatabase {
   _$AppDatabase(QueryExecutor e) : super(e);
   $AppDatabaseManager get managers => $AppDatabaseManager(this);
@@ -5568,6 +6711,8 @@ abstract class _$AppDatabase extends GeneratedDatabase {
   late final $SubtitleRefsTable subtitleRefs = $SubtitleRefsTable(this);
   late final $ScanCursorsTable scanCursors = $ScanCursorsTable(this);
   late final $SettingsTable settings = $SettingsTable(this);
+  late final $PlaybackPrefsTable playbackPrefs = $PlaybackPrefsTable(this);
+  late final $DownloadTasksTable downloadTasks = $DownloadTasksTable(this);
   @override
   Iterable<TableInfo<Table, Object?>> get allTables =>
       allSchemaEntities.whereType<TableInfo<Table, Object?>>();
@@ -5578,6 +6723,8 @@ abstract class _$AppDatabase extends GeneratedDatabase {
     subtitleRefs,
     scanCursors,
     settings,
+    playbackPrefs,
+    downloadTasks,
   ];
 }
 
@@ -5613,6 +6760,7 @@ typedef $$MediaItemsTableCreateCompanionBuilder =
       required DateTime updatedAt,
       Value<DateTime?> lastPlayedAt,
       Value<int?> resumePositionMs,
+      Value<int?> maxPositionMs,
       Value<String?> thumbUrl,
       Value<double?> faceAnchorX,
       Value<int?> videoWidth,
@@ -5651,6 +6799,7 @@ typedef $$MediaItemsTableUpdateCompanionBuilder =
       Value<DateTime> updatedAt,
       Value<DateTime?> lastPlayedAt,
       Value<int?> resumePositionMs,
+      Value<int?> maxPositionMs,
       Value<String?> thumbUrl,
       Value<double?> faceAnchorX,
       Value<int?> videoWidth,
@@ -5814,6 +6963,11 @@ class $$MediaItemsTableFilterComposer
 
   ColumnFilters<int> get resumePositionMs => $composableBuilder(
     column: $table.resumePositionMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get maxPositionMs => $composableBuilder(
+    column: $table.maxPositionMs,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -5997,6 +7151,11 @@ class $$MediaItemsTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<int> get maxPositionMs => $composableBuilder(
+    column: $table.maxPositionMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get thumbUrl => $composableBuilder(
     column: $table.thumbUrl,
     builder: (column) => ColumnOrderings(column),
@@ -6139,6 +7298,11 @@ class $$MediaItemsTableAnnotationComposer
     builder: (column) => column,
   );
 
+  GeneratedColumn<int> get maxPositionMs => $composableBuilder(
+    column: $table.maxPositionMs,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<String> get thumbUrl =>
       $composableBuilder(column: $table.thumbUrl, builder: (column) => column);
 
@@ -6219,6 +7383,7 @@ class $$MediaItemsTableTableManager
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 Value<int?> resumePositionMs = const Value.absent(),
+                Value<int?> maxPositionMs = const Value.absent(),
                 Value<String?> thumbUrl = const Value.absent(),
                 Value<double?> faceAnchorX = const Value.absent(),
                 Value<int?> videoWidth = const Value.absent(),
@@ -6255,6 +7420,7 @@ class $$MediaItemsTableTableManager
                 updatedAt: updatedAt,
                 lastPlayedAt: lastPlayedAt,
                 resumePositionMs: resumePositionMs,
+                maxPositionMs: maxPositionMs,
                 thumbUrl: thumbUrl,
                 faceAnchorX: faceAnchorX,
                 videoWidth: videoWidth,
@@ -6293,6 +7459,7 @@ class $$MediaItemsTableTableManager
                 required DateTime updatedAt,
                 Value<DateTime?> lastPlayedAt = const Value.absent(),
                 Value<int?> resumePositionMs = const Value.absent(),
+                Value<int?> maxPositionMs = const Value.absent(),
                 Value<String?> thumbUrl = const Value.absent(),
                 Value<double?> faceAnchorX = const Value.absent(),
                 Value<int?> videoWidth = const Value.absent(),
@@ -6329,6 +7496,7 @@ class $$MediaItemsTableTableManager
                 updatedAt: updatedAt,
                 lastPlayedAt: lastPlayedAt,
                 resumePositionMs: resumePositionMs,
+                maxPositionMs: maxPositionMs,
                 thumbUrl: thumbUrl,
                 faceAnchorX: faceAnchorX,
                 videoWidth: videoWidth,
@@ -8002,6 +9170,544 @@ typedef $$SettingsTableProcessedTableManager =
       SettingRow,
       PrefetchHooks Function()
     >;
+typedef $$PlaybackPrefsTableCreateCompanionBuilder =
+    PlaybackPrefsCompanion Function({
+      required String itemId,
+      required String groupKey,
+      Value<String> prefs,
+      required DateTime updatedAt,
+      Value<int> rowid,
+    });
+typedef $$PlaybackPrefsTableUpdateCompanionBuilder =
+    PlaybackPrefsCompanion Function({
+      Value<String> itemId,
+      Value<String> groupKey,
+      Value<String> prefs,
+      Value<DateTime> updatedAt,
+      Value<int> rowid,
+    });
+
+class $$PlaybackPrefsTableFilterComposer
+    extends Composer<_$AppDatabase, $PlaybackPrefsTable> {
+  $$PlaybackPrefsTableFilterComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnFilters<String> get itemId => $composableBuilder(
+    column: $table.itemId,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get groupKey => $composableBuilder(
+    column: $table.groupKey,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get prefs => $composableBuilder(
+    column: $table.prefs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get updatedAt => $composableBuilder(
+    column: $table.updatedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+}
+
+class $$PlaybackPrefsTableOrderingComposer
+    extends Composer<_$AppDatabase, $PlaybackPrefsTable> {
+  $$PlaybackPrefsTableOrderingComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnOrderings<String> get itemId => $composableBuilder(
+    column: $table.itemId,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get groupKey => $composableBuilder(
+    column: $table.groupKey,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get prefs => $composableBuilder(
+    column: $table.prefs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get updatedAt => $composableBuilder(
+    column: $table.updatedAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+}
+
+class $$PlaybackPrefsTableAnnotationComposer
+    extends Composer<_$AppDatabase, $PlaybackPrefsTable> {
+  $$PlaybackPrefsTableAnnotationComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  GeneratedColumn<String> get itemId =>
+      $composableBuilder(column: $table.itemId, builder: (column) => column);
+
+  GeneratedColumn<String> get groupKey =>
+      $composableBuilder(column: $table.groupKey, builder: (column) => column);
+
+  GeneratedColumn<String> get prefs =>
+      $composableBuilder(column: $table.prefs, builder: (column) => column);
+
+  GeneratedColumn<DateTime> get updatedAt =>
+      $composableBuilder(column: $table.updatedAt, builder: (column) => column);
+}
+
+class $$PlaybackPrefsTableTableManager
+    extends
+        RootTableManager<
+          _$AppDatabase,
+          $PlaybackPrefsTable,
+          PlaybackPrefRow,
+          $$PlaybackPrefsTableFilterComposer,
+          $$PlaybackPrefsTableOrderingComposer,
+          $$PlaybackPrefsTableAnnotationComposer,
+          $$PlaybackPrefsTableCreateCompanionBuilder,
+          $$PlaybackPrefsTableUpdateCompanionBuilder,
+          (
+            PlaybackPrefRow,
+            BaseReferences<_$AppDatabase, $PlaybackPrefsTable, PlaybackPrefRow>,
+          ),
+          PlaybackPrefRow,
+          PrefetchHooks Function()
+        > {
+  $$PlaybackPrefsTableTableManager(_$AppDatabase db, $PlaybackPrefsTable table)
+    : super(
+        TableManagerState(
+          db: db,
+          table: table,
+          createFilteringComposer:
+              () => $$PlaybackPrefsTableFilterComposer($db: db, $table: table),
+          createOrderingComposer:
+              () =>
+                  $$PlaybackPrefsTableOrderingComposer($db: db, $table: table),
+          createComputedFieldComposer:
+              () => $$PlaybackPrefsTableAnnotationComposer(
+                $db: db,
+                $table: table,
+              ),
+          updateCompanionCallback:
+              ({
+                Value<String> itemId = const Value.absent(),
+                Value<String> groupKey = const Value.absent(),
+                Value<String> prefs = const Value.absent(),
+                Value<DateTime> updatedAt = const Value.absent(),
+                Value<int> rowid = const Value.absent(),
+              }) => PlaybackPrefsCompanion(
+                itemId: itemId,
+                groupKey: groupKey,
+                prefs: prefs,
+                updatedAt: updatedAt,
+                rowid: rowid,
+              ),
+          createCompanionCallback:
+              ({
+                required String itemId,
+                required String groupKey,
+                Value<String> prefs = const Value.absent(),
+                required DateTime updatedAt,
+                Value<int> rowid = const Value.absent(),
+              }) => PlaybackPrefsCompanion.insert(
+                itemId: itemId,
+                groupKey: groupKey,
+                prefs: prefs,
+                updatedAt: updatedAt,
+                rowid: rowid,
+              ),
+          withReferenceMapper:
+              (p0) =>
+                  p0
+                      .map(
+                        (e) => (
+                          e.readTable(table),
+                          BaseReferences(db, table, e),
+                        ),
+                      )
+                      .toList(),
+          prefetchHooksCallback: null,
+        ),
+      );
+}
+
+typedef $$PlaybackPrefsTableProcessedTableManager =
+    ProcessedTableManager<
+      _$AppDatabase,
+      $PlaybackPrefsTable,
+      PlaybackPrefRow,
+      $$PlaybackPrefsTableFilterComposer,
+      $$PlaybackPrefsTableOrderingComposer,
+      $$PlaybackPrefsTableAnnotationComposer,
+      $$PlaybackPrefsTableCreateCompanionBuilder,
+      $$PlaybackPrefsTableUpdateCompanionBuilder,
+      (
+        PlaybackPrefRow,
+        BaseReferences<_$AppDatabase, $PlaybackPrefsTable, PlaybackPrefRow>,
+      ),
+      PlaybackPrefRow,
+      PrefetchHooks Function()
+    >;
+typedef $$DownloadTasksTableCreateCompanionBuilder =
+    DownloadTasksCompanion Function({
+      required String id,
+      required String provider,
+      required String fileId,
+      required String name,
+      Value<String> dirPath,
+      required String savePath,
+      Value<int?> sizeBytes,
+      Value<int> receivedBytes,
+      required String status,
+      Value<String?> error,
+      required DateTime createdAt,
+      required DateTime updatedAt,
+      Value<int> rowid,
+    });
+typedef $$DownloadTasksTableUpdateCompanionBuilder =
+    DownloadTasksCompanion Function({
+      Value<String> id,
+      Value<String> provider,
+      Value<String> fileId,
+      Value<String> name,
+      Value<String> dirPath,
+      Value<String> savePath,
+      Value<int?> sizeBytes,
+      Value<int> receivedBytes,
+      Value<String> status,
+      Value<String?> error,
+      Value<DateTime> createdAt,
+      Value<DateTime> updatedAt,
+      Value<int> rowid,
+    });
+
+class $$DownloadTasksTableFilterComposer
+    extends Composer<_$AppDatabase, $DownloadTasksTable> {
+  $$DownloadTasksTableFilterComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnFilters<String> get id => $composableBuilder(
+    column: $table.id,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get provider => $composableBuilder(
+    column: $table.provider,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get fileId => $composableBuilder(
+    column: $table.fileId,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get name => $composableBuilder(
+    column: $table.name,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get dirPath => $composableBuilder(
+    column: $table.dirPath,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get savePath => $composableBuilder(
+    column: $table.savePath,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get sizeBytes => $composableBuilder(
+    column: $table.sizeBytes,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get receivedBytes => $composableBuilder(
+    column: $table.receivedBytes,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get status => $composableBuilder(
+    column: $table.status,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get error => $composableBuilder(
+    column: $table.error,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get createdAt => $composableBuilder(
+    column: $table.createdAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get updatedAt => $composableBuilder(
+    column: $table.updatedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+}
+
+class $$DownloadTasksTableOrderingComposer
+    extends Composer<_$AppDatabase, $DownloadTasksTable> {
+  $$DownloadTasksTableOrderingComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnOrderings<String> get id => $composableBuilder(
+    column: $table.id,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get provider => $composableBuilder(
+    column: $table.provider,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get fileId => $composableBuilder(
+    column: $table.fileId,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get name => $composableBuilder(
+    column: $table.name,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get dirPath => $composableBuilder(
+    column: $table.dirPath,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get savePath => $composableBuilder(
+    column: $table.savePath,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get sizeBytes => $composableBuilder(
+    column: $table.sizeBytes,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get receivedBytes => $composableBuilder(
+    column: $table.receivedBytes,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get status => $composableBuilder(
+    column: $table.status,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get error => $composableBuilder(
+    column: $table.error,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get createdAt => $composableBuilder(
+    column: $table.createdAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get updatedAt => $composableBuilder(
+    column: $table.updatedAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+}
+
+class $$DownloadTasksTableAnnotationComposer
+    extends Composer<_$AppDatabase, $DownloadTasksTable> {
+  $$DownloadTasksTableAnnotationComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  GeneratedColumn<String> get id =>
+      $composableBuilder(column: $table.id, builder: (column) => column);
+
+  GeneratedColumn<String> get provider =>
+      $composableBuilder(column: $table.provider, builder: (column) => column);
+
+  GeneratedColumn<String> get fileId =>
+      $composableBuilder(column: $table.fileId, builder: (column) => column);
+
+  GeneratedColumn<String> get name =>
+      $composableBuilder(column: $table.name, builder: (column) => column);
+
+  GeneratedColumn<String> get dirPath =>
+      $composableBuilder(column: $table.dirPath, builder: (column) => column);
+
+  GeneratedColumn<String> get savePath =>
+      $composableBuilder(column: $table.savePath, builder: (column) => column);
+
+  GeneratedColumn<int> get sizeBytes =>
+      $composableBuilder(column: $table.sizeBytes, builder: (column) => column);
+
+  GeneratedColumn<int> get receivedBytes => $composableBuilder(
+    column: $table.receivedBytes,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get status =>
+      $composableBuilder(column: $table.status, builder: (column) => column);
+
+  GeneratedColumn<String> get error =>
+      $composableBuilder(column: $table.error, builder: (column) => column);
+
+  GeneratedColumn<DateTime> get createdAt =>
+      $composableBuilder(column: $table.createdAt, builder: (column) => column);
+
+  GeneratedColumn<DateTime> get updatedAt =>
+      $composableBuilder(column: $table.updatedAt, builder: (column) => column);
+}
+
+class $$DownloadTasksTableTableManager
+    extends
+        RootTableManager<
+          _$AppDatabase,
+          $DownloadTasksTable,
+          DownloadTaskRow,
+          $$DownloadTasksTableFilterComposer,
+          $$DownloadTasksTableOrderingComposer,
+          $$DownloadTasksTableAnnotationComposer,
+          $$DownloadTasksTableCreateCompanionBuilder,
+          $$DownloadTasksTableUpdateCompanionBuilder,
+          (
+            DownloadTaskRow,
+            BaseReferences<_$AppDatabase, $DownloadTasksTable, DownloadTaskRow>,
+          ),
+          DownloadTaskRow,
+          PrefetchHooks Function()
+        > {
+  $$DownloadTasksTableTableManager(_$AppDatabase db, $DownloadTasksTable table)
+    : super(
+        TableManagerState(
+          db: db,
+          table: table,
+          createFilteringComposer:
+              () => $$DownloadTasksTableFilterComposer($db: db, $table: table),
+          createOrderingComposer:
+              () =>
+                  $$DownloadTasksTableOrderingComposer($db: db, $table: table),
+          createComputedFieldComposer:
+              () => $$DownloadTasksTableAnnotationComposer(
+                $db: db,
+                $table: table,
+              ),
+          updateCompanionCallback:
+              ({
+                Value<String> id = const Value.absent(),
+                Value<String> provider = const Value.absent(),
+                Value<String> fileId = const Value.absent(),
+                Value<String> name = const Value.absent(),
+                Value<String> dirPath = const Value.absent(),
+                Value<String> savePath = const Value.absent(),
+                Value<int?> sizeBytes = const Value.absent(),
+                Value<int> receivedBytes = const Value.absent(),
+                Value<String> status = const Value.absent(),
+                Value<String?> error = const Value.absent(),
+                Value<DateTime> createdAt = const Value.absent(),
+                Value<DateTime> updatedAt = const Value.absent(),
+                Value<int> rowid = const Value.absent(),
+              }) => DownloadTasksCompanion(
+                id: id,
+                provider: provider,
+                fileId: fileId,
+                name: name,
+                dirPath: dirPath,
+                savePath: savePath,
+                sizeBytes: sizeBytes,
+                receivedBytes: receivedBytes,
+                status: status,
+                error: error,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                rowid: rowid,
+              ),
+          createCompanionCallback:
+              ({
+                required String id,
+                required String provider,
+                required String fileId,
+                required String name,
+                Value<String> dirPath = const Value.absent(),
+                required String savePath,
+                Value<int?> sizeBytes = const Value.absent(),
+                Value<int> receivedBytes = const Value.absent(),
+                required String status,
+                Value<String?> error = const Value.absent(),
+                required DateTime createdAt,
+                required DateTime updatedAt,
+                Value<int> rowid = const Value.absent(),
+              }) => DownloadTasksCompanion.insert(
+                id: id,
+                provider: provider,
+                fileId: fileId,
+                name: name,
+                dirPath: dirPath,
+                savePath: savePath,
+                sizeBytes: sizeBytes,
+                receivedBytes: receivedBytes,
+                status: status,
+                error: error,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                rowid: rowid,
+              ),
+          withReferenceMapper:
+              (p0) =>
+                  p0
+                      .map(
+                        (e) => (
+                          e.readTable(table),
+                          BaseReferences(db, table, e),
+                        ),
+                      )
+                      .toList(),
+          prefetchHooksCallback: null,
+        ),
+      );
+}
+
+typedef $$DownloadTasksTableProcessedTableManager =
+    ProcessedTableManager<
+      _$AppDatabase,
+      $DownloadTasksTable,
+      DownloadTaskRow,
+      $$DownloadTasksTableFilterComposer,
+      $$DownloadTasksTableOrderingComposer,
+      $$DownloadTasksTableAnnotationComposer,
+      $$DownloadTasksTableCreateCompanionBuilder,
+      $$DownloadTasksTableUpdateCompanionBuilder,
+      (
+        DownloadTaskRow,
+        BaseReferences<_$AppDatabase, $DownloadTasksTable, DownloadTaskRow>,
+      ),
+      DownloadTaskRow,
+      PrefetchHooks Function()
+    >;
 
 class $AppDatabaseManager {
   final _$AppDatabase _db;
@@ -8016,4 +9722,8 @@ class $AppDatabaseManager {
       $$ScanCursorsTableTableManager(_db, _db.scanCursors);
   $$SettingsTableTableManager get settings =>
       $$SettingsTableTableManager(_db, _db.settings);
+  $$PlaybackPrefsTableTableManager get playbackPrefs =>
+      $$PlaybackPrefsTableTableManager(_db, _db.playbackPrefs);
+  $$DownloadTasksTableTableManager get downloadTasks =>
+      $$DownloadTasksTableTableManager(_db, _db.downloadTasks);
 }

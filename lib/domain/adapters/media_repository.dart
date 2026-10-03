@@ -4,6 +4,7 @@ import '../../core/utils/filename_parser.dart';
 import '../../core/utils/media_category.dart';
 import '../entities/media_item.dart';
 import '../entities/media_work.dart';
+import '../entities/playback_preference.dart';
 import '../entities/subtitle_track.dart';
 import '../entities/drive_provider.dart';
 import '../entities/scan_cursor.dart';
@@ -285,6 +286,61 @@ abstract class MediaRepository {
   /// 的开关，调用点会变成一串布尔字面量，比两个方法难读得多。
   Future<void> saveResumePosition(String itemId, Duration? position);
 
+  /// 把「历史最大播放位置」往上顶到 [position]（**只增不减**）。
+  ///
+  /// ## 与 [saveResumePosition] 的分工
+  ///
+  /// 那个回答「这次该从哪儿接着播」，会变、也会被清掉；这个回答「这一集
+  /// 看过没有 / 看到哪儿了」，**永不回退、永不清除**。详情页「文件」列表
+  /// 靠它画每条的进度条（用续播点画的话，看完的一集会显示成 0%）。
+  ///
+  /// ## 为什么参数不可空、也不接受「清除」
+  ///
+  /// 「历史最大位置」没有「清除」这个操作 —— 看过就是看过。传零 / 负数
+  /// 是**无操作**（而不是把已有的值抹掉）：调用方每 10 秒报一次位置，
+  /// 起播那一刻位置就是 0，那时抹掉用户攒下的进度是最坏的结果。
+  Future<void> saveMaxPosition(String itemId, Duration position);
+
+  /// 读某一条的播放偏好（画质 / 音轨 / 字幕 / 字幕开关 / 音效）。
+  ///
+  /// ## 两级查找：先本文件，再同作品
+  ///
+  ///   1. **精确命中** `itemId` —— 「这个文件上次怎么播的」，最准；
+  ///   2. 没命中时回退到**同一部作品里最近改过的那一条**（按 `updatedAt`
+  ///      取最新）—— 用户给第 1 集选了粤语，第 2 集打开也该是粤语，
+  ///      而不是每集重选一次。
+  ///
+  /// [groupKey] 为 `null` / 空串时**只做第一级**：手输直链、内置自检视频
+  /// 这类没有库记录的播放不该去继承别人的偏好。
+  ///
+  /// ## 回退来的音轨 / 字幕必须做特征匹配
+  ///
+  /// 第二级拿到的可能是**另一集**的记录，里面的内嵌轨 id 在这一集里几乎
+  /// 必然不存在。调用方要用 [TrackPreference.bestIndex] 去匹配，匹配不上
+  /// 就退回默认 —— **绝不能直接拿 id 去设轨**（症状是「换集之后字幕变成
+  /// 外语了」，或者干脆点了没反应）。
+  Future<PlaybackPreference?> playbackPreferenceFor(
+    String itemId, {
+    String? groupKey,
+  });
+
+  /// 保存播放偏好（**整条覆盖写**）。
+  ///
+  /// ## 为什么是「整条覆盖」而不是「按项合并」
+  ///
+  /// 调用方（内置播放页 / 独立播放窗口）手里**始终有一份完整的偏好对象**：
+  /// 打开时读出来的那一份，之后用户每改一项就地更新。所以写的时候直接覆盖
+  /// 即可，不需要在仓储层再实现一套「哪些字段该保留」的合并语义 —— 那种
+  /// 语义一旦有两处实现（这边和调用方），必然漂移。
+  ///
+  /// ⚠️ **「等于默认值」的偏好也要写**，不要自作聪明地跳过：用户可能是把
+  /// 画质从 1080P 改回原画、或者主动把字幕关掉 —— 那些都是**有效的选择**，
+  /// 不写下来下次就还原不出来（`subtitlesEnabled` 那一位尤其明显）。
+  Future<void> savePlaybackPreference(
+    String itemId,
+    String groupKey,
+    PlaybackPreference preference);
+
   // -------------------------------------------------------------------
   // 读取
   // -------------------------------------------------------------------
@@ -302,6 +358,21 @@ abstract class MediaRepository {
   /// 「最近播放」那一栏。它与 [category] 是**正交**的两件事（一部电影既在
   /// 「电影」里，也在「最近播放」里），所以是一个独立的开关而不是分类的一个
   /// 取值 —— 理由见 `LibraryFilter.playedOnly`。
+  ///
+  /// [scrapedOnly] 只保留**已在线刮削**的作品（`source = 'online'`），
+  /// 服务的是筛选面板上的「已刮削」那一项。与 [playedOnly] 一样是一个
+  /// 正交的开关而不是分类的一个取值。
+  ///
+  /// ## 判据为什么是 `source`，而不是 `MediaWork.isScraped`
+  ///
+  /// `isScraped` 是 `online || manual`，它回答的是「这一行**要不要被
+  /// 自动刮削覆盖**」—— 那是合并逻辑的保护位。而这里问的是「有没有刮到过
+  /// 在线数据」，两者在「用户点过『自定义』」的行上分道扬镳：自定义会把
+  /// 在线信息整份清掉（`scrapedAt` 也置 `null`），那一行**不该**算「已刮削」。
+  ///
+  /// 也正因为 `scrapedAt` 只由在线刮削写（`WorkSeed.build` /
+  /// `WorkScraper._apply`），它与 `source = 'online'` 是同一件事的两列，
+  /// 取 `source` 是因为那一列的文档本来就写着「刮削的幂等依据」。
   ///
   /// [years] 与 [genres] 是筛选面板里的两个条件，与上面几个**全部取交集**。
   ///
@@ -336,6 +407,7 @@ abstract class MediaRepository {
     MediaKind? kind,
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -391,11 +463,17 @@ abstract class MediaRepository {
   ///
   /// ## 计数口径：等于「把年份 / 类型清空后，列表里的条数」
   ///
-  /// 所以它跟着 [category] / [playedOnly] / [query] 收窄，但**不跟着
-  /// [years] / [genres] 收窄**（那两维由调用方保证不传进来）。
+  /// 所以它跟着 [category] / [playedOnly] / [scrapedOnly] / [query] 收窄，
+  /// 但**不跟着 [years] / [genres] 收窄**（那两维由调用方保证不传进来）。
   /// 这条规则只有一个目的：**面板上出现的每一个选项，点下去至少有一条结果**。
   /// 整库统计做不到这一点 —— 用户切到「综艺」栏再打开面板，会看到一堆
   /// 综艺里根本不存在的类型，点下去是空列表。
+  ///
+  /// [scrapedOnly] 进这一组而 [years] / [genres] 不进，是因为它们**不是
+  /// 同一类条件**：前者是面板顶部那个开关，改的是「这一份列表里有哪些
+  /// 作品」，年份 / 类型正是在它筛出来的这批作品里再分面；而 [years] /
+  /// [genres] 是分面本身 —— 让分面互相收窄，用户每勾一个类型，剩下的类型
+  /// 角标就跟着变，勾到第二个时列表已经空了。
   ///
   /// 副作用是切换分类 / 搜索时面板上的数字会变（标准的分面筛选行为）。
   ///
@@ -404,6 +482,7 @@ abstract class MediaRepository {
   Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   });
 
@@ -419,6 +498,7 @@ abstract class MediaRepository {
   Future<Map<String, int>> countWorksByGenre({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   });
 
@@ -461,6 +541,15 @@ abstract class MediaRepository {
   /// `map[id] ?? Duration.zero` 拿值，而「到底有没有存过」这件事本来就该由
   /// 缺失来表达。
   Future<Map<String, Duration>> resumePositions(List<String> itemIds);
+
+  /// 批量读**历史最大播放位置**（详情页「文件」列表画进度条用）。
+  ///
+  /// 与 [resumePositions] 同形、同一套「没存过就不出现在结果里」的口径，
+  /// 但读的是另一列（见 [saveMaxPosition]）。两个都要查的时候**必须分成
+  /// 两次调用**，不要试图合成一个返回两种值的查询 —— 调用方真正需要的
+  /// 往往只有一个（剧集面板要续播点，详情页列表要历史最大位置），
+  /// 合并只会让不需要的那一半也陪着查一遍。
+  Future<Map<String, Duration>> maxPositions(List<String> itemIds);
 
   /// 某个媒体项的字幕引用。
   Future<List<SubtitleTrack>> subtitlesForItem(String itemId);
@@ -505,8 +594,25 @@ class InMemoryMediaRepository implements MediaRepository {
   /// 续播位置。**没存过的条目不出现在这里**（与真实实现同一口径）。
   final Map<String, Duration> _resume = {};
 
+  /// 历史最大播放位置（只增不减）。与 [_resume] 分开两张表 —— 它们是两个
+  /// 不同的量，合并的话「看完清续播点」会顺手把历史进度也抹掉。
+  final Map<String, Duration> _maxPositions = {};
+
+  /// 逐文件的播放偏好。值里带上 `groupKey` 与写入时间 —— 前者供「同剧
+  /// 继承」回退查询，后者是回退时的排序依据（取最新一条），与真实实现
+  /// 的 `playback_prefs.group_key` / `updated_at` 两列一一对应。
+  final Map<String, ({PlaybackPreference pref, String groupKey, DateTime at})>
+      _prefs = {};
+
+  /// 只读视图，供测试断言。
+  Map<String, PlaybackPreference> get playbackPrefs =>
+      Map.unmodifiable(_prefs.map((k, v) => MapEntry(k, v.pref)));
+
   /// 只读视图，供测试断言。
   Map<String, Duration> get resume => Map.unmodifiable(_resume);
+
+  /// 只读视图，供测试断言。
+  Map<String, Duration> get maxWatched => Map.unmodifiable(_maxPositions);
 
   /// 只读视图，供测试断言。
   Map<String, MediaItem> get items => Map.unmodifiable(_items);
@@ -544,12 +650,14 @@ class InMemoryMediaRepository implements MediaRepository {
   Future<bool> deleteItem(String itemId) async {
     final removed = _items.remove(itemId);
     if (removed == null) return false;
-    // 三张挂在这条文件上的旁表一起走：`_played` 决定「最近播放」排序，
-    // `_resume` 是续播点。留着的话被删掉的文件仍然会出现在「最近播放」里
-    // —— 而点它只会再失败一次。
+    // 五张挂在这条文件上的旁表一起走：`_played` 决定「最近播放」排序，
+    // `_resume` 是续播点，`_maxPositions` 是历史进度，`_prefs` 是播放偏好。
+    // 留着的话被删掉的文件仍然会出现在「最近播放」里 —— 而点它只会再失败一次。
     _subtitles.remove(itemId);
     _resume.remove(itemId);
+    _maxPositions.remove(itemId);
     _played.remove(itemId);
+    _prefs.remove(itemId);
     _recountWork(removed.groupKey);
     return true;
   }
@@ -571,6 +679,7 @@ class InMemoryMediaRepository implements MediaRepository {
       _subtitles.remove(id);
       _resume.remove(id);
       _played.remove(id);
+      _prefs.remove(id);
     }
     for (final k in keys) {
       _works.remove(k);
@@ -862,6 +971,57 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<void> saveMaxPosition(String itemId, Duration position) async {
+    // 零 / 负位置是**无操作**，不是「清零」（见接口文档）：每 10 秒一次
+    // 的位置回报里，起播那一刻就是 0，那时抹掉已有进度是最坏的结果。
+    if (position <= Duration.zero) return;
+    final stored = _maxPositions[itemId];
+    // 只增不减。回拖 / 重看都不该让它倒退。
+    if (stored != null && stored >= position) return;
+    _maxPositions[itemId] = position;
+  }
+
+  @override
+  Future<PlaybackPreference?> playbackPreferenceFor(
+    String itemId, {
+    String? groupKey,
+  }) async {
+    // 第一级：本文件。`isEmpty` 的行按「没记过」处理 —— 真实实现那边
+    // 空对象是可能的（`prefs` 列有 `DEFAULT '{}'`），两边口径必须一致。
+    final own = _prefs[itemId];
+    if (own != null && !own.pref.isEmpty) return own.pref;
+
+    final key = groupKey;
+    if (key == null || key.isEmpty) return null;
+
+    // 第二级：同一部作品里最近改过的那一条。
+    ({PlaybackPreference pref, String groupKey, DateTime at})? latest;
+    for (final entry in _prefs.entries) {
+      if (entry.key == itemId) continue;
+      if (entry.value.groupKey != key) continue;
+      if (entry.value.pref.isEmpty) continue;
+      if (latest == null || entry.value.at.isAfter(latest.at)) {
+        latest = entry.value;
+      }
+    }
+    return latest?.pref;
+  }
+
+  @override
+  Future<void> savePlaybackPreference(
+    String itemId,
+    String groupKey,
+    PlaybackPreference preference,
+  ) async {
+    // 与真实实现同一口径：**整条覆盖**，且空偏好也照写。
+    _prefs[itemId] = (
+      pref: preference,
+      groupKey: groupKey,
+      at: DateTime.now(),
+    );
+  }
+
+  @override
   Future<void> setWorkCategory(String key, MediaCategory? category) async {
     final work = _works[key];
     if (work == null) return;
@@ -986,6 +1146,7 @@ class InMemoryMediaRepository implements MediaRepository {
     MediaKind? kind,
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -1008,6 +1169,15 @@ class InMemoryMediaRepository implements MediaRepository {
     // 「播过没有」看的是作品行上的 `lastPlayedAt`，与分类无关。
     if (playedOnly) {
       list = list.where((w) => w.lastPlayedAt != null).toList();
+    }
+    // 「刮过没有」只看 `source`。⚠️ **不是** `w.isScraped` —— 那一位还包含
+    // `manual`（「用户点过自定义」的行），而自定义恰恰会把在线信息整份清掉。
+    // 判据的完整理由见接口上 `listWorks` 的文档。
+    //
+    // 与 drift 侧的 `t.source.equals('online')` 必须同口径：替身松一点，
+    // 用它的测试就会对「哪些算已刮削」给出与真库不同的结论。
+    if (scrapedOnly) {
+      list = list.where((w) => w.source == ScrapeSource.online).toList();
     }
     // 年份：`years` 存的是**具体年份**（2023 只匹配 2023 年上映的作品）。
     // 没有年份的作品（`year == null`）归不进任何年份 —— 选了年份就等于把
@@ -1169,6 +1339,7 @@ class InMemoryMediaRepository implements MediaRepository {
   Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) async {
     // 直接复用 [listWorks] 的筛选，而不是把条件再抄一遍：口径要严格等于
@@ -1176,6 +1347,7 @@ class InMemoryMediaRepository implements MediaRepository {
     final works = await listWorks(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
       limit: _noLimit,
     );
@@ -1194,11 +1366,13 @@ class InMemoryMediaRepository implements MediaRepository {
   Future<Map<String, int>> countWorksByGenre({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) async {
     final works = await listWorks(
       category: category,
       playedOnly: playedOnly,
+      scrapedOnly: scrapedOnly,
       query: query,
       limit: _noLimit,
     );
@@ -1291,6 +1465,16 @@ class InMemoryMediaRepository implements MediaRepository {
     final out = <String, Duration>{};
     for (final id in itemIds) {
       final d = _resume[id];
+      if (d != null && d > Duration.zero) out[id] = d;
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<String, Duration>> maxPositions(List<String> itemIds) async {
+    final out = <String, Duration>{};
+    for (final id in itemIds) {
+      final d = _maxPositions[id];
       if (d != null && d > Duration.zero) out[id] = d;
     }
     return out;

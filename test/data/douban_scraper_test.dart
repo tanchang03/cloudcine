@@ -435,6 +435,158 @@ void main() {
     });
   });
 
+  group('DoubanScraper 宽松档（无年份的电影）', () {
+    // 无年份时年份硬闸门失效，闸门只认精确同名；并且要求**第一条影视候选**
+    // 就是精确同名（第一位按「跳过书 / 音乐 / 游戏后的第一个影视条目」算）。
+    // ⚠️ 不要求唯一 —— 实测「奥德赛」豆瓣上就有 2 条精确同名。
+    const q = ScrapeQuery(
+      title: '奥德赛',
+      kind: MediaKind.movie,
+      requireExactTitle: true,
+    );
+
+    test('精确同名 + 唯一 + 首位 → 命中', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(
+              id: '36808876',
+              title: '奥德赛',
+              targetType: 'movie',
+              year: '2026',
+            ),
+            // 后面跟着「前缀同名」的候选：它不该影响判定。
+            _hit(id: '2', title: '奥德赛：归来', targetType: 'movie', year: '2024'),
+          ],
+        ),
+        detail: (id) => _detailBody(
+          id: id,
+          type: 'movie',
+          title: '奥德赛',
+          year: '2026',
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.scrape(q);
+
+      expect(md, isNotNull);
+      expect(md!.onlineId, 'douban/movie/36808876');
+    });
+
+    test('只有前缀同名 → null', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(id: '2', title: '奥德赛：归来', targetType: 'movie', year: '2024'),
+          ],
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      expect(
+        await scraper.scrape(q),
+        isNull,
+        reason: '「奥德赛：归来」在严格档下拿 0.86（> 0.6）通过 —— '
+            '那是静默刮错。宽松档没有年份可兜底，只认精确同名',
+      );
+    });
+
+    test('精确同名但**不在第一位** → null', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(id: '1', title: '特洛伊', targetType: 'movie', year: '2004'),
+            _hit(id: '36808876', title: '奥德赛', targetType: 'movie', year: '2026'),
+          ],
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      expect(await scraper.scrape(q), isNull);
+    });
+
+    test('**多条**精确同名 → 取第一条（**不要求唯一**）', () async {
+      // 实测 2026-10-03：搜「奥德赛」时豆瓣返回 **2 条**精确同名、TMDB 4 条。
+      // 加「唯一」会把正主也挡掉。
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(id: '1', title: '英雄', targetType: 'movie', year: '2002'),
+            _hit(id: '2', title: '英雄', targetType: 'movie', year: '2007'),
+          ],
+        ),
+        detail: (id) => _detailBody(
+          id: id,
+          type: 'movie',
+          title: '英雄',
+          year: '2002',
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.scrape(
+        const ScrapeQuery(
+          title: '英雄',
+          kind: MediaKind.movie,
+          requireExactTitle: true,
+        ),
+      );
+
+      expect(md, isNotNull);
+      expect(md!.onlineId, 'douban/movie/1');
+    });
+
+    test('⚠️ 「第一位」按跳过书 / 音乐 / 游戏之后的影视条目算', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            // 实测搜「繁花」的前两条就是两本书 —— 它们不该把「第一位」占掉。
+            _hit(id: '22714154', title: '繁花', targetType: 'book'),
+            _hit(id: '36808876', title: '奥德赛', targetType: 'movie', year: '2026'),
+          ],
+        ),
+        detail: (id) => _detailBody(
+          id: id,
+          type: 'movie',
+          title: '奥德赛',
+          year: '2026',
+        ),
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.scrape(q);
+
+      expect(
+        md,
+        isNotNull,
+        reason: '书 / 音乐 / 游戏不是候选，不该占「第一位」—— 否则只要搜索'
+            '结果里先冒出一本书，宽松档就永远不生效',
+      );
+      expect(md!.onlineId, 'douban/movie/36808876');
+    });
+  });
+
   group('DoubanScraper 详情与映射', () {
     test('类型读的是响应体的 type —— 301 跟随之后才知道是剧集', () async {
       final http = _server(

@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform;
+    show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,9 +12,11 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/seek_acceleration.dart';
+import '../../core/utils/track_labels.dart';
 import '../../data/db/settings_store.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/entities/playback_preference.dart';
 import '../../domain/entities/quality_option.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/services/episode_queue.dart';
@@ -27,6 +29,7 @@ import '../widgets/buffered_slider.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/missing_media_dialog.dart';
 import '../widgets/player_keys.dart';
+import '../widgets/player_tv_overlay.dart';
 
 /// 遥控器 / 键盘上某个键，在当前上下文里该触发什么。
 ///
@@ -129,6 +132,52 @@ RemoteKeyAction resolveRemoteKey({
   return RemoteKeyAction.ignored;
 }
 
+/// TV 设置面板相关的按键该干什么。
+///
+/// ## 为什么要跟 [RemoteKeyAction] 分开，而且必须先判
+///
+/// 面板的开关**不是播放动作**，并且它必须在 [resolveRemoteKey] **之前**判：
+/// 那里面「沉浸模式下任何认识的键 → `showControls`」这一条会把菜单键吃掉，
+/// 于是沉浸状态下按菜单键只会把控制栏叫回来、面板永远打不开 ——
+/// 而菜单键恰恰是这条需求点名要用的键。
+enum TvPanelKeyAction {
+  /// 与面板无关，交给 [resolveRemoteKey] 继续判。
+  none,
+
+  /// 唤出面板。
+  open,
+
+  /// 收起面板（菜单键再按一次）。
+  close,
+}
+
+/// 决定一个按键要不要动 TV 设置面板。
+///
+/// ## 为什么 ↑ 只在「焦点真在画面上」时才接管
+///
+/// 电视的通行约定是画面里按 ↑ 唤出设置（YouTube / Netflix 都这样），而 ↑ 在
+/// 画面上本来就是**空闲**的 —— 顶栏整块 `ExcludeFocus`，焦点挪不上去。
+/// 但焦点一旦进了控制栏，↑ 就属于焦点遍历（用户要从下面走回去），
+/// 这时接管会把「走回上一行」变成「弹出面板」。
+///
+/// ⚠️ 反过来说 **↓ 必须继续放行**：从画面往下走到控制栏（去够「设置」按钮）
+/// 靠的就是它。所以这里只认 ↑，绝不认 ↓。
+TvPanelKeyAction resolveTvPanelKey({
+  required LogicalKeyboardKey key,
+  required bool panelOpen,
+  required bool stageFocused,
+}) {
+  // 菜单键（Android `KEYCODE_MENU` = 82 → `contextMenu`）。同一个键开 / 关。
+  // 不挑焦点：它上面没有别的含义，任何位置按下去都该是「开设置」。
+  if (key == LogicalKeyboardKey.contextMenu) {
+    return panelOpen ? TvPanelKeyAction.close : TvPanelKeyAction.open;
+  }
+  if (key == LogicalKeyboardKey.arrowUp && !panelOpen && stageFocused) {
+    return TvPanelKeyAction.open;
+  }
+  return TvPanelKeyAction.none;
+}
+
 /// 控制栏是否该在无操作超时后自动收起（进入沉浸）。
 ///
 /// 抽成**纯函数**是为了可单测 —— 「什么时候藏」一旦散在定时器回调里，
@@ -147,15 +196,66 @@ bool shouldAutoHideControls({
 }) =>
     !immersive && playing && stageFocused;
 
+/// 画面上该不该显示「正在切换…」这一层。
+///
+/// 抽成**纯函数**是为了可单测（与 [shouldAutoHideControls] 同理）——
+/// 「什么时候算换档」一旦散在 `build` 里，就会随状态字段增减而漂移。
+///
+/// ## 判据
+///
+/// `isLoading` 同时被 `open()`（首次开播 / 换集 / 重试）与 `switchQuality`
+/// 置位，光看它分不出「换档」和「首次载入」。所以用 `duration` 区分：
+///
+///   * `open()` 会把时长归零 —— 它换的是**另一个文件**，旧的时长没有意义；
+///   * `switchQuality` **不走** `open()`（见 `PlaybackController._loadIntoPlayer`），
+///     时长还在 —— 它换的是同一部片子的另一条转码流。
+///
+/// 于是「时长还在 + 正在加载」== 换档。首次载入时时长为零，不会误报。
+///
+/// ⚠️ **不要**把它改成页面自己的布尔标志位：那种锁存状态一旦有某条提前返回
+/// 的分支忘了清，指示就会永远挂在画面上（「永远不收」比「早收」糟得多）。
+/// 这里是从 `isLoading` 推导的，`switchQuality` 的 `try/finally` 保证它
+/// 一定会落回 false。
+bool shouldShowSwitchVeil({
+  required bool isLoading,
+  required Duration duration,
+}) =>
+    isLoading && duration > Duration.zero;
+
+/// 进播放页要播的那一条：**调用方直接给的优先**，没给才按 id 查库。
+///
+/// ## 为什么这条规则要单独抽出来
+///
+/// 写反了（永远查库）的表现是：目录视图里点一个**还没入库**的视频，弹出来
+/// 一句「找不到这个媒体项。可能它已被重新扫描移除」—— 而用户点的那部片子
+/// 就在网盘上，只是还没进库。播放页本身太重（media_kit + 跨引擎通道），
+/// 整页测不划算，所以判据抽成这个函数、由用例钉死。
+///
+/// [lookup] 由调用方传进来（而不是在这里 `ref.read`）：这样用例能验
+/// 「给了对象时**一次都没查库**」，而那正是这条规则的要害 —— 库里没有
+/// 那一行，查一次只会白跑一趟并拿到 `null`。
+@visibleForTesting
+Future<MediaItem?> resolvePlayItem({
+  required String itemId,
+  required MediaItem? item,
+  required Future<MediaItem?> Function(String itemId) lookup,
+}) async =>
+    item ?? await lookup(itemId);
+
 /// 播放页。
 ///
-/// ## 为什么播放页要自己把数据装一遍
+/// ## 为什么**默认**只收 itemId，而 [PlayerPage.item] 是例外
 ///
-/// 它接收的是 **itemId 而不是 `MediaItem` 对象**。看起来多绕一步，换来两件事：
+/// 常规路径传的是 **itemId 而不是 `MediaItem` 对象**。看起来多绕一步，
+/// 换来两件事：
 ///   1. 深链接 / 热重载后页面能自己恢复（对象传参会丢）；
 ///   2. 「播放」这件事的**全部前置条件**（字幕引用、默认清晰度、音量倍速、
 ///      是否自动加载字幕）都从库里现读，不会因为调用方忘了传某个参数
 ///      而静默用默认值。
+///
+/// 唯一的例外是 [PlayerPage.item]：目录视图允许**不先入库就直接播**，那一条
+/// 库里根本没有，按 id 查必然查不到 —— 所以那种情况下调用方把对象一起带
+/// 过来（见 [resolvePlayItem] 的规则），而**只有**那种情况才会用到它。
 ///
 /// ## 控制栏为什么是自绘的
 ///
@@ -164,12 +264,25 @@ bool shouldAutoHideControls({
 /// 就是「同一个文件」。清晰度菜单、字幕来源标注（网盘/内嵌）、
 /// 音轨语言名这些都必须我们自己画。
 class PlayerPage extends ConsumerStatefulWidget {
-  const PlayerPage({super.key, required this.itemId, this.qualityId});
+  const PlayerPage({super.key, required this.itemId, this.qualityId, this.item});
 
   final String itemId;
 
   /// 指定要播的清晰度档位（从详情页点某一档进来时用）。`null` = 用设置里的默认。
   final String? qualityId;
+
+  /// 要播的媒体项**对象**。`null` = 去库里按 [itemId] 查。
+  ///
+  /// ## 为什么除了 id 还要能直接给对象
+  ///
+  /// 目录视图允许**不先入库就直接播**（`playDriveEntry`）：那条路手里有一个
+  /// 现造的 `MediaItem`，而库里**没有这一行** —— 只给 id 的话，[PlayerPage]
+  /// 查库查不到，只能报「找不到这个媒体项」，而用户点的那部片子就在网盘上。
+  ///
+  /// 走导航参数（go_router 的 `extra`）而不是在这里查一个旁路缓存：谁导航
+  /// 过来、带的是哪一条，在调用点上一眼看得到。已经入库的条目也会带上它
+  /// （同一个对象，省一次点查），所以这里**不区分**两种来源。
+  final MediaItem? item;
 
   @override
   ConsumerState<PlayerPage> createState() => _PlayerPageState();
@@ -227,11 +340,46 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 而逐集标记的代价高得没人会去标）。
   MediaWork? _work;
 
+  /// 这一条**当前生效的播放偏好**（画质 / 音轨 / 字幕 / 字幕开关 / 音效）。
+  ///
+  /// ## 为什么在页面里留一份，而不是每次写库时现读
+  ///
+  /// 用户改一项时要写回去的是**完整的偏好**（仓储是整条覆盖写）。现读一次
+  /// 当然也行，但那会多一次数据库往返 + 一次 JSON 解析，而这一份本来就
+  /// 已经读出来过（`_openItem` 里），只是原先没地方放。
+  ///
+  /// ⚠️ 它必须**跟着当前这一集走**：`_openItem` 每次都会用新一集读到的值
+  /// 覆盖它。漏了覆盖的话，「切到下一集 → 改字幕」会把上一集的偏好写进
+  /// 下一集的行里 —— 而用户只看到「设置记住了错的」。
+  PlaybackPreference _pref = const PlaybackPreference();
+
+  /// 音效是否已经应用过。**进播放页后只应用一次**（切集不重来）。
+  ///
+  /// 与连播 / 跳片头同一待遇：音效描述的是**这台设备怎么接音箱**，与播
+  /// 哪一集无关。切集时重下发会让 mpv 重配音频输出 —— 听感上是一次极短的
+  /// 断音，而用户什么都没改。
+  bool _audioEffectApplied = false;
+
   /// 设置：一集播完是否自动接下一集。
   bool _autoPlayNext = true;
 
   /// 设置：有片头标识时是否自动跳过。
   bool _skipIntro = true;
+
+  /// TV 右侧设置面板是否打开。
+  ///
+  /// 它**不是**路由、也不是 `showModalBottomSheet` —— 面板只是画面 `Stack`
+  /// 里的一层。走路由的话，「返回键是先关面板还是先退出播放」会变成两个地方
+  /// 各自的决定，而电视上返回键是唯一的退出手段，分错一次就是「按了没反应」。
+  bool _tvPanelOpen = false;
+
+  /// 同一部作品下的全部条目（「选集」用）。
+  ///
+  /// 与 `_playNextEpisode` 取的是**同一份**（`itemsForWork` 的并集）——
+  /// 在这里缓存是为了让面板一开就能列出集数，而不是让用户盯着「—」等一次
+  /// 数据库往返。空列表表示这一条不在库里（从「文件夹」直接播了没入库的
+  /// 文件），那时面板里「选集」那一行不可调。
+  List<MediaItem> _siblings = const [];
 
   @override
   void initState() {
@@ -283,15 +431,48 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     await _openItem(next);
   }
 
+  /// 改一项偏好并**立刻写库**。
+  ///
+  /// 顺序是「先更新本地、再写库」：本地那份是 UI 立刻要用的（菜单打勾、
+  /// 按钮状态），而写库只决定「下次还记不记得」。反过来等一次数据库往返，
+  /// 用户会觉得点了没反应。
+  ///
+  /// 写库失败**不影响本次播放**，只留一条 warn —— 但必须留痕，否则用户
+  /// 下次打开发现设置又变回去了，而日志里一条线索都没有。
+  Future<void> _savePref(
+    PlaybackPreference Function(PlaybackPreference current) update,
+  ) async {
+    final next = update(_pref);
+    // 值没变就不写：菜单里点中当前那一项是常事，白跑一次写库（以及一次
+    // `setState`）没有意义。
+    if (next == _pref) return;
+    setState(() => _pref = next);
+
+    final item = _item;
+    if (item == null) return;
+    try {
+      await ref
+          .read(mediaRepositoryProvider)
+          .savePlaybackPreference(item.id, item.groupKey, next);
+    } catch (e) {
+      diag.warn('播放', '播放偏好没能存下来（本次播放已生效）：$e');
+    }
+  }
+
   /// 切换「音效」预设：**先应用、再落库**。
   ///
   /// 顺序是有意的：应用是用户按下菜单那一刻要听到的结果，落库是「下次还记得」。
   /// 反过来先等一次数据库写，用户会觉得点了没反应。
   ///
-  /// 落库失败**不影响本次播放**，只留一条 warn —— 但必须留痕，否则用户下次
-  /// 开视频发现音效又变回默认，而日志里一条线索都没有。
+  /// 落库**写两处**，它们语义不同：
+  ///   - 全局设置 = 「这台设备怎么接音箱」，其它片子跟着用；
+  ///   - 这条偏好 = 「这部片上的覆盖」，下次播它时优先。
+  ///
+  /// 只写全局的话，「这部片要直通、别的片立体声」就做不到；只写偏好则会让
+  /// 用户在设置页看到的音效永远停在旧值。
   Future<void> _setAudioEffect(AudioEffectPreset preset) async {
     await _controller.setAudioEffect(preset);
+    await _savePref((p) => p.withAudioEffect(preset.value));
     try {
       await ref
           .read(settingsStoreProvider)
@@ -300,6 +481,73 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       diag.warn('音效', '音效设置没能存下来（本次播放已生效）：$e');
     }
   }
+
+  /// 换清晰度：切档 + 记住。
+  ///
+  /// ⚠️ **失败时不记**：`switchQuality` 在「这一档服务端没给地址」时只设一条
+  /// `_notice` 就返回，`activeQualityId` 不会变。记下来的话，下次打开会去选
+  /// 一个取不到地址的档位 —— 表现是「一进播放页就报错」，而用户上次只是
+  /// 随手点了一下。
+  Future<void> _changeQuality(String id) async {
+    await _controller.switchQuality(id);
+    if (_controller.activeQualityId != id) return;
+    await _savePref((p) => p.withQuality(id));
+  }
+
+  /// 换字幕（`null` = 关闭字幕）：加载 + 记住。
+  ///
+  /// ⚠️ 同样**只在真的挂上了之后才记**。`selectSubtitle` 失败时（网盘字幕
+  /// 取不下来、内嵌轨没有轨道号）只设 `_notice`，`activeSubtitleId` 不变 ——
+  /// 那时若已经写成「选中这一条」，下次打开会**再失败一次**，而用户完全
+  /// 不知道为什么这部片的字幕总是加载不上。
+  Future<void> _changeSubtitle(SubtitleTrack? track) async {
+    await _controller.selectSubtitle(track);
+    if (track != null && _controller.activeSubtitleId != track.id) return;
+
+    // ⛔ 本地字幕**不记**：它的 id 是 `local#<微秒时间戳>`（见
+    // `PlaybackController.addLocalSubtitle`），每挑一次文件都会变，记下来
+    // 永远匹配不回去；而只剩「序号兜底」那一级时，它会把偏好记成**另一条
+    // 完全不相干的轨**。何况本地字幕本来就是「只对本次播放有效」的临时选择
+    // （见那个方法的文档），记进库等于偷偷改变了它的语义。
+    //
+    // 不记的代价是「下次打开回到上一条记住的字幕」，这是刻意接受的取舍 ——
+    // 与独立播放窗口那边同一条规则。
+    if (track != null && track.origin == SubtitleOrigin.localFile) return;
+
+    // 序号取「在**当前字幕列表**里的位置」—— 与 `_autoLoadSubtitle` 的匹配
+    // 口径一致（那边也是按 `allSubtitles` 的下标比的）。
+    var index = 0;
+    if (track != null) {
+      final all = _controller.allSubtitles;
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].id == track.id) {
+          index = i;
+          break;
+        }
+      }
+    }
+    await _savePref(
+      (p) => p.withSubtitle(
+        track == null ? null : TrackPreference.ofSubtitle(track, index: index),
+      ),
+    );
+  }
+
+  /// 记住用户选的音轨。**切轨本身由菜单自己做**（它手里就有 `AudioTrack`）。
+  ///
+  /// [index] 是这条轨在**真实音轨列表**里的位置，由菜单一并给出 —— 在
+  /// 「语言标记一个都没写」的片源里，它是唯一可用的匹配依据
+  /// （见 `TrackPreference`）。
+  Future<void> _rememberAudio(mk.AudioTrack track, int index) => _savePref(
+        (p) => p.withAudio(
+          TrackPreference(
+            trackId: track.id,
+            language: track.language,
+            title: track.title,
+            index: index,
+          ),
+        ),
+      );
 
   /// 当前这一条**在网盘上已经没了** → 问用户要不要把它的索引删掉。
   ///
@@ -351,7 +599,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   Future<void> _bootstrap() async {
     final repo = ref.read(mediaRepositoryProvider);
 
-    final item = await repo.itemById(widget.itemId);
+    final item = await resolvePlayItem(
+      itemId: widget.itemId,
+      item: widget.item,
+      lookup: repo.itemById,
+    );
     if (!mounted) return;
     if (item == null) {
       setState(() => _loadError = '找不到这个媒体项。可能它已被重新扫描移除，'
@@ -364,13 +616,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 的偏好，中途去设置页改的极端情况不值得为它每次切集多打一次库。
     final settings = ref.read(settingsStoreProvider);
     final values = await settings.readAll(const [
-      SettingKeys.defaultQuality,
-      SettingKeys.autoLoadSubtitles,
       SettingKeys.playerVolume,
       SettingKeys.playerRate,
       SettingKeys.autoPlayNext,
       SettingKeys.skipIntro,
-      SettingKeys.playerAudioEffect,
     ]);
     if (!mounted) return;
 
@@ -383,15 +632,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     });
 
     final controller = _controller;
+    // 音量与倍速是**全局**的（不按片记）：它们描述的是这台设备 / 这个人的
+    // 观看习惯，与播哪一部片无关 —— 半夜把音量调小，不该只对一部片生效。
     await controller.setVolume(volume);
     await controller.setRate(rate);
-    // 音效**只在进页面时读一次**，之后由菜单自己维护（与连播 / 跳片头同一
-    // 待遇）：它描述的是这台设备怎么接音箱，与播哪一集无关，切集时重读一遍
-    // 只会多打一次库。
-    await controller.setAudioEffect(
-      PlayerAudioEffect.parse(values[SettingKeys.playerAudioEffect]),
-    );
-
+    // 音效**不在这里**应用：它现在也按片记（见 `PlaybackPreference`），而
+    // 偏好是 `_openItem` 里读的。挪过去统一处理，省得同一个值读两遍、
+    // 也省得「先按全局设一次、再按偏好设一次」白跑一次音频输出重配。
     await _openItem(item);
   }
 
@@ -403,32 +650,68 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   Future<void> _openItem(MediaItem item) async {
     final repo = ref.read(mediaRepositoryProvider);
 
-    // 字幕引用（扫描期建的，不含正文）与作品级数据一起读。
+    // 字幕引用（扫描期建的，不含正文）、作品级数据、这一条的播放偏好
+    // 一起读 —— 三样合起来才是「打开这一集需要的全部前置条件」。
     final subtitles = await repo.subtitlesForItem(item.id);
     final work = await repo.workByKey(item.groupKey);
+    // 兄弟集（TV 面板的「选集」用）。与自动连播取的是**同一份**并集，
+    // 口径必须一致 —— 否则跨目录归一的剧集会出现「面板里 24 集、播完第 3
+    // 集就断」，而两处都看不出错。
+    final siblings = await repo.itemsForWork(item.groupKey);
+    final pref = await repo.playbackPreferenceFor(
+      item.id,
+      groupKey: item.groupKey,
+    );
     final settings = ref.read(settingsStoreProvider);
     final values = await settings.readAll(const [
       SettingKeys.defaultQuality,
       SettingKeys.autoLoadSubtitles,
+      SettingKeys.playerAudioEffect,
     ]);
     if (!mounted) return;
 
-    final preferred =
-        widget.qualityId ?? _nonEmpty(values[SettingKeys.defaultQuality]);
-    // 默认 **true**：绝大多数片子都有中文字幕，默认加载省一次点击；
+    // 选档优先级：**进页面时指定的那一档 > 这部片上次选的 > 全局默认**。
+    // 第一项是「从详情页点了某一档进来」，那是比偏好更明确的意图。
+    final preferred = widget.qualityId ??
+        _nonEmpty(pref?.qualityId) ??
+        _nonEmpty(values[SettingKeys.defaultQuality]);
+    // 字幕开关：偏好优先（用户上次在这部片上开着 / 关着），没记过才用全局
+    // 设置。默认 **true**：绝大多数片子都有中文字幕，默认加载省一次点击；
     // 没有字幕时 `_autoLoadSubtitle` 会安静地什么都不做。
-    final autoSub = values[SettingKeys.autoLoadSubtitles] != 'false';
+    final autoSub = pref?.subtitlesEnabled ??
+        (values[SettingKeys.autoLoadSubtitles] != 'false');
 
     setState(() {
       _item = item;
       _work = work;
+      // ⚠️ 偏好**必须跟着这一集换掉**：留着上一集的，用户在新一集上改任何
+      // 一项，写回去的都是上一集的值（见 [_pref] 的文档）。
+      _pref = pref ?? const PlaybackPreference();
       _ready = true;
       // 音轨选中态是**逐文件**的：上一集的音轨号在新文件里可能根本不存在，
       // 留着会让音轨菜单高亮一个不存在的轨。
       _audioId = null;
+      // 兄弟集跟着这一部走。不清的话，切到下一集后面板里列的还是上一部
+      // 的集数，而「选集」那一格看起来完全正常。
+      _siblings = siblings;
       // 拖拽预览值同理：它属于上一集的进度条。
       _dragFraction = null;
     });
+
+    // 音效只应用**一次**（进播放页时），切集不重来：它描述的是这台设备怎么
+    // 接音箱，重下发会让 mpv 重配音频输出（听感上是一次极短的断音），
+    // 而用户什么都没改。
+    //
+    // 这一项也按片记（用户可能给某部片单独选了直通），所以取值优先级是
+    // 「这条偏好 > 全局默认」。
+    if (!_audioEffectApplied) {
+      _audioEffectApplied = true;
+      await _controller.setAudioEffect(
+        PlayerAudioEffect.parse(
+          _pref.audioEffect ?? values[SettingKeys.playerAudioEffect],
+        ),
+      );
+    }
 
     await _controller.open(
       item,
@@ -438,6 +721,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       // 手标区间（兜底）。文件章节那份由控制器自己探测，且优先级更高。
       introMarker: work?.introRange,
       skipIntro: _skipIntro,
+      // 音轨 / 字幕的还原。控制器按**特征**匹配（内嵌轨号逐文件不同），
+      // 匹配不上就退回默认 —— 见 `TrackPreference`。
+      preference: _pref,
     );
   }
 
@@ -543,29 +829,39 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
     return Scaffold(
       backgroundColor: AppTheme.cinema,
-      body: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) => Focus(
-          // 这一层**只为收按键**存在，自己不参与焦点遍历。
-          // 放在最外层，是为了让焦点无论在画面还是在控制栏，按键都能冒泡到这里。
-          canRequestFocus: false,
-          skipTraversal: true,
-          onKeyEvent: _onRemoteKey,
-          child: Column(
-            children: [
-              // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
-              // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
-              // 沉浸模式是桌面鼠标的用法，TV 上不该让焦点先停在这里。
-              if (!_immersive) ExcludeFocus(child: _buildTopBar(controller)),
-              Expanded(
-                child: Focus(
-                  focusNode: _stageNode,
-                  autofocus: true,
-                  child: _buildStage(controller),
+      body: PopScope(
+        // 面板开着时，返回键**先关面板**，而不是退出播放。
+        //
+        // 电视上返回键既是唯一的退出手段，也是唯一的「取消」手段 —— 不拦的话，
+        // 用户想取消一次误开的面板，结果整部片退出了、还得重新找进度。
+        canPop: !_tvPanelOpen,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop && _tvPanelOpen) _closeTvPanel();
+        },
+        child: ListenableBuilder(
+          listenable: controller,
+          builder: (context, _) => Focus(
+            // 这一层**只为收按键**存在，自己不参与焦点遍历。
+            // 放在最外层，是为了让焦点无论在画面还是在控制栏，按键都能冒泡到这里。
+            canRequestFocus: false,
+            skipTraversal: true,
+            onKeyEvent: _onRemoteKey,
+            child: Column(
+              children: [
+                // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
+                // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
+                // 沉浸模式是桌面鼠标的用法，TV 上不该让焦点先停在这里。
+                if (!_immersive) ExcludeFocus(child: _buildTopBar(controller)),
+                Expanded(
+                  child: Focus(
+                    focusNode: _stageNode,
+                    autofocus: true,
+                    child: _buildStage(controller),
+                  ),
                 ),
-              ),
-              if (!_immersive) _remoteReachable(_buildControlBar(controller)),
-            ],
+                if (!_immersive) _remoteReachable(_buildControlBar(controller)),
+              ],
+            ),
           ),
         ),
       ),
@@ -611,6 +907,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 这样连「放行给焦点系统」的方向键（↑/↓）也会重置，而不是只有播放 /
     // 快退才重置（否则用户在控制栏里找按钮时，倒计时照样到点把控件藏掉）。
     _scheduleControlsHide();
+
+    // TV：菜单键与「画面上按 ↑」唤出右侧设置面板（见 [_handleTvPanelKey]）。
+    if (_isTv && _handleTvPanelKey(event.logicalKey)) {
+      return KeyEventResult.handled;
+    }
 
     final action = resolveRemoteKey(
       key: event.logicalKey,
@@ -680,15 +981,73 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   }
 
   // -------------------------------------------------------------------
+  // TV 右侧设置面板
+  // -------------------------------------------------------------------
+
+  bool get _isTv => AppTheme.isTvLayout(context);
+
+  /// 唤出 / 收起 TV 设置面板的键。**返回 true 表示这个键已被吃掉。**
+  ///
+  /// ⚠️ 面板**开着**且握着焦点时，菜单键由面板自己处理（它在焦点链更靠下的
+  /// 位置，会先收到事件并报 `handled`）—— 那时 [resolveTvPanelKey] 的
+  /// `close` 分支其实走不到。留着它是因为还有另一种情形：面板开着、焦点却被
+  /// 挪到了控制栏上，这时菜单键会冒泡到这里，按下去应当是「收起面板」而不是
+  /// 「再开一个」。
+  ///
+  /// 这不是巧合，正是我们想要的层级：越靠下的 UI 越先决定。
+  bool _handleTvPanelKey(LogicalKeyboardKey key) {
+    // 路由判断在 [resolveTvPanelKey]（纯函数，可单测），这里只负责执行 ——
+    // 与 [_onRemoteKey] 对 [resolveRemoteKey] 的分工完全一致。
+    switch (resolveTvPanelKey(
+      key: key,
+      panelOpen: _tvPanelOpen,
+      stageFocused: _stageNode.hasPrimaryFocus,
+    )) {
+      case TvPanelKeyAction.none:
+        return false;
+      case TvPanelKeyAction.open:
+        _openTvPanel();
+      case TvPanelKeyAction.close:
+        _closeTvPanel();
+    }
+    return true;
+  }
+
+  void _openTvPanel() {
+    if (_tvPanelOpen) return;
+    setState(() {
+      _tvPanelOpen = true;
+      // 面板显示时控制栏也要在：TV 上它们是同一套 OSD 的两半，只出一半
+      // 会被读成「控制栏没了」。
+      _immersive = false;
+    });
+    _scheduleControlsHide();
+  }
+
+  void _closeTvPanel() {
+    if (!_tvPanelOpen) return;
+    setState(() => _tvPanelOpen = false);
+    // 焦点必须交回画面。面板的 `Focus(autofocus: true)` 拿走焦点之后不主动
+    // 还回去的话，↑ / ↓ 会继续被面板吃掉、OK 也不再是播放/暂停 ——
+    // 而画面上没有任何东西提示「焦点现在在别处」，用户只会以为播放器卡了。
+    _stageNode.requestFocus();
+    _scheduleControlsHide();
+  }
+
+  // -------------------------------------------------------------------
   // 顶栏
   // -------------------------------------------------------------------
 
   Widget _buildTopBar(PlaybackController controller) {
     final item = _item;
+    // 顶栏要避让过扫描带：那个返回键原本起于 x=8，而电视会把最左 48px 裁掉 ——
+    // 整个按钮（8~46）都落在被切掉的那一圈里。
+    // ⚠️ 高度跟着 `safe.top` 一起加，否则内容会被挤在一条更矮的条里。
+    final safe = AppTheme.safeAreaInsets(context);
     return Container(
-      height: 48,
+      height: 48 + safe.top,
       color: AppTheme.cinema,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: EdgeInsets.fromLTRB(8 + safe.left, safe.top, 8 + safe.right, 0),
       child: Row(
         children: [
           IconButton(
@@ -754,6 +1113,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final error = controller.error;
     final notice = controller.notice;
 
+    // 「同一部片换一档清晰度」——**用户自己刚点的操作**，不该只丢一个转圈让
+    // 他猜是卡住了还是点了没反应。独立窗口那边有 `_switching`（半透明
+    // 「正在切换…」），这里对齐它。判据与理由见 [shouldShowSwitchVeil]。
+    final switching = shouldShowSwitchVeil(
+      isLoading: controller.isLoading,
+      duration: controller.duration,
+    );
+
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -783,7 +1150,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
 
-        if (controller.isBuffering && error == null)
+        // 换档走这一支：半透明罩 + 文案，**不盖掉上一帧**（用户视线里的位置
+        // 一点没变）。它与下面那个通用缓冲圈互斥 —— 否则同一处会叠两个圈。
+        if (switching && error == null)
+          const _SwitchVeil()
+        else if (controller.isBuffering && error == null)
           const Center(
             child: SizedBox(
               width: 26,
@@ -829,6 +1200,39 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
               },
             ),
           ),
+
+        // TV 右侧设置面板。**浮在画面之上**，不占布局空间 —— 用 `Column`
+        // 挤窄画面的话，调一次字幕就要让视频重新布局一次（画面会明显抖一下），
+        // 而用户只是想看字幕有没有乱码。
+        if (_tvPanelOpen)
+          Positioned(
+            top: 0,
+            right: 0,
+            bottom: 0,
+            child: PlayerTvOverlay(
+              controller: controller,
+              item: _item,
+              siblings: _siblings,
+              activeAudioId: _audioId,
+              onPickQuality: _changeQuality,
+              onPickSubtitle: _changeSubtitle,
+              onPickAudioTrack: (track, index) {
+                setState(() => _audioId = track.id);
+                unawaited(controller.selectAudioTrack(track));
+                unawaited(_rememberAudio(track, index));
+              },
+              onPickAudioEffect: _setAudioEffect,
+              onPickRate: controller.setRate,
+              onPickEpisode: _openItem,
+              onJumpIntro: () async {
+                final marker = controller.introMarker;
+                if (marker == null) return;
+                await controller.seek(marker.start);
+              },
+              onClose: _closeTvPanel,
+              onActivity: _scheduleControlsHide,
+            ),
+          ),
       ],
     );
   }
@@ -857,10 +1261,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             : (position.inMilliseconds / duration.inMilliseconds)
                 .clamp(0.0, 1.0));
 
+    // ⛔ 控制栏贴着屏幕最下面，自身只有 6px 底内边距，而电视会把最下 27px
+    // 裁掉 —— 那 6px 远不够，按钮那排的下半截会落进被切掉的一圈里
+    // （TV 上图标放大到 34px，切掉一截很明显）。
+    // ⚠️ 高度跟着 `safe.bottom` 一起加：只加内边距会把内容挤扁，反而更糟。
+    //
+    // ⚠️ 这一处与上面顶栏那处**是按几何推的，没有自动化用例**：播放页在
+    // `flutter test` 里起不来（`PlaybackController` 的 `Player` 是字段初始化器，
+    // 一构造就启 libmpv）。真机上请顺带看一眼控制栏有没有被切。
+    final safe = AppTheme.safeAreaInsets(context);
     return Container(
-      height: AppTheme.playerBarHeight,
+      height: AppTheme.playerBarHeight + safe.bottom,
       color: AppTheme.cinema,
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+      padding: EdgeInsets.fromLTRB(
+        12 + safe.left,
+        0,
+        12 + safe.right,
+        6 + safe.bottom,
+      ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
@@ -898,7 +1316,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             children: [
               IconButton(
                 onPressed: controller.playOrPause,
-                iconSize: 22,
+                // TV 上放大：22px 的图标隔着三米连「是暂停还是播放」都看不出来。
+                iconSize: _isTv ? 34 : 22,
                 tooltip: controller.isPlaying ? '暂停（空格）' : '播放（空格）',
                 icon: Icon(
                   controller.isPlaying
@@ -910,28 +1329,28 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
               IconButton(
                 onPressed: () =>
                     controller.seekRelative(const Duration(seconds: -10)),
-                iconSize: 17,
+                iconSize: _isTv ? 26 : 17,
                 tooltip: '后退 10 秒（←）',
                 icon: const Icon(Icons.replay_10_rounded, color: AppTheme.muted),
               ),
               IconButton(
                 onPressed: () =>
                     controller.seekRelative(const Duration(seconds: 10)),
-                iconSize: 17,
+                iconSize: _isTv ? 26 : 17,
                 tooltip: '前进 10 秒（→）',
                 icon: const Icon(
                   Icons.forward_10_rounded,
                   color: AppTheme.muted,
                 ),
               ),
-              const SizedBox(width: 6),
+              SizedBox(width: _isTv ? 14 : 6),
 
               // 音量
               IconButton(
                 onPressed: () => unawaited(
                   controller.setVolume(controller.volume > 0 ? 0 : 100),
                 ),
-                iconSize: 16,
+                iconSize: _isTv ? 24 : 16,
                 tooltip: controller.volume > 0 ? '静音' : '取消静音',
                 icon: Icon(
                   controller.volume <= 0
@@ -940,43 +1359,73 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                   color: AppTheme.muted,
                 ),
               ),
-              // 音量滑块同样 `ExcludeFocus`（理由见方法头）。TV 上音量交给
-              // 电视自己的音量键，遥控器只需要那个静音按钮。
-              SizedBox(
-                width: 84,
-                child: ExcludeFocus(
-                  child: Slider(
-                    value: controller.volume.clamp(0, 100),
-                    max: 100,
-                    onChanged: (v) => unawaited(controller.setVolume(v)),
+              // 音量滑块同样 `ExcludeFocus`（理由见方法头）。
+              //
+              // TV 上**干脆不画**它：遥控器的音量键走 CEC 到电视 / 功放，
+              // 应用内这个滑块在电视上是个无效控件；而它占着 84px，会把下面
+              // 那个「设置」入口往右推得更远。
+              if (!_isTv)
+                SizedBox(
+                  width: 84,
+                  child: ExcludeFocus(
+                    child: Slider(
+                      value: controller.volume.clamp(0, 100),
+                      max: 100,
+                      onChanged: (v) => unawaited(controller.setVolume(v)),
+                    ),
                   ),
                 ),
-              ),
 
               const Spacer(),
 
-              _QualityMenu(controller: controller),
-              _SubtitleMenu(controller: controller),
-              _AudioMenu(
-                controller: controller,
-                activeId: _audioId,
-                onSelected: (id) => setState(() => _audioId = id),
-              ),
-              // 「音效」紧跟「音轨」——它们解决的是同一个听感问题的两半，
-              // 但**不是同一件事**，见 `_AudioEffectMenu` 的类文档。
-              _AudioEffectMenu(
-                controller: controller,
-                onSelected: (p) => unawaited(_setAudioEffect(p)),
-              ),
-              _RateMenu(controller: controller),
-              // 片头标记入口。`_work` 为空（这一条没进过库）时不显示 ——
-              // 标记要写到作品行上，没有那一行就无处可写。
-              if (_work case final work?)
-                _IntroMenu(
+              // TV 上给一个**可以点**的「设置」入口。
+              //
+              // 菜单键不是每台遥控器都有 —— 大量电视盒子只有方向键 + OK +
+              // 返回。而右侧面板是这个版本里调画质 / 字幕 / 音轨 / 音效的
+              // **唯一**入口，没有可点的入口，那些功能在那些设备上等于不存在。
+              if (_isTv) _TvSettingsButton(onTap: _openTvPanel),
+
+              // TV 上**不渲染这几组菜单按钮**。
+              //
+              // 它们是为鼠标排的：六个按钮横在一条 64 高的栏里，点两下就到。
+              // 遥控器没有指针，要够到最右边那个得先按 ↓ 进这一栏、再按 → 一路
+              // 挪过去，中途还会停在静音键和音量滑块上 —— 换个字幕要按七八下。
+              // 于是「全都看得见、但要花很久才够得到」，这是电视上最难受的一类
+              // 交互。全部并进右侧面板（一个键唤出、↑↓ 选、←→ 改），桌面
+              // 那套原样保留 —— 鼠标用户并没有这个问题。
+              if (!_isTv) ...[
+                _QualityMenu(
                   controller: controller,
-                  work: work,
-                  onAction: (a) => unawaited(_markIntro(a)),
+                  onSelected: (id) => unawaited(_changeQuality(id)),
                 ),
+                _SubtitleMenu(
+                  controller: controller,
+                  onSelected: (t) => unawaited(_changeSubtitle(t)),
+                ),
+                _AudioMenu(
+                  controller: controller,
+                  activeId: _audioId,
+                  onSelected: (id) => setState(() => _audioId = id),
+                  // 切轨由菜单自己做（它手里就有 `AudioTrack`），页面只负责
+                  // 把「用户选了哪条」记进偏好。
+                  onTrackSelected: (t, i) => unawaited(_rememberAudio(t, i)),
+                ),
+                // 「音效」紧跟「音轨」——它们解决的是同一个听感问题的两半，
+                // 但**不是同一件事**，见 `_AudioEffectMenu` 的类文档。
+                _AudioEffectMenu(
+                  controller: controller,
+                  onSelected: (p) => unawaited(_setAudioEffect(p)),
+                ),
+                _RateMenu(controller: controller),
+                // 片头标记入口。`_work` 为空（这一条没进过库）时不显示 ——
+                // 标记要写到作品行上，没有那一行就无处可写。
+                if (_work case final work?)
+                  _IntroMenu(
+                    controller: controller,
+                    work: work,
+                    onAction: (a) => unawaited(_markIntro(a)),
+                  ),
+              ],
             ],
           ),
         ],
@@ -986,6 +1435,61 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   /// `1:02:03` / `02:03`
   static String _fmt(Duration d) => _fmtClock(d);
+}
+
+/// TV 控制栏上的「设置」按钮 —— 打开右侧面板。
+///
+/// ## 为什么必须带文字
+///
+/// 纯图标按钮在电视上是个谜：没有 hover，用户按下去之前不可能知道会发生
+/// 什么（项目里所有 tooltip 在 TV 上都等于不存在，理由见 `tv_affordance.dart`）。
+/// 而这是**进入全部播放设置的唯一可点入口** —— 认不出来就等于没有。
+///
+/// ## 为什么写「设置」而不是「菜单」
+///
+/// 「菜单」在电视上容易和「系统菜单 / 遥控器菜单键」混起来。它打开的是画质 /
+/// 字幕 / 音轨那一组，写「设置」更贴近它实际做的事。
+class _TvSettingsButton extends StatelessWidget {
+  const _TvSettingsButton({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppTheme.panel2,
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          // 高度取 `tvActionHeight`（48）而不是由内边距撑出来：这个按钮是
+          // **没有菜单键的遥控器上唯一一条进设置面板的路**，焦点框必须够大。
+          // 按原来的 `vertical: 9` 撑出来只有 38 —— 隔三米按不中，而按不中的
+          // 后果不是「少用一个功能」，是「选集 / 画质 / 字幕全都打不开」。
+          child: SizedBox(
+            height: AppTheme.tvActionHeight,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.tune_rounded, size: 20, color: AppTheme.text),
+                const SizedBox(width: 8),
+                Text(
+                  '设置',
+                  style: const TextStyle(
+                    fontSize: AppTheme.tvActionLabel,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.text,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// `1:02:03` / `02:03`。
@@ -1055,9 +1559,14 @@ Future<void> _openAnchoredMenu<T>({
 }
 
 class _QualityMenu extends StatelessWidget {
-  const _QualityMenu({required this.controller});
+  const _QualityMenu({required this.controller, required this.onSelected});
 
   final PlaybackController controller;
+
+  /// 选中某一档清晰度。**切档与「记进偏好」都由页面做**：只有切档真的
+  /// 成功了才值得记（见 `_PlayerPageState._changeQuality`），菜单自己切完
+  /// 就写库会记下一个其实没生效的档位。
+  final ValueChanged<String> onSelected;
 
   @override
   Widget build(BuildContext context) {
@@ -1075,7 +1584,7 @@ class _QualityMenu extends StatelessWidget {
         onTap: () => unawaited(_openAnchoredMenu<String>(
           buttonContext: buttonContext,
           title: '清晰度',
-          onSelected: (id) => unawaited(controller.switchQuality(id)),
+          onSelected: onSelected,
           rows: (context, select) => [
             for (final q in qualities)
               _MenuTile(
@@ -1107,9 +1616,14 @@ class _QualityMenu extends StatelessWidget {
 }
 
 class _SubtitleMenu extends StatelessWidget {
-  const _SubtitleMenu({required this.controller});
+  const _SubtitleMenu({required this.controller, required this.onSelected});
 
   final PlaybackController controller;
+
+  /// 选中某条字幕；**传 `null` 表示关闭字幕**。加载与记账都交给页面
+  /// （见 `_PlayerPageState._changeSubtitle`）—— 只有真挂上了才记，
+  /// 否则会记下一条下次打开同样加载失败的轨。
+  final ValueChanged<SubtitleTrack?> onSelected;
 
   static const String _offValue = '__off__';
 
@@ -1121,39 +1635,46 @@ class _SubtitleMenu extends StatelessWidget {
     return Builder(
       builder: (buttonContext) => _MenuButton(
         tooltip: '字幕',
-        onTap: () => unawaited(_openAnchoredMenu<String>(
-          buttonContext: buttonContext,
-          title: '字幕',
-          onSelected: (value) {
-            if (value == _offValue) {
-              unawaited(controller.selectSubtitle(null));
-              return;
-            }
-            for (final t in tracks) {
-              if (t.id == value) {
-                unawaited(controller.selectSubtitle(t));
+        onTap: () {
+          // 菜单一打开就在后台预取**网盘字幕**正文：用户浏览菜单这几秒通常
+          // 足够取完，等他真点下去就是瞬时挂上，而不是「点了没反应」。
+          // 在线字幕不在预取范围（按次计费），理由见
+          // `PlaybackController.prefetchCloudSubtitles`。
+          controller.prefetchCloudSubtitles();
+          unawaited(_openAnchoredMenu<String>(
+            buttonContext: buttonContext,
+            title: '字幕',
+            onSelected: (value) {
+              if (value == _offValue) {
+                onSelected(null);
                 return;
               }
-            }
-          },
-          rows: (context, select) => [
-            _MenuTile(
-              onTap: () => select(_offValue),
-              child: const _MenuRow(label: '关闭字幕', detail: ''),
-            ),
-            if (tracks.isNotEmpty)
-              const Divider(height: 1, thickness: 1, color: Colors.white12),
-            for (final t in tracks)
+              for (final t in tracks) {
+                if (t.id == value) {
+                  onSelected(t);
+                  return;
+                }
+              }
+            },
+            rows: (context, select) => [
               _MenuTile(
-                onTap: () => select(t.id),
-                child: _MenuRow(
-                  label: t.displayLabel,
-                  detail: _originLabel(t),
-                  selected: t.id == active,
-                ),
+                onTap: () => select(_offValue),
+                child: const _MenuRow(label: '关闭字幕', detail: ''),
               ),
-          ],
-        )),
+              if (tracks.isNotEmpty)
+                const Divider(height: 1, thickness: 1, color: Colors.white12),
+              for (final t in tracks)
+                _MenuTile(
+                  onTap: () => select(t.id),
+                  child: _MenuRow(
+                    label: t.displayLabel,
+                    detail: _originLabel(t),
+                    selected: t.id == active,
+                  ),
+                ),
+            ],
+          ));
+        },
         child: _BarButton(
           icon: Icons.subtitles_rounded,
           label: active == null ? '字幕' : '字幕 · 开',
@@ -1175,11 +1696,18 @@ class _AudioMenu extends StatelessWidget {
     required this.controller,
     required this.activeId,
     required this.onSelected,
+    required this.onTrackSelected,
   });
 
   final PlaybackController controller;
   final String? activeId;
   final ValueChanged<String> onSelected;
+
+  /// 用户切到了哪条音轨，**连同它在真实音轨列表里的下标**。
+  ///
+  /// 切轨由菜单自己完成（`AudioTrack` 就在它手里），页面只借这个回调
+  /// **记账**（见 `_PlayerPageState._rememberAudio`）。
+  final void Function(mk.AudioTrack track, int index) onTrackSelected;
 
   @override
   Widget build(BuildContext context) {
@@ -1194,10 +1722,13 @@ class _AudioMenu extends StatelessWidget {
           buttonContext: buttonContext,
           title: '音轨',
           onSelected: (id) {
-            for (final t in tracks) {
-              if (t.id == id) {
+            for (var i = 0; i < tracks.length; i++) {
+              if (tracks[i].id == id) {
                 onSelected(id);
-                unawaited(controller.selectAudioTrack(t));
+                unawaited(controller.selectAudioTrack(tracks[i]));
+                // 下标与轨道一起给出：语言标记一个都没写的片源里，
+                // 「第几条」是唯一能跨集对上号的依据。
+                onTrackSelected(tracks[i], i);
                 return;
               }
             }
@@ -1207,10 +1738,12 @@ class _AudioMenu extends StatelessWidget {
               _MenuTile(
                 onTap: () => select(tracks[i].id),
                 child: _MenuRow(
-                  label: tracks[i].title ??
-                      _languageLabel(tracks[i].language) ??
-                      '音轨 ${i + 1}',
-                  detail: _trackDetail(tracks[i]),
+                  // 文案走 TrackLabels，**不要在这里自己拼**：独立播放窗口
+                  // 用的是同一份（`player_window_app.dart` 的 `audioTitle`），
+                  // 各写一份的代价是「同一个语言标记在两边显示得不一样」，
+                  // 而两个播放器不会同时出现在同一块屏上，没人会发现。
+                  label: TrackLabels.audioTitle(tracks[i]),
+                  detail: TrackLabels.audioDetail(tracks[i]),
                   selected: tracks[i].id == activeId,
                 ),
               ),
@@ -1220,28 +1753,6 @@ class _AudioMenu extends StatelessWidget {
       ),
     );
   }
-
-  static String _trackDetail(mk.AudioTrack t) => [
-        if (t.codec != null) t.codec!,
-        if (t.channels != null) t.channels!,
-        if (t.bitrate != null) '${(t.bitrate! / 1000).round()} kbps',
-      ].join(' · ');
-
-  static String? _languageLabel(String? tag) {
-    if (tag == null || tag.isEmpty) return null;
-    const table = {
-      'chi': '中文',
-      'zho': '中文',
-      'zh': '中文',
-      'eng': '英文',
-      'en': '英文',
-      'jpn': '日文',
-      'ja': '日文',
-      'kor': '韩文',
-      'ko': '韩文',
-    };
-    return table[tag.toLowerCase()] ?? tag;
-  }
 }
 
 class _RateMenu extends StatelessWidget {
@@ -1249,7 +1760,10 @@ class _RateMenu extends StatelessWidget {
 
   final PlaybackController controller;
 
-  static const List<double> _rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+  // 与 TV 右侧面板**同一张表**（理由见 `kPlaybackRates` 的文档）：这里再写
+  // 一份的话，「电视上能选 2.0x、桌面上只有 1.5x」这种偏差不会有人发现 ——
+  // 没人会开着两个平台对着数档位。
+  static const List<double> _rates = kPlaybackRates;
 
   @override
   Widget build(BuildContext context) {
@@ -1327,7 +1841,10 @@ class _AudioEffectMenu extends StatelessWidget {
           maxWidth: 300,
           onSelected: onSelected,
           rows: (context, select) => [
-            for (final p in PlayerAudioEffect.all)
+            // ⚠️ 用 `selectable` 而不是 `all`：macOS 上「直通」会把整部片
+            // 卡死，列出来只会变成一条「点了没反应」的反馈。理由见
+            // `PlayerAudioEffect.passthroughAvailable`。
+            for (final p in PlayerAudioEffect.selectable)
               _MenuTile(
                 onTap: () => select(p),
                 child: _MenuRow(
@@ -1623,6 +2140,56 @@ class _MenuRow extends StatelessWidget {
 /// 刻意做成「贴顶的小药丸 + 可关闭」，而不是像 [_ErrorOverlay] 那样铺满画面：
 /// 它要报告的事（这条字幕没挂上、这一档切不过去）**都不影响视频继续播放**，
 /// 为此把画面挡住反而是更严重的故障 —— 实测就是这么翻的车。
+/// 换清晰度时压在画面上的那一层：半透明 + 「正在切换…」。
+///
+/// ## 为什么**不**盖成不透明
+///
+/// 换档时 mpv 的视频输出**还挂着上一帧**，用户视线里的位置一点没变 ——
+/// 把整块画面盖死等于把那一帧也抹了，看起来就是「重新缓存了一遍」，正是
+/// 这个改动要消掉的那个观感。所以只压一层 55% 的黑。
+///
+/// ## 为什么要 [IgnorePointer]
+///
+/// 这层只是告知，不该吃掉点击：用户照样要能点暂停、点返回。独立窗口的
+/// 加载罩出于同样的理由也这么写。
+///
+/// ## 与通用缓冲圈的关系
+///
+/// 两者在 `_buildStage` 里是**互斥**的：换档时画这一层，真正的网络卡顿才画
+/// 那个裸转圈。同一处叠两个圈会让「切档」和「网卡了」看起来一模一样。
+class _SwitchVeil extends StatelessWidget {
+  const _SwitchVeil();
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: ColoredBox(
+        color: Colors.black.withValues(alpha: 0.55),
+        child: const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 30,
+                height: 30,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.5,
+                  color: Colors.white70,
+                ),
+              ),
+              SizedBox(height: 12),
+              Text(
+                '正在切换…',
+                style: TextStyle(fontSize: 13, color: Colors.white),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _NoticePill extends StatelessWidget {
   const _NoticePill({required this.message, required this.onDismiss});
 

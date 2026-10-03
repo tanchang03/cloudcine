@@ -11,15 +11,14 @@ import '../../domain/entities/media_work.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
-import '../providers/drive_browse_providers.dart';
-import '../providers/folder_providers.dart';
 import '../providers/library_providers.dart';
 import '../providers/library_selection_providers.dart';
 import '../providers/scan_providers.dart';
+import '../providers/scrape_providers.dart';
+import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/batch_merge_dialog.dart';
 import '../widgets/common_widgets.dart';
-import '../widgets/folder_browser.dart';
 import '../widgets/library_filter_panel.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
@@ -117,16 +116,24 @@ Future<void> playWork({
     final query = filter.query.trim();
     final hasQuery = query.isNotEmpty;
 
+    // 面板里**实际**在筛的那几组。这句话必须点名它们：用户会照着提示去清
+    // 「年份 / 类型」，而如果他只开了「已刮削」，那句话就是在让他去清一组
+    // 根本没选过的条件 —— 而他点完按钮列表变空的原因也解释不了。
+    final facets = [
+      if (filter.scrapedOnly) '「已刮削」',
+      if (filter.years.isNotEmpty || filter.genres.isNotEmpty) '年份 / 类型',
+    ];
+
     if (filter.hasExtra && hasQuery) {
       return (
-        body: '没有同时匹配「$query」与所选年份 / 类型的作品。',
+        body: '没有同时匹配「$query」与所选${facets.join("、")}的作品。',
         actionLabel: '清空筛选条件',
         action: LibraryEmptyAction.clearExtraAndQuery,
       );
     }
     if (filter.hasExtra) {
       return (
-        body: '当前筛选条件下一条都没筛到。清掉年份 / 类型再看看。',
+        body: '当前筛选条件下一条都没筛到。清掉${facets.join("、")}再看看。',
       actionLabel: '清空筛选',
       action: LibraryEmptyAction.clearExtra,
     );
@@ -199,7 +206,10 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     ref.read(libraryFilterProvider.notifier).setQuery('');
   }
 
-  /// 重新读库。两种视图的数据来源不同（作品表 / 网盘目录），必须一起失效。
+  /// 重新读库。
+  ///
+  /// 网盘目录那一份（目录内容 + 「已入库」叠加层）**不在这里**：它属于
+  /// 侧栏的「文件夹」页，那里有自己的刷新按钮（`folder_page.dart`）。
   void _refresh() {
     ref.invalidate(workListProvider);
     ref.invalidate(categoryCountsProvider);
@@ -210,10 +220,8 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
     ref.invalidate(libraryStatsProvider);
-    // 目录视图：列表本身要重列网盘，叠加的「已入库」标记也要重算。
-    ref.invalidate(folderTreeProvider);
-    ref.invalidate(indexedFileIdsProvider);
-    ref.invalidate(driveListingProvider);
+    // 「还有多少部没刮过」也是从库里数出来的。
+    ref.invalidate(unscrapedCountProvider);
   }
 
   @override
@@ -222,16 +230,27 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     final works = ref.watch(workListProvider);
     final stats = ref.watch(libraryStatsProvider).valueOrNull;
     final filter = ref.watch(libraryFilterProvider);
-    final scanning = ref.watch(scanControllerProvider).running;
+    final scan = ref.watch(scanControllerProvider);
+    final scanning = scan.running;
+    final scrape = ref.watch(libraryScrapeControllerProvider);
+
+    // 没配在线源（TMDB Key / 豆瓣 Cookie）时「刮削媒体库」必须**禁用**：
+    // 流水线只剩本地文件名兜底，而 `WorkScraper.scrape` 明确把「只有本地
+    // 兜底」判成未命中 —— 点了会跑完全程、一部都不命中，用户只会以为
+    // 「这个按钮坏了」。禁用 + tooltip 说清去哪配，才是诚实的做法。
+    final canScrape =
+        ref.watch(settingsProvider).valueOrNull?.canScrapeOnline ?? false;
+
+    // 「还有多少部没刮过」要读一次全表，而刮削 / 扫描进行中按钮显示的是
+    // 各自的进度、用不到它 —— 那段时间**不要** watch，否则每推一次列表信号
+    // （刮削是每部一次）就多一次全表读。见 `unscrapedCountProvider` 的文档。
+    final unscrapedCount = (!canScrape || scanning || scrape.running)
+        ? null
+        : ref.watch(unscrapedCountProvider).valueOrNull;
 
     // 封面与列表列的是**同一批作品**（只是排布不同），所以排序 / 筛选 /
-    // 多选在这两个视图里完全共用；目录视图列的是网盘文件，那些控件在那里
-    // 没有任何可作用的东西。判据统一走 [LibraryView.showsWorks]。
-    final showsWorks = view.showsWorks;
-
-    // 多选只对作品列表有意义。目录视图下即使状态还残留（比如刚从封面切过来）
-    // 也不该把整页换成批量操作条 —— 那里没有「一部作品」可以勾。
-    final selecting = showsWorks && ref.watch(librarySelectionProvider).active;
+    // 多选在这两个视图里完全共用 —— 不需要「当前是哪个视图」的判据。
+    final selecting = ref.watch(librarySelectionProvider).active;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -241,63 +260,72 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
         else
           PageHeader(
             title: '媒体库',
-            subtitle: showsWorks
-                ? (stats == null
-                    ? null
-                    : '${stats.items} 个视频 · ${stats.works} 部作品')
-                : _folderSubtitle(ref),
+            subtitle:
+                stats == null ? null : '${stats.items} 个视频 · ${stats.works} 部作品',
             actions: [
-              if (scanning)
-                const Padding(
-                  padding: EdgeInsets.only(right: 8),
-                  child: Row(
-                    children: [
-                      SizedBox(
-                        width: 13,
-                        height: 13,
-                        child: CircularProgressIndicator(strokeWidth: 1.6),
-                      ),
-                      SizedBox(width: 7),
-                      Text(
-                        '正在扫描',
-                        style: TextStyle(fontSize: 11.5, color: AppTheme.accent),
-                      ),
-                    ],
-                  ),
+              // 批量动作放在最前：它们是这一页最重的两个动作，TV 上折行后
+              // 也落在最左边（遥控器从海报墙按一次 ↑ 就够得到）。
+              TvIconLabel(
+                label: '刮削',
+                child: IconButton(
+                  tooltip: !canScrape
+                      ? '未启用在线刮削：到「设置 → 刮削」填 TMDB Key 或豆瓣 Cookie'
+                      : scanning
+                          ? '正在扫描，稍后再刮削'
+                          : (unscrapedCount == null
+                              ? '刮削媒体库（只刮未刮削的作品）'
+                              : '刮削媒体库：还有 $unscrapedCount 部没刮过'),
+                  onPressed: (!canScrape || scanning || scrape.running)
+                      ? null
+                      : () => ref
+                          .read(libraryScrapeControllerProvider.notifier)
+                          .start(),
+                  icon: scrape.running
+                      ? const SizedBox(
+                          width: 17,
+                          height: 17,
+                          child: CircularProgressIndicator(strokeWidth: 1.8),
+                        )
+                      : const Icon(Icons.auto_awesome_rounded, size: 17),
                 ),
+              ),
+              TvIconLabel(
+                label: '重扫',
+                child: IconButton(
+                  tooltip: scanning ? '正在扫描…' : '重新扫描媒体库',
+                  onPressed: (scanning || scrape.running)
+                      ? null
+                      : () => ref.read(scanControllerProvider.notifier).start(),
+                  icon: const Icon(Icons.radar_rounded, size: 17),
+                ),
+              ),
+              const SizedBox(width: 8),
               const _ViewSwitch(),
               const SizedBox(width: 8),
-              _SearchBox(
+              HeaderSearchBox(
                 controller: _search,
                 onChanged: _onSearchChanged,
-                // 作品视图与目录视图搜的东西**不是一回事**，提示词必须说清：
-                // 作品视图搜的是库里已入库的作品 / 文件，目录视图筛的是
-                // **当前这一层网盘目录**。
-                hint: showsWorks ? '搜片名或文件名…' : '筛当前目录…',
+                // 搜的是**库里已入库的**作品 / 文件。网盘目录那一份搜索在
+                // 侧栏的「文件夹」页，它只筛当前这一层，是另一回事。
+                hint: '搜片名或文件名…',
               ),
-              // 排序只对作品列表有意义：目录视图按**目录结构**排（自然序），
-              // 换排序方式在那里没有任何东西会变，摆着只会让人以为坏了。
-              if (showsWorks) ...[
-                const SizedBox(width: 8),
-                const _SortMenu(),
-                const SizedBox(width: 4),
-                // 年份 / 类型筛选同理：目录视图的列表是**文件**，
-                // 而年份 / 类型是作品的元数据，在那里没有可筛的东西。
-                const LibraryFilterButton(),
-                const SizedBox(width: 4),
-                // 「选择」是一个**模式开关**，不是一次动作：点它进入多选，
-                // 之后点卡片才是勾选。做成常驻按钮而不是长按 / 右键才出的
-                // 隐藏入口，是因为电视上既没有右键也没有可靠的长按。
-                TvIconLabel(
-                  label: '选择',
-                  child: IconButton(
-                    tooltip: '多选（批量合并）',
-                    onPressed: () =>
-                        ref.read(librarySelectionProvider.notifier).enter(),
-                    icon: const Icon(Icons.checklist_rounded, size: 17),
-                  ),
+              const SizedBox(width: 8),
+              const _SortMenu(),
+              const SizedBox(width: 4),
+              const LibraryFilterButton(),
+              const SizedBox(width: 4),
+              // 「选择」是一个**模式开关**，不是一次动作：点它进入多选，
+              // 之后点卡片才是勾选。做成常驻按钮而不是长按 / 右键才出的
+              // 隐藏入口，是因为电视上既没有右键也没有可靠的长按。
+              TvIconLabel(
+                label: '选择',
+                child: IconButton(
+                  tooltip: '多选（批量合并）',
+                  onPressed: () =>
+                      ref.read(librarySelectionProvider.notifier).enter(),
+                  icon: const Icon(Icons.checklist_rounded, size: 17),
                 ),
-              ],
+              ),
               // 「刷新」是个纯图标按钮：桌面上悬停会出 tooltip，电视上没有
               // hover —— 所以 TV 上补一个看得见的「刷新」标签。
               TvIconLabel(
@@ -310,108 +338,237 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
               ),
             ],
           ),
-        if (showsWorks) ...[
-          const _CategoryBar(),
-          Expanded(
-            child: works.when(
-              loading: () => const Center(
-                child: SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
+        // 扫描 / 刮削进行时，页头下方占一条实时进度 —— 用户在这里就能看到
+        // 「卡片一批批长出来」「一部部刮削成功」，不用切到扫描页去等。
+        if (scanning || scrape.running || scrape.finished)
+          _LibraryActivityBar(scan: scan, scrape: scrape),
+        const _CategoryBar(),
+        Expanded(
+          child: works.when(
+            loading: () => const Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2),
               ),
-              error: (e, _) => EmptyState(
-                icon: Icons.error_outline_rounded,
-                danger: true,
-                title: '读取媒体库失败',
-                body: '$e',
-                actionLabel: '重试',
-                onAction: () => ref.invalidate(workListProvider),
-              ),
-              data: (list) {
-                if (list.isEmpty) {
-                  // 三种空态要分开：**库里本来就没有**（该去扫描）、
-                  // **这一栏本来就该是空的**（还没看过任何片子）、
-                  // **筛选没筛到**（该清条件）。给错行动按钮比不给更糟。
-                  if (filter.playedOnly) return const _NoPlayHistoryState();
-                  if (filter.isEmpty) return const _NeverScannedState();
-                  // 提示语与按钮都由 `libraryEmptyHint` 按**当前实际存在的
-                  // 条件**分派 —— 按钮绝不能一律 `clear()`（那会连分类栏选的
-                  // 位置一起丢掉），理由见那个函数的文档。
-                  final hint = libraryEmptyHint(filter);
-                  return EmptyState(
-                    icon: Icons.search_off_rounded,
-                    title: '这里还没有内容',
-                    body: hint.body,
-                    actionLabel: hint.actionLabel,
-                    onAction: () {
-                      final notifier = ref.read(libraryFilterProvider.notifier);
-                      switch (hint.action) {
-                        case LibraryEmptyAction.clearExtra:
-                          notifier.clearExtra();
-                        case LibraryEmptyAction.clearQuery:
-                          // 走 `_clearSearch` 而不是 `setQuery('')`：输入框里
-                          // 还留着上一次打的字，只改状态会得到「列表已经不过滤
-                          // 了，但搜索框里还有词」这种自相矛盾的样子。
-                          _clearSearch();
-                        case LibraryEmptyAction.clearExtraAndQuery:
-                          notifier.clearExtra();
-                          _clearSearch();
-                        case LibraryEmptyAction.clearAll:
-                          notifier.clear();
-                      }
-                    },
-                  );
-                }
-                // 封面与列表读的是同一个 `list`，只有排布不同。
-                return view == LibraryView.posters
-                    ? _PosterGrid(works: list)
-                    : _WorkList(works: list);
-              },
             ),
+            error: (e, _) => EmptyState(
+              icon: Icons.error_outline_rounded,
+              danger: true,
+              title: '读取媒体库失败',
+              body: '$e',
+              actionLabel: '重试',
+              onAction: () => ref.invalidate(workListProvider),
+            ),
+            data: (list) {
+              if (list.isEmpty) {
+                // 四种空态要分开：**库里本来就没有**（该去扫描）、
+                // **这一栏本来就该是空的**（还没看过任何片子 / 还没刮过）、
+                // **筛选没筛到**（该清条件）。给错行动按钮比不给更糟。
+                if (filter.playedOnly) return const _NoPlayHistoryState();
+                // 「只开了已刮削」单独一支：这与「条件太紧」是两回事 ——
+                // 见 `_NoScrapedState`。带了年份 / 类型或搜索词就走下面的
+                // 通用分支（那时候确实是条件太紧）。
+                if (filter.scrapedOnly &&
+                    filter.years.isEmpty &&
+                    filter.genres.isEmpty &&
+                    filter.query.trim().isEmpty) {
+                  return const _NoScrapedState();
+                }
+                if (filter.isEmpty) return const _NeverScannedState();
+                // 提示语与按钮都由 `libraryEmptyHint` 按**当前实际存在的
+                // 条件**分派 —— 按钮绝不能一律 `clear()`（那会连分类栏选的
+                // 位置一起丢掉），理由见那个函数的文档。
+                final hint = libraryEmptyHint(filter);
+                return EmptyState(
+                  icon: Icons.search_off_rounded,
+                  title: '这里还没有内容',
+                  body: hint.body,
+                  actionLabel: hint.actionLabel,
+                  onAction: () {
+                    final notifier = ref.read(libraryFilterProvider.notifier);
+                    switch (hint.action) {
+                      case LibraryEmptyAction.clearExtra:
+                        notifier.clearExtra();
+                      case LibraryEmptyAction.clearQuery:
+                        // 走 `_clearSearch` 而不是 `setQuery('')`：输入框里
+                        // 还留着上一次打的字，只改状态会得到「列表已经不过滤
+                        // 了，但搜索框里还有词」这种自相矛盾的样子。
+                        _clearSearch();
+                      case LibraryEmptyAction.clearExtraAndQuery:
+                        notifier.clearExtra();
+                        _clearSearch();
+                      case LibraryEmptyAction.clearAll:
+                        notifier.clear();
+                    }
+                  },
+                );
+              }
+              // 封面与列表读的是同一个 `list`，只有排布不同。
+              return view == LibraryView.posters
+                  ? _PosterGrid(works: list)
+                  : _WorkList(works: list);
+            },
           ),
-        ] else
-          Expanded(child: FolderBrowser(onClearSearch: _clearSearch)),
+        ),
       ],
     );
   }
+}
 
-  /// 目录视图的副标题：当前网盘目录 + 它这一层有什么。
-  ///
-  /// 副标题必须**跟着浏览位置变**：它回答的是「我现在在哪、这一层有多少」。
-  /// 只在页头显示一次整库规模的话，用户翻进一个空目录会以为整个盘空了。
-  ///
-  /// 数字来自网盘列表本身（而不是本地索引）：这个视图现在描述的是
-  /// 「网盘上有什么」，用一个本地索引算出来的数字会与列表里看到的对不上。
-  static String? _folderSubtitle(WidgetRef ref) {
-    final crumb = ref.watch(currentCrumbProvider);
-    final listing = ref.watch(driveListingProvider(crumb)).valueOrNull;
-    final where = crumb.isRoot ? '根目录' : crumb.path;
-    if (listing == null) return where;
-    final extra = listing.otherFileCount > 0
-        ? ' · 另有 ${listing.otherFileCount} 个非视频文件'
-        : '';
-    return '$where · ${listing.folders.length} 个子目录 · '
-        '${listing.videos.length} 个视频$extra';
+/// 媒体库顶部的**活动条**：扫描 / 刮削进行时占一行，显示实时进度。
+///
+/// ## 为什么单独一条，而不是塞进页头
+///
+/// 页头那一行已经有八个控件，TV 上要折成两行；而进度条需要的是**整行宽度**
+/// （一眼看出「还剩多少」），塞进页头只会两边都憋屈。
+///
+/// ## 为什么扫描与刮削共用一条
+///
+/// 两者不会同时跑（媒体库页把两个入口互斥了），所以一条就够 —— 分开两条
+/// 会多出一块「另一个永远是空的」的版式。
+///
+/// ## 刮削结束后为什么还留着
+///
+/// 结果（命中多少 / 未命中多少）是用户点这一次按钮唯一的回执。跑完就消失的话，
+/// 用户只看到进度条闪了一下，不知道到底刮成了几部。留到用户点「关闭」，
+/// 或下一次扫描 / 刮削开始时被顶掉。
+class _LibraryActivityBar extends ConsumerWidget {
+  const _LibraryActivityBar({required this.scan, required this.scrape});
+
+  final ScanState scan;
+  final LibraryScrapeState scrape;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // 刮削优先：它结束后那条结果提示还要留着，而扫描不会与它同时跑。
+    final scraping = scrape.running || scrape.finished;
+    final tv = AppTheme.isTvLayout(context);
+
+    final String title;
+    final String? detail;
+    final VoidCallback onAction;
+    final String actionLabel;
+    final IconData actionIcon;
+    final double? fraction;
+
+    if (scraping) {
+      fraction = scrape.fraction;
+      title = scrape.running
+          ? '正在刮削 ${scrape.done}/${scrape.total}'
+          : scrape.summary;
+      detail = scrape.running && scrape.currentTitle != null
+          ? '当前：${scrape.currentTitle}'
+          : null;
+      if (scrape.running) {
+        onAction =
+            () => ref.read(libraryScrapeControllerProvider.notifier).cancel();
+        actionLabel = '停止';
+        actionIcon = Icons.stop_rounded;
+      } else {
+        onAction =
+            () => ref.read(libraryScrapeControllerProvider.notifier).dismiss();
+        actionLabel = '关闭';
+        actionIcon = Icons.close_rounded;
+      }
+    } else {
+      final p = scan.progress;
+      fraction = null;
+      title = p == null ? '正在扫描…' : '正在扫描 · ${p.phase.label}';
+      final dir = p?.currentDirPath;
+      detail = p == null
+          ? null
+          : '已扫 ${p.scannedDirs} 个目录 · 命中 ${p.foundMedia} 个视频'
+              '${dir == null || dir.isEmpty ? "" : " · $dir"}';
+      onAction = () => ref.read(scanControllerProvider.notifier).cancel();
+      actionLabel = '停止';
+      actionIcon = Icons.stop_rounded;
+    }
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(22, 0, 22, 10),
+      padding: const EdgeInsets.fromLTRB(14, 9, 10, 11),
+      decoration: BoxDecoration(
+        color: AppTheme.panel,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.line, width: 0.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                scraping ? Icons.auto_awesome_rounded : Icons.radar_rounded,
+                size: tv ? 20 : 15,
+                color: AppTheme.accent,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: tv ? AppTheme.tvActionLabel : 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.text,
+                  ),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: onAction,
+                icon: Icon(actionIcon, size: 15),
+                label: Text(actionLabel),
+              ),
+            ],
+          ),
+          if (fraction != null) ...[
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                value: fraction,
+                minHeight: 4,
+                backgroundColor: AppTheme.panel3,
+              ),
+            ),
+          ],
+          if (detail != null) ...[
+            const SizedBox(height: 7),
+            Text(
+              detail,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: tv ? 13 : 11,
+                color: AppTheme.dim,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 }
 
-/// 「海报墙 / 文件夹」切换。
+/// 「封面 / 列表」切换。
 ///
-/// 做成同一页面里的分段控件而不是侧栏第四项：两者读的是同一批数据，
-/// 只是视角不同（「有哪些片子」vs「网盘上是怎么放的」）。分成两个一级入口
-/// 会让用户觉得它们是两个功能，而搜索、刷新、扫描状态这些本该共用的东西
-/// 也得各写一份。
+/// 只在这两个视图之间切：它们读的是**同一批作品**，只是排布不同，所以做成
+/// 同一页面里的分段控件就够了（搜索、分类栏、排序、筛选、多选全部共用）。
+///
+/// ⚠️ 「文件夹」**不在这里** —— 它读的是网盘实时目录、不是本地索引，与这里
+/// 没有一处共用，已经是侧栏上并列的一级入口（`ui/pages/folder_page.dart`）。
 class _ViewSwitch extends ConsumerWidget {
   const _ViewSwitch();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final view = ref.watch(libraryViewProvider);
+    final tv = AppTheme.isTvLayout(context);
 
     return Container(
-      height: 32,
+      // TV 上抬到 44：32 高的分段控件里，焦点环几乎没有地方画，而 12sp 的
+      // 标签隔三米读不出来。
+      height: tv ? 44 : 32,
       padding: const EdgeInsets.all(2),
       decoration: BoxDecoration(
         color: AppTheme.panel,
@@ -427,18 +584,9 @@ class _ViewSwitch extends ConsumerWidget {
               icon: switch (option) {
                 LibraryView.posters => Icons.grid_view_rounded,
                 LibraryView.list => Icons.view_list_rounded,
-                LibraryView.folders => Icons.folder_rounded,
               },
               selected: view == option,
-              onTap: () {
-                ref.read(libraryViewProvider.notifier).set(option);
-                // 切到目录视图时**顺带退出多选**：那里列的是网盘文件，没有
-                // 「一部作品」可以勾，留着选择状态再切回来会看到「刚回来就
-                // 莫名其妙选着几部」，而那几部还是上一次的老选择。
-                if (!option.showsWorks) {
-                  ref.read(librarySelectionProvider.notifier).exit();
-                }
-              },
+              onTap: () => ref.read(libraryViewProvider.notifier).set(option),
             ),
         ],
       ),
@@ -461,6 +609,7 @@ class _ViewSegment extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tv = AppTheme.isTvLayout(context);
     final color = selected ? AppTheme.text : AppTheme.muted;
     return Material(
       color: selected ? AppTheme.panel3 : Colors.transparent,
@@ -469,16 +618,19 @@ class _ViewSegment extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(6),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+          padding: EdgeInsets.symmetric(
+            horizontal: tv ? 16 : 9,
+            vertical: tv ? 11 : 5,
+          ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 14, color: color),
-              const SizedBox(width: 5),
+              Icon(icon, size: tv ? 19 : 14, color: color),
+              SizedBox(width: tv ? 8 : 5),
               Text(
                 label,
                 style: TextStyle(
-                  fontSize: 12,
+                  fontSize: tv ? AppTheme.tvActionLabel : 12,
                   fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                   color: color,
                 ),
@@ -514,10 +666,17 @@ class _CategoryBar extends ConsumerWidget {
     final total =
         counts?.values.fold<int>(0, (sum, n) => sum + n);
 
+    final tv = AppTheme.isTvLayout(context);
+    // TV 上把间距拉开：chip 变高变大之后，6 的间距会让相邻两个看起来像
+    // 连在一起的一整条，焦点落在哪一个全靠猜。
+    final gap = tv ? 10.0 : 6.0;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(22, 0, 22, 12),
       child: SizedBox(
-        height: 28,
+        // TV 上抬到 44：28 是给鼠标的（点一下就到），遥控器上焦点环画不下、
+        // 12sp 的字也读不出来。
+        height: tv ? 44 : 28,
         child: ListView(
           scrollDirection: Axis.horizontal,
           children: [
@@ -528,7 +687,7 @@ class _CategoryBar extends ConsumerWidget {
               onTap: () =>
                   ref.read(libraryFilterProvider.notifier).setCategory(null),
             ),
-            const SizedBox(width: 6),
+            SizedBox(width: gap),
             _CategoryChip(
               label: '最近播放',
               icon: Icons.history_rounded,
@@ -538,7 +697,7 @@ class _CategoryBar extends ConsumerWidget {
                   ref.read(libraryFilterProvider.notifier).setPlayedOnly(),
             ),
             for (final category in MediaCategory.displayOrder) ...[
-              const SizedBox(width: 6),
+              SizedBox(width: gap),
               _CategoryChip(
                 label: category.label,
                 count: counts?[category],
@@ -575,29 +734,33 @@ class _CategoryChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
+    final tv = AppTheme.isTvLayout(context);
+    final chip = Material(
       color: selected ? AppTheme.accent.withValues(alpha: 0.16) : AppTheme.panel,
       borderRadius: BorderRadius.circular(7),
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(7),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          padding: EdgeInsets.symmetric(
+            horizontal: tv ? 18 : 12,
+            vertical: tv ? 11 : 6,
+          ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               if (icon != null) ...[
                 Icon(
                   icon,
-                  size: 13,
+                  size: tv ? 18 : 13,
                   color: selected ? AppTheme.accent : AppTheme.muted,
                 ),
-                const SizedBox(width: 5),
+                SizedBox(width: tv ? 8 : 5),
               ],
               Text(
                 label,
                 style: TextStyle(
-                  fontSize: 12,
+                  fontSize: tv ? AppTheme.tvActionLabel : 12,
                   fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                   color: selected ? AppTheme.accent : AppTheme.muted,
                 ),
@@ -605,11 +768,11 @@ class _CategoryChip extends StatelessWidget {
               // 计数为 0 或还没算出来时不显示角标：一个「综艺 0」的按钮
               // 只会让人以为坏了，而它其实只是没有综艺。
               if (count != null && count! > 0) ...[
-                const SizedBox(width: 5),
+                SizedBox(width: tv ? 8 : 5),
                 Text(
                   '$count',
                   style: TextStyle(
-                    fontSize: 10.5,
+                    fontSize: tv ? 13 : 10.5,
                     color: selected
                         ? AppTheme.accent.withValues(alpha: 0.75)
                         : AppTheme.dim,
@@ -621,6 +784,13 @@ class _CategoryChip extends StatelessWidget {
         ),
       ),
     );
+
+    // TV 上补一圈焦点环。这条 chip 自己有 `Material`，ink 高亮**画得出来**，
+    // 但深色主题下那层高亮在电视上太淡 —— 八个 chip 并排时，用户分辨不出
+    // 焦点落在哪一个上。
+    return tv
+        ? TvFocusable(borderRadius: BorderRadius.circular(7), child: chip)
+        : chip;
   }
 }
 
@@ -1341,64 +1511,6 @@ class _SelectionHeader extends ConsumerWidget {
   }
 }
 
-class _SearchBox extends StatelessWidget {
-  const _SearchBox({
-    required this.controller,
-    required this.onChanged,
-    required this.hint,
-  });
-
-  final TextEditingController controller;
-  final ValueChanged<String> onChanged;
-
-  /// 提示词随视图变：海报墙搜的是「片名 / 文件名」，目录视图还多一层
-  /// **路径**（那正是它存在的理由），不写出来的话用户不会想到可以搜目录。
-  final String hint;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 220,
-      // ⚠️ 这个高度是**写死的 32**，故意不进 tvTextScaler。媒体库页头（含搜索框）
-      // 不能在 TV 上放大字号：P1-3 给海报网格套了 `tvTextScaler`，但页头那行
-      // 没有 —— 一个固定高度的输入框一旦被放大字号，里面的字会顶破 32 的框、
-      // 触发 RenderFlex 溢出。要放大也得先让这个 `SizedBox` 改吸收高度。
-      height: 32,
-      child: TextField(
-        controller: controller,
-        onChanged: onChanged,
-        style: const TextStyle(fontSize: 12.5, color: AppTheme.text),
-        cursorHeight: 14,
-        decoration: InputDecoration(
-          isDense: true,
-          hintText: hint,
-          hintStyle: const TextStyle(fontSize: 12, color: AppTheme.dim),
-          prefixIcon: const Icon(Icons.search_rounded, size: 15),
-          prefixIconConstraints: const BoxConstraints(
-            minWidth: 30,
-            minHeight: 30,
-          ),
-          filled: true,
-          fillColor: AppTheme.panel,
-          contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: AppTheme.line, width: 0.5),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: AppTheme.line, width: 0.5),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: AppTheme.accent, width: 0.8),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 /// 「最近播放」栏为空。
 ///
 /// **不能复用分类那一套空态**：那里写的是「换个分类看看，或者重新扫描一次」，
@@ -1417,6 +1529,30 @@ class _NoPlayHistoryState extends ConsumerWidget {
       actionLabel: '去看看全部',
       onAction: () =>
           ref.read(libraryFilterProvider.notifier).setCategory(null),
+    );
+  }
+}
+
+/// 「已刮削」这个视图里什么都没有的空态。
+///
+/// 与 `_NoPlayHistoryState` 同一条理由：这不是「条件太紧，清掉就好」，
+/// 而是**库里还没有刮削过的作品**。走通用的「清掉筛选条件」的话，用户
+/// 照做之后列表是回来了，但他想看的那个视图仍然什么都没有，而他并不知道
+/// 该去干什么 —— 这一支存在的意义就是把「刮一部试试」说出来。
+class _NoScrapedState extends ConsumerWidget {
+  const _NoScrapedState();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return EmptyState(
+      // 与详情页那个「刮削」按钮同一个图标：用户照着它就能找到入口。
+      icon: Icons.auto_awesome_outlined,
+      title: '还没有刮削过的作品',
+      body: '在作品详情页点「刮削」拿到海报、简介和上映年份之后，'
+          '它就会出现在这里。',
+      actionLabel: '取消「已刮削」',
+      onAction: () =>
+          ref.read(libraryFilterProvider.notifier).toggleScrapedOnly(),
     );
   }
 }

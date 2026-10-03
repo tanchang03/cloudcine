@@ -111,7 +111,15 @@ void main() {
         reason: '空的时候必须说清「为什么空」。一片空白时用户的第一反应是'
             '「功能坏了」，而实际上只是还没刮削过',
       );
-      expect(find.textContaining('刮削'), findsOneWidget);
+      // ⚠️ 这里**不能**用宽松的 `find.textContaining('刮削')`：面板上还有
+      // 「刮削」分组标题和「已刮削」那颗 chip，宽松匹配会同时命中三处 ——
+      // 那样这条断言就不再是在验「提示语说了要刮削」，而是「面板里出现过
+      // 刮削两个字」。
+      expect(
+        find.textContaining('刮削一次就能拿到上映年份'),
+        findsOneWidget,
+        reason: '光说「还没有带年份的作品」是不够的，还得告诉用户怎么办',
+      );
     });
 
     testWidgets('没有类型信息 → 提示刮削后会出现', (tester) async {
@@ -120,6 +128,20 @@ void main() {
       await open(tester);
 
       expect(find.textContaining('还没有类型信息'), findsOneWidget);
+    });
+
+    testWidgets('「已刮削」单独一组列出来', (tester) async {
+      await pump(tester, works: [work('a', year: 2021, genres: ['剧情'])]);
+
+      await open(tester);
+
+      expect(find.text('刮削'), findsOneWidget, reason: '分组标题');
+      expect(
+        find.text('已刮削'),
+        findsOneWidget,
+        reason: '它是一个**开关**（单选、没有「或」的余地），所以只有一颗 '
+            'chip —— 与年份 / 类型那种多选是两回事',
+      );
     });
 
     testWidgets('没有任何条件时「清空筛选」是禁用的', (tester) async {
@@ -215,7 +237,57 @@ void main() {
       expect(state(c).years.length + state(c).genres.length, 2);
     });
 
-    testWidgets('清空筛选只清面板里的两组，不动分类与搜索词', (tester) async {
+    testWidgets('点「已刮削」→ 打开，再点一次 → 取消', (tester) async {
+      final c = await pump(tester, works: [work('a', year: 2021)]);
+      await open(tester);
+
+      await tester.tap(find.text('已刮削'));
+      await tester.pumpAndSettle();
+      expect(state(c).scrapedOnly, isTrue);
+
+      await tester.tap(find.text('已刮削'));
+      await tester.pumpAndSettle();
+      expect(state(c).scrapedOnly, isFalse);
+    });
+
+    testWidgets('「已刮削」也算一项生效条件，按钮上要出现数字', (tester) async {
+      // 这一棵树上刻意**不放年份 / 类型**：面板里那些 chip 也带数字，
+      // 混在一起就分不清按钮上那个「1」是角标还是某颗 chip 的计数。
+      final c = await pump(tester, works: [work('a')]);
+      await open(tester);
+
+      await tester.tap(find.text('已刮削'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.descendant(of: find.byType(Tooltip), matching: find.text('1')),
+        findsOneWidget,
+        reason: '它是面板里三组条件之一。不数进去的话，用户明明筛着东西，'
+            '按钮上却没有任何标记 —— 他会以为「列表少了好多片子」是别的原因',
+      );
+      expect(state(c).selectedCount, 1);
+    });
+
+    testWidgets('「清空筛选」把「已刮削」也一起清掉', (tester) async {
+      final c = await pump(tester, works: [work('a')]);
+      await open(tester);
+      await tester.tap(find.text('已刮削'));
+      await tester.pumpAndSettle();
+      expect(state(c).scrapedOnly, isTrue);
+
+      await tester.tap(find.widgetWithText(TextButton, '清空筛选'));
+      await tester.pumpAndSettle();
+
+      expect(
+        state(c).scrapedOnly,
+        isFalse,
+        reason: '它没有别的清除入口（不像分类栏与搜索框各有一个）。不清的话，'
+            '用户点完「清空筛选」列表还是空的，而面板上已经看不出是哪儿在筛',
+      );
+      expect(state(c).hasExtra, isFalse);
+    });
+
+    testWidgets('清空筛选只清面板里的三组，不动分类与搜索词', (tester) async {
       final c = await pump(tester, works: [
         work('a', year: 2021, genres: ['剧情']),
       ]);
@@ -426,6 +498,7 @@ class _BrokenYearRepo extends InMemoryMediaRepository {
   Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) async =>
       throw StateError('数据库炸了');
@@ -437,6 +510,7 @@ class _BrokenGenreRepo extends InMemoryMediaRepository {
   Future<Map<String, int>> countWorksByGenre({
     MediaCategory? category,
     bool playedOnly = false,
+    bool scrapedOnly = false,
     String? query,
   }) async =>
       throw StateError('数据库炸了');

@@ -1,13 +1,18 @@
 import 'package:cloudcine/data/remote/quark/quark_play_routes.dart';
+import 'package:cloudcine/domain/adapters/stream_relay.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// `play/info` 的真实响应形状**没有落盘证据**（参考项目只打过端点、
-/// 没留下响应样本），所以解析器刻意不按固定字段名读，而是递归遍历、
-/// 收集「像播放地址的字段」。
+/// `play/info` 的解析器刻意**不按固定字段名读**，而是递归遍历、收集
+/// 「像播放地址的字段」—— 因为它最初写的时候没有响应样本（参考项目只
+/// 打过端点、没留下落盘证据）。
 ///
-/// 正因如此，这些合成载荷测试是这条路由**唯一能离线验证的部分**：
-/// 它们钉住的是「换字段名/换嵌套层级仍然认得出来」，而不是某个具体
-/// 服务端契约。形状无关性本身就是被测试的性质。
+/// 所以这些合成载荷测试钉住的是「换字段名/换嵌套层级仍然认得出来」，
+/// 而不是某个具体服务端契约。形状无关性本身就是被测试的性质。
+///
+/// ⚠️ **2026-10-03 已抓到真实响应并落盘**（见本文件末尾那一组）。那一组
+/// 钉的是与上面相反的半边：真实样本的**具体**嵌套层级。两组都要，别拿
+/// 一组替换另一组 —— 合成组保证「换个形状也认得出」，真实组保证
+/// 「服务端真给的那个形状一定读得对」。
 void main() {
   group('parseQualities · 形状无关', () {
     test('典型嵌套载荷：梯度 + 原画，且已按清晰度降序排好', () {
@@ -489,6 +494,117 @@ void main() {
         QuarkPlayInfoParser.audioOnlyKeys,
         containsAll(<String>['audio_list', 'audio_info']),
       );
+    });
+  });
+
+  group('真实 play/info 响应形状（2026-10-03 实测落盘）', () {
+    // 2026-10-03 抓到的真实响应（指环王 S01E01，原文件 17.09 GiB / hevc /
+    // matroska）。**URL 已换成占位符**（原值是带 `auth_key` 的签名直链），
+    // 其余字段与**嵌套层级**逐字保留 —— 层级正是这一组要钉的东西。
+    //
+    // 为什么值得钉：本文件开头说过「真实形状没有落盘证据」，解析器只能靠
+    // 合成载荷验证形状无关性。有了真实样本之后，可以钉死两件**都曾被判断错**
+    // 的事：
+    //   1. 转码档的 `size` 在 `video_info` 里、**与 `url` 同一层**，所以
+    //      `parseQualities` 读得到它 —— `estimatedBytes` **不是 null**。
+    //      （曾以为服务端不给、会让所有转码档退化成直连；实测证伪。）
+    //   2. 档位直链里**没有 `.m3u8`**（整份响应一次都没出现），所以
+    //      `isRelayableUrl` 不排除它们 —— 转码档**可以走本地中继**。
+    //
+    // 这两条合起来才是「换档票据不沿用旧流体积」那个修复能成立的前提：
+    // 拿得到真实体积 → 中继按对的长度切块 → **既不 416 黑屏，也不丢加速**。
+    Map<String, Object?> tier(
+      String resolution,
+      int size,
+      int width,
+      int height,
+      double bitrate,
+    ) =>
+        {
+          'resolution': resolution,
+          'right': 'svip',
+          'member_right': 'svip',
+          'trans_status': 'success',
+          'accessable': true,
+          'supports_format': 'mp4',
+          'video_info': {
+            'duration': 7437,
+            'size': size,
+            'width': width,
+            'height': height,
+            'bitrate': bitrate,
+            'codec': 'h264',
+            'url': 'https://video-play-c-sz.drive.quark.cn/PLACEHOLDER/'
+                '$resolution?auth_key=1',
+            'hls_type': 'none',
+            'resolution': resolution,
+            'finish': true,
+          },
+        };
+
+    final payload = <String, Object?>{
+      'status': 200,
+      'code': 0,
+      'data': {
+        'fid-placeholder': {
+          'file_name': 'Extraction.2.2023.2160p.NF.WEB-DL.mkv',
+          // 目录列表给的**原文件**体积（17.09 GiB）。
+          'size': 18352334984,
+          'video_list': [
+            tier('4k', 4703134338, 3840, 2160, 5058.0),
+            tier('super', 940783265, 1440, 810, 1012.0),
+            tier('high', 603617141, 960, 540, 649.0),
+            tier('low', 222196440, 480, 270, 239.0),
+          ],
+          'meta': {
+            'duration': 7438,
+            'size': 18352334984,
+            'format': 'matroska,webm',
+            'width': 3840,
+            'height': 2160,
+            'bitrate': 19740.0,
+            'codec': 'hevc',
+          },
+        },
+      },
+    };
+
+    test('四个转码档都读到真实体积 —— estimatedBytes 不是 null', () {
+      final qs = QuarkPlayInfoParser.parseQualities(payload);
+
+      expect(qs.map((q) => q.id).toList(), ['4k', 'super', 'high', 'low']);
+      expect(
+        qs.map((q) => q.estimatedBytes).toList(),
+        <int>[4703134338, 940783265, 603617141, 222196440],
+        reason: '`size` 与 `url` 同在 video_info 那一层。读不到就会让所有'
+            '转码档退化成直连（丢加速）；而若改成沿用原文件体积则是 416 黑屏。',
+      );
+    });
+
+    test('档位直链不是 HLS —— 转码档可以走本地中继', () {
+      final qs = QuarkPlayInfoParser.parseQualities(payload);
+
+      for (final q in qs) {
+        expect(
+          isRelayableUrl(q.url!),
+          isTrue,
+          reason: '实测响应里没有一处 `.m3u8`（档位 ${q.id}）',
+        );
+      }
+    });
+
+    test('原画体积与任何转码档都不同 —— 沿用它正是 416 的成因', () {
+      final originalBytes = QuarkPlayInfoParser.parseSourceMeta(payload)?.sizeBytes;
+      expect(originalBytes, 18352334984, reason: 'meta 描述的是原文件');
+
+      for (final q in QuarkPlayInfoParser.parseQualities(payload)) {
+        expect(
+          q.estimatedBytes,
+          isNot(originalBytes),
+          reason: '换档时若把上一条流（原画）的体积套到转码流上，中继就会按'
+              '错的总长发越界 Range，上游回 416 —— 表现就是「切到 4K 就黑屏」',
+        );
+      }
     });
   });
 }

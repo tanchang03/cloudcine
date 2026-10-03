@@ -416,6 +416,7 @@ void main() {
         fileName: 'The.Glory.S01E03.2160p-老K.mkv',
         subtitle: '2160P · MKV',
         resumePosition: Duration(minutes: 3),
+        maxPosition: Duration(minutes: 30),
         duration: Duration(minutes: 60),
       );
 
@@ -424,6 +425,28 @@ void main() {
       expect(restored, original);
       expect(restored!.fileName, 'The.Glory.S01E03.2160p-老K.mkv');
       expect(restored.rowTitle, 'The.Glory.S01E03.2160p-老K.mkv');
+      expect(
+        restored.maxPosition,
+        const Duration(minutes: 30),
+        reason: '漏了 `maxPositionMs` 的话，播放窗口收到的历史进度永远是 0 —— '
+            '表现是「面板上一条进度条都没有」，而且没有任何报错。',
+      );
+    });
+
+    test('老请求里没有 maxPositionMs 时退回续播点（它是下界）', () {
+      final restored = PlaylistEntry.fromJson(const <String, Object?>{
+        'itemId': 'q:1',
+        'title': '第 1 集',
+        'resumePositionMs': 7 * 60 * 1000,
+        'durationMs': 45 * 60 * 1000,
+      })!;
+
+      expect(
+        restored.maxPosition,
+        const Duration(minutes: 7),
+        reason: '退回续播点得到的是一条偏短但不说谎的进度条；退回 0 会让'
+            '看过的一集显示成「没看过」。',
+      );
     });
 
     test('缺 fileName 的旧请求还原成空串，不是 itemId', () {

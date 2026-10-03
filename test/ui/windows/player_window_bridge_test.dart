@@ -335,6 +335,106 @@ void main() {
     });
   });
 
+  group('fetchThumbnail（剧集面板的缩略图）', () {
+    test('itemId 与地址一起交给回调，回来的本地路径原样交回去', () async {
+      // 播放窗口拿这个路径去 `Image.file` —— 它自己下不了这张图（夸克缩略图
+      // 缺 Cookie 一律 401，凭证在主窗口这边）。
+      String? askedItem;
+      String? askedUrl;
+      onFetchThumbnail = (itemId, url) async {
+        askedItem = itemId;
+        askedUrl = url;
+        return '/tmp/posters/quark_f1_ab12cd34.jpg';
+      };
+
+      final path = await handlePlayerWindowCall(
+        const MethodCall(
+          PlayerBridgeMethod.fetchThumbnail,
+          <String, Object?>{
+            'itemId': 'quark:f1',
+            'url': 'https://drive.example.com/thumb-f1',
+          },
+        ),
+      );
+
+      expect(askedItem, 'quark:f1');
+      expect(askedUrl, 'https://drive.example.com/thumb-f1');
+      expect(path, '/tmp/posters/quark_f1_ab12cd34.jpg');
+    });
+
+    test('没有地址时不回调 —— 拿一条空 URL 去下只会白烧一次请求', () async {
+      var called = false;
+      onFetchThumbnail = (_, _) async {
+        called = true;
+        return '/tmp/x.jpg';
+      };
+
+      for (final raw in const <Object?>[
+        null,
+        'not-a-map',
+        <String, Object?>{},
+        <String, Object?>{'url': ''},
+        <String, Object?>{'url': 42},
+      ]) {
+        expect(
+          await handlePlayerWindowCall(
+            MethodCall(PlayerBridgeMethod.fetchThumbnail, raw),
+          ),
+          isNull,
+          reason: 'raw=$raw',
+        );
+      }
+
+      expect(called, isFalse);
+    });
+
+    test('itemId 缺失（老版本主窗口投来的请求）退化成空串，图照样取得回来', () async {
+      // 缓存键那时退化成 URL 本身 —— 文件名难看一点，但图不能取不到。
+      String? askedItem;
+      onFetchThumbnail = (itemId, _) async {
+        askedItem = itemId;
+        return '/tmp/x.jpg';
+      };
+
+      final path = await handlePlayerWindowCall(
+        const MethodCall(
+          PlayerBridgeMethod.fetchThumbnail,
+          <String, Object?>{'url': 'https://drive.example.com/t'},
+        ),
+      );
+
+      expect(askedItem, '');
+      expect(path, '/tmp/x.jpg');
+    });
+
+    test('取不到时返回 null —— 约 30% 的视频夸克还没生成预览图', () async {
+      // 这不是错误路径，是常态。播放窗口拿到 null 安静退回占位图即可。
+      onFetchThumbnail = (_, _) async => null;
+
+      expect(
+        await handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.fetchThumbnail,
+            <String, Object?>{'url': 'https://drive.example.com/t'},
+          ),
+        ),
+        isNull,
+      );
+    });
+
+    test('没装上回调时返回 null，不抛异常', () async {
+      expect(
+        await handlePlayerWindowCall(
+          const MethodCall(
+            PlayerBridgeMethod.fetchThumbnail,
+            <String, Object?>{'url': 'https://drive.example.com/t'},
+          ),
+        ),
+        isNull,
+      );
+    });
+  });
+
   group('searchOnlineSubtitles（在线搜索）', () {
     test('把整个 SubtitleSearchRequest 交给回调 —— 片名由主窗口按 itemId 补全', () async {
       SubtitleSearchRequest? asked;
@@ -549,6 +649,7 @@ void _resetGlobals() {
   onPlaybackProgress = null;
   onTicketRefresh = null;
   onFetchSubtitleText = null;
+  onFetchThumbnail = null;
   onSearchOnlineSubtitles = null;
   onFetchOnlineSubtitle = null;
 }
