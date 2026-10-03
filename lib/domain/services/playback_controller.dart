@@ -7,12 +7,15 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
 import '../../core/utils/mpv_chapters.dart';
+import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
+import '../../core/utils/player_subtitle_config.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/track_labels.dart';
 import '../adapters/cloud_drive_adapter.dart';
+import '../adapters/stream_relay.dart';
 import '../entities/media_item.dart';
 import '../entities/quality_option.dart';
 import '../entities/stream_ticket.dart';
@@ -47,9 +50,11 @@ class PlaybackController extends ChangeNotifier {
   PlaybackController({
     required DriveAdapterRegistry registry,
     required SubtitleResolver subtitleResolver,
+    StreamRelay? relay,
     Duration positionSaveInterval = const Duration(seconds: 10),
   })  : _registry = registry,
         _subtitleResolver = subtitleResolver,
+        _relay = relay,
         _positionSaveInterval = positionSaveInterval {
     // 渲染控制器**必须**绑定到上面那个 [player]，并且必须在任何 `open()`
     // 之前就建出来。
@@ -80,6 +85,19 @@ class PlaybackController extends ChangeNotifier {
 
   final DriveAdapterRegistry _registry;
   final SubtitleResolver _subtitleResolver;
+
+  /// 本地中继。**为 null 表示直连** —— 这不是错误状态，只是没启用。
+  ///
+  /// 注入而不是在这里 new：本类活在领域层，而中继要 bind 端口、发网络
+  /// 请求，是实现细节。
+  final StreamRelay? _relay;
+
+  /// 当前中继会话的标识。
+  ///
+  /// 换片源 / 切清晰度时**必须先关掉旧的**：不关的话上一条流还在后台预取，
+  /// 几条会话的并发叠加起来会把带宽吃光，而用户看到的是「越播越卡」。
+  String? _relayToken;
+
   final Duration _positionSaveInterval;
 
   /// mpv 播放器实例。**只在本类内部使用**。
@@ -87,9 +105,14 @@ class PlaybackController extends ChangeNotifier {
   /// 缓冲上限 256 MB（media_kit 默认 32 MB 对高码率原画远远不够），
   /// 预读目标在 [PlayerBufferConfig.apply] 里设。两个播放器（本类 +
   /// 独立窗口 `player_window_app.dart`）共用同一份配置。
+  ///
+  /// `libass: PlayerSubtitleConfig.useLibass` 必须给 —— 缺了它 media_kit 会把
+  /// `sub-visibility` 设成 `no`，**所有**字幕都不显示且不报错（位图字幕如 PGS
+  /// 更是没有任何替代路径）。原因见 `player_subtitle_config.dart`。
   final mk.Player player = mk.Player(
     configuration: const mk.PlayerConfiguration(
       bufferSize: PlayerBufferConfig.bufferSize,
+      libass: PlayerSubtitleConfig.useLibass,
     ),
   );
 
@@ -164,6 +187,17 @@ class PlaybackController extends ChangeNotifier {
   List<QualityOption> get qualities => _ticket?.qualities ?? const [];
 
   String? get activeQualityId => _activeQualityId;
+
+  /// 本地中继的实时统计。**没走中继时是 null。**
+  ///
+  /// 它是**真实计数**而不是 mpv 的估算：下载了多少字节只有发起请求的那一方
+  /// 才知道确切数字。正好拿来对冲 mpv `demuxer-cache-time` 的估算误差 ——
+  /// 那个数在 VBR 的高码率原画上会严重虚高（见 [bufferedAhead]）。
+  RelayStats? get relayStats {
+    final token = _relayToken;
+    if (token == null) return null;
+    return _relay?.statsOf(token);
+  }
 
   bool get isLoading => _loading;
   String? get error => _error;
@@ -243,6 +277,9 @@ class PlaybackController extends ChangeNotifier {
         position: _position,
         cacheAhead: _bufferedAhead,
         duration: _duration,
+        // mpv 自己说在等数据时，缓冲层收到播放头。理由（VBR 原画上
+        // `demuxer-cache-time` 会严重虚高）见 [PlayerBufferProgress.fraction]。
+        stalled: _buffering,
       );
 
   /// 音量（0..100，与 mpv 口径一致）
@@ -426,14 +463,55 @@ class PlaybackController extends ChangeNotifier {
     _bufferedAhead = Duration.zero;
     notifyListeners();
 
+    final source = await _prepareSource(ticket);
+
     await player.open(
       PlaybackMedia.build(
-        ticket.url.toString(),
-        headers: ticket.headers,
+        source.url,
+        headers: source.headers,
         startAt: startAt,
       ),
       play: true,
     );
+  }
+
+  /// 决定这条流**从哪里读**：本地中继，还是原直链。
+  ///
+  /// 中继不是总能成立（源流不支持 Range、长度未知、端口绑不上、是 HLS），
+  /// 拿不到就**原样直连** —— 直连至少能播，所以失败一律静默，只记日志。
+  /// 用户看到的最坏情况是「没变快」，绝不是「播不了」。
+  Future<_PlaybackSource> _prepareSource(StreamTicket ticket) async {
+    // 换源 = 上一条中继会话作废。必须在这里关，不能靠调用方：
+    // `switchQuality` 走的也是 `_loadIntoPlayer`，只关在 `open()` 里的话
+    // 切一次清晰度就多留一条后台预取的会话。
+    await _releaseRelay();
+
+    final relay = _relay;
+    final length = ticket.contentLength;
+    if (relay == null || length == null || length <= 0) {
+      return _PlaybackSource(ticket.url.toString(), ticket.headers);
+    }
+    if (!isRelayableUrl(ticket.url)) {
+      return _PlaybackSource(ticket.url.toString(), ticket.headers);
+    }
+
+    final endpoint = await relay.open(ticket, label: _item?.displayTitle);
+    if (endpoint == null) {
+      return _PlaybackSource(ticket.url.toString(), ticket.headers);
+    }
+    _relayToken = endpoint.token;
+    diag.info('播放', '已交给本地中继：${(length / 1073741824).toStringAsFixed(2)} GiB');
+    // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
+    // 中继服务，它自己会在发往上游时带上。
+    return _PlaybackSource(endpoint.uri.toString(), const <String, String>{});
+  }
+
+  Future<void> _releaseRelay() async {
+    final token = _relayToken;
+    _relayToken = null;
+    final relay = _relay;
+    if (token == null || relay == null) return;
+    await relay.close(token);
   }
 
   /// 决定「当前应该用哪一档」。
@@ -801,11 +879,33 @@ class PlaybackController extends ChangeNotifier {
     // 播放错误。mpv 的报错很笼统（`Failed to open ...`），
     // 但对用户来说「播不了」这个结论是准确的 —— 具体原因看诊断日志。
     _subs.add(player.stream.error.listen((msg) {
+      // ⚠️ 字幕解码失败**必须先分流**：它不是「这条链播不了」，而是
+      // 「本机 libmpv 解不开这种字幕」。掉进下面那行会被
+      // `_error ??=` 记成播放错误（用户会看到「播放器报错」的横幅，
+      // 而画面其实好好的），而且这句话不含 `failed`/`error`，
+      // 本来就会被关键词过滤丢掉 —— 两头都不落好。
+      if (isSubtitleDiagnosticLog(msg)) {
+        diag.warn('播放', 'mpv 字幕：$msg');
+        return;
+      }
       final lower = msg.toLowerCase();
       if (!lower.contains('failed') && !lower.contains('error')) return;
       diag.warn('播放', 'mpv 报错：$msg');
       _error ??= '播放器报错：$msg';
       notifyListeners();
+    }));
+
+    // ⚠️ 字幕那条**只能靠 `stream.log`**，`stream.error` 收不到。
+    //
+    // media_kit 只把特定 prefix 的 error 转发到 `stream.error`
+    // （`file` / `ffmpeg`（text 必须以 `tcp:` 开头）/ `vd` / `ad` /
+    // `cplayer` / `stream`），而报字幕解码失败的是 `sd_lavc` —— 不在白名单里。
+    // 所以上面那条监听**永远收不到**它，别因为「已经监听了 error」就把这里删掉。
+    //
+    // 代价只有一条 warn 级订阅；实际每条字幕轨最多出一条。
+    _subs.add(player.stream.log.listen((entry) {
+      if (!isSubtitleDiagnosticLog(entry.text)) return;
+      diag.warn('播放', 'mpv 字幕：${entry.text}');
     }));
   }
 
@@ -986,9 +1086,25 @@ class PlaybackController extends ChangeNotifier {
       s.cancel();
     }
     _subs.clear();
+    unawaited(_releaseRelay());
     unawaited(player.dispose());
     super.dispose();
   }
+}
+
+/// 交给 mpv 的最终地址：可能是网盘直链，也可能是本地中继。
+///
+/// 拆成类型而不是返回 `MapEntry`：调用点上看 `source.url` / `source.headers`
+/// 比 `entry.key` / `entry.value` 清楚，而这类「两个值一起换、漏一个就出事」
+/// 的组合正是最该让名字说话的地方 —— 漏换 headers 的表现是「走本地中继
+/// 却被要求带 Cookie」，而 412 的错误信息里根本看不出是头的问题。
+class _PlaybackSource {
+  const _PlaybackSource(this.url, this.headers);
+
+  final String url;
+
+  /// 播放器要带的请求头。**走本地中继时它必须是空的。**
+  final Map<String, String> headers;
 }
 
 /// 从文件名猜字幕格式（用于本地字幕与内嵌轨标签）。

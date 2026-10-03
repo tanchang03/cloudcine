@@ -96,6 +96,8 @@ Future<PlayRequest> buildPlayRequest(
     SettingKeys.rememberPosition,
     SettingKeys.autoPlayNext,
     SettingKeys.skipIntro,
+    SettingKeys.streamRelay,
+    SettingKeys.relayConnections,
   ]);
   final preferred = qualityId ?? _nonEmpty(values[SettingKeys.defaultQuality]);
   // 设置里缺这一项时按「记住」处理：与 `AppSettings.rememberPosition` 的
@@ -107,6 +109,16 @@ Future<PlayRequest> buildPlayRequest(
   // 「这两项在设置页开着却完全不生效」。
   final autoPlayNext = values[SettingKeys.autoPlayNext] != 'false';
   final skipIntro = values[SettingKeys.skipIntro] != 'false';
+  // 中继的两项同理：播放窗口在另一个引擎里，读不到设置库。
+  //
+  // ⚠️ 判据与 `AppSettings.fromValues` **必须逐字一致**（缺失即开 /
+  // 缺失即 8，且同样卡在 1..16）。两处不一致不会报错，只会表现成
+  // 「设置页显示 8 条，实际按 0 条跑」—— 一个没人会想到去查的问题。
+  final streamRelay = values[SettingKeys.streamRelay] != 'false';
+  final relayConnections =
+      (int.tryParse(values[SettingKeys.relayConnections] ?? '') ?? 8)
+          .clamp(1, 16)
+          .toInt();
 
   // 剧集列表与续播位置一起取：它们来自同一批兄弟条目，分两次查会多一次
   // 往返，也容易漏掉「当前这一集」本身（它不是从 `siblings` 里挑出来的，
@@ -170,6 +182,11 @@ Future<PlayRequest> buildPlayRequest(
     startPosition: start,
     // 缓冲指示要用它把「缓存了多少秒」换算成 KB/s，见字段文档。
     sizeBytes: item.sizeBytes,
+    // 中继配置随请求投过去。不带的话独立窗口只能用自己的默认值，于是
+    // 「在设置页关掉中继」只对内置播放页生效 —— 而用户不可能知道这两条
+    // 路是分开的，只会觉得开关时灵时不灵。
+    streamRelay: streamRelay,
+    relayConnections: relayConnections,
     // 画质弹框的数据源。**只有元信息，没有地址** —— 换档要把 id 报回来
     // 重新取链，理由见 `QualityBrief` 的类文档。
     qualities: [

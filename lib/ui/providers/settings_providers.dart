@@ -29,6 +29,8 @@ class AppSettings {
     this.scanMaxDepth = 12,
     this.lastScanAt,
     this.logLevel = 'info',
+    this.streamRelay = true,
+    this.relayConnections = 8,
   });
 
   /// 是否允许联网刮削（总开关）。
@@ -122,6 +124,16 @@ class AppSettings {
   final DateTime? lastScanAt;
   final String logLevel;
 
+  /// 播网盘原画时是否走本地中继（多连接并发预取）。**默认开**，理由见
+  /// `SettingKeys.streamRelay`。
+  ///
+  /// 关掉只会退回「直连播放」这个老行为 —— 中继建不起来时走的也是这条路，
+  /// 所以这一项**永远不可能让视频播不了**。
+  final bool streamRelay;
+
+  /// 本地中继的并发连接数。改它**只影响之后新建的会话**，正在播的不受影响。
+  final int relayConnections;
+
   /// 在线刮削是否**真的**能用：总开关打开 **且** 至少配了一个数据源。
   ///
   /// 两个条件缺一不可，而 UI 上必须把它们合成一个判断 —— 只开开关不填
@@ -159,6 +171,8 @@ class AppSettings {
     int? scanMaxDepth,
     DateTime? lastScanAt,
     String? logLevel,
+    bool? streamRelay,
+    int? relayConnections,
   }) {
     return AppSettings(
       onlineScrape: onlineScrape ?? this.onlineScrape,
@@ -181,6 +195,8 @@ class AppSettings {
       scanMaxDepth: scanMaxDepth ?? this.scanMaxDepth,
       lastScanAt: lastScanAt ?? this.lastScanAt,
       logLevel: logLevel ?? this.logLevel,
+      streamRelay: streamRelay ?? this.streamRelay,
+      relayConnections: relayConnections ?? this.relayConnections,
     );
   }
 
@@ -235,6 +251,15 @@ class AppSettings {
       scanMaxDepth: int.tryParse(v[SettingKeys.scanMaxDepth] ?? '') ?? 12,
       lastScanAt: DateTime.tryParse(v[SettingKeys.lastScanAt] ?? ''),
       logLevel: v[SettingKeys.logLevel] ?? 'info',
+      // 中继两项都是「缺失即用默认」，判据与 autoPlayNext 同族。
+      streamRelay: v[SettingKeys.streamRelay] != 'false',
+      // 卡在 1..16：0 条会让流根本下不来（open 直接返回 null，等于静默关掉
+      // 中继），而几十条一定会触发网盘风控 —— 两种都是「用户只是想调快点，
+      // 结果变成了别的故障」。
+      relayConnections:
+          (int.tryParse(v[SettingKeys.relayConnections] ?? '') ?? 8)
+              .clamp(1, 16)
+              .toInt(),
     );
   }
 }
@@ -269,6 +294,8 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       SettingKeys.scanMaxDepth,
       SettingKeys.lastScanAt,
       SettingKeys.logLevel,
+      SettingKeys.streamRelay,
+      SettingKeys.relayConnections,
     ]);
 
     return AppSettings.fromValues(v);
@@ -295,6 +322,8 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     int? scanIntervalMs,
     int? scanMaxDepth,
     String? logLevel,
+    bool? streamRelay,
+    int? relayConnections,
   }) async {
     final store = ref.read(settingsStoreProvider);
     final current = state.valueOrNull ?? const AppSettings();
@@ -362,6 +391,15 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     if (logLevel != null) {
       await store.write(SettingKeys.logLevel, logLevel);
     }
+    if (streamRelay != null) {
+      await store.writeBool(SettingKeys.streamRelay, streamRelay);
+    }
+    if (relayConnections != null) {
+      await store.write(
+        SettingKeys.relayConnections,
+        '${relayConnections.clamp(1, 16)}',
+      );
+    }
 
     state = AsyncData(
       current.copyWith(
@@ -384,6 +422,8 @@ class SettingsController extends AsyncNotifier<AppSettings> {
         scanIntervalMs: scanIntervalMs,
         scanMaxDepth: scanMaxDepth,
         logLevel: logLevel,
+        streamRelay: streamRelay,
+        relayConnections: relayConnections?.clamp(1, 16).toInt(),
       ),
     );
   }

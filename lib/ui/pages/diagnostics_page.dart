@@ -2,9 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/format.dart';
+import '../../domain/adapters/stream_relay.dart';
+import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/tv_affordance.dart';
@@ -124,6 +128,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                   onCopy: _copyLogPath,
                 ),
               ),
+              const RelayStatusPanel(),
               Expanded(
                 child: lines.isEmpty
                     ? const EmptyState(
@@ -253,6 +258,165 @@ class LogPathRow extends StatelessWidget {
 /// 可以替换实现，不需要真的去碰平台通道。
 Future<void> copyToClipboard(String text) async {
   await Clipboard.setData(ClipboardData(text: text));
+}
+
+/// 本地中继的实时状态。
+///
+/// ## 为什么值得单独摆出来
+///
+/// 「原画卡顿」的因果链全在暗处：用户看不到开了几条连接、拉到了多少字节、
+/// 上游失败了几次。没有这一块，实测只能凭手感说「好像快了点」；而万一还是
+/// 卡，也分不清是「中继没生效」还是「总带宽本来就不够」—— 这两件事的处置
+/// 完全不同（前者要翻日志，后者只能切转码档）。
+///
+/// ## ⚠️ 自己按 1 Hz 拉，不让中继广播
+///
+/// 中继的统计每秒都在变。让它去 `notifyListeners` 会让**整个播放页**每秒
+/// 重建一次；而这里只要一个页面上的数字，按需拉取代价可以忽略。
+class RelayStatusPanel extends ConsumerStatefulWidget {
+  const RelayStatusPanel({super.key});
+
+  @override
+  ConsumerState<RelayStatusPanel> createState() => _RelayStatusPanelState();
+}
+
+class _RelayStatusPanelState extends ConsumerState<RelayStatusPanel> {
+  Timer? _ticker;
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  /// 只在**确实有会话**时才跳秒。
+  ///
+  /// ⚠️ 不这么写的话，诊断页会在测试里留下一个永远在跑的 periodic timer，
+  /// `pumpAndSettle` 会一直等它 —— 测试直接超时，而报错完全指不到这里。
+  void _syncTicker(bool needed) {
+    if (needed && _ticker == null) {
+      _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else if (!needed && _ticker != null) {
+      _ticker!.cancel();
+      _ticker = null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final relay = ref.watch(streamRelayProvider);
+    final stats = relay.aggregateStats;
+    _syncTicker(stats != null);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(22, 0, 22, 10),
+      child: _card(relay, stats),
+    );
+  }
+
+  Widget _card(StreamRelay relay, RelayStats? stats) {
+    final box = BoxDecoration(
+      color: AppTheme.panel,
+      borderRadius: BorderRadius.circular(8),
+      border: Border.all(color: AppTheme.line, width: 0.5),
+    );
+
+    if (stats == null) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: box,
+        child: const Row(
+          children: [
+            Icon(Icons.hub_outlined, size: 15, color: AppTheme.dim),
+            SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '本地中继 · 当前没有走中继的流'
+                '（未启用，或播的是转码档 / 本地文件）',
+                style: TextStyle(fontSize: 11.5, color: AppTheme.dim),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final total = relay.primaryContentLength;
+    final progress = total == null ? null : stats.progressOf(total);
+    final source = relay.sessionLabels.isEmpty ? '' : relay.sessionLabels.first;
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      decoration: box,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.hub_outlined, size: 15, color: AppTheme.accent),
+              const SizedBox(width: 8),
+              Text(
+                '本地中继 · ${stats.activeWorkers} 条连接在拉',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.text,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                progress == null
+                    ? '已拉 ${formatBytes(stats.downloadedBytes)}'
+                    : '已拉 ${formatBytes(stats.downloadedBytes)}'
+                        ' / ${formatBytes(total)}'
+                        '（${(progress * 100).toStringAsFixed(0)}%）',
+                style: const TextStyle(fontSize: 11.5, color: AppTheme.muted),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: LinearProgressIndicator(
+              // 长度未知时给 0 而不是 null：null 会变成**无限循环**的动画，
+              // 而这一页在 widget 测试里会被 `pumpAndSettle` 一直等下去。
+              value: progress ?? 0,
+              minHeight: 4,
+              backgroundColor: AppTheme.line,
+              valueColor: AlwaysStoppedAnimation<Color>(AppTheme.accent),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  source,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: AppTheme.mono.copyWith(fontSize: 10.5),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '缓存 ${formatBytes(stats.cachedBytes)}'
+                ' · 上游请求 ${stats.upstreamRequests}'
+                '${stats.upstreamFailures == 0 ? "" : " · 失败 ${stats.upstreamFailures}"}',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: stats.upstreamFailures == 0
+                      ? AppTheme.dim
+                      : AppTheme.warn,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _LogLine extends StatelessWidget {

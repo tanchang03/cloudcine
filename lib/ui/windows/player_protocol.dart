@@ -431,6 +431,8 @@ class PlayRequest {
     this.skipIntro = true,
     this.introStartMs,
     this.introEndMs,
+    this.streamRelay = true,
+    this.relayConnections = 8,
   });
 
   /// 直链地址（含签名查询串）
@@ -539,6 +541,19 @@ class PlayRequest {
   final int? introStartMs;
   final int? introEndMs;
 
+  /// 播原画时是否走本地多路中继（并发预取）。**默认开**。
+  ///
+  /// ## 为什么必须随请求投过来
+  ///
+  /// 播放窗口跑在**另一个 Flutter 引擎**里，读不到设置库（与
+  /// [autoPlayNext] / [skipIntro] 同一个理由）。不带这一项的话，用户在设置页
+  /// 关掉中继只对内置播放页生效，而独立窗口照旧开着 —— 用户不可能知道
+  /// 这两条路是分开的，只会觉得开关时灵时不灵。
+  final bool streamRelay;
+
+  /// 中继的并发连接数。同样随请求投过来。
+  final int relayConnections;
+
   /// 手标区间；半条标记（只标了起点或终点）当没有。
   ///
   /// 用 `IntroMarker.fromMilliseconds` 而不是在这里各判一次：那个函数还要
@@ -562,6 +577,8 @@ class PlayRequest {
         'skipIntro': skipIntro,
         'introStartMs': introStartMs,
         'introEndMs': introEndMs,
+        'streamRelay': streamRelay,
+        'relayConnections': relayConnections,
       };
 
   /// 从通道参数还原。**任何畸形输入都返回 null，不抛异常** ——
@@ -621,6 +638,8 @@ class PlayRequest {
     final rawSkipIntro = raw['skipIntro'];
     final rawIntroStart = raw['introStartMs'];
     final rawIntroEnd = raw['introEndMs'];
+    final rawStreamRelay = raw['streamRelay'];
+    final rawRelayConnections = raw['relayConnections'];
 
     return PlayRequest(
       url: url,
@@ -648,6 +667,15 @@ class PlayRequest {
           : null,
       introEndMs:
           rawIntroEnd is int && rawIntroEnd > 0 ? rawIntroEnd : null,
+      // 与 autoPlayNext / skipIntro 同一套判据：只有**显式 false** 才关。
+      // 写成 `rawStreamRelay == true` 的话，主窗口某次漏带这个字段就会静默
+      // 关掉中继 —— 而设置页上它是开着的。
+      streamRelay: rawStreamRelay != false,
+      // 越界值夹回来而不是原样信：通道那头给个 0 会让中继直接不下数据
+      // （`_take` 永远挑不出块），表现是「播不了」而不是「慢」。
+      relayConnections: rawRelayConnections is int
+          ? rawRelayConnections.clamp(1, 16).toInt()
+          : 8,
     );
   }
 
@@ -675,6 +703,8 @@ class PlayRequest {
           other.skipIntro == skipIntro &&
           other.introStartMs == introStartMs &&
           other.introEndMs == introEndMs &&
+          other.streamRelay == streamRelay &&
+          other.relayConnections == relayConnections &&
           mapEquals(other.headers, headers) &&
           listEquals(other.qualities, qualities) &&
           listEquals(other.playlist, playlist) &&
@@ -693,6 +723,8 @@ class PlayRequest {
         skipIntro,
         introStartMs,
         introEndMs,
+        streamRelay,
+        relayConnections,
         Object.hashAllUnordered(
           headers.entries.map((e) => Object.hash(e.key, e.value)),
         ),
@@ -1187,6 +1219,11 @@ final RegExp _http4xxPattern = RegExp(r'http error 4\d\d', caseSensitive: false)
 /// av_log 的 context 名（也可能是 `http`）。状态码本身一定在正文里 ——
 /// 按正文判，两种布局都命中。
 bool isHttp4xxLog(String text) => _http4xxPattern.hasMatch(text);
+
+// 字幕那条判定（`isSubtitleDiagnosticLog`）**不在这里**，在
+// `core/utils/mpv_subtitle_log.dart`：内置播放页走 `PlaybackController`
+// （`domain/` 层），那一层不能 import 这个文件。两边用的是同一份实现，
+// 别再复制一份到这里。
 
 /// URL 匹配：`http://` 或 `https://` 起，一直吃到空白字符。
 ///

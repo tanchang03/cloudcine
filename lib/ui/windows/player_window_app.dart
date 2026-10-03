@@ -13,12 +13,17 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/format.dart';
 import '../../core/utils/mpv_cache_state.dart';
 import '../../core/utils/mpv_chapters.dart';
+import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
+import '../../core/utils/player_subtitle_config.dart';
 import '../../core/utils/seek_acceleration.dart';
 import '../../core/utils/text_encoding.dart';
 import '../../core/utils/track_labels.dart';
+import '../../data/stream/local_stream_relay.dart';
+import '../../domain/adapters/stream_relay.dart';
+import '../../domain/entities/stream_ticket.dart';
 import '../../domain/services/cache_speed_meter.dart';
 import '../../domain/services/episode_queue.dart';
 import '../../domain/services/intro_marker.dart';
@@ -316,6 +321,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// mpv 报上来的**真实**内嵌字幕轨。
   List<SubtitleTrack> _embeddedSubtitles = const [];
 
+  /// 上一次已经落过日志的字幕轨清单，用来给 [_onTracks] 去重。
+  ///
+  /// `stream.tracks` 每次轨道变动都会发一遍（打开文件、切轨、探到新信息），
+  /// 不挡一下会把同一份清单反复写进诊断日志 —— 而那份日志是给用户整段
+  /// 复制粘贴的，刷屏会把它变得没法看。
+  String? _loggedSubtitleInventory;
+
   /// 当前选中的音轨 id（[AudioTrack.id]）。
   ///
   /// **以 mpv 回报为准**（`player.stream.track`），不在点击时乐观更新：
@@ -361,6 +373,19 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 正在搜。菜单里那一条要显示成「搜索中…」并且不能再点。
   bool _searchingOnlineSubtitles = false;
 
+  /// 本地流式中继。
+  ///
+  /// ⚠️ 它跑在**播放窗口这个引擎里**，不是主窗口那边：独立窗口是另一个
+  /// Flutter 引擎，够不到主进程的 provider。放本地也让「关掉主窗口、继续在
+  /// 播放窗口里看」照常成立 —— 中继不会跟着主窗口一起消失。
+  ///
+  /// 配置由主窗口随**每条请求**投过来（见 `PlayRequest.streamRelay`），
+  /// 在 [_prepareSource] 里应用。这里的默认值只是「第一次播放之前」的初值。
+  final LocalStreamRelay _relay = LocalStreamRelay();
+
+  /// 当前中继会话标识。换源时必须先关掉旧的（理由见 [_prepareSource]）。
+  String? _relayToken;
+
   @override
   void initState() {
     super.initState();
@@ -378,6 +403,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _playlistUnmountTimer?.cancel();
     _netSpeedTimer?.cancel();
     _playlistController.dispose();
+    // 关掉中继服务本体（含监听端口与所有会话）。只关当前会话是不够的：
+    // 换源路径上的旧会话如果没被清掉，端口会一直挂着。
+    unawaited(_relay.dispose());
     unawaited(_releasePlayer());
 
     // ⚠️ 这行日志是**探针**，不要当成普通日志删掉。
@@ -670,6 +698,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       configuration: const PlayerConfiguration(
         logLevel: MPVLogLevel.warn,
         bufferSize: PlayerBufferConfig.bufferSize,
+        // ⚠️ 缺了它 media_kit 会把 `sub-visibility` 设成 `no`：**所有**字幕
+        // 都不显示且不报错（`stream.track` 照常回报 `sid=1`）。位图字幕
+        // （PGS）更是没有任何替代路径 —— Flutter 层的 `SubtitleView` 只吃
+        // 纯文本。原因见 `player_subtitle_config.dart`。
+        libass: PlayerSubtitleConfig.useLibass,
       ),
     );
     // 先记下来：万一下一行抛异常，dispose 也还能回收这个原生实例。
@@ -720,6 +753,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // `warn`。两处是**配套**的，改一处必须改另一处。
     _subs.add(
       player.stream.log.listen((entry) {
+        // ⚠️ 字幕消息要**先分流**，不能混进下面那条「直链过期」的路：
+        // 字幕解不开跟直链没有半点关系，走进去只会白白刷一次链
+        // （刷完还是解不开，而用户会看到画质档位莫名其妙地跳了一下）。
+        //
+        // 它也不能靠 `stream.error` 那条路兜底 —— 那句话里既没有 `failed`
+        // 也没有 `error`，详见 [isSubtitleDiagnosticLog]。
+        if (isSubtitleDiagnosticLog(entry.text)) {
+          diag.warn('播放窗口', 'mpv 字幕：${redactUrls(entry.text)}');
+          return;
+        }
         if (!isHttp4xxLog(entry.text)) return;
         unawaited(_onTicketExpiryLog(entry));
       }),
@@ -821,9 +864,28 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 轨道清单变了。只存真实的那些（合成轨见 [TrackLabels.realTracks]）。
   void _onTracks(Tracks tracks) {
     if (!mounted) return;
+    final subs = TrackLabels.realTracks(tracks.subtitle, (t) => t.id);
+
+    // 内嵌字幕清单落一条日志。**这是「字幕出不来」的第一分诊点**：
+    //   - 这里就是「无」→ 根本没识别到轨道（容器/文件名的问题）；
+    //   - 这里有轨道、菜单也能选中，但画面没字 → 解码/渲染的问题，
+    //     接着看 `mpv 字幕：…`（见 [isSubtitleDiagnosticLog]）。
+    // 没有这一条，两种故障在日志里长得一模一样，只能靠猜。
+    final inventory = subs
+        .map((t) => '${t.id}/${t.codec ?? "-"}/${t.language ?? "-"}'
+            '${t.isDefault == true ? "/默认" : ""}')
+        .join('，');
+    if (inventory != _loggedSubtitleInventory) {
+      _loggedSubtitleInventory = inventory;
+      diag.info(
+        '播放窗口',
+        '内嵌字幕轨 ${subs.length} 条：${subs.isEmpty ? "无" : inventory}',
+      );
+    }
+
     setState(() {
       _audioTracks = TrackLabels.realTracks(tracks.audio, (t) => t.id);
-      _embeddedSubtitles = TrackLabels.realTracks(tracks.subtitle, (t) => t.id);
+      _embeddedSubtitles = subs;
     });
   }
 
@@ -833,9 +895,21 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 字符串 `'no'`）表示「字幕关着」，它不是轨道号。
   void _onTrackSelection(Track selection) {
     if (!mounted) return;
+    final subId = int.tryParse(selection.subtitle.id);
+
+    // mpv 回报的当前字幕轨也落一条。它和 [_onTracks] 那条配合起来能把
+    // 「字幕出不来」拆成三种，而不是笼统一句「没字幕」：
+    //   1. 清单有、这里始终没有 → 我们的 `setSubtitleTrack` 没生效；
+    //   2. 清单有、这里也有 → mpv 确实选中了，问题在解码/渲染
+    //      （最典型：本机 libmpv 缺 `pgssub` 解码器）；
+    //   3. 这里来回跳 → 有东西在跟我们抢 `sid`。
+    if (subId != _activeSubtitleId) {
+      diag.info('播放窗口', 'mpv 回报当前字幕轨：${selection.subtitle.id}');
+    }
+
     setState(() {
       _activeAudioId = selection.audio.id;
-      _activeSubtitleId = int.tryParse(selection.subtitle.id);
+      _activeSubtitleId = subId;
     });
   }
 
@@ -1038,6 +1112,20 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 是「播到一半卡死、用户只能关窗重开」。误判的代价由 [TicketRefreshGuard]
   /// 兜住：非时效性的失败刷几次就会停，同一次故障的回声由它的冷却窗口收掉。
   Future<void> _onPlayerError(String message) async {
+    // ⚠️ 字幕解码失败**必须先分流并直接返回**，两个理由：
+    //
+    //   1. 换了直链也解不开 —— 这是本机 libmpv 缺解码器，不是链的问题。
+    //      掉进下面那条 `_refreshTicket` 只会让用户看到「档位自己跳了一下、
+    //      字幕照旧没有」。
+    //   2. 这句话**不含 `failed` 也不含 `error`**（mpv 说的是
+    //      `Could not find subtitle decoder for format 'hdmv_pgs_subtitle'.`），
+    //      不在这里放行就会被下面那行直接丢掉 —— 实测踩过，
+    //      详见 [isSubtitleDiagnosticLog]。
+    if (isSubtitleDiagnosticLog(message)) {
+      diag.warn('播放窗口', 'mpv 字幕：${redactUrls(message)}');
+      return;
+    }
+
     final lower = message.toLowerCase();
     // 与内置播放页同一套过滤：mpv 的告警里也常带 'error' 字样，
     // 不值得为它重开一次流。
@@ -1501,8 +1589,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       //
       // `startAt` 默认为 `Duration.zero` 而不是 null 也是必须的，理由见
       // [PlaybackMedia]：mpv 的 `start` 属性会**残留**到下一个文件。
+      // 网盘直链先过一遍本地中继（多连接并发预取）。拿不到就**原样直连**：
+      // 中继失败一律静默，最坏只是「没变快」，绝不是「播不了」。
+      final source = await _prepareSource(uri, label, headers);
       await _player!.open(
-        PlaybackMedia.build(uri, headers: headers, startAt: startAt),
+        PlaybackMedia.build(
+          source.url,
+          headers: source.headers,
+          startAt: startAt,
+        ),
         play: true,
       );
       if (!mounted) return;
@@ -1519,6 +1614,66 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// 决定这条流**从哪里读**：本地中继，还是原直链。
+  ///
+  /// 走不通（长度未知 / 是 HLS / 端口绑不上）就原样返回。**失败一律静默** ——
+  /// 用户既没有「重试」按钮也没有第二个开关，弹提示只会让人以为播放坏了，
+  /// 而真相是「这次没加速」。
+  Future<({String url, Map<String, String> headers})> _prepareSource(
+    String uri,
+    String label,
+    Map<String, String> headers,
+  ) async {
+    // 先把主窗口投过来的配置应用上（见 `PlayRequest.streamRelay`）。
+    // 不应用的话这里只能用自己的默认值，「在设置页关掉中继」对独立窗口就
+    // 不生效 —— 而用户不可能知道这两条路是分开的，只会觉得开关时灵时不灵。
+    final request = _currentRequest;
+    _relay.configure(
+      enabled: request?.streamRelay ?? true,
+      connections: request?.relayConnections ?? 8,
+    );
+
+    // 换源 = 上一条中继会话作废。必须放在**这里**而不是「播新片」那条路：
+    // 换清晰度、刷新过期直链走的也都是 `_openStream`，只关在播新片那里的话，
+    // 用户切一次清晰度就多留一条后台预取的会话，几次之后带宽被它们吃光 ——
+    // 表现是「越播越卡，而且跟画质无关」。
+    await _releaseRelay();
+
+    final parsed = Uri.tryParse(uri);
+    final size = _currentRequest?.sizeBytes;
+    // 没有请求头 = 本地文件 / 内置自检视频，本来就不走网络。
+    if (parsed == null || size == null || size <= 0 || headers.isEmpty) {
+      return (url: uri, headers: headers);
+    }
+    if (!isRelayableUrl(parsed)) {
+      return (url: uri, headers: headers);
+    }
+
+    final endpoint = await _relay.open(
+      StreamTicket(
+        url: parsed,
+        headers: headers,
+        contentLength: size,
+        supportsRange: true,
+      ),
+      label: label,
+    );
+    if (endpoint == null) {
+      return (url: uri, headers: headers);
+    }
+    _relayToken = endpoint.token;
+    // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
+    // 中继服务，它会在发往上游时自己带上。
+    return (url: endpoint.uri.toString(), headers: const <String, String>{});
+  }
+
+  Future<void> _releaseRelay() async {
+    final token = _relayToken;
+    _relayToken = null;
+    if (token == null) return;
+    await _relay.close(token);
   }
 
   /// 弹提示用的 messenger。
@@ -2964,6 +3119,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       case _SubtitleKind.embedded:
         // 内嵌轨的选择态由 mpv 回报（`stream.track` → `_activeSubtitleId`），
         // 这里只把三个「外挂字幕」的记账清掉。
+        //
+        // 落一条日志是为了对上 [isSubtitleDiagnosticLog] 那条：mpv 报
+        // 「解不开」时必须能回答「我们到底让它解哪一条」。缺了这条，
+        // 只看到一句 `Could not find subtitle decoder` 是不知道该怪谁的。
+        diag.info('播放窗口', '选择内嵌字幕轨：id=${picked.trackId}');
         _clearExternalSubtitle();
         await player.setSubtitleTrack(
           SubtitleTrack('${picked.trackId}', null, null),
@@ -3322,6 +3482,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                         position: played,
                         cacheAhead: _cacheAhead,
                         duration: total,
+                        // mpv 自己说在等数据时，缓冲层收到播放头。理由（VBR
+                        // 原画上 `demuxer-cache-time` 会严重虚高）见
+                        // [PlayerBufferProgress.fraction]。
+                        stalled: _buffering,
                       ),
                       // 时长还不知道时（还在解文件头）不给拖：拖了也没意义，
                       // 而且滑块会在真时长到达时突然跳一下。

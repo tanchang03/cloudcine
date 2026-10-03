@@ -95,6 +95,39 @@ void main() {
 
       expect(f, 1.0);
     });
+
+    test('mpv 说在等数据时，缓冲层收回到播放头', () {
+      // 这是**修正**而不是保守：`demuxer-cache-time` 是「缓存字节 ÷ 估算
+      // 码率」换算出来的，VBR 原画上会严重虚高 —— 缓存 200 MB，按文件头报的
+      // 7.7 Mbps 算成「还有 207 秒」，可那一段实际是 35 Mbps，只够 45 秒。
+      // 于是用户看到「进度条说超前三分钟，画面却每隔几十秒卡一下」——
+      // 两个数都不假，只是口径不同。
+      //
+      // `paused-for-cache`（media_kit 的 `stream.buffering`）是仲裁者：它
+      // 为真时「播放头前面没有可用的缓冲」就是事实，缓冲层必须照实收回去。
+      final f = PlayerBufferProgress.fraction(
+        position: position,
+        cacheAhead: ahead,
+        duration: total,
+        stalled: true,
+      );
+
+      // 与「缓存为 0」同一个落点：播放头。
+      expect(f, closeTo(10 / 45, 1e-9));
+    });
+
+    test('卡顿时哪怕缓存量看着很大也不往前画', () {
+      // 上面那条注释里的虚高场景：mpv 报 20 分钟，实际一分半后就见底。
+      // 不拦住的话，缓冲层会一路画到 30/45 处，而画面此刻正卡着。
+      final f = PlayerBufferProgress.fraction(
+        position: position,
+        cacheAhead: const Duration(minutes: 20),
+        duration: total,
+        stalled: true,
+      );
+
+      expect(f, closeTo(10 / 45, 1e-9));
+    });
   });
 
   group('positionOf', () {

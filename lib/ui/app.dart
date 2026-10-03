@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'providers/app_providers.dart';
 import 'router/app_router.dart';
 import 'theme/app_theme.dart';
 import 'widgets/app_logo.dart';
@@ -25,6 +26,11 @@ class CloudCineApp extends ConsumerWidget {
     // 它不产出值，watch 的目的只是建立生命周期绑定 —— 容器销毁时 Provider
     // 会 `onDispose` 把回调摘掉，免得闭包留着一个失效的 `ref`。
     ref.watch(playerBridgeHostProvider);
+
+    // 把设置里的中继开关推给中继实例。与上面同一个理由：副作用 Provider
+    // 必须有人 watch 才会执行。而且这里**必须**是 watch 而不是 read ——
+    // read 只跑一次，用户之后在设置页改开关就不会生效。
+    ref.watch(relayConfigSyncProvider);
 
     return MaterialApp.router(
       title: AppLogo.appName,

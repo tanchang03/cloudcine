@@ -744,6 +744,43 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ref.read(settingsProvider.notifier).set(skipIntro: v),
             ),
           ),
+          const SizedBox(height: 16),
+          const Divider(height: 1, color: AppTheme.line),
+          const SizedBox(height: 14),
+          // 这一组与上面几项的区别是「数据怎么取」，不是「播放时做什么」，
+          // 所以另起一段。
+          _ToggleRow(
+            label: '原画多路加速（本地中继）',
+            hint: s.streamRelay
+                ? '播网盘原画时改用多条连接并发预取，再交给播放器。'
+                    '4K 原画在单条连接上追不上播放时，这一项正是「缓冲看着不少'
+                    '却一会一卡」的解药。'
+                : '已关闭。原画退回单条连接直连播放。',
+            value: s.streamRelay,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(streamRelay: v),
+            ),
+          ),
+          _SliderRow(
+            label: '并发连接数',
+            valueLabel: '${s.relayConnections} 条',
+            value: s.relayConnections.toDouble(),
+            min: 1,
+            max: 16,
+            divisions: 15,
+            onChanged: (v) => unawaited(
+              ref
+                  .read(settingsProvider.notifier)
+                  .set(relayConnections: v.round()),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '只在播网盘**原画**时生效：转码清晰度本来就是分片下发的，'
+            '用不上它，也不会被它影响。改这一项只作用于之后新开的播放，'
+            '正在播的不受影响。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
         ],
       ),
     );

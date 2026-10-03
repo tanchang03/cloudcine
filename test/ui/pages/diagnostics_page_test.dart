@@ -1,11 +1,19 @@
 import 'package:cloudcine/ui/pages/diagnostics_page.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// 日志页的取向是「取证材料要能带走」。这里钉住的是**带走路径**那一步：
 /// 它看着不起眼，但少了它，用户能看见日志却没法把「文件在哪」告诉别人。
 void main() {
-  Widget wrap(Widget child) => MaterialApp(home: Scaffold(body: child));
+  /// 诊断页里有一块「本地中继状态」，它要读 Riverpod 容器。
+  ///
+  /// ⚠️ 这里**不需要** override 任何数据库相关的 Provider：中继 Provider 刻意
+  /// 不依赖设置（理由见 `streamRelayProvider` 的文档），构造它只是 new 一个
+  /// 纯 Dart 对象 —— 不碰平台通道，也不 bind 端口（端口是 lazy 的）。
+  Widget wrap(Widget child) => ProviderScope(
+        child: MaterialApp(home: Scaffold(body: child)),
+      );
 
   /// ⚠️ `TextButton.icon` 造出来的是 `TextButton` 的**私有子类**
   /// （`_TextButtonWithIcon`），而 `find.byType` 只按精确类型匹配 ——
@@ -76,7 +84,9 @@ void main() {
 
   group('DiagnosticsPage 接线', () {
     testWidgets('路径那一行接到了日志单例上（未启动时按钮禁用）', (tester) async {
-      await tester.pumpWidget(const MaterialApp(home: DiagnosticsPage()));
+      await tester.pumpWidget(
+        const ProviderScope(child: MaterialApp(home: DiagnosticsPage())),
+      );
 
       final row = find.byType(LogPathRow);
       expect(row, findsOneWidget);
@@ -95,6 +105,24 @@ void main() {
         find.descendant(of: row, matching: copyPathButton()),
       );
       expect(button.onPressed, isNull);
+    });
+  });
+
+  group('RelayStatusPanel', () {
+    testWidgets('没有会话时说明原因，而不是显示一排 0', (tester) async {
+      await tester.pumpWidget(wrap(const RelayStatusPanel()));
+
+      // 显示「0 连接 · 已拉 0 B」会让人以为中继在跑却什么都没拉到，而真相
+      // 是它根本没被用上（没开、播的是转码档、或播的是本地文件）。
+      expect(find.textContaining('当前没有走中继的流'), findsOneWidget);
+    });
+
+    testWidgets('没有会话时不留下 periodic timer', (tester) async {
+      await tester.pumpWidget(wrap(const RelayStatusPanel()));
+
+      // ⚠️ 这条不是形式主义：跳秒的 timer 一旦在无会话时也启动，诊断页在
+      // 任何 `pumpAndSettle` 的用例里都会**超时**，而报错完全指不到这里。
+      await tester.pumpAndSettle();
     });
   });
 }

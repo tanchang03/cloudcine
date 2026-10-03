@@ -15,7 +15,7 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 `core/` 纯工具 · `domain/` 实体+服务+适配器抽象（**不 import Flutter/drift**）· `data/` 夸克/HTTP/drift/刮削/凭证 · `ui/` Riverpod 组合根 + go_router + 页面。跨层信号放叶子文件，**别让组合根 invalidate feature provider**。
 
 ## 文件夹模式与局部发现（2026-10-01）
-- 文件夹视图的数据源是**网盘实时目录**（`driveListingProvider` 按 `DriveCrumb` 逐层列），**不是**已扫描的媒体库；本地索引退居「已入库」叠加。
+- 文件夹视图的数据源是**网盘实时目录**（`driveListingProvider` 逐层列），**不是**已扫描的媒体库；本地索引退居「已入库」叠加。
 - 局部发现与全盘扫描共用三份唯一实现：`media_entry_classifier.dart`（镜像判定必须在视频判定**之前**）、`work_builder.dart`、`request_throttle.dart`。
 - 三条硬约束（做错不报错，只表现为数据悄悄坏掉）：**绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。
 - 两条入口共用 QPS：发现让着扫描（`DiscoveryController.canStart` 看 `scanController.running`），`MediaDiscoveryService._active` 防重入。
@@ -48,12 +48,12 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 macOS 点播放走**独立窗口** `player_window_app.dart`，内置播放页 `player_page.dart` 是另一份。**键位表、三个菜单都要改两处**，只改一个=用户看到「功能没做」。数字键表与长按加速**共用**（`player_keys.dart`、`seek_acceleration.dart`），但⚠️「一串结束了没有」两边机制不同：`Focus.onKeyEvent` 有 key-up、`CallbackShortcuts` 只能靠 700ms 超时。
 **菜单统一走 `ui/widgets/anchored_menu.dart`**（贴按钮正上方划出）；别退回 `AlertDialog`（屏幕正中）或 `CompositedTransformFollower`（飘左上角）。摆位是纯函数 `anchoredMenuOffset`，有单测。
 **进度条**：两播放器共用 `ui/widgets/buffered_slider.dart`（**0..1 比例**）。算法只在 `core/utils/player_buffer_progress.dart`：`demuxer-cache-time` 是播放头**前面**的秒数 → 缓冲位置 = 播放头 + 它；时长未知返回 **null** 不画。
-音轨源 `player.stream.tracks` 必须过 `TrackLabels.realTracks` 剔掉 media_kit 的 `auto`/`no` 合成轨；**选中态以 `player.stream.track` 回报为准**。字幕四路枚举穷举，漏一种=「点了没反应」。搜索走 `subtitle_query.dart`：**绝不能拿 `displayTitle` 去搜**。**跨引擎错误只认 `PlatformException`**。
+音轨源 `player.stream.tracks` 必须过 `TrackLabels.realTracks` 剔掉 media_kit 合成轨；**选中态以 `player.stream.track` 回报为准**。字幕四路枚举穷举，漏一种=「点了没反应」。搜索走 `subtitle_query.dart`：**绝不能拿 `displayTitle` 去搜**。**跨引擎错误只认 `PlatformException`**。
 ## 媒体库三轴（不能互相推导/合并）
 - `MediaKind`（结构）：只看文件名 `SxxExx`。
 - `MediaCategory`（语义）：落库 `media_works.category`；空串≠other。`MediaCategoryGuesser.guess` 序：TMDB genres→目录路径→片名+文件名→结构兜底；ASCII 关键词必须卡词边界。
 - 「最近播放」（视图）：只看播过的，不落库（`LibraryFilter.playedOnly`）；与 `category` 互斥、与 `query` 叠加。
-**交互**：`PlayTarget.resolve` ①最近播过且留续播点→那集 ②播过但续播点清→仍是那集 ③全新→第一集；排掉 `isSampleOrExtra`。`playItem()` 是唯一起播入口。`mergeWorkForUpsert`：`category` 取新值但**先按 `effectiveGenres` 折算**；手动标记的行整列不动；`posterUrl` 永不为空；`source=manual` 只被**显式**刮削覆盖（`overrideManual`；那时**分类与锁都取 incoming**，不认旧锁，§「手动重刮改了类型却没生效」）。
+**交互**：`PlayTarget.resolve` ①最近播过且留续播点→那集 ②播过但续播点清→仍是那集 ③全新→第一集；排掉 `isSampleOrExtra`。`playItem()` 是唯一起播入口。`mergeWorkForUpsert`：`category` 取新值但**先按 `effectiveGenres` 折算**；手动标记的行整列不动；`posterUrl` 永不为空；`source=manual` 只被**显式**刮削覆盖（`overrideManual`；那时**分类与锁都取 incoming**，不认旧锁）。
 **路径**：归一化只在 `core/utils/drive_paths.dart`（`/电影` 与 `/电影/` 变两键→静默筛不到）；`dirPath` 带尾斜杠、目录树内部不带（`drivePathJoin`）。目录视图不排序；搜索只筛当前层。
 
 ## 目录名作为系列名（§）
@@ -63,29 +63,30 @@ macOS 点播放走**独立窗口** `player_window_app.dart`，内置播放页 `p
 `MediaItem` + **`part/partLabel`**（v9）；`MediaWork` + **`seasonCount`**（v10）+ **`mergedInto`**（v11）。层级**不落库**（`work_levels.dart` 现算）：**季在外、部在内**，某层**少于 2 个选项不画**。
 - 自动归一在 `work_merge_planner.dart`（纯函数）：**只认 `onlineId` 相同 + `source==online` + kind 相同**，`manual` 不参与；目标=itemCount 最大→firstSeenAt 最早→key 升序。**本地片名相似度绝不参与**；手动闸门 `manualBlocker` 同处；`siblingOf` 复用 `planFor`。
 - **手动归一**「合并到…」（`MergeWorkDialog`，**无刮削门槛**）：留下**选中的那一部**；不能合→按钮灰+原因（自己 / 目标已别名 / **源自己还折着别人**）；撤销=目标页「拆开」。
-- ⚠️ 卡片三个计数是**并集**：`listWorks` 读时现算、**不写回**、**只碰真有源的行**；`seasonCount` 是 `COUNT(DISTINCT)`**不能相加**；`allWorks`/`workByKey` 仍存值。
-- ⛔ `_unionStats` SQL **别改回 JOIN 里的 `OR`**（用不上索引 → 336ms；必须两段 `UNION ALL` 等值连接 = 3ms）；第一段的 `EXISTS` **别删**（删了 6.4s，且会覆盖无关作品）。`listWorks` 唯一热路径（§）。
-- ⛔ **归一 = 打标记，不删行、不改 `group_key`**：列表/角标滤 `merged_into IS NULL`、`itemsForWork` 取并集、撤销=清标记。**不许链式**。⚠️ `mergeWorkForUpsert` 里它**无条件取旧值**（照抄=重扫拆开）；`copyWith` **清不掉**它；搜索穿透折叠时内层表**必须起别名**。
+- ⚠️ 卡片三个计数是**并集**：`listWorks` 读时现算、**不写回**、**只碰真有源的行**；`seasonCount` 是 `COUNT(DISTINCT)`**不能相加**。
+- ⛔ `_unionStats` SQL **别改回 JOIN 里的 `OR`**（336ms → 必须两段 `UNION ALL` 等值连接 = 3ms）；第一段的 `EXISTS` **别删**（删了 6.4s）。`listWorks` 唯一热路径（§）。
+- ⛔ **归一 = 打标记，不删行、不改 `group_key`**：列表/角标滤 `merged_into IS NULL`、`itemsForWork` 取并集、撤销=清标记。**不许链式**。⚠️ `mergeWorkForUpsert` 里**无条件取旧值**（照抄=重扫拆开）；`copyWith` **清不掉**它；搜索穿透折叠内层表**必须起别名**。
 - 设置 `autoMergeByOnlineId` **默认开**（判据 `!= 'false'`，与 `autoScrapeOnScan` 相反）。
+
+## 原画加速：本地多路中继（2026-10-03，细节见当日日志）
+`data/stream/local_stream_relay.dart`：loopback + N 路并发 Range 预取 + LRU + 插队，**只服务原画**（`.m3u8` 由 `isRelayableUrl` 排除）。三条雷：⛔ 上游 `findProxy=DIRECT`（否则直链被 `http_proxy` 代理掉）；⛔ `Accept-Encoding: identity`；⛔ 设置同步**别重建中继对象**（掐断在播的流）。
 
 ## 筛选面板（§）
 `library_filter_panel.dart`，`MenuAnchor` 浮层；用普通 `InkWell` → **点 chip 不关面板**；内部 `SingleChildScrollView` 必须 `primary: false`（否则抛异常）。TV 无 Esc → 底有常驻「关闭」+ `PopScope`。
 - `LibraryFilter.years`（**具体年份**）/ `.genres`；空集合=这一维不限；多选之间「或」；`clearExtra()` **只清这两组**。
 - `==`/`hashCode` 必须按**集合内容**比（`setEquals` + `Object.hashAllUnordered`）—— Set 默认引用相等，会让 Riverpod 误判「没变」。
-- **角标口径 = 「清空年份/类型后列表的条数」**：跟着 `category`/`playedOnly`/`query` 收窄、**不跟** years/genres。刷新点别漏（§）。⚠️ 三条陷阱见 §。
+- **角标口径 = 「清空年份/类型后列表的条数」**：跟着 `category`/`playedOnly`/`query` 收窄、**不跟** years/genres。刷新点与三条陷阱见 §。
 
 ## 封面与刮削
 `posterFaceX` 与 `posterUrl` **必须成对**；`keptWidth` 必须 `LayoutBuilder` 现算。
-无「国内版 TMDB」（DNS 污染+SNI 阻断）；TMDB/豆瓣响应形状**≠夸克信封**（照夸克信封读**静默得空**）；熔断只计**网络层**失败，连 3 次即断、任何 HTTP 响应即清零。
-**TMDB `/search/*` 是模糊搜索，绝不能取 `results.first`**：必须过 `scrape_match.dart` 的 `ScrapeMatch` 闸门（§）；全没过闸门时必须 `diag.info` 留痕。
-**手动刮削通道**（§「手动刮削」）：片名被插字符或只剩分辨率时**自动算法救不回来**。三条交互不许改：①预填**文件名解析出的词**；②打开时**不自带搜索**；③点候选只是**选中**，再点「用这一条更新」才生效。**不过闸门**。刮完：库里已有同 `onlineId` 的一部→自动归一/否则提示；对话框可手选媒体类型。⚠️ **手动通道的「自动」= 按本次刮削重判**：忽略分类锁、**连语义档也会被 `tv/`/`movie/` 改写**（§）；自动通道仍认锁。⚠️ `implements MetadataScraper` **不继承默认实现**（§）。
-**「自定义」**：`customizeWork` **整行写、不过 merge**（merge 的「海报永不为空」会把刚清的补回来）。⚠️ 只清**刮来的** `genres`，`genresManual` 的行连类型带锁一起留；`categoryManual` 只在**改了分类**时才锁。清刮削后封面回落网盘缩略图（含 v13 文件级锚点、加列须同步迁移测试 DROP）：§「自定义清刮削后封面回落」。
+无「国内版 TMDB」；TMDB/豆瓣响应形状**≠夸克信封**（照夸克信封读**静默得空**）；熔断只计**网络层**失败，连 3 次即断、任何 HTTP 响应即清零；豆瓣的熔断要会过期，`title` 只能来自响应体。
+**TMDB `/search/*` 是模糊搜索，绝不能取 `results.first`**：必须过 `scrape_match.dart` 的 `ScrapeMatch` 闸门（§）；全没过闸门必须 `diag.info` 留痕。
+**手动刮削通道**（§）：片名被插字符或只剩分辨率时**自动算法救不回来**。三条交互（预填文件名解析词 / 打开不自动搜 / 选中后才生效）与「不过闸门」不许改（§）。刮完：库里已有同 `onlineId` 的一部→自动归一/否则提示；可手选媒体类型。⚠️ **手动通道的「自动」= 按本次刮削重判**：忽略分类锁、**连语义档也会被 `tv/`/`movie/` 改写**（§）；自动通道仍认锁。⚠️ `implements MetadataScraper` **不继承默认实现**（§）。
+**「自定义」**：`customizeWork` **整行写、不过 merge**（merge 的「海报永不为空」会把刚清的补回来）。⚠️ 只清**刮来的** `genres`，`genresManual` 的行连类型带锁一起留；`categoryManual` 只在**改了分类**时才锁。清刮削后封面回落网盘缩略图：§。
 **刮削文案按「通道」分**：`WorkScrapeOutcome.message` 取 `(status, channel)`，`channel` 必填（§）。
-豆瓣（§477）：熔断要会过期；`title` 只能来自响应体。
 
 ## 测试取向
-纯函数优先；断言写「为什么重要」。**基线：`flutter test` 1473 例全过**。
-- ⚠️ **文档进度表/「仍未做」行会过期，判据按代码核**。
+纯函数优先；断言写「为什么重要」。**基线：`flutter test` 1584 例全过**。
 - ⚠️ **修并发/竞态 bug：先加测试跑一遍确认确实红，再加修复**。
 - ⚠️ 用户常**边改边跑**，全量冒 1~2 红例是常态。**判据=红的在不在我改的文件里**（文件名+mtime），用户正在改的**别碰**。
 - ⚠️ **测相似度/打分别猜数值，先写脚本跑**；断言写 `lessThan(ScrapeMatch.weakSimilarity)` 这类**档位边界**。

@@ -16,6 +16,7 @@ import '../../data/registry/adapter_registry.dart';
 import '../../data/remote/quark/quark_adapter.dart';
 import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/poster_cache.dart';
+import '../../data/stream/local_stream_relay.dart';
 import '../../domain/adapters/credential_store.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/drive_provider.dart';
@@ -23,6 +24,7 @@ import '../../domain/services/library_backup_service.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/subtitle_service.dart';
 import 'library_refresh_providers.dart';
+import 'settings_providers.dart';
 
 /// 组合根。
 ///
@@ -143,6 +145,39 @@ final subtitleResolverProvider = Provider<SubtitleResolver>(
   ),
 );
 
+/// 本地流式中继（多连接并发预取网盘直链）。
+///
+/// ⚠️ **刻意不读设置**。读设置就得依赖 `settingsProvider`，而它是异步的、
+/// 底下连着数据库 —— 任何只想「看一眼中继状态」的地方（诊断页）都会被拖着
+/// 把数据库建一遍，单元测试里还会直接炸。设置由 [relayConfigSyncProvider]
+/// 单独推过来。
+final streamRelayProvider = Provider<LocalStreamRelay>((ref) {
+  final relay = LocalStreamRelay();
+  ref.onDispose(() => unawaited(relay.dispose()));
+  return relay;
+});
+
+/// 把设置里的中继开关推给 [streamRelayProvider]。**不产出值**。
+///
+/// ## 两个「不能」
+///
+/// 1. **不能让它去建中继**（`watch` 出来再改）：设置一变就会重建中继对象
+///    → `dispose` → 关掉所有会话 → 掐断 mpv 正在读的那条流。用户只是在
+///    设置页拨了一下开关，不该把正在播的视频搞停 —— 而这是最难联想到的
+///    一种因果关系。所以走 [LocalStreamRelay.configure]（就地改），不重建。
+/// 2. **不能没人 watch**：副作用 Provider 不产出值，必须在 `CloudCineApp`
+///    的 `build` 里 watch 一次才生效。漏了它的表现是「设置页开关点了没反应」，
+///    而且**没有任何报错**。
+final relayConfigSyncProvider = Provider<void>((ref) {
+  final relay = ref.watch(streamRelayProvider);
+  final settings = ref.watch(settingsProvider).valueOrNull;
+  if (settings == null) return;
+  relay.configure(
+    enabled: settings.streamRelay,
+    connections: settings.relayConnections,
+  );
+});
+
 /// 播放控制器。
 ///
 /// 用 `Provider` + `ListenableBuilder` 而不是 `ChangeNotifierProvider`：
@@ -152,6 +187,7 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
   final controller = PlaybackController(
     registry: ref.watch(adapterRegistryProvider),
     subtitleResolver: ref.watch(subtitleResolverProvider),
+    relay: ref.watch(streamRelayProvider),
   );
 
   // 播放进度落库。**在组合根接而不是在播放页接**：这样即使用户在播放中

@@ -40,13 +40,33 @@ class PlayerBufferProgress {
   ///
   /// 返回 null 而不是 0：时长还没解出来时画一条空的或满的缓冲层，都是在
   /// 凭空编造信息。进度条上宁可只有「已播」和「底」两层。
+  ///
+  /// ## [stalled]：mpv 说「在等数据」时，缓冲层必须收回到播放头
+  ///
+  /// 这不是保守处理，是**修正一个已知的虚高**：`demuxer-cache-time` 是
+  /// 「缓存字节 ÷ 估算码率」换算出来的秒数，而那个估算码率来自文件头。
+  /// VBR 的高码率原画上误差极大 —— 缓存 200 MB，按文件头报的 7.7 Mbps 算
+  /// 成「还有 207 秒」，可那一段实际是 35 Mbps，只够 45 秒。
+  ///
+  /// 于是用户看到的是：进度条说缓冲超前三分钟，画面却每隔几十秒卡一下 ——
+  /// 两个数字都不假，只是口径不同。
+  ///
+  /// 而 `paused-for-cache`（media_kit 的 `Player.stream.buffering`）是 mpv
+  /// 直接报的**状态**，不经过任何换算。它为真的时候，「播放头前面没有可用
+  /// 的缓冲」就是事实，缓冲层必须如实收回到播放头 —— 否则进度条等于在
+  /// 骗人，而用户唯一能据此做的判断（「能不能往前拖」）会全错。
   static double? fraction({
     required Duration position,
     required Duration cacheAhead,
     required Duration duration,
+    bool stalled = false,
   }) {
     final totalMs = duration.inMilliseconds;
     if (totalMs <= 0) return null;
+
+    if (stalled) {
+      return (position.inMilliseconds / totalMs).clamp(0.0, 1.0);
+    }
 
     final reachedMs = positionOf(
       position: position,

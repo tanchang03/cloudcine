@@ -159,6 +159,24 @@ class SettingKeys {
   /// 诊断日志级别（`debug` / `info` / `warn` / `error`）
   static const String logLevel = 'log_level';
 
+  /// 播网盘原画时是否走**本地中继**（多连接并发预取 + 本地缓存）。
+  ///
+  /// ## 默认**开**
+  ///
+  /// 夸克原画直链是一条 TCP 顺序读，而网盘对单连接普遍有吞吐上限，于是
+  /// 4K 原画在一条连接上永远追不上播放 —— 症状就是「缓冲看着不少，却每隔
+  /// 几十秒卡一下」。中继把它换成多条并发连接，正是夸克自己的播放器的做法。
+  ///
+  /// ⚠️ 判据必须是 `!= 'false'`：写成 `== 'true'` 的后果是「新装用户等于
+  /// 没开」，而设置页的开关是开着的 —— 这类默认值问题没有任何报错。
+  ///
+  /// 关掉它的唯一理由是排查「是不是中继把播放搞坏了」。中继建不起来时会
+  /// **静默退回直连**，所以关掉它永远只是回到老行为，不会让视频播不了。
+  static const String streamRelay = 'stream_relay';
+
+  /// 本地中继的并发连接数。默认 8，上限 16。
+  static const String relayConnections = 'relay_connections';
+
   /// 备份同步的网盘目录名。空串 = 用默认目录名「云影备份」。
   static const String backupDirName = 'backup_dir_name';
 
