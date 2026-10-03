@@ -122,6 +122,19 @@ class SettingKeys {
   /// 播放倍速（如 `1.0`）
   static const String playerRate = 'player_rate';
 
+  /// 播放器「音效」预设（`auto` / `upmix` / `stereo` / `passthrough`）。
+  ///
+  /// ## 为什么它要落库，而不是每次播放重新选
+  ///
+  /// 它描述的是**这台设备怎么接音箱**（笔记本扬声器？HDMI 接功放？），
+  /// 那是环境属性，不是「这一部片子的偏好」—— 换一集、换一部片子都不会变。
+  /// 夸克播放器也明确写着「会记住常用的画质、**音效**和倍速设置」。
+  /// 不记的话，用户每开一个视频都要重新选一次。
+  ///
+  /// 取值由 `PlayerAudioEffect.parse` 还原；读不懂一律退回 `auto`，
+  /// 所以旧版本写坏的值不会让播放器起不来。
+  static const String playerAudioEffect = 'player_audio_effect';
+
   /// 是否记住播放进度
   static const String rememberPosition = 'remember_position';
 

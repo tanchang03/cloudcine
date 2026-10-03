@@ -20,14 +20,14 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 - 三条硬约束（做错不报错，只表现为数据悄悄坏掉）：**绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。
 - 两条入口共用 QPS：发现让着扫描（`DiscoveryController.canStart` 看 `scanController.running`），`MediaDiscoveryService._active` 防重入。
 
-## macOS 签名与 entitlements（§254 §275）
+## macOS 签名与 entitlements（§）
 - ⛔ 两份 entitlements 都不许写 `keychain-access-groups`：受限能力项，ad-hoc 下 taskgated 判签名无效 → **启动即 SIGKILL**（崩溃报告无栈）。
 - `app-sandbox` 必须 **`false`**。两份都要 `network.client`·`network.server`·`files.user-selected.read-only`；`DebugProfile` 另加 `get-task-allow`（缺了 `flutter run` 卡住、无窗口）。
-- 部署目标 10.15；Podfile `post_install` 逐 target 覆盖；两段补丁别删：`cloudcine_fix_media_kit_symlinks`、`FileUtils.rm_rf`。⚠️ `pod install` 前设 `LANG/LC_ALL=en_US.UTF-8`（路径含中文）。`MainFlutterWindow.swift` 的 `setOnWindowCreatedCallback { RegisterGeneratedPlugins }` 别删，否则子窗口插件全 `MissingPluginException`。
+- 部署目标 10.15；Podfile 两段补丁别删（`cloudcine_fix_media_kit_symlinks`、`FileUtils.rm_rf`）；⚠️ `pod install` 前设 `LANG/LC_ALL=en_US.UTF-8`。`MainFlutterWindow.swift` 的 `RegisterGeneratedPlugins` 回调别删（否则子窗口插件全 `MissingPluginException`）。
 
 ## 凭证存储：macOS **不用钥匙串**（§335）
 `SecureCredentialStore` 按平台挑后端：其余平台走 `flutter_secure_storage`；**macOS 走 `EncryptedFileSecretBackend`**（`credentials.enc`，`secret_cipher.dart`）。
-- ⛔ **别再试钥匙串**：ACL 只认「创建条目的那份签名」，ad-hoc（重建即变）→ 每次启动弹密码框（§335）。
+- ⛔ **别再试钥匙串**：ACL 只认「创建条目的那份签名」，ad-hoc（重建即变）→ 每次启动弹密码框（§）。
 - ⚠️ 密钥由 `IOPlatformUUID` 派生 → **同机同用户任何程序都能解开**；**别掺易变环境值**（`localHostname` 跟电脑名走，改名即解不开→静默掉登录）。⚠️ 依赖 `appSupportDirProvider`（`main()` override），漏了抛 `UnimplementedError`。
 
 ## 不可动摇的设计约束
@@ -42,13 +42,13 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 9. 夸克上传收尾**两步**、备份同步比 `libraryModifiedAt`，各有空守卫；`includeSettings`/`restoreSettings` 是**空开关**（§）。
 10. Android TV 构建：`flutter build apk --release` 已通（须无沙箱**且前台**，其余见 §「Android 构建」）。
 11. **TV 上 `SelectableText` 是焦点陷阱**（D-pad 进去出不来）→ 用 `widgets/tv_text.dart` 的 `TvSelectableText`（§）。
-**缓冲**：`PlayerBufferConfig` 是两播放器共用真源，只改这个文件。
-
 ## 播放器（两个播放器各一份，别只改一个）
-macOS 点播放走**独立窗口** `player_window_app.dart`，内置播放页 `player_page.dart` 是另一份。**键位表、三个菜单都要改两处**，只改一个=用户看到「功能没做」。数字键表与长按加速**共用**（`player_keys.dart`、`seek_acceleration.dart`），但⚠️「一串结束了没有」两边机制不同：`Focus.onKeyEvent` 有 key-up、`CallbackShortcuts` 只能靠 700ms 超时。
+macOS 点播放走**独立窗口** `player_window_app.dart`，内置播放页 `player_page.dart` 是另一份。**键位表、菜单都要改两处**，只改一个=用户看到「功能没做」。键位表与长按加速**共用**（§），但⚠️「一串结束了没有」两边机制不同（§）。
 **菜单统一走 `ui/widgets/anchored_menu.dart`**（贴按钮正上方划出）；别退回 `AlertDialog`（屏幕正中）或 `CompositedTransformFollower`（飘左上角）。摆位是纯函数 `anchoredMenuOffset`，有单测。
-**进度条**：两播放器共用 `ui/widgets/buffered_slider.dart`（**0..1 比例**）。算法只在 `core/utils/player_buffer_progress.dart`：`demuxer-cache-time` 是播放头**前面**的秒数 → 缓冲位置 = 播放头 + 它；时长未知返回 **null** 不画。
+**进度条/缓冲**：两播放器共用 `ui/widgets/buffered_slider.dart`（**0..1 比例**），算法只在 `core/utils/player_buffer_progress.dart`、参数真源 `PlayerBufferConfig`。⛔ `demuxer-cache-time` 是**绝对时间戳**（=缓存末尾位置），**不是**「播放头前面多少秒」；时长未知返回 **null** 不画。
 音轨源 `player.stream.tracks` 必须过 `TrackLabels.realTracks` 剔掉 media_kit 合成轨；**选中态以 `player.stream.track` 回报为准**。字幕四路枚举穷举，漏一种=「点了没反应」。搜索走 `subtitle_query.dart`：**绝不能拿 `displayTitle` 去搜**。**跨引擎错误只认 `PlatformException`**。
+**剧集面板**：主标题=**原始文件名**、副标题=`集号 · 码率`；`title` 与文件名**折叠后互含**才算重复。
+**音效 ≠ 音轨**（音效是播放端对输出的处理，与片源无关）：`core/utils/player_audio_effect.dart`；⛔ 本库 Avfilter 无可用音频滤镜、**`af set` 返回值不能当依据**（§）。
 ## 媒体库三轴（不能互相推导/合并）
 - `MediaKind`（结构）：只看文件名 `SxxExx`。
 - `MediaCategory`（语义）：落库 `media_works.category`；空串≠other。`MediaCategoryGuesser.guess` 序：TMDB genres→目录路径→片名+文件名→结构兜底；ASCII 关键词必须卡词边界。
@@ -86,7 +86,7 @@ macOS 点播放走**独立窗口** `player_window_app.dart`，内置播放页 `p
 **刮削文案按「通道」分**：`WorkScrapeOutcome.message` 取 `(status, channel)`，`channel` 必填（§）。
 
 ## 测试取向
-纯函数优先；断言写「为什么重要」。**基线：`flutter test` 1584 例全过**。
+纯函数优先；断言写「为什么重要」。**基线：`flutter test` 1626 例全过**。
 - ⚠️ **修并发/竞态 bug：先加测试跑一遍确认确实红，再加修复**。
 - ⚠️ 用户常**边改边跑**，全量冒 1~2 红例是常态。**判据=红的在不在我改的文件里**（文件名+mtime），用户正在改的**别碰**。
 - ⚠️ **测相似度/打分别猜数值，先写脚本跑**；断言写 `lessThan(ScrapeMatch.weakSimilarity)` 这类**档位边界**。

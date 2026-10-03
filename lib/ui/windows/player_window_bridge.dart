@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/player_audio_effect.dart';
 import 'player_protocol.dart';
 import 'window_launch.dart';
 
@@ -118,6 +119,19 @@ abstract final class PlayerBridgeMethod {
   /// 删除**必须由主窗口执行**：它要删的是 `media_items` 与 `media_works`
   /// 两行，而播放窗口刻意不碰数据库 —— 与 [saveIntroRange] 同一条边界。
   static const String removeMissingMedia = 'removeMissingMedia';
+
+  /// 播放窗口 → 主窗口：「用户把音效换成了这一档，存下来」。
+  ///
+  /// 参数是 `{'value': 'auto' | 'upmix' | 'stereo' | 'passthrough'}`，返回
+  /// `null`（**不返回值**：这是一条单向通知，播放窗口那边音效早已生效，
+  /// 不需要等落库结果）。
+  ///
+  /// ## 为什么这一条也必须回主窗口写
+  ///
+  /// 与 [saveIntroRange] 同一条边界：设置库装在主窗口，播放窗口跑在另一个
+  /// 引擎里读不到它。不回传的话，用户在播放窗口里选的音效只在**这一次**有效
+  /// —— 下次开窗口又变回设置里那一档，而用户完全不知道为什么。
+  static const String saveAudioEffect = 'saveAudioEffect';
 }
 
 /// 跨引擎通道上的**错误码**。
@@ -202,6 +216,15 @@ Future<String?> Function(int fileId)? onFetchOnlineSubtitle;
 /// 那会被读成「点了没反应」。
 Future<IntroRangeSnapshot?> Function(IntroRangeSaveRequest request)?
     onSaveIntroRange;
+
+/// 播放窗口把用户选的「音效」预设报回来时，主窗口该做什么。
+///
+/// 与 [onSaveIntroRange] 同样的理由必须由 UI 层装上（要拿设置库）。
+///
+/// **没有返回值**：这是一条单向通知。播放窗口那边音效早已生效（它自己就能设
+/// mpv 属性），落库只是「下次还记得」—— 拿不到结果也不该拦住用户。
+/// 所以回调失败只记日志，不回传错误。
+Future<void> Function(AudioEffectPreset preset)? onSaveAudioEffect;
 
 /// 播放窗口问「这一条是不是已经没了」时，主窗口该做什么。
 ///
@@ -446,9 +469,44 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       diag.info('窗口', '移除结果：$removed');
       return removed;
 
+    case PlayerBridgeMethod.saveAudioEffect:
+      // 解不开的值**不报错**，只忽略：这是一条单向通知，播放窗口那边不等
+      // 结果。为一条存不下来的设置把异常抛回去，只会让用户看到一个与
+      // 他的操作毫无关系的错误弹窗。
+      final preset = _audioEffectFromArguments(call.arguments);
+      if (preset == null) {
+        diag.warn('窗口', '收到解不开的音效值，忽略：${call.arguments}');
+        return null;
+      }
+      final saveEffect = onSaveAudioEffect;
+      if (saveEffect == null) {
+        diag.warn('窗口', '播放窗口要保存音效，但没有装上保存回调');
+        return null;
+      }
+      diag.info('窗口', '播放窗口把音效改成了「${PlayerAudioEffect.label(preset)}」');
+      await saveEffect(preset);
+      return null;
+
     default:
       throw MissingPluginException('主窗口未实现的通道方法：${call.method}');
   }
+}
+
+/// 从通道参数里取出音效预设。畸形输入返回 `null`。
+///
+/// 走 `PlayerAudioEffect.parse` 而不是在这里比字符串：那个函数同时承担
+/// 「读不懂时退回默认」这条规则，这里再判一次就会多出第二份口径。
+/// 但它**把未知值悄悄变成 `auto`**，所以这里要先确认那个字符串确实是已知档位
+/// —— 否则「播放窗口报了个未来版本的档位」会被记成「用户选了跟随片源」，
+/// 写进库就把用户原来的设置抹掉了。
+AudioEffectPreset? _audioEffectFromArguments(Object? raw) {
+  if (raw is! Map) return null;
+  final value = raw['value'];
+  if (value is! String) return null;
+  for (final p in PlayerAudioEffect.all) {
+    if (p.value == value) return p;
+  }
+  return null;
 }
 
 /// 播放窗口侧：处理主窗口发过来的请求。

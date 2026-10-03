@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/player_audio_effect.dart';
 import '../../data/db/settings_store.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
@@ -98,6 +99,7 @@ Future<PlayRequest> buildPlayRequest(
     SettingKeys.skipIntro,
     SettingKeys.streamRelay,
     SettingKeys.relayConnections,
+    SettingKeys.playerAudioEffect,
   ]);
   final preferred = qualityId ?? _nonEmpty(values[SettingKeys.defaultQuality]);
   // 设置里缺这一项时按「记住」处理：与 `AppSettings.rememberPosition` 的
@@ -210,6 +212,11 @@ Future<PlayRequest> buildPlayRequest(
     subtitles: await _buildSubtitles(repository, item.id),
     autoPlayNext: autoPlayNext,
     skipIntro: skipIntro,
+    // 音效同理必须随请求过来（播放窗口读不到设置库）。**不在这里 parse**：
+    // 原样把字符串投过去，由 `PlayerAudioEffect.parse` 统一还原 ——
+    // 这里再判一次就会多出第二份「读不懂时怎么办」的口径。
+    audioEffect:
+        values[SettingKeys.playerAudioEffect] ?? PlayerAudioEffect.defaultPreset,
     // 手标的片头区间。文件章节那一份由播放窗口自己从 mpv 读（它手里就有），
     // 这一对只能随请求过去 —— 库在主窗口。
     introStartMs: work?.introStartMs,
@@ -260,6 +267,9 @@ List<PlaylistEntry> _buildPlaylist({
       PlaylistEntry(
         itemId: siblings[i].id,
         title: labels[i],
+        // 原始文件名。面板把它当**主标题**显示 —— 见 `PlaylistEntry.fileName`
+        // 的类文档：人话标题（`第 3 集`）在撞名时会变形状，文件名不会。
+        fileName: siblings[i].name,
         subtitle: siblings[i].technicalSummary,
         thumbnailUrl: thumbnailUrl,
         // 原始值（不套「看完就从片头」）—— 面板上要用它画进度条。

@@ -1,6 +1,8 @@
 import 'package:flutter/foundation.dart';
 
+import '../../core/utils/file_names.dart';
 import '../../core/utils/filename_parser.dart';
+import '../../core/utils/player_audio_effect.dart';
 import '../../domain/services/intro_marker.dart';
 import '../../domain/services/missing_media.dart';
 
@@ -278,6 +280,7 @@ class PlaylistEntry {
   const PlaylistEntry({
     required this.itemId,
     required this.title,
+    this.fileName = '',
     this.subtitle = '',
     this.thumbnailUrl,
     this.resumePosition = Duration.zero,
@@ -293,6 +296,23 @@ class PlaylistEntry {
   /// 目录（整目录归一部剧、季集号被刻意清掉）下列表里每一行都是同一个剧名，
   /// 完全分不出是哪一集。组装规则见 `desktop_play.dart` 的 `_episodeLabel`。
   final String title;
+
+  /// **网盘上的原始文件名**（含扩展名，如
+  /// `The.Glory.S01E01.2160p.NF.WEB-DL.SDR.HEVC.DDP5.1.Atmos-老K.mkv`）。
+  ///
+  /// ## 为什么它必须单独有一个字段，而不是从 [title] 里剥
+  ///
+  /// [title] 是**给人看的人话**（`第 3 集`），它会随撞名逐级退让成
+  /// `剧名 S01E03`、再退成 `剧名-文件名`（见 `_playlistLabels`）—— 也就是说
+  /// 同一个字段在不同列表里含义不同，剥不出稳定的文件名。
+  ///
+  /// 而文件名是这一行里**唯一权威的身份**：同一集的国语版 / 粤语版、
+  /// 2160p / 1080p 两个压制，人话标题可能一模一样，文件名不会。
+  /// 面板把它当主标题显示，用户一眼就能对上自己网盘里看到的那一行。
+  ///
+  /// 空串表示「上游没给」—— 老版本主窗口投过来的请求里没有这一项，
+  /// 那时退回 [title] 显示（见 `player_window_app.dart` 的 `_buildEpisodeTile`）。
+  final String fileName;
 
   /// 副标题（`2160P · MKV · H.265 · 12.3 GB`）。可能为空。
   final String subtitle;
@@ -323,9 +343,61 @@ class PlaylistEntry {
   /// 有没有看过一点。面板据此决定要不要画那条细进度条。
   bool get hasProgress => resumePosition > Duration.zero;
 
+  /// 面板第一行（主标题）：**文件名优先**，上游没给时退回 [title]。
+  ///
+  /// 面板把最大的那行字留给文件名，理由见 [fileName]：一行一行往下扫的时候，
+  /// 用户要找的是「网盘上那个文件」，而集号在副标题里同样看得到。
+  String get rowTitle => fileName.isNotEmpty ? fileName : title;
+
+  /// 面板第二行（副标题）：`第 3 集 · 2160P · MKV · H.265 · 12.3 GB`。
+  ///
+  /// 集号**排在最前**，因为它是这一行里最不该被省略号吃掉的字段（后面的
+  /// 码率、体积被截掉无所谓，集号被截掉就等于这一行认不出来了）。
+  ///
+  /// [title] 与 [fileName] 说的是同一件事时**不重复显示** —— 提不出集号的
+  /// 条目，[title] 本身就是 `剧名-文件名`（见 `MediaItem._fileRowLabel`），
+  /// 再往副标题里放一遍就是同一句话出现两次，而这一行只有 ~190px 宽。
+  String get rowSubtitle {
+    final parts = <String>[];
+    if (title.isNotEmpty && !_titleRepeatsFileName) parts.add(title);
+    if (subtitle.isNotEmpty) parts.add(subtitle);
+    return parts.join(' · ');
+  }
+
+  /// [title] 是不是「已经由 [fileName] 说了一遍」。
+  ///
+  /// 判据是**折叠后互相包含**（只留字母数字与汉字、大小写不敏感），因为两条
+  /// 路径写出来的文件名长得不一样：
+  ///   - `剧名-文件名` 用的是**去扩展名**的名字（`_fileRowLabel` 走 `baseNameOf`），
+  ///     而 [fileName] 是带扩展名的原名；
+  ///   - `剧名 S01E03` 那一支（撞名退让）里片名与集号都在 [fileName] 里。
+  /// 直接比字符串一个都对不上，所以两边都折一遍再判包含。
+  bool get _titleRepeatsFileName {
+    final t = _fold(title);
+    if (t.isEmpty || fileName.isEmpty) return false;
+    // 两个候选都要比：`剧名-文件名` 那一支用的是**去扩展名**的名字，
+    // 而 [fileName] 带扩展名。只比带扩展名的那个，这条判据就永远不成立。
+    for (final f in <String>[_fold(fileName), _fold(baseNameOf(fileName))]) {
+      if (f.isEmpty) continue;
+      if (t.contains(f) || f.contains(t)) return true;
+    }
+    return false;
+  }
+
+  /// 只留字母、数字与汉字，大小写不敏感。
+  ///
+  /// 折掉标点是有意的：`The.Glory.S01E01.2160p-老K.mkv` 与
+  /// `剧名-The.Glory.S01E01.2160p-老K` 里那些 `.` `-` 对不上，不折的话
+  /// 上面那条包含判据永远不成立，去重就形同虚设。
+  /// （与 `MediaItem._foldForCompare` 同一套口径，刻意各留一份：一个在
+  /// `domain/`、一个在 `ui/`，共享会把两层绑在一起。）
+  static String _fold(String s) =>
+      s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
+
   Map<String, Object?> toJson() => <String, Object?>{
         'itemId': itemId,
         'title': title,
+        'fileName': fileName,
         'subtitle': subtitle,
         'thumbnailUrl': thumbnailUrl,
         'resumePositionMs': resumePosition.inMilliseconds,
@@ -340,6 +412,7 @@ class PlaylistEntry {
     if (itemId is! String || itemId.isEmpty) return null;
 
     final title = raw['title'];
+    final fileName = raw['fileName'];
     final subtitle = raw['subtitle'];
     final thumbnail = raw['thumbnailUrl'];
     final resume = raw['resumePositionMs'];
@@ -352,6 +425,10 @@ class PlaylistEntry {
     return PlaylistEntry(
       itemId: itemId,
       title: title is String && title.isNotEmpty ? title : itemId,
+      // 缺这一项时给空串（不是回落到 itemId）：空串在 UI 那边是「上游没给，
+      // 请显示 title」的明确信号，而回落到 itemId 会显示成 `provider:fileId`
+      // 那种机器串，比没有人话标题更糟。
+      fileName: fileName is String ? fileName : '',
       subtitle: subtitle is String ? subtitle : '',
       thumbnailUrl: thumbnail is String && thumbnail.isNotEmpty
           ? thumbnail
@@ -372,6 +449,7 @@ class PlaylistEntry {
       other is PlaylistEntry &&
           other.itemId == itemId &&
           other.title == title &&
+          other.fileName == fileName &&
           other.subtitle == subtitle &&
           other.thumbnailUrl == thumbnailUrl &&
           other.resumePosition == resumePosition &&
@@ -382,6 +460,7 @@ class PlaylistEntry {
   int get hashCode => Object.hash(
         itemId,
         title,
+        fileName,
         subtitle,
         thumbnailUrl,
         resumePosition,
@@ -429,6 +508,7 @@ class PlayRequest {
     this.subtitles = const <SubtitleBrief>[],
     this.autoPlayNext = true,
     this.skipIntro = true,
+    this.audioEffect = PlayerAudioEffect.defaultPreset,
     this.introStartMs,
     this.introEndMs,
     this.streamRelay = true,
@@ -526,6 +606,20 @@ class PlayRequest {
   /// 与 [autoPlayNext] 同样必须随请求过来，缺省值同样是 **true**。
   final bool skipIntro;
 
+  /// 「音效」预设的字符串值（`auto` / `upmix` / `stereo` / `passthrough`）。
+  /// 来自设置 `SettingKeys.playerAudioEffect`。
+  ///
+  /// ## 为什么它也得随请求过来
+  ///
+  /// 与 [autoPlayNext] / [skipIntro] / [streamRelay] 同一个理由：播放窗口跑在
+  /// **另一个 Flutter 引擎**里，读不到主窗口的设置库。不带的话，用户在播放页
+  /// 选的音效只对内置播放页生效，独立窗口永远停在默认档 ——
+  /// 而用户不可能知道这两条路是分开的。
+  ///
+  /// 缺省值是 `auto`（跟随片源）：它是**没有副作用**的那一档，
+  /// 主窗口某次忘了带这个字段时最坏结果只是「没上混」，而不是「声音变哑」。
+  final String audioEffect;
+
   /// 用户**手标**的片头区间（毫秒）。`null` = 没标过。
   ///
   /// ## 为什么手标区间要传过来，而文件章节不用
@@ -575,6 +669,7 @@ class PlayRequest {
         'subtitles': subtitles.map((s) => s.toJson()).toList(),
         'autoPlayNext': autoPlayNext,
         'skipIntro': skipIntro,
+        'audioEffect': audioEffect,
         'introStartMs': introStartMs,
         'introEndMs': introEndMs,
         'streamRelay': streamRelay,
@@ -640,6 +735,7 @@ class PlayRequest {
     final rawIntroEnd = raw['introEndMs'];
     final rawStreamRelay = raw['streamRelay'];
     final rawRelayConnections = raw['relayConnections'];
+    final rawAudioEffect = raw['audioEffect'];
 
     return PlayRequest(
       url: url,
@@ -676,6 +772,12 @@ class PlayRequest {
       relayConnections: rawRelayConnections is int
           ? rawRelayConnections.clamp(1, 16).toInt()
           : 8,
+      // 读不懂的值原样留着（不在这里 normalize 成 `auto`）：`PlayerAudioEffect.parse`
+      // 才是那套规则的唯一实现，这里再判一次就会多出第二份口径。
+      // 缺字段时给 `auto` —— 与构造函数的默认值一致。
+      audioEffect: rawAudioEffect is String && rawAudioEffect.isNotEmpty
+          ? rawAudioEffect
+          : PlayerAudioEffect.defaultPreset,
     );
   }
 
@@ -705,6 +807,7 @@ class PlayRequest {
           other.introEndMs == introEndMs &&
           other.streamRelay == streamRelay &&
           other.relayConnections == relayConnections &&
+          other.audioEffect == audioEffect &&
           mapEquals(other.headers, headers) &&
           listEquals(other.qualities, qualities) &&
           listEquals(other.playlist, playlist) &&
@@ -725,6 +828,7 @@ class PlayRequest {
         introEndMs,
         streamRelay,
         relayConnections,
+        audioEffect,
         Object.hashAllUnordered(
           headers.entries.map((e) => Object.hash(e.key, e.value)),
         ),

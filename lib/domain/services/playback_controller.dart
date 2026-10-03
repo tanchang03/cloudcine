@@ -9,6 +9,7 @@ import '../../core/error/drive_error.dart';
 import '../../core/utils/mpv_chapters.dart';
 import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
+import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
 import '../../core/utils/player_subtitle_config.dart';
@@ -168,14 +169,23 @@ class PlaybackController extends ChangeNotifier {
   /// 本次打开的文件是否已经播到结尾。见 [onCompleted]（只在上升沿触发）。
   bool _completed = false;
 
-  /// 已缓存在播放头**前面**的秒数（mpv 的 `demuxer-cache-time`）。
+  /// 缓冲覆盖到的**绝对位置**（mpv 的 `demuxer-cache-time`）。
   ///
-  /// ⚠️ 它不是「从头一共下了多少秒」：mpv 的缓存有上限，填满之后这个数就
-  /// 不再增长，而播放头还在往前走。进度条那层「已缓冲」必须按
-  /// `播放头 + 这个数` 算，规则在 [PlayerBufferProgress]。
-  Duration _bufferedAhead = Duration.zero;
+  /// ⚠️ 它是**时间戳**，不是「播放头前面还有多少秒」—— 手册原文是
+  /// 「returns the **last timestamp** of buffered data in demuxer」。
+  /// 别再加播放头（加了就等于把播放头算两遍，症状见
+  /// [PlayerBufferProgress]）。要「前面还有多少秒」得自己减
+  /// `position`。规则与理由都在 [PlayerBufferProgress]。
+  Duration _cacheEnd = Duration.zero;
   double _volume = 100;
   double _rate = 1.0;
+
+  /// 当前「音效」预设。默认 [AudioEffectPreset.auto]（跟随片源）。
+  ///
+  /// 它由播放页在 bootstrap 时从设置库读出来喂进来（本类不碰数据库），
+  /// 之后用户在菜单里改。换集**不重置** —— 它描述的是这台设备怎么接音箱，
+  /// 与播哪一集无关。
+  AudioEffectPreset _audioEffect = AudioEffectPreset.auto;
 
   /// 当前正在播放的媒体项
   MediaItem? get item => _item;
@@ -191,8 +201,9 @@ class PlaybackController extends ChangeNotifier {
   /// 本地中继的实时统计。**没走中继时是 null。**
   ///
   /// 它是**真实计数**而不是 mpv 的估算：下载了多少字节只有发起请求的那一方
-  /// 才知道确切数字。正好拿来对冲 mpv `demuxer-cache-time` 的估算误差 ——
-  /// 那个数在 VBR 的高码率原画上会严重虚高（见 [bufferedAhead]）。
+  /// 才知道确切数字。正好拿来对冲 mpv `demuxer-cache-time` 的口径差 ——
+  /// 那个数只告诉你「缓存到了哪个时间戳」，换算成「还能看多久」要减播放头，
+  /// 而中继这边是实打实的字节（见 [_cacheEnd]）。
   RelayStats? get relayStats {
     final token = _relayToken;
     if (token == null) return null;
@@ -266,8 +277,8 @@ class PlaybackController extends ChangeNotifier {
   Duration get position => _position;
   Duration get duration => _duration;
 
-  /// 已缓存在播放头前面的秒数。见 [_bufferedAhead]。
-  Duration get bufferedAhead => _bufferedAhead;
+  /// 缓冲覆盖到的绝对位置。见 [_cacheEnd]。
+  Duration get bufferedEnd => _cacheEnd;
 
   /// 进度条上「已缓冲」那一层（0..1）。
   ///
@@ -275,10 +286,10 @@ class PlaybackController extends ChangeNotifier {
   /// 都是编的。
   double? get bufferedFraction => PlayerBufferProgress.fraction(
         position: _position,
-        cacheAhead: _bufferedAhead,
+        cacheEnd: _cacheEnd,
         duration: _duration,
-        // mpv 自己说在等数据时，缓冲层收到播放头。理由（VBR 原画上
-        // `demuxer-cache-time` 会严重虚高）见 [PlayerBufferProgress.fraction]。
+        // mpv 自己说在等数据时，缓冲层收到播放头。理由见
+        // [PlayerBufferProgress.fraction]。
         stalled: _buffering,
       );
 
@@ -286,6 +297,9 @@ class PlaybackController extends ChangeNotifier {
   double get volume => _volume;
 
   double get rate => _rate;
+
+  /// 当前「音效」预设。菜单据此打勾。见 [_audioEffect]。
+  AudioEffectPreset get audioEffect => _audioEffect;
 
   bool get hasMedia => _item != null;
 
@@ -453,17 +467,25 @@ class PlaybackController extends ChangeNotifier {
       '起播=${startAt.inSeconds}s',
     );
     // 换源 = 缓存作废：mpv 是从零重新攒的，旧值属于上一条 URL。不清的话
-    // 新流一开播，进度条上就挂着上一条流（可能是另一个码率）的缓冲量 ——
-    // 而 [_position] 这时已经被恢复成续播点了，两者相加会把缓冲层画到
-    // 一个根本没缓存到的地方去。
+    // 新流一开播，进度条上就挂着上一条流（可能是另一个码率）的缓冲终点 ——
+    // 而 [_position] 这时已经被恢复成续播点了，两者一减/一画就对不上，
+    // 缓冲层会画到一个根本没缓存到的地方去。
     //
     // ⚠️ 必须放在**这个**入口上，不能只放在 `open()` 里：`switchQuality`
     // 换的是同一部片子的另一档转码，走的是本方法而不是 `open()`，
     // 只清 open() 的话「切清晰度」这条路的缓冲层就会残留。
-    _bufferedAhead = Duration.zero;
+    _cacheEnd = Duration.zero;
     notifyListeners();
 
     final source = await _prepareSource(ticket);
+
+    // 音效每次开流前**重新下发一遍**。
+    //
+    // 不能只在下拉里设一次：`audio-channels` 在 mpv 里是按文件选项，换一条
+    // URL（换集 / 切清晰度都走这里）会回到默认值 —— 只设一次的话，第二集
+    // 开始音效就悄悄失效了，而菜单上那个勾还在（勾读的是我们自己的状态）。
+    // 重新下发的代价是两次 setProperty，可以忽略。
+    await PlayerAudioEffect.apply(player, _audioEffect);
 
     await player.open(
       PlaybackMedia.build(
@@ -752,7 +774,7 @@ class PlaybackController extends ChangeNotifier {
     _buffering = false;
     _position = Duration.zero;
     _duration = Duration.zero;
-    _bufferedAhead = Duration.zero;
+    _cacheEnd = Duration.zero;
     _ticket = null;
     _activeQualityId = null;
     _activeSubtitleId = null;
@@ -801,6 +823,19 @@ class PlaybackController extends ChangeNotifier {
     await player.setRate(value.clamp(0.25, 4.0));
   }
 
+  /// 切换「音效」预设。
+  ///
+  /// **立即生效、不用重开流**：`audio-channels` / `audio-spdif` 都是 mpv 的
+  /// 运行期可改属性（实测 `mpv_set_property_string` 返回成功），改完 mpv 自己
+  /// 重配音频输出。重开流反而会把用户正在看的位置丢掉。
+  ///
+  /// ⚠️ 与「音轨」无关，别把两者合并 —— 理由见 `PlayerAudioEffect` 的类文档。
+  Future<void> setAudioEffect(AudioEffectPreset preset) async {
+    _audioEffect = preset;
+    notifyListeners();
+    await PlayerAudioEffect.apply(player, preset);
+  }
+
   // -------------------------------------------------------------------
   // mpv 事件绑定
   // -------------------------------------------------------------------
@@ -839,11 +874,14 @@ class PlaybackController extends ChangeNotifier {
 
     // 缓冲量。进度条上那层「已经缓存到这儿了」用它。
     //
+    // 它是**绝对时间戳**（mpv `demuxer-cache-time` 的语义），不是「前面还有
+    // 多少秒」—— 换算规则见 [PlayerBufferProgress]。
+    //
     // 比 `position` 稀疏得多（mpv 只在缓存量变化时报，而缓存是切片式增长的），
     // 所以不必像位置那样节流。
     _subs.add(player.stream.buffer.listen((v) {
-      if (v == _bufferedAhead) return;
-      _bufferedAhead = v;
+      if (v == _cacheEnd) return;
+      _cacheEnd = v;
       notifyListeners();
     }));
 

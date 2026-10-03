@@ -1,11 +1,16 @@
-/// 由 mpv 的 `demuxer-cache-time`（已缓存到播放头前面多少**秒**）估算缓存速度。
+/// 由 mpv 的 `demuxer-cache-time`（已缓存区间的**结束时间戳**）估算缓存速度。
 ///
 /// ## 为什么要有它
 ///
 /// 缓冲指示要给两个数：**进度**和**速率**。进度 mpv 直接给了
-/// （`cache-buffering-state`，0~100；以及 `demuxer-cache-time` 这个秒数）。
-/// 速率没有 —— media_kit 不暴露字节计数，只暴露「缓存了多少秒」。
+/// （`cache-buffering-state`，0~100；以及 `demuxer-cache-time` 这个时间戳）。
+/// 速率没有 —— media_kit 不暴露字节计数，只暴露「缓存到了哪个时间戳」。
 /// 于是速率只能自己算：对 `demuxer-cache-time` 求时间导数。
+///
+/// ⚠️ 求**差**的写法在这里是安全的：那个值是绝对时间戳，整体偏移不影响斜率。
+/// 但**前提是没有跳变** —— 向前 seek 会让它整体跳升一大截，看起来就像缓存
+/// 暴涨。那种跳变本类挡不住（见 [_rewindToleranceSeconds]），必须由调用方
+/// 在 seek 时显式 [reset]。
 ///
 /// 得到的单位是「每秒能缓存多少秒视频」（下称倍速）。它本身就是有意义的信息
 /// —— `1.0×` 是下载与播放刚好持平的分界线，小于它就迟早会再卡一次。
@@ -49,24 +54,32 @@ class CacheSpeedMeter {
   /// 的字节上限兜底。
   static const double _minSpanSeconds = 1.5;
 
-  /// 缓存量**回退**多少秒算「换了文件」。
+  /// 缓存终点**回退**多少秒算「不连续」。
   ///
-  /// `demuxer-cache-time` 只在两个时刻会变小：换片源（清零）和 seek
-  /// （跳到别处，缓存作废）。两者的旧样本都**一律作废** —— 拿旧文件的
-  /// 缓存增长去除以新文件经过的时间，得到的数字没有任何意义。
+  /// `demuxer-cache-time` 是**绝对时间戳**，它变小只有两种可能：换片源
+  /// （清零）和**往回** seek 到旧缓存区间之前。两种情况下旧样本都**一律
+  /// 作废** —— 拿旧位置的缓存增长去除以新位置经过的时间，得到的数字没有
+  /// 任何意义。
   ///
   /// 留 0.05s 的容差：mpv 的值是从 double 转出来的，浮点毛刺不该被当成换片。
+  ///
+  /// ⚠️ **向前** seek 是反方向：那个值会**跳升**一大截。本容差挡不住它
+  /// （看起来就是"缓存暴涨"），所以调用方在 seek 时必须显式 [reset]。
   static const double _rewindToleranceSeconds = 0.05;
 
   final List<_Sample> _samples = <_Sample>[];
 
-  /// 喂一个新的缓存量，返回当前倍速；样本不够时返回 null。
+  /// 喂一个新的缓存终点（mpv `demuxer-cache-time` 的原始值），返回当前倍速；
+  /// 样本不够时返回 null。
   ///
   /// 返回 null **不是错误**，调用方应当保留上一次的值继续显示，
   /// 而不是把速度清成 0 —— 那样缓冲指示会一格一格地闪。
-  double? accept(Duration cacheAhead) {
+  ///
+  /// ⚠️ 参数是**绝对时间戳**，本方法只关心它的**差**（见文件头）。
+  /// 向前 seek 造成的跳变要调用方自己 [reset]，这里挡不住。
+  double? accept(Duration cacheEnd) {
     final at = _now();
-    final seconds = cacheAhead.inMicroseconds / Duration.microsecondsPerSecond;
+    final seconds = cacheEnd.inMicroseconds / Duration.microsecondsPerSecond;
 
     if (_samples.isNotEmpty &&
         seconds < _samples.last.seconds - _rewindToleranceSeconds) {

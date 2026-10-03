@@ -316,4 +316,132 @@ void main() {
       expect(a == b, isFalse);
     });
   });
+
+  // ------------------------------------------------------------------ 剧集列表
+
+  /// 面板上那一行显示什么，全由这两个 getter 决定（`EpisodeTile` 只负责画）。
+  /// 它们错了不会抛异常，只会「看起来就是这样设计的」。
+  group('PlaylistEntry 面板文案', () {
+    PlaylistEntry entry({
+      String title = '第 3 集',
+      String fileName = '',
+      String subtitle = '',
+      Duration resume = Duration.zero,
+      Duration duration = Duration.zero,
+    }) =>
+        PlaylistEntry(
+          itemId: 'q:1',
+          title: title,
+          fileName: fileName,
+          subtitle: subtitle,
+          resumePosition: resume,
+          duration: duration,
+        );
+
+    test('主标题是文件名，不是集号', () {
+      // 用户扫这个列表是为了找「网盘上那个文件」。显示集号的话，同一集的
+      // 国语版 / 粤语版、2160p / 1080p 两个压制会长得一模一样。
+      expect(
+        entry(title: '第 3 集', fileName: 'The.Glory.S01E03.2160p-老K.mkv')
+            .rowTitle,
+        'The.Glory.S01E03.2160p-老K.mkv',
+      );
+    });
+
+    test('上游没给文件名时退回集号（老版本请求里没有这个字段）', () {
+      expect(entry(title: '第 3 集').rowTitle, '第 3 集');
+    });
+
+    test('副标题里集号排在最前 —— 被省略号吃掉的只能是后面的码率', () {
+      final e = entry(
+        title: '第 3 集',
+        fileName: 'a.S01E03.mkv',
+        subtitle: '2160P · MKV · H.265 · 12.3 GB',
+      );
+      expect(e.rowSubtitle, '第 3 集 · 2160P · MKV · H.265 · 12.3 GB');
+    });
+
+    test('标题与文件名说的是同一件事时不重复显示', () {
+      // 提不出集号的条目，title 本身就是 `剧名-文件名`（见
+      // `MediaItem._fileRowLabel`）。再往副标题里放一遍就是同一句话出现两次，
+      // 而这一行只有约 190px 宽。
+      final e = entry(
+        title: 'F飞CC日 志2-01.国语',
+        fileName: '01.国语.mp4',
+        subtitle: '1080P · MP4',
+      );
+      expect(e.rowSubtitle, '1080P · MP4');
+    });
+
+    test('撞名退让出来的 `剧名 S01E03`，片名与文件名同文时同样不重复', () {
+      // 退让到第二级（`RowLabelStyle.withTitle`）时，标题是
+      // `剧名 S01E03`。刮削到的是英文剧名、文件名也是英文时两者同源，
+      // 主标题里已经写着 `The.Glory.S01E03`，副标题再写一遍是纯噪音。
+      final e = entry(
+        title: 'The Glory S01E03',
+        fileName: 'The.Glory.S01E03.2160p.mkv',
+        subtitle: '2160P',
+      );
+      expect(e.rowSubtitle, '2160P');
+    });
+
+    test('中文剧名对英文文件名不算重复 —— 那一行反而是有用的', () {
+      // 同一支退让，但刮削回来的是中文剧名（`黑暗荣耀`）而网盘文件是英文名
+      // （`The.Glory...`）。折叠后一个是 `黑暗荣耀s01e03`、一个是
+      // `theglorys01e03…`，互不包含。
+      //
+      // 这里**不该**去重：主标题是英文文件名，副标题里的中文 `黑暗荣耀 S01E03`
+      // 是用户唯一能看到「这是第几集」的地方。若为了「像重复」把它删掉，
+      // 副标题就只剩码率，用户反而认不出这一行是第几集。
+      final e = entry(
+        title: '黑暗荣耀 S01E03',
+        fileName: 'The.Glory.S01E03.2160p.mkv',
+        subtitle: '2160P',
+      );
+      expect(e.rowSubtitle, '黑暗荣耀 S01E03 · 2160P');
+    });
+
+    test('副标题为空时不留一个孤零零的分隔符', () {
+      expect(entry(title: '第 1 集', fileName: 'a.mkv').rowSubtitle, '第 1 集');
+      expect(entry(title: '第 1 集', fileName: 'a.mkv', subtitle: '')
+          .rowSubtitle, '第 1 集');
+    });
+
+    test('fileName 能原样过一趟跨引擎通道', () {
+      // 漏了序列化的话，播放窗口收到的 fileName 永远是空串 ——
+      // 表现是「面板上又只剩下集号了」，而没有任何报错。
+      const original = PlaylistEntry(
+        itemId: 'q:9',
+        title: '第 3 集',
+        fileName: 'The.Glory.S01E03.2160p-老K.mkv',
+        subtitle: '2160P · MKV',
+        resumePosition: Duration(minutes: 3),
+        duration: Duration(minutes: 60),
+      );
+
+      final restored = PlaylistEntry.fromJson(original.toJson());
+
+      expect(restored, original);
+      expect(restored!.fileName, 'The.Glory.S01E03.2160p-老K.mkv');
+      expect(restored.rowTitle, 'The.Glory.S01E03.2160p-老K.mkv');
+    });
+
+    test('缺 fileName 的旧请求还原成空串，不是 itemId', () {
+      // 回落到 itemId 会显示成 `provider:fileId` 那种机器串 ——
+      // 比没有人话标题更糟。
+      final restored = PlaylistEntry.fromJson(const <String, Object?>{
+        'itemId': 'q:1',
+        'title': '第 1 集',
+      })!;
+
+      expect(restored.fileName, isEmpty);
+      expect(restored.rowTitle, '第 1 集');
+    });
+
+    test('fileName 变了就不相等 —— 否则面板不会重绘', () {
+      const a = PlaylistEntry(itemId: 'q:1', title: 't', fileName: 'a.mkv');
+      const b = PlaylistEntry(itemId: 'q:1', title: 't', fileName: 'b.mkv');
+      expect(a == b, isFalse);
+    });
+  });
 }

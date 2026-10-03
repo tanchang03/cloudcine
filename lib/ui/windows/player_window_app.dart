@@ -15,6 +15,7 @@ import '../../core/utils/mpv_cache_state.dart';
 import '../../core/utils/mpv_chapters.dart';
 import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
+import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
 import '../../core/utils/player_subtitle_config.dart';
@@ -37,6 +38,7 @@ import '../widgets/buffered_slider.dart';
 import '../widgets/player_keys.dart';
 import '../widgets/tv_text.dart';
 import '../widgets/missing_media_dialog.dart';
+import '../widgets/now_playing_bars.dart';
 import 'child_window_channel.dart';
 import 'player_protocol.dart';
 import 'player_window_bridge.dart';
@@ -108,6 +110,17 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 这个没有原生回调 —— 置顶只能由我们自己改，不存在「被系统改掉」的路径，
   /// 所以本地状态就是真相。
   bool _alwaysOnTop = false;
+
+  /// 当前「音效」预设。
+  ///
+  /// 来源是请求里带的那个字符串（见 `PlayRequest.audioEffect`）—— 播放窗口
+  /// 读不到设置库，用户的选择只能由主窗口投过来。用户在本窗口改了之后，
+  /// 本地立刻生效并**报回主窗口落库**（见 [PlayerBridgeMethod.saveAudioEffect]），
+  /// 下次开窗口才不会又变回默认。
+  ///
+  /// ⚠️ 与「音轨」无关（音轨是片源里封着的流）。两者的区别见
+  /// `core/utils/player_audio_effect.dart` 的类文档。
+  AudioEffectPreset _audioEffect = AudioEffectPreset.auto;
 
   /// 当前是否在播放。控制栏那个播放/暂停按钮跟着它变。
   ///
@@ -204,13 +217,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 没有哪个信号能保证一定来（比如某些流不会触发 video reconfig）。
   bool _awaitingFrame = false;
 
-  /// 已经缓存到播放头**前面**多少秒（mpv 的 `demuxer-cache-time`）。
+  /// 缓冲覆盖到的**绝对位置**（mpv 的 `demuxer-cache-time`）。
   ///
-  /// 注意它不是「从头一共下下来多少」：mpv 的缓存是有上限的，填满之后这个数
-  /// 就停在那儿不动了。所以显示的时候要写「已缓存多少秒（可看多少）」，
-  /// 而不是拿它去除以总时长当百分比 —— 后者在一部长片上是 0.4%，
-  /// 看着像坏了（实测：默认缓存上限下，45 分钟片子的稳定值约 10 秒）。
-  Duration _cacheAhead = Duration.zero;
+  /// ⚠️ 它是**时间戳**，不是「播放头前面还有多少秒」：mpv 手册写的是
+  /// 「returns the **last timestamp** of buffered data in demuxer」，
+  /// 源码里对应 `demux_reader_state.ts_end`。别再加播放头 —— 加了等于把
+  /// 播放头算两遍，症状是「一跳进度条缓冲层就凭空长出一大截」
+  /// （详见 [PlayerBufferProgress]）。
+  ///
+  /// 要「还能看多少秒」得自己减 `position`，见 [_cacheStatusLine]。
+  Duration _cacheEnd = Duration.zero;
 
   /// 缓存速度：**每秒能缓存多少秒视频**。null = 还没算出来。
   ///
@@ -788,14 +804,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
     // 缓存量。缓冲指示上「已缓存多少秒」和「速度」两个数都来自这里。
     //
+    // ⚠️ 它是**绝对时间戳**（mpv `demuxer-cache-time`），不是「前面还有多少
+    // 秒」。直接拿它当增量会把播放头算两遍 —— 见 [PlayerBufferProgress]。
+    // 速度那边靠**求差**，整体偏移不影响结果。
+    //
     // 速度算不出来时**保留上一次的值**：返回 null 只是「这一拍样本不够」，
     // 清成 0 会让数字一格一格地闪，比一直显示同一个旧值更难看。
     _subs.add(
-      player.stream.buffer.listen((ahead) {
-        final rate = _cacheMeter.accept(ahead);
+      player.stream.buffer.listen((end) {
+        final rate = _cacheMeter.accept(end);
         if (!mounted) return;
         setState(() {
-          _cacheAhead = ahead;
+          _cacheEnd = end;
           if (rate != null) {
             _cacheRate = rate;
             // 时间戳跟着值一起走：[_currentCacheRate] 靠它判断这一份还新不新。
@@ -1007,7 +1027,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // `seek` 是异步往返，晚置位会连发几次 seek（画面往前窜、进度条乱跳）。
     final skipTo = _introSession.takeSkipTarget(position);
     if (skipTo != null) {
-      unawaited(_player?.seek(skipTo));
+      unawaited(_seek(skipTo));
       _toast('已跳过片头');
     }
 
@@ -1477,6 +1497,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 必然对不上时间轴。留在菜单里等于给用户埋一个坑。
       _localSubtitle = null;
       _activeLocalPath = null;
+      // 音效**只在换片/换集时**从请求里取。
+      //
+      // ⚠️ 不能放在 `if` 外面：刷新直链也走这个方法，而那条路拿的是同一个
+      // 条目的新请求 —— 如果用户刚在本窗口把音效改成「立体声」，主窗口那边
+      // 落库还没回来时来一次刷新，就会把选择**悄悄改回**请求里带的旧值。
+      // （换片才取，与上面那批「换集清理」同一套时机。）
+      _audioEffect = PlayerAudioEffect.parse(request.audioEffect);
     }
 
     _currentRequest = request;
@@ -1542,7 +1569,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       _awaitingFrame = true;
       // 换片源 = 上一次的缓存量与增速全部作废。不清的话缓冲指示会带着
       // 上一部片子的「已缓存 10 秒」出现，然后突然跳回 0。
-      _cacheAhead = Duration.zero;
+      _cacheEnd = Duration.zero;
       _cacheRate = null;
       _cacheRateAt = null;
       _cacheFill = null;
@@ -1592,6 +1619,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 网盘直链先过一遍本地中继（多连接并发预取）。拿不到就**原样直连**：
       // 中继失败一律静默，最坏只是「没变快」，绝不是「播不了」。
       final source = await _prepareSource(uri, label, headers);
+      // 音效每次开流前重新下发。理由与内置播放页那份相同：`audio-channels`
+      // 是 mpv 的按文件选项，换一条 URL（换集 / 切清晰度 / 刷新直链都走这里）
+      // 会回到默认值 —— 只设一次的话第二集开始音效就悄悄失效了，
+      // 而菜单上那个勾还在。
+      await PlayerAudioEffect.apply(_player!, _audioEffect);
       await _player!.open(
         PlaybackMedia.build(
           source.url,
@@ -1838,6 +1870,27 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _pokeChrome();
   }
 
+  /// 发起 seek 的**唯一**入口 —— 除了转发给 mpv，还负责作废缓存测速的样本。
+  ///
+  /// ## 为什么必须统一走这里
+  ///
+  /// `demuxer-cache-time` 是**绝对时间戳**（见 [PlayerBufferProgress]），
+  /// 所以**向前** seek 会让它整体跳升一大截。那段「增长」不是下载速度，
+  /// 留在 [CacheSpeedMeter] 的窗口里会被算成一个假尖峰（倍速能到几百上千），
+  /// 并在界面上挂满 [_cacheRateStaleAfter]。
+  ///
+  /// [CacheSpeedMeter] 自己的回退容差挡不住这种情况 —— 它处理的是「变小」
+  /// （换片源、往回跳），而向前跳是「变大」，看起来就像缓存暴涨。
+  ///
+  /// 顺手把已经算出的 [_cacheRate] 也清掉：`reset()` 只清样本，旧值还会靠
+  /// 那个 5 秒宽限继续显示，而它一定不适用于新位置。
+  Future<void> _seek(Duration target) async {
+    _cacheMeter.reset();
+    _cacheRate = null;
+    _cacheRateAt = null;
+    await _player?.seek(target);
+  }
+
   /// ← / →：相对跳转。
   ///
   /// 基准取 `player.state.position` 而不是我们自己缓存的某个字段：mpv 的
@@ -1850,7 +1903,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       player.state.position + delta,
       player.state.duration,
     );
-    unawaited(player.seek(target));
+    unawaited(_seek(target));
     // 同 [_onPlayPauseKey]：让用户看见时间码跳到了哪儿。
     _pokeChrome();
   }
@@ -1876,7 +1929,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       Duration(milliseconds: (duration.inMilliseconds * fraction).round()),
       duration,
     );
-    unawaited(player.seek(target));
+    unawaited(_seek(target));
     _pokeChrome();
   }
 
@@ -2158,8 +2211,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   }
 
   /// 「已缓存多少 · 多快」那一行。两样都拿不到就只说在等。
+  ///
+  /// ⚠️ 显示的是**播放头前面还有多少秒**（`缓冲终点 − 播放头`），不是
+  /// [_cacheEnd] 本身。后者是绝对时间戳（语义是「缓存到 14:11 了」），
+  /// 直接印出来会是一个跟总时长同量级的数 —— 而这一行唯一的用处是回答
+  /// 「还能撑多久」，那恰好就是超前的秒数。
   String _cacheStatusLine() {
-    final parts = <String>['已缓存 ${_formatDuration(_cacheAhead)}'];
+    final position = _player?.state.position ?? Duration.zero;
+    final ahead = _cacheEnd > position ? _cacheEnd - position : Duration.zero;
+    final parts = <String>['已缓存 ${_formatDuration(ahead)}'];
 
     final bytes = _currentBytesPerSecond();
     if (bytes != null && bytes >= 1) {
@@ -2477,6 +2537,21 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                             : () => unawaited(_showAudioMenu(buttonContext)),
                       ),
                     ),
+                    // 音效紧挨着音轨，但**不是同一件事**（音轨=片源里的流，
+                    // 音效=输出处理）。图标用等化器而不是喇叭：喇叭在别的
+                    // 播放器里是「音量」，这里再放一个会撞车。
+                    Builder(
+                      builder: (buttonContext) => _buildBarIcon(
+                        icon: Icons.graphic_eq_rounded,
+                        tooltip: _audioEffect == AudioEffectPreset.auto
+                            ? '音效'
+                            : '音效 · ${PlayerAudioEffect.label(_audioEffect)}',
+                        onPressed: _player == null
+                            ? null
+                            : () =>
+                                unawaited(_showAudioEffectMenu(buttonContext)),
+                      ),
+                    ),
                     // 剧集列表的入口**不在这里**。原来它是控制栏上的一个图标，
                     // 但它要跟一个展开后面板走，放在底部控制栏里，展开后会出现
                     // 「按钮在这儿、面板在右上角」的割裂感 —— 现在挪到画面右边缘
@@ -2657,132 +2732,19 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     );
   }
 
+  /// 剧集列表里的一行。
+  ///
+  /// 长什么样、显示哪个字段，全在顶层的 [EpisodeTile] 里 —— 提到那里是为了
+  /// 能在测试里**单独渲染**它。这一行里全是「改错不报错」的规则：主标题该是
+  /// 文件名还是集号、动效只画在当前那一行、副标题怎么拼，错了都不会抛异常，
+  /// 只会看起来「本来就是这么设计的」。
   Widget _buildEpisodeTile(PlaylistEntry entry, {required bool current}) {
-    return InkWell(
+    return EpisodeTile(
+      entry: entry,
+      current: current,
+      progress: episodeProgressOf(entry),
       onTap: () => unawaited(_openEpisode(entry)),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(
-          color: current ? AppTheme.accent.withValues(alpha: 0.16) : null,
-          border: Border(
-            // 左侧那条竖线是「我在这一集」最显眼的标记 —— 背景色在缩略图上
-            // 往往看不出来（图本身可能就很亮）。
-            left: BorderSide(
-              color: current ? AppTheme.accent : Colors.transparent,
-              width: 3,
-            ),
-          ),
-        ),
-        child: Row(
-          children: [
-            _buildThumbnail(entry, current: current),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    entry.title,
-                    // ⚠️ **两行**，不是一行。提不出集号的那些条目标题是
-                    // `剧名-文件名`（见 `desktop_play.dart` 的 `_episodeLabel`），
-                    // 而这一行只有约 194px（面板 320 − 缩略图 96 − 间距与内边距）
-                    // ≈ 中文 15 个字 —— 长剧名一前缀就把文件名挤没了，而那正是
-                    // 用户用来分辨「这是哪一集」的唯一信息。放开一行等于这个
-                    // 修复没做。
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      fontWeight: current ? FontWeight.w600 : FontWeight.w400,
-                      color: current ? Colors.white : Colors.white70,
-                    ),
-                  ),
-                  if (entry.subtitle.isNotEmpty) ...[
-                    const SizedBox(height: 2),
-                    Text(
-                      entry.subtitle,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 10.5, color: Colors.white38),
-                    ),
-                  ],
-                  if (entry.hasProgress) ...[
-                    const SizedBox(height: 5),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(2),
-                      child: LinearProgressIndicator(
-                        value: _episodeProgress(entry),
-                        minHeight: 3,
-                        backgroundColor: Colors.white24,
-                        valueColor: const AlwaysStoppedAnimation<Color>(
-                          AppTheme.accent,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
     );
-  }
-
-  /// 缩略图。
-  ///
-  /// ⚠️ 用的是**作品海报**，不是这一集的截图 —— 网盘不给逐集预览图，
-  /// 我们也没有在列表里逐集解码首帧的能力（那要为每一集起一次 seek）。
-  /// 没有海报时（没开在线刮削、刮削失败、离线）退回占位图。
-  Widget _buildThumbnail(PlaylistEntry entry, {required bool current}) {
-    final url = entry.thumbnailUrl;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(6),
-      child: SizedBox(
-        width: 96,
-        height: 54,
-        child: url == null
-            ? _buildThumbPlaceholder(current: current)
-            : Image.network(
-                url,
-                fit: BoxFit.cover,
-                // ⚠️ 必须兜住失败：海报是 TMDB 的外链，离线、没配 API Key、
-                // 图片被删都会走到这里。不兜的话整个列表会变成一片红色报错块。
-                errorBuilder: (_, _, _) => _buildThumbPlaceholder(current: current),
-                loadingBuilder: (context, child, progress) =>
-                    progress == null
-                        ? child
-                        : _buildThumbPlaceholder(current: current),
-              ),
-      ),
-    );
-  }
-
-  Widget _buildThumbPlaceholder({required bool current}) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: current
-              ? <Color>[AppTheme.accent.withValues(alpha: 0.5), Colors.black54]
-              : const <Color>[Colors.white24, Colors.black54],
-        ),
-      ),
-      child: const Center(
-        child: Icon(Icons.movie_outlined, size: 18, color: Colors.white70),
-      ),
-    );
-  }
-
-  /// 这一集看过多少（0..1）。
-  ///
-  /// 时长未知时返回 0 —— 画一条满格或半格的**假**进度比不画更误导。
-  double _episodeProgress(PlaylistEntry entry) {
-    final total = entry.duration.inMilliseconds;
-    if (total <= 0) return 0;
-    return (entry.resumePosition.inMilliseconds / total).clamp(0.0, 1.0);
   }
 
   // -------------------------------------------------------------------
@@ -2921,7 +2883,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       case _IntroAction.jump:
         final marker = _introSession.marker;
         if (marker == null) return;
-        unawaited(_player?.seek(marker.start));
+        unawaited(_seek(marker.start));
 
       case _IntroAction.clear:
         final snapshot = await _saveIntroRange(request.itemId, clear: true);
@@ -3011,6 +2973,70 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 不在这里 setState 记「已选中」：成功与否由 `stream.track` 回报
     // （见 [_activeAudioId]）。
     await player.setAudioTrack(picked);
+  }
+
+  /// 「音效」菜单 —— 输出的声道 / 直通模式。
+  ///
+  /// ⛔ 与紧邻的 [_showAudioMenu]（音轨）**不是同一件事**，虽然名字只差一个字：
+  /// 音轨列的是**片源里封着的流**（换一集就换一批），音效是**播放端对输出的
+  /// 处理方式**（与片源封了什么无关）。夸克播放器也把它们分成「语言」与
+  /// 「音效」两个入口。合并两者的第一个后果是用户会以为「音效」里那一列
+  /// 就是能选的音轨，找不到粤语时来报「音轨丢了」。
+  /// 完整理由与「为什么只有四个选项」见 `core/utils/player_audio_effect.dart`。
+  Future<void> _showAudioEffectMenu(BuildContext buttonContext) async {
+    final player = _player;
+    if (player == null) return;
+
+    _cancelHide();
+    if (!buttonContext.mounted) {
+      _pokeChrome();
+      return;
+    }
+    final navigator = Navigator.of(buttonContext, rootNavigator: true);
+    final anchor = globalRectOf(buttonContext);
+    if (anchor == null) {
+      _pokeChrome();
+      return;
+    }
+
+    final picked = await _pinnedMenu(
+      () => showAnchoredMenu<AudioEffectPreset>(
+        navigator: navigator,
+        anchor: anchor,
+        builder: (context) => _AudioEffectMenuPanel(active: _audioEffect),
+      ),
+    );
+    if (!mounted) return;
+    _pokeChrome();
+    // 选的是当前这一档时**什么都不做**：白跑一次 `setProperty` 会让 mpv
+    // 重配音频输出（听感上是一次极短的断音），而用户什么都没改。
+    if (picked == null || picked == _audioEffect) return;
+
+    setState(() => _audioEffect = picked);
+    // 立即生效、不重开流：`audio-channels` / `audio-spdif` 都是 mpv 运行期
+    // 可改的属性，而重开流会把用户正在看的位置丢掉。
+    await PlayerAudioEffect.apply(player, picked);
+    // 报回主窗口落库 —— 播放窗口刻意不碰数据库（见本类的类文档）。
+    unawaited(_saveAudioEffect(picked));
+  }
+
+  /// 把音效选择报回主窗口，由它写进设置库。
+  ///
+  /// 失败**不影响本次播放**（音效已经生效了），只记一条日志 —— 但必须留痕：
+  /// 否则用户下次开窗口发现音效又变回默认，而日志里一条线索都没有。
+  Future<void> _saveAudioEffect(AudioEffectPreset preset) async {
+    if (!_channelReady) {
+      diag.warn('音效', '跨窗口通道不可用，音效设置存不下来（本次播放已生效）');
+      return;
+    }
+    try {
+      await playerWindowChannel.invokeMethod<void>(
+        PlayerBridgeMethod.saveAudioEffect,
+        <String, Object?>{'value': preset.value},
+      );
+    } catch (e) {
+      diag.warn('音效', '音效设置没能报回主窗口（本次播放已生效）：$e');
+    }
   }
 
   /// 字幕选择菜单。
@@ -3475,16 +3501,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                       value: hasDuration
                           ? (current.inMilliseconds / maxMs).clamp(0.0, 1.0)
                           : 0,
-                      // 「已经缓存到这儿了」那一层。见 [_cacheAhead]：它是
-                      // 播放头**前面**的秒数，换算成进度的规则在
+                      // 「已经缓存到这儿了」那一层。见 [_cacheEnd]：它是
+                      // **绝对位置**（不是「前面还有多少秒」），换算规则在
                       // [PlayerBufferProgress]；时长未知时返回 null（不画）。
                       buffered: PlayerBufferProgress.fraction(
                         position: played,
-                        cacheAhead: _cacheAhead,
+                        cacheEnd: _cacheEnd,
                         duration: total,
-                        // mpv 自己说在等数据时，缓冲层收到播放头。理由（VBR
-                        // 原画上 `demuxer-cache-time` 会严重虚高）见
-                        // [PlayerBufferProgress.fraction]。
+                        // mpv 自己说在等数据时，缓冲层收到播放头。
+                        // 理由见 [PlayerBufferProgress.fraction]。
                         stalled: _buffering,
                       ),
                       // 时长还不知道时（还在解文件头）不给拖：拖了也没意义，
@@ -3499,7 +3524,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                       // 位置本来就没有意义。松手才真的跳。
                       onChangeEnd: (v) async {
                         setState(() => _seekPreview = null);
-                        await player.seek(
+                        await _seek(
                           Duration(milliseconds: (v * maxMs).round()),
                         );
                       },
@@ -3817,6 +3842,190 @@ class _SelfCheckRow extends StatelessWidget {
   }
 }
 
+/// 剧集列表里的一行。
+///
+/// ## 为什么它是顶层类，而不是 `_PlayerWindowAppState` 的一个方法
+///
+/// 这一行里有三条**改错不报错**的规则，必须能单独渲染来测：
+///
+///   1. 主标题是**文件名**（`PlaylistEntry.rowTitle`），不是集号 ——
+///      用户扫这个列表是为了找「网盘上那个文件」；
+///   2. 「正在播放」动效**只画在当前那一行**（画满全表 = 没有任何信息）；
+///   3. 副标题里集号排在最前，被省略号吃掉的只能是后面的码率 / 体积。
+///
+/// 三条错了都不会抛异常，只会看起来「本来就是这么设计的」。而窗口整体在
+/// `flutter test` 里根本建不出来（`Player()` 找不到 libmpv），所以只能把它
+/// 单独拿出来渲染 —— 与 `buildAudioMenuForTest` 同一个理由。
+@visibleForTesting
+class EpisodeTile extends StatelessWidget {
+  const EpisodeTile({
+    super.key,
+    required this.entry,
+    required this.current,
+    required this.progress,
+    this.onTap,
+  });
+
+  final PlaylistEntry entry;
+
+  /// 是不是**正在播**的那一集。决定背景、左侧竖线、字重与动效。
+  final bool current;
+
+  /// 看过多少（0..1）。见 [episodeProgressOf]。
+  final double progress;
+
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: current ? AppTheme.accent.withValues(alpha: 0.16) : null,
+          border: Border(
+            // 左侧那条竖线是「我在这一集」最显眼的标记 —— 背景色在缩略图上
+            // 往往看不出来（图本身可能就很亮）。
+            left: BorderSide(
+              color: current ? AppTheme.accent : Colors.transparent,
+              width: 3,
+            ),
+          ),
+        ),
+        child: Row(
+          children: [
+            _buildThumbnail(),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    // **文件名优先**（见 `PlaylistEntry.rowTitle`）。面板上最大的
+                    // 那行字给文件名：用户扫这个列表是为了找「网盘上那个文件」，
+                    // 而集号在下面一行同样看得到 —— 夸克的播放列表也是这么排的。
+                    entry.rowTitle,
+                    // ⚠️ **两行**，不是一行。文件名动辄六七十个字符
+                    //（`The.Glory.S01E01.2160p.NF.WEB-DL.SDR.HEVC.DDP5.1.Atmos-老K.mkv`），
+                    // 而这一行只有约 190px（面板 320 − 缩略图 96 − 间距与内边距）
+                    // ≈ 中文 15 个字。放开一行等于只剩开头那几个字符，
+                    // 而 `S01E01` 恰好就在开头之后不远 —— 挤掉的是分辨能力本身。
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      // 当前这一集加粗。非当前的用 w500 而不是 w400：这一行现在
+                      // 是**文件名**，等宽度参差、整体偏细，w400 在 12.5px 下
+                      // 糊成一团灰线。
+                      fontWeight: current ? FontWeight.w600 : FontWeight.w500,
+                      color: current ? Colors.white : Colors.white70,
+                      height: 1.25,
+                    ),
+                  ),
+                  if (entry.rowSubtitle.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      // 集号排在最前（见 `PlaylistEntry.rowSubtitle`）——
+                      // 这一行只有一行，省略号吃掉末尾的码率无所谓，
+                      // 吃掉集号就等于这一行认不出是哪一集了。
+                      entry.rowSubtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        color: Colors.white38,
+                      ),
+                    ),
+                  ],
+                  if (entry.hasProgress) ...[
+                    const SizedBox(height: 5),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: progress,
+                        minHeight: 3,
+                        backgroundColor: Colors.white24,
+                        valueColor: const AlwaysStoppedAnimation<Color>(
+                          AppTheme.accent,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            // 「正在播放」动效。只画在当前这一集上 —— 静态标记（左侧竖线、
+            // 背景色、加粗）已经有三处了，**动**才是那个缺掉的信号。
+            //
+            // 放在行尾而不是压在缩略图上：缩略图是**作品海报**（网盘不给逐集
+            // 预览图），每行都是同一张，盖住它等于把唯一的视觉锚点弄脏。
+            if (current) ...[
+              const SizedBox(width: 8),
+              const NowPlayingBars(size: 14),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 缩略图。
+  ///
+  /// ⚠️ 用的是**作品海报**，不是这一集的截图 —— 网盘不给逐集预览图，
+  /// 我们也没有在列表里逐集解码首帧的能力（那要为每一集起一次 seek）。
+  /// 没有海报时（没开在线刮削、刮削失败、离线）退回占位图。
+  Widget _buildThumbnail() {
+    final url = entry.thumbnailUrl;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: SizedBox(
+        width: 96,
+        height: 54,
+        child: url == null
+            ? _buildThumbPlaceholder()
+            : Image.network(
+                url,
+                fit: BoxFit.cover,
+                // ⚠️ 必须兜住失败：海报是 TMDB 的外链，离线、没配 API Key、
+                // 图片被删都会走到这里。不兜的话整个列表会变成一片红色报错块。
+                errorBuilder: (_, _, _) => _buildThumbPlaceholder(),
+                loadingBuilder: (context, child, p) =>
+                    p == null ? child : _buildThumbPlaceholder(),
+              ),
+      ),
+    );
+  }
+
+  Widget _buildThumbPlaceholder() {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: current
+              ? <Color>[AppTheme.accent.withValues(alpha: 0.5), Colors.black54]
+              : const <Color>[Colors.white24, Colors.black54],
+        ),
+      ),
+      child: const Center(
+        child: Icon(Icons.movie_outlined, size: 18, color: Colors.white70),
+      ),
+    );
+  }
+}
+
+/// 这一集看过多少（0..1）。
+///
+/// 时长未知时返回 0 —— 画一条满格或半格的**假**进度比不画更误导。
+/// 抽成顶层纯函数是为了能直接单测「时长未知不画假进度」这条。
+double episodeProgressOf(PlaylistEntry entry) {
+  final total = entry.duration.inMilliseconds;
+  if (total <= 0) return 0;
+  return (entry.resumePosition.inMilliseconds / total).clamp(0.0, 1.0);
+}
+
 /// 清晰度选择菜单。
 ///
 /// 只是**选择**：它不自己换流，而是把选中的档位 `pop` 回去，由
@@ -3862,6 +4071,65 @@ class _QualityMenuPanel extends StatelessWidget {
                 : null,
             onTap: () => Navigator.of(context).pop(q),
           ),
+      ],
+    );
+  }
+}
+
+/// 「音效」菜单面板。
+///
+/// 只是**选择**：选中的预设 `pop` 回去，由
+/// [_PlayerWindowAppState._showAudioEffectMenu] 应用并报回主窗口。
+///
+/// 摆位与动画在 [showAnchoredMenu] 里；这里只管「长什么样」。
+/// 选项与文案全部来自 `PlayerAudioEffect`（**两个播放器共用那一份**）——
+/// 在这里另写一套名字的话，同一个预设在内置播放页叫「环绕上混」、
+/// 在独立窗口叫「环绕声」，用户会以为是两个不同的功能。
+class _AudioEffectMenuPanel extends StatelessWidget {
+  const _AudioEffectMenuPanel({required this.active});
+
+  final AudioEffectPreset active;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnchoredMenuPanel(
+      title: '音效',
+      maxWidth: 300,
+      children: [
+        for (final p in PlayerAudioEffect.all)
+          ListTile(
+            dense: true,
+            visualDensity: VisualDensity.compact,
+            selected: p == active,
+            selectedTileColor: AppTheme.accent.withValues(alpha: 0.14),
+            title: Text(
+              PlayerAudioEffect.label(p),
+              style: const TextStyle(fontSize: 13),
+            ),
+            subtitle: Text(
+              PlayerAudioEffect.detail(p),
+              style: const TextStyle(fontSize: 11),
+            ),
+            trailing: p == active
+                ? const Icon(Icons.check_rounded, size: 18)
+                : null,
+            onTap: () => Navigator.of(context).pop(p),
+          ),
+        // 说明为什么没有 EQ 那一套。**不是装饰**：用户是从夸克过来的，
+        // 找不到「人声增强 / 虚拟环绕」时必须有一句话告诉他为什么，
+        // 否则那会变成一条「功能缺失」的反馈。
+        const Divider(height: 1, thickness: 1, color: Colors.white12),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(14, 9, 14, 11),
+          child: Text(
+            '人声增强 / 低音增强 / 虚拟环绕需要音频滤镜，当前内置播放引擎未提供。',
+            style: TextStyle(
+              fontSize: 11,
+              color: Colors.white38,
+              height: 1.35,
+            ),
+          ),
+        ),
       ],
     );
   }

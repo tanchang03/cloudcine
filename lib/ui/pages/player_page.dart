@@ -10,6 +10,7 @@ import 'package:media_kit/media_kit.dart' as mk;
 import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/seek_acceleration.dart';
 import '../../data/db/settings_store.dart';
 import '../../domain/entities/media_item.dart';
@@ -282,6 +283,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     await _openItem(next);
   }
 
+  /// 切换「音效」预设：**先应用、再落库**。
+  ///
+  /// 顺序是有意的：应用是用户按下菜单那一刻要听到的结果，落库是「下次还记得」。
+  /// 反过来先等一次数据库写，用户会觉得点了没反应。
+  ///
+  /// 落库失败**不影响本次播放**，只留一条 warn —— 但必须留痕，否则用户下次
+  /// 开视频发现音效又变回默认，而日志里一条线索都没有。
+  Future<void> _setAudioEffect(AudioEffectPreset preset) async {
+    await _controller.setAudioEffect(preset);
+    try {
+      await ref
+          .read(settingsStoreProvider)
+          .write(SettingKeys.playerAudioEffect, preset.value);
+    } catch (e) {
+      diag.warn('音效', '音效设置没能存下来（本次播放已生效）：$e');
+    }
+  }
+
   /// 当前这一条**在网盘上已经没了** → 问用户要不要把它的索引删掉。
   ///
   /// 删掉之后顺手退出播放页：留在一个「索引已经不存在」的页面上没有
@@ -351,6 +370,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       SettingKeys.playerRate,
       SettingKeys.autoPlayNext,
       SettingKeys.skipIntro,
+      SettingKeys.playerAudioEffect,
     ]);
     if (!mounted) return;
 
@@ -365,6 +385,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final controller = _controller;
     await controller.setVolume(volume);
     await controller.setRate(rate);
+    // 音效**只在进页面时读一次**，之后由菜单自己维护（与连播 / 跳片头同一
+    // 待遇）：它描述的是这台设备怎么接音箱，与播哪一集无关，切集时重读一遍
+    // 只会多打一次库。
+    await controller.setAudioEffect(
+      PlayerAudioEffect.parse(values[SettingKeys.playerAudioEffect]),
+    );
 
     await _openItem(item);
   }
@@ -936,6 +962,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                 activeId: _audioId,
                 onSelected: (id) => setState(() => _audioId = id),
               ),
+              // 「音效」紧跟「音轨」——它们解决的是同一个听感问题的两半，
+              // 但**不是同一件事**，见 `_AudioEffectMenu` 的类文档。
+              _AudioEffectMenu(
+                controller: controller,
+                onSelected: (p) => unawaited(_setAudioEffect(p)),
+              ),
               _RateMenu(controller: controller),
               // 片头标记入口。`_work` 为空（这一条没进过库）时不显示 ——
               // 标记要写到作品行上，没有那一行就无处可写。
@@ -1246,6 +1278,89 @@ class _RateMenu extends StatelessWidget {
           icon: Icons.speed_rounded,
           label: rate == 1.0 ? '倍速' : '${rate}x',
           active: rate != 1.0,
+        ),
+      ),
+    );
+  }
+}
+
+/// 「音效」菜单 —— 输出的声道 / 直通模式。
+///
+/// ## ⛔ 与左边那个「音轨」菜单是两件完全不同的事
+///
+/// 两个入口在控制栏里挨着，名字也只差一个字，但它们的数据来源毫无关系：
+///
+///   - 「音轨」列的是**片源里封着的流**（`stream.tracks`）。一部 MKV 里有几条
+///     完全由发布组决定，换一集就换一批，可能一条中文都没有。
+///   - 「音效」是**播放端对输出的处理方式**，与片源封了什么无关 ——
+///     同一部片子谁都能选立体声或直通。
+///
+/// 夸克播放器也是这么分的：帮助中心把「多语言音轨」写在**「语言」**入口下，
+/// 「环绕音效」写在**「音效」**入口下，两者并列。所以**别把它们合并成一个菜单**
+/// （合并后的第一个后果是：用户会以为「音效」里那一列就是能选的音轨，
+/// 于是找不到粤语时来报「音轨丢了」）。
+///
+/// ## 为什么选项只有四个
+///
+/// 当前内置的 libmpv 里没有任何可用的音频 DSP 滤镜（EQ / 人声增强 /
+/// 虚拟环绕都做不出来）。完整证据与「怎么才能解锁」写在
+/// `core/utils/player_audio_effect.dart` 的类文档里 —— 加新预设之前先读它。
+class _AudioEffectMenu extends StatelessWidget {
+  const _AudioEffectMenu({required this.controller, required this.onSelected});
+
+  final PlaybackController controller;
+
+  /// 由页面负责「应用 + 落库」两件事 —— 落库要拿 settings 仓储，
+  /// 而这个 widget 是纯展示。
+  final ValueChanged<AudioEffectPreset> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = controller.audioEffect;
+
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '音效',
+        onTap: () => unawaited(_openAnchoredMenu<AudioEffectPreset>(
+          buttonContext: buttonContext,
+          title: '音效',
+          maxWidth: 300,
+          onSelected: onSelected,
+          rows: (context, select) => [
+            for (final p in PlayerAudioEffect.all)
+              _MenuTile(
+                onTap: () => select(p),
+                child: _MenuRow(
+                  label: PlayerAudioEffect.label(p),
+                  // 每一项都要说清「什么时候它才有区别」：不写的话
+                  // 「立体声」在笔记本上与「跟随片源」**完全一样**（设备本来
+                  // 就是 2.0，`auto-safe` 已经下混过了），用户会以为功能坏了。
+                  detail: PlayerAudioEffect.detail(p),
+                  selected: p == active,
+                ),
+              ),
+            const Divider(height: 1, thickness: 1, color: Colors.white12),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(14, 9, 14, 11),
+              child: Text(
+                '人声增强 / 低音增强 / 虚拟环绕需要音频滤镜，当前内置播放引擎未提供。',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.white38,
+                  height: 1.35,
+                ),
+              ),
+            ),
+          ],
+        )),
+        child: _BarButton(
+          icon: Icons.graphic_eq_rounded,
+          // 默认档不写全名（`跟随片源`），与隔壁「倍速」在 1.0x 时只写
+          // 「倍速」同一套口径：控制栏只有那么宽，常态不该占地方。
+          label: active == AudioEffectPreset.auto
+              ? '音效'
+              : PlayerAudioEffect.label(active),
+          active: active != AudioEffectPreset.auto,
         ),
       ),
     );

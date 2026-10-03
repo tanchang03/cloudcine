@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/text_encoding.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/remote/subtitle/opensubtitles_client.dart';
@@ -351,6 +352,27 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     }
   };
 
+  // -------------------------------------------------------------------
+  // 播放窗口的「音效」菜单选了什么
+  // -------------------------------------------------------------------
+  //
+  // 与片头标记同一条边界：播放窗口在**另一个引擎**里，读不到设置库。
+  // 它在本地把音效设进 mpv 之后，只把「选了哪一档」报回来，落库在这边做。
+  //
+  // ⚠️ 不返回值、也不回传错误：音效在播放窗口那边**已经生效了**，
+  // 落库只决定「下次还记不记得」。为一次写库失败让用户看到一个错误提示，
+  // 与他的操作（换个音效）毫无关系。
+  onSaveAudioEffect = (preset) async {
+    try {
+      await ref
+          .read(settingsStoreProvider)
+          .write(SettingKeys.playerAudioEffect, preset.value);
+      diag.info('窗口', '音效已存为「${PlayerAudioEffect.label(preset)}」');
+    } catch (e, st) {
+      diag.error('窗口', '音效没能存下来（本次播放已生效）', error: e, stackTrace: st);
+    }
+  };
+
   ref.onDispose(() {
     onPlaybackProgress = null;
     onTicketRefresh = null;
@@ -360,6 +382,7 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     onSaveIntroRange = null;
     onQueryMissingMedia = null;
     onRemoveMissingMedia = null;
+    onSaveAudioEffect = null;
   });
 });
 

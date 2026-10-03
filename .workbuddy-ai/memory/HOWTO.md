@@ -30,6 +30,18 @@ lib = ctypes.CDLL(f"{FW}/Mpv.framework/Versions/A/Mpv", mode=ctypes.RTLD_GLOBAL)
   到下一条命令就没了（mpv 报 `Connection refused`）。「起服务」和「跑探针」必须放进
   **同一次** Bash 调用。
 
+### 用 C 直接调 mpv（2026-10-03，要枚举滤镜/查编译期能力时用）
+
+`avfilter_get_by_name` 这类**链接期**符号 Python ctypes 拿不到，得写 C：
+
+- `clang -F` 要指向 **`.../Mpv.xcframework/macos-arm64_x86_64`**（那层才有
+  `Mpv.framework`）；指到 xcframework 根目录会报 `framework 'Mpv' not found`。
+- 运行期还会缺 `Ass.framework` → 建一个软链目录（`ln -s` 进 `Ass.framework` / `Mpv.framework`）
+  再 `DYLD_FRAMEWORK_PATH=<那个目录>` 跑。
+- ⛔ **必须 `setvbuf(stdout, NULL, _IONBF, 0)`**：`printf` 走管道时是块缓冲，
+  被 SIGTERM 掉就**一个字都收不到**，看起来像「程序没跑」。
+- 等待轮数别开太大（400 → 60）：探针是「发命令 → 抽事件 → 打印」，多等只是白等。
+
 ## 逆向夸克接口
 
 ```python
@@ -1943,6 +1955,101 @@ sqlite3 -noheader -separator $'\t' "file:$DB?mode=ro" \
 
 实测结果（`f飞cc日志2`，32 行）：未标季 22 行 → 22 个不同标题；第 1 季 10 行 → 10 个不同；
 播放列表 `compact` 起步有 **10 行重名**，逐级退让后 **32/32 唯一**。
+
+## 剧集面板：主标题改成**文件名**，加当前播放动效（2026-10-03）
+
+### 为什么把集号从主标题挪走
+
+面板一行只有 ~320px、一行字就是全部信息。原来主标题是 `第 3 集`（`RowLabelStyle.compact`），
+代价是**同一集的多个版本长得一模一样**：国语/粤语、2160p/1080p 两个压制在列表里无法区分
+（`_playlistLabels` 的逐级退让就是为这个补的，但退让出来的 `剧名 S01E03` 仍然不含版本信息）。
+
+改成：**主标题 = 原始文件名**（`PlaylistEntry.fileName`，带扩展名的原名），
+**副标题 = `集号 · 码率`**（集号排最前 —— 被省略号吃掉的只能是后面的码率/体积）。
+
+- 用户扫这个列表是为了找「网盘上那个文件」，文件名是唯一不会变形状的东西：
+  人话标题在撞名时会变成 `剧名 S01E03` 或 `剧名-文件名`，文件名永远一样。
+- `rowTitle` / `rowSubtitle` 是 `PlaylistEntry` 上的**纯 getter**，`EpisodeTile` 只负责画 ——
+  面板文案要测就直接测这两个 getter，不用 pump 界面。
+
+### ⚠️ 去重判据：折叠后**互相包含**，但中英文对不上就**不去重**
+
+`title` 与 `fileName` 说的是同一件事时副标题不重复显示（否则同一句话在一行里出现两次）。
+判据是两边都折叠（只留字母数字与汉字、小写）后**互相包含**，并且 `fileName` 要按
+**带扩展名**和**去扩展名**两个候选各比一次 —— 因为 `剧名-文件名` 那一支用的是 `baseNameOf`。
+
+**反例（别"修"）**：`title = 黑暗荣耀 S01E03`、`fileName = The.Glory.S01E03.2160p.mkv`
+折叠后是 `黑暗荣耀s01e03` 与 `theglorys01e03…`，互不包含 → **保留**，副标题显示
+`黑暗荣耀 S01E03 · 2160P`。这是对的：主标题是英文文件名，那行中文集号是用户唯一能
+看出「这是第几集」的地方。刮削回来的是中文剧名、网盘文件是英文名，这种组合很常见。
+
+### 动效：三根条，只挂当前行
+
+`ui/widgets/now_playing_bars.dart`，纯函数 `nowPlayingBarScales(t)` + 常量
+`barPhaseStep = 2.1` / `minScale = 0.30`。
+
+- 三根条**不同相**：同相看起来只是整体一起呼吸；相位差也不能是 π 的整数倍，否则第 1 根与第 3 根同步。
+- ⚠️ **常驻动画会让 `pumpAndSettle` 永不返回** → 组件停在 `MediaQuery.disableAnimationsOf`
+  （无障碍「减弱动态效果」开关）与 `animate: false` 两处；并且动效只挂在剧集面板里，
+  面板收起即 dispose，不常驻。
+- 画满全表等于没有信息：非当前播放的行**不画**。
+
+## 「音效」是播放端的事，不是片源的事（2026-10-03）
+
+用户拿夸克网盘播放 `/来自：分享/黑暗荣耀 全2季…/The.Glory.S01E01.2160p.NF.WEB-DL…-老K.mkv`
+问：画质弹框里那份「音效列表」（杜比音效 / 立体声音效）跟**片源**有关系，还是 app 的逻辑？
+跟**音轨**是不是一回事？用户自己判断「看起来好像不像」——**判断是对的**。
+
+**答：音效 = app 逻辑**（播放端对**输出**的处理），与片源无关，**不是音轨**。
+
+| | 音轨 | 音效 |
+| --- | --- | --- |
+| 是什么 | 片源里**封着的流**，发布组决定 | 播放端对输出的**处理方式** |
+| 谁提供 | 解复用器列出来（`stream.tracks`） | 播放器自己（下混/上混/直通） |
+| 夸克放哪 | 「语言」入口 | 「音效」入口 |
+| 换个播放器 | 还在（在文件里） | 没了（跟播放器走） |
+
+佐证：夸克帮助中心把「多语言音轨」归到**语言**入口、「环绕音效」归到**音效**入口；
+官方原文「播放器还会记住常用的画质、**音效**和倍速设置」。
+
+### ⛔ 实测：本库的 libmpv **做不了** EQ / 人声增强 / 虚拟环绕
+
+`media_kit_libs_macos_video 1.1.4` 内置 mpv 0.36.0 + FFmpeg 6.1（Avfilter 9.3.100），
+但**音频滤镜只注册了 3 个**：`abuffer` / `abuffersink` / `equalizer`。
+用 `avfilter_get_by_name` 直接枚举确认；`equalizer` 还因为缺 `aresample` 运行期直接失败。
+
+⛔ **别再用 `mpv_command_string("af set ...")` 的返回值判断滤镜可用性。**
+第一版探测就是这么做，`headphone` / `dynaudnorm` / `bass` 全部返回 OK —— 因为
+`af set` **只做语法解析**，滤镜图能不能真的建起来是运行时才知道。正确判据只有两条：
+真实解码（生成 2.0 / 5.1 WAV → `loadfile` → 收 warn/error 日志），或 `avfilter_get_by_name` 枚举。
+（要解锁 DSP 得换一份带音频滤镜的 Avfilter —— 与修 PGS 是同一套路。）
+
+### 能做的四个预设：只靠两个 mpv 原生属性
+
+`core/utils/player_audio_effect.dart`。`audio-channels` 与 `audio-spdif` 都是
+**运行期可改**的 mpv 原生选项（不需要滤镜）：
+
+| 预设 | `audio-channels` | `audio-spdif` |
+| --- | --- | --- |
+| 跟随片源（默认） | `auto-safe` | `no` |
+| 环绕上混 | `auto` | `no` |
+| 立体声 | `stereo` | `no` |
+| 杜比/DTS 直通 | `auto-safe` | `ac3,eac3,dts,truehd,dts-hd` |
+
+- 每个预设都把**两个属性写全**：只写一个的话，切档时上一个档的残值会留着
+  （比如从直通切回立体声，spdif 还开着）。
+- 应用时机在 `player.open` **之前**（`PlaybackController._loadIntoPlayer` /
+  `player_window_app._openStream` 各一处）。
+- 存储值就是枚举名（`auto` / `upmix` / `stereo` / `passthrough`），改名等于让老用户的设置失效。
+
+### 跨引擎：设置投递进去、改动回报出来
+
+独立播放窗口跑在**另一个 Flutter 引擎**里，读不到主窗口的设置库：
+
+- 主窗口 → 窗口：`PlayRequest.audioEffect`
+- 窗口 → 主窗口：`PlayerBridgeMethod.saveAudioEffect` → `SettingKeys.playerAudioEffect`
+- ⚠️ 两个播放器（`player_window_app.dart` + `player_page.dart`）**都要接**，
+  只改一个 = 用户看到「功能没做」。
 
 
 
