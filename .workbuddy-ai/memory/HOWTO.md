@@ -3845,6 +3845,13 @@ weak import 里有几项不存在是**正常**的（那是 mdk 支持的**另一
 - ⚠️ `find.byType(FilledButton)` **不匹配** `FilledButton.icon`（子类）
   → 报 `Bad state: No element`。改用
   `find.byWidgetPredicate((w) => w is FilledButton)`。
+- ⚠️ **页面自己会把内容渲染出来**时，别用页面级 `find.textContaining(...)` +
+  `findsOneWidget`：诊断页把日志逐行列出来，而「上传日志」这个动作**自己也会写一行
+  日志**（成功那行含目录名、失败那行含「上传失败」）—— 于是同一条文本在页面上出现
+  **两次**（SnackBar 一次、日志列表一次），断言因「找到两个」而红，看着像功能坏了。
+  修法：把断言限定进弹层 ——
+  `find.descendant(of: find.byType(SnackBar), matching: find.textContaining('上传失败'))`。
+  （2026-10-04，诊断页日志上传那两条用例就是这么红的。）
 
 ## §封面与刮削（从 MEMORY.md 下沉的标识符）
 

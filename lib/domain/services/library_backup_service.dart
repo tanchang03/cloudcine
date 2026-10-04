@@ -322,12 +322,42 @@ class LibraryBackupService {
     String dirName = defaultBackupDir,
     String? fileName,
     void Function(int sent, int total)? onProgress,
-  }) async {
-    final dirFid = await ensureBackupDir(dirName: dirName);
+  }) {
     final name = fileName ??
         'cloudcine_backup_${DateTime.now().toIso8601String().replaceAll(':', '-').split('.').first}$backupExtension';
 
-    diag.info('备份', '上传备份包「$name」（${bytes.length} 字节）'
+    return uploadFileToBackupDir(
+      fileName: name,
+      bytes: bytes,
+      dirName: dirName,
+      onProgress: onProgress,
+      logTag: '备份',
+      what: '备份包',
+    );
+  }
+
+  /// 把一个**任意文件**上传到网盘备份目录（目录不存在则创建）。
+  ///
+  /// 与 [uploadBackupToDrive] 是同一个动作，只是**不带备份包的语义假设**：
+  /// 文件名与扩展名由调用方给全。诊断日志就是靠它上云的 —— 它借用的只是
+  /// 「往那个已经存在的目录里放个文件」这条通道，不需要也不该被打包成备份。
+  ///
+  /// ⚠️ **同名覆盖是「先删后传」**，中间有一段「旧文件已经没了、新文件还没上去」
+  /// 的空窗。所以调用方给的文件名**必须带时间戳**，别用固定名 ——
+  /// 否则一次失败的上传会把上一份日志也一起带走。
+  ///
+  /// [logTag] 只影响日志里的分类标签，[what] 只影响日志正文的措辞。
+  Future<String> uploadFileToBackupDir({
+    required String fileName,
+    required List<int> bytes,
+    String dirName = defaultBackupDir,
+    void Function(int sent, int total)? onProgress,
+    String logTag = '上传',
+    String what = '文件',
+  }) async {
+    final dirFid = await ensureBackupDir(dirName: dirName);
+
+    diag.info(logTag, '上传$what「$fileName」（${bytes.length} 字节）'
         '到目录「$dirName」');
 
     // 如果同名文件已存在，先删掉（覆盖语义）
@@ -336,8 +366,8 @@ class LibraryBackupService {
       pageSize: 100,
     );
     for (final entry in existing.entries) {
-      if (!entry.isDirectory && entry.name == name) {
-        diag.info('备份', '同名文件已存在，先删除旧文件 fid=${entry.id}');
+      if (!entry.isDirectory && entry.name == fileName) {
+        diag.info(logTag, '同名文件已存在，先删除旧文件 fid=${entry.id}');
         await _adapter.deleteFiles(fileIds: [entry.id]);
         break;
       }
@@ -345,11 +375,11 @@ class LibraryBackupService {
 
     final fid = await _adapter.uploadFile(
       parentId: dirFid,
-      fileName: name,
+      fileName: fileName,
       bytes: bytes,
       onProgress: onProgress,
     );
-    diag.info('备份', '上传完成 fid=$fid');
+    diag.info(logTag, '上传完成 fid=$fid');
     return fid;
   }
 

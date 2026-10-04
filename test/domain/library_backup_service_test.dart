@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -407,6 +408,71 @@ void main() {
 
       expect(result.action, SyncAction.conflict);
       expect(drive.uploadedFiles, isEmpty);
+    });
+  });
+
+  group('uploadFileToBackupDir —— 任意文件上云（诊断日志走的就是它）', () {
+    LibraryBackupService svcWith(_FakeRemoteDrive drive) => LibraryBackupService(
+          adapter: drive,
+          databasePath: dbPath,
+          posterCachePath: posterPath,
+          deviceId: 'test-device-001',
+          deviceName: '测试机器',
+        );
+
+    test('目录不存在时先建目录再上传', () async {
+      final drive = _FakeRemoteDrive(); // 初始没有「云影备份」目录
+
+      final fid = await svcWith(drive).uploadFileToBackupDir(
+        fileName: 'cloudcine-log-android-20261004-164512.txt',
+        bytes: utf8.encode('日志正文'),
+      );
+
+      expect(fid, isNotEmpty);
+      expect(
+        drive.uploadedFiles,
+        ['cloudcine-log-android-20261004-164512.txt'],
+      );
+    });
+
+    test('同名先删后传 —— 否则网盘里会留下两个同名文件', () async {
+      const name = 'cloudcine-log-android-20261004-164512.txt';
+      final drive = _FakeRemoteDrive()
+        ..seed(name, Uint8List.fromList([1, 2, 3]));
+
+      await svcWith(drive).uploadFileToBackupDir(
+        fileName: name,
+        bytes: utf8.encode('新的一版'),
+      );
+
+      // 旧字节必须已经被**换掉**，而不是又并排传了一份上去。
+      expect(utf8.decode(drive.bytesOf(name)!), '新的一版');
+    });
+
+    test('上传的字节原样到达网盘 —— 中文和错误原文都不能被改写', () async {
+      final drive = _FakeRemoteDrive();
+      const text = '播放失败：Player error: 4\n取链失败：上游返回 403';
+
+      await svcWith(drive).uploadFileToBackupDir(
+        fileName: 'log.txt',
+        bytes: utf8.encode(text),
+      );
+
+      expect(utf8.decode(drive.bytesOf('log.txt')!), text);
+    });
+
+    test('进度回调被转交给适配器（按钮上那个百分比靠它）', () async {
+      final drive = _FakeRemoteDrive();
+      final seen = <double>[];
+
+      await svcWith(drive).uploadFileToBackupDir(
+        fileName: 'log.txt',
+        bytes: utf8.encode('x' * 100),
+        onProgress: (sent, total) => seen.add(sent / total),
+      );
+
+      expect(seen, isNotEmpty);
+      expect(seen.last, 1.0);
     });
   });
 }

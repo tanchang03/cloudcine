@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,8 +7,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/diagnostics/log_export.dart';
 import '../../core/utils/format.dart';
 import '../../domain/adapters/stream_relay.dart';
+import '../../domain/services/library_backup_service.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
@@ -21,19 +24,30 @@ import '../windows/player_window_bridge.dart';
 ///   - 只提供「复制全部」与「清空内存缓冲」，**不提供删文件** ——
 ///     删了文件就再也没法回头看了，而用户点这个按钮时通常正在气头上；
 ///   - 文件路径直接可选中，方便去访达里取。
-class DiagnosticsPage extends StatefulWidget {
+///
+/// 电视上的「带走」还要多一条路：电视上既没有访达、也没法插 U 盘把文件拷出来
+/// （小米电视的开发者选项里也没有「导出文件」这种功能）。所以这里有第三条
+/// 出口 —— **把日志直接传到网盘**，用户拿手机上的夸克 App 就能看到并转发。
+/// 走的是与媒体库备份同一个目录、同一条上传通道。
+class DiagnosticsPage extends ConsumerStatefulWidget {
   const DiagnosticsPage({super.key});
 
   @override
-  State<DiagnosticsPage> createState() => _DiagnosticsPageState();
+  ConsumerState<DiagnosticsPage> createState() => _DiagnosticsPageState();
 }
 
-class _DiagnosticsPageState extends State<DiagnosticsPage> {
+class _DiagnosticsPageState extends ConsumerState<DiagnosticsPage> {
   /// 只看 warn 以上。
   ///
   /// 默认**关闭**：默认打开会让「日志页是空的」变成一个常见困惑，
   /// 而全量日志在排查时又必须能一次看到。
   bool _onlyProblems = false;
+
+  /// 正在上传日志到网盘。
+  bool _uploading = false;
+
+  /// 上传进度（0..1）；null 表示总长度未知。
+  double? _uploadProgress;
 
   @override
   Widget build(BuildContext context) {
@@ -110,6 +124,20 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
                       onPressed: lines.isEmpty ? null : () => _copy(lines),
                       icon: const Icon(Icons.copy_all_rounded, size: 15),
                       label: const Text('复制全部'),
+                    ),
+                    // 电视上的主要出口：电视没有访达、也拷不出文件，
+                    // 而夸克 App 在手机上就能看到这个目录。
+                    TextButton.icon(
+                      onPressed: (_uploading || all.isEmpty)
+                          ? null
+                          : () => _uploadToDrive(all),
+                      icon: Icon(
+                        _uploading
+                            ? Icons.cloud_sync_rounded
+                            : Icons.cloud_upload_rounded,
+                        size: 15,
+                      ),
+                      label: Text(_uploadLabel),
                     ),
                     TextButton.icon(
                       onPressed: all.isEmpty
@@ -200,6 +228,94 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('已复制 ${lines.length} 行日志')),
     );
+  }
+
+  /// 上传按钮上的文字 —— 进度直接写在按钮上。
+  ///
+  /// 不弹对话框：电视上焦点本来就难找，一个转圈对话框会把它抢走，
+  /// 而且用户按一下返回键就可能把上传打断（那正是最不该中断的一步）。
+  String get _uploadLabel {
+    if (!_uploading) return '上传到网盘';
+    final p = _uploadProgress;
+    if (p == null) return '上传中…';
+    return '上传中 ${(p * 100).toStringAsFixed(0)}%';
+  }
+
+  /// 把日志传到网盘的「云影备份」目录。
+  ///
+  /// 这条路存在的理由：**电视没有别的出口**。文件在电视的私有数据目录里，
+  /// 既没有访达可开，也没有「导出文件」这种系统功能；`adb` 又要求用户先去
+  /// 开发者选项里开调试、还得在同一网段配对。而网盘这条路只要求「这台电视
+  /// 已经登录过网盘」—— 那是它本来就得有的东西。
+  Future<void> _uploadToDrive(List<String> bufferLines) async {
+    if (_uploading) return;
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() {
+      _uploading = true;
+      _uploadProgress = null;
+    });
+
+    try {
+      // 正文优先取日志文件（含启动那几行），读不到才退回内存缓冲。
+      final payload = await buildLogExportPayload(
+        filePath: diag.filePath,
+        buffer: bufferLines.join('\n'),
+        now: DateTime.now(),
+      );
+      final bytes = utf8.encode(payload.text);
+
+      final service = ref.read(libraryBackupServiceProvider);
+      final fid = await service.uploadFileToBackupDir(
+        fileName: payload.fileName,
+        bytes: bytes,
+        logTag: '日志',
+        what: '诊断日志',
+        onProgress: (sent, total) {
+          if (!mounted) return;
+          setState(() {
+            _uploadProgress = total <= 0 ? null : sent / total;
+          });
+        },
+      );
+
+      diag.info(
+        '日志',
+        '诊断日志已上传到网盘「${LibraryBackupService.defaultBackupDir}」：'
+        '${payload.fileName}（${bytes.length} 字节，'
+        '来源=${payload.source.label}，fid=$fid）',
+      );
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _uploadProgress = null;
+      });
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            '日志已上传到网盘「${LibraryBackupService.defaultBackupDir}」'
+            '／${payload.fileName}'
+            '（${(bytes.length / 1024).toStringAsFixed(0)} KB），'
+            '用夸克 App 打开这个目录就能看到',
+          ),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    } catch (e, st) {
+      // 失败也要落一行日志：用户下次上传前会先来翻这里，
+      // 「上次为什么没传上去」必须能在这里找到答案。
+      diag.error('日志', '诊断日志上传失败', error: e, stackTrace: st);
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _uploadProgress = null;
+      });
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('上传失败：$e'),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    }
   }
 
   /// 复制日志文件的**绝对路径**（不是内容）。
