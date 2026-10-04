@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/cookie_parser.dart';
 import '../../core/utils/player_audio_effect.dart';
 import '../../data/db/settings_store.dart';
 import '../../domain/adapters/media_repository.dart';
@@ -223,7 +224,10 @@ Future<PlayRequest> buildPlayRequest(
   diag.info(
     '窗口',
     '投给独立窗口：${picked.redactedUrl} '
-    '请求头=${picked.headers.keys.toList()} 档位=${quality?.label ?? "-"} '
+    '${picked.url.toString().contains(".m3u8") ? "HLS(转码档)" : "直链(原画)"} '
+    '请求头=${picked.headers.keys.toList()} '
+    'Cookie键=${cookieHeaderKeyNames(picked.headers["Cookie"])} '
+    '档位=${quality?.label ?? "-"} '
     '可选档位=${ticket.qualities.length} 同组条目=${siblings.length}',
   );
 
@@ -253,6 +257,13 @@ Future<PlayRequest> buildPlayRequest(
   return PlayRequest(
     url: picked.url.toString(),
     title: item.displayTitle,
+    // 网盘上的完整路径，播放窗口顶栏显示它。
+    //
+    // 必须在这里取 `item.netdiskPath` 而不是让播放窗口自己拼：`dirPath` 的
+    // 结尾斜杠形状是扫描器的实现细节（见 `MediaItem.netdiskPath`），播放窗口
+    // 手里只有 `name` 与 `dirPath` 两个字段，自己拼迟早会拼出 `/目录/文件名`
+    // 少一个斜杠的畸形结果。
+    filePath: item.netdiskPath,
     // 只为进度回报用：播放窗口每 10 秒把位置报回来，主窗口据此落库。
     // 不带它的话「独立窗口播完，续播位置不记」。
     //

@@ -425,9 +425,14 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
         return null;
       }
       // 只打片名/档位/位置，不打新链 —— 直链带签名查询串。
+      //
+      // ⚠️ 请求头要打到**键名**这一层：转码档（HLS）的鉴权靠 `Video-Auth`
+      // 这个 cookie，而「请求头」这一项永远都写着 Cookie —— 少的是它里面的
+      // 键。只看键名看不出来。
       diag.info(
         '窗口',
-        '已刷新直链 → ${fresh.describe()} @ ${fresh.startPosition.inSeconds}s',
+        '已刷新直链 → ${fresh.describe()} @ ${fresh.startPosition.inSeconds}s'
+        '（${fresh.isHls ? "HLS 转码档" : "直链原画"}，${fresh.describeHeaders()}）',
       );
       return fresh.toJson();
 

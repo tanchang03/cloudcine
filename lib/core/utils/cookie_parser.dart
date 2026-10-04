@@ -95,3 +95,23 @@ String buildCookieHeader(
   }
   return parts.join('; ');
 }
+
+/// 取出 `Cookie:` 头里的**键名**（不含值），供诊断日志使用。
+///
+/// ⚠️ Cookie 的值是凭证，绝不能进日志（诊断日志是给用户复制粘贴用的）。
+/// 但**键名**必须能看见：转码档（HLS）的鉴权依赖 `Video-Auth` 这个键，
+/// 它一旦在轮换回填里被丢掉，光看「请求头=[…, Cookie]」完全看不出来 ——
+/// 表现只是 mpv 取分片拿到 404。
+List<String> cookieHeaderKeyNames(String? header) {
+  final raw = header ?? '';
+  if (raw.isEmpty) return const <String>[];
+  final names = <String>[];
+  for (final seg in raw.split(';')) {
+    final s = seg.trim();
+    if (s.isEmpty) continue;
+    final eq = s.indexOf('=');
+    final key = eq <= 0 ? s : s.substring(0, eq).trim();
+    if (key.isNotEmpty) names.add(key);
+  }
+  return names;
+}

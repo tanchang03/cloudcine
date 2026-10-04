@@ -376,6 +376,102 @@ void main() {
     });
   });
 
+  group('顶栏（片名 + 网盘全路径）', () {
+    // 这一行存在的理由：同一部剧的翡翠台 / 粤语 / 4K 重制**片名一模一样**，
+    // 只有全路径能告诉用户「现在放的是哪一份」。它丢了不会报错 —— 顶栏照常
+    // 显示，只是少一行，所以必须有断言盯着。
+    const path = '/电影/流浪地球2 (2023)/流浪地球2.2023.2160p.mkv';
+
+    PlayRequest withPath() => const PlayRequest(
+          url: 'https://cdn.example.com/a.mkv',
+          title: '流浪地球2 (2023)',
+          filePath: path,
+        );
+
+    testWidgets('顶栏出片名与网盘全路径', (tester) async {
+      await pumpPlayer(tester);
+      await pushPlayRequest(tester, withPath());
+
+      // 路径只可能来自顶栏（底部控制栏那一行只出片名），所以这条断言能唯一
+      // 地钉住「顶栏确实画了路径」。
+      expect(find.text(path), findsOneWidget);
+      await drainTimers(tester);
+    });
+
+    testWidgets('顶栏与控制栏同步：一起出现、一起收起', (tester) async {
+      // 「显示和消失同控制栏一致」的落地判据 —— 两边共用同一份 `_chromeVisible`，
+      // 所以任何一个时刻都不该出现「一个在、一个不在」。
+      await pumpPlayer(tester);
+      await pushPlayRequest(tester, withPath());
+
+      expect(find.text(path), findsOneWidget);
+      expect(find.byTooltip('全屏（F）'), findsOneWidget);
+
+      // 静置超过浮层的隐藏倒计时。
+      await tester.pump(const Duration(seconds: 4));
+
+      expect(find.text(path), findsNothing, reason: '顶栏没跟着控制栏一起收');
+      expect(find.byTooltip('全屏（F）'), findsNothing);
+    });
+
+    testWidgets('指针移出窗口时顶栏一起收起', (tester) async {
+      await pumpPlayer(tester);
+      await pushPlayRequest(tester, withPath());
+
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.addPointer(location: const Offset(100, 100));
+      addTearDown(mouse.removePointer);
+      await mouse.moveTo(const Offset(120, 120));
+      await tester.pump();
+      expect(find.text(path), findsOneWidget);
+
+      await mouse.moveTo(const Offset(-40, -40));
+      await tester.pump();
+
+      expect(find.text(path), findsNothing);
+      await drainTimers(tester);
+    });
+
+    testWidgets('没有网盘路径时只出片名，不留一行空白', (tester) async {
+      // 自检视频 / 手输直链没有网盘路径。那时顶栏要短一截 —— 留一个空行只会
+      // 把片名推得离顶边更远，还让用户以为「路径加载失败了」。
+      await pumpPlayer(tester);
+      await pushPlayRequest(
+        tester,
+        const PlayRequest(url: 'file:///tmp/a.mkv', title: '自检视频'),
+      );
+      final withoutPath = tester.getSize(find.byKey(topChromeKey)).height;
+
+      await pushPlayRequest(tester, withPath());
+      final withPathHeight = tester.getSize(find.byKey(topChromeKey)).height;
+
+      expect(
+        withoutPath,
+        lessThan(withPathHeight),
+        reason: '没有路径时顶栏不该留着那一行的位置',
+      );
+      await drainTimers(tester);
+    });
+
+    testWidgets('超长路径不溢出 —— 省略号截断，不报 RenderFlex 异常', (tester) async {
+      // 溢出在 widget test 里是**报错**而不是「看不全」，所以这条用例本身
+      // 就是断言。网盘上的目录名可以很长（发布组名 + 季 + 版本）。
+      await pumpPlayer(tester, size: const Size(640, 400));
+      await pushPlayRequest(
+        tester,
+        const PlayRequest(
+          url: 'https://cdn.example.com/a.mkv',
+          title: '一个非常非常长的剧名 S01E01',
+          filePath: '/来自：分享/某某压制组 2026 春季合集/第一季/'
+              '某个非常长的文件名 2160p HDR 10bit 国粤双语 内封字幕.mkv',
+        ),
+      );
+
+      expect(tester.takeException(), isNull);
+      await drainTimers(tester);
+    });
+  });
+
   group('键盘快捷键', () {
     /// 当前生效的键位表。
     ///

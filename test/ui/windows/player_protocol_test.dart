@@ -467,4 +467,112 @@ void main() {
       expect(a == b, isFalse);
     });
   });
+
+  group('PlayRequest 诊断摘要', () {
+    // 这两条判据存在的理由（2026-10-04 实测）：转码档是 `media.m3u8`，
+    // 原画是带签名的直链文件，两者**鉴权方式不同**（前者靠 `Video-Auth`
+    // cookie，后者靠 URL 里的签名）。日志里分不开这两种流，就只能看到
+    // 「换了个画质就坏了」，看不出坏在哪一层。
+
+    test('m3u8 认作 HLS，带签名的直链不是', () {
+      const hls = PlayRequest(
+        url: 'https://video-play-h-zb.drive.quark.cn/qv/abc/media.m3u8',
+        title: 't',
+      );
+      const direct = PlayRequest(
+        url: 'https://video-play-c-zb.drive.quark.cn/2eReavx1/5b5a10d9',
+        title: 't',
+      );
+
+      expect(hls.isHls, isTrue);
+      expect(direct.isHls, isFalse);
+    });
+
+    test('摘要里有 Cookie 键名，但绝没有 Cookie 的值', () {
+      const request = PlayRequest(
+        url: 'https://cdn.example.com/media.m3u8',
+        title: 't',
+        headers: <String, String>{
+          'User-Agent': 'ua',
+          'Cookie': '__pus=TOPSECRET; Video-Auth=ALSOTOPSECRET',
+        },
+      );
+
+      final text = request.describeHeaders();
+
+      // 键名是排查「少了哪个键」的唯一依据 —— 只看 `headers.keys` 永远只能
+      // 看到「Cookie」这一项，而它**永远都在**。
+      expect(text, contains('Video-Auth'));
+      expect(text, contains('__pus'));
+      // 值漏出去的话，用户把日志发给别人排查就等于把账号交出去。
+      expect(text, isNot(contains('TOPSECRET')));
+    });
+
+    test('没有 Cookie 头时摘要只列请求头键名，不炸', () {
+      // 内置自检视频 / 本地文件没有请求头，那条日志路径照样要能走。
+      const request = PlayRequest(
+        url: 'file:///tmp/a.mkv',
+        title: 't',
+        headers: <String, String>{'User-Agent': 'ua'},
+      );
+
+      expect(request.describeHeaders(), contains('User-Agent'));
+    });
+  });
+
+  group('PlayRequest.filePath（播放窗口顶栏的网盘全路径）', () {
+    // 这一行是用户在播放窗口里确认「放的是哪一份文件」的唯一依据：
+    // 同一部剧的翡翠台 / 粤语 / 4K 重制**片名一模一样**，只有全路径能分开。
+    // 路径丢了的表现极其安静 —— 顶栏照常显示，只是少一行，没人会报错。
+
+    test('路径要原样过一趟通道', () {
+      const original = PlayRequest(
+        url: 'https://cdn.example.com/a.mkv',
+        title: '流浪地球2 (2023)',
+        filePath: '/电影/流浪地球2 (2023)/流浪地球2.2023.2160p.mkv',
+      );
+
+      final restored = PlayRequest.fromJson(original.toJson())!;
+
+      expect(restored.filePath, '/电影/流浪地球2 (2023)/流浪地球2.2023.2160p.mkv');
+      // 也要参与相等判定，否则「换了文件但其余字段相同」会被当成同一条请求。
+      expect(restored, original);
+    });
+
+    test('缺省是空串，不崩 —— 自检视频 / 手输直链没有网盘路径', () {
+      final restored = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mp4',
+        'title': 't',
+      })!;
+
+      expect(restored.filePath, isEmpty);
+    });
+
+    test('路径读不懂（非字符串）也退回空串，不整条作废', () {
+      final restored = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mp4',
+        'title': 't',
+        'filePath': 42,
+      })!;
+
+      expect(restored.filePath, isEmpty);
+      expect(restored.url, 'https://a/b.mp4');
+    });
+
+    test('路径不同就不相等 —— 否则换文件会被判成同一条请求', () {
+      const a = PlayRequest(
+        url: 'https://a/b.mkv',
+        title: 't',
+        filePath: '/电影/A.mkv',
+      );
+      const b = PlayRequest(
+        url: 'https://a/b.mkv',
+        title: 't',
+        filePath: '/电影/B.mkv',
+      );
+
+      expect(a == b, isFalse);
+      expect(a.hashCode == b.hashCode, isFalse);
+    });
+  });
 }

@@ -67,22 +67,39 @@ class RelayStats {
   }
 }
 
+/// 这条地址是不是 HLS（`media.m3u8`）。
+///
+/// 转码档签出来的就是它。它与原画的直链是**两套东西**：原画是一条带签名的
+/// 字节流，HLS 是一份播放列表 + 一堆分片。中继对这两者用两条不同的服务路径
+/// （见 `LocalStreamRelay` 里的 `_serve` 与 `_serveHls`）。
+bool isHlsUrl(Uri url) => url.toString().toLowerCase().contains('.m3u8');
+
 /// 这条流适不适合走本地中继。
 ///
-/// ## 为什么 HLS 要排除
+/// ## ⚠️ 2026-10-04：HLS **也要**走中继了，这里从「排除 m3u8」改成「都放行」
 ///
-/// 转码档签出来的是 `media.m3u8`：它**本来就是分片并发下发**的，中继帮不上
-/// 忙；更要命的是 m3u8 里的分片地址是**相对路径**，而 mpv 会把「m3u8 的
-/// URL」当成基准去拼 —— 一旦走中继，基准变成 `127.0.0.1`，拼出来的分片
-/// 地址全部指向我们自己的服务，而那里根本没有 m3u8 的内容。
+/// 以前这里把 `.m3u8` 排除掉，理由是「分片是相对路径，走中继之后基准变成
+/// `127.0.0.1`，拼出来的分片地址全指向我们自己」。那个理由本身没错，
+/// **但绕开它的办法是改写列表**（见 `rewriteHlsForRelay`），而不是放弃中继。
 ///
-/// 表现是「开了中继之后转码档反而播不了」，而原画照常 —— 一个极易被误判成
-/// 「中继在某些文件上有 bug」的现象。
-bool isRelayableUrl(Uri url) {
-  if (url.scheme != 'http' && url.scheme != 'https') return false;
-  final text = url.toString().toLowerCase();
-  return !text.contains('.m3u8');
-}
+/// 放弃中继的代价在那天变成了致命伤。夸克把转码档从**签名直链**换成了
+/// `media.m3u8`，于是转码档第一次成了「不经中继、播放器直连 CDN」的流 ——
+/// 而本机 `http_proxy` 环境变量指向一个为命令行准备的代理，ffmpeg 一读到它
+/// 就改用 `httpproxy` 协议，那个协议不在 mpv 的 protocol whitelist 里：
+///
+/// ```
+/// ffmpeg: httpproxy: Protocol 'httpproxy' not on whitelist 'udp,rtp,tcp,…'!
+/// lavf: avformat_open_input() failed
+/// ```
+///
+/// 分片一个都取不到，表现是「切到 4K/1080 只有声音没画面、两秒就 EOF」。
+/// 原画一直没事，正因为**它走的是 `127.0.0.1` 的中继** —— ffmpeg 对回环地址
+/// 不做代理。所以让转码档也回到回环上，是唯一能同时解决「相对路径」与
+/// 「代理劫持」两个问题的位置。
+///
+/// 中继侧对 HLS 是**原样转发**：不做并发预取（上游本来就是分片并发下发的），
+/// 只把「上游地址」换成 `127.0.0.1` 的入口。
+bool isRelayableUrl(Uri url) => url.scheme == 'http' || url.scheme == 'https';
 
 /// 把网盘直链**中继**成本地 HTTP 流。
 ///

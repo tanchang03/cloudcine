@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import '../../core/utils/cookie_parser.dart';
 import '../../core/utils/file_names.dart';
 import '../../core/utils/filename_parser.dart';
 import '../../core/utils/player_audio_effect.dart';
@@ -556,6 +557,7 @@ class PlayRequest {
   const PlayRequest({
     required this.url,
     required this.title,
+    this.filePath = '',
     this.itemId = '',
     this.headers = const <String, String>{},
     this.qualityId,
@@ -580,6 +582,24 @@ class PlayRequest {
 
   /// 播放窗口标题栏/页头显示的片名
   final String title;
+
+  /// 网盘上的**完整路径**：
+  /// `/电影/流浪地球2 (2023)/流浪地球2.2023.2160p.mkv`。
+  ///
+  /// ## 为什么它必须随请求过来
+  ///
+  /// 播放窗口跑在**另一个 Flutter 引擎**里，读不到主窗口的索引库（与
+  /// [autoPlayNext] / [skipIntro] / [audioEffect] 同一条理由）。顶栏要显示
+  /// 「现在放的是网盘上的哪一个文件」，只有把路径随请求投过去这一条路。
+  ///
+  /// ## 为什么片名之外还要显示它
+  ///
+  /// 同一部剧的同名文件常常有好几份（翡翠台 / 粤语 / 4K 重制），
+  /// [displayTitle] 解析出来**一模一样** —— 只有全路径能分开它们。用户排查
+  /// 「怎么放的是没字幕的那一版」时，第一眼看的就是这一行。
+  ///
+  /// 缺省是空串（自检视频、手输直链都没有网盘路径），那时顶栏只显示片名。
+  final String filePath;
 
   /// 本地索引库里这一项的 id。
   ///
@@ -737,6 +757,7 @@ class PlayRequest {
   Map<String, Object?> toJson() => <String, Object?>{
         'url': url,
         'title': title,
+        'filePath': filePath,
         'itemId': itemId,
         'headers': headers,
         'qualityId': qualityId,
@@ -807,6 +828,7 @@ class PlayRequest {
     }
 
     final rawTitle = raw['title'];
+    final rawFilePath = raw['filePath'];
     final rawItemId = raw['itemId'];
     final rawQualityId = raw['qualityId'];
     final rawLabel = raw['qualityLabel'];
@@ -822,6 +844,9 @@ class PlayRequest {
     return PlayRequest(
       url: url,
       title: rawTitle is String ? rawTitle : '',
+      // 读不懂当空串（与 [filePath] 的缺省值一致）：顶栏少一行路径，
+      // 不该让整条请求作废。
+      filePath: rawFilePath is String ? rawFilePath : '',
       itemId: rawItemId is String ? rawItemId : '',
       headers: headers,
       qualityId: rawQualityId is String && rawQualityId.isNotEmpty
@@ -875,12 +900,36 @@ class PlayRequest {
     return q == null ? title : '$title（$q）';
   }
 
+  /// 供日志使用的**请求头摘要**。
+  ///
+  /// 只打键名与 Cookie 的**键名**（值一律不打，理由见 [describe]）。
+  ///
+  /// 为什么连 Cookie 的键名都要打：夸克转码档（`media.m3u8`）的地址不带签名，
+  /// 鉴权靠 `Video-Auth` 这个 cookie。它一旦没被带上，mpv 取分片只会拿到
+  /// 404（表现是「只有声音没画面、播两秒就 EOF」），而光看
+  /// 「请求头=[User-Agent, Accept, Referer, Cookie]」完全看不出少了什么 ——
+  /// Cookie 这一项**永远都在**，少的是它里面的键。
+  String describeHeaders() {
+    final keys = headers.keys.toList();
+    final cookie = headers['Cookie'];
+    if (cookie == null) return '$keys';
+    return '$keys Cookie键=${cookieHeaderKeyNames(cookie)}';
+  }
+
+  /// 这条流是不是 HLS（转码档）。
+  ///
+  /// 判据与 `StreamRelay` 排除 HLS 的那处一致（见 `canRelay`）：地址里含
+  /// `.m3u8`。原画是带签名的直链文件，转码档才是 m3u8 —— 两者在「鉴权方式」
+  /// 上是两套东西，日志里必须能分开看。
+  bool get isHls => url.contains('.m3u8');
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is PlayRequest &&
           other.url == url &&
           other.title == title &&
+          other.filePath == filePath &&
           other.itemId == itemId &&
           other.qualityId == qualityId &&
           other.qualityLabel == qualityLabel &&
@@ -903,6 +952,7 @@ class PlayRequest {
   int get hashCode => Object.hash(
         url,
         title,
+        filePath,
         itemId,
         qualityId,
         qualityLabel,

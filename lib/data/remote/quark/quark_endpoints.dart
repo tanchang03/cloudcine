@@ -270,6 +270,15 @@ class QuarkEndpoints {
   static const List<String> essentialCookieNames = ['__pus', '__puus'];
 
   /// 会一并抓取的已知 Cookie（便于服务端识别设备/账号）。
+  ///
+  /// ⚠️ `Video-Auth` **不能少**（2026-10-04 实测）：它由签发**转码档**的
+  /// `/file/play/info` 下发，而转码档的地址是 `media.m3u8` —— 那个 URL
+  /// **不带签名**（同一个文件隔几小时取回来一模一样），鉴权全靠这个 cookie。
+  /// 少了它，mpv 去取 m3u8 / 分片会拿到 **404**，表现是「只有声音没画面、
+  /// 播两秒就 EOF」。
+  ///
+  /// 原画走的是 `/file/audioplay`，地址自带 `auth_key` 签名、且那个接口
+  /// 不下发 `Video-Auth` —— 这正是「原画正常、转码档全挂」的分界线。
   static const List<String> knownCookieNames = [
     '__pus',
     '__puus',
@@ -279,6 +288,7 @@ class QuarkEndpoints {
     '__kps',
     '__ktd',
     '__kui',
+    'Video-Auth',
   ];
 
   /// 组装 `Cookie:` 头时的优先顺序（关键键在前，便于日志排查）

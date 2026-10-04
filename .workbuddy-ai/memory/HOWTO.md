@@ -3471,3 +3471,282 @@ libmdk 内核能正确渲染 DV P5。至此「换内核」不再是可行性问�
 - ⚠️ **别拿 mdk 日志当判据**：应用内**看不到** `Dolby Vision … Profile 5` 那行
   （默认日志级别不够，`bin/window` 才有）→ 起播成功与否要看界面，不是日志。
 
+---
+
+## 内核迁移方案：按需路由（2026-10-04 下午，用户已定）
+
+### 用户拍板的两条
+1. **只对 DV 片走 fvp**，其余仍走 media_kit。Android/TV **完全不动**
+   （那边是**真 window vo**，本来就不受 render API 限制）。
+2. **音效菜单保留，不可用的档位置灰并说明**（不做隐藏、不做删除）。
+
+### 为什么「按需路由」没有省掉抽象层
+DV 片也要切音轨、挂字幕、跳章节、看缓冲 —— 这些能力**必须在新内核上同样可用**。
+所以 `PlaybackController` 那 1392 行照样要过一层引擎门面；按需路由降低的是
+**暴露面**（只有 DV 片承担回归风险），不是**实现量**。
+
+### ⛔ 闸门是「开播前自己判 DV」——不能让播放器先打开再问
+先开再问是死循环：**打开本身就要先选好内核**。判据只能回到容器元数据。
+实测我们那条 4K DV 片源，映射记录在**偏移 439 字节**处，读 64 KiB 头部就够。
+
+### 已落地：`lib/core/utils/dolby_vision.dart`（纯解析，20 例单测全过）
+- Matroska 链：`Segment`(0x18538067) → `Tracks`(0x1654AE6B) → `TrackEntry`(0xAE)
+  → `BlockAdditionMapping`(0x41E4) → `BlockAddIDType`(0x41E7) /
+  `BlockAddIDExtraData`(0x41ED)。
+  ⛔ `BlockAddIDType` 是 **ASCII `"dvcC"` = `0x64766343`** / `"dvvC"` = `0x64767643`
+  ——**这是值不是元素名**，别去搜字面量 `dvcC`。
+- ISO BMFF：`moov` → … → `stsd`（**多一层「版本+标志(4)+条目数(4)」头**）→
+  `dvcC`/`dvvC` 盒，盒体本身就是那 24 字节记录。⚠️ `moov` **后置**的文件头部探不到。
+- 24 字节 DOVI 记录位布局（**已用真实片源对齐**）：
+  `byte2 bits7..1 = profile`、`byte2 bit0 + byte3 bits7..3 = level(6 位)`、
+  `byte3 bit2/1/0 = rpu/el/bl`、`byte4 bits7..4 = bl_signal_compatibility_id`。
+  实测样本 `01 00 0a 4d 00` → profile 5 / level 9 / compat 0，
+  与 mdk 打印的 `Dolby Vision 1.0 Profile 5 Level 9` 一致。
+- 判定口径刻意收窄：`needsDolbyVisionEngine = profile==5 && compat==0`。
+  带 HDR10 兼容层的 P8 退化成 HDR10 播只是「不够好」，
+  **不该替它承担换内核的回归风险**。
+- 两道值域闸（`record[0]==1`、`profile<=9`、`level<=13`）：MP4 那条路靠 4 字节盒名
+  定位，**误命中的代价是拿随机数据当配置解析**，会「探出」不存在的档位。
+
+### ⚠️ 测试里写 EBML 辅助函数的坑（我踩了）
+EBML 长度是 VINT，**1 字节形式的长度 0 必须写成 `0x80` 而不是 `0x00`**
+（`0x00` 没有任何标记位，真实解析器只能当坏数据）。写错的症状是
+**整个 Segment 都解析不出来**，看起来像解析器的 bug。
+
+### fvp/mdk 的能力缺口清单（实测，不是文档抄的）
+| 现有能力 | mpv | mdk | 结论 |
+|---|---|---|---|
+| 打开+请求头 | `Media(httpHeaders:)` | `video_player` 的 `httpHeaders` | ✅ |
+| 音/视/字轨列表 | `stream.tracks`（**流**） | `getMediaInfo()`（**一次性**） | ⚠️ 语义差 |
+| 选音轨/字幕轨/关字幕 | `setAudioTrack`/`setSubtitleTrack` | `setAudioTracks([id])`/`setSubtitleTracks([])` | ✅ |
+| 外挂字幕 | `SubtitleTrack.data(bytes)` | `setExternalSubtitle(uri)` —— **只吃 URI** | ⚠️ 需落临时文件 |
+| 字幕渲染 | libass（media_kit_video 内） | **mdk 内部 libass，渲染进视频纹理** | ✅ 不丢 |
+| 章节 | `getProperty('chapter-list')` | `MediaInfo.chapters` | ✅ |
+| 缓冲终点 | `stream.buffer`（**绝对时间戳**） | `bufferedTimeRanges()`（**区间列表**） | ⚠️ 要改写 |
+| 硬解 | `hwdec` | `setVideoDecoders([...])` | ✅ |
+| 缓冲参数 | `cache`/`video-sync`/`demuxer-readahead-secs` | `setBufferRange(min,max,drop)` + `demuxer.*` | ⚠️ 语义不同 |
+| 音效 | `af` / `audio-channels` | **无对等物** | ❌ 置灰 |
+| 网络速率 | `demuxer-cache-state` | 无直接对等 | ❌ 降级 |
+| mpv 日志流 | `stream.log` | 无对等 | ❌ 字幕解码诊断会丢 |
+| 出画面判据 | `stream.videoParams` | `VideoPlayerValue.size > 0` | ✅ |
+| 画面调节 | 无 | `setVideoEffect`（亮度/对比/色相/饱和） | ➕ 白送 |
+
+### 阶段 2 已落地：引擎契约 + fvp 实现
+- 契约：`lib/domain/services/playback_engine.dart`（抽象放 domain，符合本项目分层）。
+  含 `EngineMedia` / `EngineTrack(s)` / `EngineChapter` / `EngineVideoSize` /
+  `EngineCapabilities` / `EngineTimeRange`。
+- fvp 实现：`lib/data/playback/fvp_playback_engine.dart`（实现放 data）。
+- 单测：`test/domain/services/playback_engine_test.dart`（16 例）。
+
+#### ⛔ 契约里最危险的一条：缓冲终点
+`bufferEnd` 的语义是**「已缓存区间的结束位置」**（= mpv 的 `demuxer-cache-time`），
+**不是**「前面还有多少秒」。两个内核的原始表示不同：
+mpv 直接给绝对时间戳，mdk 给**区间列表**。
+唯一允许的换算点是 `EngineTimeRange.cacheEndAt(ranges, position)`：
+- **优先取「包含播放头的那一段」的终点**，⛔ 不是全局最大值 ——
+  取最大值会把 seek 后残留在远端的段算进来，进度条画出一段读不到的缓存。
+- **播放头不在任何区间里 → 返回 0，绝不猜**。代价不对称：
+  少报只是暂时不画缓冲层（`PlayerBufferProgress.positionOf` 会退回播放头），
+  多报是进度条说谎。
+
+#### fvp 接入的实测事实（都是踩出来的）
+1. `FVPControllerExtensions` 是**扩展方法** → `import 'package:fvp/fvp.dart'`
+   **不能加前缀**，否则 `controller.setAudioTracks(...)` 编译不过。
+2. fvp 会把 `dataSource.httpHeaders` 写成 mdk 的 **`avio.headers`** → **Cookie 能带上**。
+3. fvp 的 `create()` 调 `player.prepare()` **不带位置** → 起播位置只能
+   `initialize()` 之后、`play()` 之前 `seekTo()`。
+   ⚠️ 这条路**必须在真机上验**（续播是主路径）。理论上 mdk 在 Prepared 状态下
+   seek 是有效的（不像 mpv 的 `loadfile` 竞态 —— 那正是 media_kit 非要
+   `Media(start:)` 的原因）。
+4. ⛔ **fvp 不上报 `buffered`**（`video_player_mdk.dart` 全文件没有这个词）→
+   `bufferEnd` 在 DV 片源上恒为 0，**进度条的缓冲层不会出现**。
+   不做补偿的理由：`positionOf` 在 `cacheEnd<=0` 时退回播放头，缓冲层自动
+   与已播层重合（看不见），是**优雅降级**；而 `MdkVideoPlayerPlatform._players`
+   是私有的，硬取要重写整个平台层，不值得。
+5. ⛔ `MediaInfo` 里**没有 `isDefault`** → `EngineTrack.isDefault` 恒为 false。
+   影响面：内嵌字幕的「发布者标记为默认」那一条退化；
+   音轨不受影响（`_maybeRestoreAudio` 本来就把「没偏好」当「让引擎用默认」）。
+6. ⚠️ **音量口径不同**：`video_player` 是 0..1，media_kit 是 0..100。
+   契约统一 0..100，fvp 实现里 ×100 / ÷100 换算。
+7. ⚠️ mdk 的 `setActiveTracks(audio, [])` 是「一条都不选」＝**静音**，
+   与 media_kit 的 `AudioTrack.auto()` 语义不同 →
+   `selectAudioTrack(null)` 在 fvp 实现里是**空操作**，不是关音轨。
+8. `MediaInfo` 是**一次性查询**（不是流）→ fvp 实现开了 8 秒的轮询窗口
+   （400ms × 20 次）反复问，靠 `EngineTracks.signature` 去重。
+   指纹**必须带 id 而不只是条数**：换集时条数常一样、只有轨道号变了。
+
+#### 渲染句柄的归属
+领域层契约**故意不带**渲染方法（domain 不引 Flutter）。
+两个实现各自暴露具体类型的 getter（`VideoController` / `VideoPlayerController`），
+由 **UI 层**按引擎具体类型挑组件 —— 见 `ui/widgets/playback_surface.dart`（待做）。
+
+### 下一步（阶段 3）
+1. `MediaKitPlaybackEngine`（把现有 media_kit 行为**原样**包一遍，不改语义）。
+2. `PlaybackController` 改为面向 `PlaybackEngine`，并在 `resolveStream` 之后
+   用 `dolby_vision.dart` 探头部字节（Range 请求，走 `HttpClientLike.getBytes`
+   传 `{'Range': 'bytes=0-262143'}` + ticket.headers）决定用哪个引擎。
+3. `ui/widgets/playback_surface.dart` + 两份播放器 UI 的渲染槽位与置灰。
+4. `main.dart` 里 `fvp.registerWith(options: {'platforms': ['macos']})`。
+
+---
+
+## 引擎契约的标识符与两条硬约束（2026-10-04 傍晚，阶段 2 补完）
+
+### 文件
+- `lib/domain/services/playback_engine.dart` —— 契约与模型（领域层，**不引 Flutter**）。
+- `lib/data/playback/fvp_playback_engine.dart` —— fvp（libmdk），**只服务 DV 片**。
+- `lib/data/playback/media_kit_playback_engine.dart` —— media_kit（mpv），**默认内核**。
+- `lib/data/playback/change_gate.dart` —— `ChangeGate<T>`，两个引擎共用。
+
+### ⛔ 契约里最容易写错的三个标识符
+| 标识符 | 正确 | 写错的后果 |
+|---|---|---|
+| `networkSpeed` | `Stream<double>`，**字节/秒** | 曾误写成 `Stream<Duration>`。这个量与「秒」无关，它是带宽 |
+| `log` | `Stream<String>`，**必须有** | 缺了它**字幕解码诊断彻底消失**：mpv 报 `sd_lavc` 失败时 `stream.error` 收不到（media_kit 的白名单里没有 `sd_lavc`），只能从 `stream.log` 捞 |
+| `EngineVideoSize` | 必须有 `==` / `hashCode` | `ChangeGate` 用 `==`，缺了它闸完全失效，每次 `videoParams` 都被判成「尺寸变了」 |
+
+### ⛔ `ChangeGate` 的 `null` 陷阱（真 bug，被测试抓出来）
+不能用 `_last == null` 判断「有没有发过」—— `null` 是**合法值**
+（`activeSubtitleTrackId` 的 null = 没有字幕在显示）。
+必须单独记一位 `bool _has`。
+症状：打开一部没有内嵌字幕的片子，字幕菜单停在上一集的状态。
+
+### 两处「刻意不换算」
+1. `bufferEnd` 在 media_kit 实现里**直接转发** `player.stream.buffer`。
+   mpv 的 `demuxer-cache-time` 本来就是绝对时间戳，与契约参照系一致。
+   ⛔ 别在这条路上调 `EngineTimeRange.cacheEndAt` —— 那是给 mdk 的
+   「区间列表」用的，套到标量上语义完全错位。
+2. `error` **原样转发、不过滤**。关键词过滤与字幕诊断分流是业务判断，
+   留在 `PlaybackController`。
+
+### `chapters()` 的语义补全
+mpv 的 `chapter-list` **只给起点**（`IntroChapter` 只有 title+start），
+而契约要 `[start, end]`。补法：**一章延伸到下一章的起点，最后一章延伸到
+片尾**。片长未知 / 乱序时退化成零长度（`end == start`），**不编假终点** ——
+章节的唯一用途是「认片头」，而认片头只看 `start`。
+
+### 归属：两个引擎都**拥有**自己的播放器
+- media_kit：构造函数建 `mk.Player` + `VideoController`，`dispose()` 销毁。
+  但 `mk.Player get player` **仍对外暴露** —— 音效
+  （`PlayerAudioEffect.apply`）与缓冲调优（`PlayerBufferConfig.apply`）是
+  mpv 专有能力，契约里没有（mdk 无对等物）。构造参数 `tv` 由调用方给。
+- fvp：构造函数建 `VideoPlayerController`，`dispose()` 销毁；
+  `VideoPlayerController get videoController` 给 UI 当渲染句柄。
+
+⚠️ 领域层契约**故意不带渲染方法**（领域层不引 Flutter，拿不到 widget）。
+UI 层按引擎的具体类型挑渲染组件，见（待建）`ui/widgets/playback_surface.dart`。
+
+### 验证口径
+`flutter test` 全量 **2177 例**（阶段 2 补完后）。`flutter analyze` 全仓
+仍有 7 条既有 info（`test/ui/providers/move_targets_test.dart`、
+`test/ui/widgets/drive_move_dialog_test.dart`、`tool/seek_probe_test.dart`），
+**都与本工作无关**。
+
+---
+
+## 两条取链路由：**原画 = 直链文件，转码档 = HLS**（2026-10-04 13:3x）
+
+### ⛔ 验证 DV 必须选**原画**，选了转码档等于在测另一件事
+
+| 档位 | 路由 | 产物 | 与 DV 的关系 |
+|---|---|---|---|
+| **原画** | `audio_play` | **直链文件**（`video-play-c-zb...`），支持 Range → 走本地中继 | **DV 只在这里** |
+| 转码档（4K/super/high/low） | `play_info` | **`media.m3u8`（HLS）**，1920p 起的 SDR 转码 | **无关**（转码是 SDR） |
+
+日志里的判据：`[取链] 路由 audio_play 签发票据` vs `路由 play_info 签发票据`。
+
+⚠️ 5 个档位共用**同一个** `media.m3u8`（`StreamTicket.withQuality` 只改
+`contentLength`，不改 URL）→ 界面上的「档位=4K」对 HLS **没有实际作用**，
+由 mpv 自己挑 variant。这是个既有的设计缺口，与 DV 无关，但排查时要知道。
+
+### 故障现象（13:2x 实测，尚未定位到根因）
+转码档 HLS：有声音、没画面、mpv 在 **1~2 秒**后报 `eof-reached` →
+`completed` → 自动连播下一集 → 几十秒内级联跳完 5 部片。
+`completed` 直接来自 `player.stream.completed`（无 duration 启发式），
+所以是**流本身就短**，不是我们的判定错。
+
+已排除：`VideoController` 绑错 Player（绑定正确）、音效/缓冲参数（旧构建同样）、
+本地中继（HLS 根本不进中继）、mdk 的 FFmpeg（不影响 mpv）。
+
+### ⛔ mdk 的 FFmpeg **没有**被打进 macOS 产物（阶段 3 之前必须修）
+```
+otool -L macos/Pods/mdk/.../mdk.framework/mdk
+  @rpath/libavformat.63.dylib (weak) ← 产物里没有
+  @rpath/libavcodec.63.dylib  (weak) ← 产物里没有
+  @rpath/FFmpeg.framework/FFmpeg (weak) ← 产物里没有
+```
+`CloudCine.app/Contents/Frameworks/` 只有 `mdk.framework`。全是 weak import →
+**加载成功、拿不到 FFmpeg、解不了任何流**，而且**不报错**。
+media_kit 那套是 `Avformat.framework` **版本 60**（FFmpeg 6），mdk 要 **63**
+（FFmpeg 7/8）—— 两套**不能互用**，别指望它捡到 media_kit 那份。无关**。
+
+
+
+## §测试取向（细节，从 MEMORY.md 下沉）
+
+- **基线**：`flutter test` 全过（`skip` 只收 `bool?`）。
+- ⚠️ **测相似度 / 打分别猜数值，先写脚本跑**；断言写档位边界。
+- ⚠️ 时间相关逻辑**必须注入时钟**；测「按平台挑后端」必须设
+  `debugDefaultTargetPlatformOverride`（`flutter test` 下默认**一律 `android`**）；
+  复位只能写在**测试体里**。
+- ⚠️ 改 `tables.dart` 列后先跑 `build_runner build`；看不懂的编译错误先重跑一次。
+  `AppSettings.fromValues(Map)` 是默认值真源。
+- ⚠️ `find.byType(FilledButton)` **不匹配** `FilledButton.icon`（子类）
+  → 报 `Bad state: No element`。改用
+  `find.byWidgetPredicate((w) => w is FilledButton)`。
+
+## §封面与刮削（从 MEMORY.md 下沉的标识符）
+
+- `mergeWorkForUpsert` 的覆盖开关叫 **`overrideManual`**：
+  `source=manual` 只被**显式**刮削覆盖。
+- 两条解析层守卫的名字：**`_pickYear`**（括号内日期不算年份）、
+  **`_isStandaloneRelease`**（纯数字片名要自带年份）。
+
+## §转码档 HLS：2 秒 EOF 的完整结论（2026-10-04）
+
+### 症状
+夸克网盘里同一部片：**原画正常**（DV 偏绿是另一件事），切到 **4K / 1080P** 只能播
+2~8 秒、有声音没画面，然后 EOF → 触发自动连播。**所有剧集都一样**，与 DV 无关。
+夸克自己的网页播放器播同一文件**没有**这个问题。
+
+### 根因（有日志证据，不是推测）
+夸克把 `play/info` 的 `video_list[].video_info.url` 从**带签名直链**换成了
+**`media.m3u8`（HLS）**：
+
+| 日期 | 投给播放窗口的 4K 地址 |
+|---|---|
+| 2026-10-03 | `video-play-c-zb/.../6698b322...`（带签名直链）→ **播得动** |
+| 2026-10-04 | `video-play-h-zb/qv/.../media.m3u8` → **2~8 秒 EOF** |
+
+判据：`awk` 统计 `投给独立窗口` 那一行 —— 10-03 是「直链 档位=4K」9 次，
+10-04 变成「HLS 档位=4K」33 次。**不是我们的代码改的**：
+`QuarkPlayInfoParser._firstUrl` 按 `urlKeys` 取第一个像地址的字段
+（`url` 优先），服务端给什么用什么，**没有任何「直链优先」的偏好逻辑**；
+而 `quark_play_routes.dart` 自 10-01 起没动过。
+
+### 一级嫌疑：`Video-Auth` cookie
+- 签发**转码档**的 `/file/play/info` **每个响应都下发** `set-cookie: Video-Auth`；
+  签发**原画**的 `/file/audioplay` **不下发**（原画地址自带 `auth_key` 签名）。
+- 而 `media.m3u8` 的 URL **不带签名** —— 同一个文件在 11:15 / 13:24 / 13:54 / 13:59
+  取回来**一模一样**，鉴权只能靠 cookie。
+- `QuarkEndpoints.knownCookieNames` 原本**没有** `Video-Auth`，于是
+  `_absorbRotatedCookies` 按白名单过滤时把它**静默丢弃**。已修（加进白名单）。
+- 2026-10-04 13:59:57 切 4K 后 30ms，mpv 报 `http: HTTP error 404 Not Found`。
+
+### ⛔ 一个反直觉的坑：护栏会**放行**这个故障
+`PlaybackCompletion.isRealEnd` 的判据是「位置 ≥ 3s」或「出过画面」。
+实测故障现场是 **位置 3~7 秒 + mpv 确实报过视频尺寸** → 护栏判成「真播完」，
+自动连播照常触发。所以**诊断的触发条件必须独立于护栏**：
+`request.isHls && position < PlaybackCompletion.suspiciousHlsPosition`（30s）。
+上一版把诊断挂在护栏里面，结果护栏一次都没拦，诊断一次都没跑，
+最关键的证据（m3u8 内容）从头到尾没落过盘。
+
+### 已加的诊断（下一轮复现就能定位）
+- `_probeHlsPlaylist`：出事时**用票据自带的请求头**自己抓一次 m3u8，
+  打状态码 + `cookieHeaderKeyNames` + `summarizeHlsPlaylist` 的摘要
+  （**分片数 / 合计时长 / 有无 ENDLIST / 是否 master**）。
+  分水岭：自己抓 200 而 mpv 404 → 是 mpv 侧；自己抓也 404 → 是凭证/票据。
+- `_mpvLogTail`（环形缓冲 120 条）+ `_dumpPlaybackDiagnostics`：
+  mpv 平时的话**全被两个过滤器丢掉**，这条尾巴是它唯一能留痕的地方。
+- 投链与刷新直链两处日志补上「HLS 还是直链」+ **Cookie 键名**
+  （只看 `headers.keys` 永远只能看到「Cookie」这一项，而它**永远都在**）。

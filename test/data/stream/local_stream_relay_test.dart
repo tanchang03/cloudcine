@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cloudcine/core/utils/hls_relay_rewrite.dart';
 import 'package:cloudcine/core/utils/http_range.dart';
 import 'package:cloudcine/data/stream/local_stream_relay.dart';
 import 'package:cloudcine/domain/adapters/stream_relay.dart';
@@ -10,11 +12,21 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('isRelayableUrl', () {
-    test('HLS 不走中继', () {
-      // m3u8 里的分片是相对地址，中继会把拼地址的基准改成 127.0.0.1，
-      // 拼出来的地址全部指向我们自己的服务 —— 播不了。
+    test('HLS **也**要走中继（2026-10-04 改，以前断言的是 false）', () {
+      // 以前这里断言 false，理由是「分片是相对地址，中继会把拼地址的基准改成
+      // 127.0.0.1」。那个理由靠**改写列表**解决（见 `rewriteHlsForRelay`），
+      // 而放弃中继的代价是致命的：转码档因此成了本机唯一一条「播放器直连
+      // CDN」的流，而本机 `http_proxy` 会让 ffmpeg 走进未放行的 `httpproxy`
+      // 协议 —— 分片一个都取不到，表现就是「切到 4K/1080 只有声音没画面、
+      // 两秒就 EOF」。原画一直没事，正因为它本来就走在 127.0.0.1 上。
       expect(isRelayableUrl(Uri.parse('https://cdn.quark.cn/media.m3u8?x=1')),
-          isFalse);
+          isTrue);
+    });
+
+    test('isHlsUrl 只认 .m3u8', () {
+      // 中继靠它分流：HLS 走「改写列表 + 透传分片」，其余走「按块并发预取」。
+      expect(isHlsUrl(Uri.parse('https://cdn.quark.cn/media.m3u8?x=1')), isTrue);
+      expect(isHlsUrl(Uri.parse('https://cdn.quark.cn/a.mkv')), isFalse);
     });
 
     test('普通 http/https 直链可以走中继', () {
@@ -24,6 +36,103 @@ void main() {
     test('本地文件 / asset 不走中继', () {
       expect(isRelayableUrl(Uri.parse('file:///Users/a/b.mkv')), isFalse);
       expect(isRelayableUrl(Uri.parse('asset:///assets/probe.mp4')), isFalse);
+    });
+  });
+
+  group('LocalStreamRelay HLS（转码档）', () {
+    test('列表被改写成中继入口、分片经中继取回，Cookie 带到上游', () async {
+      const segmentBody = 'SEGMENT-BYTES-0123456789';
+      final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(upstream.close);
+      final seenCookies = <String?>[];
+      final seenPaths = <String>[];
+      upstream.listen((request) async {
+        seenCookies.add(request.headers.value('Cookie'));
+        seenPaths.add(request.uri.path);
+        if (request.uri.path.endsWith('.m3u8')) {
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType =
+                ContentType.parse('application/vnd.apple.mpegurl')
+            // ⚠️ 分片是**相对地址** —— 这正是必须改写列表的原因。
+            ..write('#EXTM3U\n'
+                '#EXT-X-VERSION:3\n'
+                '#EXT-X-PLAYLIST-TYPE:VOD\n'
+                '#EXTINF:2.000,\n'
+                'media-x-0.ts?auth_key=1-2-3\n'
+                '#EXT-X-ENDLIST\n');
+        } else {
+          request.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.parse('video/MP2T')
+            ..headers.set(HttpHeaders.contentLengthHeader, segmentBody.length)
+            ..write(segmentBody);
+        }
+        await request.response.close();
+      });
+
+      final relay = LocalStreamRelay();
+      addTearDown(relay.dispose);
+
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:${upstream.port}/qv/x/media.m3u8'),
+          headers: const <String, String>{'Cookie': 'token=abc'},
+          // 服务端声明的整档体积 —— 中继**不能**拿它当「这条流多少字节」。
+          contentLength: 12345,
+        ),
+      ))!;
+
+      // ① 播放器拿到的地址必须是 127.0.0.1。这就是绕开本机 http_proxy 的关键：
+      //    ffmpeg 对回环地址不做代理，也就不会去用那个未放行的 httpproxy 协议。
+      expect(endpoint.uri.host, '127.0.0.1');
+      expect(endpoint.uri.path, endsWith('/$relayEntryPath'));
+      expect(endpoint.uri.queryParameters[relayTargetQueryKey], isNotNull);
+
+      final client = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(client.close);
+
+      // ② 取列表：应被改写，且**上游主机名不再出现**在正文里
+      //    （分片地址被换成了中继入口）。
+      final playlistResponse = await (await client.getUrl(endpoint.uri)).close();
+      expect(playlistResponse.statusCode, HttpStatus.ok);
+      final playlist = await utf8.decodeStream(playlistResponse);
+      expect(playlist, contains('#EXT-X-ENDLIST'));
+      expect(playlist, isNot(contains('127.0.0.1:${upstream.port}')));
+      final segmentLine = playlist
+          .split('\n')
+          .map((l) => l.trim())
+          .firstWhere((l) => l.isNotEmpty && !l.startsWith('#'));
+      expect(segmentLine, startsWith(relayEntryPath));
+
+      // ③ 按**列表自己的地址**解析那一行（播放器就是这么做的）→ 分片也应从
+      //    127.0.0.1 取到，而不是去 CDN。
+      final segmentUri = endpoint.uri.resolve(segmentLine);
+      expect(segmentUri.host, '127.0.0.1');
+      final segmentResponse = await (await client.getUrl(segmentUri)).close();
+      expect(segmentResponse.statusCode, HttpStatus.ok);
+      expect(await utf8.decodeStream(segmentResponse), segmentBody);
+
+      // ④ Cookie 必须被中继带到上游 —— 转码档还额外依赖 Video-Auth，
+      //    少了它上游一律 404。
+      expect(seenCookies, isNotEmpty);
+      expect(seenCookies.every((c) => c == 'token=abc'), isTrue);
+      // ⑤ 上游确实收到了「列表」和「分片」两次请求，且分片那次带上了原始
+      //    查询串（auth_key 丢了就是 404）。
+      expect(seenPaths.where((p) => p.endsWith('.m3u8')).length, 1);
+      expect(seenPaths.where((p) => p.endsWith('.ts')).length, 1);
+
+      // ⑥ HLS 会话不做预取，所以没有 RelayStats —— `warmUpRelay` 靠这个
+      //    立刻返回，不会在换档时白等一个预热超时。
+      expect(relay.statsOf(endpoint.token), isNull);
+      expect(relay.sessionCount, 1);
+
+      // ⑦ 关掉之后该 token 的所有请求都变成 404（旧连接上的回声）。
+      await relay.close(endpoint.token);
+      expect(relay.sessionCount, 0);
+      final gone = await (await client.getUrl(endpoint.uri)).close();
+      expect(gone.statusCode, HttpStatus.notFound);
+      await gone.drain<void>();
     });
   });
 

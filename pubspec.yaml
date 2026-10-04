@@ -68,6 +68,21 @@ dependencies:
   qr_flutter: ^4.1.0
   fast_gbk: ^1.0.0
 
+  # 第二内核：fvp（libmdk）。**只用于杜比视界片源**，其余片源仍走 media_kit。
+  #
+  # 为什么要它：DV Profile 5 的像素在 IPT-PQ-C2 空间里，还原成 RGB 必须把 RPU
+  # 元数据应用在**渲染阶段**。macOS 上 media_kit 走 mpv 的 render API
+  # （`vo=libmpv`），而它的后端只有 `gpu`/`sw` 两个，`vo=gpu-next` **架构上
+  # 不可达** —— libmpv 这条路在 macOS 上不可能渲染 DV。mdk 内置 Metal shader
+  # 做 RPU reshape，已 PoC 验证颜色正确。
+  #
+  # ⚠️ fvp 是 `video_player` 的平台实现，**必须在启动时显式
+  # `fvp.registerWith(options: {'platforms': ['macos']})`** —— 它的 macOS
+  # 声明里没有 `dartPluginClass`，不注册就会静默走 Apple 那套栈，
+  # 测出来是假阴性。
+  fvp: ^0.39.0
+  video_player: ^2.10.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

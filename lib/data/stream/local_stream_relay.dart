@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/hls_relay_rewrite.dart';
 import '../../core/utils/http_range.dart';
 import '../../domain/adapters/stream_relay.dart';
 import '../../domain/entities/stream_ticket.dart';
@@ -102,6 +104,12 @@ class LocalStreamRelay implements StreamRelay {
 
   final Map<String, _RelaySession> _sessions = <String, _RelaySession>{};
 
+  /// HLS（转码档）会话。与 [_sessions] **分开存**，因为服务方式完全不同：
+  /// 字节流会话是「按块并发预取 + 本地缓存」，而 HLS 会话只是把上游地址
+  /// 换成 `127.0.0.1` 的入口再原样转发 —— 上游本来就是分片并发下发的，
+  /// 再套一层预取只会两头添乱。见 [_serveHls]。
+  final Map<String, _HlsRelaySession> _hlsSessions = <String, _HlsRelaySession>{};
+
   @override
   Future<RelayEndpoint?> open(
     StreamTicket ticket, {
@@ -109,6 +117,13 @@ class LocalStreamRelay implements StreamRelay {
     int startOffset = 0,
   }) async {
     if (!enabled) return null;
+
+    // 转码档走另一条路：它没有「总长度」也没有「按块预取」这回事。
+    // ⚠️ 必须在下面那两个检查**之前**分流 —— HLS 的 contentLength 是服务端
+    // 声明的整档体积，与「这条流多少字节」不是一回事，拿它切块会切错。
+    if (isHlsUrl(ticket.url)) {
+      return _openHls(ticket, label: label);
+    }
 
     final total = ticket.contentLength;
     if (total == null || total <= 0) {
@@ -169,22 +184,227 @@ class LocalStreamRelay implements StreamRelay {
 
   void _onRequest(HttpRequest request) {
     final token = _tokenOf(request);
-    final session = token == null ? null : _sessions[token];
+    if (token == null) {
+      _notFound(request);
+      return;
+    }
+    // HLS 会话（转码档）走另一条服务路径：播放列表要改写、分片要透传。
+    final hls = _hlsSessions[token];
+    if (hls != null) {
+      unawaited(_serveHls(request, hls));
+      return;
+    }
+    final session = _sessions[token];
     if (session == null) {
-      request.response
-        ..statusCode = HttpStatus.notFound
-        ..headers.set(HttpHeaders.contentLengthHeader, 0);
-      unawaited(request.response.close().catchError((Object _) {}));
+      _notFound(request);
       return;
     }
     unawaited(_serve(request, session, ++_readerSeq));
   }
 
-  /// 从路径里取会话标识：`/s3` → `s3`。
+  /// 回一条 404。中继上「token 不认识」就是这个意思 —— 会话已关 / 从没建过。
+  ///
+  /// ⚠️ 这个 404 会被 ffmpeg 原样报成 `http: HTTP error 404 Not Found`，
+  /// 而播放窗口的 `isHttp4xxLog` **只看正文里的状态码**，分不出它来自中继。
+  /// 所以「换源时先关旧会话」会引出一条假的「直链过期」——见
+  /// `player_window_app._prepareSource` 里关于关闭时机的说明。
+  void _notFound(HttpRequest request) {
+    request.response
+      ..statusCode = HttpStatus.notFound
+      ..headers.set(HttpHeaders.contentLengthHeader, 0);
+    unawaited(request.response.close().catchError((Object _) {}));
+  }
+
+  /// 从路径里取**会话标识**（只取第一段）：`/s3` → `s3`，
+  /// `/h1/index.m3u8` → `h1`。
+  ///
+  /// ⚠️ 必须只取第一段：HLS 会话的请求路径是 `/<token>/index.m3u8`，
+  /// 拿整条路径当标识的话每个分片都查不到会话 —— 表现是「播放列表取得回来、
+  /// 分片全 404」，正好是最难查的那种半死状态。
   String? _tokenOf(HttpRequest request) {
     final path = request.uri.path;
     if (path.isEmpty || path == '/') return null;
-    return path.startsWith('/') ? path.substring(1) : path;
+    final trimmed = path.startsWith('/') ? path.substring(1) : path;
+    final slash = trimmed.indexOf('/');
+    final token = slash < 0 ? trimmed : trimmed.substring(0, slash);
+    return token.isEmpty ? null : token;
+  }
+
+  // -------------------------------------------------------------------
+  // HLS（转码档）
+  // -------------------------------------------------------------------
+
+  /// 建一条**直连**的上游连接（HLS 代理用）。
+  ///
+  /// ⚠️ `findProxy = DIRECT` 是整条修复的关键：`dart:io` 的 `HttpClient` 默认
+  /// 会读 `http_proxy` 环境变量，而本机那份代理是为命令行工具准备的。少了它，
+  /// 中继自己也会被代理掉 —— 那就等于没修。
+  ///
+  /// （字节流会话里也有一份同名逻辑，在 `_RelaySession._openClient` 上；
+  /// 两处口径必须一致：都直连、都开 keep-alive。）
+  HttpClient _directClient() {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    client.findProxy = (Uri _) => 'DIRECT';
+    client.idleTimeout = const Duration(seconds: 30);
+    return client;
+  }
+
+  /// 为一条 HLS 流建会话。
+  ///
+  /// 它**不做**并发预取，也**不要求**已知长度 / Range —— 上游本来就是分片
+  /// 并发下发的，中继在这里只干一件事：把「上游地址」换成 `127.0.0.1` 的入口。
+  ///
+  /// 为什么要换，见 [isRelayableUrl] 的文档：本机 `http_proxy` 会让 ffmpeg
+  /// 走进一个不在 protocol whitelist 里的 `httpproxy` 协议，分片一个都取不到。
+  Future<RelayEndpoint?> _openHls(StreamTicket ticket, {String? label}) async {
+    try {
+      final server = await _ensureServer();
+      final token = 'h${++_tokenSeq}';
+      final name = label ?? ticket.redactedUrl;
+      _hlsSessions[token] = _HlsRelaySession(
+        headers: ticket.headers,
+        label: name,
+      );
+      final entry = Uri(
+        scheme: 'http',
+        host: '127.0.0.1',
+        port: server.port,
+        path: '/$token/$relayEntryPath',
+        queryParameters: <String, String>{
+          relayTargetQueryKey: encodeRelayTarget(ticket.url.toString()),
+        },
+      );
+      diag.info(
+        '中继',
+        '已接管 $name（HLS 转码档）：播放列表与分片都改走 127.0.0.1，'
+        '避开本机 http_proxy（那个代理会让 ffmpeg 用上未放行的 httpproxy 协议）',
+      );
+      return RelayEndpoint(
+        uri: entry,
+        token: token,
+        contentLength: ticket.contentLength ?? 0,
+      );
+    } catch (e) {
+      // 起不来不是错误：直连至少还能试。这里**不能**往上抛。
+      diag.warn('中继', 'HLS 中继启动失败，直连播放：$e');
+      return null;
+    }
+  }
+
+  /// 服务一条 HLS 请求：**播放列表改写后回给播放器，分片原样透传**。
+  ///
+  /// 上游地址放在查询串 `?u=`（base64url）里，所以这一个入口同时承担「取列表」
+  /// 与「取分片」两件事 —— 列表里每一行都会被改写成指向它自己（见
+  /// `rewriteHlsForRelay`）。
+  ///
+  /// 失败一律降级成 502：中继是加速手段，它自己不该变成故障源。
+  Future<void> _serveHls(HttpRequest request, _HlsRelaySession session) async {
+    final response = request.response;
+    final encoded = request.uri.queryParameters[relayTargetQueryKey];
+    final target = encoded == null ? null : decodeRelayTarget(encoded);
+    final upstream = target == null ? null : Uri.tryParse(target);
+    if (upstream == null) {
+      response
+        ..statusCode = HttpStatus.badRequest
+        ..headers.set(HttpHeaders.contentLengthHeader, 0);
+      unawaited(response.close().catchError((Object _) {}));
+      return;
+    }
+
+    HttpClient? client;
+    try {
+      // ⚠️ `_directClient()` 里那句 `findProxy = DIRECT` 是整条修复的关键：
+      // 少了它，中继自己也会被 `http_proxy` 代理掉 —— 那就等于没修。
+      client = _directClient();
+      final upstreamRequest = await client.getUrl(upstream);
+      for (final e in session.headers.entries) {
+        upstreamRequest.headers.set(e.key, e.value);
+      }
+      // 播放器（或上游）要求 Range 时原样带过去：分片也可能被 seek 分段取。
+      final range = request.headers.value(HttpHeaders.rangeHeader);
+      if (range != null) {
+        upstreamRequest.headers.set(HttpHeaders.rangeHeader, range);
+      }
+      upstreamRequest.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+
+      final up = await upstreamRequest.close();
+      session.requests++;
+      if (up.statusCode != HttpStatus.ok &&
+          up.statusCode != HttpStatus.partialContent) {
+        session.failures++;
+        diag.debug('中继', 'HLS 上游 ${up.statusCode}：${upstream.path}');
+        await up.drain<void>();
+        response
+          ..statusCode = HttpStatus.badGateway
+          ..headers.set(HttpHeaders.contentLengthHeader, 0);
+        await response.close();
+        return;
+      }
+
+      if (_isPlaylistResponse(upstream, up)) {
+        // 播放列表很小（实测十几 KB），一次读全是安全的。
+        final bytes = await up.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+        final rewritten = rewriteHlsForRelay(
+          utf8.decode(bytes, allowMalformed: true),
+          playlistUrl: upstream,
+        );
+        final body = utf8.encode(rewritten.body);
+        response
+          ..statusCode = HttpStatus.ok
+          ..headers.set(
+            HttpHeaders.contentTypeHeader,
+            'application/vnd.apple.mpegurl',
+          )
+          ..headers.contentLength = body.length
+          ..add(body);
+        await response.close();
+        diag.debug(
+          '中继',
+          'HLS 播放列表已改写 ${rewritten.entryCount} 条（${upstream.path}）',
+        );
+        return;
+      }
+
+      response
+        ..statusCode = up.statusCode
+        ..headers.set(
+          HttpHeaders.contentTypeHeader,
+          up.headers.contentType?.toString() ?? 'video/mp2t',
+        )
+        // ⚠️ 声明支持 Range：mpv 靠它判断能不能 seek，少了这行进度条拖不动
+        // （同 [_serve] 里那条注释）。
+        ..headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+      final length = up.headers.contentLength;
+      if (length >= 0) response.headers.contentLength = length;
+      await response.addStream(up);
+      await response.close();
+    } catch (e) {
+      session.failures++;
+      diag.debug('中继', 'HLS 代理失败：$e');
+      try {
+        response
+          ..statusCode = HttpStatus.badGateway
+          ..headers.set(HttpHeaders.contentLengthHeader, 0);
+        await response.close();
+      } catch (_) {
+        // 响应头可能已经发出去了，关不掉就算了 —— 这里不该再抛。
+      }
+    } finally {
+      client?.close(force: true);
+    }
+  }
+
+  /// 这条上游响应是不是播放列表。
+  ///
+  /// 判据**按扩展名优先**，不靠嗅探正文：分片动辄一两 MB，为了嗅探先把首块
+  /// 读出来再想办法塞回去，只会让透传路径变复杂。列表的地址一定以 `.m3u8`
+  /// 结尾（master 的子列表也一样），Content-Type 只作兜底。
+  bool _isPlaylistResponse(Uri upstream, HttpClientResponse up) {
+    if (upstream.path.toLowerCase().endsWith('.m3u8')) return true;
+    final type = up.headers.contentType?.mimeType;
+    return type == 'application/vnd.apple.mpegurl' ||
+        type == 'application/x-mpegurl';
   }
 
   /// 服务一个读取器（一个 HTTP 请求）。[reader] 是它的身份 —— 用来让中继
@@ -251,12 +471,15 @@ class LocalStreamRelay implements StreamRelay {
     }
   }
 
+  /// ⚠️ HLS 会话**刻意返回 null**。它不做预取，没有「已缓存多少」可言；
+  /// 而 `warmUpRelay` 对 null 的语义正是「拿不到统计 → 不等了，直接切换」，
+  /// 所以换档到转码档时不会白等一个预热超时。
   @override
   RelayStats? statsOf(String token) => _sessions[token]?.stats;
 
-  /// 当前会话数。
+  /// 当前会话数（含 HLS 会话）。诊断页靠它回答「中继到底在不在干活」。
   @override
-  int get sessionCount => _sessions.length;
+  int get sessionCount => _sessions.length + _hlsSessions.length;
 
   /// 全部会话的**汇总**统计。没有会话时返回 `null`。
   ///
@@ -290,10 +513,12 @@ class LocalStreamRelay implements StreamRelay {
     );
   }
 
-  /// 当前会话的来源标签（脱敏后），供诊断显示。
+  /// 当前会话的来源标签（脱敏后），供诊断显示。含 HLS 会话。
   @override
-  List<String> get sessionLabels =>
-      _sessions.values.map((s) => s.label).toList(growable: false);
+  List<String> get sessionLabels => <String>[
+        ..._sessions.values.map((s) => s.label),
+        ..._hlsSessions.values.map((s) => s.label),
+      ];
 
   /// 当前会话的源长度（字节）。同时播两条流时取先注册的那条 —— 显示任意
   /// 一条都比显示「未知」有用，而「同机同时播两条」本身就是罕见情况。
@@ -307,6 +532,17 @@ class LocalStreamRelay implements StreamRelay {
 
   @override
   Future<void> close(String token) async {
+    // HLS 会话没有要 dispose 的 worker / 缓存，摘掉登记即可 ——
+    // 摘掉之后这个 token 的所有请求会立刻转成 404（见 [_notFound]）。
+    final hls = _hlsSessions.remove(token);
+    if (hls != null) {
+      diag.info(
+        '中继',
+        '会话 $token 已关闭（${hls.label}）'
+        '｜HLS 上游请求 ${hls.requests} 次，失败 ${hls.failures} 次',
+      );
+      return;
+    }
     final session = _sessions.remove(token);
     if (session == null) return;
     await session.dispose();
@@ -319,12 +555,36 @@ class LocalStreamRelay implements StreamRelay {
       await session.dispose();
     }
     _sessions.clear();
+    _hlsSessions.clear();
     final server = _server;
     _server = null;
     if (server != null) {
       await server.close(force: true);
     }
   }
+}
+
+/// 一条 **HLS**（转码档）会话。
+///
+/// 与 [_RelaySession] 的区别是**它不缓存、不预取**：HLS 本来就是「播放列表 +
+/// 一堆分片」，上游按需并发下发，中继在这里只负责把地址换成 `127.0.0.1`
+/// （理由见 [isRelayableUrl] 的文档），把请求原样转出去。
+///
+/// 因此它也**没有** `RelayStats` —— 见 [LocalStreamRelay.statsOf] 的说明。
+class _HlsRelaySession {
+  _HlsRelaySession({required this.headers, required this.label});
+
+  /// 上游请求头（含 Cookie）。中继转发时逐条带上 —— 夸克缺 Cookie 一律 412，
+  /// 而转码档还额外依赖 `Video-Auth`。
+  final Map<String, String> headers;
+
+  /// 脱敏后的来源标签，供诊断显示。
+  final String label;
+
+  /// 上游请求次数 / 失败次数。只用于关闭时落一条日志（也回答「这次换档到底
+  /// 有没有真的走中继」）。
+  int requests = 0;
+  int failures = 0;
 }
 
 /// 一条流的会话：缓存 + 并发拉取 + 对外提供字节流。

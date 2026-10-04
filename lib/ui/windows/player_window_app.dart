@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -10,7 +11,9 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/cookie_parser.dart';
 import '../../core/utils/format.dart';
+import '../../core/utils/hls_playlist.dart';
 import '../../core/utils/mpv_cache_state.dart';
 import '../../core/utils/mpv_chapters.dart';
 import '../../core/utils/mpv_subtitle_log.dart';
@@ -30,6 +33,7 @@ import '../../domain/services/cache_speed_meter.dart';
 import '../../domain/services/episode_queue.dart';
 import '../../domain/services/intro_marker.dart';
 import '../../domain/services/intro_session.dart';
+import '../../domain/services/playback_completion.dart';
 import '../../domain/services/playback_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../../domain/services/missing_media.dart';
@@ -44,6 +48,13 @@ import 'child_window_channel.dart';
 import 'player_protocol.dart';
 import 'player_window_bridge.dart';
 import 'window_launch.dart';
+
+/// 顶部浮层（片名 + 网盘全路径）的 key。
+///
+/// 暴露出来只为一件事：**量它的高度**。顶栏的高度随「有没有网盘路径」变
+/// （没有路径时少一行），而「少没少那一行」只能靠尺寸断言 ——
+/// 找 `MouseRegion` 的第几个、或者数 `Text` 的个数都会随布局调整误报。
+const Key topChromeKey = ValueKey('player-top-chrome');
 
 /// 内置自检视频的 asset URI（32 KB，H.264 baseline + AAC，3 秒）。
 ///
@@ -217,6 +228,76 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 清掉它的信号见 [_ensurePlayer] 里那几条订阅 —— 取「先到的那个」，因为
   /// 没有哪个信号能保证一定来（比如某些流不会触发 video reconfig）。
   bool _awaitingFrame = false;
+
+  /// 本次播放中，mpv 有没有真的报过**非零的视频尺寸**。
+  ///
+  /// ⚠️ 它是「播完」护栏的证据（见 [PlaybackCompletion]），所以语义要**窄**到
+  /// 只有 `videoParams.w > 0` 才置位 —— 不能从 `_awaitingFrame` 反推，
+  /// 因为那个标记会被 `duration` / `position` 一起清掉，而两者纯音频流同样
+  /// 会给，于是「有声音没画面」会被记成「出过画面」，护栏就失效了。
+  ///
+  /// 每次换流归零（见 [_openStream]）。
+  bool _sawVideoFrame = false;
+
+  /// 这条流有没有已经做过 m3u8 自检（见 [_probeHlsPlaylist]）。
+  ///
+  /// 每次换流归零。存在的理由就是「一次故障会连着触发好几个钩子」——
+  /// 不设闸的话同一条列表会被抓好几遍。
+  bool _hlsProbed = false;
+
+  /// 「转码档开了 N 秒还没出画面」那次延迟检查的定时器（见
+  /// [_scheduleHlsSettleCheck]）。
+  Timer? _hlsSettleTimer;
+
+  /// 转码档开流后，隔多久回来验一次「到底出画面了没有」。
+  ///
+  /// 10 秒是个折中：HLS 要先取 m3u8 再取前几个分片，正常起播在这之内；
+  /// 而真的坏了的话，10 秒时 mpv 的错误日志已经写满，`track-list` 也稳定了。
+  static const Duration hlsSettleDelay = Duration(seconds: 10);
+
+  /// 排一次「转码档开流后仍无画面」的延迟检查。
+  ///
+  /// ## 为什么不能只靠现有的那几个钩子
+  ///
+  /// 实测（2026-10-04 14:29 那份日志）：`_onTicketExpiryLog` 在 `open()` 之后
+  /// **46 毫秒**就把诊断打了出来，那时 mpv 还没开始读 m3u8 —— `track-list`
+  /// 必然是 `[]`、`duration` 必然是空。**证据全在，只是取早了**，等于白打。
+  ///
+  /// 所以补这一条**按时间**触发的路：开流满 [hlsSettleDelay] 后如果
+  /// [_sawVideoFrame] 还是 false，再落一次诊断 —— 那时拿到的才是
+  /// 「流里到底有没有视频轨」这个真正能定性的结论。
+  ///
+  /// 只在 [PlayRequest.isHls] 的流上排：原画是直链文件，10 秒不出画面通常
+  /// 只是网慢，没必要刷诊断。
+  void _scheduleHlsSettleCheck() {
+    _hlsSettleTimer?.cancel();
+    _hlsSettleTimer = null;
+    if (!mounted || _player == null) return;
+    if (!(_currentRequest?.isHls ?? false)) return;
+    _hlsSettleTimer = Timer(hlsSettleDelay, () {
+      _hlsSettleTimer = null;
+      if (!mounted || _sawVideoFrame) return;
+      if (!(_currentRequest?.isHls ?? false)) return;
+      unawaited(_dumpPlaybackDiagnostics('转码档开流 ${hlsSettleDelay.inSeconds} 秒仍没出画面'));
+    });
+  }
+
+  /// mpv 日志的**尾巴**（环形缓冲，只留最近 [mpvLogTailSize] 条）。
+  ///
+  /// ## 为什么要有它
+  ///
+  /// `stream.log` 一路订阅原本只喂给两个过滤器（字幕、HTTP 4xx），**其余全部
+  /// 丢掉** —— 于是「转码档只有声音没画面」这类故障在诊断日志里**一条痕迹
+  /// 都没有**，只能靠猜。而 mpv 自己通常是说了原因的（`vd:` / `ffmpeg/demuxer`
+  /// 那些行），只是没人把它写下来。
+  ///
+  /// 缓冲而不是全量落盘：mpv 的日志在 warn 级下本来就不多，但一次播放里
+  /// 也够刷屏了。只留最近一段，在**出事的那一刻**再落盘（见
+  /// [_dumpPlaybackDiagnostics]），既拿得到上下文，又不会把日志撑爆。
+  final List<String> _mpvLogTail = <String>[];
+
+  /// mpv 日志缓冲的条数上限。
+  static const int mpvLogTailSize = 120;
 
   /// 正在**换一条流**（切清晰度 / 切集 / 刷新过期直链），而不是首次开播。
   ///
@@ -458,6 +539,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _hideTimer?.cancel();
     _playlistUnmountTimer?.cancel();
     _netSpeedTimer?.cancel();
+    _hlsSettleTimer?.cancel();
     _playlistController.dispose();
     // 关掉中继服务本体（含监听端口与所有会话）。只关当前会话是不够的：
     // 换源路径上的旧会话如果没被清掉，端口会一直挂着。
@@ -811,6 +893,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // `warn`。两处是**配套**的，改一处必须改另一处。
     _subs.add(
       player.stream.log.listen((entry) {
+        // ⚠️ **先**进缓冲，再走下面的过滤器。
+        //
+        // 顺序不能反：下面那条路只认两种消息（字幕、HTTP 4xx），其余全丢。
+        // 而「转码档有声音没画面」这类故障的原因就在被丢掉的那批里 ——
+        // 不先存下来就永远看不到 mpv 到底说了什么。
+        _appendMpvLog(entry);
         // ⚠️ 字幕消息要**先分流**，不能混进下面那条「直链过期」的路：
         // 字幕解不开跟直链没有半点关系，走进去只会白白刷一次链
         // （刷完还是解不开，而用户会看到画质档位莫名其妙地跳了一下）。
@@ -886,7 +974,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 「永远不收」比「早收」糟得多。
     _subs.add(
       player.stream.videoParams.listen((params) {
-        if ((params.w ?? 0) > 0) _clearAwaitingFrame();
+        if ((params.w ?? 0) > 0) {
+          _clearAwaitingFrame();
+          // ⚠️ 这一位是「播完」护栏的证据（见 [PlaybackCompletion]），
+          // **不能**用 `_awaitingFrame` 代替它 —— 后者也会被
+          // `duration` / `position` 清掉，而那两者纯音频流同样会给，
+          // 于是「有声音没画面」会被误记成「出过画面」。
+          _sawVideoFrame = true;
+        }
       }),
     );
     _subs.add(
@@ -1294,6 +1389,208 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _introSession.setChapter(marker);
   }
 
+  /// 把一条 mpv 日志存进尾巴（环形缓冲）。见 [_mpvLogTail]。
+  void _appendMpvLog(PlayerLog entry) {
+    _mpvLogTail.add('[${entry.level}] ${entry.prefix}: ${redactUrls(entry.text)}');
+    if (_mpvLogTail.length > mpvLogTailSize) {
+      _mpvLogTail.removeAt(0);
+    }
+  }
+
+  /// 把「这一刻播放器到底在放什么」全部写进诊断日志。
+  ///
+  /// 只在**可疑的播完**时调用 —— 那正是需要拿证据的时刻（平时刷这些属性
+  /// 只会污染日志，而且 `getProperty` 是跨 isolate 调用，不该放进热路径）。
+  ///
+  /// ## 为什么要读 mpv 属性，而不是只看我们自己的状态
+  ///
+  /// 「有声音没画面」有两个完全不同的成因，在我们这层**看不出区别**：
+  ///   1. 流里**根本没有视频轨**（夸克转码没出画面 / 我们挑错了 variant）；
+  ///   2. 有视频轨但**解码器开不起来**（codec / 硬解 / 内存）。
+  ///
+  /// 两者的修法完全不同，而 `track-list` 一行就能分开它们 —— 这一份诊断
+  /// 存在的唯一目的就是拿到那一行。
+  Future<void> _dumpPlaybackDiagnostics(String reason) async {
+    diag.warn('播放窗口', '──── 播放异常诊断：$reason ────');
+
+    final platform = _player?.platform;
+    if (platform is! NativePlayer) {
+      diag.warn('播放窗口', '  播放器不是 NativePlayer，读不到 mpv 属性');
+      return;
+    }
+
+    for (final key in const <String>[
+      'file-format',
+      'duration',
+      'demuxer-cache-time',
+      'demuxer-cache-state',
+      'video-out-params',
+      'audio-params',
+      'track-list',
+    ]) {
+      String value;
+      try {
+        value = await platform.getProperty(key);
+      } catch (e) {
+        value = '<读不到：$e>';
+      }
+      diag.warn('播放窗口', '  $key = ${_truncate(value.isEmpty ? '<空>' : value)}');
+    }
+
+    if (_mpvLogTail.isEmpty) {
+      // 这条本身就是结论：mpv 一条 warn 级日志都没给，说明它认为一切正常 ——
+      // 那问题就在「流本身就短」，而不是解码失败。
+      diag.warn('播放窗口', '  mpv 日志缓冲为空（mpv 一条 warn 级日志都没给）');
+    } else {
+      diag.warn('播放窗口', '  最近 ${_mpvLogTail.length} 条 mpv 日志：');
+      for (final line in _mpvLogTail) {
+        diag.warn('播放窗口', '    $line');
+      }
+    }
+
+    // HLS（转码档）才做这一步：**用我们自己的请求头**把 m3u8 抓下来。
+    //
+    // 这是「转码档只有声音没画面」的分水岭证据：
+    //   - 自己抓得到 200 → 票据与请求头都没问题，问题在 mpv 那边；
+    //   - 自己抓也是 404 → 鉴权 / 票据的问题（最可能是少了某个 cookie）。
+    //
+    // 只在这条流是 HLS 时才抓：原画是带签名的**直链文件**，抓它既没有信息量，
+    // 又等于往网盘发一个几 GiB 的请求。
+    final request = _currentRequest;
+    if (request != null && request.isHls) {
+      await _probeHlsPlaylist(request);
+    }
+    diag.warn('播放窗口', '──── 诊断结束 ────');
+  }
+
+  /// 用**播放票据自带的请求头**（含 Cookie）试探性地抓一次 m3u8。
+  ///
+  /// 只在已经出事时调用，所以多这一次请求无所谓；但它回答了排查时最关键
+  /// 的那个二选一 —— 是「我们给的凭证不对」还是「mpv 读不动这条流」。
+  ///
+  /// 失败一律自己兜住：诊断不该把播放窗口拖崩。
+  ///
+  /// ⚠️ **每条流最多抓一次**（[_hlsProbed]）。一次故障会连着触发好几个钩子
+  /// （EOF 护栏、404、mpv 报错），不设闸的话同一条 m3u8 会被抓三四遍，
+  /// 日志里刷出几份一样的摘要，反而把别的东西挤掉。
+  Future<void> _probeHlsPlaylist(PlayRequest request) async {
+    if (_hlsProbed) return;
+    _hlsProbed = true;
+
+    HttpClient? client;
+    try {
+      client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+      final httpRequest = await client.getUrl(Uri.parse(request.url));
+      for (final e in request.headers.entries) {
+        httpRequest.headers.set(e.key, e.value);
+      }
+      final response = await httpRequest.close();
+
+      final chunks = <List<int>>[];
+      var total = 0;
+      await for (final chunk in response) {
+        if (total >= 8192) break;
+        chunks.add(chunk);
+        total += chunk.length;
+      }
+      final text = utf8.decode(
+        chunks.expand<int>((c) => c).toList(growable: false),
+        allowMalformed: true,
+      );
+      diag.warn(
+        '播放窗口',
+        '  m3u8 自检：HTTP ${response.statusCode}，$total 字节'
+        '（请求头键=${request.headers.keys.toList()} '
+        'Cookie键=${cookieHeaderKeyNames(request.headers["Cookie"])}）',
+      );
+      // ⚠️ 这一行是整份诊断里**信息量最大的一条**。
+      //
+      // 「转码档播两三秒就 EOF」有两个完全不同的成因，而用户观感一模一样：
+      //   - 播放列表本身就只有几秒（服务端给了预览档 / 转码没做完）；
+      //   - 播放列表是完整的，是播放器没跟上（分片取不到、解码失败…）。
+      // 「合计时长」一眼分开这两者 —— 所以它必须打出来，不能只打前几行原文。
+      diag.warn(
+        '播放窗口',
+        '  m3u8 摘要：${summarizeHlsPlaylist(text).describe()}',
+      );
+      final lines = text
+          .split('\n')
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .take(12);
+      for (final line in lines) {
+        // 分片地址里可能带 token，走同一套脱敏。
+        diag.warn('播放窗口', '    m3u8 | ${redactUrls(line)}');
+      }
+      // m3u8 能下 **不等于** 分片能下 —— 转码档的鉴权挂在分片 URL 上
+      // （`auth_key`），所以必须把第一条分片也探一次。
+      await _probeFirstSegment(request, text);
+    } catch (e) {
+      diag.warn('播放窗口', '  m3u8 自检失败：$e');
+    } finally {
+      client?.close(force: true);
+    }
+  }
+
+  /// 用播放票据的请求头抓**第一条分片**，只读一小段就断开。
+  ///
+  /// ## 它回答的问题
+  ///
+  /// 「m3u8 200 但播不出来」只剩两种可能：
+  ///   - **分片取不到**（`auth_key` 过期 / cookie 不全 / 分片还没转码出来）→ 这里 4xx/5xx；
+  ///   - **分片取得到，是解码或选流的问题** → 这里 200。
+  ///
+  /// 两种情况在我们这一层观感完全一样（有声音没画面），而修法一个在天上
+  /// 一个在地下。这一行就是那条分界线。
+  ///
+  /// 只读 64 KiB 就断：`.ts` 分片动辄几 MB，诊断不该为了取证把整条片子拉下来。
+  Future<void> _probeFirstSegment(PlayRequest request, String playlistText) async {
+    final relative = firstSegmentUri(playlistText);
+    if (relative == null) {
+      diag.warn('播放窗口', '  分片自检：播放列表里没有分片行');
+      return;
+    }
+    final base = Uri.tryParse(request.url);
+    if (base == null) {
+      diag.warn('播放窗口', '  分片自检：播放地址解析不了');
+      return;
+    }
+    // 分片在列表里是**相对路径**，必须按 m3u8 自己的地址去拼（同
+    // `isRelayableUrl` 那条注释里说的基准问题）。
+    final segment = base.resolve(relative);
+
+    HttpClient? client;
+    try {
+      client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+      final httpRequest = await client.getUrl(segment);
+      for (final e in request.headers.entries) {
+        httpRequest.headers.set(e.key, e.value);
+      }
+      final response = await httpRequest.close();
+      var total = 0;
+      await for (final chunk in response) {
+        total += chunk.length;
+        if (total >= 65536) break;
+      }
+      diag.warn(
+        '播放窗口',
+        '  分片自检：HTTP ${response.statusCode}，读到 $total 字节'
+        '（类型=${response.headers.contentType} '
+        '声明长度=${response.contentLength}）',
+      );
+    } catch (e) {
+      // 诊断不该把播放窗口拖崩 —— 失败本身也是证据，照记。
+      diag.warn('播放窗口', '  分片自检失败：$e');
+    } finally {
+      client?.close(force: true);
+    }
+  }
+
+  /// 属性值可能很长（`track-list`、`demuxer-cache-state` 都是 node 转出来的
+  /// 大串），截断是为了别让一条属性把日志刷满 —— 我们要的通常只是前几段。
+  static String _truncate(String s) =>
+      s.length <= 600 ? s : '${s.substring(0, 600)}…（截断 ${s.length} 字）';
+
   /// 一集播完：自动切到同作品的下一集（若设置允许、且确实有下一集）。
   ///
   /// 触发点是 `player.stream.completed`。与剧集列表里的「下一集」共用
@@ -1301,7 +1598,67 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 列表里不从头开始、跳过花絮而不是撞上就停、到尾不循环。
   Future<void> _onCompleted() async {
     final request = _currentRequest;
-    if (request == null || !request.autoPlayNext) return;
+    if (request == null) return;
+
+    // ⚠️ 先判「这次 EOF 是不是真的播完了」。
+    //
+    // 顺序刻意放在 `autoPlayNext` 判断**之前**：诊断要对**所有**用户生效，
+    // 关掉自动连播的人一样会遇到「只有 2 秒」，而那批人正是最需要这份日志的
+    // —— 他们没有级联可看，故障表现得更安静。
+    //
+    // 内核的 `completed` 只表示「读到流末尾」，不表示这一集被看过了。
+    // 实测（2026-10-04，夸克转码档 HLS）：流只有 1~2 秒、有声音没画面，
+    // mpv 照常报 EOF —— 于是不加护栏的话，60 秒内会级联「看」完 5 部片，
+    // 而真正的故障（这一档根本读不出东西）**一次都没露出来**，用户只看到
+    // 播放窗口自己在疯狂换片。
+    //
+    // 判据本体在 [PlaybackCompletion]（纯函数，两个播放器共用）。
+    final state = _player?.state;
+    final position = state?.position ?? Duration.zero;
+    final duration = state?.duration ?? Duration.zero;
+    final realEnd = PlaybackCompletion.isRealEnd(
+      position: position,
+      sawVideo: _sawVideoFrame,
+    );
+
+    // ⚠️ **诊断的触发条件刻意不等于护栏的触发条件**。
+    //
+    // 2026-10-04 实测踩到的坑：转码档 HLS 的故障现场是「位置 3~7 秒、mpv 报过
+    // 视频尺寸」，于是护栏**放行**（按它的规则，这确实像一段真播完的短片）。
+    // 上一版把诊断挂在护栏里面，结果护栏一次都没拦，诊断也一次都没跑 ——
+    // 最要紧的那份证据（`media.m3u8` 里到底写了什么）从头到尾没落过盘。
+    //
+    // 所以：只要**是转码档**而且**短命**，不管护栏判成什么都要抓。
+    // 判据用 `isHls`（原画是带签名的直链，本来就正常，别拿它刷日志）。
+    final shortHls = request.isHls &&
+        position < PlaybackCompletion.suspiciousHlsPosition;
+    if (!realEnd || shortHls) {
+      final why = realEnd
+          ? '转码档（HLS）只播了 ${position.inSeconds}s 就报播完'
+              '（时长=${duration.inSeconds}s）'
+          : PlaybackCompletion.describe(
+              position: position,
+              duration: duration,
+              sawVideo: _sawVideoFrame,
+            );
+      // ⚠️ 必须留痕（warn 级）：下一次报「怎么不自动连播了」，第一件要
+      // 确认的就是这几个量。写成 debug 的话这类问题在日志里根本找不到。
+      diag.warn('播放窗口', '播完但没当成播完：$why');
+      // 出事这一刻把 mpv 的真实状态抓下来 —— 这是「转码档只有声音没画面」
+      // 这类问题唯一能拿到的第一手证据（mpv 平时的话全被过滤器丢了）。
+      await _dumpPlaybackDiagnostics(why);
+    }
+
+    if (!realEnd) {
+      // 只有开着自动连播的人需要那句提示：没开的人本来就不会跳，
+      // 说「已停止」反而让他以为自己改过设置。
+      if (request.autoPlayNext) {
+        _toast('这一集没能正常播放，已停止自动连播');
+      }
+      return;
+    }
+
+    if (!request.autoPlayNext) return;
 
     final playlist = request.playlist;
     final next = EpisodeQueue.nextAfter(
@@ -1428,6 +1785,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 「请求刷新直链：… 原因：…」—— 它同时说了「发生了什么」和「我们打算怎么办」，
     // 而且一次故障只打一条（冷却窗口收掉回声）。
     diag.debug('播放窗口', '直链疑似过期（${entry.prefix}）：$safe');
+
+    // 转码档（HLS）报 4xx 是**另一码事**：它的地址不带签名，鉴权靠 cookie，
+    // 而 4xx 在这里既可能是 cookie 不对、也可能是分片取不到。刷新直链
+    // （下面那句）治不了后者 —— 所以先把证据抓下来，再照常去刷新。
+    if (_currentRequest?.isHls ?? false) {
+      await _dumpPlaybackDiagnostics('转码档报 HTTP 4xx：$safe');
+    }
+
     await _refreshTicket(reason: safe);
   }
 
@@ -1664,6 +2029,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       if (freshQuality != null && freshQuality.isNotEmpty) {
         _savePreference((p) => p.withQuality(freshQuality));
       }
+      // ⚠️ 这一行是「换档到底有没有走到开流」的**分界证据**。
+      //
+      // 2026-10-04 实测日志里出现过一次「已刷新直链 →（4K）」之后**没有**
+      // `open →`：那时最需要知道的就是「是没走到这一步，还是进去了又被
+      // 早退」。只靠下面 `_openStream` 里那行日志分不开这两种情况 ——
+      // 少了这一条，下一轮排查还得重新猜。
+      diag.info(
+        '播放窗口',
+        '换档取回新链 → ${fresh.describe()}'
+        '（${fresh.isHls ? "HLS 转码档" : "直链原画"}，${fresh.describeHeaders()}）'
+        '准备开流 @ ${position.inSeconds}s',
+      );
       // 换档：同一部片子的另一条流，用户视线里的位置没变 —— 保留上一帧、
       // 不清缓冲，只给一个「正在切换…」的半透明提示（见 [_openStream]）。
       await _openStream(
@@ -1850,6 +2227,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 任何指示，否则等于凭空告诉用户「卡了」。真正该立标记的时刻是
       // `open()` 之前，见下面那处。
       _switching = false;
+      // ⚠️ 无条件归零，连 `keepLastFrame` 那条路也一样：它描述的是「**这条**
+      // 流有没有出过画面」，而换清晰度换的就是另一条流。留着旧值的话，
+      // 「新流没画面」会被上一条流的证据掩盖 —— 护栏正好在最需要它时失效。
+      _sawVideoFrame = false;
+      // 同一条理由：自检是**按流**做的，换流了就该重新允许抓一次。
+      _hlsProbed = false;
       if (!keepLastFrame) {
         // 从这一刻到「解出第一帧」之间画面是**黑的**，而 `open()` 不等文件加载
         // 完成 —— 这段正是「刚打开视频时黑屏」的那几秒，加载指示要盖住它。
@@ -1865,6 +2248,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         _cacheMeter.reset();
       }
     });
+    // 旧中继会话由 [_prepareSource] 交回来、在这里关（见它的文档：必须等
+    // `open()` 之后）。声明在 try 之外是为了让 `finally` 一定拿得到它。
+    String? pendingClose;
     try {
       _ensurePlayer();
       // 片头状态机随每条新流归零。读 `_currentRequest` 拿这次的开关与手标区间：
@@ -1908,6 +2294,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 网盘直链先过一遍本地中继（多连接并发预取）。拿不到就**原样直连**：
       // 中继失败一律静默，最坏只是「没变快」，绝不是「播不了」。
       final source = await _prepareSource(uri, label, headers, startAt: startAt);
+      pendingClose = source.previousToken;
       // 到这里旧中继会话已经关了（`_prepareSource` 的最后一步），旧流随时会断；
       // 接下来这一句 `open()` 会让 mpv 丢掉当前流。**从这一刻起**才该立
       // 「正在切换…」—— 上一帧还在画面上，所以用半透明罩，别盖掉它。
@@ -1929,6 +2316,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       );
       if (!mounted) return;
       setState(() => _nowPlaying = label);
+      // 转码档（HLS）要晚一点再验一次：`open()` 不等加载完成，刚打开那一瞬间
+      // `track-list` 必然是空的（见 [_dumpPlaybackDiagnostics] 的时机问题）。
+      _scheduleHlsSettleCheck();
     } catch (e, st) {
       // 开流失败就永远等不到第一帧了 —— 必须自己收掉加载指示，否则它会一直
       // 挂在画面上，把「播放失败」的提示也盖住。
@@ -1945,6 +2335,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 「一播就报错」的路径，用户最需要看到提示的时候反而会再抛一个异常。
       _toast('播放失败：$e');
     } finally {
+      // ⚠️ 旧中继会话**在这里**才关（而不是在 `_prepareSource` 里）：
+      // mpv 到这一刻才真正换了源，之前它还在读旧会话。理由见
+      // [_prepareSource] 的文档（关早了会引出一条假的 HTTP 404）。
+      await _closeRelayToken(pendingClose);
       if (mounted) setState(() => _busy = false);
     }
   }
@@ -1954,7 +2348,29 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 走不通（长度未知 / 是 HLS / 端口绑不上）就原样返回。**失败一律静默** ——
   /// 用户既没有「重试」按钮也没有第二个开关，弹提示只会让人以为播放坏了，
   /// 而真相是「这次没加速」。
-  Future<({String url, Map<String, String> headers})> _prepareSource(
+  ///
+  /// ## ⚠️ 返回里那个 [previousToken] 必须由调用方关（**在 `open()` 之后**）
+  ///
+  /// 旧中继会话**不能在这里关**。mpv 此刻还在读它，会话一没，那条连接就断，
+  /// ffmpeg 立刻吐出：
+  ///
+  /// ```
+  /// http: Stream ends prematurely at 88080384, should be 7563081406
+  /// http: Will reconnect at 88080384 in 0 second(s), error=Input/output error.
+  /// http: HTTP error 404 Not Found      ← 我们自己的中继对已关闭的 token 回 404
+  /// ```
+  ///
+  /// 而 `isHttp4xxLog` 只按正文里的 `HTTP error 4\d\d` 判定 —— 它分不出这条
+  /// 404 来自**我们自己刚拆掉的旧流**。于是每次换档都会误判成「新直链过期」，
+  /// 立刻触发一次 `_refreshTicket`，与正在加载的新流抢 `open()`。
+  ///
+  /// 换成 HLS 档位之后这个误判变得致命：新流本来就慢（要先取 m3u8 再取分片），
+  /// 被这次假刷新一打断，用户看到的就是「一切画质就只有两秒」。
+  ///
+  /// 所以顺序必须是：**建新会话 → 预热 → `open()` → 关旧会话**。
+  /// 与中继那条路注释里「先开新的、再关旧的」是同一个理由。
+  Future<({String url, Map<String, String> headers, String? previousToken})>
+      _prepareSource(
     String uri,
     String label,
     Map<String, String> headers, {
@@ -1969,26 +2385,27 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       connections: request?.relayConnections ?? 8,
     );
 
-    // 换源 = 上一条中继会话作废。但它**先记下来、不立刻关**：新会话要先建起来、
-    // 把起播点附近预取上，再关旧的。顺序反过来的话，「新会话还是空的 + 旧会话
-    // 已经关了」这一小段里 mpv 什么都拿不到 —— 那正是「切一下就卡一下」。
-    //
-    // 放在**这里**而不是「播新片」那条路：换清晰度、刷新过期直链走的也都是
-    // `_openStream`，只关在播新片那里的话，用户切一次清晰度就多留一条后台
-    // 预取的会话，几次之后带宽被它们吃光 —— 表现是「越播越卡，跟画质无关」。
+    // 换源 = 上一条中继会话作废。但它**只记下来、不关**：关的动作交给调用方，
+    // 必须等 mpv 真的换了源（见本方法的文档）。放在这里关的话，「新流还没开
+    // 起来、旧流已经被掐断」这一小段里 mpv 什么都拿不到，而且会引出那条假 404。
     final previousToken = _relayToken;
     _relayToken = null;
 
     final parsed = Uri.tryParse(uri);
     final size = _currentRequest?.sizeBytes;
-    final direct = (url: uri, headers: headers);
+    final direct = (url: uri, headers: headers, previousToken: previousToken);
     // 没有请求头 = 本地文件 / 内置自检视频，本来就不走网络。
-    if (parsed == null || size == null || size <= 0 || headers.isEmpty) {
-      await _closeRelayToken(previousToken);
+    if (parsed == null || headers.isEmpty) {
+      return direct;
+    }
+    // 转码档（HLS）**没有「总长度」这回事**，不能拿 size 当门槛：服务端没声明
+    // 体积时它是 null，而那条流恰恰最需要走中继（理由见 `isRelayableUrl` 的
+    // 文档 —— 播放器直连 CDN 会被本机 `http_proxy` 打成一个未放行的协议）。
+    final hls = isHlsUrl(parsed);
+    if (!hls && (size == null || size <= 0)) {
       return direct;
     }
     if (!isRelayableUrl(parsed)) {
-      await _closeRelayToken(previousToken);
       return direct;
     }
 
@@ -2002,25 +2419,33 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       label: label,
       // 告诉中继「播放器大概从哪儿开始读」：切集 / 切清晰度时起点常在中后段，
       // 让预取窗口直接摆过去，省掉开流后那一次上游往返。
-      startOffset: _byteOffsetFor(startAt, size),
+      //
+      // ⚠️ HLS 会话不做预取（上游本来就是分片并发下发的），换算没有意义。
+      startOffset: hls ? 0 : _byteOffsetFor(startAt, size!),
     );
     if (endpoint == null) {
-      await _closeRelayToken(previousToken);
       return direct;
     }
     _relayToken = endpoint.token;
 
     // 只有「换流」（存在旧会话）才等预热：这期间**旧流还在播**，等待是白赚的；
     // 而全新开播时没有旧流垫着，等它就是白白拖慢出画。
-    if (previousToken != null) {
+    //
+    // ⚠️ HLS 不预热：它没有预取窗口可等（`statsOf` 对 HLS 返回 null，
+    // `warmUpRelay` 会立刻返回 false）。照走的话日志会打一句误导性的
+    // 「预热超时」，看起来像出了问题。
+    if (previousToken != null && !hls) {
       final ready = await warmUpRelay(_relay, endpoint.token);
       diag.info('播放窗口', ready ? '新中继已预热，关闭旧会话' : '新中继预热超时，直接切换');
     }
-    await _closeRelayToken(previousToken);
 
     // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
     // 中继服务，它会在发往上游时自己带上。
-    return (url: endpoint.uri.toString(), headers: const <String, String>{});
+    return (
+      url: endpoint.uri.toString(),
+      headers: const <String, String>{},
+      previousToken: previousToken,
+    );
   }
 
   /// 把续播点换算成**大致**字节偏移，给中继当预取起点的提示。
@@ -2346,6 +2771,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                     child: _buildPlaylistEdgeTab(),
                   ),
 
+                // 顶部浮层：片名 + 网盘全路径。
+                //
+                // ⚠️ 它与底部控制栏**共用同一份显隐状态**（[_chromeVisible]），
+                // 自己**不持有任何定时器** —— 「显示和消失同控制栏一致」就是靠
+                // 这一条落地的：鼠标动 / 进窗口出现、移出窗口或静置超时收起，
+                // 两条永远同步。若给它单开一个 Timer，两边迟早会错开半拍。
+                //
+                // 隐藏时同样**整个移出树**（理由与下面那条一样）：留一个透明的
+                // 层会在画面顶部多出一条看不见、却照样吃点击的死区。
+                if (_chromeVisible)
+                  Positioned(left: 0, right: 0, top: 0, child: _buildTopChrome()),
+
                 // 片名 + 控制栏浮层。隐藏时**整个移出树**，而不是留一个透明的层 ——
                 // 留层会让画面底部多出一条看不见、但照样吃点击的区域。
                 if (_chromeVisible)
@@ -2653,6 +3090,99 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     } catch (e) {
       diag.debug('缓冲', '读输入速率失败：$e');
     }
+  }
+
+  /// 顶部浮层：片名 + 网盘全路径。
+  ///
+  /// ## 为什么放顶部而不是并进控制栏
+  ///
+  /// 控制栏那一行（[_buildNowPlayingLine]）已经在底部了，再往里塞路径会把
+  /// 进度条挤窄；而且底部那一行**只出片名**——同名文件（翡翠台 / 粤语 /
+  /// 4K 重制）在它上面长得一模一样，用户没法确认「放的是哪一份」。
+  ///
+  /// ## 显隐
+  ///
+  /// 它**没有自己的定时器**：显隐完全由 [_chromeVisible] 决定，与底部控制栏
+  /// 逐帧同步（见 [_buildPlayer] 那处的说明）。这里的 `MouseRegion` 只负责
+  /// 「鼠标停在浮层上时别收」（用户正在读那一长串路径），语义与控制栏那层
+  /// 完全一致。
+  ///
+  /// 用**自上而下的渐变**（与控制栏的自下而上镜像）：纯色会在亮画面上显成
+  /// 一块贴在顶部的补丁，渐变能让它的下边缘「化」进画面里。
+  Widget _buildTopChrome() {
+    final request = _currentRequest;
+    final title = request?.title ?? '';
+    // 自检视频 / 手输直链没有网盘路径，那时整行不画 —— 留一个空行只会把
+    // 片名推得离顶边更远。
+    final path = request?.filePath ?? '';
+
+    return MouseRegion(
+      // 给用例一个稳定的抓手：顶栏的高度会随「有没有路径」变（见下面那个
+      // `if (path.isNotEmpty)`），而「高度对不对」只能靠量尺寸断言 ——
+      // 少了这个 key，测试就只能靠「第几个 MouseRegion」去猜，一改布局就误报。
+      key: topChromeKey,
+      // 鼠标停在浮层上时**别收起** —— 用户可能正在读路径。
+      onEnter: (_) => _cancelHide(),
+      onHover: (_) => _cancelHide(),
+      // 回到画面上：重新开始计时，而不是立刻收（那样鼠标一动就闪）。
+      onExit: (_) => _pokeChrome(),
+      child: GestureDetector(
+        // 吃掉落在浮层上的点击，别穿到下面的画面手势层变成「点一下 → 暂停」。
+        behavior: HitTestBehavior.opaque,
+        onTap: () {},
+        child: Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: <Color>[
+                Colors.black.withValues(alpha: 0.78),
+                Colors.black.withValues(alpha: 0.55),
+                Colors.black.withValues(alpha: 0),
+              ],
+              stops: const <double>[0, 0.45, 1],
+            ),
+          ),
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 22),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title.isEmpty ? '云影 · 播放器' : title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              if (path.isNotEmpty) ...[
+                const SizedBox(height: 3),
+                // 路径通常比片名长得多，**必然**被省略号截断。挂个 tooltip
+                // 让人hover 一下能看到完整路径 —— 否则这一行等于只显示了
+                // 前十几个字，而用户要确认的恰恰是结尾那一段（档位/版本）。
+                Tooltip(
+                  message: path,
+                  waitDuration: const Duration(milliseconds: 400),
+                  child: Text(
+                    path,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Colors.white70,
+                      height: 1.2,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   /// 底部浮层：片名 + 进度条 + 按钮行。
