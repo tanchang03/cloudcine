@@ -229,6 +229,7 @@ class EmptyState extends StatelessWidget {
     this.body,
     this.actionLabel,
     this.onAction,
+    this.actionFocusNode,
     this.danger = false,
   }) : assert(
           (actionLabel == null) == (onAction == null),
@@ -243,6 +244,18 @@ class EmptyState extends StatelessWidget {
   final String? body;
   final String? actionLabel;
   final VoidCallback? onAction;
+
+  /// 挂在行动按钮上的焦点节点（可选）。
+  ///
+  /// ## 为什么调用方会需要它
+  ///
+  /// TV 上「焦点自己走到这个按钮」是不成立的：空态通常铺在一个**同样铺满
+  /// 屏幕的焦点节点里面**（播放页的画面节点就是），而方向键遍历要求候选节点
+  /// 完全在当前节点之外 —— 于是往下按只会跳过按钮、落到屏幕外那一层。
+  /// 那种情况下只有调用方显式 `requestFocus` 才够得着，节点就得从这里传进去。
+  ///
+  /// 桌面 / 手机不传，行为一点不变。
+  final FocusNode? actionFocusNode;
 
   /// 用错误色渲染（失败态）。
   final bool danger;
@@ -287,6 +300,7 @@ class EmptyState extends StatelessWidget {
               if (actionLabel != null && onAction != null) ...[
                 const SizedBox(height: 18),
                 FilledButton(
+                  focusNode: actionFocusNode,
                   onPressed: onAction,
                   style: FilledButton.styleFrom(
                     backgroundColor: AppTheme.accent,

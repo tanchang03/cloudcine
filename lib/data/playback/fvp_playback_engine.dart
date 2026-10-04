@@ -9,10 +9,35 @@ import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/diagnostics/resource_probe.dart';
 import '../../domain/services/playback_engine.dart';
 import 'change_gate.dart';
 
-/// fvp（libmdk）引擎。**只服务杜比视界片源**。
+/// fvp（libmdk）引擎。**只服务杜比视界 P5**（macOS）。
+///
+/// ## ⛔ 2026-10-04 实测：这条路在 Android TV 上**不可用**，别再试
+///
+/// 起因是 mpv 在 Android 上拿不到零拷贝 —— 真机两次实测（`hwdec` 下发到位、
+/// Surface 也在、还重建过一次解码器）`hwdec-current` 恒为
+/// `mediacodec-copy`：MediaCodec 解到 CPU 内存再拷回，4K 上每 21 秒丢
+/// 100~340 帧；同一台机器播 810p 只丢 0~7 帧。于是想借 mdk 的
+/// `AMediaCodec` 直出（夸克 TV 的做法）绕过去。**两轮都没成**：
+///
+///   1. `viewType: platformView`（SurfaceView）→ 用户报「更卡、音画不同步」。
+///   2. 再加 `tunnel: true`（零拷贝）→ 用户报「4K 看不到画面，只有声音」。
+///
+/// 证据见 `main.dart` 注册块那段注释（中继在推进、CPU 225~326% 说明在解码，
+/// 但屏上没有东西；同一次播放里还有 `libmdk.so` 与 `SurfaceTextureWrapper`
+/// 两处原生崩溃）。**回退后 4K 回到 mpv**。
+///
+/// 顺带钉住两条读源码得到的事实，省得下次重查：
+///   - `platformView` **不等于**零拷贝：mdk 仍要跑一遍 GL 渲染器把每帧画进
+///     SurfaceView；`tunnel:true` 才是「解码器直接写 surface」。
+///   - tunnel 分支**显式跳过** `maxWidth/maxHeight` 钳制（`video_player_mdk.dart`
+///     原文 *"'tunnel' has no GL renderer"*），于是 SurfaceView 的
+///     `setFixedSize` 拿到的是**视频原生**尺寸（这台电视上是 3840×2160），
+///     而 Android 的显示层只有 1920×1080 —— 这一条**没有被证实**是
+///     「看不到画面」的成因，但它是下次要查的第一个假设。
 ///
 /// ## ⛔ 前提：必须先 `fvp.registerWith`
 ///
@@ -62,6 +87,14 @@ class FvpPlaybackEngine implements PlaybackEngine {
   VideoPlayerController? _controller;
   Timer? _trackTimer;
   bool _disposed = false;
+
+  /// 资源采样（CPU / 内存 / 磁盘）。
+  ///
+  /// ⚠️ 这条路**没有视频管线探针** —— 读 mpv 属性的那套（`hwdec-current` /
+  /// `frame-drop-count`）在 mdk 上没有对等物，fvp 也没把底层 `mdk.Player`
+  /// 暴露出来（见类文档末尾）。所以这里的资源采样是这条路**唯一**的周期性
+  /// 证据：至少能回答「当时这台机器有多忙」。
+  final ResourceProbe _resourceProbe = ResourceProbe();
 
   /// 上一份「正文型」外挂字幕落成的临时文件。见 [loadExternalSubtitleText]。
   String? _tempSubtitlePath;
@@ -175,6 +208,12 @@ class FvpPlaybackEngine implements PlaybackEngine {
       Uri.parse(media.url),
       // ⚠️ 夸克直链缺 Cookie 一律 412。fvp 会把它写成 mdk 的 `avio.headers`。
       httpHeaders: media.headers,
+      // ⛔ **不要**加 `viewType: VideoViewType.platformView`：2026-10-04 在
+      // Android TV 上试过（连带 `tunnel: true`），4K 直接看不到画面。
+      // 完整经过与证据见类文档与 `main.dart` 的注册块注释。
+      //
+      // 这里刻意保持默认的 `textureView` —— 它是 fvp 自己 example 用的那条路，
+      // macOS 的 DV 也是这么验的（`platformView` 是 Android 专属）。
     );
     _controller = controller;
     controller.addListener(_onValueChanged);
@@ -198,6 +237,9 @@ class FvpPlaybackEngine implements PlaybackEngine {
     // 轨道清单：mdk 的 MediaInfo 是**一次性查询**，而内嵌轨可能晚一步才齐。
     // 开一个有限窗口反复问，靠内容指纹去重。
     _startTrackRefreshWindow();
+
+    // 资源采样。这条路没有视频探针，所以它是唯一的周期性证据。
+    _resourceProbe.start();
 
     if (play) await controller.play();
   }
@@ -229,6 +271,7 @@ class FvpPlaybackEngine implements PlaybackEngine {
   /// 提前销毁会让调用方拿不到后续事件。
   @override
   Future<void> stop() async {
+    _resourceProbe.stop();
     final c = _controller;
     if (c == null) return;
     await c.pause();
@@ -355,6 +398,7 @@ class FvpPlaybackEngine implements PlaybackEngine {
     _disposed = true;
     _trackTimer?.cancel();
     _trackTimer = null;
+    _resourceProbe.stop();
     await _teardownController();
 
     await Future.wait<void>(<Future<void>>[

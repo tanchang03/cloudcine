@@ -248,13 +248,19 @@ class AppTheme {
       // 不设的话，深色主题下 `ThemeData` 的默认值是
       // `Colors.white.withValues(alpha: 0.12)` —— 实测 alpha 恰好 `0.1216`。
       // 隔三米看电视，12% 的白色蒙层**等于没有**，用户不知道遥控器正指着谁。
-      // 换成强调色 30% 蒙层：亮度够，又不至于把按钮本身的颜色盖掉。
+      //
+      // ⛔ **不要用强调色**。上一版是 `accent @ 0.30`，真机反馈是
+      // 「不需要背景蒙版色凸显，看起来有点多余，也不太美观」——
+      // 带颜色的罩子把控件整体染蓝，看着像「选中」而不是「焦点」。
+      // 现在统一走**中性提亮**：只抬亮度、不动色相，与 `TvFocusable` 的
+      // `brighten` 是同一种语言。
       //
       // ⚠️ **只改这一行不够**：海报卡片的 `InkWell` 高亮是画在子节点**下面**的
       // （`_RenderInkFeatures.paint` 先画 ink、再 `super.paint` 画子节点），
       // 一整张海报会把它盖得干干净净 —— 调多亮都没用。
-      // 卡片类点击区还要额外套一层 `TvFocusable`（见 `ui/widgets/tv_focus.dart`）。
-      focusColor: accent.withValues(alpha: 0.30),
+      // 卡片类点击区还要额外套一层 `TvFocusable`（见 `ui/widgets/tv_focus.dart`），
+      // 由它的 `brighten` 兜底。
+      focusColor: Colors.white.withValues(alpha: 0.18),
     );
 
     return base.copyWith(

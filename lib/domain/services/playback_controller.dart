@@ -9,6 +9,7 @@ import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/player_buffer_progress.dart';
+import '../../core/utils/redact.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/track_bridge.dart';
 import '../../core/utils/track_labels.dart';
@@ -565,6 +566,24 @@ class PlaybackController extends ChangeNotifier {
     // 值 —— 而它们恰好等于目标（目标就是从旧流取的），提前挂会被它们骗过去。
     _restore = startAt > Duration.zero ? RestoreSeek(startAt) : null;
 
+    // ⚠️ 这一条是**唯一**记录「内核实际打开了哪个地址」的地方。
+    //
+    // 本方法开头那条「交给播放器」打的是 `ticket.redactedUrl` —— 那是**上游**
+    // 地址；而走中继时内核拿到的是 `http://127.0.0.1:PORT/sN`，且**不带任何
+    // 请求头**。少了这一条，播放器报
+    // `Failed to open http://127.0.0.1:43617/s1.` 时，日志里只有上游地址，
+    // 无从确认「中继到底参与了没有、交给内核的是哪条会话」—— 而那恰恰是这个
+    // 报错仅有的全部信息量。
+    //
+    // [redactUrl] 在这里够用：它只丢查询串。中继地址的会话号在**路径**上
+    // （`/s1`），会被原样保留；而直链的签名在查询串里，正好被抹掉。
+    diag.info(
+      '播放',
+      '内核打开：${redactUrl(source.url)}'
+      '（${source.relayed ? "本地中继" : "直连"}）'
+      '请求头=${source.headers.length} 条 起播=${startAt.inSeconds}s',
+    );
+
     await _engine.open(
       EngineMedia(
         url: source.url,
@@ -656,7 +675,15 @@ class PlaybackController extends ChangeNotifier {
       return direct;
     }
     _relayToken = endpoint.token;
-    diag.info('播放', '已交给本地中继：${(length / 1073741824).toStringAsFixed(2)} GiB');
+    // 会话号必须进日志：播放器打不开时报的是它自己的原话
+    // 「Failed to open http://127.0.0.1:43617/s1.」—— 那个 `s1` 就是这里的
+    // token。没有它，日志里只有一串「已交给本地中继」，事后没法把屏幕上的
+    // 报错对上哪一条会话（一次播放会建多条）。
+    diag.info(
+      '播放',
+      '已交给本地中继：会话 ${endpoint.token}，'
+      '${(length / 1073741824).toStringAsFixed(2)} GiB',
+    );
 
     // 只有「换源」（存在旧会话）才等预热：这期间**旧流还在播**，等待是白赚的；
     // 而全新开播时没有旧流垫着，等它就是白白拖慢出画。
@@ -668,7 +695,11 @@ class PlaybackController extends ChangeNotifier {
 
     // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
     // 中继服务，它自己会在发往上游时带上。
-    return _PlaybackSource(endpoint.uri.toString(), const <String, String>{});
+    return _PlaybackSource(
+      endpoint.uri.toString(),
+      const <String, String>{},
+      relayed: true,
+    );
   }
 
   /// 把续播点换算成**大致**字节偏移，给中继当预取起点的提示。
@@ -1494,12 +1525,20 @@ class PlaybackController extends ChangeNotifier {
 /// 的组合正是最该让名字说话的地方 —— 漏换 headers 的表现是「走本地中继
 /// 却被要求带 Cookie」，而 412 的错误信息里根本看不出是头的问题。
 class _PlaybackSource {
-  const _PlaybackSource(this.url, this.headers);
+  const _PlaybackSource(this.url, this.headers, {this.relayed = false});
 
   final String url;
 
   /// 播放器要带的请求头。**走本地中继时它必须是空的。**
   final Map<String, String> headers;
+
+  /// 这条地址是不是**本地中继**的入口，而不是网盘直链。
+  ///
+  /// 只用于诊断日志，但必须是**显式的一位**而不是「拿 URL 猜是不是
+  /// `127.0.0.1`」：播放器报 `Failed to open http://127.0.0.1:PORT/sN.` 时，
+  /// 日志要能直接说出「内核拿到的是中继地址」；靠猜在将来加了别的本地代理
+  /// 之后就会说谎，而「日志说谎」比没有日志更坏。
+  final bool relayed;
 }
 
 /// 从文件名猜字幕格式（用于本地字幕与内嵌轨标签）。

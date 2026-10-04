@@ -211,4 +211,162 @@ void main() {
       );
     });
   });
+
+  group('nextVideoProbeAction：视频管线探针什么时候发读数', () {
+    // 这条链回答的是用户报的「4K 全程不流畅」。判据是**实际生效的解码器**
+    // 与**上屏相关的丢帧数**，而它们只能从 mpv 属性读出来 —— 真机上唯一能
+    // 看到的地方是应用内「诊断日志」页，所以这段判断错了不会报错，只会让人
+    // 照着假结论去改一堆没用的参数。
+
+    test('解码器还没起来（hwdec-current 是空串）时**不发**第一拍', () {
+      // ⛔ 这条是整段逻辑里最容易写错、代价最大的一处：`loadfile` 之后的一小段
+      // 时间里 `hwdec-current` 就是空串。把它当成「软解」会得出
+      // 「硬解没生效」的结论，而它下一秒就起来了。
+      expect(
+        nextVideoProbeAction(ticks: 1, samples: 0, decoderReady: false),
+        VideoProbeAction.skip,
+      );
+      expect(
+        nextVideoProbeAction(ticks: 5, samples: 0, decoderReady: false),
+        VideoProbeAction.skip,
+      );
+    });
+
+    test('解码器一起来就发第一拍（不必等满固定秒数）', () {
+      expect(
+        nextVideoProbeAction(ticks: 1, samples: 0, decoderReady: true),
+        VideoProbeAction.sample,
+      );
+    });
+
+    test('第一拍之后按固定间隔继续发 —— 采样要**跨越整段播放**', () {
+      // ⛔ 旧策略只发两拍（约第 6s / 第 27s），而那两拍恰好都贴着
+      // 「起播 + 片头跳过 seek」，读数全是 0 —— 用户报的却是**全程**不流畅。
+      // 只测起播那 30 秒就会得出「没有掉帧」的假结论（10-04 就是这么栽的）。
+      expect(
+        nextVideoProbeAction(ticks: 2, samples: 1, decoderReady: true),
+        VideoProbeAction.skip,
+      );
+      expect(
+        nextVideoProbeAction(ticks: 7, samples: 1, decoderReady: true),
+        VideoProbeAction.sample,
+        reason: '第 7 拍（约第 21s）要再发一条',
+      );
+      expect(
+        nextVideoProbeAction(ticks: 98, samples: 5, decoderReady: true),
+        VideoProbeAction.sample,
+        reason: '第 98 拍（约第 294s）还得在发 —— 长片要能一直看到读数',
+      );
+    });
+
+    test('采样点不挨着 —— 相邻两条之间至少隔一拍', () {
+      // 挨着发的两个数都是 0，看不出「每 10 秒丢 30 帧」这种速率。
+      var samples = 0;
+      final sampleTicks = <int>[];
+      for (var ticks = 1; ticks <= 40; ticks++) {
+        final a = nextVideoProbeAction(
+          ticks: ticks,
+          samples: samples,
+          decoderReady: true,
+        );
+        if (a == VideoProbeAction.sample) {
+          samples++;
+          sampleTicks.add(ticks);
+        }
+      }
+      expect(
+        sampleTicks.length,
+        greaterThan(2),
+        reason: '一轮探针至少要发三条，才谈得上「跨越整段播放」',
+      );
+      for (var i = 1; i < sampleTicks.length; i++) {
+        expect(
+          sampleTicks[i] - sampleTicks[i - 1],
+          greaterThan(1),
+        );
+      }
+    });
+
+    test('发满上限就收工 —— 别把 800 行的环形缓冲刷满', () {
+      expect(
+        nextVideoProbeAction(ticks: 200, samples: 16, decoderReady: true),
+        VideoProbeAction.stop,
+      );
+      expect(
+        nextVideoProbeAction(ticks: 121, samples: 3, decoderReady: true),
+        VideoProbeAction.stop,
+      );
+    });
+
+    test('解码器一直不起来时到点就停 —— 不能永远挂着定时器', () {
+      expect(
+        nextVideoProbeAction(ticks: 9, samples: 0, decoderReady: false),
+        VideoProbeAction.skip,
+      );
+      expect(
+        nextVideoProbeAction(ticks: 10, samples: 0, decoderReady: false),
+        VideoProbeAction.stop,
+      );
+    });
+  });
+
+  group('shouldKickHwdec：起播后要不要重建解码器', () {
+    // 这条判据是「Surface 等超时」那条兜底路上的闸门。它决定要不要在播放
+    // 中途改 `hwdec` —— 改会重建解码器，有一瞬间顿挫；不改则 4K 继续丢帧。
+    // 三个条件各自都能单独写错，所以逐条钉住。
+
+    test('还在拷贝档 + 片头 → 动手', () {
+      expect(
+        MediaKitPlaybackEngine.shouldKickHwdec(
+          hwdecCurrent: 'mediacodec-copy',
+          position: Duration.zero,
+        ),
+        isTrue,
+      );
+    });
+
+    test('已经是零拷贝 → 绝不动手（一个字节都不改播放）', () {
+      // 直通生效时这条检查必须是纯读。误判成「要重建」会在片头平白顿一下，
+      // 而且用户刚报过「卡顿」，这一下会被当成没修好。
+      expect(
+        MediaKitPlaybackEngine.shouldKickHwdec(
+          hwdecCurrent: 'mediacodec',
+          position: Duration.zero,
+        ),
+        isFalse,
+      );
+    });
+
+    test('解码器还没起来（空串）→ 不动手', () {
+      // ⛔ 空串不是「退回拷贝」，只是还没有读数。这一条写错就会在起播那一
+      // 瞬间触发一次没必要的重建。
+      expect(
+        MediaKitPlaybackEngine.shouldKickHwdec(
+          hwdecCurrent: '',
+          position: Duration.zero,
+        ),
+        isFalse,
+      );
+    });
+
+    test('已过重建窗口 → 不动手，哪怕确实在拷贝档', () {
+      // 重建的顿挫放在正片中间就成了**新的卡顿**。窗口边界是闭区间：
+      // 正好卡在窗口末尾那一次仍允许（那时的顿挫还贴着片头）。
+      const window = MediaKitPlaybackEngine.hwdecKickWindow;
+      expect(
+        MediaKitPlaybackEngine.shouldKickHwdec(
+          hwdecCurrent: 'mediacodec-copy',
+          position: window + const Duration(seconds: 1),
+        ),
+        isFalse,
+      );
+      expect(
+        MediaKitPlaybackEngine.shouldKickHwdec(
+          hwdecCurrent: 'mediacodec-copy',
+          position: window,
+        ),
+        isTrue,
+      );
+    });
+  });
 }

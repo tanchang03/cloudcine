@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cloudcine/core/diagnostics/diag_log.dart';
 import 'package:cloudcine/core/utils/hls_relay_rewrite.dart';
 import 'package:cloudcine/core/utils/http_range.dart';
 import 'package:cloudcine/data/stream/local_stream_relay.dart';
@@ -426,6 +427,156 @@ void main() {
         after.where((r) => r.start >= seekChunk * chunk).length,
         greaterThanOrEqualTo(prefetchChunks - 2),
       );
+    });
+  });
+
+  group('中继诊断日志 —— TV 上「Failed to open 127.0.0.1」的取证路径', () {
+    // 这一组钉的是**日志**而不是行为，因为那个故障在真机上只能靠日志事后还原：
+    // 电视上播放失败时屏幕上只有一句
+    //   「播放器报错：Failed to open http://127.0.0.1:43617/s1.」
+    // 而中继原来对**请求本身**一声不吭 —— 「请求压根没来」与「来了但被 404
+    // 掉」在日志里长得一模一样，事后无从区分。下面每条断言就是一道分水岭。
+
+    setUp(() {
+      diag.clearBuffer();
+      addTearDown(diag.clearBuffer);
+    });
+
+    String logs() => diag.lines.join('\n');
+
+    /// 起一个「要什么给什么」的上游，返回它的端口。
+    Future<int> goodUpstream(int total) async {
+      final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(upstream.close);
+      upstream.listen((request) async {
+        final range = parseRangeHeader(request.headers.value('Range'), total) ??
+            ByteRange(0, total - 1);
+        request.response
+          ..statusCode = HttpStatus.partialContent
+          ..headers.set(
+            HttpHeaders.contentRangeHeader,
+            formatContentRange(range, total),
+          )
+          ..headers.set(HttpHeaders.contentLengthHeader, range.length)
+          ..add(Uint8List(range.length));
+        await request.response.close();
+      });
+      return upstream.port;
+    }
+
+    test('会话号与入口 URL 写进日志 —— 才能把报错里的 /s1 对上哪一次接管', () async {
+      final port = await goodUpstream(10);
+      final relay = LocalStreamRelay(chunkSize: 10, prefetchBytes: 10);
+      addTearDown(relay.dispose);
+
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:$port/demo.mkv'),
+          contentLength: 10,
+        ),
+      ))!;
+
+      // 没有这一条，「Failed to open .../s1」里的 s1 就无从对应到哪一次接管
+      // ——一次播放会建多条会话，只能靠顺序猜。
+      expect(logs(), contains('已接管 ${endpoint.token}'));
+      // 入口 URL 一起打出来，才能和屏幕上的报错逐字对上。
+      expect(
+        logs(),
+        contains('127.0.0.1:${endpoint.uri.port}/${endpoint.token}'),
+      );
+    });
+
+    test('请求到达 + 首块下发都留痕 —— 反过来「没有任何中继日志」就等于没连进来',
+        () async {
+      final port = await goodUpstream(10);
+      final relay = LocalStreamRelay(chunkSize: 10, prefetchBytes: 10);
+      addTearDown(relay.dispose);
+
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:$port/demo.mkv'),
+          contentLength: 10,
+        ),
+      ))!;
+
+      final client = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(client.close);
+      final request = await client.getUrl(endpoint.uri);
+      final response = await request.close();
+      expect(response.statusCode, HttpStatus.ok);
+      await response.drain<void>();
+
+      expect(logs(), contains('会话 ${endpoint.token} 收到读取器 #1'));
+      expect(logs(), contains('首块已下发'));
+      expect(logs(), contains('已下发 10 字节'));
+    });
+
+    test('未知 token 回 404 并落 warn —— 假「直链过期」的唯一痕迹', () async {
+      final port = await goodUpstream(10);
+      final relay = LocalStreamRelay(chunkSize: 10, prefetchBytes: 10);
+      addTearDown(relay.dispose);
+
+      // 先建一条真会话，好让中继服务起在某个已知端口上。
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:$port/demo.mkv'),
+          contentLength: 10,
+        ),
+      ))!;
+
+      final client = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(client.close);
+      final request = await client.getUrl(
+        Uri.parse('http://127.0.0.1:${endpoint.uri.port}/s999'),
+      );
+      final response = await request.close();
+      expect(response.statusCode, HttpStatus.notFound);
+      await response.drain<void>();
+
+      // 这条 warn 是「换源时先关旧会话」那条假过期路径**唯一**的痕迹：
+      // 播放器只会报一句笼统的 Failed to open，分不出 404 来自中继。
+      expect(logs(), contains('拒绝 GET /s999'));
+      expect(logs(), contains('会话不存在'));
+    });
+
+    test('上游取不到数据 → 一个字节都没发出，必须落 warn（Failed to open 的直接机制）',
+        () async {
+      // 上游对每一块都回 500：中继答应得出 200，正文却一个字节都拿不到。
+      // 这正是 ffmpeg 判定「打不开」的形态 —— 它拿到了响应头，却读不出容器。
+      final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(upstream.close);
+      upstream.listen((request) async {
+        request.response
+          ..statusCode = HttpStatus.internalServerError
+          ..headers.set(HttpHeaders.contentLengthHeader, 0);
+        await request.response.close();
+      });
+
+      final relay = LocalStreamRelay(chunkSize: 10, prefetchBytes: 10);
+      addTearDown(relay.dispose);
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:${upstream.port}/demo.mkv'),
+          contentLength: 10,
+        ),
+      ))!;
+
+      final client = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(client.close);
+      try {
+        final request = await client.getUrl(endpoint.uri);
+        final response = await request.close();
+        await response.drain<void>();
+      } catch (_) {
+        // 中继会把连接掐掉（正文一个字节都没有）—— 客户端这边报什么不重要，
+        // 要断言的是**中继自己留下了痕迹**。
+      }
+
+      // 上游那一侧的证据……
+      expect(logs(), contains('取块 0 失败：上游返回 500'));
+      // ……以及「中继对播放器一个字节都没给出」这个结论本身。原来它和「正常
+      // 换源掐断连接」共用一条 debug，现场日志里会彻底消失。
+      expect(logs(), contains('一个字节都没发出'));
     });
   });
 }

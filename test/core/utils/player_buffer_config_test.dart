@@ -53,13 +53,22 @@ void main() {
   });
 
   group('硬件解码：只有电视开', () {
-    test('电视下发 auto-safe', () {
+    test('电视下发 mediacodec,auto-safe —— 直通在前、拷贝兜底', () {
       // 背景：mpv 的 `hwdec` 默认是 `no`（纯软解），media_kit 那张默认属性表
-      // 里**也没有这一项** —— 全项目搜 `hwdec` 一处都没有。
-      // 于是电视盒子一直在软解高码率原画，而那颗 SoC 通常只够软解 1080p：
-      // 解码跟不上音频 → mpv 跳帧追主时钟 → 「卡帧 + 音画不同步」。
-      // 缓冲参数解决不了这一条 —— 那是「数据没到位」，这是「解码跟不上」。
-      expect(PlayerBufferConfig.hwdecFor(tv: true), 'auto-safe');
+      // 里**也没有这一项**。于是电视盒子一直在软解高码率原画，而那颗 SoC
+      // 通常只够软解 1080p。
+      //
+      // 10-04 真机日志把「4K 掉帧」钉在**上屏路径**上：4K 原画 21 秒丢
+      // 141 帧（37.6%），同一文件转 810p 只丢 7 帧（1.3%），而每一拍
+      // `解码丢帧=0`。掉帧率随**分辨率**缩放、与解码能力无关 —— 典型的一拷
+      // 一上传（4K 约 580 MB/s）打满内存带宽。
+      //
+      // ⚠️ 但光下发这一项**不够**：`hwdec-current` 实测恒为 `mediacodec-copy`。
+      // 根因不是白名单，是 **media_kit 在 `open()` 之后才写 `vo=null` + `hwdec`**
+      // —— 解码器定型时 VO 交不出 surface，`mediacodec` 只能静默退回拷贝档。
+      // 所以引擎侧还必须在 Surface 挂上之后重发一次 `hwdec`（见
+      // `MediaKitPlaybackEngine._awaitVideoSurface`）。
+      expect(PlayerBufferConfig.hwdecFor(tv: true), 'mediacodec,auto-safe');
     });
 
     test('桌面**不下发**这一项 —— 返回 null，不是 "no"', () {
@@ -69,14 +78,73 @@ void main() {
       expect(PlayerBufferConfig.hwdecFor(tv: false), isNull);
     });
 
-    test('不写死 mediacodec、也不用 auto', () {
-      // 写死 `mediacodec` 是直通路径，渲染端配不上就是**黑屏**；
-      // `auto` 会把不安全的 API 一起试（崩溃 / 花屏）。
-      // `auto-safe` 配不上时回落到软解 —— 最坏情况等于没改。
-      final tv = PlayerBufferConfig.hwdecFor(tv: true);
-      expect(tv, isNot('mediacodec'));
-      expect(tv, isNot('auto'));
-      expect(tv, isNot('no'));
+    test('直通必须排第一 —— 排在后面等于没改', () {
+      // mpv 的 `--hwdec` 是**逗号列表**，按顺序试、先成的胜出（手册里
+      // `vaapi,auto` 就是这个语义）。所以 `mediacodec` 一旦不在首位，
+      // 前面的那个会先成功，零拷贝永远轮不到。
+      final tv = PlayerBufferConfig.hwdecFor(tv: true)!;
+      expect(tv.split(',').first, 'mediacodec');
+    });
+
+    test('必须有兜底项 —— 光写 mediacodec 失败只剩软解，4K 直接不能看', () {
+      // ⛔ 这条是本组最重要的断言。`mediacodec` 在 mpv 手册里属于
+      // 「不安全档」：它强制 RGB 转换、10bit 降到 8bit，而且要求
+      // `--vo=gpu` + `--gpu-context=android`（media_kit 恰好满足，但
+      // 别的构建不保证）。没有逗号后面的兜底项时，一旦它配不上，
+      // mpv 只会回落到**软件解码** —— 那比现在的拷贝路更糟。
+      final tv = PlayerBufferConfig.hwdecFor(tv: true)!;
+      final parts = tv.split(',');
+      expect(parts.length, greaterThan(1));
+      expect(parts.first, isNot('no'));
+      // 兜底那一段不能是空串，也不能又是 mediacodec（那等于没有兜底）。
+      expect(parts.sublist(1).every((p) => p.trim().isNotEmpty), isTrue);
+      expect(parts.sublist(1).contains('mediacodec'), isFalse);
+    });
+  });
+
+  group('isCopyHwdec：读出来的解码器算不算「拷贝档」', () {
+    // 这条判据决定了引擎**要不要**再逼 mpv 重建一次解码器。判错的两个方向
+    // 代价不对称，所以四条都要钉住。
+
+    test('零拷贝直通不算拷贝档', () {
+      // 这是「已经修好了」的那一种。若把它误判成拷贝档，引擎会在片头白白
+      // 重建一次解码器 —— 用户看到的是「改完反而开头卡了一下」。
+      expect(PlayerBufferConfig.isCopyHwdec('mediacodec'), isFalse);
+      expect(PlayerBufferConfig.isCopyHwdec('vaapi'), isFalse);
+    });
+
+    test('带 -copy 的都算拷贝档（不只是 mediacodec-copy）', () {
+      // ⛔ 判据取「名字里带 copy」而不是与某个具体值相等：同族的
+      // `vaapi-copy` / `d3d11va-copy` / `vdpau-copy` 是同一个病，
+      // 写死字符串会在别的平台上静默失效。
+      expect(PlayerBufferConfig.isCopyHwdec('mediacodec-copy'), isTrue);
+      expect(PlayerBufferConfig.isCopyHwdec('vaapi-copy'), isTrue);
+      expect(PlayerBufferConfig.isCopyHwdec('d3d11va-copy'), isTrue);
+    });
+
+    test('大小写不影响判定', () {
+      // mpv 给的是小写，但这一条只是为了让判据在日志被人手抄过之后仍然成立。
+      expect(PlayerBufferConfig.isCopyHwdec('MediaCodec-Copy'), isTrue);
+    });
+
+    test('空串**不算**拷贝档 —— 它只是还没有读数', () {
+      // ⛔ 最容易写错、代价最大的一条：`loadfile` 之后的一小段时间里
+      // `hwdec-current` 就是空串。把它算成「退回了拷贝」会触发一次
+      // 没必要的解码器重建，而且是在片头最不该抖的时候。
+      expect(PlayerBufferConfig.isCopyHwdec(''), isFalse);
+      expect(PlayerBufferConfig.isCopyHwdec('   '), isFalse);
+    });
+
+    test('过渡值不是软解 —— 重建那一瞬间也不能掉出硬解', () {
+      // ⛔ 过渡值若写成 `no`，重建时解码器会被拽到**软解**：4K 软解直接卡死，
+      // 比「留在拷贝档」更糟。所以过渡值必须是硬解族里的另一个值。
+      expect(PlayerBufferConfig.hwdecKickTransient, isNot('no'));
+      expect(PlayerBufferConfig.hwdecKickTransient, isNotEmpty);
+      // 而且它必须与目标值不同，否则 mpv 视作空操作、根本不重建。
+      expect(
+        PlayerBufferConfig.hwdecKickTransient,
+        isNot(PlayerBufferConfig.hwdecFor(tv: true)),
+      );
     });
   });
 }

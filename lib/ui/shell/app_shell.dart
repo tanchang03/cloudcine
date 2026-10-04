@@ -417,11 +417,14 @@ class _NavTile extends StatelessWidget {
 
     if (!tv) return tile;
 
-    // TV 上补一层焦点环，且**必须画在子节点之上**：这个 tile 的 ink 落在它
-    // 自己的 `Material` 上，而 `_RenderInkFeatures.paint` 是先画 ink 再画
-    // 子节点 —— 把主题的 `focusColor` 调多亮都会被内容盖住。
-    // 完整理由见 [TvFocusable] 的类文档。
-    return TvFocusable(borderRadius: BorderRadius.circular(8), child: tile);
+    // TV 上「整项轻微放大」是这一版的焦点语言（见 [TvFocusable] 的类文档）。
+    // 侧栏项自己有 `Material`，ink 高亮本来画得出来，所以**不再叠色罩** ——
+    // 用户的原话是「不需要背景蒙版色凸显，看起来有点多余，也不太美观」。
+    return TvFocusable(
+      borderRadius: BorderRadius.circular(8),
+      focusScale: 1.04,
+      child: tile,
+    );
   }
 }
 

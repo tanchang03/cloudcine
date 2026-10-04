@@ -95,13 +95,46 @@ class PlayerBufferConfig {
   /// ⚠️ 上面那套缓冲参数只解决「数据没到位」，**解决不了「解码跟不上」**。
   /// 这是两条独立的路，缺一条原画就还是卡。
   ///
-  /// ## 为什么是 `auto-safe` 而不是 `auto` / `mediacodec`
+  /// ## 为什么是 `mediacodec,auto-safe` 而不是光写 `auto-safe`（10-04 实测）
   ///
-  /// - `auto` 会连**不安全**的 API 一起试（崩溃 / 花屏）；
-  /// - 写死 `mediacodec` 是**直通**路径，要求渲染端配合，配不上就是**黑屏**；
-  /// - `auto-safe` 只用安全列表（Android 上解析成 `mediacodec-copy`：解码走硬件、
-  ///   帧拷回内存再上屏），配不上时**回落到软解** —— 最坏情况等于没改。
-  static const String tvHwdec = 'auto-safe';
+  /// 用户报「4K 掉帧、1080P 顺、夸克播同一片源没问题」。真机日志把根因钉死了：
+  ///
+  /// ```
+  /// 第 6s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=14
+  /// 第27s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=58
+  /// ```
+  ///
+  /// `解码丢帧` 恒为 0（解码永远跟得上），而 `显示丢帧` 21 秒涨 44 帧
+  /// （≈ 每秒丢 9%），同一段 `[中继]` 一条告警都没有 —— 瓶颈既不在解码、
+  /// 也不在网络，而在**「拷回内存 + 上传纹理」这一段**。
+  ///
+  /// 为什么会有那一拷：mpv 的 `auto-safe` **只用白名单**，而
+  /// `mediacodec` / `mediacodec-copy` **都不在白名单里**（白名单只有
+  /// d3d11va / videotoolbox / vaapi / nvdec / drm / vulkan 这几族）。
+  /// Android 上 `auto-safe` 于是落到 `mediacodec-copy`：MediaCodec 解到 CPU
+  /// 内存，再 memcpy 进 mpv 的帧、再上传成纹理。4K 一帧 YUV 约 12 MB，
+  /// 24fps 就是 ~290 MB/s 的 memcpy **再加**等量的上传，电视 SoC 撑不住
+  /// 41ms 的帧预算。1080P 只有 1/4 像素，所以顺；夸克走 ExoPlayer +
+  /// SurfaceView（解码器直接输出到 surface，一次拷贝都没有）所以也顺。
+  ///
+  /// 所以要把**直通**那一档显式点出来。两个前提都成立：
+  ///
+  /// 1. `mediacodec` 要求 `--vo=gpu` + `--gpu-context=android`（mpv 手册原话；
+  ///    另一条 `--vo=mediacodec_embed` 我们不用）—— media_kit 在 Android 上
+  ///    **恰好就是这两个值**：`android_video_controller/real.dart` 里
+  ///    `vo: configuration.vo ?? 'gpu'`，并把 `gpu-context` 写死成 `android`，
+  ///    配 `wid` 指向真实 Surface。**这条是上一轮误判过的地方**：Android 不是
+  ///    render API（那条路确实只吃拷贝型硬解），是真窗口 vo。
+  /// 2. 逗号列表**带自动回退**：手册里 `vaapi,auto` 的含义就是「先试 vaapi，
+  ///    失败再走 auto 逻辑」。于是 `mediacodec,auto-safe` = 先试零拷贝，
+  ///    配不上就退回今天这条拷贝路 —— **最坏情况等于没改**。
+  ///
+  /// ⛔ 别写成光秃秃的 `mediacodec`：那样失败只剩软解，4K 会直接不能看。
+  ///
+  /// ⚠️ 代价（手册明说）：`mediacodec` 是不安全档，它**强制 RGB 转换**、
+  /// 非标准色彩空间的表现不明，10bit 会被降到 8bit。这台电视是 1080p SDR
+  /// 面板，两条都不构成损失；哪天上了 HDR 屏，要回来重看这一条。
+  static const String tvHwdec = 'mediacodec,auto-safe';
 
   // ---- 按设备取用 ----
 
@@ -121,6 +154,31 @@ class PlayerBufferConfig {
   /// 下发 `'no'` 也是**改了桌面行为**（把 mpv 的默认显式化，且挡住了将来
   /// 有人给桌面开硬解）。
   static String? hwdecFor({required bool tv}) => tv ? tvHwdec : null;
+
+  /// 生效的解码器是否落在**拷贝档**。
+  ///
+  /// mpv 的 `hwdec-current` 在零拷贝直通上是 `mediacodec`，退回拷贝档是
+  /// `mediacodec-copy`；其它平台还有 `vaapi-copy` / `d3d11va-copy` 同族值，
+  /// 所以判据取「名字里带 copy」，而不是与某个具体值相等。
+  ///
+  /// ⚠️ 空串（解码器还没起来）**不算**拷贝档 —— 那不是「退回了拷贝」，
+  /// 只是还没有读数。把空串算进来会让「起播那一瞬间的检查」误判成失败。
+  static bool isCopyHwdec(String current) =>
+      current.toLowerCase().contains('copy');
+
+  /// 让 mpv **重新解析** `hwdec` 时先写入的过渡值。
+  ///
+  /// ## 为什么必须「改一次再改回来」
+  ///
+  /// mpv 只在 `hwdec` **发生变化**时才重建视频解码器；写入一个与当前完全
+  /// 相同的字符串是**空操作**。所以「请重新解析一次」只能靠先写一个不同的
+  /// 值、再写回目标值。
+  ///
+  /// ## 为什么过渡值不是 `no`
+  ///
+  /// `no` 同样能触发重建，但它把解码器拽到**软解** —— 4K 软解会直接卡死。
+  /// `auto-safe` 依旧是硬解（只是拷贝档），重建那一瞬间的代价小得多。
+  static const String hwdecKickTransient = 'auto-safe';
 
   /// 在 [Player] 创建后、`open()` 之前调用，设置 [PlayerConfiguration]
   /// 管不到的 mpv 属性。

@@ -29,6 +29,12 @@ String _clock(Duration d) {
   return h > 0 ? '$h:$m:$s' : '$m:$s';
 }
 
+/// 倍速档位在选项条上怎么写。
+///
+/// 1.0 写「正常速度」而不是「1.0x」：用户要找的是「怎么恢复原速」，
+/// 而「1.0x」需要他在心里先换算一次。
+String rateLabel(double rate) => rate == 1.0 ? '正常速度' : '${rate}x';
+
 /// 集数网格里一格的文字。
 ///
 /// 优先用**解析出来的集号**（`episode`），没有才退回「第 N 格」。
@@ -52,11 +58,11 @@ String episodeRowLabel(MediaItem item, int index) {
   return '第 ${index + 1} 集';
 }
 
-/// TV 播放页右侧那块设置面板的**全部状态与切换逻辑**。
+/// TV 播放页底部菜单的**全部状态与切换逻辑**。
 ///
 /// ## 为什么单独一个组件，而不是塞进播放页
 ///
-/// 播放页已经 2000 行，再塞进「面板开在第几页、选中第几行、每一档怎么循环」
+/// 播放页已经 2000 行，再塞进「菜单开在第几页、选中第几行、每一档怎么循环」
 /// 会让它彻底没法读。而这块逻辑与播放页的耦合面其实很窄：只是
 /// **读控制器状态** + **回调出「用户选了什么」**，两侧都不碰数据库。
 /// 收进来之后，播放页只剩「什么时候打开 / 关闭它」这一个决定。
@@ -66,6 +72,12 @@ String episodeRowLabel(MediaItem item, int index) {
 /// 画质与字幕**切完了还要落库**（而且只在真的切成功之后才落，见
 /// `_changeQuality` / `_changeSubtitle` 的注释）。那段逻辑在播放页手里，
 /// 这里重做一遍就是两份「只在成功时记」的规则 —— 一定会漂。
+///
+/// ## 选项从哪来
+///
+/// 每一行都把**全部可选项**交给 [PlayerTvSheet] 画成一条 chip（照夸克
+/// 播放器）。这样用户在按 OK 之前就看得到「有哪些档、现在是哪一档」——
+/// 原来那一版只给一个当前值字符串，改值靠 ← / → 逐档盲循环。
 class PlayerTvOverlay extends StatefulWidget {
   const PlayerTvOverlay({
     super.key,
@@ -87,11 +99,11 @@ class PlayerTvOverlay extends StatefulWidget {
 
   final PlaybackController controller;
 
-  /// 面板的焦点节点，**由播放页持有**。
+  /// 菜单的焦点节点，**由播放页持有**。
   ///
-  /// ⛔ 不能让面板自己建一个 + `autofocus`：画面节点早就占着焦点了，
-  /// `autofocus` 是空操作，面板会收不到任何按键（用户报的「上下键按不动」
-  /// 就是这个）。播放页在打开面板后显式 `requestFocus` 到这个节点上。
+  /// ⛔ 不能让菜单自己建一个 + `autofocus`：画面节点早就占着焦点了，
+  /// `autofocus` 是空操作，菜单会收不到任何按键（用户报的「上下键按不动」
+  /// 就是这个）。播放页在打开菜单后显式 `requestFocus` 到这个节点上。
   final FocusNode focusNode;
 
   /// 当前这一集。**可能为 null**（还没加载出来）—— 那时「选集」行显示「—」。
@@ -140,7 +152,7 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
         currentIndex: siblings.indexWhere((i) => i.id == widget.item?.id),
         labelOf: (i) => episodeCellLabel(siblings[i], i),
         onPick: (i) {
-          // 选完就跳，跳完**收起整个面板**：用户想看的是片子，不是面板。
+          // 选完就跳，跳完**收起整个菜单**：用户想看的是片子，不是菜单。
           unawaited(widget.onPickEpisode(siblings[i]));
           widget.onClose();
         },
@@ -149,7 +161,7 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
       );
     }
 
-    return PlayerTvPanel(
+    return PlayerTvSheet(
       focusNode: widget.focusNode,
       rows: _rows(),
       selectedIndex: _rowIndex,
@@ -172,33 +184,27 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
         row: PlayerTvRow.episode,
         value: epIndex < 0 ? '' : episodeRowLabel(siblings[epIndex], epIndex),
         adjustable: siblings.length > 1,
+        // 「选集」没有选项条（集数可能几十条，横着铺不下），走二级网格页。
+        hint: siblings.length > 1
+            ? '按 OK 打开选集 · ← → 直接换集'
+            : '这一条不在剧集列表里（不是从库里进来的）',
       ),
       _qualityRow(c),
       _subtitleRow(c),
       _audioRow(c),
-      PlayerTvRowValue(
-        row: PlayerTvRow.audioEffect,
-        value: PlayerAudioEffect.label(c.audioEffect),
-        adjustable: PlayerAudioEffect.selectable.length > 1,
-      ),
-      PlayerTvRowValue(
-        row: PlayerTvRow.rate,
-        value: c.rate == 1.0 ? '正常速度' : '${c.rate}x',
-      ),
+      _effectRow(c),
+      _rateRow(c),
       _introRow(c),
     ];
   }
 
-  PlayerTvRowValue _introRow(PlaybackController c) {
-    final marker = c.introMarker;
-    return PlayerTvRowValue(
-      row: PlayerTvRow.intro,
-      // 没有片头标识时写「未标记」而不是空串：空串会被渲染成「—」，
-      // 用户读不出那是「还没标」还是「这部片没有片头」。
-      value: marker == null ? '未标记' : '跳到 ${_clock(marker.start)}',
-      adjustable: false,
-    );
-  }
+  // -------------------------------------------------------------------
+  // 每一行的「可选项 + 当前是哪一项」
+  //
+  // ⚠️ `selectedOption` 必须真的指向 [PlayerTvRowValue.options] 里那一项：
+  // 菜单打开时把它当光标起点，越界会让 `options[_chip]` 抛 RangeError。
+  // 所以每一处都留了「找不到就退回 0」的兜底。
+  // -------------------------------------------------------------------
 
   PlayerTvRowValue _qualityRow(PlaybackController c) {
     final all = c.qualities;
@@ -209,48 +215,66 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
         row: PlayerTvRow.quality,
         value: '原画',
         adjustable: false,
+        hint: '服务端没有给转码档位，这一条只能放原画',
       );
     }
     final active = c.activeQualityId;
-    var label = '原画';
-    for (final q in all) {
-      if (q.id == active) {
-        label = q.label;
-        break;
-      }
+    var selected = 0;
+    final options = <PlayerTvOption>[];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].id == active) selected = i;
+      // 服务端没给地址的档位照画（灰掉），只是 ← / → 会跳过它 ——
+      // 直接不画的话，用户会以为这个应用不支持 4K。
+      options.add(PlayerTvOption(all[i].label, enabled: all[i].isAvailable));
     }
     return PlayerTvRowValue(
       row: PlayerTvRow.quality,
-      value: label,
+      value: options[selected].label,
       adjustable: all.length > 1,
+      options: options,
+      selectedOption: selected,
     );
   }
 
   PlayerTvRowValue _subtitleRow(PlaybackController c) {
     final tracks = c.allSubtitles;
-    final active = c.activeSubtitleId;
-    if (active == null) {
-      return PlayerTvRowValue(
+    if (tracks.isEmpty) {
+      return const PlayerTvRowValue(
         row: PlayerTvRow.subtitle,
         value: '关闭',
-        adjustable: tracks.isNotEmpty,
+        adjustable: false,
+        hint: '这一条没有任何字幕轨',
       );
     }
-    var label = '字幕';
-    for (final t in tracks) {
-      if (t.id == active) {
-        label = t.displayLabel;
-        break;
+    final active = c.activeSubtitleId;
+    // 第 0 颗永远是「关闭」—— 把「不要字幕」也做成一档，用户才不用去猜
+    // 「怎么关掉」。它占着第 0 位还有个好处：`selectedOption` 永远有值。
+    var selected = 0;
+    var label = '关闭';
+    for (var i = 0; i < tracks.length; i++) {
+      if (tracks[i].id == active) {
+        selected = i + 1;
+        label = tracks[i].displayLabel;
       }
     }
-    return PlayerTvRowValue(row: PlayerTvRow.subtitle, value: label);
+    // 生效中但不在列表里（例如外挂字幕还没解析完）：说「字幕」比说「关闭」诚实。
+    if (active != null && selected == 0) label = '字幕';
+    return PlayerTvRowValue(
+      row: PlayerTvRow.subtitle,
+      value: label,
+      options: [
+        const PlayerTvOption('关闭'),
+        for (final t in tracks) PlayerTvOption(t.displayLabel),
+      ],
+      selectedOption: selected,
+    );
   }
 
   /// 音轨名走 `TrackLabels.audioTitle`，**本文件不再自己维护一张语言表**。
   ///
   /// 这里一开始抄了一份「`chi` → 中文」的映射（当时的理由是「只为一行文字去
   /// 动 `TrackLabels` 不值得」）。那是错的：桌面内置播放页的音轨菜单、独立
-  /// 播放窗口、以及这块面板一共三处要显示同一个名字，各抄一份的结果是
+  /// 播放窗口、以及这块菜单一共三处要显示同一个名字，各抄一份的结果是
   /// 「`chi` 在一处显示中文、另一处显示简体中文、第三处原样显示 chi」——
   /// 而这三处**没有任何一处在真机上会同时出现**，所以没人会发现。
   /// `TrackLabels` 的类文档正好写着这件事，别再拆成两份。
@@ -263,24 +287,81 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
         // 「这部片子有没有国语」，而不是「这里有个菜单」。
         value: tracks.isEmpty ? '' : TrackLabels.audioTitle(tracks.first),
         adjustable: false,
+        hint: '这一条只有一条音轨',
       );
     }
     final active = widget.activeAudioId;
-    var label = TrackLabels.audioTitle(tracks.first);
-    for (final t in tracks) {
-      if (t.id == active) {
-        label = TrackLabels.audioTitle(t);
-        break;
-      }
+    var selected = 0;
+    for (var i = 0; i < tracks.length; i++) {
+      if (tracks[i].id == active) selected = i;
     }
-    return PlayerTvRowValue(row: PlayerTvRow.audioTrack, value: label);
+    return PlayerTvRowValue(
+      row: PlayerTvRow.audioTrack,
+      value: TrackLabels.audioTitle(tracks[selected]),
+      options: [
+        for (final t in tracks) PlayerTvOption(TrackLabels.audioTitle(t)),
+      ],
+      selectedOption: selected,
+    );
   }
+
+  PlayerTvRowValue _effectRow(PlaybackController c) {
+    final all = PlayerAudioEffect.selectable;
+    final active = c.audioEffect;
+    if (all.length <= 1) {
+      return PlayerTvRowValue(
+        row: PlayerTvRow.audioEffect,
+        value: PlayerAudioEffect.label(active),
+        adjustable: false,
+        hint: '这一条没有可切换的音效',
+      );
+    }
+    var selected = all.indexOf(active);
+    if (selected < 0) selected = 0;
+    return PlayerTvRowValue(
+      row: PlayerTvRow.audioEffect,
+      value: PlayerAudioEffect.label(active),
+      options: [for (final p in all) PlayerTvOption(PlayerAudioEffect.label(p))],
+      selectedOption: selected,
+    );
+  }
+
+  PlayerTvRowValue _rateRow(PlaybackController c) {
+    var selected = kPlaybackRates.indexOf(c.rate);
+    if (selected < 0) selected = kPlaybackRates.indexOf(1.0);
+    return PlayerTvRowValue(
+      row: PlayerTvRow.rate,
+      value: rateLabel(c.rate),
+      options: [for (final r in kPlaybackRates) PlayerTvOption(rateLabel(r))],
+      selectedOption: selected,
+    );
+  }
+
+  PlayerTvRowValue _introRow(PlaybackController c) {
+    final marker = c.introMarker;
+    return PlayerTvRowValue(
+      row: PlayerTvRow.intro,
+      // 没有片头标识时写「未标记」而不是空串：空串会被渲染成「—」，
+      // 用户读不出那是「还没标」还是「这部片没有片头」。
+      value: marker == null ? '未标记' : '跳到 ${_clock(marker.start)}',
+      adjustable: false,
+      hint: marker == null
+          ? '这部片没有片头标记（标记入口在桌面控制栏）'
+          : '按 OK 跳到 ${_clock(marker.start)}',
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // 按键 → 动作
+  // -------------------------------------------------------------------
 
   /// OK 落在某一行上。
   ///
-  /// ⚠️ 「片头」跳完**收起面板**：跳过去之后用户要看的是片子，留着面板
-  /// 只会挡住三分之一画面。
-  void _activate(PlayerTvRow row) {
+  /// `optionIndex` 是选项条里被选中的那颗；这一行没有选项条时为 -1。
+  ///
+  /// ⚠️ 「片头」跳完**收起菜单**：跳过去之后用户要看的是片子，留着菜单
+  /// 只会挡住下面三分之一画面。
+  void _activate(PlayerTvRow row, int optionIndex) {
     switch (row) {
       case PlayerTvRow.episode:
         if (widget.siblings.length > 1) setState(() => _episodes = true);
@@ -288,32 +369,62 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
         unawaited(widget.onJumpIntro());
         widget.onClose();
       case PlayerTvRow.quality:
+        _pickQuality(optionIndex);
       case PlayerTvRow.subtitle:
+        _pickSubtitle(optionIndex);
       case PlayerTvRow.audioTrack:
+        _pickAudio(optionIndex);
       case PlayerTvRow.audioEffect:
+        _pickEffect(optionIndex);
       case PlayerTvRow.rate:
-        _adjust(row, 1);
+        _pickRate(optionIndex);
     }
   }
 
+  /// ← / → 落在**没有选项条**的行上。
+  ///
+  /// 目前只有「选集」会走到这里 —— 它的选项多到铺不下一条，改成「直接换集」
+  /// 反而更顺手（看剧时「下一集」是最高频的动作）。
   void _adjust(PlayerTvRow row, int delta) {
-    switch (row) {
-      case PlayerTvRow.intro:
-        // 左右键对片头没有意义 —— 它是一次跳转，走 OK。
-        break;
-      case PlayerTvRow.episode:
-        _stepEpisode(delta);
-      case PlayerTvRow.quality:
-        _stepQuality(delta);
-      case PlayerTvRow.subtitle:
-        _stepSubtitle(delta);
-      case PlayerTvRow.audioTrack:
-        _stepAudio(delta);
-      case PlayerTvRow.audioEffect:
-        _stepEffect(delta);
-      case PlayerTvRow.rate:
-        _stepRate(delta);
+    if (row == PlayerTvRow.episode) _stepEpisode(delta);
+  }
+
+  void _pickQuality(int i) {
+    final all = widget.controller.qualities;
+    if (i < 0 || i >= all.length) return;
+    // 不可选的档位在菜单里已经灰掉、← / → 也会跳过它，这里再挡一次是为了
+    // 鼠标：鼠标点得到灰掉的那一颗。
+    if (!all[i].isAvailable) return;
+    unawaited(widget.onPickQuality(all[i].id));
+  }
+
+  void _pickSubtitle(int i) {
+    final tracks = widget.controller.allSubtitles;
+    if (i <= 0) {
+      // 第 0 颗是「关闭」。`null` 在播放页那边就是「关掉字幕」。
+      unawaited(widget.onPickSubtitle(null));
+      return;
     }
+    final index = i - 1;
+    if (index >= tracks.length) return;
+    unawaited(widget.onPickSubtitle(tracks[index]));
+  }
+
+  void _pickAudio(int i) {
+    final tracks = widget.controller.embeddedAudioTracks;
+    if (i < 0 || i >= tracks.length) return;
+    widget.onPickAudioTrack(tracks[i], i);
+  }
+
+  void _pickEffect(int i) {
+    final all = PlayerAudioEffect.selectable;
+    if (i < 0 || i >= all.length) return;
+    unawaited(widget.onPickAudioEffect(all[i]));
+  }
+
+  void _pickRate(int i) {
+    if (i < 0 || i >= kPlaybackRates.length) return;
+    unawaited(widget.onPickRate(kPlaybackRates[i]));
   }
 
   void _stepEpisode(int delta) {
@@ -326,69 +437,5 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
     // **不循环**：第一集的「上一集」不存在，绕到最后一集是纯困惑。
     if (target < 0 || target >= siblings.length) return;
     unawaited(widget.onPickEpisode(siblings[target]));
-  }
-
-  void _stepQuality(int delta) {
-    final all = widget.controller.qualities;
-    if (all.length <= 1) return;
-    var i = all.indexWhere((q) => q.id == widget.controller.activeQualityId);
-    if (i < 0) i = 0;
-    // 跳过「服务端没给地址」的档位：按下去只会弹一条提示，而用户要按第二次
-    // 才知道自己刚才那下没生效。最多绕一圈，全是不可用时什么都不做。
-    for (var n = 0; n < all.length; n++) {
-      i = nextTvRowIndex(current: i, delta: delta, total: all.length);
-      if (all[i].isAvailable) {
-        unawaited(widget.onPickQuality(all[i].id));
-        return;
-      }
-    }
-  }
-
-  void _stepSubtitle(int delta) {
-    final tracks = widget.controller.allSubtitles;
-    if (tracks.isEmpty) return;
-    final active = widget.controller.activeSubtitleId;
-    var cur = 0; // 0 = 关闭字幕
-    if (active != null) {
-      final idx = tracks.indexWhere((t) => t.id == active);
-      if (idx >= 0) cur = idx + 1;
-    }
-    final next = nextTvRowIndex(
-      current: cur,
-      delta: delta,
-      total: tracks.length + 1,
-    );
-    unawaited(widget.onPickSubtitle(next == 0 ? null : tracks[next - 1]));
-  }
-
-  void _stepAudio(int delta) {
-    final tracks = widget.controller.embeddedAudioTracks;
-    if (tracks.length <= 1) return;
-    var i = tracks.indexWhere((t) => t.id == widget.activeAudioId);
-    if (i < 0) i = 0;
-    final next = nextTvRowIndex(current: i, delta: delta, total: tracks.length);
-    widget.onPickAudioTrack(tracks[next], next);
-  }
-
-  void _stepEffect(int delta) {
-    final all = PlayerAudioEffect.selectable;
-    if (all.length <= 1) return;
-    var i = all.indexOf(widget.controller.audioEffect);
-    if (i < 0) i = 0;
-    unawaited(widget.onPickAudioEffect(all[nextTvRowIndex(
-      current: i,
-      delta: delta,
-      total: all.length,
-    )]));
-  }
-
-  void _stepRate(int delta) {
-    var i = kPlaybackRates.indexOf(widget.controller.rate);
-    if (i < 0) i = kPlaybackRates.indexOf(1.0);
-    unawaited(widget.onPickRate(kPlaybackRates[nextTvRowIndex(
-      current: i,
-      delta: delta,
-      total: kPlaybackRates.length,
-    )]));
   }
 }

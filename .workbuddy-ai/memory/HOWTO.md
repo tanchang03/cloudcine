@@ -3852,6 +3852,20 @@ weak import 里有几项不存在是**正常**的（那是 mdk 支持的**另一
   修法：把断言限定进弹层 ——
   `find.descendant(of: find.byType(SnackBar), matching: find.textContaining('上传失败'))`。
   （2026-10-04，诊断页日志上传那两条用例就是这么红的。）
+- ⚠️ **「先确认断言是红的」不必动工作区**：`git stash` 在这个仓库有风险 ——
+  可能有**别的会话正在写同一棵树**（见 `2026-10-04.md` 那次两套实现撞车），
+  pop 时容易撞车。要证明新断言在旧代码上必然失败，用**只读**的办法：
+
+  ```sh
+  git show HEAD:lib/<file>.dart | grep -c '<新日志串或新标识符>'
+  ```
+
+  全是 `0` 就说明这些串在旧代码里根本不存在，断言必然红。
+  （2026-10-04 傍晚，中继诊断日志那 4 例就是这么验的：7 个串全 0。）
+  ⚠️ 只适用于**新增的字符串/标识符**；改语义、改返回值的修复还是得真跑一遍红。
+- ⚠️ 纯日志改动的用例可以直接断言单例：`diag.clearBuffer()` +
+  `diag.lines.join('\n')` + `contains(...)`（`DiagLog.instance` 在测试里没
+  `start()`，所以 `_supportPath` 为空、**不写盘**）。先例：`diagnostics_page_test.dart`。
 
 ## §封面与刮削（从 MEMORY.md 下沉的标识符）
 
@@ -3972,3 +3986,612 @@ MEMORY.md 只留红线与指针，下面是被下沉的原文细节。**没有�
 **路径**归一化只在 `core/utils/drive_paths.dart` 一处 ——
 `/电影` 与 `/电影/` 会变成两个键，于是**静默筛不到**；
 `dirPath` 带尾斜杠、内部不带。
+
+## 播放器报 `Failed to open http://127.0.0.1:PORT/sN`：中继侧的分水岭（2026-10-04 傍晚）
+
+**症状原话**（屏幕上的覆盖层，`player_page.dart` 的 `_ErrorOverlay`）：
+
+```
+播放失败
+播放器报错：Failed to open http://127.0.0.1:43617/s1.
+```
+
+**先认清这句是谁说的**：`Failed to open <url>.` 是 **mpv** 的原话
+（`prefix='stream'`、error 级，所以它**能**走到 `stream.error`）。失败的是
+**本地中继地址**，所以这不是「解码器不认编码」，而是**连中继都没打开**。
+`/s1` 就是 `LocalStreamRelay` 的 token（`s` = 字节流会话，`h` = HLS 会话）。
+
+⚠️ **TV 上拿不到 ffmpeg 的补充信息**：内置播放页的 `MediaKitPlaybackEngine`
+不开 `verboseLog`（`logLevel=error`），而 `http: HTTP error 4xx` 是 **warn** 级
+—— TV 上永远收不到。所以 TV 只剩孤零零一句 `Failed to open`，**必须**靠中继
+自己的日志还原。
+
+### 三种机制，靠这几条日志区分（2026-10-04 傍晚补的）
+
+| 日志里看到 | 结论 |
+|---|---|
+| **没有** `会话 sN 收到读取器 #M` | 播放器压根没连进来（端口不通 / 地址发错 / 服务已 dispose） |
+| 有 `收到读取器`，**有** `拒绝 … 会话不存在` | 会话被提前关掉 → 中继回 **404**（那条「假的直链过期」） |
+| 有 `收到读取器`，**没有** `首块已下发`，且末尾 `已下发 0 字节 ← 一个字节都没发出` | 中继答应了 200/206 却给不出正文 → ffmpeg 读不出容器 → `Failed to open`。**最常见**，往上翻找 `取块 N 失败：上游返回 <code>` |
+| 有 `收到读取器` + `首块已下发` | 数据流过了，问题不在中继（看内核/容器） |
+| 有 `拒绝 … Range 超出流长度` | 416：拿旧会话的长度读新流 |
+
+配套的新日志（都在 `local_stream_relay.dart`）：
+
+- `已接管 sN <片名>：… ｜入口 http://127.0.0.1:PORT/sN` —— **token 在这里**，
+  拿它把屏幕上的 `/s1` 对上具体哪一次接管。
+- `会话 sN 收到读取器 #M：GET /s1（Range: bytes=0-）` —— **分水岭本体**。
+- `会话 sN 读取器 #M → 200 bytes 0-9/10` / `首块已下发（N 字节）` /
+  `结束：已下发 N 字节`。
+- `拒绝 GET /s999：会话不存在（已关闭或从未建立）（当前活跃会话 N 条 + HLS M 条）`
+  —— 落 **warn**。正常换源时旧会话是**已被占住的存量连接**，不会再来新请求，
+  所以它几乎总是异常。
+- `HLS 会话 <片名> 上游返回 <code>：…` —— 落 **warn**（健康会话永远走不到；
+  最常见成因是缺 `Video-Auth`）。
+
+⛔ **「0 字节」必须留在 warn**：它和「正常换源掐断连接」原来共用一条 debug，
+而后者是高频正常事件 —— 落 debug 会让真故障在现场日志里彻底消失。
+
+⛔ **HLS 的分片请求不能逐条记**：一次播放几百条，会把 800 行的环形缓冲冲垮。
+只记每条会话的**首个**请求（`_HlsRelaySession.sawRequest`），总量靠
+`close()` 那条「上游请求 N 次，失败 M 次」。
+
+### 播放侧对应的那一条（`playback_controller.dart`）
+
+`内核打开：http://127.0.0.1/s1（本地中继）请求头=0 条 起播=0s`
+
+⛔ 这是**唯一**记录「内核实际打开了哪个地址」的地方。同方法开头那条「交给播放器」
+打的是 `ticket.redactedUrl` —— 那是**上游**地址，而走中继时内核拿到的是
+`http://127.0.0.1:PORT/sN` 且**不带任何请求头**。只有前者会让日志**说谎**：
+播放器报的是中继地址，日志里却只有上游地址，于是「中继到底参与了没有」无从确认。
+
+用 `redactUrl`（`core/utils/redact.dart`，只丢**查询串**）：中继的会话号在**路径**
+上（`/s1`）会被原样保留，直链签名在查询串里正好被抹掉。别为此新造助手。
+
+⚠️ `_PlaybackSource` 的「是不是中继」是**显式一位** `relayed`，不是「URL 里有没有
+`127.0.0.1`」—— 靠猜在将来加了别的本地代理之后就会说谎。
+
+## 夸克 TV 播放器的 OSD 实测几何（2026-10-04 晚，照它重做 TV 菜单）
+
+小米电视（1920×1080 @ density 320 → **逻辑 960×540**）上，`com.quark.yun.tv`
+（`eskit.sdk.core.ui.BrowserStandardActivity`）播放中：
+
+```sh
+adb shell input keyevent 23            # OK 唤出 OSD
+adb shell uiautomator dump /sdcard/q.xml && adb pull /sdcard/q.xml
+```
+
+⛔ **拿不到截图**：整块播放界面在 screencap 里是**全黑**（`SurfaceRenderView`
+/ FLAG_SECURE 一类），但 `uiautomator dump` **照常有完整视图树与 bounds** ——
+所以只能靠 dump 还原几何。`service call SurfaceFlinger 1008` 在本机电视上
+`Operation not permitted`，别在这上面花时间。
+
+**层级（逻辑坐标）**：顶栏 `(0,0) 960×90`（标题 `(28,22) 236×68`、右上时间
+`(876,23) 45×20`）；中央有一块 `(430,220) 100×100` 的**反馈 HUD**；
+字幕区固定在 `(0,215) 960×100`（`foreground_textView` + `background_textView`
+两层描边字，**字幕是它自己画的，不是播放器画的**）。
+
+**两种底部形态**（互斥，**不共存**）：
+- **进度形态**：一行 `(0,411) 960×39` —— 播放键 `(29,411) 39×39`、当前时间
+  `(94,419) 80×19.5`、进度条 `(157.5,422.5) 700×12.5`（**它自己是焦点**）、
+  总时长 `(841,419) 80×19.5`。
+- **菜单形态**：`(0,215) 960×325` 的纵向行列表；**选中的那一行下面铺开一条
+  横向 RecyclerView**（实测 chip `176×73`，文字如「超清/高清/流畅」，当前那
+  颗带勾、并高亮）。
+
+**导航模型（这就是「XY 轴」）**：`↓` 在**行之间**走（实测：进度行 → 播放列表
+卡片行 → 画质行 → …），`←/→` 在**当前那一行的 chip 条里**走。行高 50、
+chip 高 ~73。⛔ `↑` 从第一行往上**什么也不做**（不是关闭）。
+
+→ 本项目照它重做的实现在 `lib/ui/widgets/player_tv_panel.dart` 的
+`PlayerTvSheet`：贴底横排、选中行下面铺 chip、`↑↓` 换行（**循环**，与夸克
+不同）、`←→` 挪光标（**不循环、跳过灰掉的**）、`OK` 才生效（挪光标不生效 ——
+否则连按 → 会连取五次流）。`←→` 只在**没有 chip 条**的行上回调 `onAdjust`。
+
+## TV 菜单的高度预算：`Container` 会把 `decoration` 的描边算成内边距
+
+`kPlayerTvSheetHeight` = 七行 × 40 + 选项条 50 + 上下内边距 16 **+ 0.8**。
+最后那 0.8 是 `TvSheetCard` 顶部那条 `BorderSide(width: 0.8)` ——
+`Container` 把 `decoration.padding` 加进内容的内边距，于是内容实得高度比
+`height` 少 0.8px。少了它就是 `RenderFlex overflowed by 0.8 pixels`。
+
+⚠️ 这个数**不可能靠肉眼看出来**，是被单测抓出来的（
+`test/ui/widgets/player_tv_panel_test.dart` 的「七行 + 选项条刚好装得下」）。
+同理：行高只能收，不能再加 —— 菜单越高，留给画面的那一条越窄，而
+「换字幕时看得见字幕」是那两项设置**唯一**的反馈（字幕因此在菜单打开时被
+抬高，见 `_PlayerPageState._subtitleBottomPadding`）。
+
+## ⚠️ `flutter_test` 里 `defaultTargetPlatform` **默认就是 android**
+
+实测（`debugPrint` 探针）：`defaultTargetPlatform = TargetPlatform.android`、
+`debugDefaultTargetPlatformOverride = null`、默认视口 `2400×1800 @ dpr 3`。
+推论：`AppTheme.isTvLayout` 的两条判据里，**平台那条在单测里天然成立**，
+只要把视口宽度设到 ≥960 就进了 TV 分支（`safeAreaInsets` 会真的返回
+48/27）。写 TV 布局断言时按这个来，别去 override 平台。
+
+⚠️ 另一个坑：**别用 `SizedBox(height: 540, child: <面板>)` 当测试夹具** ——
+那给的是**紧**约束，卡片会被拉满 540，于是「面板有多高」这类断言全都在测那个
+`SizedBox`。真机上贴底面板的约束是**松**的（`Positioned(left:0,right:0,bottom:0)`），
+夹具必须同形（整屏 `Stack` + `Positioned`）。
+
+## 用 adb 驱动电视前，先确认前台是不是本应用
+
+`adb shell input keyevent` 是**打到当前前台窗口**的，与你想操作哪个 App 无关。
+
+10-04 实测：驱动脚本按「left/up/ok」想回媒体库，那时用户已经把电视切到了
+**夸克网盘**，于是这几下全打进了夸克 —— 导航乱了，最后那个 `ok` 还在夸克里
+**真的起播了一集**（`194.mp4`）。而夸克的播放面**截不出来**（全黑，见上），
+所以从截图上看只像是「我们的播放器黑屏了」，极具误导性。
+
+配方：
+
+```sh
+adb -s $SERIAL shell "dumpsys window | grep -E 'mCurrentFocus'"
+```
+
+拿到 `mCurrentFocus` 里的包名再决定要不要发键。**要么先 `am start` 把本应用
+拉回前台，要么先问用户**。
+
+⚠️ 同理：**用户可能正在用实体遥控器操作电视**（他就是「看效果」）。判据是
+**空闲对比截图** —— 不发任何键，间隔几秒截两张，哈希不同就说明画面在被人推着走。
+这时任何自动驱动的结果都不可信，别拿它当验收证据。
+
+## 4K 掉帧的根因：mpv 的**拷贝路径**（10-04 实测定论）
+
+用户报「4K 掉帧、1080P 顺、夸克播放同一片源没问题」。真机日志（`[解码]` 行）
+把范围锁死了：
+
+```
+第 6s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=14
+第 27s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=58
+```
+
+- `解码丢帧` = mpv `decoder-frame-drop-count` → **0**，解码永远跟得上；
+- `显示丢帧` = mpv `frame-drop-count` → 21 秒涨 44 帧 ≈ **2.1 fps ≈ 每秒丢 9%**；
+- 同段 `[中继]` **一条 WARN 都没有**（对比 16:33 那次满屏 `HTTP connection timed out`）。
+
+→ **不是解码、不是网络，是「拷贝 + 上屏」这一段。**
+
+为什么是拷贝：media_kit 在 Android 走的是**纹理路径** ——
+`media_kit_video` 的 `VideoOutput.java` 用 `TextureRegistry.SurfaceProducer`
+拿 Surface 交给 native，mpv 用 `mpv_render_context`（render API）画进 GL 纹理。
+render API 只吃得了「拷贝型」硬解，所以 `hwdec=auto-safe` 在 Android 上解析成
+**`mediacodec-copy`**：MediaCodec 解到 CPU ByteBuffer → memcpy 进 mpv 帧
+→ 上传成 GL 纹理。4K 一帧 YUV 约 12 MB，24fps 就是 ~290 MB/s 的 memcpy
+**再加** ~290 MB/s 的上传，电视 SoC 撑不住 41ms 的帧预算。1080P 只有 1/4 像素。
+
+⛔ **`hwdec=mediacodec`（直通）在 media_kit 上不可能生效** —— 直通要求
+MediaCodec 输出到 Surface，而 render API 的 GL 后端映射不了
+`AV_PIX_FMT_MEDIACODEC`。别再往这个方向试（黑屏或静默回落软解）。
+
+### 出路：fvp / libmdk 的 SurfaceView 零拷贝（库已在产物里）
+
+`fvp` 的 Android 实现是 `SurfaceView`（`FvpVideoView.java`），
+且 `fvp.dart` 的选项文档写明：
+
+> `tunnel`/`platformView`：MediaCodec 输出**直接到 surface**，
+> **不过 OpenGL：没有 GL renderer、没有 EGLConfig、没有 GPU 拷贝**，
+> 视频按原生分辨率扫描输出 —— 这正是让 4K 在「UI 层跑 1080p 的电视」上
+> 全分辨率上屏的办法。
+
+与夸克（ExoPlayer + SurfaceView）是同一个机制。**而且不用加依赖**：
+`unzip -l` 确认产物里 `libmdk.so`(2.3MB) / `libffmpeg.so` / `libfvp.so`
+在 arm64-v8a / armeabi-v7a / x86 / x86_64 **四个 ABI 都有**。
+
+缺的只是接线，三处：
+
+1. `main.dart` 的 `fvp.registerWith(options: {'platforms': ['macos']})`
+   → 加上 `'android'`（现在 Android 上 fvp 平台实现**没注册**）；
+2. `app_providers.dart:216` / `player_window_app.dart:904` 的
+   `dolbyVisionEngine: dvEnabled ? … : null` —— Android 上是 `null`；
+3. `playback_engine_router.dart` 的判据现在**只认 DV P5**，
+   要加一条「TV 上的 4K 原画也走第二内核」。
+
+⚠️ 代价（fvp 自己声明）：无 HDR 色调映射、无截图回读、可用解码器更少；
+我们的 `playback_surface.dart` 已有 fvp 分支（`VideoPlayer`），
+且它注明「fvp 的字幕由 mdk 自己（libass）烧进画面」——换内核要一并核对字幕路径。
+
+### 附带：诊断盲点
+
+日志里**没有帧率 / 位深 / 像素格式**。10bit（P010）会让每帧拷贝量翻倍
+（12 MB → 24 MB），是「同是 4K 有的卡有的不卡」的关键变量。
+`_readVideoPipeline` 里加一条 `video-params` 的一次性读数即可。
+
+### ✅ 实际采用的修法：`hwdec=mediacodec,auto-safe`（**不是**换 fvp）
+
+上面那套「换内核」是**后备方案**。查 mpv 手册后发现了更小、更对路的改法，
+**一行常量**就够了：
+
+```
+static const String tvHwdec = 'mediacodec,auto-safe';   // 原为 'auto-safe'
+```
+
+三条手册事实支撑它：
+
+1. **`auto-safe` 只用白名单**，而白名单里只有 d3d11va / videotoolbox / vaapi /
+   nvdec / drm / vulkan 那几族 —— **`mediacodec` 与 `mediacodec-copy` 都不在**。
+   这就是 Android 上落到 `-copy` 的**直接原因**（根因闭合）。
+2. **`--hwdec` 是逗号列表，且能混特殊值**：手册里 `vaapi,auto` 的语义是
+   「先试 vaapi，失败再走 auto 逻辑」。所以 `mediacodec,auto-safe`
+   = 先试零拷贝直通，配不上就退回今天这条拷贝路 —— **最坏情况等于没改**。
+   ⛔ 别写成光秃秃的 `mediacodec`：那样失败只剩软解，4K 直接不能看。
+3. **`mediacodec` 要求 `--vo=gpu` + `--gpu-context=android`** —— media_kit 在
+   Android 上**恰好就是这两个值**（`android_video_controller/real.dart` 里
+   `vo: configuration.vo ?? 'gpu'`，并写死 `gpu-context: android`，配 `wid`
+   指向真实 Surface）。**不需要改 vo，也不需要换内核。**
+
+⚠️ 代价（手册明说）：`mediacodec` 是不安全档，**强制 RGB 转换**、
+非标准色彩空间表现不明、**10bit 降到 8bit**。这台电视是 1080p SDR 面板，
+两条都不构成损失；上 HDR 屏时要回来重看。
+
+#### ⛔ 上一轮的一条误判（别再犯）
+
+我一度判定「Android 走的是 mpv render API → 只吃拷贝型硬解 → 直通不可能」。
+**错的**。Android 走的是**真窗口 vo**（`vo=gpu` + `wid`），`main.dart` 里
+早就写着这条论断。判据：`media_kit_video` 的
+`lib/src/video_controller/android_video_controller/real.dart` ——
+里面有 `wid`、`android-surface-size`、`gpu-context: android`，
+以及专为 `vo=mediacodec_embed` 写的 `vid` 重初始化分支。
+（`VideoOutput.java` 用 `TextureRegistry.SurfaceProducer` 拿 Surface 是**另一件事**：
+那是把 Surface 交给 native 当 `wid`，不等于走 render API。）
+
+#### 落点：两处必须同值
+
+`hwdec` 会被设**两次** —— `VideoControllerConfiguration.hwdec`（构造时）
+与 `PlayerBufferConfig.apply`（构造之后跑）。只改一处，另一处会在几百毫秒后
+把它覆盖掉，表现是「改了没生效」。所以两处都取
+`PlayerBufferConfig.hwdecFor(tv: tv)`，且**同值**。
+
+#### 验收判据
+
+真机日志（诊断页）里看 `[解码]` 那一行：
+
+- `解码器=mediacodec` 且 `显示丢帧` 不再涨 → **直通生效，修好了**；
+- 仍是 `mediacodec-copy` → 直通没配上、自动退回了拷贝路（功能不坏、掉帧照旧），
+  这时才轮到上面那套 fvp 方案。
+
+#### ⛔ 实测回执（10-04 19:03，`190434.txt`）：直通**没生效**
+
+新版本**确实装上了**，参数也**确实下发了** —— 但 mpv 把 `mediacodec` 拒了：
+
+```
+18:57:43 [缓冲] … hwdec=mediacodec,auto-safe …          ← 我们的改动（新版本）
+18:57:53 [片源] 3840x2160 标称帧率=25.000000 像素格式=? 硬解格式=? 原色=?
+18:57:53 [解码] 第 6s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=0
+18:58:13 [解码] 第27s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=4
+19:02:31 [解码] 第27s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=0    ← 原画 4K
+19:03:18 [解码] 第27s：解码器=mediacodec-copy 解码丢帧=0 显示丢帧=128  ← 4K 转码档
+```
+
+**不是没下发。** `media_kit_video` 的
+`lib/src/video_controller/android_video_controller/real.dart:195` 明写
+`'hwdec': configuration.hwdec!`（构造时就设到 mpv），`apply()` 又设一次，
+两处同值。**所以是 mpv 试了 `mediacodec` 没配上，按逗号列表语义退回
+`auto-safe` → `mediacodec-copy`。** 当初写的「最坏情况等于没改」正是这个结局。
+
+⛔ **别再靠猜**：这台电视上 mpv 只开 `error` 级日志（`MediaKitPlaybackEngine`
+的 `verboseLog` 在**内置页**是 false），`mediacodec` 初始化失败的原因在 verbose
+级，**一条都没记**。要往下走只有两条路：把 TV 的 mpv 日志抬到 `warn`/`v` 抓一次
+失败原因，或直接上上面那套 fvp。
+
+⚠️ **两个还没排除的变量**，下次采样必须分开：
+
+1. **`[片源]` 报 25.000000 fps**。25fps 在 60Hz 面板上本身就是 3:2 不均
+   （judder），而 `frame-drop-count` 抓不到 judder —— 「看着卡」未必等于
+   「真的丢帧」。别把两者混成一个问题。
+2. **两次采样（6s / 27s）都贴着「起播 + 片头跳过 seek」**。旧版本的 58 帧、
+   新版本 4K 转码档的 128 帧，都可能主要是 seek 的一次性代价（128 帧 @25fps
+   ≈ 5s ≈ 一个 HLS 分片），不是持续掉帧。**采样点要加一个远离 seek 的（如 60s）。**
+
+---
+
+## ✅✅ 真根因（10-04 20:xx，源码级定位）：**顺序竞态**，不是 mpv 拒绝 mediacodec
+
+上面那条「mpv 试了 `mediacodec` 没配上，按逗号列表退回 `auto-safe`」的结论
+**是错的**。参数送到了、mpv 也没拒绝 —— 是**我们在解码器定型之前就 `loadfile`**，
+那时 VO 交不出 Android surface，`mediacodec` 配不上只能静默退回拷贝档。
+
+### 机制（三条源码事实，缺一不可）
+
+1. `media_kit_video/src/video_controller/video_controller.dart`：构造 `VideoController`
+   时把 `AndroidVideoController.create()` 塞进
+   `WidgetsBinding.instance.addPostFrameCallback` —— 它跑在**首帧之后**。
+2. `android_video_controller/real.dart:191-205`：`create()` 一上来在**同一批**
+   `setProperty` 里写 `'vo': 'null'` **和** `'hwdec'`（注释：*必须先 vo=null 才不
+   会 SIGSEGV，`--wid` 必须在 `vo=gpu` 之前赋*）。
+3. `android_video_controller/real.dart:59-65` `widListener()`：Surface 到位后才重建
+   vo（`vo=null` → `android-surface-size` → `wid` → `vo=voValue`），
+   **从不重设 `hwdec`**。
+
+我们原来在构造函数之后**立刻** `open()`，`loadfile` 几乎总抢在 `create()` 前面
+→ 解码器在「`vo=null`、没有 surface」的状态下定型 → 逗号列表静默退到
+`mediacodec-copy` → **这个选择跟着整条流，之后 Surface 到位也不会重解析**。
+
+### 两条互相独立的真机证据
+
+- `hwdec-current` 恒为 `mediacodec-copy`（`[解码]` / `[硬解]` 行）—— 这个读数
+  才是分水岭：`mediacodec`=零拷贝，`mediacodec-copy`=拷贝档。
+- `widListener()` 结尾那句 `await player.seek(Duration.zero)` 把起播位置冲成 0
+  —— 日志里 `起播位置没生效（现在 0s，应为 434s）→ 补发 seek` 就是它干的。
+  这条**与 hwdec 无关**，却证明 Surface 确实**晚于** `loadfile` 才挂上。
+
+### 修法：`open()` 里三步，**顺序就是修复**
+
+```dart
+await _awaitVideoSurface();   // 等 videoController.rect != null（+120ms settle）
+await _reapplyHwdec();        // 读回 hwdec 再写一遍，让它成为 mpv 最后一次写
+await _player.open(...);      // 这时 loadfile 建解码器，零拷贝才配得上
+unawaited(_verifyZeroCopyHwdec());  // 兜底 + 取证
+```
+
+- **判据为什么能用 `rect`**：Java 侧每次表面变化发 `VideoOutput.Resize`，Dart 侧
+  在**同一个回调里**同时写 `rect`/`id`/`wid`（`real.dart:267-269`）。`wid` 私有，
+  而 `rect` 通过 `VideoController.rect` **公开** —— 所以「`rect != null`」就是
+  「Surface 已挂上」的公开判据，不必 `import package:media_kit_video/src/...`。
+- 只在 Android 等（`defaultTargetPlatform`），等不到就照旧 `open()`（最坏=改之前）。
+- 兜底 `_verifyZeroCopyHwdec()`：起播后读 `hwdec-current`，若仍在拷贝档**且**
+  还在 `hwdecKickWindow`（20s）内，则写 `auto-safe` → 400ms → 写回目标值
+  （mpv 只在 `hwdec` **变化**时重建解码器，写同值是空操作，所以必须「改一次再
+  改回来」）。过渡值**不能是 `no`**（那会把 4K 拽到软解）。
+  判据抽在纯函数 `MediaKitPlaybackEngine.shouldKickHwdec()` 里，有单测。
+- ⛔ 空串（`hwdec-current` 还没起来）**不算拷贝档** —— 误判会在起播瞬间触发
+  一次没必要的重建。
+
+### 量化：掉帧率随**分辨率**缩放，解码丢帧恒为 0（`193049.txt`）
+
+| 采样 | 区间 | 显示丢帧增量 | 速率 |
+|---|---|---|---|
+| 4K 原画 | 6s→21s | 0→141 | **37.6%** |
+| 4K 原画 | 21s→42s | 0→179 | **34.1%** |
+| 4K 原画 | 42s→63s | 2→111 | **20.8%** |
+| 4K 原画 | 63s→84s | 111→341 | **43.8%** |
+| 810p 转码 | 21s→42s | 0→7 | **1.3%** |
+
+每一拍 `解码丢帧=0`、`VO延迟帧=0`；源 3840×2160@25.000fps，面板 1920×1080@60Hz
+且**只支持这一个模式**（`supportedModes` 只有 `{1920x1080, 60.000004}`）→
+OS 刷新率切换这条路不存在。`面板帧率=?` ⇒ mpv **没有 `display-fps`**（media_kit
+的默认属性表里没有这一项）⇒ 它按帧率无关的方式上屏。
+
+**其他已排除**：中继（`local_stream_relay.dart` 数据路是 `response.addStream`，
+主 isolate 但非瓶颈，零 WARN）；SurfaceFlinger（`--latency` 显示 ~19.95ms 均匀
+节奏、只有 1.6% 漏 vsync ⇒ 不是经典丢 present）；SoC 已近饱和
+（app ~254% + `media.codec` ~98% + SF 14.5% ≈ 367% / 400% 预算，
+`MemTotal 2.6GB`、`SwapTotal 0`、`kswapd0` 在跑）。
+
+### 验收判据（下一轮真机）
+
+`[硬解]` 行必须出现 `零拷贝直通已生效：hwdec-current=mediacodec`（不是 `-copy`），
+且 `[解码]` 的 `显示丢帧` 不再随分辨率缩放。若**重建后仍是 `-copy`**，说明
+mpv 的 `mediacodec` 在 media_kit 的 Surface 上确实绑不上 —— 那时才轮到
+fvp / libmdk 那条路（见上）。
+
+⚠️ 另外：原画 4K 这两次是 0~4 帧（旧版本同片源 14→58），但**解码器没变**，
+所以不能算「改好了」—— 更可能是旧那两次撞上了冷启动 + 换集 + 双 seek。
+**跨会话比 `显示丢帧` 之前，先确认两次的起播条件一致。**
+
+## 夸克 TV APK 逆向：播放器内核与硬解证据（10-04 晚）
+
+对标报告：`docs/AndroidTV-4K-丢帧-夸克对标.md`。
+样本 `kuakewangpan/kkwptvb_2.9.1702_dangbei.apk`；解包在 `_x/`，反编译在 `jadx_out/sources/`
+（`jadx-1.5.1` 在 `/Users/tandy/work/javatools/jadx-1.5.1/bin/jadx`，要带 `JAVA_HOME` 指 JDK 17）。
+
+### 内核构成（三条并存）
+- **主内核 `com.UCMobile.Apollo.*`** —— UC 的 **ExoPlayer 分支**（`ApolloSDK`/`MediaPlayer`/
+  `MediaCodec`/`MediaFormat`/`DecoderInfo`/`VideoView`），**不是**原生 ExoPlayer 包名。
+- **第二内核 `eskit.sdk.support.player.ijk.*`** —— 当贝 ESKit 的 ijkplayer 分支。
+- ⚠️ APK 的 `lib/` 里**没有任何 ffmpeg/ijk/player 的 `.so`**（只有 `libc++_shared`、
+  `libmarsxlog`、`librsjni`、`libxcrash_eskit`、`liblamemp3`）。解码器是 **VirtualAPK
+  插件化运行时下载**（`com/didi/virtualapk/...` + `downloadPlugin` + `READER_PLUGIN_SO_*`；
+  dex 里有 `libextplayer.so`/`libvplayer.so`/`libu3player.so`/`libapolloffmpeg.so` 等名字）。
+  → 它用的硬件解码通路是**系统 MediaCodec**，不需要自带 `.so`。
+
+### 硬解怎么开的（核心证据）
+`eskit/.../player/ijk/player/IjkVideoView.java:959-972` `setFastCommonOptions()`：
+`mediacodec=1` + **`mediacodec-all-videos=1`** + `mediacodec_mpeg4=1` + `framedrop=1`
++ `skip_loop_filter=48` + `probesize=10240` + `fflags=fastseek` + `max-buffer-size=1048576`。
+→ ijkplayer 的**零拷贝**组合：MediaCodec 直出 Surface。
+
+### 画面落在哪里（最关键）
+`com/UCMobile/Apollo/VideoView.java:23` → `public class VideoView extends SurfaceView`；
+`MediaCodec.java` 的 native 签名 `native_configure(..., Surface, ...)` /
+`native_setOutputSurface(Surface)` / `native_releaseOutputBuffer(int, boolean)`。
+→ **解码器持有 Surface，输出缓冲直接释放，全程不过 CPU 内存。**
+
+### 它对硬/软解有显式模型
+`eskit/.../manager/decode/a.java`：`IJK(0,"硬解IJK")` `EXO(1,"软解EXO")` `HARDWARE(2,"硬解")`
+`IJK_SOFT(3,"软解IJK")`；`manager/definition/a.java`：标清/高清/超清720/原画/蓝光/4K。
+`ijk/player/third/c.java:329` 在 `onPrepared` 里上报
+`getOption("ro.instance.decode_video_use_mediacodec")`（`1:硬解 0:软解 -1:未知`）
+→ **夸克把"这次到底硬解了没有"当一等可观测属性**，不是碰运气。
+
+### 对照我们自己
+| 维度 | 夸克 | 云影（改之前） |
+|---|---|---|
+| 输出 | 零拷贝直出 SurfaceView | `mediacodec-copy` 拷回 CPU |
+| 显示层 | SurfaceView 独立硬件层 | **Flutter 外部纹理**（`TextureRegistry.createSurfaceProducer`）→ 多一次全屏合成 |
+| 默认档位 | 显式 `mediacodec=1` | `media_kit` 出厂 `getDefaultHwdec()` 返回 **`auto-safe`** → 必然拷贝档 |
+
+⚠️ `auto-safe` 为什么必然是拷贝档：mpv 的 `mediacodec` 是**不安全**档（强制 RGB、10→8bit），
+`mediacodec-copy` 才是安全档；`auto-safe` 只从安全列表挑 → Android 上落到 `-copy`。
+
+### fvp（libmdk）那条路的凭据
+- `fvp-0.39.0/android/.../FvpVideoView.java`：`implements PlatformView` + `new SurfaceView(context)`
+  + `holder.setFixedSize(视频宽高)` + `nativeSetSurface(..., tunnel)`。类注释明写
+  *"Unlike the Texture path ..., a SurfaceView gets its own display layer ... also the only
+  surface type that can display tunneled (sideband) playback"*。
+- `video_player_mdk.dart:210`：`'android': ['AMediaCodec', 'FFmpeg', 'dav1d']`（AMediaCodec 第一）。
+- `libfvp.so` 里的解码器名：`AMediaCodec:dv=1:image=0:surface=` —— `surface=` 即直出。
+- Dart 侧开关：`registerWith` 的 `tunnel` / `maxWidth` / `maxHeight`；
+  `VideoPlayerPlatform.createWithOptions` 传 `VideoViewType.platformView`
+  （`MdkVideoPlayerPlatform` **只在 `Platform.isAndroid` 时尊重它**）。
+- ✅ **已过时（20:5x 起）**：`main.dart` 的 `fvp.registerWith` 现在是
+  `platforms: ['macos','android']` **且 Android 带 `tunnel:true`**；4K（≥1440p）
+  已经在走 fvp（`needsAlternateForResolution`，与 DV 共用同一内核）。
+  ⛔ **只设 `platformView` 不开 `tunnel` 会更卡 + 音画不同步** ——
+  根因与证据见本文档末尾「⛔ 4K 走 fvp 后**更卡**」那一节，**先读那节再动这里的代码**。
+- ⚠️ 本机面板是 **1920×1080@60Hz 单模式**（不是"1080p UI + 4K 屏"），所以 fvp 注释里
+  那条"UI 层低于面板分辨率"的论证**不适用**；但对它的**价值点仍然成立**：去掉 Flutter 那一层合成，
+  并且可以用 `maxWidth/maxHeight` 把渲染目标钳到 1080p（现在 mpv 是按视频原始 4K 渲染，纯浪费）。
+
+---
+
+## ⛔⛔ 4K 切 fvp 的两轮实测：**全败，已回退**（2026-10-04 20:5x–21:4x）
+
+> 本节**推翻**上一节末尾「4K 走 fvp/libmdk + `VideoViewType.platformView` 是远期路线」
+> 那条判断，也**推翻**本节自己更早的版本（那版写的是「补上 `tunnel` 就好了」——
+> 补上之后是「看不到画面」）。**别再按那条路线改代码。**
+
+### 时间线（两轮，各一次真机验收）
+
+| 轮次 | 改了什么 | 用户反馈 | 日志 |
+|---|---|---|---|
+| A | `platforms` 加 `android`；路由加第二条触发线（≥1440p）；引擎用 `viewType: platformView` | *「比之前版本卡的更厉害了，音画都不同步了」* | `…205646.txt` |
+| B | 在 A 之上加 `tunnel: true`（零拷贝） | *「**4k 看不到画面了，只有声音**」* | `…213519.txt` |
+
+### 为什么回退：三条证据（**都在日志/设备上核过**）
+
+**1. 解码在跑，屏上没东西。**
+
+`…213519.txt` 的 `21:34:42` 那次（pid 20499）：中继读取器一路推进
+（`bytes=0-` → `bytes=24135308-` → `bytes=62205509-`），
+`[资源] 第 10s：进程CPU=225.2%（单核口径；折合 4 核 56.3%）`、
+`第 20s：326.0%（折合 81.5%）` —— **mdk 确实在解码**，但用户看不到任何画面。
+（对比 A 轮：中继卡在 2 MiB、53 秒不动 —— 两轮的表现其实不同，但都没画面。）
+
+**2. 进程被原生崩溃打挂。**
+
+`adb logcat -b crash`（**注意：业务日志在 `-b main`，崩溃在 `-b crash`，且
+`chatty` 会按 uid 丢弃行**，所以 `FvpPlugin` 的日志时有时无 —— **「没看到某行」
+不能当证据**）：
+
+```
+21:33:04.857 F/libc (19579): Fatal signal 11 (SIGSEGV), fault addr 0x2 in tid 20081 (Thread-7)
+  #00 libc strlen   #01 __vfprintf   #02 vsnprintf   #03..#06 libmdk.so
+```
+
+崩在 **libmdk 自己的日志格式化**里（`%s` 拿到坏指针），不是解码逻辑。
+另外四个进程都崩在同一个地方：
+
+```
+FinalizerDaemon: pthread_mutex_lock → ConsumerBase::onLastStrongRef
+  → SurfaceTexture_release → io.flutter.embedding.engine.renderer.SurfaceTextureWrapper.release
+```
+
+这是 Flutter 引擎在 `SurfaceProducer` 被释放后**二次释放** ——
+**换内核就会触发，与 `viewType` 无关**。所以「换成 textureView 再试」也躲不掉它。
+
+**3. mpv 的零拷贝在 media_kit 里是做不到的（结构性）。**
+
+`media_kit_video-1.3.1/android/src/main/java/com/alexmercerind/media_kit_video/VideoOutput.java`：
+
+```java
+surfaceProducer = textureRegistryReference.createSurfaceProducer();   // 写死
+```
+
+它**只有** Flutter 纹理这一条路，没有 `platformView` / `SurfaceView` 选项。
+所以 mpv 只能 `mediacodec-copy`（解到 CPU 再拷回）—— 调 mpv 参数没用，
+这就是 4K 卡顿的根。
+
+### 📌 面板事实（以后判断「要不要 4K」用得上）
+
+```
+ro.boot.mi.panel_resolution = 3840x2160     # 65 寸 4K 面板（CSOT）
+dumpsys display → real 1920 x 1080          # 但 Android 显示层只有 1080p
+                  唯一 mode = 1920x1080@60
+```
+
+⇒ 应用内渲染（Flutter 纹理 / 合成）**最高只有 1080p**，由电视自己倍线到 4K；
+**只有 SurfaceView（独立显示层 + `setFixedSize`）才可能真 4K 扫描输出**。
+这既是当初想走 fvp 的理由，也是这条路唯一还值得再看一眼的地方。
+
+### ⚠️ 下次要查的**第一个假设**（**未证实，别当成结论**）
+
+fvp 的 tunnel 分支**显式跳过** `maxWidth/maxHeight` 钳制
+（`lib/src/video_player_mdk.dart` 注释原文 *"'tunnel' has no GL renderer, so the
+decoder's own geometry stands."*）→ `FvpVideoView` 的
+`holder.setFixedSize(videoWidth, videoHeight)` 拿到的是**视频原生** 3840×2160，
+而 Android 显示层只有 1920×1080。若 SurfaceFlinger 拒绝合成一个比显示层还大的
+SurfaceView 层，表现就正好是「有声音没画面」。
+
+**下次先试**：`platformView` + **不开** tunnel + `'maxWidth': 1920, 'maxHeight': 1080`
+（不开 tunnel 时那条钳制分支才生效）。**并且**要一并解决「换内核 → `SurfaceProducer`
+二次释放崩进程」那条，否则试出来也带崩。
+
+### 回退落点（**代码现状**）
+
+- `lib/main.dart`：注册范围收回 `if (Platform.isMacOS)` + `'platforms': ['macos']`，
+  **删掉** `tunnel`。
+- `lib/data/playback/fvp_playback_engine.dart`：**删掉** `viewType:` 参数（回默认
+  `textureView` —— 那是 fvp 自己 example 用的那条路，也是 macOS DV 验过的）。
+- `lib/domain/services/playback_engine_router.dart`：**删掉**第二条触发线
+  （`needsAlternateForResolution` / `highResolutionThreshold` /
+  `useAlternateForHighResolution` / `selectFor` 的 `videoHeight` 参数），
+  判据收回到只剩杜比视界一条。
+- `lib/domain/services/playback_controller.dart`：删掉 `highResolutionEngine` 参数
+  与 `_heightForEngineSelection`。
+- `lib/ui/providers/app_providers.dart`：`alternateAvailable` 收回 `Platform.isMacOS`。
+- `test/domain/services/playback_engine_test.dart`：删掉那组「高分辨率换内核的判据」
+  用例，原处留一条注释说明**不要加回来**。
+
+4K 现在的取舍只有两条：用夸克的 **`super`(810p) 转码档**（同机实测只丢 0~7 帧、
+流畅、降画质），或接受原画卡顿。
+
+---
+
+## 资源采样：CPU / 内存 / 磁盘（2026-10-04，`core/diagnostics/resource_probe.dart`）
+
+用户要求「增加诊断日志，定时输出 cpu 内存 磁盘等资源参数」。设计要点（**红线**）：
+
+- **周期 10 秒**，**故意不与**视频探针的 21 秒相等：用户报的正是「每 21 秒掉一批帧」，
+  两个周期相等会**拍频锁定** —— 永远在同一相位采样，要么次次采到「正在卡」、
+  要么次次采到「刚好不卡」，真实规律被整个掩盖（10 与 21 互质，相位会一轮轮扫过去）。
+- **读数读不到就整段从日志行消失**，绝不退化成 `0`。字段全部可空，可空 = 这台设备读不到。
+  「未知」写成「空闲」比不写还糟（同 `hwdec-current` 空串那个坑）。
+- **进程 CPU 是单核口径**（4 核盒子要 400% 才叫满载），日志必须写明「折合 N 核」，
+  否则 48% 会被系统性误读成「很闲」。
+- **系统 CPU 的「忙」不含 iowait**：iowait 是「在等磁盘」，算进去会让磁盘慢伪装成 CPU 忙。
+  只认 `/proc/stat` 的**汇总行** `cpu `（带空格），**别用 `cpu0`**。
+- **`/proc/self/stat` 必须按最后一个 `)` 切字段**：comm（进程名）允许含空格与括号，
+  按空白 split 会让 utime/stime/num_threads 整体错位，**且不报错** —— 只会把 CPU 时间
+  报成隔壁字段的数字。字段位：`f[11]`=utime、`f[12]`=stime、`f[17]`=num_threads
+  （`f[i]` 对应 stat 的第 `i+3` 个字段）。
+- **`df` 用正则从左锚定**（`^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%`，第 3 组是「可用」），
+  不按列 split —— 挂载点里可以有空格，split 会让下标漂移且不报错。
+  表头行天然不匹配（`1024-blocks` 在 `(\d+)` 后面跟的是 `-` 不是空白）。
+- **用异步 `Process.run` 而非 `runSync`**：这是播放路径上的定时任务，
+  同步版会在主 isolate 上阻塞十几毫秒 —— 诊断工具最不能干的就是自己制造卡顿。
+- 两个引擎**各持一个** `ResourceProbe`（`open()` 起、`stop()`/`dispose()` 停）。
+  ⚠️ **fvp 那条路没有视频探针**，所以这是它**唯一**的周期性证据。
+- macOS 没有 `/proc`：内存退回 `dart:io` 的 `ProcessInfo.currentRss`，CPU / 负载 / 磁盘 IO
+  留空。**这是正常的，不是 bug**（别去"修"它）。
+
+### 这台电视上「哪些读数根本拿不到」（实测，别白试）
+
+| 来源 | 结果 |
+|---|---|
+| `/proc/loadavg` | ⛔ **`Permission denied`**（连 `ls -l` 都拒）—— 连 shell uid 2000 都读不到 |
+| `/proc/pressure/*`（PSI） | ⛔ **不存在**（Android 9 没有） |
+| `/proc/stat` | ✅ 可读 → 所以 `系统CPU` 与 **`procs_running` / `procs_blocked`** 都从它来 |
+| `/proc/self/{stat,status,io}`、`/proc/meminfo` | ✅ 可读 |
+| `df -k /data` | ✅（`12600152` 可用，与正则吻合） |
+
+**`procs_running` / `procs_blocked` 是 `loadavg` 的替代读数**，而且比它更该看：
+它是**瞬时**值（loadavg 是分钟平均，会把「刚刚那一下卡」抹平），且把
+`media.codec` 那种**别的进程**的负载也算进去 —— 而本进程 CPU 恰恰看不见它。
+解析函数 `parseProcStatProcs` 与系统 CPU **共用同一次 `/proc/stat` 读取**，不额外读盘。
+
+⛔ **日志里必须把核数一起写**（`可运行进程=14（4 核，超订 3.50×）`）：
+14 在 4 核上是 3.5 倍超订，在 16 核上等于空闲 —— 同一个数字两种结论。
+⛔ `阻塞IO进程` **只在 > 0 时写**：常态就是 0，每拍都写一个 0 只会把行撑长、掩盖异常。
+⚠️ 解析时别把 `processes`（开机以来创建过多少个进程，只增不减）当成 `procs_running`。
+
+### 测试
+
+`test/core/diagnostics/resource_probe_test.dart`（**65 例**）。纯解析函数逐位钉住
+（含 comm 带括号、`cpu0` 诱饵、挂载点含空格、`rchar` 诱饵、`processes` 诱饵），
+探针本身用注入的假读数 + 短周期真定时器测生命周期与静默。
+⚠️ 定时器类测试**别用同值读数当基准** —— 占用率是两条读数之差，同值差为 0，
+`systemCpuPercentOfInterval` 会因「总 jiffies 没涨」返回 null，
+于是断言「有系统CPU」会失败（这是测试的坑，不是实现的坑）。
+
+

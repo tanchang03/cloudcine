@@ -31,6 +31,8 @@ import '../widgets/missing_media_dialog.dart';
 import '../widgets/player_keys.dart';
 import '../widgets/playback_surface.dart';
 import '../widgets/player_tv_overlay.dart';
+// `kPlayerTvSheetHeight` —— 字幕要抬到菜单上方，靠的就是这个高度。
+import '../widgets/player_tv_panel.dart';
 
 /// 遥控器 / 键盘上某个键，在当前上下文里该触发什么。
 ///
@@ -97,7 +99,14 @@ RemoteKeyAction resolveRemoteKey({
   required bool stageFocused,
 }) {
   // 沉浸模式优先：任何认识的键，第一下都用来把控制栏叫回来。
-  if (immersive && _remoteKeys.contains(key)) {
+  //
+  // ⚠️ 但**只在焦点真的落在画面上时**才算「第一下」。沉浸模式下控制栏根本
+  // 没渲染，焦点照理只可能在画面上 —— 直到播放失败：那一层报错浮层是**独立
+  // 的按钮**，它拿到焦点之后，用户按 OK 想点的是「重新取链」。
+  // 不判 [stageFocused] 的话，那一下只会把控制栏叫回来（用户的原话就是
+  // 「为啥一按遥控器就弹出 osd 菜单，而且我点不到报错按钮」），
+  // 报错浮层上的三个按钮**永远按不到** —— 而它看起来完全正常。
+  if (immersive && stageFocused && _remoteKeys.contains(key)) {
     return RemoteKeyAction.showControls;
   }
 
@@ -300,11 +309,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// provider 可能已经被销毁，行为不确定。
   late final PlaybackController _controller;
 
-  /// 沉浸模式：隐藏顶栏与控制栏，只剩画面。
+  /// 是否**收起 OSD**（顶栏 + 控制栏）。
   ///
-  /// ⚠️ TV 上进来就是 `true`（见 [didChangeDependencies]）——「点开一部片子」
-  /// 就是「开始看」，满屏才是默认。桌面 / 手机保持 `false`：那边有鼠标，
-  /// 顶栏与控制栏常驻更让人安心，也留着一个看得见的「怎么退出去」的出口。
+  /// ⚠️ 这个名字容易误导，它**与「全屏」无关** —— 画面在任何情况下都铺满整屏
+  /// （两者是 `Stack` 里的覆盖关系，见 `build` 里那段注释）。
+  /// 这个字段现在只回答一件事：OSD 露不露出来。
+  ///
+  /// TV 上进来就是 `true`（见 [didChangeDependencies]）——「点开一部片子」
+  /// 就是「开始看」，干净的画面才是默认。桌面 / 手机保持 `false`：那边有鼠标，
+  /// OSD 常驻更让人安心，也留着一个看得见的「怎么退出去」的出口。
   bool _immersive = false;
 
   /// 这一页是不是**已经**把 TV 的全屏打开过（沉浸 + 系统 UI 让位）。
@@ -324,6 +337,23 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   /// TV 右侧设置面板的焦点节点。**必须由页面持有**，理由见 [_openTvPanel]。
   final FocusNode _tvPanelNode = FocusNode(debugLabel: 'player-tv-panel');
+
+  /// 报错浮层里**第一个动作按钮**的焦点节点（「返回」或空态的「返回」）。
+  ///
+  /// ## 为什么非要有它 —— 方向键**走不进**画面节点内部的按钮
+  ///
+  /// 报错浮层挂在 `Focus(focusNode: _stageNode)` **里面**，而 `_stageNode`
+  /// 的矩形铺满整个画面区。方向键遍历的规则是「候选节点的矩形要完全在
+  /// 当前节点之外」（`DirectionalFocusTraversalPolicy`），于是从画面往下按
+  /// 只会**跳过浮层内部的按钮**、直接落到下面的控制栏 ——
+  /// 用户的原话是「我无法将焦点切换到报错按钮中」。
+  ///
+  /// 所以只能由页面在错误出现时显式 `requestFocus` 过去，与 TV 面板
+  /// （[_openTvPanel]）是同一套办法、同一个原因。
+  final FocusNode _errorActionNode = FocusNode(debugLabel: 'player-error-action');
+
+  /// 报错浮层当前**是否已经拿到焦点**（防止每帧重复 `requestFocus`）。
+  bool _errorFocusGiven = false;
 
   /// 无操作收起控制栏（进入沉浸）的定时器。
   ///
@@ -405,11 +435,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (_tvFullscreen || !AppTheme.isTvLayout(context)) return;
     _tvFullscreen = true;
 
-    // ## TV 上进来就满屏
+    // ## TV 上进来就收起 OSD
     //
-    // 原来 `_immersive` 默认 `false`，于是顶栏 48 + 控制栏 64 + 过扫描 54
-    // 一共 **166px（540 的 31%）** 永远压在画面上 —— 而 16:9 的片子塞进
-    // 剩下那 374 高里，上下再留两条黑边。用户的原话是「播放器并没有默认全屏」。
+    // 原来 `_immersive` 默认 `false`，于是顶栏 48 + 控制栏 64 一共 112px
+    // 永远压在画面上 —— 而 16:9 的片子塞进剩下那一段里，上下再留两条黑边。
+    // 用户的原话是「播放器并没有默认全屏」。
+    //
+    // 现在这两条已经改成**覆盖层**（画面尺寸恒定，见 `build`），但默认仍然
+    // 收起：TV 上「点开一部片子 = 开始看」，干净的画面才是常态。
     //
     // 这里**直接改字段而不 `setState`**：`didChangeDependencies` 之后紧接着
     // 就是本帧的 `build`，再标一次脏没有意义。
@@ -606,12 +639,46 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   /// 播放状态一变就重算收起倒计时：开始播 → 挂上；暂停 / 停止 → 撤掉
   /// （暂停时用户多半在读数 / 调设置，藏控制栏会把正看的东西盖掉）。
+  ///
+  /// 顺带同步一次报错浮层的焦点（见 [_syncErrorFocus]）：`_error` 的每一次
+  /// 变化后面都跟着 `notifyListeners()`（见 `PlaybackController`），
+  /// 所以「播放失败 / 重试成功」这两件事都会走到这里。
   void _onPlayStateChanged() {
     if (_controller.isPlaying) {
       _scheduleControlsHide();
     } else {
       _cancelIdleHide();
     }
+    _syncErrorFocus();
+  }
+
+  /// 报错浮层是不是正占着屏幕。两种都算：**取链失败**（`controller.error`，
+  /// 铺满画面的那一层）与**这一条根本不在库里**（`_loadError`，空态）。
+  bool get _errorShowing => _loadError != null || _controller.error != null;
+
+  /// 把焦点在「画面」与「报错浮层的第一个按钮」之间搬一次。
+  ///
+  /// 只在**状态真的翻转**时动，所以可以随便调 —— 不会每帧抢一次焦点。
+  /// 两头的理由：
+  ///   * 出现 → 交给浮层：不然方向键走不进去（理由见 [_errorActionNode]）；
+  ///   * 消失（重试成功 / 用户返回后又回来）→ 交回画面：不还回去的话，
+  ///     `stageFocused` 一直是 false，OK 不再是播放/暂停、←/→ 也不再快退 ——
+  ///     而画面上没有任何东西提示「焦点在别处」，用户只会以为播放器卡了。
+  void _syncErrorFocus() {
+    final showing = _errorShowing;
+    if (showing == _errorFocusGiven) return;
+    _errorFocusGiven = showing;
+
+    // 下一帧再要焦点：错误状态是在这一帧的 `build` 之前设的，浮层里的按钮
+    // 还没建出来，`requestFocus` 会落到一个还没有 `context` 的节点上。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (showing) {
+        _errorActionNode.requestFocus();
+      } else if (!_tvPanelOpen) {
+        _stageNode.requestFocus();
+      }
+    });
   }
 
   @override
@@ -641,6 +708,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     }
     _stageNode.dispose();
     _tvPanelNode.dispose();
+    _errorActionNode.dispose();
     super.dispose();
   }
 
@@ -656,6 +724,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (item == null) {
       setState(() => _loadError = '找不到这个媒体项。可能它已被重新扫描移除，'
           '或链接是从旧版本的应用里带过来的。');
+      // 空态那个「返回」按钮同样够不着（理由见 [_errorActionNode]）。
+      _syncErrorFocus();
       return;
     }
 
@@ -896,32 +966,49 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             onKeyEvent: _onRemoteKey,
             child: Stack(
               // ⛔ 必须 `expand`。`Stack` 默认给**非定位**子节点的是松约束，
-              // 里面那个 `Column` 会因为 `Expanded` 拿到无界高度而抛异常。
+              // 里面的 `Column` 会因为 `Expanded` 拿到无界高度而抛异常。
               fit: StackFit.expand,
               children: [
-                Column(
-                  children: [
-                    // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
-                    // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
-                    // 沉浸模式是桌面鼠标的用法，TV 上不该让焦点先停在这里。
-                    if (!_immersive) ExcludeFocus(child: _buildTopBar(controller)),
-                    Expanded(
-                      child: Focus(
-                        focusNode: _stageNode,
-                        autofocus: true,
-                        child: _buildStage(controller),
-                      ),
-                    ),
-                    if (!_immersive)
-                      _remoteReachable(_buildControlBar(controller)),
-                  ],
+                // ⛔ 画面**永远**铺满整屏，与 OSD 是否显示无关。
+                //
+                // 旧写法把顶栏 / 控制栏当成 `Column` 的**兄弟节点**，于是 OSD 一
+                // 出现，画面就被压矮 `48 + playerBarHeight` px —— 用户看到的就是
+                // 「按一下遥控器就退出全屏了」。现在两者都是**浮在上面的覆盖层**，
+                // 画面尺寸在整段播放里**恒定不变**。
+                Focus(
+                  focusNode: _stageNode,
+                  autofocus: true,
+                  child: _buildStage(controller),
                 ),
 
-                // TV 右侧设置面板。**挂在页面最外层**，不在画面那一块里 ——
+                // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
+                // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
+                // 收起控制栏是桌面鼠标的用法，TV 上不该让焦点先停在这里。
+                if (!_immersive)
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    child: ExcludeFocus(child: _buildTopBar(controller)),
+                  ),
+
+                // ⚠️ 菜单开着时**不画控制栏**：菜单是贴底的一整块（高
+                // `kPlayerTvSheetHeight` + 过扫描带），控制栏的位置正好在它
+                // 后面 —— 画了也只是被盖住，还会白占一次布局。
+                // 夸克播放器也是这个分工：唤出菜单之后，进度条让位给菜单。
+                if (!_immersive && !_tvPanelOpen)
+                  Positioned(
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    child: _remoteReachable(_buildControlBar(controller)),
+                  ),
+
+                // TV 设置菜单。**挂在页面最外层**，不在画面那一块里 ——
                 // 见下面那段「为什么不能放进 `_buildStage`」。
                 if (_tvPanelOpen)
                   Positioned(
-                    top: 0,
+                    left: 0,
                     right: 0,
                     bottom: 0,
                     child: PlayerTvOverlay(
@@ -1095,6 +1182,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       case TvPanelKeyAction.none:
         return false;
       case TvPanelKeyAction.open:
+        // ⛔ 报错时**不开面板**。画面已经取不到链了，画质 / 字幕 / 音轨没有
+        // 一项改得动；而面板一开就会把焦点从报错浮层抢走 —— 用户手里明明
+        // 有「重新取链」，却按不动了。菜单键在这里**放行**（返回 false），
+        // 让事件继续冒泡，别把用户的按键吞掉。
+        if (_errorShowing) return false;
         _openTvPanel();
       case TvPanelKeyAction.close:
         _closeTvPanel();
@@ -1106,23 +1198,23 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (_tvPanelOpen) return;
     setState(() {
       _tvPanelOpen = true;
-      // 面板显示时控制栏也要在：TV 上它们是同一套 OSD 的两半，只出一半
-      // 会被读成「控制栏没了」。
+      // 菜单显示时顶栏也要在：它是「我在看什么片子」的唯一说明。
+      // 控制栏则相反 —— 它被菜单盖住，`build` 里会跳过它（见那段注释）。
       _immersive = false;
     });
-    // ## ⛔ 焦点必须**显式**交给面板，光靠面板自己的 `autofocus` 是不够的
+    // ## ⛔ 焦点必须**显式**交给菜单，光靠菜单自己的 `autofocus` 是不够的
     //
     // `Focus(autofocus: true)` 只在「它所在的那个 scope 还没有焦点」时才生效。
     // 而这里画面节点 `_stageNode` 也是 `autofocus`、且**早就拿到了焦点** ——
-    // 于是面板那个 `autofocus` 是空操作，`Focus.onKeyEvent` 永远收不到按键。
+    // 于是菜单那个 `autofocus` 是空操作，`Focus.onKeyEvent` 永远收不到按键。
     //
     // 症状正是用户报的那条：「菜单键能弹出 OSD，但上下键按不动、选不了菜单」。
     // ↑/↓ 冒泡到页面那一层，`stageFocused` 仍是 true（焦点压根没离开画面），
     // 于是 `resolveRemoteKey` 把方向键判成 `ignored` 交还给焦点遍历 ——
-    // 而面板贴在右边、几何上不在「画面上方 / 下方」，遍历也走不进去。
-    // 结果是两条路都是死的，遥控器完全操作不了面板。
+    // 而菜单是自绘的、里面**没有可遍历的焦点节点**，遍历也走不进去。
+    // 结果是两条路都是死的，遥控器完全操作不了菜单。
     //
-    // 下一帧再要焦点：这一帧面板还没建出来，`requestFocus` 会落到一个
+    // 下一帧再要焦点：这一帧菜单还没建出来，`requestFocus` 会落到一个
     // 还没有 `context` 的节点上。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_tvPanelOpen) return;
@@ -1131,14 +1223,31 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     _scheduleControlsHide();
   }
 
+  /// 关掉 TV 设置菜单，并**回到干净的画面**。
+  ///
+  /// ## 为什么关菜单要顺手进入沉浸
+  ///
+  /// 菜单原本有一行「全屏（收起控制栏）」，专门用来从设置界面回到只剩画面的
+  /// 状态 —— 因为那时菜单一开就退出沉浸，不补一行的话只剩「等 30 秒自动
+  /// 收起」和「按返回键退出播放」两条路。现在这一行删掉了：**关菜单 = 回到
+  /// 干净画面**，功能没丢，少一行（`PlayerTvRow` 的文档里记着这件事）。
+  ///
+  /// 这也与「播放器恒全屏」那条需求同向：画面本来就一直铺满整屏，菜单只是
+  /// 浮在上面的一层，关掉它就该什么都不剩。
   void _closeTvPanel() {
     if (!_tvPanelOpen) return;
-    setState(() => _tvPanelOpen = false);
-    // 焦点必须交回画面。面板的 `Focus(autofocus: true)` 拿走焦点之后不主动
-    // 还回去的话，↑ / ↓ 会继续被面板吃掉、OK 也不再是播放/暂停 ——
+    setState(() {
+      _tvPanelOpen = false;
+      _immersive = true;
+    });
+    // 焦点必须交回画面。菜单的 `Focus(autofocus: true)` 拿走焦点之后不主动
+    // 还回去的话，↑ / ↓ 会继续被菜单吃掉、OK 也不再是播放/暂停 ——
     // 而画面上没有任何东西提示「焦点现在在别处」，用户只会以为播放器卡了。
     _stageNode.requestFocus();
-    _scheduleControlsHide();
+    // ⚠️ 这里**不**再 `_scheduleControlsHide()`：已经沉浸了，倒计时只会在
+    // 到点时再判一次 `shouldAutoHideControls`（沉浸 → 直接返回 false）。
+    // 留着它只会让「用户按任意键唤回控制栏」那一刻多一次无意义的取消。
+    _cancelIdleHide();
   }
 
   // -------------------------------------------------------------------
@@ -1153,7 +1262,19 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final safe = AppTheme.safeAreaInsets(context);
     return Container(
       height: 48 + safe.top,
-      color: AppTheme.cinema,
+      // 顶栏现在是**浮在画面上**的覆盖层，所以不能再用不透明的
+      // `AppTheme.cinema` —— 那会变成一条生硬的色带，把画面切掉一块。
+      // 改成从上往下渐隐的遮罩：压得住底下的画面，又不切断它。
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Colors.black.withValues(alpha: 0.78),
+            Colors.black.withValues(alpha: 0),
+          ],
+        ),
+      ),
       padding: EdgeInsets.fromLTRB(8 + safe.left, safe.top, 8 + safe.right, 0),
       child: Row(
         children: [
@@ -1190,9 +1311,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
           IconButton(
+            // ⚠️ 语义已经变了：播放器**任何时候都是全屏**（画面恒定铺满），
+            // 这个键现在只是「把 OSD 收起来」。图标沿用全屏符号 ——
+            // 用户认的就是它。
             onPressed: () => setState(() => _immersive = true),
             iconSize: 17,
-            tooltip: '沉浸模式（Esc 退出）',
+            tooltip: '收起控制栏',
             icon: const Icon(Icons.fullscreen_rounded, color: AppTheme.muted),
           ),
         ],
@@ -1204,6 +1328,30 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   // 画面
   // -------------------------------------------------------------------
 
+  /// 字幕距画面下缘留多少。
+  ///
+  /// ## 为什么菜单打开时要把它抬上去
+  ///
+  /// 默认 44 是「贴着画面下缘」的常规位置。而 TV 设置菜单是**贴底的一整块**
+  /// （高 [kPlayerTvSheetHeight]），打开时正好压在字幕上 —— 于是用户换字幕
+  /// 时看不到那一行字，而**那一行字是换字幕唯一的反馈**（有没有乱码、对不对
+  /// 得上口型）。菜单里写着的「当前字幕」只是轨道名，不是效果。
+  ///
+  /// 所以菜单打开时把字幕抬到菜单顶边上方一点。夸克播放器是同一套做法：
+  /// 它的字幕区固定在 y 215–315，菜单在它下面（实测 `uiautomator dump`）。
+  ///
+  /// ⚠️ 改 [kPlayerTvSheetHeight] 之后这里会跟着变 —— 这正是要的效果：
+  /// 两个数一旦各写一份，菜单长高之后字幕就会被重新盖住，而**没有任何
+  /// 报错**，只是「换字幕时看不到字幕」。
+  double _subtitleBottomPadding() {
+    if (!_tvPanelOpen) return 44;
+    final safe = AppTheme.safeAreaInsets(context);
+    // 菜单底边距屏幕下缘 safe.bottom，自身高 kPlayerTvSheetHeight，
+    // 所以它的顶边在 `540 − safe.bottom − kPlayerTvSheetHeight`。
+    // 字幕要落在顶边之上，再留 16 的呼吸。
+    return kPlayerTvSheetHeight + safe.bottom + 16;
+  }
+
   Widget _buildStage(PlaybackController controller) {
     final loadError = _loadError;
     if (loadError != null) {
@@ -1213,6 +1361,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         title: '打不开这个视频',
         body: loadError,
         actionLabel: '返回',
+        // 遥控器要够得着这个按钮，理由见 [_errorActionNode]。
+        actionFocusNode: _errorActionNode,
         onAction: () => context.pop(),
       );
     }
@@ -1240,15 +1390,15 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             // 自绘控制栏（见类文档）。
             controls: (_) => const SizedBox.shrink(),
             fill: AppTheme.cinema,
-            subtitleViewConfiguration: const SubtitleViewConfiguration(
-              style: TextStyle(
+            subtitleViewConfiguration: SubtitleViewConfiguration(
+              style: const TextStyle(
                 fontSize: 30,
                 height: 1.35,
                 color: Colors.white,
                 fontWeight: FontWeight.w500,
                 backgroundColor: Color(0x99000000),
               ),
-              padding: EdgeInsets.fromLTRB(24, 0, 24, 44),
+              padding: EdgeInsets.fromLTRB(24, 0, 24, _subtitleBottomPadding()),
             ),
           )
         else
@@ -1273,9 +1423,27 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
 
+        // 沉浸模式下点画面任意处切回普通模式 —— 否则用户会「进去出不来」。
+        //
+        // ⛔ 它必须排在**报错浮层之前**（`Stack` 里越靠后越在上层）。
+        // 原来它在最后，于是 `HitTestBehavior.opaque` 把整个画面区吃掉了：
+        // 报错浮层上那三个按钮**用鼠标也点不动**，点了只会退出沉浸模式。
+        // 真机上的表现就是「点不了」，而它看起来完全正常。
+        if (_immersive)
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () {
+                setState(() => _immersive = false);
+                _scheduleControlsHide();
+              },
+            ),
+          ),
+
         if (error != null)
           _ErrorOverlay(
             message: error,
+            focusNode: _errorActionNode,
             onRetry: controller.retry,
             onBack: () => context.pop(),
             // 只有「网盘上已经没有这个文件」才给这个出口。登录失效、断网、
@@ -1299,30 +1467,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
 
-        // 沉浸模式下点画面任意处切回普通模式 —— 否则用户会「进去出不来」。
-        if (_immersive)
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () {
-                setState(() => _immersive = false);
-                _scheduleControlsHide();
-              },
-            ),
-          ),
-
-        // ⚠️ TV 右侧设置面板**不在这里** —— 它挂在 `build` 最外层那个
-        // `Stack` 上，理由只有一条：**高度**。
+        // ⚠️ TV 设置菜单**不在这里** —— 它挂在 `build` 最外层那个 `Stack` 上。
         //
-        // 画面这一块是 `Column` 里的 `Expanded`，面板一开控制栏也要显示
-        // （`_openTvPanel` 会退出沉浸），于是这里只有
-        // 540 − 顶栏 75 − 控制栏 91 = **374** 高；而面板要装下
-        // 表头 54 + 七行 × 52 + 底部提示 40 ≈ 458。差出来的 84px 会让
-        // 第 5 行往后要滚动才看得见 —— 而**电视上没有滚动条**，
-        // 用户根本不会知道「音效 / 倍速 / 片头」还在下面。
-        // 挂到最外层之后它拿到整屏 540，靠自己的上下边距避让过扫描带。
+        // 理由有两条，都不是「省一层 Stack」：
+        //   1. **高度**。菜单是贴底的一整块（`kPlayerTvSheetHeight` 346），
+        //      而画面这一块在旧结构里是 `Column` 的 `Expanded`，可用高会被
+        //      顶栏与控制栏啃掉一截。挂到最外层它才能拿到整屏、直接贴底。
+        //   2. **字幕要让位**。菜单压着画面下缘，字幕得抬到它上面去 ——
+        //      而字幕的内边距是在本方法里给的（见 [_subtitleBottomPadding]）。
+        //      菜单若也在这里，两层会互相算对方的尺寸。
         //
-        // ⛔ 别为了「省一层 Stack」把它挪回这里。
+        // ⛔ 别把它挪回这里。
       ],
     );
   }
@@ -1362,7 +1517,17 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     final safe = AppTheme.safeAreaInsets(context);
     return Container(
       height: AppTheme.playerBarHeight + safe.bottom,
-      color: AppTheme.cinema,
+      // 与控制栏同理：覆盖层用自下而上渐隐的遮罩，而不是不透明底色。
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.bottomCenter,
+          end: Alignment.topCenter,
+          colors: [
+            Colors.black.withValues(alpha: 0.78),
+            Colors.black.withValues(alpha: 0),
+          ],
+        ),
+      ),
       padding: EdgeInsets.fromLTRB(
         12 + safe.left,
         0,
@@ -2341,8 +2506,22 @@ class _ErrorOverlay extends StatelessWidget {
     required this.message,
     required this.onRetry,
     required this.onBack,
+    this.focusNode,
     this.onRemove,
   });
+
+  /// 挂在**第一个**动作按钮上的焦点节点，由播放页持有并 `requestFocus`。
+  ///
+  /// ## 为什么是「第一个」而不是「重新取链」
+  ///
+  /// 规则越简单越不会漂：**焦点落在最左边那个动作上**。这里它正好是「返回」——
+  /// 唯一一个没有副作用的出口（与 `MissingMediaDialog` 把「暂不处理」放最前
+  /// 是同一条理由）。想重试就按一下 → ，而 `Wrap` 里三个按钮的左右顺序
+  /// 与焦点遍历顺序一致。
+  ///
+  /// ⛔ 少了它，遥控器**永远够不到这三个按钮**：这一层挂在画面节点的内部，
+  /// 而画面节点的矩形铺满整个画面区 —— 方向键的「往下找」只会跳过它。
+  final FocusNode? focusNode;
 
   final String message;
   final Future<void> Function() onRetry;
@@ -2394,7 +2573,11 @@ class _ErrorOverlay extends StatelessWidget {
                 spacing: 10,
                 runSpacing: 8,
                 children: [
-                  OutlinedButton(onPressed: onBack, child: const Text('返回')),
+                  OutlinedButton(
+                    focusNode: focusNode,
+                    onPressed: onBack,
+                    child: const Text('返回'),
+                  ),
                   FilledButton(
                     onPressed: () => unawaited(onRetry()),
                     style: FilledButton.styleFrom(

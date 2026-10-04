@@ -253,6 +253,36 @@ void main() {
         RemoteKeyAction.pop,
       );
     });
+
+    test('⚠️ 焦点不在画面上时，沉浸模式**不**抢 OK 与方向键', () {
+      // 这条是用户报的「一按遥控器就弹出 osd 菜单，而且我点不到报错按钮」
+      // 的根因之一：播放失败时那一层报错浮层是**独立的按钮**，它拿到焦点
+      // 之后按 OK，用户想点的是「重新取链」。
+      //
+      // 原来的写法只看 `immersive`，于是那一按只会把控制栏叫回来 ——
+      // 报错浮层上的三个按钮**永远按不到**，而它看起来完全正常。
+      expect(
+        resolveRemoteKey(
+          key: LogicalKeyboardKey.select,
+          immersive: true,
+          stageFocused: onWidget,
+        ),
+        RemoteKeyAction.ignored,
+        reason: '焦点在报错浮层的按钮上时，OK 必须放行给焦点系统去激活按钮',
+      );
+      for (final key in [
+        LogicalKeyboardKey.arrowLeft,
+        LogicalKeyboardKey.arrowRight,
+        LogicalKeyboardKey.arrowUp,
+        LogicalKeyboardKey.arrowDown,
+      ]) {
+        expect(
+          resolveRemoteKey(key: key, immersive: true, stageFocused: onWidget),
+          RemoteKeyAction.ignored,
+          reason: '焦点在报错浮层的按钮上时，方向键要能换焦点（$key）',
+        );
+      }
+    });
   });
 
   group('TV 设置面板的开关（resolveTvPanelKey）', () {

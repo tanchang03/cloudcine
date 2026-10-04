@@ -36,9 +36,23 @@ Future<void> main(List<String> args) async {
   // `video_player_avfoundation`（Apple 那套栈）——**DV 依然渲染不对，而且不报
   // 任何错**，排查时看起来像「换了内核也没用」。
   //
-  // ⚠️ **只在 macOS 注册**。Android / TV 走的是 media_kit 的**真窗口 vo**
-  // （`android_video_controller` 设 `vo=gpu` + `wid`），本来就不受 render API
-  // 限制，不需要换内核 —— 换过去等于把一条已验的路径换成没验的。
+  // ⛔ **只注册 macOS**。2026-10-04 在 Android TV 上试过把它开到
+  // `['macos','android']` 走 4K 直出，**两轮都失败，已回退**，别再试同一套：
+  //
+  //   1. 只设 `viewType: platformView`（SurfaceView）：用户报「更卡、音画不同步」。
+  //   2. 再加 `tunnel: true`（零拷贝）：用户报「4K 看不到画面，只有声音」。
+  //
+  // 日志证据（`cloudcine-log-android-20261004-213519.txt` + `logcat -b crash`）：
+  //   - 中继在推进（2MB→24MB→62MB），`[资源]` 显示进程 CPU 225~326%（单核口径），
+  //     说明**解码在跑**，但屏上什么都没有 → 出画面那一层没present。
+  //   - 同一次播放里进程**原生崩溃**：`libmdk.so` 的 `strlen→vfprintf→vsnprintf`
+  //     （mdk 自己的工作线程），以及反复出现的 `SurfaceTextureWrapper.release`
+  //     （FinalizerDaemon）。后者是 Flutter 引擎在 `SurfaceProducer` 被释放后
+  //     二次释放 —— 换内核就会触发，与 viewType 无关。
+  //
+  // 回退后 4K 回到 mpv：画面正常，但 `hwdec-current=mediacodec-copy` 的卡顿
+  // 仍在（那是 mpv 在 Android 上的结构性问题，见
+  // `docs/AndroidTV-4K-丢帧-夸克对标.md`）。
   //
   // 位置与上面的 `MediaKit.ensureInitialized()` 同理，必须在**分流之前**：
   // 播放窗口跑的是**独立引擎**，而 Dart 侧的平台实现注册是**每个引擎各一份**的，
@@ -47,9 +61,15 @@ Future<void> main(List<String> args) async {
   // `platforms` 显式写出来是**双保险**：即便以后在别的平台也 import 了这里，
   // 也只有 macOS 会被 fvp 接管。
   if (Platform.isMacOS) {
-    fvp.registerWith(options: {
-      'platforms': ['macos'],
+    fvp.registerWith(options: <String, Object>{
+      'platforms': <String>['macos'],
     });
+    // 把实际下发的选项写进日志。
+    //
+    // **为什么值得占一行**：注册只让 `video_player` 改用 mdk 实现，是「配错了
+    // 也不报错、只是静默走 Apple 那套栈」的那类开关，没有回读手段。它同时是
+    // 独立播放窗口的判据：那个窗口有自己的引擎，这行会出现两次。
+    diag.info('播放', 'fvp 注册：platforms=[macos]');
   }
 
   // 分流要尽可能早：播放窗口跑的是播放界面，不该做媒体库的启动工作

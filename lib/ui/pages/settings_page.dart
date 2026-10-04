@@ -21,6 +21,7 @@ import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/tv_adjust_slider.dart';
 
 /// 版本号。**必须与 `pubspec.yaml` 的 `version` 保持一致。**
 ///
@@ -1637,6 +1638,11 @@ class _ToggleRow extends StatelessWidget {
   }
 }
 
+/// 「标签 + 值 + 滑块」的一行。
+///
+/// ⚠️ **两条轨道要分开走**：桌面用 Material [Slider]（鼠标拖拽最自然），
+/// TV 用 [TvAdjustSlider]。**不能只留一个** —— 原生 [Slider] 会把四个方向键
+/// 全吃掉，电视上焦点一落进来就再也出不去（用户报的第 4 条）。
 class _SliderRow extends StatelessWidget {
   const _SliderRow({
     required this.label,
@@ -1674,13 +1680,22 @@ class _SliderRow extends StatelessWidget {
             ),
           ],
         ),
-        Slider(
-          value: value.clamp(min, max),
-          min: min,
-          max: max,
-          divisions: divisions,
-          onChanged: onChanged,
-        ),
+        if (AppTheme.isTvLayout(context))
+          TvAdjustSlider(
+            value: value,
+            min: min,
+            max: max,
+            divisions: divisions,
+            onChanged: onChanged,
+          )
+        else
+          Slider(
+            value: value.clamp(min, max),
+            min: min,
+            max: max,
+            divisions: divisions,
+            onChanged: onChanged,
+          ),
       ],
     );
   }

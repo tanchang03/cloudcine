@@ -63,6 +63,14 @@ class EngineSelection {
 /// 默认内核由调用方建、由 [dispose] 释放；DV 内核由本类**惰性**建
 /// （DV 片源是少数，绝大多数用户一次都用不到，而 `FvpPlaybackEngine`
 /// 一建出来就占住一份解码器配置），同样由 [dispose] 释放。
+///
+/// ## ⛔ 曾经有过「第二条触发线」：Android TV 高分辨率。**已删除**
+///
+/// 10-04 试过「≥1440p 也切 fvp」，因为 mpv 在 Android 上拿不到零拷贝硬解
+/// （`hwdec-current` 恒为 `mediacodec-copy`，4K 每 21 秒丢 100~340 帧）。
+/// **两轮真机都失败**，最后一轮是「4K 看不到画面，只有声音」+ 原生崩溃。
+/// 经过与证据见 `main.dart` 的注册块注释与 `fvp_playback_engine.dart`
+/// 的类文档。判据收回到只剩杜比视界一条。
 class PlaybackEngineRouter {
   PlaybackEngineRouter({
     required PlaybackEngine defaultEngine,
@@ -148,16 +156,18 @@ class PlaybackEngineRouter {
     final factory = _dvEngineFactory;
     final probe = _dvProbe;
 
-    var needsDolbyVision = false;
+    var reason = '';
     final probeable = url.scheme == 'http' || url.scheme == 'https';
     if (factory != null && probe != null && probeable && !isHlsUrl(url)) {
       final info = await probe(key: key, url: url, headers: headers);
-      needsDolbyVision = info?.needsDolbyVisionEngine ?? false;
+      if (info?.needsDolbyVisionEngine ?? false) {
+        reason = '这条片源是杜比视界 P5';
+      }
     }
 
-    final target = needsDolbyVision
-        ? (_dvEngine ??= factory!())
-        : _defaultEngine;
+    final target = reason.isEmpty || factory == null
+        ? _defaultEngine
+        : (_dvEngine ??= factory());
     if (identical(target, _engine)) {
       return EngineSelection(engine: _engine, changed: false);
     }
@@ -166,9 +176,7 @@ class PlaybackEngineRouter {
     _engine = target;
     diag.info(
       logTag,
-      needsDolbyVision
-          ? '这条片源是杜比视界 P5，切到 fvp（libmdk）内核'
-          : '切回 media_kit（mpv）内核',
+      reason.isEmpty ? '切回 media_kit（mpv）内核' : '$reason，切到 fvp（libmdk）内核',
     );
 
     unawaited(

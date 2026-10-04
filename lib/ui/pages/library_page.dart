@@ -252,92 +252,170 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     // 多选在这两个视图里完全共用 —— 不需要「当前是哪个视图」的判据。
     final selecting = ref.watch(librarySelectionProvider).active;
 
+    // -----------------------------------------------------------------
+    // 页头动作：**同一份逻辑，两种排法**
+    //
+    // 八个控件在 TV 上塞不进一行（624 − 96 过扫描 − 44 内边距 = 580）。
+    // 上一版把它们全交给 `Wrap` 折成两行，页头因此吃掉 **122px** ——
+    // 而 960×540 上整页只有 486，一张卡高 168，于是第二排海报永远露不出来。
+    //
+    // 这一版按「用得多不多」重新分区：
+    //   * 边看边用的四个（视图切换 / 搜索 / 排序 / 筛选）留在页头两带里；
+    //   * 偶尔动一次的四个（刮削 / 重扫 / 选择 / 刷新）收进右端的「更多」菜单。
+    // 省下的 60 余 px 全归海报墙 —— 这正是用户说的「有效空间过小」。
+    // -----------------------------------------------------------------
+    final busyScanning = scanning || scrape.running;
+    final scrapeTooltip = !canScrape
+        ? '未启用在线刮削：到「设置 → 刮削」填 TMDB Key 或豆瓣 Cookie'
+        : scanning
+            ? '正在扫描，稍后再刮削'
+            : (unscrapedCount == null
+                ? '刮削媒体库（只刮未刮削的作品）'
+                : '刮削媒体库：还有 $unscrapedCount 部没刮过');
+    final rescanTooltip = scanning ? '正在扫描…' : '重新扫描媒体库';
+
+    final VoidCallback? scrapeAction = (!canScrape || busyScanning)
+        ? null
+        : () => ref.read(libraryScrapeControllerProvider.notifier).start();
+    final VoidCallback? rescanAction = busyScanning
+        ? null
+        : () => ref.read(scanControllerProvider.notifier).start();
+    void selectAction() =>
+        ref.read(librarySelectionProvider.notifier).enter();
+
+    // 「更多」菜单里的四项。⚠️ `onPressed` 与下面桌面那四个按钮**是同一份**：
+    // 两处各写一遍的话，TV 上「刮削」能不能按会和桌面上不一致 ——
+    // 而没有人会同时开着电视和电脑对着数。
+    final overflowActions = <_HeaderAction>[
+      _HeaderAction(
+        icon: Icons.auto_awesome_rounded,
+        label: '刮削',
+        onPressed: scrapeAction,
+        busy: scrape.running,
+      ),
+      _HeaderAction(
+        icon: Icons.radar_rounded,
+        label: '重扫',
+        onPressed: rescanAction,
+      ),
+      _HeaderAction(
+        icon: Icons.checklist_rounded,
+        label: '选择',
+        onPressed: selectAction,
+      ),
+      _HeaderAction(
+        icon: Icons.refresh_rounded,
+        label: '刷新',
+        onPressed: _refresh,
+      ),
+    ];
+
+    // 桌面那一行。TV 上这几个控件不会走到这里（那四个进了菜单、另外四个
+    // 进了 `_CategoryBar.leading`），但对象还是在这里建一次 ——
+    // 分成两份写会让两边的启用判据慢慢漂开。
+    final scrapeButton = TvIconLabel(
+      label: '刮削',
+      enabled: scrapeAction != null,
+      child: IconButton(
+        tooltip: scrapeTooltip,
+        onPressed: scrapeAction,
+        icon: scrape.running
+            ? const SizedBox(
+                width: 17,
+                height: 17,
+                child: CircularProgressIndicator(strokeWidth: 1.8),
+              )
+            : const Icon(Icons.auto_awesome_rounded, size: 17),
+      ),
+    );
+    final rescanButton = TvIconLabel(
+      label: '重扫',
+      enabled: rescanAction != null,
+      child: IconButton(
+        tooltip: rescanTooltip,
+        onPressed: rescanAction,
+        icon: const Icon(Icons.radar_rounded, size: 17),
+      ),
+    );
+    final selectButton = TvIconLabel(
+      label: '选择',
+      child: IconButton(
+        tooltip: '多选（批量合并）',
+        onPressed: selectAction,
+        icon: const Icon(Icons.checklist_rounded, size: 17),
+      ),
+    );
+    final refreshButton = TvIconLabel(
+      label: '刷新',
+      child: IconButton(
+        tooltip: '刷新',
+        onPressed: _refresh,
+        icon: const Icon(Icons.refresh_rounded, size: 17),
+      ),
+    );
+
+    final viewSwitch = const _ViewSwitch();
+    final searchBox = HeaderSearchBox(
+      controller: _search,
+      onChanged: _onSearchChanged,
+      // 搜的是**库里已入库的**作品 / 文件。网盘目录那一份搜索在
+      // 侧栏的「文件夹」页，它只筛当前这一层，是另一回事。
+      hint: '搜片名或文件名…',
+    );
+    final sortMenu = const _SortMenu();
+    final filterButton = const LibraryFilterButton();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         if (selecting)
           _SelectionHeader(onRefresh: _refresh)
+        else if (AppTheme.isTvLayout(context))
+          _LibraryHeader(
+            title: '媒体库',
+            subtitle: stats == null
+                ? null
+                : '${stats.items} 个视频 · ${stats.works} 部作品',
+            actions: [
+              viewSwitch,
+              searchBox,
+              _MoreMenu(actions: overflowActions),
+            ],
+          )
         else
           PageHeader(
             title: '媒体库',
             subtitle:
                 stats == null ? null : '${stats.items} 个视频 · ${stats.works} 部作品',
             actions: [
-              // 批量动作放在最前：它们是这一页最重的两个动作，TV 上折行后
-              // 也落在最左边（遥控器从海报墙按一次 ↑ 就够得到）。
-              TvIconLabel(
-                label: '刮削',
-                child: IconButton(
-                  tooltip: !canScrape
-                      ? '未启用在线刮削：到「设置 → 刮削」填 TMDB Key 或豆瓣 Cookie'
-                      : scanning
-                          ? '正在扫描，稍后再刮削'
-                          : (unscrapedCount == null
-                              ? '刮削媒体库（只刮未刮削的作品）'
-                              : '刮削媒体库：还有 $unscrapedCount 部没刮过'),
-                  onPressed: (!canScrape || scanning || scrape.running)
-                      ? null
-                      : () => ref
-                          .read(libraryScrapeControllerProvider.notifier)
-                          .start(),
-                  icon: scrape.running
-                      ? const SizedBox(
-                          width: 17,
-                          height: 17,
-                          child: CircularProgressIndicator(strokeWidth: 1.8),
-                        )
-                      : const Icon(Icons.auto_awesome_rounded, size: 17),
-                ),
-              ),
-              TvIconLabel(
-                label: '重扫',
-                child: IconButton(
-                  tooltip: scanning ? '正在扫描…' : '重新扫描媒体库',
-                  onPressed: (scanning || scrape.running)
-                      ? null
-                      : () => ref.read(scanControllerProvider.notifier).start(),
-                  icon: const Icon(Icons.radar_rounded, size: 17),
-                ),
-              ),
-              const _ViewSwitch(),
-              HeaderSearchBox(
-                controller: _search,
-                onChanged: _onSearchChanged,
-                // 搜的是**库里已入库的**作品 / 文件。网盘目录那一份搜索在
-                // 侧栏的「文件夹」页，它只筛当前这一层，是另一回事。
-                hint: '搜片名或文件名…',
-              ),
-              const _SortMenu(),
-              const LibraryFilterButton(),
+              // 批量动作放在最前：它们是这一页最重的两个动作。
+              scrapeButton,
+              rescanButton,
+              viewSwitch,
+              searchBox,
+              sortMenu,
+              filterButton,
               // 「选择」是一个**模式开关**，不是一次动作：点它进入多选，
               // 之后点卡片才是勾选。做成常驻按钮而不是长按 / 右键才出的
               // 隐藏入口，是因为电视上既没有右键也没有可靠的长按。
-              TvIconLabel(
-                label: '选择',
-                child: IconButton(
-                  tooltip: '多选（批量合并）',
-                  onPressed: () =>
-                      ref.read(librarySelectionProvider.notifier).enter(),
-                  icon: const Icon(Icons.checklist_rounded, size: 17),
-                ),
-              ),
+              selectButton,
               // 「刷新」是个纯图标按钮：桌面上悬停会出 tooltip，电视上没有
               // hover —— 所以 TV 上补一个看得见的「刷新」标签。
-              TvIconLabel(
-                label: '刷新',
-                child: IconButton(
-                  tooltip: '刷新',
-                  onPressed: _refresh,
-                  icon: const Icon(Icons.refresh_rounded, size: 17),
-                ),
-              ),
+              refreshButton,
             ],
           ),
         // 扫描 / 刮削进行时，页头下方占一条实时进度 —— 用户在这里就能看到
         // 「卡片一批批长出来」「一部部刮削成功」，不用切到扫描页去等。
         if (scanning || scrape.running || scrape.finished)
           _LibraryActivityBar(scan: scan, scrape: scrape),
-        const _CategoryBar(),
+        // TV 上「排序 / 筛选」并进这一带，与胶囊同排 —— 三者在回答同一件事
+        // （「现在列表里显示的是哪些」），分成两条横带只是白吃一行高度。
+        // 桌面上 `leading` 为空，分类栏与原来一模一样。
+        _CategoryBar(
+          leading: AppTheme.isTvLayout(context)
+              ? [sortMenu, filterButton]
+              : const [],
+        ),
         Expanded(
           child: works.when(
             loading: () => const Center(
@@ -408,6 +486,210 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
         ),
       ],
     );
+  }
+}
+
+/// 媒体库页头（**只有 TV 走这里**）。
+///
+/// ## 为什么这一页不再用共用的 `PageHeader`
+///
+/// `PageHeader` 的 TV 分支是给「两三个动作」的页面（文件夹 / 扫描 / 下载 /
+/// 设置）定的：标题块当作 `Wrap` 的第一项、操作跟在后面折行。媒体库有八个
+/// 控件，那一套折出来是**两行 122px**。
+///
+/// 而 960×540 上整页只有 486 高（过扫描各 27 已让开），一张海报卡高 168 ——
+/// 页头每多占 50px，就意味着第二排海报**永远露不出来**。用户的原话是
+/// 「界面整体布局看起来有效空间过小…将布局优化紧凑，重点突出」。
+///
+/// 所以这里改成**一带一行**：标题 + 视图切换 + 搜索 + 「更多」。
+/// 低频的四个动作（刮削 / 重扫 / 选择 / 刷新）进 [_MoreMenu]，
+/// 排序 / 筛选则下移到分类栏那一带（见 `_CategoryBar.leading`）——
+/// 三者在回答同一件事，本就该同排。
+///
+/// 高度账（960×540、页面实得 624×486，实测）：
+///   * 上一版：页头 122 + 分类栏 50 = **172**，海报墙只剩 294；
+///   * 这一版：页头 58 + 分类栏 50 = **108**，海报墙拿到 378
+///     —— 刚好放下「完整一行 + 完整第二行」（2 × 168 + 18 = 354）。
+class _LibraryHeader extends StatelessWidget {
+  const _LibraryHeader({
+    required this.title,
+    required this.subtitle,
+    required this.actions,
+  });
+
+  final String title;
+  final String? subtitle;
+
+  /// 这一带上的控件：视图切换 / 搜索框 / 「更多」。**宽度都是定值**，
+  /// 标题块吸收剩余空间。
+  final List<Widget> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      // ⚠️ 这个 key 是给 `library_tv_layout_test` 用的：它要量「页头吃了多少
+      // 高度」，而这一页已经不走共用的 `PageHeader`，没有别的稳定锚点。
+      key: const Key('library-header'),
+      // 上下 6/4：电视上垂直空间比水平更贵 —— 页头每省 10px，海报墙就多
+      // 露出 10px 的封面。这一带的内容本身是 48 高（标题两行 / 控件 44）。
+      padding: const EdgeInsets.fromLTRB(22, 6, 22, 4),
+      child: Row(
+        children: [
+          // ⛔ 标题块用 `Flexible`，**不是** `Expanded`。
+          // 两者在这里的差别很关键：`Expanded` 会强行把标题撑到「整行减去
+          // 控件」的宽度（今天正好等于它的自然宽度，看不出问题），而
+          // `Flexible` 让它按内容取宽、只在不够时才被压窄并省略。
+          // 哪天真给这一带加了一个控件，`Expanded` 那版会把控件挤出屏幕 ——
+          // 而 `Row` 溢出在 Release 下是**静默裁掉**的。
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: AppTheme.tvHeaderTitle,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.text,
+                  ),
+                ),
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: AppTheme.tvHeaderSubtitle,
+                      color: AppTheme.dim,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          for (final action in actions) ...[action, const SizedBox(width: 10)],
+        ],
+      ),
+    );
+  }
+}
+
+/// 「更多」菜单里的一项。
+///
+/// 刻意**不是** `Widget`：同一件事在桌面上是「图标 + 标签」的按钮、
+/// 在 TV 上是菜单里的一行，两者的排法完全不同，共用得上的只有
+/// 「图标 / 文案 / 能不能按」这三样。
+class _HeaderAction {
+  const _HeaderAction({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    this.busy = false,
+  });
+
+  final IconData icon;
+
+  /// TV 上菜单里的那一行字。桌面上的 tooltip 由调用方另外给 ——
+  /// 电视上没有 hover，那段话在这里没有任何出口。
+  final String label;
+
+  /// `null` = 当前不可用（菜单项会灰掉并跳过焦点）。
+  final VoidCallback? onPressed;
+
+  /// 正在跑（例如刮削中）—— 菜单里画一个转圈。
+  final bool busy;
+}
+
+/// 页头右端的「更多」—— 把四个低频动作收进一个菜单。
+///
+/// ## 为什么敢在电视上用弹出菜单
+///
+/// 同一页的「排序」([_SortMenu]) 本来就是一个 `PopupMenuButton`，它在这台
+/// 电视上一直能用 —— 也就是说「弹出层里的项遥控器走得到、OK 能激活」这条
+/// 路已经被验证过了，不是新引入的风险。
+///
+/// ## 为什么灰掉比藏起来好
+///
+/// 刮削在「没配在线源 / 正在扫描」时按不动。把它**藏掉**的话，用户会以为
+/// 这个版本没有刮削功能；灰着留在菜单里，他才有一个「为什么按不动」可问的
+/// 地方（真机上那行字是唯一的提示 —— tooltip 在电视上等于不存在）。
+class _MoreMenu extends StatelessWidget {
+  const _MoreMenu({required this.actions});
+
+  final List<_HeaderAction> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    final button = PopupMenuButton<int>(
+      tooltip: '更多',
+      position: PopupMenuPosition.under,
+      onSelected: (i) => actions[i].onPressed?.call(),
+      itemBuilder: (context) => [
+        for (var i = 0; i < actions.length; i++)
+          PopupMenuItem(
+            value: i,
+            enabled: actions[i].onPressed != null,
+            height: 46,
+            child: Row(
+              children: [
+                Icon(
+                  actions[i].icon,
+                  size: 18,
+                  color: actions[i].onPressed == null
+                      ? AppTheme.dim
+                      : AppTheme.text,
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  actions[i].label,
+                  style: TextStyle(
+                    fontSize: AppTheme.tvActionLabel,
+                    color: actions[i].onPressed == null
+                        ? AppTheme.dim
+                        : AppTheme.text,
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+      child: SizedBox(
+        // 与同排的视图切换 / 搜索框同高（44），否则这一带看着像没对齐。
+        height: 44,
+        child: Row(
+          // ⛔ `min`：`Wrap` / `Row` 给子项的约束可能很宽，默认的 `max`
+          // 会让这一个控件撑满整行，把它后面所有东西挤下去。
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              actions.any((a) => a.busy)
+                  ? Icons.hourglass_top_rounded
+                  : Icons.more_horiz_rounded,
+              size: 19,
+              color: AppTheme.muted,
+            ),
+            const SizedBox(width: 5),
+            const Text(
+              '更多',
+              style: TextStyle(
+                fontSize: AppTheme.tvActionLabel,
+                color: AppTheme.muted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    // 补一层焦点提示。这个按钮自己有 `Material`，ink 高亮画得出来，但深色
+    // 主题下那层高亮在电视上太淡 —— 不补的话用户按到「更多」上时屏幕上没有
+    // 任何变化，会以为遥控器失灵（与 `_SortMenu` 同一条理由）。
+    return TvFocusable(borderRadius: BorderRadius.circular(8), child: button);
   }
 }
 
@@ -651,7 +933,16 @@ class _ViewSegment extends StatelessWidget {
 /// 角标数字取自 `countWorksByCategory`（一次 GROUP BY）与
 /// `countPlayedWorks`（一次 COUNT），所以这个部件不会在每次滚动海报墙时重查库。
 class _CategoryBar extends ConsumerWidget {
-  const _CategoryBar();
+  const _CategoryBar({this.leading = const []});
+
+  /// TV 上排在胶囊**左边**的控件（排序 / 筛选）。
+  ///
+  /// 它们与胶囊是同一件事的两半 —— 都在回答「现在列表里显示的是哪些」。
+  /// 分成两条横带（页头一行 + 分类栏一行）会让页头多吃一整行，而
+  /// 960×540 上那一行 50px 直接等于「第二排海报露不出来」。
+  ///
+  /// 桌面上恒为空 —— 那边的页头宽度够，排序 / 筛选留在标题右侧更顺。
+  final List<Widget> leading;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -666,76 +957,86 @@ class _CategoryBar extends ConsumerWidget {
     // 连在一起的一整条，焦点落在哪一个全靠猜。
     final gap = tv ? 10.0 : 6.0;
 
-    return Padding(
-      padding: EdgeInsets.fromLTRB(22, 0, 22, tv ? 8 : 12),
-      child: SizedBox(
-        // TV 上抬到 42：28 是给鼠标的（点一下就到），遥控器上焦点环画不下、
-        // 12sp 的字也读不出来。
-        //
-        // ⚠️ 从 44 收到 42 是**量出来的**：960×540 上页面实得 486 高，
-        // 页头省下的每一像素都直接变成海报墙的可见高度。
-        // 42 装得下 15sp 的字（PingFang 行高约 21）+ 上下各 9 的内边距，
-        // 留 3px 余量给系统字体缩放 —— 44 只是白白多占 2px。
-        height: tv ? 42 : 28,
-        child: Stack(
-          children: [
-            ListView(
-              scrollDirection: Axis.horizontal,
-              children: [
-                _CategoryChip(
-                  label: '全部',
-                  count: total,
-                  selected: filter.category == null && !filter.playedOnly,
-                  onTap: () =>
-                      ref.read(libraryFilterProvider.notifier).setCategory(null),
-                ),
+    final chips = SizedBox(
+      // TV 上抬到 44：28 是给鼠标的（点一下就到），遥控器上焦点环画不下、
+      // 12sp 的字也读不出来。
+      //
+      // ⚠️ 44 是**与左右那两个控件对齐**取的值（`_SortMenu` / 「更多」都是
+      // 44）—— 这一带里三个控件高度不一致的话，折行之后看着像没对齐。
+      // 42 装得下 15sp 的字（PingFang 行高约 21）+ 上下各 11 的内边距。
+      height: tv ? 44 : 28,
+      child: Stack(
+        children: [
+          ListView(
+            scrollDirection: Axis.horizontal,
+            children: [
+              _CategoryChip(
+                label: '全部',
+                count: total,
+                selected: filter.category == null && !filter.playedOnly,
+                onTap: () =>
+                    ref.read(libraryFilterProvider.notifier).setCategory(null),
+              ),
+              SizedBox(width: gap),
+              _CategoryChip(
+                label: '最近播放',
+                icon: Icons.history_rounded,
+                count: played,
+                selected: filter.playedOnly,
+                onTap: () =>
+                    ref.read(libraryFilterProvider.notifier).setPlayedOnly(),
+              ),
+              for (final category in MediaCategory.displayOrder) ...[
                 SizedBox(width: gap),
                 _CategoryChip(
-                  label: '最近播放',
-                  icon: Icons.history_rounded,
-                  count: played,
-                  selected: filter.playedOnly,
-                  onTap: () =>
-                      ref.read(libraryFilterProvider.notifier).setPlayedOnly(),
+                  label: category.label,
+                  count: counts?[category],
+                  selected: filter.category == category,
+                  onTap: () => ref
+                      .read(libraryFilterProvider.notifier)
+                      .setCategory(category),
                 ),
-                for (final category in MediaCategory.displayOrder) ...[
-                  SizedBox(width: gap),
-                  _CategoryChip(
-                    label: category.label,
-                    count: counts?[category],
-                    selected: filter.category == category,
-                    onTap: () => ref
-                        .read(libraryFilterProvider.notifier)
-                        .setCategory(category),
-                  ),
-                ],
               ],
-            ),
-            // TV 上这条分类栏**一定是横向滚动的**（八个胶囊在 580 里排不下），
-            // 而电视上没有滚动条、也没有「半张卡片露在边上」这种通用暗号 ——
-            // 实测用户把它读成「最后一个分类被切坏了」。
-            // 在最右边压一道渐隐，把「还有，往右按」这件事画出来。
-            if (tv)
-              const Positioned(
-                top: 0,
-                right: 0,
-                bottom: 0,
-                width: 40,
-                child: IgnorePointer(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.centerLeft,
-                        end: Alignment.centerRight,
-                        colors: [Color(0x000B0D12), AppTheme.bg],
-                      ),
+            ],
+          ),
+          // TV 上这条分类栏**一定是横向滚动的**（八个胶囊在 580 里排不下），
+          // 而电视上没有滚动条、也没有「半张卡片露在边上」这种通用暗号 ——
+          // 实测用户把它读成「最后一个分类被切坏了」。
+          // 在最右边压一道渐隐，把「还有，往右按」这件事画出来。
+          if (tv)
+            const Positioned(
+              top: 0,
+              right: 0,
+              bottom: 0,
+              width: 40,
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.centerLeft,
+                      end: Alignment.centerRight,
+                      colors: [Color(0x000B0D12), AppTheme.bg],
                     ),
                   ),
                 ),
               ),
-          ],
-        ),
+            ),
+        ],
       ),
+    );
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(22, 0, 22, tv ? 6 : 12),
+      child: leading.isEmpty
+          ? chips
+          : Row(
+              children: [
+                for (final w in leading) ...[w, const SizedBox(width: 12)],
+                // ⛔ 胶囊必须拿 `Expanded`：它们是一条**横向滚动**的列表，
+                // 不夹宽度的话 `ListView` 会向 Row 要无限宽，直接抛异常。
+                Expanded(child: chips),
+              ],
+            ),
     );
   }
 }
@@ -770,9 +1071,10 @@ class _CategoryChip extends StatelessWidget {
         child: Padding(
           padding: EdgeInsets.symmetric(
             horizontal: tv ? 18 : 12,
-            // TV 上 9（原来 11）：分类栏那一格从 44 收到 40 之后，11 会把
-            // 胶囊撑出格子、被 `ListView` 裁掉上下各 2px。9 正好落在 40 里。
-            vertical: tv ? 9 : 6,
+            // TV 上 11（原来是 9）：分类栏那一格从 42 抬到 44 之后，11 让胶囊
+            // 正好填满那一格（21 的字 + 上下各 11 = 43），不再像「浮在格子里
+            // 的一条小带子」；同时与左右两个 44 高的控件（排序 / 更多）对齐。
+            vertical: tv ? 11 : 6,
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -813,9 +1115,10 @@ class _CategoryChip extends StatelessWidget {
       ),
     );
 
-    // TV 上补一圈焦点环。这条 chip 自己有 `Material`，ink 高亮**画得出来**，
+    // TV 上补一层提亮罩。这条 chip 自己有 `Material`，ink 高亮**画得出来**，
     // 但深色主题下那层高亮在电视上太淡 —— 八个 chip 并排时，用户分辨不出
-    // 焦点落在哪一个上。
+    // 焦点落在哪一个上。（罩子是全项目统一的那种焦点语言，不是描边；
+    // 理由见 [TvFocusable] 的类文档。）
     return tv
         ? TvFocusable(borderRadius: BorderRadius.circular(7), child: chip)
         : chip;
@@ -892,8 +1195,8 @@ class _SortMenu extends ConsumerWidget {
       ),
     );
 
-    // TV 上补一圈焦点环。这个按钮自己有 `Material`，ink 高亮画得出来，
-    // 但深色主题下那层高亮在电视上太淡 —— 不补环的话，用户按到「排序」
+    // TV 上补一层提亮罩。这个按钮自己有 `Material`，ink 高亮画得出来，
+    // 但深色主题下那层高亮在电视上太淡 —— 不补的话，用户按到「排序」
     // 上时屏幕上没有任何变化，会以为遥控器失灵。
     return tv
         ? TvFocusable(borderRadius: BorderRadius.circular(8), child: button)
@@ -909,9 +1212,11 @@ class _PosterGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final grid = GridView.builder(
-      // TV 上底边距 28 → 16：那是「滚到底之后留白」用的，而 960×540 上
-      // 页面只有 486 高 —— 多留的 12px 会直接从「第二排卡片能露多少」里扣。
-      padding: EdgeInsets.fromLTRB(22, 4, 22, AppTheme.isTvLayout(context) ? 16 : 28),
+      // TV 上底边距 28 → 16 → **8**：那是「滚到底之后留白」用的，而 960×540
+      // 上整页只有 486 高。这一条是**卡在临界点上**的：卡高 168、行距 18，
+      // 「完整两排」需要 354，而这一版海报墙拿到 378 —— 多留 8px 就正好
+      // 把第二排的底边推出可视区（电视上没有滚动条，用户只会以为「就这几部」）。
+      padding: EdgeInsets.fromLTRB(22, 4, 22, AppTheme.isTvLayout(context) ? 8 : 28),
       gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
         // 用「最大宽度」而不是固定列数：侧栏固定宽 + 窗口可缩放，
         // 固定列数会让宽窗口下的海报被拉成巨幅。
@@ -1141,16 +1446,24 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
       ),
     );
 
-    // 焦点环必须画在**子节点之上**：这张卡片的 InkWell 是全项目唯一一个
+    // 焦点提示必须画在**子节点之上**：这张卡片的 InkWell 是全项目唯一一个
     // 没给自己包 `Material` 的卡片点击区，它的 ink 落到 `Scaffold` 那一层，
     // 而 `_RenderInkFeatures.paint` 是先画 ink、再画子节点 ——
     // 于是高亮被海报整个盖住，**只调主题的 `focusColor` 一点用都没有**。
     // 详见 [TvFocusable] 的类文档。
+    //
+    // ⚠️ 这里底下**没有** ink 高亮兜底，所以焦点完全靠这一层罩子 + 放大 ——
+    // 它是全项目唯一一个 `focusScale` 不为 1 的地方（`library_tv_layout_test`
+    // 用「存在 scale > 1 的 AnimatedScale」当焦点可见的判据）。
     return TvFocusable(
       borderRadius: BorderRadius.circular(10),
       // 1.05 是安全值：卡片约 133×199、网格间距 14/18，
       // 每边只向外溢出 3.3 / 5 px，不会和邻卡重叠。
       focusScale: 1.05,
+      // 海报的 ink 高亮落到 `Scaffold` 那一层、被整张图盖住，所以这里必须
+      // 自己补一层**中性白提亮**。⛔ 不能用强调色 —— 用户明确说不要
+      // 「背景蒙版色」：带颜色的罩子把海报整体染蓝，一屏几十张就是一片脏。
+      brighten: 0.10,
       child: card,
     );
   }

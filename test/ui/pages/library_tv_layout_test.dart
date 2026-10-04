@@ -10,7 +10,6 @@ import 'package:cloudcine/ui/providers/auth_providers.dart';
 import 'package:cloudcine/ui/providers/scan_providers.dart';
 import 'package:cloudcine/ui/theme/app_theme.dart';
 import 'package:cloudcine/ui/widgets/common_widgets.dart';
-import 'package:cloudcine/ui/widgets/tv_affordance.dart';
 import 'package:cloudcine/ui/widgets/tv_focus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -152,77 +151,103 @@ void main() {
     }
   });
 
-  testWidgets('页头每个操作都落在可见区内（遥控器够得到也看得见）', (tester) async {
+  testWidgets('页头与分类栏的每个控件都落在可见区内（遥控器够得到也看得见）',
+      (tester) async {
+    // 页头在 TV 上**不再折行**（见 `_LibraryHeader`）：八个控件被重新分区到
+    // 「页头一带 / 分类栏一带 / 更多菜单」三处。分区之后任何一处算错宽度，
+    // 控件都会跑出内容区 —— 而 `Row` 溢出在 Release 下只是**静静地画到屏幕
+    // 外**：遥控器按得到、屏幕上看不见，用户只会以为遥控器坏了。
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
     try {
       await pumpTvPage(tester);
 
       final frame = tester.getRect(find.byKey(const Key('tv-frame')));
-      final labels = find.byType(TvIconLabel);
-      expect(labels, findsWidgets,
-          reason: 'TV 上纯图标按钮必须补出文字标签，否则用户按下去之前不知道'
-              '会发生什么 —— 而「选择」「刷新」这两个偏偏都只有图标');
 
-      for (var i = 0; i < labels.evaluate().length; i++) {
-        final rect = tester.getRect(labels.at(i));
-        expect(
-          rect.left >= frame.left - 0.5 && rect.right <= frame.right + 0.5,
-          isTrue,
-          reason: '第 $i 个操作按钮横跨 ${rect.left}–${rect.right}，'
-              '而内容区只有 ${frame.left}–${frame.right}。'
-              '跑到区外的控件在电视上就是「按得到但看不见」——'
-              '用户会以为遥控器坏了',
-        );
+      // 页头的控件都在这两个 finder 里：搜索框与「视图切换 / 更多 / 排序 /
+      // 筛选 / 分类胶囊」（后四个都套了 `TvFocusable`）。海报卡也在
+      // `TvFocusable` 里，但它由 `GridView` 自己的宽度约束管着，顺带一起验。
+      final groups = <Finder>[
+        find.byType(HeaderSearchBox),
+        find.byType(TvFocusable),
+      ];
+
+      var checked = 0;
+      for (final group in groups) {
+        for (var i = 0; i < group.evaluate().length; i++) {
+          // 分类胶囊要跳过：八个胶囊在 580 里排不下，它们是**设计上就要横向
+          // 滚动**的，排在后面的几个本来就被 `ListView` 布局到视口之外 ——
+          // 那是「往右按还能看到更多」，不是「跑到区外看不见」。
+          if (inHorizontalScroll(group.evaluate().elementAt(i))) continue;
+
+          final rect = tester.getRect(group.at(i));
+          expect(
+            rect.left >= frame.left - 0.5 && rect.right <= frame.right + 0.5,
+            isTrue,
+            reason: '第 $checked 个控件横跨 ${rect.left}–${rect.right}，'
+                '而内容区只有 ${frame.left}–${frame.right}。'
+                '跑到区外的控件在电视上就是「按得到但看不见」——'
+                '用户会以为遥控器坏了',
+          );
+          checked++;
+        }
       }
+      expect(
+        checked,
+        greaterThanOrEqualTo(3),
+        reason: '页头 / 分类栏 / 海报墙都没渲染出来，这条用例测不到东西',
+      );
     } finally {
       debugDefaultTargetPlatformOverride = null;
     }
   });
 
-  testWidgets('页头只折两行，海报墙拿到六成以上的高度', (tester) async {
-    // 诉求原话是「Android TV 端界面布局混乱」。实测的「乱」长这样
-    // （960×540、页面实得 624×486）：
+  testWidgets('页头只占一带，海报墙拿得下**完整两排**海报', (tester) async {
+    // 诉求原话是「界面整体布局看起来有效空间过小，对于 4k 电视分辨率，
+    // 将布局优化紧凑，重点突出」。实测的「过小」长这样（960×540、页面
+    // 实得 624×486）：
     //
-    //   页头 **284px**（标题独占一行 + 操作区折成三行）
-    //   分类栏  56px
-    //   海报墙 **146px** —— 而一张卡高 166，**连一行都露不全**
+    //   上一版：页头 122 + 分类栏 50 = **172px** 的装饰，
+    //          海报墙只剩 **294px** —— 而一张卡高 168，第二排只能露半个头。
     //
-    // 也就是说屏幕上六成的高度被八个控件吃掉，用户打开媒体库只看到
-    // 半排被切掉的海报。这条用例把「海报墙必须拿到大头」钉住。
+    // 这一版把八个控件重新分区（见 `_LibraryHeader` / `_CategoryBar.leading`），
+    // 页头压到一带。这条用例把「海报墙拿得下两整排」钉住 —— 那是「紧凑」
+    // 唯一有意义的验收口径，光断言「没溢出」是量不出改善的。
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
     try {
       await pumpTvPage(tester);
 
       final frame = tester.getRect(find.byKey(const Key('tv-frame')));
-      final header = tester.getRect(find.byType(PageHeader));
+      final header = tester.getRect(find.byKey(const Key('library-header')));
       final grid = tester.getRect(find.byType(GridView));
 
-      // 标题块现在是 `Wrap` 的第一项，操作区跟在它后面折行 —— 两行就够。
-      // ⛔ 三行不是「差一点」，是「又回到标题独占一行」了：`Wrap` 里任何
-      // 一个子项只要比整行还宽（例如 `Row` 忘了写 `MainAxisSize.min`，
-      // 它会被 `Wrap` 的 `maxWidth: 580` 撑满），后面所有控件都会被挤下去。
+      // ⛔ 80 不是「差一点」的边界，是「又折回两带」的信号：页头一旦折行
+      // （任何一处宽度算错都会），实测回到 110px 以上，海报墙立刻掉到
+      // 装不下两排 —— 而屏幕上看起来只是「第二排海报被切了一半」。
       expect(
         header.height,
-        lessThan(150),
+        lessThan(80),
         reason: '页头占了 ${header.height}px（整页只有 ${frame.height}）。'
-            '标题必须作为 `Wrap` 的第一个块与操作区同排 —— 让它独占一行的话'
-            '实测回到 284px，海报墙只剩 146px。',
+            'TV 上它必须只有**一带**：标题 / 视图切换 / 搜索 / 更多。'
+            '折成两带就会把第二排海报顶出可视区。',
       );
 
       expect(
         grid.height,
-        greaterThan(frame.height * 0.6),
+        greaterThan(frame.height * 0.7),
         reason: '海报墙只有 ${grid.height}px（整页 ${frame.height}）。'
-            '这一页的主体是海报，页头与分类栏加起来不该超过四成。',
+            '这一页的主体是海报，页头与分类栏加起来不该超过三成。',
       );
 
-      // 「看得见一行」是底线，「看得见第二行」才是这一页读起来像海报墙的前提。
+      // 「看得见一行」是底线，「**完整**看得见第二行」才是这一页读起来像
+      // 海报墙的前提 —— 电视上没有滚动条，露半个头的第二排会被读成
+      // 「这个应用把海报切坏了」。
       final card = tester.getRect(find.byType(TvFocusable).last);
       expect(
         grid.height,
-        greaterThan(card.height * 1.6),
+        greaterThan(card.height * 2),
         reason: '卡片高 ${card.height}，海报墙只有 ${grid.height} —— '
-            '露不出完整一行加下一行的开头，用户会以为「就这几部」。',
+            '装不下完整两排。查一下页头 / 分类栏是不是又长高了，'
+            '或者海报网格的底边距（TV 上是 8）被改大了。',
       );
     } finally {
       debugDefaultTargetPlatformOverride = null;
@@ -245,22 +270,22 @@ void main() {
     try {
       await pumpTvPage(tester);
 
-      final labels = find.byType(TvIconLabel);
+      final header = find.byKey(const Key('library-header'));
       final focusables = find.byType(TvFocusable);
-      expect(labels, findsWidgets, reason: '页头那排操作没渲染出来，这条用例测不到东西');
+      expect(header, findsOneWidget, reason: '页头没渲染出来，这条用例测不到东西');
       expect(
         focusables.evaluate().length,
         greaterThanOrEqualTo(3),
-        reason: '分类胶囊与海报卡都是 TvFocusable。少于 3 个说明内容区根本没铺开，'
-            '那样「走得通」是假的',
+        reason: '页头里的「更多」、分类胶囊与海报卡都是 TvFocusable。少于 3 个'
+            '说明内容区根本没铺开，那样「走得通」是假的',
       );
 
-      // 树里第一个 TvFocusable 是分类条上的胶囊、最后一个是海报卡 ——
-      // 分别代表「页头下面那条」与「页面主体」两块。
+      // 分类条上的胶囊、页面主体的海报卡 —— 分别代表「页头下面那条」与
+      // 「页面主体」两块。
       //
-      // ⚠️ 分类条那一项**不能**用 `focusables.first`：页头里的「排序」
+      // ⚠️ 分类条那一项**不能**用 `focusables.first`：页头里的「更多」
       // 也套了 `TvFocusable`（它原本连焦点环都没有），而它在树里更靠前。
-      // 用 `.first` 的话这一条会**悄悄变成在测排序按钮**，仍然全绿 ——
+      // 用 `.first` 的话这一条会**悄悄变成在测「更多」**，仍然全绿 ——
       // 一条不再测它该测的东西的断言比没有更糟。所以按文案定位到「全部」那颗胶囊。
       final firstChip = find
           .ancestor(of: find.text('全部'), matching: find.byType(TvFocusable))
@@ -268,7 +293,10 @@ void main() {
       final hit = await walkReachability(
         tester,
         probes: {
-          '页头': (t) => anyFocusedInside(t, labels),
+          // ⚠️ 页头那一带用 key 而不是 `TvIconLabel`：TV 上「刮削 / 重扫 /
+          // 选择 / 刷新」已经收进「更多」菜单，页头里一个 `TvIconLabel`
+          // 都没有了 —— 拿它当探针会**永远**命中不了。
+          '页头': (t) => focusedInside(t, header),
           '分类条': (t) => focusedInside(t, firstChip),
           '海报墙': (t) => focusedInside(t, focusables.last),
         },
@@ -277,9 +305,10 @@ void main() {
       expect(
         hit[0],
         isTrue,
-        reason: '焦点走不到页头那排操作 —— 那是「刮削 / 重扫 / 选择 / 刷新」的入口，'
-            '够不到等于这些功能在电视上不存在。查一下这一块是不是被 '
-            'ExcludeFocus 包住了（播放页控制栏原来就犯过这个错）',
+        reason: '焦点走不到页头 —— 那里有视图切换、搜索框和「更多」'
+            '（刮削 / 重扫 / 选择 / 刷新的入口）。够不到等于这些功能在电视上'
+            '不存在。查一下这一块是不是被 ExcludeFocus 包住了'
+            '（播放页控制栏原来就犯过这个错）',
       );
       expect(
         hit[1],
@@ -301,16 +330,16 @@ void main() {
     // 上一条证明的是「焦点**走得到**」。而走得到但**看不见焦点在哪**，在电视上
     // 和够不到是同一种坏：用户只能盲按。
     //
-    // 焦点环的显示条件比可达性苛刻：
-    //   `TvFocusable._showRing = _focused && highlightMode == traditional`
+    // 焦点提示的显示条件比可达性苛刻：
+    //   `TvFocusable._showHighlight = _focused && highlightMode == traditional`
     // 而 Android 上 `highlightMode` 默认是 `touch`，**收到第一个按键事件才翻成
-    // traditional**（见 `tv_focus.dart` 的类文档）。所以「焦点环没出现」有两种
+    // traditional**（见 `tv_focus.dart` 的类文档）。所以「焦点提示没出现」有两种
     // 完全不同的原因 —— 焦点没到位，或者档位还没翻 —— 只有断言能区分。
     //
     // 判据取 `AnimatedScale.scale`：全项目**只有海报卡**传了
-    // `focusScale: 1.05`（`library_page.dart:1096`，grep 可证），而它与焦点环
-    // 由同一个 `_showRing` 控制 —— 于是「存在 scale > 1 的 AnimatedScale」
-    // 就等于「焦点环正在画」。
+    // `focusScale: 1.05`（grep `focusScale` 可证），而它与那层提亮罩
+    // 由同一个 `_showHighlight` 控制 —— 于是「存在 scale > 1 的 AnimatedScale」
+    // 就等于「焦点提示正在画」。
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
     try {
       await pumpTvPage(tester);
@@ -324,8 +353,8 @@ void main() {
       expect(
         ringed(),
         findsNothing,
-        reason: '还没按过遥控器就把卡片放大了 —— 焦点环的判据绕过了 '
-            'highlightMode，桌面上鼠标点过的卡片会一直留一圈环',
+        reason: '还没按过遥控器就把卡片放大了 —— 焦点提示的判据绕过了 '
+            'highlightMode，桌面上鼠标点过的卡片会一直留一层亮罩',
       );
 
       final hit = await walkReachability(
@@ -340,8 +369,8 @@ void main() {
         ringed(),
         findsWidgets,
         reason: '焦点已经在海报卡上、也按过键了，却没有一张卡在放大 —— '
-            '焦点环没画出来，电视上用户看不见焦点在哪，只能盲按。'
-            '查 `TvFocusable._showRing` 的两个条件，以及有没有人把 '
+            '焦点提示没画出来，电视上用户看不见焦点在哪，只能盲按。'
+            '查 `TvFocusable._showHighlight` 的两个条件，以及有没有人把 '
             '`focusScale` 改回 1.0',
       );
     } finally {
@@ -361,4 +390,23 @@ void main() {
           '测的是一个不存在的屏幕宽度',
     );
   });
+}
+
+/// 这个控件是不是落在某条**横向滚动列表**里。
+///
+/// 存在的唯一理由是分类胶囊：八个胶囊在 580 里排不下，`ListView` 会把排在
+/// 后面的几个**布局到视口之外**（往右按才滚出来）。那是设计如此，
+/// 不是「跑到区外看不见」—— 「每个控件都在可见区内」那条断言必须跳过它们，
+/// 否则它会一直红，而界面完全正常。
+bool inHorizontalScroll(Element element) {
+  var hit = false;
+  element.visitAncestorElements((a) {
+    final w = a.widget;
+    if (w is Scrollable && w.axisDirection == AxisDirection.right) {
+      hit = true;
+      return false;
+    }
+    return true;
+  });
+  return hit;
 }

@@ -154,13 +154,19 @@ class LocalStreamRelay implements StreamRelay {
       session.start();
 
       final uri = Uri.parse('http://127.0.0.1:${server.port}/$token');
+      // ⚠️ **token 必须进日志**：播放器打开失败时报的是它自己的原话
+      // 「Failed to open http://127.0.0.1:43617/s1.」—— 那个 `s1` 就是这里的
+      // token。少了它，日志里只有一串「已接管 <片名>」，事后无从判断报错指向
+      // 哪一条会话（同一次播放会建多条），只能靠顺序猜。入口 URL 一起打出来，
+      // 是为了把「端口 + 路径」与屏幕上的报错逐字对上。
       diag.info(
         '中继',
-        '已接管 ${label ?? ticket.redactedUrl}：'
+        '已接管 $token ${label ?? ticket.redactedUrl}：'
         '${(total / 1073741824).toStringAsFixed(2)} GiB，'
         '$connections 连接 × ${(chunkSize / 1048576).round()} MiB 块，'
         '预取 ${(prefetchBytes / 1048576).round()} MiB'
-        '${startOffset > 0 ? "，起点 ${(startOffset / 1048576).round()} MiB" : ""}',
+        '${startOffset > 0 ? "，起点 ${(startOffset / 1048576).round()} MiB" : ""}'
+        '｜入口 $uri',
       );
       return RelayEndpoint(uri: uri, token: token, contentLength: total);
     } catch (e) {
@@ -185,21 +191,51 @@ class LocalStreamRelay implements StreamRelay {
   void _onRequest(HttpRequest request) {
     final token = _tokenOf(request);
     if (token == null) {
-      _notFound(request);
+      _notFound(request, reason: '路径里没有会话标识');
       return;
     }
     // HLS 会话（转码档）走另一条服务路径：播放列表要改写、分片要透传。
     final hls = _hlsSessions[token];
     if (hls != null) {
+      // 分片请求一次播放有几百条，逐条记会把日志冲垮 —— 只记这条会话的
+      // **第一个**请求，用来回答「播放器到底连上中继没有」。之后的总量由
+      // [close] 以「上游请求 N 次，失败 M 次」落一条。
+      if (!hls.sawRequest) {
+        hls.sawRequest = true;
+        diag.debug(
+          '中继',
+          'HLS 会话 $token 收到首个请求：${request.method} ${request.uri.path}',
+        );
+      }
       unawaited(_serveHls(request, hls));
       return;
     }
     final session = _sessions[token];
     if (session == null) {
-      _notFound(request);
+      _notFound(request, reason: '会话不存在（已关闭或从未建立）');
       return;
     }
-    unawaited(_serve(request, session, ++_readerSeq));
+    // ⚠️ **这一条是「播放器报 Failed to open 127.0.0.1」的分水岭。**
+    //
+    // 有它 = 请求确实到了中继，故障在中继下游（上游取块失败 / 我们回错了）；
+    // 没有它 = 播放器压根没连进来（端口不通 / 会话被提前关掉 / 地址发错）。
+    // 这两种故障今天的日志长得**一模一样**，事后无从区分。
+    //
+    // 字节流会话的读取器只有个位数（mpv 开几条连接就是几条），逐条记 debug
+    // 不会淹掉日志；量大的 HLS 那条路已经按会话去重。
+    final reader = ++_readerSeq;
+    diag.debug(
+      '中继',
+      '会话 $token 收到读取器 #$reader：${request.method} '
+      '${request.uri.path}${_describeRange(request)}',
+    );
+    unawaited(_serve(request, session, reader));
+  }
+
+  /// 把请求里的 `Range` 头整理成日志片段（没有就返回空串）。
+  static String _describeRange(HttpRequest request) {
+    final range = request.headers.value(HttpHeaders.rangeHeader);
+    return range == null ? '' : '（Range: $range）';
   }
 
   /// 回一条 404。中继上「token 不认识」就是这个意思 —— 会话已关 / 从没建过。
@@ -208,7 +244,18 @@ class LocalStreamRelay implements StreamRelay {
   /// 而播放窗口的 `isHttp4xxLog` **只看正文里的状态码**，分不出它来自中继。
   /// 所以「换源时先关旧会话」会引出一条假的「直链过期」——见
   /// `player_window_app._prepareSource` 里关于关闭时机的说明。
-  void _notFound(HttpRequest request) {
+  ///
+  /// ⚠️ **必须记日志**。上面那条「假的直链过期」正是最难查的一类：播放器只报
+  /// 一句 `Failed to open http://127.0.0.1:PORT/sN.`，而中继这边原来一声不吭
+  /// —— 事后无法区分「请求没来」与「来了但被 404 掉」。落 warn 是因为它几乎
+  /// 总是异常：正常换源时，旧会话的连接是**已被占住的存量连接**，不会再来新
+  /// 请求。
+  void _notFound(HttpRequest request, {required String reason}) {
+    diag.warn(
+      '中继',
+      '拒绝 ${request.method} ${request.uri.path}：$reason'
+      '（当前活跃会话 ${_sessions.length} 条 + HLS ${_hlsSessions.length} 条）',
+    );
     request.response
       ..statusCode = HttpStatus.notFound
       ..headers.set(HttpHeaders.contentLengthHeader, 0);
@@ -277,8 +324,9 @@ class LocalStreamRelay implements StreamRelay {
       );
       diag.info(
         '中继',
-        '已接管 $name（HLS 转码档）：播放列表与分片都改走 127.0.0.1，'
-        '避开本机 http_proxy（那个代理会让 ffmpeg 用上未放行的 httpproxy 协议）',
+        '已接管 $token $name（HLS 转码档）：播放列表与分片都改走 127.0.0.1，'
+        '避开本机 http_proxy（那个代理会让 ffmpeg 用上未放行的 httpproxy 协议）'
+        '｜入口 $entry',
       );
       return RelayEndpoint(
         uri: entry,
@@ -333,7 +381,16 @@ class LocalStreamRelay implements StreamRelay {
       if (up.statusCode != HttpStatus.ok &&
           up.statusCode != HttpStatus.partialContent) {
         session.failures++;
-        diag.debug('中继', 'HLS 上游 ${up.statusCode}：${upstream.path}');
+        // ⚠️ warn 而不是 debug：健康的会话**永远**走不到这里，所以它一旦出现
+        // 就是真问题（最常见是 `Video-Auth` Cookie 没带上 —— 夸克换了 HLS 之后
+        // 取分片全靠它，缺了就是 4xx）。落 debug 会让「转码档播不了」在现场
+        // 日志里彻底消失，而分片请求量大、逐条记又必须有个上界，取 warn 正好：
+        // 正常时零条，出故障时才成片出现。
+        diag.warn(
+          '中继',
+          'HLS 会话 ${session.label} 上游返回 ${up.statusCode}：'
+          '${upstream.path}（已失败 ${session.failures} 次）',
+        );
         await up.drain<void>();
         response
           ..statusCode = HttpStatus.badGateway
@@ -419,12 +476,31 @@ class LocalStreamRelay implements StreamRelay {
     int reader,
   ) async {
     final response = request.response;
+    // 实际写进响应体的字节数。**只有这里统计得到** —— 播放器报
+    // `Failed to open` 时，「一个字节都没发出」与「发了几百 MiB 才断」是
+    // 完全不同的两种故障；而 [session.stats] 里的 `downloadedBytes` 是
+    // **上游取回**的字节数，两者不是一回事。
+    var delivered = 0;
+    var aborted = false;
+    // 已经单独记过原因的分支（416）：别让 finally 再补一条「0 字节」的 warn，
+    // 同一件事记两遍只会让现场日志更难读。
+    var explained = false;
     try {
       final total = session.totalLength;
       final requested =
           parseRangeHeader(request.headers.value(HttpHeaders.rangeHeader), total);
       final range = clampRange(requested ?? ByteRange(0, total - 1), total);
       if (range == null) {
+        // 成因只有一个：请求的范围完全落在流长度之外（拿旧会话的长度去读
+        // 新流时会出现）。它是 416 而不是 404，但播放器同样只报一句
+        // `Failed to open`，所以必须自己留下痕迹。
+        diag.warn(
+          '中继',
+          '会话 ${session.token} 拒绝读取器 #$reader：Range 超出流长度'
+          '（流长 $total 字节，请求 '
+          '${request.headers.value(HttpHeaders.rangeHeader) ?? "无"}）',
+        );
+        explained = true;
         response
           ..statusCode = HttpStatus.requestedRangeNotSatisfiable
           ..headers.set('content-range', 'bytes */$total')
@@ -452,9 +528,30 @@ class LocalStreamRelay implements StreamRelay {
       // 长度已知，不要分块编码 —— mpv 对 chunked 的流无法做范围估算。
       response.headers.chunkedTransferEncoding = false;
 
+      // 响应头发出**之前**记一条：事后能看到「我们答应了给哪一段、答应了多少
+      // 字节」。播放器打不开时，这是判断「中继回错了没有」的唯一依据 ——
+      // 响应一旦开始发，头就收不回来了。
+      diag.debug(
+        '中继',
+        '会话 ${session.token} 读取器 #$reader → ${response.statusCode} '
+        '${formatContentRange(range, total)}',
+      );
+
+      var firstChunk = true;
       if (request.method != 'HEAD') {
         await for (final bytes in session.read(range, reader)) {
+          if (firstChunk) {
+            firstChunk = false;
+            // 「首块已下发」= 上游确实取到数据了。没有这一条、播放器却仍报
+            // Failed to open，问题就不在中继 —— 它连第一个字节都没能给出。
+            diag.debug(
+              '中继',
+              '会话 ${session.token} 读取器 #$reader 首块已下发'
+              '（${bytes.length} 字节）',
+            );
+          }
           response.add(bytes);
+          delivered += bytes.length;
           // 每块刷一次：不 flush 的话数据会攒在 dart:io 的缓冲里，
           // mpv 那边就是「缓冲条不动、等半天才突然涨一截」。
           await response.flush();
@@ -463,11 +560,24 @@ class LocalStreamRelay implements StreamRelay {
     } catch (e) {
       // 客户端断开（mpv seek 时会直接掐掉旧连接）是最常见的正常退出，
       // 不是错误。只记 debug，别惊动用户。
+      aborted = true;
       diag.debug('中继', '响应中断（通常是播放器换源/seek）：$e');
     } finally {
       // 当前读取器走了必须让位，否则锚点再没人推动、窗口冻在原地。
       session.release(reader);
       await response.close().catchError((Object _) {});
+
+      // ⚠️ 「一个字节都没发出」**升级成 warn**：这正是播放器报
+      // `Failed to open <中继地址>` 的直接机制 —— ffmpeg 拿到了响应头却读不到
+      // 任何数据，无法识别容器格式，于是判定「打不开」。原来它和「正常换源掐断
+      // 连接」共用同一条 debug，这类故障在现场日志里会彻底消失。
+      final summary = '会话 ${session.token} 读取器 #$reader 结束：'
+          '已下发 $delivered 字节${aborted ? '（连接中断）' : ''}';
+      if (delivered == 0 && !explained) {
+        diag.warn('中继', '$summary ← 一个字节都没发出，播放器可能因此报 Failed to open');
+      } else {
+        diag.debug('中继', summary);
+      }
     }
   }
 
@@ -580,6 +690,10 @@ class _HlsRelaySession {
 
   /// 脱敏后的来源标签，供诊断显示。
   final String label;
+
+  /// 是否已经收到过**第一个**请求。分片请求一次播放有几百条，只记第一条 ——
+  /// 见 [LocalStreamRelay._onRequest] 里 HLS 那一支。
+  bool sawRequest = false;
 
   /// 上游请求次数 / 失败次数。只用于关闭时落一条日志（也回答「这次换档到底
   /// 有没有真的走中继」）。

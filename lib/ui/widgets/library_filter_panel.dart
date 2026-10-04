@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../providers/library_providers.dart';
 import '../theme/app_theme.dart';
+import 'tv_focus.dart';
 
 /// 右上角的「筛选」按钮，点开是贴在它下面的年份 / 类型两组多选。
 ///
@@ -111,7 +112,14 @@ class _FilterButton extends ConsumerWidget {
     // 否则只会觉得「怎么少了好多片子」。
     final color = active ? AppTheme.accent : AppTheme.muted;
 
-    return Tooltip(
+    // TV 上这一颗与同排的「排序」/ 分类胶囊是**同一带**里的控件
+    // （见 `library_page.dart` 的 `_CategoryBar.leading`），所以尺寸必须对齐：
+    // 19px 图标 + 15sp 字 + 上下各 11 = 43，正好落进那一带 44 高的格子里。
+    // 沿用桌面那套（15px 图标 / 12sp 字 / 上下 6）会让它在那一带里明显矮一截，
+    // 看着像没对齐。
+    final tv = AppTheme.isTvLayout(context);
+
+    final button = Tooltip(
       message: '按年份 / 类型 / 刮削状态筛选',
       child: Material(
         color: active
@@ -122,26 +130,29 @@ class _FilterButton extends ConsumerWidget {
           onTap: onTap,
           borderRadius: BorderRadius.circular(8),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            padding: EdgeInsets.symmetric(
+              horizontal: tv ? 14 : 8,
+              vertical: tv ? 11 : 6,
+            ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(Icons.tune_rounded, size: 15, color: color),
-                const SizedBox(width: 5),
+                Icon(Icons.tune_rounded, size: tv ? 19 : 15, color: color),
+                SizedBox(width: tv ? 8 : 5),
                 Text(
                   '筛选',
                   style: TextStyle(
-                    fontSize: 12,
+                    fontSize: tv ? AppTheme.tvActionLabel : 12,
                     fontWeight: active ? FontWeight.w600 : FontWeight.w400,
                     color: color,
                   ),
                 ),
                 if (active) ...[
-                  const SizedBox(width: 5),
+                  SizedBox(width: tv ? 8 : 5),
                   Text(
                     '$selected',
                     style: TextStyle(
-                      fontSize: 10.5,
+                      fontSize: tv ? 13 : 10.5,
                       color: AppTheme.accent.withValues(alpha: 0.85),
                     ),
                   ),
@@ -152,6 +163,13 @@ class _FilterButton extends ConsumerWidget {
         ),
       ),
     );
+
+    if (!tv) return button;
+
+    // TV 上补一层焦点提示。这个按钮自己有 `Material`，ink 高亮画得出来，
+    // 但深色主题下那层高亮在电视上太淡 —— 不补的话它与旁边**有**提示的
+    // 「排序」并排时会显得「按了没反应」（与 `_SortMenu` 同一条理由）。
+    return TvFocusable(borderRadius: BorderRadius.circular(8), child: button);
   }
 }
 
