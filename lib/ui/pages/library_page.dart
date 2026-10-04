@@ -299,9 +299,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
                   icon: const Icon(Icons.radar_rounded, size: 17),
                 ),
               ),
-              const SizedBox(width: 8),
               const _ViewSwitch(),
-              const SizedBox(width: 8),
               HeaderSearchBox(
                 controller: _search,
                 onChanged: _onSearchChanged,
@@ -309,11 +307,8 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
                 // 侧栏的「文件夹」页，它只筛当前这一层，是另一回事。
                 hint: '搜片名或文件名…',
               ),
-              const SizedBox(width: 8),
               const _SortMenu(),
-              const SizedBox(width: 4),
               const LibraryFilterButton(),
-              const SizedBox(width: 4),
               // 「选择」是一个**模式开关**，不是一次动作：点它进入多选，
               // 之后点卡片才是勾选。做成常驻按钮而不是长按 / 右键才出的
               // 隐藏入口，是因为电视上既没有右键也没有可靠的长按。
@@ -672,41 +667,72 @@ class _CategoryBar extends ConsumerWidget {
     final gap = tv ? 10.0 : 6.0;
 
     return Padding(
-      padding: const EdgeInsets.fromLTRB(22, 0, 22, 12),
+      padding: EdgeInsets.fromLTRB(22, 0, 22, tv ? 8 : 12),
       child: SizedBox(
-        // TV 上抬到 44：28 是给鼠标的（点一下就到），遥控器上焦点环画不下、
+        // TV 上抬到 42：28 是给鼠标的（点一下就到），遥控器上焦点环画不下、
         // 12sp 的字也读不出来。
-        height: tv ? 44 : 28,
-        child: ListView(
-          scrollDirection: Axis.horizontal,
+        //
+        // ⚠️ 从 44 收到 42 是**量出来的**：960×540 上页面实得 486 高，
+        // 页头省下的每一像素都直接变成海报墙的可见高度。
+        // 42 装得下 15sp 的字（PingFang 行高约 21）+ 上下各 9 的内边距，
+        // 留 3px 余量给系统字体缩放 —— 44 只是白白多占 2px。
+        height: tv ? 42 : 28,
+        child: Stack(
           children: [
-            _CategoryChip(
-              label: '全部',
-              count: total,
-              selected: filter.category == null && !filter.playedOnly,
-              onTap: () =>
-                  ref.read(libraryFilterProvider.notifier).setCategory(null),
+            ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                _CategoryChip(
+                  label: '全部',
+                  count: total,
+                  selected: filter.category == null && !filter.playedOnly,
+                  onTap: () =>
+                      ref.read(libraryFilterProvider.notifier).setCategory(null),
+                ),
+                SizedBox(width: gap),
+                _CategoryChip(
+                  label: '最近播放',
+                  icon: Icons.history_rounded,
+                  count: played,
+                  selected: filter.playedOnly,
+                  onTap: () =>
+                      ref.read(libraryFilterProvider.notifier).setPlayedOnly(),
+                ),
+                for (final category in MediaCategory.displayOrder) ...[
+                  SizedBox(width: gap),
+                  _CategoryChip(
+                    label: category.label,
+                    count: counts?[category],
+                    selected: filter.category == category,
+                    onTap: () => ref
+                        .read(libraryFilterProvider.notifier)
+                        .setCategory(category),
+                  ),
+                ],
+              ],
             ),
-            SizedBox(width: gap),
-            _CategoryChip(
-              label: '最近播放',
-              icon: Icons.history_rounded,
-              count: played,
-              selected: filter.playedOnly,
-              onTap: () =>
-                  ref.read(libraryFilterProvider.notifier).setPlayedOnly(),
-            ),
-            for (final category in MediaCategory.displayOrder) ...[
-              SizedBox(width: gap),
-              _CategoryChip(
-                label: category.label,
-                count: counts?[category],
-                selected: filter.category == category,
-                onTap: () => ref
-                    .read(libraryFilterProvider.notifier)
-                    .setCategory(category),
+            // TV 上这条分类栏**一定是横向滚动的**（八个胶囊在 580 里排不下），
+            // 而电视上没有滚动条、也没有「半张卡片露在边上」这种通用暗号 ——
+            // 实测用户把它读成「最后一个分类被切坏了」。
+            // 在最右边压一道渐隐，把「还有，往右按」这件事画出来。
+            if (tv)
+              const Positioned(
+                top: 0,
+                right: 0,
+                bottom: 0,
+                width: 40,
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        colors: [Color(0x000B0D12), AppTheme.bg],
+                      ),
+                    ),
+                  ),
+                ),
               ),
-            ],
           ],
         ),
       ),
@@ -744,7 +770,9 @@ class _CategoryChip extends StatelessWidget {
         child: Padding(
           padding: EdgeInsets.symmetric(
             horizontal: tv ? 18 : 12,
-            vertical: tv ? 11 : 6,
+            // TV 上 9（原来 11）：分类栏那一格从 44 收到 40 之后，11 会把
+            // 胶囊撑出格子、被 `ListView` 裁掉上下各 2px。9 正好落在 40 里。
+            vertical: tv ? 9 : 6,
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -801,7 +829,8 @@ class _SortMenu extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final sort = ref.watch(libraryFilterProvider).sort;
-    return PopupMenuButton<WorkSort>(
+    final tv = AppTheme.isTvLayout(context);
+    final button = PopupMenuButton<WorkSort>(
       tooltip: '排序方式',
       initialValue: sort,
       position: PopupMenuPosition.under,
@@ -810,39 +839,65 @@ class _SortMenu extends ConsumerWidget {
         for (final option in WorkSort.values)
           PopupMenuItem(
             value: option,
-            height: 34,
+            height: tv ? 46 : 34,
             child: Row(
               children: [
                 Icon(
                   option == sort
                       ? Icons.check_rounded
                       : Icons.check_box_outline_blank,
-                  size: 14,
+                  size: tv ? 18 : 14,
                   color: option == sort ? AppTheme.accent : Colors.transparent,
                 ),
                 const SizedBox(width: 8),
                 Text(
                   option.label,
-                  style: const TextStyle(fontSize: 12.5, color: AppTheme.text),
+                  style: TextStyle(
+                    fontSize: tv ? AppTheme.tvActionLabel : 12.5,
+                    color: AppTheme.text,
+                  ),
                 ),
               ],
             ),
           ),
       ],
       child: SizedBox(
-        height: 32,
+        // TV 上抬到 44：页头那一行里其余控件（按钮 48 / 搜索框 44 / 分段
+        // 控件 44）都是这个量级，32 会让排序这一块**明显矮一截**，
+        // 折行之后那一行看着像没对齐。
+        height: tv ? 44 : 32,
         child: Row(
+          // ⛔ **必须 `min`**。`Wrap` 给子项的约束是 `maxWidth = 整行宽`
+          // （`RenderWrap` 用的是 `BoxConstraints(maxWidth: …)`，不是无界），
+          // 而 `Row` 默认 `MainAxisSize.max` —— 于是这一项会**撑满整行 580**，
+          // 把它自己和后面所有控件都挤到下一行去。实测：页头因此从 2 行
+          // 变成 4 行（284 → 234 白改），而症状只是「排序莫名其妙换行了」。
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.swap_vert_rounded, size: 15, color: AppTheme.muted),
+            Icon(
+              Icons.swap_vert_rounded,
+              size: tv ? 19 : 15,
+              color: AppTheme.muted,
+            ),
             const SizedBox(width: 5),
             Text(
               sort.label,
-              style: const TextStyle(fontSize: 12, color: AppTheme.muted),
+              style: TextStyle(
+                fontSize: tv ? AppTheme.tvActionLabel : 12,
+                color: AppTheme.muted,
+              ),
             ),
           ],
         ),
       ),
     );
+
+    // TV 上补一圈焦点环。这个按钮自己有 `Material`，ink 高亮画得出来，
+    // 但深色主题下那层高亮在电视上太淡 —— 不补环的话，用户按到「排序」
+    // 上时屏幕上没有任何变化，会以为遥控器失灵。
+    return tv
+        ? TvFocusable(borderRadius: BorderRadius.circular(8), child: button)
+        : button;
   }
 }
 
@@ -854,7 +909,9 @@ class _PosterGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final grid = GridView.builder(
-      padding: const EdgeInsets.fromLTRB(22, 4, 22, 28),
+      // TV 上底边距 28 → 16：那是「滚到底之后留白」用的，而 960×540 上
+      // 页面只有 486 高 —— 多留的 12px 会直接从「第二排卡片能露多少」里扣。
+      padding: EdgeInsets.fromLTRB(22, 4, 22, AppTheme.isTvLayout(context) ? 16 : 28),
       gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
         // 用「最大宽度」而不是固定列数：侧栏固定宽 + 窗口可缩放，
         // 固定列数会让宽窗口下的海报被拉成巨幅。

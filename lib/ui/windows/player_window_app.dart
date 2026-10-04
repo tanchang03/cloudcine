@@ -7,7 +7,6 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
-import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../core/diagnostics/diag_log.dart';
@@ -15,16 +14,17 @@ import '../../core/utils/cookie_parser.dart';
 import '../../core/utils/format.dart';
 import '../../core/utils/hls_playlist.dart';
 import '../../core/utils/mpv_cache_state.dart';
-import '../../core/utils/mpv_chapters.dart';
 import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
 import '../../core/utils/player_audio_effect.dart';
-import '../../core/utils/player_buffer_config.dart';
 import '../../core/utils/player_buffer_progress.dart';
-import '../../core/utils/player_subtitle_config.dart';
 import '../../core/utils/seek_acceleration.dart';
 import '../../core/utils/text_encoding.dart';
+import '../../core/utils/track_bridge.dart';
 import '../../core/utils/track_labels.dart';
+import '../../data/playback/fvp_playback_engine.dart';
+import '../../data/playback/media_kit_playback_engine.dart';
+import '../../data/stream/dolby_vision_probe.dart';
 import '../../data/stream/local_stream_relay.dart';
 import '../../domain/adapters/stream_relay.dart';
 import '../../domain/entities/playback_preference.dart';
@@ -33,17 +33,19 @@ import '../../domain/services/cache_speed_meter.dart';
 import '../../domain/services/episode_queue.dart';
 import '../../domain/services/intro_marker.dart';
 import '../../domain/services/intro_session.dart';
-import '../../domain/services/playback_completion.dart';
-import '../../domain/services/playback_media.dart';
-import '../../domain/services/playback_resume.dart';
 import '../../domain/services/missing_media.dart';
+import '../../domain/services/playback_completion.dart';
+import '../../domain/services/playback_engine.dart';
+import '../../domain/services/playback_engine_router.dart';
+import '../../domain/services/playback_resume.dart';
 import '../theme/app_theme.dart';
 import '../widgets/anchored_menu.dart';
 import '../widgets/buffered_slider.dart';
-import '../widgets/player_keys.dart';
-import '../widgets/tv_text.dart';
 import '../widgets/missing_media_dialog.dart';
 import '../widgets/now_playing_bars.dart';
+import '../widgets/playback_surface.dart';
+import '../widgets/player_keys.dart';
+import '../widgets/tv_text.dart';
 import 'child_window_channel.dart';
 import 'player_protocol.dart';
 import 'player_window_bridge.dart';
@@ -98,8 +100,31 @@ class PlayerWindowApp extends StatefulWidget {
 class _PlayerWindowAppState extends State<PlayerWindowApp> {
   final TextEditingController _urlController = TextEditingController();
 
-  Player? _player;
-  VideoController? _controller;
+  /// 默认内核（media_kit）。**`verboseLog` 必须为 true** —— 见 [_ensurePlayer]。
+  ///
+  /// ⚠️ 它**只服务 mpv 专有能力**：诊断面板读原生属性（`track-list` /
+  /// `demuxer-cache-state`），以及音效（`af` / `audio-channels`）。
+  /// 起播、切轨、挂字幕、跳章节一律走 [_engine] —— 绕开契约去直接调 mpv 会让
+  /// 「清晰度要重取链」「外挂字幕要先解码」这类业务规则被绕过，而且换到 fvp
+  /// 内核之后那些调用会打在**一个已经停掉的**播放器上。
+  MediaKitPlaybackEngine? _mkEngine;
+
+  /// 内核路由。**选哪个内核**这件事只有一份实现
+  /// （见 `PlaybackEngineRouter`）—— 与内置播放页共用。
+  PlaybackEngineRouter? _router;
+
+  /// 杜比视界探测（惰性建：只有真的开流时才用得上）。
+  ///
+  /// 与内置播放页**各自持有一个实例**是有意的：两个播放器跑在两个 Flutter
+  /// 引擎里，进程内不共享对象。缓存是「同一个窗口内别重复探同一条流」，
+  /// 跨窗口重探一次（一次 256 KiB 的 Range 请求）完全可以接受。
+  final DolbyVisionProbe _dvProbe = DolbyVisionProbe();
+
+  /// 当前内核。`null` = 还没建（窗口刚打开）或已经释放。
+  PlaybackEngine? get _engine => _router?.engine;
+
+  /// mpv 实例。**只给 mpv 专有能力用**（见 [_mkEngine]）。
+  Player? get _player => _mkEngine?.player;
 
   /// 片头跳过状态机。两个播放器（内置播放页、独立窗口）共用 [IntroSession]，
   /// 状态转移只在它里面写一份 —— 否则会漂移成「内置页跳得对、独立窗口跳得怪」，
@@ -219,6 +244,26 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 「已经出过画、播到一半卡住了」。两者都要显示加载指示，但来源不同。
   bool _buffering = false;
 
+  /// 播放头位置。
+  ///
+  /// ## 为什么要有它，而不是各处去读 `player.state.position`
+  ///
+  /// 原来满窗口都在读 `_player!.state.position` —— 那是**内核自己的**状态，
+  /// 只有 media_kit 有。换内核之后那个字段就不存在了（fvp 那边只有
+  /// `VideoPlayerValue`），所以位置必须由契约的 `position` 流搬进本类。
+  ///
+  /// ⚠️ 新鲜度**没有损失**：mpv 的 `state.position` 本来就是它内部订阅同一个
+  /// 属性流时更新的，两者同一节拍（约 10 Hz）。别为了「更准」再回去读内核。
+  ///
+  /// ⚠️ 它**不触发重建**（位置流每 100ms 一条，setState 会让整个播放器每秒
+  /// 重建十次）。要实时跟手的地方用 `StreamBuilder` 订阅 `engine.position`
+  /// （见 [_buildSeekBar]），本字段只服务「按下按键那一刻读一次」这类场景。
+  Duration _position = Duration.zero;
+
+  /// 总时长。来源同 [_position]。时长未知时是 0（不是 null）——
+  /// 与 mpv / mdk 两边的口径一致，判据统一写成 `> Duration.zero`。
+  Duration _duration = Duration.zero;
+
   /// 是否正在等第一帧 —— 也就是「画面还是黑的」那段时间。
   ///
   /// 光靠 [_busy] 盖不住它：`Player.open()` **不等文件加载完成**（见
@@ -272,7 +317,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   void _scheduleHlsSettleCheck() {
     _hlsSettleTimer?.cancel();
     _hlsSettleTimer = null;
-    if (!mounted || _player == null) return;
+    if (!mounted || _engine == null) return;
     if (!(_currentRequest?.isHls ?? false)) return;
     _hlsSettleTimer = Timer(hlsSettleDelay, () {
       _hlsSettleTimer = null;
@@ -359,12 +404,6 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// [_cacheBytesPerSecond] 的估算值。解析见 [rawInputBytesPerSecond]。
   double? _netBytesPerSecond;
 
-  /// 轮询 `demuxer-cache-state` 的计时器。
-  ///
-  /// 用轮询而不是 `observeProperty`：这个属性是 node 类型、变更通知不保证发，
-  /// 而 1 Hz 读一个字符串的代价可以忽略。
-  Timer? _netSpeedTimer;
-
   /// 当前**可信**的缓存倍速。
   double? get _currentCacheRate {
     final at = _cacheRateAt;
@@ -425,8 +464,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 还没返回时就到了，那时 `_busy` 是 true。
   bool _refreshing = false;
 
-  /// mpv 的流订阅。释放时要显式取消。
+  /// **mpv 专有**的流订阅（日志尾巴、诊断）。释放时要显式取消。
+  ///
+  /// 与 [_engineSubs] 分开是有意的：这一份挂在 `MediaKitPlaybackEngine.player`
+  /// 上，**换内核时不动**（它是诊断素材，与当前在播的内核无关）；
+  /// 而 [_engineSubs] 每次换内核都必须重接（契约的流广播且不重放）。
   final List<StreamSubscription<Object?>> _subs = [];
+
+  /// **契约**的事件订阅。**换内核时必须整批重接**（见 [_bindEngine]）。
+  final List<StreamSubscription<Object?>> _engineSubs = [];
 
   // -------------------------------------------------------------------
   // 音轨 / 字幕
@@ -538,7 +584,6 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 已经在拆了。测试里则会表现成「A Timer is still pending」。
     _hideTimer?.cancel();
     _playlistUnmountTimer?.cancel();
-    _netSpeedTimer?.cancel();
     _hlsSettleTimer?.cancel();
     _playlistController.dispose();
     // 关掉中继服务本体（含监听端口与所有会话）。只关当前会话是不够的：
@@ -569,7 +614,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   // 释放
   // -------------------------------------------------------------------
 
-  /// 停止播放并释放 mpv。**幂等**。
+  /// 停止播放并释放两个内核。**幂等**。
   ///
   /// 三条路都会走到这里，而且它们会互相重叠（关窗通知 + dispose 常常
   /// 前后脚发生），所以必须幂等 —— 重复 `dispose()` 一个已释放的 [Player]
@@ -577,33 +622,38 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// **不调用 `setState`**：它可能从 `dispose()` 里被调到。
   Future<void> _releasePlayer() async {
-    final player = _player;
-    if (player == null) return;
-    _player = null;
-    _controller = null;
+    final router = _router;
+    if (router == null) return;
+    _router = null;
+    _mkEngine = null;
     _currentRequest = null;
     _refreshing = false;
     _refreshGuard.reset();
-    // 轮询也该停：播放器马上就没了，继续读只会每秒白跑一次。
-    _netSpeedTimer?.cancel();
-    _netSpeedTimer = null;
 
     // 先取消订阅：否则 dispose 过程中还可能触发一次进度回报，
     // 而那会在通道上打一条指向已释放播放器的消息。
-    for (final sub in _subs) {
+    //
+    // ⚠️ 契约订阅（[_engineSubs]）也要一起取消 —— 两个内核的事件流都会在
+    // `dispose()` 里被 close，留着订阅会在关闭时抛。
+    for (final sub in [..._subs, ..._engineSubs]) {
       await sub.cancel();
     }
     _subs.clear();
+    _engineSubs.clear();
 
     try {
       // 先 stop 再 dispose：stop 会释放解码器与网络连接，
       // 让 dispose 之后的清理更快、更干净。
-      await player.stop();
+      //
+      // ⚠️ 先停**当前**内核：DV 片源上它就是 fvp，而 `router.dispose()` 只会
+      // dispose 两个内核（mdk 那条路上「停住」与「销毁」不是一回事）。
+      await router.engine.stop();
     } catch (_) {
       // 引擎可能已经在拆了。停不下来不影响下一步的 dispose。
     }
     try {
-      await player.dispose();
+      // 两个内核一起释放（路由自己知道有几个）。
+      await router.dispose();
       diag.info('播放窗口', '已释放播放器（stop + dispose）');
     } catch (e) {
       diag.warn('播放窗口', '释放播放器失败：$e');
@@ -815,118 +865,168 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     setState(() => _checks = checks);
   }
 
-  /// 惰性建播放器。
+  /// 惰性建内核与路由。
   ///
   /// 两条硬约束（都是踩过的坑）：
-  ///   1. `VideoController` 必须绑定到**正在播放的那个** [Player]，不能另建一个；
+  ///   1. 渲染句柄必须绑定到**正在播放的那个**播放器实例，不能另建一个
+  ///      （`MediaKitPlaybackEngine` 的构造函数里就是这么做的，见那边的注释）；
   ///   2. 必须在任何 `open()` 之前建出来。
   /// 违反任一条的表现都是「有声音、进度条在走，但画面全黑，且不报错」。
+  ///
+  /// ⚠️ 第 1 条在**换内核**之后仍然成立：DV 片源切到 fvp 时，渲染句柄也跟着
+  /// 换成 fvp 那个（见 `PlaybackSurface`），不会出现「解码在新内核、出画在旧
+  /// 内核」——那正是上面那个症状。
   void _ensurePlayer() {
-    if (_player != null) return;
-    // ⚠️ 必须把日志级别抬到 `warn`。这不是「顺手多要点日志」，而是过期检测的
-    // **必要条件** —— 完整实测记录见 [isHttp4xxLog] 的文档。
+    if (_router != null) return;
+
+    // ⚠️ `verboseLog: true` 是**必要条件**，不是「顺手多要点日志」——
+    // 完整实测记录见 [isHttp4xxLog] 的文档。
     //
     // 一句话：`mpv_request_log_messages` 的语义是「该级别**及以上严重**的消息
     // 才发」，而实测 `HTTP error 403` 是 **warn** 级（比 error 轻）。media_kit
     // 默认是 `MPVLogLevel.error`，那条消息**根本不会被发送到 Dart**。
     //
-    // 抬到 warn 只影响 `stream.log` 的流量（warn 级本来就很少），
-    // `stream.error` 完全不受影响：media_kit 仍然只挑 `level == 'error'` 的。
-    final player = Player(
-      configuration: PlayerConfiguration(
-        logLevel: MPVLogLevel.warn,
-        // 独立播放窗口只存在于桌面（`supportsMultiWindow` 已排除 Android），
-        // 所以永远是桌面那一套。
-        bufferSize: PlayerBufferConfig.bufferSizeFor(tv: false),
-        // ⚠️ 缺了它 media_kit 会把 `sub-visibility` 设成 `no`：**所有**字幕
-        // 都不显示且不报错（`stream.track` 照常回报 `sid=1`）。位图字幕
-        // （PGS）更是没有任何替代路径 —— Flutter 层的 `SubtitleView` 只吃
-        // 纯文本。原因见 `player_subtitle_config.dart`。
-        libass: PlayerSubtitleConfig.useLibass,
-      ),
-    );
-    // 先记下来：万一下一行抛异常，dispose 也还能回收这个原生实例。
-    _player = player;
-    _controller = VideoController(
-      player,
-      configuration: const VideoControllerConfiguration(
-        enableHardwareAcceleration: true,
-      ),
+    // 抬到 warn 只影响日志流的流量（warn 级本来就很少），`error` 流完全不受
+    // 影响：media_kit 仍然只挑 `level == 'error'` 的。
+    //
+    // 缓冲参数与 `libass` 那两条开关都在引擎的构造函数里（它们曾经长在这里，
+    // 搬进引擎是为了让「两个播放器的 mpv 配置」只有一份）。
+    //
+    // 独立播放窗口只存在于桌面（`supportsMultiWindow` 已排除 Android），
+    // 所以 `tv` 永远是 false。
+    final engine = MediaKitPlaybackEngine(tv: false, verboseLog: true);
+    _mkEngine = engine;
+    _router = PlaybackEngineRouter(
+      defaultEngine: engine,
+      // ⚠️ 这两项必须与 `main.dart` 里的 `fvp.registerWith` **同一个判据**。
+      // 少了 `registerWith`，fvp 的 macOS 平台实现不会注册，DV 片源会照常
+      // 走官方那套栈 —— 也就是「偏绿，且不报任何错」。
+      dolbyVisionEngine: Platform.isMacOS ? FvpPlaybackEngine.new : null,
+      dolbyVisionProbe: Platform.isMacOS ? _dvProbe.probe : null,
+      logTag: '播放窗口',
     );
 
-    // 补 media_kit 构造参数管不到的 mpv 缓冲属性（demuxer-readahead-secs）。
-    unawaited(PlayerBufferConfig.apply(player, tv: false));
+    _bindEngine(_router!.engine);
+
+    // mpv 的**原始**日志尾巴（带 level / prefix）。
+    //
+    // ## 为什么这条不走契约的 `log` 流
+    //
+    // 契约的 `log` 是 `Stream<String>`，服务的是**业务过滤器**（字幕解码诊断、
+    // 直链过期）。而尾巴是**诊断面板的原始素材**，它唯一的消费者
+    // [_dumpPlaybackDiagnostics] 本身就是 100% mpv 的（读 `track-list` /
+    // `demuxer-cache-state` 这些 mpv 属性）。丢掉 level 与 prefix 会让
+    // 「哪一子系统报的、多严重」在日志里消失，而那正是排查时要看的东西。
+    //
+    // 代价是换到 fvp 内核后这条流会静默（mpv 已经停了）—— 那没关系：
+    // mdk 本来就没有日志通道，DV 片源上这份尾巴注定是空的。
+    _subs.add(engine.player.stream.log.listen(_appendMpvLog));
+  }
+
+  /// 把订阅接到 [engine] 上。**换内核时必须重新接** —— 契约的流都是广播且
+  /// **不重放**（见 `PlaybackEngine` 的类文档），晚一步这一整集就收不到任何
+  /// 事件，表现是「画面在动，但进度条、音轨菜单、暂停按钮全是死的」。
+  void _bindEngine(PlaybackEngine engine) {
+    for (final s in _engineSubs) {
+      unawaited(s.cancel());
+    }
+    _engineSubs.clear();
 
     // 进度回报。挂在 `position` 上而不是用计时器：位置流本身就是「播到哪了」
     // 的唯一真相，用计时器反而要在暂停时额外判断。
-    _subs.add(
-      player.stream.position.listen((position) {
+    _engineSubs.add(
+      engine.position.listen((position) {
+        _position = position;
         unawaited(_onPosition(position));
       }),
     );
 
-    // 播放错误。mpv 的报错很笼统（`Failed to open ...`），但对用户来说
+    // 「出画了」的信号。**三个都听，取先到的那个**：
+    //
+    //   - `videoSize`：内核要解出第一帧才能定输出格式，所以它是**最准**的
+    //     「有画面了」；
+    //   - `duration` / `position`：兜底。不是每种流都会触发 video reconfig
+    //     （比如纯音频），只认那一个的话加载指示会永远挂在屏幕上。
+    //
+    // 代价是最多早收一两秒（duration 通常在解码开始前就已知），但
+    // 「永远不收」比「早收」糟得多。
+    _engineSubs.add(
+      engine.videoSize.listen((size) {
+        if (!size.hasVideo) return;
+        _clearAwaitingFrame();
+        // ⚠️ 这一位是「播完」护栏的证据（见 [PlaybackCompletion]），
+        // **不能**用 `_awaitingFrame` 代替它 —— 后者也会被
+        // `duration` / `position` 清掉，而那两者纯音频流同样会给，
+        // 于是「有声音没画面」会被误记成「出过画面」。
+        _sawVideoFrame = true;
+      }),
+    );
+    _engineSubs.add(
+      engine.duration.listen((d) {
+        if (d == _duration) return;
+        _duration = d;
+        if (d > Duration.zero) _clearAwaitingFrame();
+      }),
+    );
+    _engineSubs.add(
+      engine.position.listen((p) {
+        if (p > Duration.zero) _clearAwaitingFrame();
+      }),
+    );
+
+    // 播放错误。内核的报错很笼统（`Failed to open ...`），但对用户来说
     // 「播不了」这个结论是准确的 —— 具体原因看诊断日志。
     //
     // ⚠️ 这里**不只是记日志**：网盘直链是带签名的临时 URL，过期后的表现正是
-    // 一条 mpv 报错（拖进度条会重新发 Range 请求，所以最常见的症状是
+    // 一条报错（拖进度条会重新发 Range 请求，所以最常见的症状是
     // 「播到一半一拖就报错」）。
     //
     // 但这条路只是过期检测的**一半**：它拿到的是二级症状（`Failed to open`），
-    // 一级证据（HTTP 4xx）走下面那条 `stream.log`。两者分工见 [isHttp4xxLog]。
-    _subs.add(
-      player.stream.error.listen((msg) {
+    // 一级证据（HTTP 4xx）走下面那条 `log`。两者分工见 [isHttp4xxLog]。
+    _engineSubs.add(
+      engine.error.listen((msg) {
         unawaited(_onPlayerError(msg));
       }),
     );
 
-    // mpv 的日志。这条订阅是过期检测的另一半：
+    // 内核日志。这条订阅是过期检测的另一半：
     //
-    // `stream.error` 看不到最直接的那条证据（`http: HTTP error 4xx`），
+    // `error` 流看不到最直接的那条证据（`http: HTTP error 4xx`），
     // 原因是**级别**（实测它是 warn，而 media_kit 默认只请求 error）叠加上
     // media_kit 自己的前缀过滤。详见 [isHttp4xxLog] 顶部的实测记录。
     //
-    // 不能改成「把 `stream.error` 的口径放宽」—— 那条消息**根本没进来**，
-    // 放宽也够不着。
-    //
-    // ⚠️ 这条订阅能不能收到东西，取决于 `_ensurePlayer` 里把日志级别抬到了
-    // `warn`。两处是**配套**的，改一处必须改另一处。
-    _subs.add(
-      player.stream.log.listen((entry) {
-        // ⚠️ **先**进缓冲，再走下面的过滤器。
-        //
-        // 顺序不能反：下面那条路只认两种消息（字幕、HTTP 4xx），其余全丢。
-        // 而「转码档有声音没画面」这类故障的原因就在被丢掉的那批里 ——
-        // 不先存下来就永远看不到 mpv 到底说了什么。
-        _appendMpvLog(entry);
+    // ⚠️ 它能不能收到东西，取决于 `_ensurePlayer` 里 `verboseLog: true`。
+    // 两处是**配套**的，改一处必须改另一处。
+    _engineSubs.add(
+      engine.log.listen((text) {
         // ⚠️ 字幕消息要**先分流**，不能混进下面那条「直链过期」的路：
         // 字幕解不开跟直链没有半点关系，走进去只会白白刷一次链
         // （刷完还是解不开，而用户会看到画质档位莫名其妙地跳了一下）。
         //
-        // 它也不能靠 `stream.error` 那条路兜底 —— 那句话里既没有 `failed`
+        // 它也不能靠 `error` 那条路兜底 —— 那句话里既没有 `failed`
         // 也没有 `error`，详见 [isSubtitleDiagnosticLog]。
-        if (isSubtitleDiagnosticLog(entry.text)) {
-          diag.warn('播放窗口', 'mpv 字幕：${redactUrls(entry.text)}');
+        if (isSubtitleDiagnosticLog(text)) {
+          diag.warn('播放窗口', '内核字幕：${redactUrls(text)}');
           return;
         }
-        if (!isHttp4xxLog(entry.text)) return;
-        unawaited(_onTicketExpiryLog(entry));
+        if (!isHttp4xxLog(text)) return;
+        unawaited(_onTicketExpiryLog(text));
       }),
     );
 
     // 播放/暂停状态。控制栏那个按钮要跟着它变 —— 否则会一直显示
     // 「播放」而实际在播放，语义正好反过来。
-    _subs.add(
-      player.stream.playing.listen((playing) {
+    _engineSubs.add(
+      engine.playing.listen((playing) {
         if (!mounted || _playing == playing) return;
         setState(() => _playing = playing);
       }),
     );
 
-    // 缓冲状态。播到一半缓存见底时 mpv 会自己停下来等数据，画面是静止的 ——
+    // 缓冲状态。播到一半缓存见底时内核会自己停下来等数据，画面是静止的 ——
     // 不告诉用户「在等」，他只会以为播放器卡死了。
-    _subs.add(
-      player.stream.buffering.listen((buffering) {
+    _engineSubs.add(
+      engine.buffering.listen((buffering) {
         if (!mounted || _buffering == buffering) return;
         setState(() => _buffering = buffering);
       }),
@@ -940,8 +1040,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     //
     // 速度算不出来时**保留上一次的值**：返回 null 只是「这一拍样本不够」，
     // 清成 0 会让数字一格一格地闪，比一直显示同一个旧值更难看。
-    _subs.add(
-      player.stream.buffer.listen((end) {
+    _engineSubs.add(
+      engine.bufferEnd.listen((end) {
         final rate = _cacheMeter.accept(end);
         if (!mounted) return;
         setState(() {
@@ -956,96 +1056,115 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     );
 
     // 初始填充的百分比。见 [_cacheFill] 那条注释：只在 0~100 之间时可信。
-    _subs.add(
-      player.stream.bufferingPercentage.listen((percent) {
+    _engineSubs.add(
+      engine.bufferingPercentage.listen((percent) {
         if (!mounted) return;
         setState(() => _cacheFill = percent);
-      }),
-    );
-
-    // 「出画了」的信号。**三个都听，取先到的那个**：
-    //
-    //   - `videoParams`：mpv 要解出第一帧才能定输出格式，所以它是**最准**的
-    //     「有画面了」；
-    //   - `duration` / `position`：兜底。不是每种流都会触发 video reconfig
-    //     （比如纯音频），只认那一个的话加载指示会永远挂在屏幕上。
-    //
-    // 代价是最多早收一两秒（duration 通常在解码开始前就已知），但
-    // 「永远不收」比「早收」糟得多。
-    _subs.add(
-      player.stream.videoParams.listen((params) {
-        if ((params.w ?? 0) > 0) {
-          _clearAwaitingFrame();
-          // ⚠️ 这一位是「播完」护栏的证据（见 [PlaybackCompletion]），
-          // **不能**用 `_awaitingFrame` 代替它 —— 后者也会被
-          // `duration` / `position` 清掉，而那两者纯音频流同样会给，
-          // 于是「有声音没画面」会被误记成「出过画面」。
-          _sawVideoFrame = true;
-        }
-      }),
-    );
-    _subs.add(
-      player.stream.duration.listen((d) {
-        if (d > Duration.zero) _clearAwaitingFrame();
-      }),
-    );
-    _subs.add(
-      player.stream.position.listen((p) {
-        if (p > Duration.zero) _clearAwaitingFrame();
       }),
     );
 
     // 音轨与内嵌字幕轨的清单。
     //
     // 这是「菜单里到底有哪些选项」的唯一来源，而它在容器解析完之前是空的，
-    // 所以必须**持续听**，不能在 `open()` 之后读一次 `state.tracks` 了事 ——
+    // 所以必须**持续听**，不能在 `open()` 之后读一次内核状态了事 ——
     // 那样菜单会永远空着。
-    _subs.add(player.stream.tracks.listen(_onTracks));
+    _engineSubs.add(engine.tracks.listen(_onTracks));
 
-    // 当前选中的轨。切轨成功与否只能由 mpv 说了算（见 [_activeAudioId]）。
-    _subs.add(player.stream.track.listen(_onTrackSelection));
+    // 当前选中的轨。切轨成功与否只能由内核说了算（见 [_activeAudioId]）。
+    _engineSubs.add(
+      engine.activeAudioTrackId.listen((id) {
+        if (!mounted) return;
+        setState(() => _activeAudioId = id == null ? null : '$id');
+      }),
+    );
+    _engineSubs.add(
+      engine.activeSubtitleTrackId.listen((id) {
+        if (!mounted) return;
+        // 内核回报的当前字幕轨也落一条。它和 [_onTracks] 那条配合起来能把
+        // 「字幕出不来」拆成三种，而不是笼统一句「没字幕」：
+        //   1. 清单有、这里始终没有 → 我们的切轨没生效；
+        //   2. 清单有、这里也有 → 内核确实选中了，问题在解码/渲染
+        //      （最典型：本机 libmpv 缺 `pgssub` 解码器）；
+        //   3. 这里来回跳 → 有东西在跟我们抢字幕轨。
+        if (id != _activeSubtitleId) {
+          diag.info('播放窗口', '内核回报当前字幕轨：${id ?? "无"}');
+        }
+        setState(() => _activeSubtitleId = id);
+      }),
+    );
 
     // 一集播完（EOF）。自动连播的触发信号：订阅它、在回调里找下一集。
     //
-    // ⚠️ 必须在 `_ensurePlayer` 里注册，而不是在 `open()` 之后读一次
-    // `state.completed` —— 那样只会拿到「上一条流是不是播完了」的旧值，新流
-    // 刚开时它往往还是 true（media_kit 不会自动归零），于是会**立刻**触发一次
-    // 「连播」，把用户刚点开的这集秒切到下一集。
-    _subs.add(
-      player.stream.completed.listen((completed) {
+    // ⚠️ 必须在这里注册，而不是在 `open()` 之后读一次内核的完成状态 ——
+    // 那样只会拿到「上一条流是不是播完了」的旧值，新流刚开时它往往还是 true
+    // （media_kit 不会自动归零），于是会**立刻**触发一次「连播」，
+    // 把用户刚点开的这集秒切到下一集。
+    _engineSubs.add(
+      engine.completed.listen((completed) {
         if (completed) unawaited(_onCompleted());
+      }),
+    );
+
+    // 实时输入速率。**轮询本体在引擎里**（原来长在这个窗口里，1 Hz 读
+    // `demuxer-cache-state`）—— 搬进去是为了让两个播放器只有一份读数。
+    //
+    // 能力缺失时（mdk 没有对等物，见 [EngineCapabilities.networkSpeed]）
+    // 这条流永不发，于是 [_netBytesPerSecond] 一直是 null，界面自动退回估算值。
+    _engineSubs.add(
+      engine.networkSpeed.listen((bytes) {
+        if (!mounted) return;
+        // 值没变就不 setState：1 Hz 的重建虽然便宜，但没必要。
+        if (bytes == _netBytesPerSecond) return;
+        setState(() => _netBytesPerSecond = bytes);
       }),
     );
   }
 
-  /// 轨道清单变了。只存真实的那些（合成轨见 [TrackLabels.realTracks]）。
-  void _onTracks(Tracks tracks) {
+  /// 轨道清单变了。
+  ///
+  /// 契约里的清单**已经过滤过合成轨**（media_kit 那两条 `auto` / `no` 由
+  /// `MediaKitPlaybackEngine.mapTracks` 剔掉，mdk 给的本来就是真轨道号），
+  /// 所以这里不再需要 [TrackLabels.realTracks] 那一道 —— 但**菜单仍然吃
+  /// media_kit 的类型**，所以这里过一次 [TrackBridge] 转过去。
+  /// 理由（为什么不改菜单的类型）见 `TrackBridge` 的类文档。
+  void _onTracks(EngineTracks tracks) {
     if (!mounted) return;
-    final subs = TrackLabels.realTracks(tracks.subtitle, (t) => t.id);
+
+    final audio = <AudioTrack>[
+      for (final t in tracks.audio) TrackBridge.audio(t),
+    ];
+    final subs = <SubtitleTrack>[
+      for (final t in tracks.subtitle) TrackBridge.subtitle(t),
+    ];
 
     // 内嵌字幕清单落一条日志。**这是「字幕出不来」的第一分诊点**：
     //   - 这里就是「无」→ 根本没识别到轨道（容器/文件名的问题）；
     //   - 这里有轨道、菜单也能选中，但画面没字 → 解码/渲染的问题，
-    //     接着看 `mpv 字幕：…`（见 [isSubtitleDiagnosticLog]）。
+    //     接着看 `内核字幕：…`（见 [isSubtitleDiagnosticLog]）。
     // 没有这一条，两种故障在日志里长得一模一样，只能靠猜。
-    final inventory = subs
+    //
+    // ⚠️ 编解码器短名（`subrip` / `hdmv_pgs_subtitle`）正是这条日志的**关键
+    // 那一列** —— 位图字幕解不开与文本字幕解不开是两回事。它现在走契约的
+    // `EngineTrack.codec`（两个内核给的都是 FFmpeg 短名，口径一致）。
+    final inventory = tracks.subtitle
         .map((t) => '${t.id}/${t.codec ?? "-"}/${t.language ?? "-"}'
-            '${t.isDefault == true ? "/默认" : ""}')
+            '${t.isDefault ? "/默认" : ""}')
         .join('，');
     if (inventory != _loggedSubtitleInventory) {
       _loggedSubtitleInventory = inventory;
       diag.info(
         '播放窗口',
-        '内嵌字幕轨 ${subs.length} 条：${subs.isEmpty ? "无" : inventory}',
+        '内嵌字幕轨 ${tracks.subtitle.length} 条：'
+        '${tracks.subtitle.isEmpty ? "无" : inventory}',
       );
     }
 
     setState(() {
-      _audioTracks = TrackLabels.realTracks(tracks.audio, (t) => t.id);
+      _audioTracks = audio;
       _embeddedSubtitles = subs;
     });
 
-    // 轨道清单刚到手 —— 这是还原音轨 / 内嵌字幕的**唯一**时机：mpv 给每条轨
+    // 轨道清单刚到手 —— 这是还原音轨 / 内嵌字幕的**唯一**时机：内核给每条轨
     // 编的号只有这时才知道，而偏好里存的是特征（见 `TrackPreference`），
     // 必须拿真实清单去比。
     unawaited(_restoreFromPreference());
@@ -1061,16 +1180,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 把 [_pref] 记着的音轨与字幕套回这次播放。
   ///
-  /// 跑在 `stream.tracks` 的回调里（见 [_onTracks]），因为**只有那一刻**才知道
-  /// mpv 给每条轨编的号；而偏好里存的是特征，必须拿真实清单去比
+  /// 跑在轨道流的回调里（见 [_onTracks]），因为**只有那一刻**才知道内核给每条
+  /// 轨编的号；而偏好里存的是特征，必须拿真实清单去比
   /// （见 `TrackPreference` 的类文档）。
   ///
   /// 音轨与字幕各只尝试一次（[_audioRestored] / [_subtitleRestored]）：那个流
   /// 在换流与切轨时都会再发一遍，无闸的话用户刚手动切完就被顶回偏好里那一条
   /// —— 表现是「切了没反应」，而日志里一切正常。
   Future<void> _restoreFromPreference() async {
-    final player = _player;
-    if (player == null || !mounted) return;
+    final engine = _engine;
+    if (engine == null || !mounted) return;
     final pref = _pref;
 
     if (!_audioRestored && _audioTracks.isNotEmpty) {
@@ -1080,8 +1199,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         [
           for (var i = 0; i < _audioTracks.length; i++)
             TrackPreference(
-              // 音轨 id 直接用 mpv 的（`aid`）。两个播放器报的都是同一套号，
-              // 口径天然一致，不需要加来源前缀。
+              // 音轨 id 直接用内核的轨道号（mpv 的 `aid` / mdk 的 stream index）。
+              // 两个内核报的都是**容器里的流号**，口径天然一致，不需要加来源
+              // 前缀 —— 而内置播放页存的也是同一个口径（见 `TrackBridge`）。
               trackId: _audioTracks[i].id,
               language: _audioTracks[i].language,
               title: _audioTracks[i].title,
@@ -1091,10 +1211,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       );
       if (index != null) {
         diag.info('播放窗口', '按上次的选择还原音轨：${_audioTracks[index].id}');
-        await player.setAudioTrack(_audioTracks[index]);
+        // `int.parse` 而不是 `tryParse`：[TrackBridge] 的 id 就是轨道号本身，
+        // 解析不了说明上游契约被改坏了，应当炸出来而不是静默不切轨。
+        await engine.selectAudioTrack(int.parse(_audioTracks[index].id));
       } else if (pref.audio != null) {
         // 匹配不上就**什么都不做**：那说明这一集没有那条轨（换了集、或者换了
-        // 片源版本）。让 mpv 用它自己的默认（发布者标了 `default` 的那条）
+        // 片源版本）。让内核用它自己的默认（发布者标了 `default` 的那条）
         // 比我们硬套一条语言都对不上的更对。
         diag.info(
           '播放窗口',
@@ -1110,14 +1232,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     if (!pref.subtitlesEnabled) {
       _subtitleRestored = true;
       _clearExternalSubtitle();
-      await player.setSubtitleTrack(SubtitleTrack.no());
+      await engine.selectSubtitleTrack(null);
       diag.info('播放窗口', '按上次的选择保持字幕关闭');
       return;
     }
 
     final sub = pref.subtitle;
     if (sub == null) {
-      // 没记过具体某一条 → 交给 mpv 自己的默认，别多此一举。
+      // 没记过具体某一条 → 交给内核自己的默认，别多此一举。
       _subtitleRestored = true;
       return;
     }
@@ -1129,11 +1251,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     if (cloudFileId != null) {
       _subtitleRestored = true;
       diag.info('播放窗口', '按上次的选择还原网盘字幕：$cloudFileId');
-      await _applySubtitleChoice(player, _SubtitleChoice.cloud(cloudFileId));
+      await _applySubtitleChoice(_SubtitleChoice.cloud(cloudFileId));
       return;
     }
 
-    // 内嵌轨：清单得先到。没到就**不落闸**，等下一次 `stream.tracks`。
+    // 内嵌轨：清单得先到。没到就**不落闸**，等下一次轨道回报。
     if (_embeddedSubtitles.isEmpty) return;
     _subtitleRestored = true;
     final index = TrackPreference.bestIndex(
@@ -1160,9 +1282,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     }
     diag.info('播放窗口', '按上次的选择还原内嵌字幕：${_embeddedSubtitles[index].id}');
     _clearExternalSubtitle();
-    await player.setSubtitleTrack(
-      SubtitleTrack(_embeddedSubtitles[index].id, null, null),
-    );
+    await engine.selectSubtitleTrack(int.parse(_embeddedSubtitles[index].id));
   }
 
   /// 偏好里那条字幕如果是**网盘字幕**，返回它的 `fileId`；否则返回 `null`。
@@ -1235,34 +1355,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     }
   }
 
-  /// 当前选中的轨变了。
-  ///
-  /// 字幕那条要判 `int.tryParse`：media_kit 用 `SubtitleTrack.no()`（id 是
-  /// 字符串 `'no'`）表示「字幕关着」，它不是轨道号。
-  void _onTrackSelection(Track selection) {
-    if (!mounted) return;
-    final subId = int.tryParse(selection.subtitle.id);
-
-    // mpv 回报的当前字幕轨也落一条。它和 [_onTracks] 那条配合起来能把
-    // 「字幕出不来」拆成三种，而不是笼统一句「没字幕」：
-    //   1. 清单有、这里始终没有 → 我们的 `setSubtitleTrack` 没生效；
-    //   2. 清单有、这里也有 → mpv 确实选中了，问题在解码/渲染
-    //      （最典型：本机 libmpv 缺 `pgssub` 解码器）；
-    //   3. 这里来回跳 → 有东西在跟我们抢 `sid`。
-    if (subId != _activeSubtitleId) {
-      diag.info('播放窗口', 'mpv 回报当前字幕轨：${selection.subtitle.id}');
-    }
-
-    setState(() {
-      _activeAudioId = selection.audio.id;
-      _activeSubtitleId = subId;
-    });
-  }
-
   /// 第一帧已经出来了 —— 收掉加载指示。
   ///
   /// 换流那条路（[_switching]）也由它收：两者的「有画面了」信号是同一批
-  /// （见 [_ensurePlayer] 里 `videoParams` / `duration` / `position` 那三条订阅）。
+  /// （见 [_bindEngine] 里 `videoSize` / `duration` / `position` 那三条订阅）。
   void _clearAwaitingFrame() {
     if (!mounted) return;
     if (!_awaitingFrame && !_switching) return;
@@ -1331,13 +1427,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 播放 / 暂停。单击画面与控制栏那个按钮都走这里。
   ///
-  /// 图标立刻按「已切换」更新：真状态仍以 `stream.playing` 为准，但那条流要
-  /// 等 mpv 回话，光靠它按钮会慢半拍 —— 用户点了没反应就会再点一次。
+  /// 图标立刻按「已切换」更新：真状态仍以 `playing` 流为准，但那条流要等内核
+  /// 回话，光靠它按钮会慢半拍 —— 用户点了没反应就会再点一次。
   void _togglePlay() {
-    final player = _player;
-    if (player == null) return;
+    final engine = _engine;
+    if (engine == null) return;
     setState(() => _playing = !_playing);
-    unawaited(player.playOrPause());
+    unawaited(engine.playOrPause());
   }
 
   // -------------------------------------------------------------------
@@ -1378,11 +1474,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// `_currentRequest` 的 itemId 已经变了，写进去会让**下一集**顶着这一集的
   /// 片头区间跳。所以用 itemId 挡一下竞态（与内置播放页同一处判断）。
   Future<void> _probeIntro() async {
-    final player = _player;
-    if (player == null) return;
+    final engine = _engine;
+    if (engine == null) return;
     final itemId = _currentRequest?.itemId;
-    final marker = await MpvChapters.detectIntro(
-      player,
+    // 章节的**读法**两个内核不同（mpv 读 `chapter-list` 属性 / mdk 查
+    // `MediaInfo.chapters`），但都由契约的 `chapters()` 收口；而**认片头**
+    // 与那几条诊断日志只有一份（`IntroMarkerDetector.detectAndLog`）——
+    // 与内置播放页共用，否则两边会漂移成「这边跳得对、那边跳得怪」。
+    final marker = IntroMarkerDetector.detectAndLog(
+      IntroMarkerDetector.fromEngineChapters(await engine.chapters()),
       label: _currentRequest?.title ?? '',
     );
     if (!mounted || _currentRequest?.itemId != itemId) return;
@@ -1412,6 +1512,18 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 存在的唯一目的就是拿到那一行。
   Future<void> _dumpPlaybackDiagnostics(String reason) async {
     diag.warn('播放窗口', '──── 播放异常诊断：$reason ────');
+
+    // ⚠️ 这一整段**只对 mpv 有效**：它读的是 mpv 的原生属性，而 fvp 那边
+    // 没有对等物（`EngineCapabilities.rawProperty` 就是 false）。所以在 DV
+    // 片源上会看到「读不到」—— 那不是故障，是这条诊断路的**已知边界**。
+    // 说清楚比留一串看不懂的 `<读不到>` 强：否则下一个人会去查一个不存在的 bug。
+    if (_engine is! MediaKitPlaybackEngine) {
+      diag.warn(
+        '播放窗口',
+        '  当前内核不是 media_kit（杜比视界片源会走 fvp），'
+        '下面的 mpv 属性读的是**空闲的** mpv 实例，不代表正在播的那条流',
+      );
+    }
 
     final platform = _player?.platform;
     if (platform is! NativePlayer) {
@@ -1613,9 +1725,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 播放窗口自己在疯狂换片。
     //
     // 判据本体在 [PlaybackCompletion]（纯函数，两个播放器共用）。
-    final state = _player?.state;
-    final position = state?.position ?? Duration.zero;
-    final duration = state?.duration ?? Duration.zero;
+    //
+    // ⚠️ 位置与时长读的是**我们自己**的状态（由契约的流搬进来），不是内核的
+    // 状态字段 —— 后者只有 media_kit 有。契约已经统一了口径，所以判据不用改。
+    final position = _position;
+    final duration = _duration;
     final realEnd = PlaybackCompletion.isRealEnd(
       position: position,
       sawVideo: _sawVideoFrame,
@@ -1704,7 +1818,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         PlaybackProgressReport(
           itemId: itemId,
           position: due,
-          duration: _player?.state.duration ?? Duration.zero,
+          duration: _duration,
         ).toJson(),
       );
     } catch (e) {
@@ -1760,11 +1874,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     await _refreshTicket(reason: safe);
   }
 
-  /// `stream.log` 上发现了 HTTP 4xx —— 直链过期的**一级证据**。
+  /// 内核日志里发现了 HTTP 4xx —— 直链过期的**一级证据**。
   ///
   /// 与 [_onPlayerError] 的分工见 [isHttp4xxLog]。
-  Future<void> _onTicketExpiryLog(PlayerLog entry) async {
-    final safe = redactUrls(entry.text);
+  ///
+  /// ⚠️ 参数是**纯文本**（契约的 `log` 流是 `Stream<String>`），所以这里不再
+  /// 打 mpv 那条日志的 `prefix`。那不是信息损失：完整行（含 level / prefix）
+  /// 仍然在 [_mpvLogTail] 里，出事时由 [_dumpPlaybackDiagnostics] 整段落盘。
+  Future<void> _onTicketExpiryLog(String text) async {
+    final safe = redactUrls(text);
 
     if ((_currentRequest?.itemId ?? '').isEmpty) {
       // 没有库记录（内置自检视频 / 手输直链）→ 无从刷新，也不会连刷，
@@ -1772,7 +1890,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       //
       // **刻意不弹提示**：没有库记录时用户本来也只能自己换一条链，
       // 他会在画面上直接看到播不动。
-      diag.warn('播放窗口', '直链疑似过期（${entry.prefix}）：$safe');
+      diag.warn('播放窗口', '直链疑似过期：$safe');
       return;
     }
 
@@ -1784,7 +1902,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 而真正有信息量的是 [_refreshTicket] 那行
     // 「请求刷新直链：… 原因：…」—— 它同时说了「发生了什么」和「我们打算怎么办」，
     // 而且一次故障只打一条（冷却窗口收掉回声）。
-    diag.debug('播放窗口', '直链疑似过期（${entry.prefix}）：$safe');
+    diag.debug('播放窗口', '直链疑似过期：$safe');
 
     // 转码档（HLS）报 4xx 是**另一码事**：它的地址不带签名，鉴权靠 cookie，
     // 而 4xx 在这里既可能是 cookie 不对、也可能是分片取不到。刷新直链
@@ -1815,9 +1933,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       return;
     }
 
-    // 位置要在重开**之前**取：报错之后 mpv 的 position 可能已经归零，
+    // 位置要在重开**之前**取：报错之后内核报的位置可能已经归零，
     // 那样刷新会把用户丢回片头。
-    final position = _player?.state.position ?? request.startPosition;
+    //
+    // 引擎都还没建（还没开过流）时才退回请求里带的续播点。
+    final position = _engine == null ? request.startPosition : _position;
 
     if (manual) {
       // 手动刷新清空计数，但**照样重新起冷却**：手动刷新也会招来旧流那批
@@ -1900,10 +2020,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // ⚠️ 顺序不能反：主窗口紧接着要读这个库算新流的续播点。写在读之前，
     // 「切走再切回来」才能续上；写晚了，切回来就是从头开始 —— 而用户在
     // 同一个窗口里来回切集时，那条路的进度本来只存在于这张表里。
-    await _reportProgress(
-      _player?.state.position ?? Duration.zero,
-      force: true,
-    );
+    await _reportProgress(_position, force: true);
 
     try {
       final raw = await playerWindowChannel.invokeMethod<Object?>(
@@ -2265,12 +2382,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
             : IntroMarker.fromMilliseconds(req.introStartMs, req.introEndMs),
         enabled: req?.skipIntro ?? false,
       );
-      // 输入速率从换源那一刻起重新采（上一条流的数字不能带过来）。
+      // 输入速率的采样起点由引擎自己管：它在 `open()` 里重起 1 Hz 轮询
+      // （换源那一刻起重新采，上一条流的数字不会带过来）。
       //
-      // ⚠️ 必须放在 `_ensurePlayer()` **之后**：播放器建不出来时
-      // （`flutter test` 里就是如此，libmpv 不在 rpath 里）不该留下一个
-      // 永远在跑的计时器 —— 那会变成「A Timer is still pending」。
-      _startNetSpeedPolling();
       // ⚠️ 请求头必须带上。夸克直链缺 Cookie 一律返回 412，
       // 表现是「能取到链、一播就报错」，而错误信息里看不出是缺头。
       //
@@ -2289,30 +2403,46 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 续播点（日志里的「续播：… 从 130s 开始」），播放窗口也确实发起了
       // seek，但它没有生效。换清晰度、刷新过期直链走的也是这一条路。
       //
-      // `startAt` 默认为 `Duration.zero` 而不是 null 也是必须的，理由见
-      // [PlaybackMedia]：mpv 的 `start` 属性会**残留**到下一个文件。
+      // `startAt` 默认为 `Duration.zero` 而不是 null 也是必须的：`start`
+      // 属性会**残留**到下一个文件。这个「每次都必须显式给」的规则收在
+      // `PlaybackEngine.open` 的契约里（两个内核各自落成自己的下达方式）。
+      //
       // 网盘直链先过一遍本地中继（多连接并发预取）。拿不到就**原样直连**：
       // 中继失败一律静默，最坏只是「没变快」，绝不是「播不了」。
       final source = await _prepareSource(uri, label, headers, startAt: startAt);
       pendingClose = source.previousToken;
       // 到这里旧中继会话已经关了（`_prepareSource` 的最后一步），旧流随时会断；
-      // 接下来这一句 `open()` 会让 mpv 丢掉当前流。**从这一刻起**才该立
+      // 接下来这一句 `open()` 会让内核丢掉当前流。**从这一刻起**才该立
       // 「正在切换…」—— 上一帧还在画面上，所以用半透明罩，别盖掉它。
       if (keepLastFrame && mounted) {
         setState(() => _switching = true);
       }
-      // 音效每次开流前重新下发。理由与内置播放页那份相同：`audio-channels`
-      // 是 mpv 的按文件选项，换一条 URL（换集 / 切清晰度 / 刷新直链都走这里）
-      // 会回到默认值 —— 只设一次的话第二集开始音效就悄悄失效了，
-      // 而菜单上那个勾还在。
-      await PlayerAudioEffect.apply(_player!, _audioEffect);
-      await _player!.open(
-        PlaybackMedia.build(
-          source.url,
-          headers: source.headers,
-          startAt: startAt,
-        ),
-        play: true,
+
+      // ⚠️ 顺序：**先选内核、再下发音效、最后 open**。
+      //   - 选内核要在 `open` 之前（内核一 `open` 就没法换了）；
+      //   - 音效要在 `open` 之前重新下发（理由见 [_applyAudioEffect]），
+      //     而它必须发给**新选中的**那个内核 —— 顺序反了会发给上一次的内核。
+      //
+      // 探测用的是**上游**地址与请求头（`uri` / `headers`），不是中继那条
+      // `127.0.0.1` 地址：要判的是网盘上那份文件，而中继只是转发。
+      // 跳过 HLS、只探 http(s) 这些规则都在 `PlaybackEngineRouter.selectFor`
+      // 里 —— **与内置播放页同一份**。
+      final router = _router!;
+      final selection = await router.selectFor(
+        key: '${_currentRequest?.itemId ?? uri}|'
+            '${_currentRequest?.qualityId ?? "-"}',
+        url: Uri.parse(uri),
+        headers: headers,
+      );
+      if (selection.changed) {
+        // 换了内核 = 换了渲染句柄（两个内核的句柄类型不同），画面必须重建。
+        _bindEngine(selection.engine);
+        if (mounted) setState(() {});
+      }
+
+      await _applyAudioEffect();
+      await router.engine.open(
+        EngineMedia(url: source.url, headers: source.headers, startAt: startAt),
       );
       if (!mounted) return;
       setState(() => _nowPlaying = label);
@@ -2341,6 +2471,26 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       await _closeRelayToken(pendingClose);
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// 重新下发「音效」预设。
+  ///
+  /// ## 为什么每次开流前都要重发
+  ///
+  /// `audio-channels` 在 mpv 里是**按文件选项**，换一条 URL（换集 / 切清晰度 /
+  /// 刷新直链都走 [_openStream]）会回到默认值 —— 只设一次的话，第二集开始音效
+  /// 就悄悄失效了，而菜单上那个勾还在（勾读的是我们自己的状态）。
+  /// 重新下发的代价是两次 `setProperty`，可以忽略。
+  ///
+  /// ## 为什么换内核后是空操作
+  ///
+  /// 音效是 mpv 专有能力：mdk 既没有 `af` 也没有 `audio-channels` 的等价物
+  /// （见 [EngineCapabilities.audioEffects]）。DV 片源上它静默跳过 ——
+  /// 用户在菜单里点的时候会收到 [_showAudioEffectMenu] 的那句说明。
+  Future<void> _applyAudioEffect() async {
+    final engine = _engine;
+    if (engine is! MediaKitPlaybackEngine) return;
+    await PlayerAudioEffect.apply(engine.player, _audioEffect);
   }
 
   /// 决定这条流**从哪里读**：本地中继，还是原直链。
@@ -2456,7 +2606,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// 时长还没解出来（全新开播）时返回 0，等于不提示 —— 那时本来就从头播。
   int _byteOffsetFor(Duration startAt, int length) {
-    final total = _player?.state.duration.inMilliseconds ?? 0;
+    final total = _duration.inMilliseconds;
     if (startAt <= Duration.zero || total <= 0) return 0;
     final ratio = (startAt.inMilliseconds / total).clamp(0.0, 1.0);
     return (length * ratio).round();
@@ -2509,7 +2659,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   }
 
   Future<void> _stop() async {
-    await _player?.stop();
+    await _engine?.stop();
     if (!mounted) return;
     setState(() => _nowPlaying = null);
   }
@@ -2628,7 +2778,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 单击画面本来就会顺手把浮层收掉，而按空格时用户正在看画面 —— 不把浮层
   /// 亮一下，他看不到按钮已经从「播放」翻成「暂停」，只会怀疑按键没生效。
   void _onPlayPauseKey() {
-    if (_player == null) return;
+    if (_engine == null) return;
     _togglePlay();
     _pokeChrome();
   }
@@ -2651,21 +2801,17 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _cacheMeter.reset();
     _cacheRate = null;
     _cacheRateAt = null;
-    await _player?.seek(target);
+    await _engine?.seek(target);
   }
 
   /// ← / →：相对跳转。
   ///
-  /// 基准取 `player.state.position` 而不是我们自己缓存的某个字段：mpv 的
-  /// `position` 流每 ~100ms 才来一条，缓存字段在「刚跳完立刻再按一下」时还是
-  /// 上一次的旧值 —— 连按三下只会跳出一段的距离。
+  /// 基准取 [_position]（由契约的 `position` 流搬进来）。它原来读的是
+  /// `player.state.position` —— 两者**同一节拍**（mpv 的 `state.position`
+  /// 本来就是这个流在更新），所以「刚跳完立刻再按一下」时的新鲜度没有变化。
   void _seekBy(Duration delta) {
-    final player = _player;
-    if (player == null) return;
-    final target = clampSeekTarget(
-      player.state.position + delta,
-      player.state.duration,
-    );
+    if (_engine == null) return;
+    final target = clampSeekTarget(_position + delta, _duration);
     unawaited(_seek(target));
     // 同 [_onPlayPauseKey]：让用户看见时间码跳到了哪儿。
     _pokeChrome();
@@ -2683,9 +2829,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// 与 [_seekBy] 同一个理由：跳完必须让用户看见时间码落到哪儿了。
   void _seekToFraction(double fraction) {
-    final player = _player;
-    if (player == null) return;
-    final duration = player.state.duration;
+    if (_engine == null) return;
+    final duration = _duration;
     if (duration <= Duration.zero) return;
 
     final target = clampSeekTarget(
@@ -2878,7 +3023,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   }
 
   Widget _buildVideoSurface() {
-    final controller = _controller;
+    final engine = _engine;
     return GestureDetector(
       // 单击：播放 / 暂停，并收起浮层。
       //
@@ -2916,17 +3061,24 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         color: AppTheme.cinema,
         // `BoxFit.contain` 是「视频固定比例、黑边填充」的实现：窗口随便拖成
         // 什么形状，画面都保持自己的比例，多出来的地方由这层底色补成黑边。
-        child: controller == null
+        //
+        // ⚠️ 用 [PlaybackSurface] 而不是直接 `Video(...)`：两个内核的渲染句柄
+        // **类型不同**（media_kit 是 `VideoController`，fvp 是
+        // `VideoPlayerController`），挑哪个组件是它的事。
+        //
+        // 不带控制栏（media_kit 那边给 `controls: null`）：双击进全屏走的是
+        // **我们自己的**原生窗口全屏，理由见上面 `onDoubleTap` 那段说明。
+        child: engine == null
             ? const Center(
                 child: Text(
                   '还没有载入片源',
                   style: TextStyle(fontSize: 13, color: AppTheme.dim),
                 ),
               )
-            : Video(
-                controller: controller,
-                controls: NoVideoControls,
+            : PlaybackSurface(
+                engine: engine,
                 fit: BoxFit.contain,
+                fill: AppTheme.cinema,
               ),
       ),
     );
@@ -3012,8 +3164,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 直接印出来会是一个跟总时长同量级的数 —— 而这一行唯一的用处是回答
   /// 「还能撑多久」，那恰好就是超前的秒数。
   String _cacheStatusLine() {
-    final position = _player?.state.position ?? Duration.zero;
-    final ahead = _cacheEnd > position ? _cacheEnd - position : Duration.zero;
+    final ahead = _cacheEnd > _position ? _cacheEnd - _position : Duration.zero;
     final parts = <String>['已缓存 ${_formatDuration(ahead)}'];
 
     final bytes = _currentBytesPerSecond();
@@ -3033,9 +3184,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 界面上该显示多少字节/秒。
   ///
-  /// **优先用 mpv 直接给的输入速率**（[_netBytesPerSecond]，真实下载速率），
+  /// **优先用内核直接给的输入速率**（[_netBytesPerSecond]，真实下载速率），
   /// 拿不到才退回估算。两条路的差别很实际：估算要乘「文件大小 ÷ 时长」这个
   /// 平均码率，播转码档时它跟实际流码率对不上，会把网速放大若干倍。
+  ///
+  /// ⚠️ 换到 fvp 内核后第一条路**永远拿不到值**（mdk 没有
+  /// `demuxer-cache-state` 的对等物，见 [EngineCapabilities.networkSpeed]）——
+  /// 于是 DV 片源上显示的始终是估算值。这是**已知的降级**，不是故障。
   ///
   /// 两条路都过同一道护栏（[defaultMaxCacheBytesPerSecond]）：无论来源如何，
   /// 超过它就不是网速，宁可这一拍不显示。
@@ -3057,40 +3212,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     return cacheBytesPerSecond(
       rate: _currentCacheRate,
       sizeBytes: _currentRequest?.sizeBytes,
-      duration: _player?.state.duration ?? Duration.zero,
+      duration: _duration,
     );
   }
 
-  /// 开始 1 Hz 轮询 `demuxer-cache-state`。重复调用只会重置计时器。
-  void _startNetSpeedPolling() {
-    _netSpeedTimer?.cancel();
-    _netSpeedTimer = Timer.periodic(
-      const Duration(seconds: 1),
-      (_) => unawaited(_readNetSpeed()),
-    );
-  }
-
-  /// 读一次 mpv 的输入速率。
-  ///
-  /// 用 `getProperty` 轮询而不是 `observeProperty`：这个属性是 node 类型、
-  /// 变更通知不保证发；1 Hz 读一个字符串的代价可以忽略。
-  ///
-  /// 任何失败（播放器还没建好、已 dispose、属性读不到）都只是让这个值为 null
-  /// —— 那时界面退回估算值。**绝不抛**，它跑在播放路径上。
-  Future<void> _readNetSpeed() async {
-    final platform = _player?.platform;
-    if (platform is! NativePlayer) return;
-    try {
-      final state = await platform.getProperty('demuxer-cache-state');
-      final bytes = rawInputBytesPerSecond(state);
-      if (!mounted) return;
-      // 值没变就不 setState：1 Hz 的重建虽然便宜，但没必要。
-      if (bytes == _netBytesPerSecond) return;
-      setState(() => _netBytesPerSecond = bytes);
-    } catch (e) {
-      diag.debug('缓冲', '读输入速率失败：$e');
-    }
-  }
+  // ⚠️ 这里原来有一个 1 Hz 轮询 `demuxer-cache-state` 的计时器
+  //（`_startNetSpeedPolling` / `_readNetSpeed`）。它**搬进引擎**了
+  // （`MediaKitPlaybackEngine`），本类只订阅契约的 `networkSpeed` 流
+  // —— 理由很实际：两个播放器各轮询一次会得到两份不同的读数，
+  // 而「怎么读这个属性」本来就该跟着内核走。
 
   /// 顶部浮层：片名 + 网盘全路径。
   ///
@@ -3312,7 +3442,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 IconButton(
-                  onPressed: _player == null ? null : _togglePlay,
+                  onPressed: _engine == null ? null : _togglePlay,
                   // 键位写进 tooltip：播放器上没有任何东西提示「空格能暂停」，
                   // 而这是用户最常按的一个键。
                   tooltip: _playing ? '暂停（空格）' : '播放（空格）',
@@ -3349,7 +3479,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                     builder: (buttonContext) => _buildBarIcon(
                       icon: Icons.fast_forward_rounded,
                       tooltip: '片头标记',
-                      onPressed: _player == null
+                      onPressed: _engine == null
                           ? null
                           : () => unawaited(_showIntroMenu(buttonContext)),
                     ),
@@ -3411,7 +3541,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                       builder: (buttonContext) => _buildBarIcon(
                         icon: Icons.subtitles_outlined,
                         tooltip: '字幕',
-                        onPressed: _player == null
+                        onPressed: _engine == null
                             ? null
                             : () => unawaited(_showSubtitleMenu(buttonContext)),
                       ),
@@ -3420,7 +3550,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                       builder: (buttonContext) => _buildBarIcon(
                         icon: Icons.audiotrack_rounded,
                         tooltip: '音轨',
-                        onPressed: _player == null
+                        onPressed: _engine == null
                             ? null
                             : () => unawaited(_showAudioMenu(buttonContext)),
                       ),
@@ -3429,16 +3559,27 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                     // 音效=输出处理）。图标用等化器而不是喇叭：喇叭在别的
                     // 播放器里是「音量」，这里再放一个会撞车。
                     Builder(
-                      builder: (buttonContext) => _buildBarIcon(
-                        icon: Icons.graphic_eq_rounded,
-                        tooltip: _audioEffect == AudioEffectPreset.auto
-                            ? '音效'
-                            : '音效 · ${PlayerAudioEffect.label(_audioEffect)}',
-                        onPressed: _player == null
-                            ? null
-                            : () =>
-                                unawaited(_showAudioEffectMenu(buttonContext)),
-                      ),
+                      builder: (buttonContext) {
+                        // 音效是 mpv 专有能力。DV 片源走 fvp 时这里**置灰并说明
+                        // 原因** —— 静默失效的表现是「点了没反应」，那是最难查的
+                        // 一类问题，而且用户会以为自己没设置对
+                        // （见 [EngineCapabilities] 的类文档）。
+                        final ok = _engine?.capabilities.audioEffects ?? false;
+                        return _buildBarIcon(
+                          icon: Icons.graphic_eq_rounded,
+                          tooltip: !ok
+                              ? '音效（这条片源用的解码内核不支持）'
+                              : _audioEffect == AudioEffectPreset.auto
+                                  ? '音效'
+                                  : '音效 · '
+                                      '${PlayerAudioEffect.label(_audioEffect)}',
+                          onPressed: !ok
+                              ? null
+                              : () => unawaited(
+                                    _showAudioEffectMenu(buttonContext),
+                                  ),
+                        );
+                      },
                     ),
                     // 剧集列表的入口**不在这里**。原来它是控制栏上的一个图标，
                     // 但它要跟一个展开后面板走，放在底部控制栏里，展开后会出现
@@ -3716,7 +3857,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
     final marker = _introSession.marker;
     final hasManual = _introSession.manual != null;
-    final positionMs = _player?.state.position.inMilliseconds ?? 0;
+    final positionMs = _position.inMilliseconds;
 
     final action = await _pinnedMenu(
       () => showAnchoredMenu<_IntroAction>(
@@ -3831,8 +3972,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 用户点它是想知道「这条片子的音频是什么样的」（语言 / 编码 / 声道 / 码率），
   /// 那是**识别**能力，不是「切换」能力。所以只在完全读不到轨道时才提示。
   Future<void> _showAudioMenu(BuildContext buttonContext) async {
-    final player = _player;
-    if (player == null) return;
+    final engine = _engine;
+    if (engine == null) return;
     if (_audioTracks.isEmpty) {
       _toast('还没读到音轨（片源可能还在打开）');
       return;
@@ -3863,13 +4004,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     if (!mounted) return;
     _pokeChrome();
     if (picked == null) return;
-    // 不在这里 setState 记「已选中」：成功与否由 `stream.track` 回报
-    // （见 [_activeAudioId]）。
-    await player.setAudioTrack(picked);
+    // 不在这里 setState 记「已选中」：成功与否由内核回报
+    // （`activeAudioTrackId` → [_activeAudioId]）。
+    //
+    // `int.parse` 而不是 `tryParse`：[TrackBridge] 的 id 就是轨道号本身
+    // （合成轨已经被引擎剔掉了），解析不了说明上游契约被改坏了。
+    await engine.selectAudioTrack(int.parse(picked.id));
     // 记进这部片的偏好。
     //
     // ⚠️ 与「切清晰度」「切字幕」不同，这里**不等成功确认就记**：候选全部来自
-    // mpv 自己报的轨道清单，切一条清单里存在的轨不会失败（清晰度那条要服务端
+    // 内核自己报的轨道清单，切一条清单里存在的轨不会失败（清晰度那条要服务端
     // 重新取链，才需要等 `activeQualityId` 确认）。
     var index = -1;
     for (var i = 0; i < _audioTracks.length; i++) {
@@ -3901,8 +4045,16 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 就是能选的音轨，找不到粤语时来报「音轨丢了」。
   /// 完整理由与「为什么只有四个选项」见 `core/utils/player_audio_effect.dart`。
   Future<void> _showAudioEffectMenu(BuildContext buttonContext) async {
-    final player = _player;
-    if (player == null) return;
+    final engine = _engine;
+    if (engine == null) return;
+    // 音效是 mpv 专有能力：mdk 既没有 `af` 也没有 `audio-channels` 的等价物
+    // （见 [EngineCapabilities.audioEffects]）。**明说而不是静默**——
+    // 静默失效的表现是「用户点了没反应」，那是最难查的一类问题，
+    // 而且他会以为自己没设置对。
+    if (!engine.capabilities.audioEffects) {
+      _toast('这条片源用的是另一个解码内核，音效暂不支持');
+      return;
+    }
 
     _cancelHide();
     if (!buttonContext.mounted) {
@@ -3932,7 +4084,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     setState(() => _audioEffect = picked);
     // 立即生效、不重开流：`audio-channels` / `audio-spdif` 都是 mpv 运行期
     // 可改的属性，而重开流会把用户正在看的位置丢掉。
-    await PlayerAudioEffect.apply(player, picked);
+    //
+    // 走 [_applyAudioEffect] 而不是直接调 `PlayerAudioEffect`：那一步会自己
+    // 判断当前内核是不是 mpv（上面那道闸已经拦住了，这里是第二道保险 ——
+    // 换内核的时序与菜单打开之间没有同步关系）。
+    await _applyAudioEffect();
     // 报回主窗口落库 —— 播放窗口刻意不碰数据库（见本类的类文档）。
     unawaited(_saveAudioEffect(picked));
     // 同时记进**这部片**的偏好。两个都要写：`saveAudioEffect` 改的是这台设备
@@ -3969,8 +4125,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 搜索次数增长，而且「谁负责把菜单关掉」会变得很难读 —— 循环把
   /// 「开菜单 → 拿到选择 → 要么应用要么重开」这一件事摆在一处。
   Future<void> _showSubtitleMenu(BuildContext buttonContext) async {
-    final player = _player;
-    if (player == null) return;
+    if (_engine == null) return;
 
     if (!buttonContext.mounted) return;
     // navigator 与锚点都在**第一次 await 之前**取好：这个菜单会被重开好几次
@@ -4011,13 +4166,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         // 挑完文件**重开菜单**（而不是直接挂上就结束）：用户挑完通常还要看到
         // 「本地文件」那一组里出现了刚挑的那条、并且打上了勾 —— 那是对
         // 「我到底选中了哪个文件」的确认。文件选择器本身不显示这个。
-        if (!await _pickLocalSubtitle(player)) return;
+        if (!await _pickLocalSubtitle()) return;
         if (!mounted) return;
         continue;
       }
 
       _pokeChrome();
-      await _applySubtitleChoice(player, picked);
+      await _applySubtitleChoice(picked);
       return;
     }
   }
@@ -4058,14 +4213,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// 选中态一律**在成功之后**才 setState，不做乐观更新：外挂字幕可能取不下来，
   /// 乐观更新会让菜单在一条根本没加载上的字幕上打勾，用户以为切成功了。
-  Future<void> _applySubtitleChoice(
-    Player player,
-    _SubtitleChoice picked,
-  ) async {
+  Future<void> _applySubtitleChoice(_SubtitleChoice picked) async {
+    final engine = _engine;
+    if (engine == null) return;
+
     switch (picked.kind) {
       case _SubtitleKind.off:
         _clearExternalSubtitle();
-        await player.setSubtitleTrack(SubtitleTrack.no());
+        await engine.selectSubtitleTrack(null);
         // 「关掉字幕」本身也是一个要记住的选择（见
         // `PlaybackPreference.subtitlesEnabled`）—— 不记的话，用户在一部片里
         // 关掉字幕，下次打开又被自动挂上一条，而他明明关过。
@@ -4073,17 +4228,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
         return;
 
       case _SubtitleKind.embedded:
-        // 内嵌轨的选择态由 mpv 回报（`stream.track` → `_activeSubtitleId`），
-        // 这里只把三个「外挂字幕」的记账清掉。
+        // 内嵌轨的选择态由内核回报（`activeSubtitleTrackId` →
+        // `_activeSubtitleId`），这里只把三个「外挂字幕」的记账清掉。
         //
-        // 落一条日志是为了对上 [isSubtitleDiagnosticLog] 那条：mpv 报
+        // 落一条日志是为了对上 [isSubtitleDiagnosticLog] 那条：内核报
         // 「解不开」时必须能回答「我们到底让它解哪一条」。缺了这条，
         // 只看到一句 `Could not find subtitle decoder` 是不知道该怪谁的。
         diag.info('播放窗口', '选择内嵌字幕轨：id=${picked.trackId}');
         _clearExternalSubtitle();
-        await player.setSubtitleTrack(
-          SubtitleTrack('${picked.trackId}', null, null),
-        );
+        await engine.selectSubtitleTrack(picked.trackId);
         // 记进这部片的偏好。`language` / `title` / `index` 从清单里现取 ——
         // 只存一个 `sid` 是没用的：换一集之后那个号指的是完全另一条轨
         // （见 `TrackPreference` 的类文档）。
@@ -4129,12 +4282,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
           _activeOnlineSubtitleId = null;
           _activeLocalPath = null;
         });
-        await player.setSubtitleTrack(
-          SubtitleTrack.data(
-            text,
-            title: brief?.label,
-            language: brief?.language,
-          ),
+        // 走契约的 `loadExternalSubtitleText`（正文直接给）：正文是我们自己
+        // 取回来并解码成 UTF-8 的**字符串**，没有地址。mdk 那条路要求 URI，
+        // 由实现落临时文件兜底（见契约里那条方法的文档）。
+        await engine.loadExternalSubtitleText(
+          text,
+          title: brief?.label,
+          language: brief?.language,
         );
         // 记进这部片的偏好。id 用与内置播放页相同的 `<itemId>#<fileId>`
         // （见 `SubtitleService._buildTrack`）—— 同一个网盘文件在整部剧里
@@ -4176,14 +4330,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
           _activeCloudSubtitleId = null;
           _activeLocalPath = null;
         });
-        await player.setSubtitleTrack(
-          SubtitleTrack.data(
-            text,
-            // 在线字幕没有「我们自己的展示名」，用站点给的标题（片名）回退到
-            // 文件名 —— 它们只出现在 mpv 自己的轨道列表里。
-            title: brief?.title ?? brief?.fileName,
-            language: brief?.language,
-          ),
+        await engine.loadExternalSubtitleText(
+          text,
+          // 在线字幕没有「我们自己的展示名」，用站点给的标题（片名）回退到
+          // 文件名 —— 它们只出现在内核自己的轨道列表里。
+          title: brief?.title ?? brief?.fileName,
+          language: brief?.language,
         );
         // ⛔ **不记进偏好**：在线字幕按次计费（OpenSubtitles 免费档只有个位数
         // 额度），下次自动还原等于替用户烧额度 —— 而他这次未必想看那条。
@@ -4204,17 +4356,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
           _activeCloudSubtitleId = null;
           _activeOnlineSubtitleId = null;
         });
-        await player.setSubtitleTrack(
-          SubtitleTrack.data(
-            text,
-            title: picked.localLabel,
-            // 本地文件的语言无从得知（文件名里的 `chs` 只是发布组的习惯，
-            // 不是规范）。不给比猜错好 —— mpv 会用它去做「按语言自动选轨」。
-          ),
+        await engine.loadExternalSubtitleText(
+          text,
+          title: picked.localLabel,
+          // 本地文件的语言无从得知（文件名里的 `chs` 只是发布组的习惯，
+          // 不是规范）。不给比猜错好 —— 内核会用它去做「按语言自动选轨」。
         );
         // ⛔ **不记进偏好**：路径是为**这一集**挑的，下一集几乎必然对不上
         // 时间轴；而且文件很可能已经被删掉或挪走 —— 那时还原会**静默失败**
-        //（`_readLocalSubtitle` 返回 null），mpv 停在「没有字幕」，
+        //（`_readLocalSubtitle` 返回 null），内核停在「没有字幕」，
         // 比干脆不还原更糟。
         return;
 
@@ -4394,7 +4544,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// `com.apple.security.files.user-selected.read-only`（两份 entitlements
   /// 都已加）。**没有那一条时选择器照样弹、照样返回路径**，只有紧接着的读取会
   /// 失败 —— 所以失败提示必须写清「读不了」，不能只说「加载失败」。
-  Future<bool> _pickLocalSubtitle(Player player) async {
+  Future<bool> _pickLocalSubtitle() async {
     const group = XTypeGroup(
       label: '字幕文件',
       extensions: <String>['srt', 'ass', 'ssa', 'vtt', 'sub', 'idx', 'txt'],
@@ -4423,9 +4573,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       _activeCloudSubtitleId = null;
       _activeOnlineSubtitleId = null;
     });
-    await player.setSubtitleTrack(
-      SubtitleTrack.data(text, title: picked.label),
-    );
+    // 走契约的 `loadExternalSubtitleText`（正文直接给）而不是
+    // `loadExternalSubtitle`（按 URI）：正文是**我们刚刚重新读并解码出来的**
+    // —— 用户在外部改过时间轴之后要能生效（见上面那句注释），所以不能把
+    // 路径甩给内核让它自己去读。mdk 那条路的「落临时文件」由实现兜底
+    // （见契约里那条方法的文档）。
+    await _engine?.loadExternalSubtitleText(text, title: picked.label);
     return true;
   }
 
@@ -4501,23 +4654,27 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 进度条 + 两端时间。
   ///
   /// 用 `StreamBuilder` 而不是把位置存进 State：`position` 是每 ~100ms 一条的
-  /// 高频流，存进 State 会让**整个播放器**每秒重建十次（连 `Video` 一起）。
+  /// 高频流，存进 State 会让**整个播放器**每秒重建十次（连画面一起）。
   /// 用 StreamBuilder 把重建限制在这条进度条内部。
   ///
   /// ⚠️ 它挂在浮层的 `Column` 里，所以**不能**再包一层 `Expanded`
   /// （那要求 `Row` / `Flex` 父级）。横向伸展由内部那个 `Row` 负责。
   Widget _buildSeekBar() {
-    final player = _player;
-    if (player == null) return const SizedBox.shrink();
+    final engine = _engine;
+    if (engine == null) return const SizedBox.shrink();
 
+    // ⚠️ 两条流来自**当前**内核。换内核时这个 widget 会被重建（`_openStream`
+    // 里那次 `setState`），于是 StreamBuilder 重新订阅 —— 而契约的流是广播且
+    // **不重放**的，所以 `initialData` 不是可有可无的优化：它填的正是
+    // 「重新订阅」到「下一条事件」之间那一段。
     return StreamBuilder<Duration>(
-      stream: player.stream.duration,
-      initialData: player.state.duration,
+      stream: engine.duration,
+      initialData: _duration,
       builder: (context, durationSnapshot) {
         final total = durationSnapshot.data ?? Duration.zero;
           return StreamBuilder<Duration>(
-            stream: player.stream.position,
-            initialData: player.state.position,
+            stream: engine.position,
+            initialData: _position,
             builder: (context, positionSnapshot) {
               final maxMs = total.inMilliseconds.toDouble();
               final hasDuration = maxMs > 0;

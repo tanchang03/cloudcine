@@ -76,22 +76,111 @@ int nextTvRowIndex({
   return (current + delta) % total;
 }
 
-/// 面板右侧那一列的容器：**宽度、底色、焦点、键盘回退**。
+// ---------------------------------------------------------------------------
+// 视觉令牌（面板这一块专用）
+//
+// 这块面板是**唯一**长得不像应用其余部分的地方：它是浮在视频上的一层，
+// 底色、圆角、阴影都要按「叠在画面上」来定，不能直接套页面那套 `panel` 平面。
+// 收在这里是为了让「改一个数字」只改一处 —— 七个行、两页共用。
+// ---------------------------------------------------------------------------
+
+/// 面板卡片的宽度。
+const double _kPanelWidth = 400;
+
+/// 卡片与屏幕上下缘的距离。**必须 ≥ 过扫描的 27**，否则卡片上下两条圆角
+/// 在真机上会被切平（电视会把最外一圈裁掉）。
+const double _kPanelMarginY = 28;
+
+/// 卡片圆角。
+const double _kCardRadius = 20;
+
+/// 一行的高度。
+///
+/// ⚠️ 这是**高度预算**里最大的一块，改之前先看 [TvPanelShell] 的文档：
+/// 7 行 × 52 + 表头 54 + 底部提示 40 ≈ 458，而卡片只有
+/// 540 − 28×2 = **484** —— 余量 26px。
+const double _kRowHeight = 52;
+
+/// 面板卡片本体：底色、描边、阴影、圆角。
+///
+/// 两页（行列表 / 集数网格）共用一份 —— 各写一份的话，切到「选集」时
+/// 卡片的圆角与阴影会跳一下，而那种差异没人会当成 bug 去报。
+class TvPanelCard extends StatelessWidget {
+  const TvPanelCard({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      // ⛔ `clipBehavior` 不能省：里面的行高亮是圆角矩形，不裁的话
+      // 选中行会盖住卡片的圆角，看着像卡片被啃掉一个角。
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(_kCardRadius),
+        // 上深下浅的一点点渐变，比纯色多一层「这是一块浮起来的玻璃」的暗示。
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            AppTheme.panel2.withValues(alpha: 0.97),
+            AppTheme.panel.withValues(alpha: 0.97),
+          ],
+        ),
+        border: Border.all(
+          color: AppTheme.line.withValues(alpha: 0.9),
+          width: 0.8,
+        ),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0xCC000000),
+            blurRadius: 32,
+            offset: Offset(0, 12),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+}
+
+/// 面板右侧那一列的容器：**宽度、卡片外观、焦点、键盘回退**。
 ///
 /// 抽出来是因为它有两页共用（行列表 / 集数网格），两页的键盘语义不同，
 /// 但「贴右、不铺满、拿焦点、吃掉没认出来的键」完全一样。
-/// ⚠️ **不铺满整屏**：调字幕和调画质时必须看得见画面，那是唯一的反馈
+///
+/// ## ⛔ 焦点必须由调用方给（[focusNode]）
+///
+/// 这里虽然留着 `autofocus: true`，但它**只在所在 scope 还没有焦点时**才
+/// 生效 —— 而播放页的画面节点早就占着焦点了。所以面板能不能收到按键，
+/// 取决于调用方在打开之后有没有 `requestFocus` 到这个节点上。
+/// 不做的后果是用户报的那句：「菜单键能弹出 OSD，但上下键按不动」。
+///
+/// ## ⚠️ 不铺满整屏，但**纵向要铺满**
+///
+/// 横向只占右边一条：调字幕和调画质时必须看得见画面，那是唯一的反馈
 /// （字幕有没有乱码、换档之后清不清楚），盖住画面就没法调了。
+///
+/// 纵向则相反 —— 它必须拿到**整屏高度**。播放页原来把它放进画面那一块
+/// （`Stack` 在 `Expanded` 里），而面板一开控制栏也要显示，于是可用高
+/// 只剩 540 − 75 − 91 = **374**：七行 × 52 装不下，第 5 行往后要滚动才
+/// 看得见，而**电视上没有滚动条**。所以它现在挂在页面最外层的 `Stack` 上，
+/// 高度是整屏，再靠 [_kPanelMarginY] 避让上下过扫描带。
 class TvPanelShell extends StatelessWidget {
   const TvPanelShell({
     super.key,
     required this.child,
     required this.onActivity,
     required this.onUnhandledKey,
-    this.width = 344,
+    this.focusNode,
+    this.width = _kPanelWidth,
   });
 
   final Widget child;
+
+  /// 面板的焦点节点，**由播放页持有**（理由见类文档）。`null` 时自建一个 ——
+  /// 单测里就是这么用的。
+  final FocusNode? focusNode;
 
   /// 任意一次按键。**必须**回调它：面板自己吃掉按键后，外层那个
   /// 「无操作 30 秒收起控制栏」的倒计时收不到事件，会当着正在调字幕的
@@ -109,17 +198,18 @@ class TvPanelShell extends StatelessWidget {
     // 电视上这块面板是**贴右**的，而屏幕最右 48px 是过扫描带 ——
     // 厂商电视会把那一圈裁掉。
     //
-    // ⚠️ 实测（960 宽、面板 `right: 0`）：行里最右那个箭头量到 x=914.25，
-    // 安全线在 912 —— **只探进去约 2px**。所以这不是「字被切了一半」那种醒目
-    // 毛病，只是擦着边：行值本身在箭头左边约 30px，离安全线还有余量。
-    // 仍然避让的两个理由：① 这点余量会随面板宽度 / 行内边距变动，擦线很容易
-    // 变成真切；② 全项目其它页面都按 48 留白，播放器不该是唯一的例外。
-    // （⛔ 只避让右边；上下为什么不避让，见下面那处 `Padding` 的实测数字。）
+    // ⛔ 只缩**内容**（卡片），不缩外层 `SizedBox`：面板的右缘要一直贴到
+    // 屏幕边缘（贴右是这个面板的设计）；把整块往里挪 48px 会在右边留一条
+    // 露出视频的缝，看起来像没对齐。
+    //
+    // ⚠️ 上下也避让（[_kPanelMarginY]）—— 面板现在纵向铺满整屏，
+    // 不避让的话卡片上下两条圆角会落进过扫描带里被切平。
     final safe = AppTheme.safeAreaInsets(context);
 
     return Focus(
-      // 面板一开就把焦点拿过来：否则 ↑ / ↓ 还落在画面上（画面会拿它去快进），
-      // 而本面板的 `onKeyEvent` 根本收不到事件。
+      focusNode: focusNode,
+      // 单测 / 单页预览里没有别人抢焦点，`autofocus` 让键盘直接可用；
+      // 真机上由播放页显式 `requestFocus`（见类文档）。
       autofocus: true,
       onKeyEvent: (node, event) {
         // 长按要能连着改（倍速从 1.0 调到 2.0 要按好几下），所以 repeat 也处理。
@@ -130,33 +220,120 @@ class TvPanelShell extends StatelessWidget {
         if (onUnhandledKey(event.logicalKey)) return KeyEventResult.handled;
         return KeyEventResult.ignored;
       },
-      child: Container(
+      child: SizedBox(
         width: width,
-        decoration: BoxDecoration(
-          color: AppTheme.panel.withValues(alpha: 0.96),
-          border: Border(left: BorderSide(color: AppTheme.line, width: 0.5)),
-          boxShadow: const [
-            BoxShadow(color: Color(0x99000000), blurRadius: 24),
-          ],
-        ),
-        // ⛔ 只缩**内容**，不缩 `Container` 本身。面板底色与左边那条描边要
-        // 一直铺到屏幕边缘（贴右是这个面板的设计）；把整个面板往里挪 48px
-        // 会变成一块浮在画面中间的卡片，右边留一条露出视频的缝。
-        //
-        // ⛔ **只避让右边，不避让上下** —— 这是量出来的取舍，不是漏了。
-        // 实测（960×540）：
-        //   表头 56 + 分隔线 0.5 + 底部提示 60 = 116.5（提示那行会折成两行）
-        //   7 行 × 60 = 420
-        //   面板高 540 − 116.5 = 423.5 → 只剩 **3.5px** 余量
-        // 也就是面板是**按 7 行正好塞满**做的。上下各加 27 之后视口掉到 369.5，
-        // 溢出 50.5px → 第 7 行「片头」被推到屏幕外，而**电视上没有滚动条**，
-        // 用户不会知道下面还有一行。
-        // 两者相权：标题上沿被切掉几像素，比整个设置项消失轻得多。
-        // ⚠️ 想两全的话得改设计（行高 60→52、或把底部提示压成一行）——
-        // 那是产品决定，留给人来定；`maxScrollExtent == 0` 的用例会钉住这条线。
         child: Padding(
-          padding: EdgeInsets.only(right: safe.right),
-          child: child,
+          padding: EdgeInsets.only(
+            right: safe.right,
+            top: _kPanelMarginY,
+            bottom: _kPanelMarginY,
+          ),
+          child: TvPanelCard(child: child),
+        ),
+      ),
+    );
+  }
+}
+
+/// 面板顶部那一行「图标 + 标题」。
+class TvPanelHeader extends StatelessWidget {
+  const TvPanelHeader({super.key, required this.title, this.icon});
+
+  final String title;
+
+  /// 默认用「播放设置」那个滑杆图标；集数页换成「选集」的图标。
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+      child: Row(
+        children: [
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(9),
+              gradient: AppTheme.brandGradient,
+            ),
+            child: Icon(
+              icon ?? Icons.tune_rounded,
+              size: 17,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.text,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 底部那行「按键说明」。三个小键帽 + 三句话。
+///
+/// 用键帽而不是一整句「↑↓ 选项目 · ←→ 改 · 菜单键关闭」：电视上那句话
+/// 折成两行、挤成一片小字，读起来像免责声明；而键帽把「哪个键」与
+/// 「干什么」分开了，扫一眼就够。
+class TvPanelKeyHints extends StatelessWidget {
+  const TvPanelKeyHints({super.key, required this.hints});
+
+  final List<(String key, String action)> hints;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      child: Row(
+        children: [
+          for (var i = 0; i < hints.length; i++) ...[
+            if (i > 0) const SizedBox(width: 12),
+            _KeyCap(hints[i].$1),
+            const SizedBox(width: 5),
+            Text(
+              hints[i].$2,
+              style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _KeyCap extends StatelessWidget {
+  const _KeyCap(this.label);
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: AppTheme.panel3.withValues(alpha: 0.8),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: AppTheme.line, width: 0.5),
+      ),
+      child: Text(
+        label,
+        style: const TextStyle(
+          fontSize: 11,
+          height: 1.15,
+          fontWeight: FontWeight.w600,
+          color: AppTheme.muted,
         ),
       ),
     );
@@ -185,6 +362,7 @@ class PlayerTvPanel extends StatelessWidget {
     required this.onActivate,
     required this.onClose,
     required this.onActivity,
+    this.focusNode,
   });
 
   final List<PlayerTvRowValue> rows;
@@ -206,10 +384,12 @@ class PlayerTvPanel extends StatelessWidget {
 
   final VoidCallback onClose;
   final VoidCallback onActivity;
+  final FocusNode? focusNode;
 
   @override
   Widget build(BuildContext context) {
     return TvPanelShell(
+      focusNode: focusNode,
       onActivity: onActivity,
       onUnhandledKey: (key) {
         switch (key) {
@@ -247,21 +427,12 @@ class PlayerTvPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(20, 18, 20, 12),
-            child: Text(
-              '播放设置',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
-                color: AppTheme.text,
-              ),
-            ),
-          ),
+          const TvPanelHeader(title: '播放设置'),
           const Divider(height: 0.5, color: AppTheme.line),
           Expanded(
             child: ListView.builder(
-              // 行高在 TV 上放大到 60，六行加起来可能超过面板高度 ——
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              // 行高在 TV 上放大到 52，七行加起来可能超过面板高度 ——
               // 用 `ListView` 而不是 `Column`，多出来的部分才滚得动
               // （遥控器 ↑↓ 会自动滚到可视区，见评估文档探针 1）。
               itemCount: rows.length,
@@ -271,12 +442,12 @@ class PlayerTvPanel extends StatelessWidget {
               ),
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
-            child: Text(
-              '↑↓ 选项目 · ←→ 改 · 菜单键关闭',
-              style: TextStyle(fontSize: 12.5, color: AppTheme.dim),
-            ),
+          const TvPanelKeyHints(
+            hints: [
+              ('↑↓', '选择'),
+              ('←→', '调整'),
+              ('菜单', '关闭'),
+            ],
           ),
         ],
       ),
@@ -295,54 +466,79 @@ class _PanelRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final row = value.row;
     final color = selected ? AppTheme.text : AppTheme.muted;
+    // 不可调的行：箭头与值一起压暗。判据只有 [PlayerTvRowValue.adjustable]
+    // 一处 —— 不在这里另判「值是不是空」。
+    final arrowColor = !value.adjustable
+        ? AppTheme.line
+        : (selected ? AppTheme.accent : AppTheme.muted);
 
-    return Container(
-      height: 60,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
-      decoration: BoxDecoration(
-        color: selected ? AppTheme.panel3 : Colors.transparent,
-        // 选中行左侧那一条竖线：光靠背景色差在电视上不够醒目 —— 面板底色
-        // 本来就是深色，30% 的提亮在 3 米外几乎看不出来。
-        border: Border(
-          left: BorderSide(
-            color: selected ? AppTheme.accent : Colors.transparent,
-            width: 3,
+    return Padding(
+      // 上下各 2 + 左右各 8：选中态的圆角高亮**缩进**在行内，看着像一颗
+      // 浮在卡片上的胶囊，而不是一条顶满两边的色带 —— 后者是原来那版
+      // 「呆板」的来源之一。
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
+        height: _kRowHeight - 4,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: selected
+              ? AppTheme.accent.withValues(alpha: 0.18)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          // ⛔ 描边**常驻**、只换颜色。改成「选中才画」的话，边框会把内容
+          // 挤进去 3px —— 按 ↑↓ 时整行会左右抖一下。
+          border: Border.all(
+            color: selected
+                ? AppTheme.accent.withValues(alpha: 0.55)
+                : Colors.transparent,
+            width: 1.5,
           ),
+          boxShadow: selected
+              ? [
+                  BoxShadow(
+                    color: AppTheme.accent.withValues(alpha: 0.22),
+                    blurRadius: 14,
+                  ),
+                ]
+              : null,
         ),
-      ),
-      child: Row(
-        children: [
-          Icon(row.icon, size: 20, color: color),
-          const SizedBox(width: 14),
-          Text(
-            row.label,
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-              color: color,
-            ),
-          ),
-          const Spacer(),
-          Flexible(
-            child: Text(
-              value.value.isEmpty ? '—' : value.value,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.end,
+        child: Row(
+          children: [
+            Icon(row.icon, size: 19, color: color),
+            const SizedBox(width: 12),
+            Text(
+              row.label,
               style: TextStyle(
                 fontSize: 15,
-                color: value.value.isEmpty ? AppTheme.dim : AppTheme.text,
+                // ⚠️ 字重是「焦点落在哪一行」的主要信号之一（另一条是背景）。
+                // 单测直接断言它，别改成别的表达方式。
+                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                color: color,
               ),
             ),
-          ),
-          const SizedBox(width: 10),
-          // 箭头灰掉 = 「这一项改不了」。见 [PlayerTvRowValue.adjustable]。
-          Icon(
-            Icons.chevron_right_rounded,
-            size: 20,
-            color: value.adjustable ? AppTheme.muted : AppTheme.line,
-          ),
-        ],
+            const Spacer(),
+            Flexible(
+              child: Text(
+                value.value.isEmpty ? '—' : value.value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.end,
+                style: TextStyle(
+                  fontSize: 14.5,
+                  fontWeight: selected ? FontWeight.w500 : FontWeight.w400,
+                  color: value.value.isEmpty
+                      ? AppTheme.dim
+                      : (selected ? AppTheme.text : AppTheme.muted),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            // 箭头灰掉 = 「这一项改不了」。见 [PlayerTvRowValue.adjustable]。
+            Icon(Icons.chevron_right_rounded, size: 18, color: arrowColor),
+          ],
+        ),
       ),
     );
   }
@@ -363,6 +559,7 @@ class PlayerTvEpisodeGrid extends StatelessWidget {
     required this.onPick,
     required this.onClose,
     required this.onActivity,
+    this.focusNode,
   });
 
   final int count;
@@ -378,10 +575,12 @@ class PlayerTvEpisodeGrid extends StatelessWidget {
   final VoidCallback onClose;
 
   final VoidCallback onActivity;
+  final FocusNode? focusNode;
 
   @override
   Widget build(BuildContext context) {
     return TvPanelShell(
+      focusNode: focusNode,
       onActivity: onActivity,
       onUnhandledKey: (key) => switch (key) {
         // 菜单键在这里是「返回行列表」，与在行列表里是「关闭面板」不同 ——
@@ -392,35 +591,18 @@ class PlayerTvEpisodeGrid extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.smart_display_rounded,
-                  size: 20,
-                  color: AppTheme.muted,
-                ),
-                const SizedBox(width: 12),
-                Text(
-                  '选集（$count）',
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.text,
-                  ),
-                ),
-              ],
-            ),
+          TvPanelHeader(
+            title: '选集（$count）',
+            icon: Icons.smart_display_rounded,
           ),
           const Divider(height: 0.5, color: AppTheme.line),
           Expanded(
             child: GridView.builder(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
               gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: 4,
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
                 childAspectRatio: 1.6,
               ),
               itemCount: count,
@@ -431,6 +613,7 @@ class PlayerTvEpisodeGrid extends StatelessWidget {
               ),
             ),
           ),
+          const TvPanelKeyHints(hints: [('菜单', '返回')]),
         ],
       ),
     );
@@ -456,22 +639,36 @@ class _EpisodeCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return TvFocusable(
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: BorderRadius.circular(12),
       child: Material(
-        color: current ? AppTheme.accent : AppTheme.panel2,
-        borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(10),
-          child: Center(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
-                color: current ? Colors.white : AppTheme.text,
+        color: current ? Colors.transparent : AppTheme.panel3,
+        borderRadius: BorderRadius.circular(12),
+        child: Ink(
+          // 「当前这一集」用品牌渐变而不是纯强调色：整块网格里只有一格是
+          // 渐变的，扫一眼就能定位到「我在哪」。
+          decoration: BoxDecoration(
+            gradient: current ? AppTheme.brandGradient : null,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: current
+                  ? Colors.transparent
+                  : AppTheme.line.withValues(alpha: 0.8),
+              width: 0.8,
+            ),
+          ),
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(12),
+            child: Center(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: current ? Colors.white : AppTheme.text,
+                ),
               ),
             ),
           ),

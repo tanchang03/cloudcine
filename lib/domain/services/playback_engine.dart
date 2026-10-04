@@ -166,6 +166,7 @@ class EngineTrack {
     required this.id,
     this.title,
     this.language,
+    this.codec,
     this.isDefault = false,
   });
 
@@ -174,10 +175,25 @@ class EngineTrack {
 
   final String? title;
   final String? language;
+
+  /// 编解码器短名（`aac` / `subrip` / `hdmv_pgs_subtitle`）。
+  ///
+  /// ## 为什么它必须在契约里
+  ///
+  /// 唯一用途是**内嵌字幕清单的诊断日志** —— 那是「字幕出不来」的第一分诊点：
+  /// 有轨道但画面没字，就得看是哪一种字幕（`hdmv_pgs_subtitle` 是位图，
+  /// 本机解不开与 `subrip` 解不开是两回事）。丢了这一位，两种故障在日志里
+  /// 长得一模一样。音轨 / 字幕菜单的副标题（`TrackLabels.*Detail`）也读它。
+  ///
+  /// 两个内核给的都是 **FFmpeg 的短名**（media_kit 转发 mpv 的 `codec`，
+  /// mdk 直接给 FFmpeg 的 codec 名），口径天然一致，不需要归一化。
+  final String? codec;
+
   final bool isDefault;
 
   @override
-  String toString() => 'EngineTrack($id, $title, $language, default=$isDefault)';
+  String toString() =>
+      'EngineTrack($id, $title, $language, codec=$codec, default=$isDefault)';
 }
 
 /// 当前媒体解出来的轨道清单。
@@ -380,13 +396,35 @@ abstract class PlaybackEngine {
   /// 切字幕轨。`null` = **关掉字幕**。
   Future<void> selectSubtitleTrack(int? id);
 
-  /// 挂一条**外部**字幕。
+  /// 挂一条**外部**字幕（按 URI）。
   ///
-  /// ⚠️ 只接受 URI：mdk 的 `setExternalSubtitle` 吃 URI 而不是字节，
-  /// 所以网盘上那些「只有字节没有地址」的字幕，调用方要先落成临时文件。
-  /// （mpv 那条路本来支持直接喂字节，换内核后这一处是**能力倒退**，
-  /// 由调用方兜底，不在本契约里做兼容层。）
+  /// ⚠️ 只接受 URI。两个内核**都**支持这一条，所以本地字幕（有路径）走它。
   Future<void> loadExternalSubtitle(String uri);
+
+  /// 挂一条**外部**字幕，正文直接给（不走 URI）。
+  ///
+  /// ## 为什么它必须在契约里，而不是「调用方自己落成临时文件」
+  ///
+  /// 两个内核收字节的方式**不一样**：
+  ///   - media_kit：`SubtitleTrack.data(text)` —— mpv 直接吃字符串，零成本；
+  ///   - fvp：mdk 的 `setExternalSubtitle` **只吃 URI**，实现必须把正文落成
+  ///     一个临时文件再下发。
+  ///
+  /// 网盘字幕（`SubtitleOrigin.cloudFile`）的正文是我们自己解码出来的
+  /// **字符串**，没有地址。如果把「落临时文件」推给调用方，那件事就会落在
+  /// `PlaybackController`（领域层）身上 —— 而它得因此引入 `dart:io` 与
+  /// `path_provider`，为了一个纯粹的**内核差异**。所以兜底放在实现里：
+  /// 调用方只管交出文本。
+  ///
+  /// ## 临时文件的回收
+  ///
+  /// 由**实现**负责：换源（[open]）与 [dispose] 时删掉上一份。
+  /// 调用方不必知道它存在。
+  Future<void> loadExternalSubtitleText(
+    String text, {
+    String? title,
+    String? language,
+  });
 
   Future<void> dispose();
 }

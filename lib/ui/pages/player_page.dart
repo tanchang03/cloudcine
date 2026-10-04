@@ -29,6 +29,7 @@ import '../widgets/buffered_slider.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/missing_media_dialog.dart';
 import '../widgets/player_keys.dart';
+import '../widgets/playback_surface.dart';
 import '../widgets/player_tv_overlay.dart';
 
 /// 遥控器 / 键盘上某个键，在当前上下文里该触发什么。
@@ -300,7 +301,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   late final PlaybackController _controller;
 
   /// 沉浸模式：隐藏顶栏与控制栏，只剩画面。
+  ///
+  /// ⚠️ TV 上进来就是 `true`（见 [didChangeDependencies]）——「点开一部片子」
+  /// 就是「开始看」，满屏才是默认。桌面 / 手机保持 `false`：那边有鼠标，
+  /// 顶栏与控制栏常驻更让人安心，也留着一个看得见的「怎么退出去」的出口。
   bool _immersive = false;
+
+  /// 这一页是不是**已经**把 TV 的全屏打开过（沉浸 + 系统 UI 让位）。
+  ///
+  /// `dispose` 要据此还原，而那一刻再读 `AppTheme.isTvLayout(context)` 是不
+  /// 安全的（`dependOnInheritedWidgetOfExactType` 在 dispose 里已经不允许），
+  /// 所以把判据在这里存下来。
+  bool _tvFullscreen = false;
 
   /// 画面区的焦点节点 —— 遥控器适配的核心判据。
   ///
@@ -309,6 +321,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 焦点一旦进到控制栏的按钮上，这两个键必须**放行**给焦点系统 ——
   /// 否则 OK 会既暂停又点按钮，←/→ 会既快退又不换焦点。
   final FocusNode _stageNode = FocusNode(debugLabel: 'player-stage');
+
+  /// TV 右侧设置面板的焦点节点。**必须由页面持有**，理由见 [_openTvPanel]。
+  final FocusNode _tvPanelNode = FocusNode(debugLabel: 'player-tv-panel');
 
   /// 无操作收起控制栏（进入沉浸）的定时器。
   ///
@@ -380,6 +395,33 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 数据库往返。空列表表示这一条不在库里（从「文件夹」直接播了没入库的
   /// 文件），那时面板里「选集」那一行不可调。
   List<MediaItem> _siblings = const [];
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // ⚠️ 这件事只能在这里做，不能放 `initState`：判据
+    // `AppTheme.isTvLayout` 读的是 `MediaQuery.sizeOf(context)`，而
+    // `initState` 阶段调 `dependOnInheritedWidgetOfExactType` 是禁止的。
+    if (_tvFullscreen || !AppTheme.isTvLayout(context)) return;
+    _tvFullscreen = true;
+
+    // ## TV 上进来就满屏
+    //
+    // 原来 `_immersive` 默认 `false`，于是顶栏 48 + 控制栏 64 + 过扫描 54
+    // 一共 **166px（540 的 31%）** 永远压在画面上 —— 而 16:9 的片子塞进
+    // 剩下那 374 高里，上下再留两条黑边。用户的原话是「播放器并没有默认全屏」。
+    //
+    // 这里**直接改字段而不 `setState`**：`didChangeDependencies` 之后紧接着
+    // 就是本帧的 `build`，再标一次脏没有意义。
+    _immersive = true;
+
+    // 系统层也一起让开（状态栏 / 导航栏）。电视盒子大多没有这两条，但有
+    // 导航栏的机型上画面会被顶掉一条，而那是**应用管不到的地方**。
+    // 退出播放页时在 `dispose` 里还原。
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+    );
+  }
 
   @override
   void initState() {
@@ -592,7 +634,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       unawaited(_controller.stop());
     }
     _cancelIdleHide();
+    // 还原系统 UI。不回退的话，退回媒体库之后状态栏 / 导航栏仍然是藏着的 ——
+    // 而那里要靠返回键与底部导航，藏着的表现是「按钮不见了」。
+    if (_tvFullscreen) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    }
     _stageNode.dispose();
+    _tvPanelNode.dispose();
     super.dispose();
   }
 
@@ -846,20 +894,61 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             canRequestFocus: false,
             skipTraversal: true,
             onKeyEvent: _onRemoteKey,
-            child: Column(
+            child: Stack(
+              // ⛔ 必须 `expand`。`Stack` 默认给**非定位**子节点的是松约束，
+              // 里面那个 `Column` 会因为 `Expanded` 拿到无界高度而抛异常。
+              fit: StackFit.expand,
               children: [
-                // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
-                // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
-                // 沉浸模式是桌面鼠标的用法，TV 上不该让焦点先停在这里。
-                if (!_immersive) ExcludeFocus(child: _buildTopBar(controller)),
-                Expanded(
-                  child: Focus(
-                    focusNode: _stageNode,
-                    autofocus: true,
-                    child: _buildStage(controller),
-                  ),
+                Column(
+                  children: [
+                    // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
+                    // 返回有遥控器自己的 BACK 键（由 Activity 处理，不走 Flutter 的按键通道），
+                    // 沉浸模式是桌面鼠标的用法，TV 上不该让焦点先停在这里。
+                    if (!_immersive) ExcludeFocus(child: _buildTopBar(controller)),
+                    Expanded(
+                      child: Focus(
+                        focusNode: _stageNode,
+                        autofocus: true,
+                        child: _buildStage(controller),
+                      ),
+                    ),
+                    if (!_immersive)
+                      _remoteReachable(_buildControlBar(controller)),
+                  ],
                 ),
-                if (!_immersive) _remoteReachable(_buildControlBar(controller)),
+
+                // TV 右侧设置面板。**挂在页面最外层**，不在画面那一块里 ——
+                // 见下面那段「为什么不能放进 `_buildStage`」。
+                if (_tvPanelOpen)
+                  Positioned(
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: PlayerTvOverlay(
+                      controller: controller,
+                      focusNode: _tvPanelNode,
+                      item: _item,
+                      siblings: _siblings,
+                      activeAudioId: _audioId,
+                      onPickQuality: _changeQuality,
+                      onPickSubtitle: _changeSubtitle,
+                      onPickAudioTrack: (track, index) {
+                        setState(() => _audioId = track.id);
+                        unawaited(controller.selectAudioTrack(track));
+                        unawaited(_rememberAudio(track, index));
+                      },
+                      onPickAudioEffect: _setAudioEffect,
+                      onPickRate: controller.setRate,
+                      onPickEpisode: _openItem,
+                      onJumpIntro: () async {
+                        final marker = controller.introMarker;
+                        if (marker == null) return;
+                        await controller.seek(marker.start);
+                      },
+                      onClose: _closeTvPanel,
+                      onActivity: _scheduleControlsHide,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -1021,6 +1110,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       // 会被读成「控制栏没了」。
       _immersive = false;
     });
+    // ## ⛔ 焦点必须**显式**交给面板，光靠面板自己的 `autofocus` 是不够的
+    //
+    // `Focus(autofocus: true)` 只在「它所在的那个 scope 还没有焦点」时才生效。
+    // 而这里画面节点 `_stageNode` 也是 `autofocus`、且**早就拿到了焦点** ——
+    // 于是面板那个 `autofocus` 是空操作，`Focus.onKeyEvent` 永远收不到按键。
+    //
+    // 症状正是用户报的那条：「菜单键能弹出 OSD，但上下键按不动、选不了菜单」。
+    // ↑/↓ 冒泡到页面那一层，`stageFocused` 仍是 true（焦点压根没离开画面），
+    // 于是 `resolveRemoteKey` 把方向键判成 `ignored` 交还给焦点遍历 ——
+    // 而面板贴在右边、几何上不在「画面上方 / 下方」，遍历也走不进去。
+    // 结果是两条路都是死的，遥控器完全操作不了面板。
+    //
+    // 下一帧再要焦点：这一帧面板还没建出来，`requestFocus` 会落到一个
+    // 还没有 `context` 的节点上。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_tvPanelOpen) return;
+      _tvPanelNode.requestFocus();
+    });
     _scheduleControlsHide();
   }
 
@@ -1125,8 +1232,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       fit: StackFit.expand,
       children: [
         if (_ready)
-          Video(
-            controller: controller.videoController,
+          // ⚠️ 用 `PlaybackSurface` 而不是 `Video`：出画面的组件要按**当前
+          // 内核**挑（media_kit → `Video`，fvp → `VideoPlayer`），而内核可能
+          // 随片源切换（杜比视界片走 fvp）。分派只有这一处，见那个组件的文档。
+          PlaybackSurface(
+            engine: controller.engine,
             // 自绘控制栏（见类文档）。
             controls: (_) => const SizedBox.shrink(),
             fill: AppTheme.cinema,
@@ -1201,38 +1311,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
 
-        // TV 右侧设置面板。**浮在画面之上**，不占布局空间 —— 用 `Column`
-        // 挤窄画面的话，调一次字幕就要让视频重新布局一次（画面会明显抖一下），
-        // 而用户只是想看字幕有没有乱码。
-        if (_tvPanelOpen)
-          Positioned(
-            top: 0,
-            right: 0,
-            bottom: 0,
-            child: PlayerTvOverlay(
-              controller: controller,
-              item: _item,
-              siblings: _siblings,
-              activeAudioId: _audioId,
-              onPickQuality: _changeQuality,
-              onPickSubtitle: _changeSubtitle,
-              onPickAudioTrack: (track, index) {
-                setState(() => _audioId = track.id);
-                unawaited(controller.selectAudioTrack(track));
-                unawaited(_rememberAudio(track, index));
-              },
-              onPickAudioEffect: _setAudioEffect,
-              onPickRate: controller.setRate,
-              onPickEpisode: _openItem,
-              onJumpIntro: () async {
-                final marker = controller.introMarker;
-                if (marker == null) return;
-                await controller.seek(marker.start);
-              },
-              onClose: _closeTvPanel,
-              onActivity: _scheduleControlsHide,
-            ),
-          ),
+        // ⚠️ TV 右侧设置面板**不在这里** —— 它挂在 `build` 最外层那个
+        // `Stack` 上，理由只有一条：**高度**。
+        //
+        // 画面这一块是 `Column` 里的 `Expanded`，面板一开控制栏也要显示
+        // （`_openTvPanel` 会退出沉浸），于是这里只有
+        // 540 − 顶栏 75 − 控制栏 91 = **374** 高；而面板要装下
+        // 表头 54 + 七行 × 52 + 底部提示 40 ≈ 458。差出来的 84px 会让
+        // 第 5 行往后要滚动才看得见 —— 而**电视上没有滚动条**，
+        // 用户根本不会知道「音效 / 倍速 / 片头」还在下面。
+        // 挂到最外层之后它拿到整屏 540，靠自己的上下边距避让过扫描带。
+        //
+        // ⛔ 别为了「省一层 Stack」把它挪回这里。
       ],
     );
   }

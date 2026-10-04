@@ -47,9 +47,22 @@ import 'change_gate.dart';
 class MediaKitPlaybackEngine implements PlaybackEngine {
   /// [tv] 决定缓冲参数与上限。判据由调用方给（`isTvDevice()`）——
   /// 引擎不该自己去猜平台，那是可以注入的、能测的输入。
-  MediaKitPlaybackEngine({bool tv = false})
+  ///
+  /// [verboseLog] 把 mpv 的日志级别抬到 `warn`。
+  ///
+  /// ## ⚠️ 只有独立播放窗口需要它，而且是**必要条件**
+  ///
+  /// 抬高之后 `log` 流才会带上 `http: HTTP error 4xx`（实测是 **warn** 级，
+  /// 而 media_kit 默认只请求 `error`）。独立窗口的「直链过期 → 自动重新取链」
+  /// 全靠这一条，缺了它用户实际会遇到的那种过期**一次都检测不到**。
+  /// 完整实测记录见 `player_protocol.dart` 的 `isHttp4xxLog`。
+  ///
+  /// 内置播放页**不开**（保持默认 `error`）：它没有那条过期检测，
+  /// 而 warn 级会把字幕诊断之外的一堆噪音也放进日志缓冲。
+  MediaKitPlaybackEngine({bool tv = false, bool verboseLog = false})
       : _player = mk.Player(
           configuration: mk.PlayerConfiguration(
+            logLevel: verboseLog ? mk.MPVLogLevel.warn : mk.MPVLogLevel.error,
             // TV 上换一套更小的缓冲：桌面那套（1 GB + 无限预读）在电视盒子上
             // 会把内存和 eMMC 写满，实测表现就是卡帧 + 音画不同步。
             // 判据与理由都在 `PlayerBufferConfig` 的类文档里。
@@ -264,6 +277,20 @@ class MediaKitPlaybackEngine implements PlaybackEngine {
   Future<void> loadExternalSubtitle(String uri) =>
       _player.setSubtitleTrack(mk.SubtitleTrack.uri(uri));
 
+  /// mpv **能直接吃字符串**，所以这条对 media_kit 是零成本的。
+  ///
+  /// ⚠️ 与 [FvpPlaybackEngine] 的同一方法**实现完全不同**（那边要落临时文件）
+  /// —— 这正是它被放进契约、而不是推给调用方的原因，见契约里的类文档。
+  @override
+  Future<void> loadExternalSubtitleText(
+    String text, {
+    String? title,
+    String? language,
+  }) =>
+      _player.setSubtitleTrack(
+        mk.SubtitleTrack.data(text, title: title, language: language),
+      );
+
   /// 读一次章节清单。
   ///
   /// 解析复用 [MpvChapters.read]（mpv 的 `chapter-list` 属性）。
@@ -331,6 +358,7 @@ class MediaKitPlaybackEngine implements PlaybackEngine {
               id: t.id,
               title: t.title,
               language: t.language,
+              codec: t.codec,
               isDefault: t.isDefault,
             ),
         ],
@@ -340,6 +368,7 @@ class MediaKitPlaybackEngine implements PlaybackEngine {
               id: t.id,
               title: t.title,
               language: t.language,
+              codec: t.codec,
               isDefault: t.isDefault,
             ),
         ],
@@ -349,6 +378,7 @@ class MediaKitPlaybackEngine implements PlaybackEngine {
               id: t.id,
               title: t.title,
               language: t.language,
+              codec: t.codec,
               isDefault: t.isDefault,
             ),
         ],
@@ -401,6 +431,7 @@ class MediaKitPlaybackEngine implements PlaybackEngine {
     required String id,
     String? title,
     String? language,
+    String? codec,
     bool? isDefault,
   }) =>
       EngineTrack(
@@ -409,6 +440,7 @@ class MediaKitPlaybackEngine implements PlaybackEngine {
         id: int.parse(id),
         title: title,
         language: language,
+        codec: codec,
         isDefault: isDefault ?? false,
       );
 

@@ -9,6 +9,7 @@ import 'package:cloudcine/ui/providers/app_providers.dart';
 import 'package:cloudcine/ui/providers/auth_providers.dart';
 import 'package:cloudcine/ui/providers/scan_providers.dart';
 import 'package:cloudcine/ui/theme/app_theme.dart';
+import 'package:cloudcine/ui/widgets/common_widgets.dart';
 import 'package:cloudcine/ui/widgets/tv_affordance.dart';
 import 'package:cloudcine/ui/widgets/tv_focus.dart';
 import 'package:flutter/foundation.dart';
@@ -178,6 +179,56 @@ void main() {
     }
   });
 
+  testWidgets('页头只折两行，海报墙拿到六成以上的高度', (tester) async {
+    // 诉求原话是「Android TV 端界面布局混乱」。实测的「乱」长这样
+    // （960×540、页面实得 624×486）：
+    //
+    //   页头 **284px**（标题独占一行 + 操作区折成三行）
+    //   分类栏  56px
+    //   海报墙 **146px** —— 而一张卡高 166，**连一行都露不全**
+    //
+    // 也就是说屏幕上六成的高度被八个控件吃掉，用户打开媒体库只看到
+    // 半排被切掉的海报。这条用例把「海报墙必须拿到大头」钉住。
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      await pumpTvPage(tester);
+
+      final frame = tester.getRect(find.byKey(const Key('tv-frame')));
+      final header = tester.getRect(find.byType(PageHeader));
+      final grid = tester.getRect(find.byType(GridView));
+
+      // 标题块现在是 `Wrap` 的第一项，操作区跟在它后面折行 —— 两行就够。
+      // ⛔ 三行不是「差一点」，是「又回到标题独占一行」了：`Wrap` 里任何
+      // 一个子项只要比整行还宽（例如 `Row` 忘了写 `MainAxisSize.min`，
+      // 它会被 `Wrap` 的 `maxWidth: 580` 撑满），后面所有控件都会被挤下去。
+      expect(
+        header.height,
+        lessThan(150),
+        reason: '页头占了 ${header.height}px（整页只有 ${frame.height}）。'
+            '标题必须作为 `Wrap` 的第一个块与操作区同排 —— 让它独占一行的话'
+            '实测回到 284px，海报墙只剩 146px。',
+      );
+
+      expect(
+        grid.height,
+        greaterThan(frame.height * 0.6),
+        reason: '海报墙只有 ${grid.height}px（整页 ${frame.height}）。'
+            '这一页的主体是海报，页头与分类栏加起来不该超过四成。',
+      );
+
+      // 「看得见一行」是底线，「看得见第二行」才是这一页读起来像海报墙的前提。
+      final card = tester.getRect(find.byType(TvFocusable).last);
+      expect(
+        grid.height,
+        greaterThan(card.height * 1.6),
+        reason: '卡片高 ${card.height}，海报墙只有 ${grid.height} —— '
+            '露不出完整一行加下一行的开头，用户会以为「就这几部」。',
+      );
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   testWidgets('遥控器走得到页头、分类条、海报墙 —— 三块区域都不是死区',
       (tester) async {
     // 诉求原话里有半句是「**很多区域遥控器方式无法触达**」。
@@ -206,11 +257,19 @@ void main() {
 
       // 树里第一个 TvFocusable 是分类条上的胶囊、最后一个是海报卡 ——
       // 分别代表「页头下面那条」与「页面主体」两块。
+      //
+      // ⚠️ 分类条那一项**不能**用 `focusables.first`：页头里的「排序」
+      // 也套了 `TvFocusable`（它原本连焦点环都没有），而它在树里更靠前。
+      // 用 `.first` 的话这一条会**悄悄变成在测排序按钮**，仍然全绿 ——
+      // 一条不再测它该测的东西的断言比没有更糟。所以按文案定位到「全部」那颗胶囊。
+      final firstChip = find
+          .ancestor(of: find.text('全部'), matching: find.byType(TvFocusable))
+          .first;
       final hit = await walkReachability(
         tester,
         probes: {
           '页头': (t) => anyFocusedInside(t, labels),
-          '分类条': (t) => focusedInside(t, focusables.first),
+          '分类条': (t) => focusedInside(t, firstChip),
           '海报墙': (t) => focusedInside(t, focusables.last),
         },
       );

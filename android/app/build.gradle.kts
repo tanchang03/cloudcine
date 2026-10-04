@@ -157,8 +157,20 @@ listOf("Release", "Debug", "Profile").forEach { capitalized ->
                 logger.lifecycle("brand${capitalized}Apk：$apkDir 下没有 app-*-$buildMode.apk，跳过")
             } else {
                 sources.forEach { source ->
-                    // 去掉前后缀，剩下的就是 ABI（普通构建为空串）。
-                    val abi = source.name.removePrefix("app-").removeSuffix("-$buildMode.apk")
+                    // Flutter 的命名是 `app-<abi>?-<mode>.apk`。普通构建**没有 ABI 段**，
+                    // 就是 `app-<mode>.apk` —— 摘掉前缀与 `.apk` 后剩下的**就是 mode 本身**，
+                    // 所以要去掉的是 `mode`（不带连字符）以及它前面那个连字符，
+                    // 不能只写 `removeSuffix("-<mode>")`：
+                    //   · `app-release.apk` → `release.apk` → 不以 `-release.apk` 结尾，
+                    //     `removeSuffix` 静默不生效 → ABI 成了 `release.apk`；
+                    //   · 只去掉 `.apk` 再写 `removeSuffix("-release")` 同样匹配不上
+                    //     （`release` 前面没有连字符）→ ABI 成了 `release`。
+                    // 两种错法都不报错，只是产物名多出一截。
+                    val abi = source.name
+                        .removePrefix("app-")
+                        .removeSuffix(".apk")
+                        .removeSuffix(buildMode)
+                        .removeSuffix("-")
                     val abiSuffix = if (abi.isEmpty()) "" else "-$abi"
                     val branded = File(
                         apkDir,

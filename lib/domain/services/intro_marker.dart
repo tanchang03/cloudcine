@@ -1,5 +1,8 @@
 import 'dart:convert';
 
+import '../../core/diagnostics/diag_log.dart';
+import 'playback_engine.dart';
+
 /// 一个「片头区间」。
 ///
 /// 两种来源，**优先级由调用方定**（`IntroMarkerDetector` 只负责识别文件里的
@@ -266,6 +269,26 @@ abstract final class IntroMarkerDetector {
   static const Duration minLength = Duration(seconds: 5);
   static const Duration maxLength = Duration(minutes: 10);
 
+  /// 引擎契约的章节清单 → 本文件认片头吃的形状。
+  ///
+  /// ## 为什么丢掉 `end`
+  ///
+  /// [EngineChapter] 带起止（mdk 直接给），而 [IntroChapter] 只有起点 ——
+  /// 因为 mpv 的 `chapter-list` **不给终点**。而认片头只看「标题像不像片头」
+  /// 与「起点在第几分钟」，终点由 [detect] 用**下一个章节的起点**推。
+  ///
+  /// 所以这里丢掉 `end` 不是信息损失，而是**让规则只有一份**：两个内核都喂
+  /// 同一个 [detect]，不会出现「DV 片跳片头跳得不一样」这种只有换内核才
+  /// 复现的怪事。
+  ///
+  /// ⚠️ 章节清单的顺序**必须保持原样**：mpv 与 mdk 都按时间升序给，而
+  /// [detect] 的「下一个章节」完全依赖这个顺序。在这里排序是错的方向 ——
+  /// 那会把「引擎给乱了」这件事掩盖掉。
+  static List<IntroChapter> fromEngineChapters(List<EngineChapter> chapters) => [
+        for (final c in chapters)
+          IntroChapter(title: c.title ?? '', start: c.start),
+      ];
+
   /// 从章节清单里推出片头区间；认不出来返回 `null`。
   ///
   /// ## 为什么必须有「下一个章节」
@@ -296,6 +319,49 @@ abstract final class IntroMarkerDetector {
     if (marker.length < minLength) return false;
     if (marker.length > maxLength) return false;
     return true;
+  }
+
+  /// [detect] 的**带诊断日志**版本。
+  ///
+  /// ## 为什么日志要跟判定放在一起
+  ///
+  /// 两个内核的**读取方式完全不同**（mpv 读 `chapter-list` 属性、mdk 查
+  /// `MediaInfo.chapters`），但「有没有读到章节」「读到了但认不出片头」这两条
+  /// 日志**必须逐字一致** —— 用户报「怎么不跳片头」时，分诊的第一步就是看这
+  /// 两条。各写一份的话，两边会慢慢分叉，而两个播放器永远不会同时出现在一块
+  /// 屏上，没人会发现。
+  ///
+  /// 日志分级是有意的：
+  ///   - **没有章节**走 `debug` —— 网盘片源绝大多数没写章节，是常态，
+  ///     用 info 会把诊断日志刷满；
+  ///   - **有章节但没认出**走 `info` —— 这条必须留痕：它把「章节名不匹配」
+  ///     与「根本没读到章节」分开，两者的修法完全不同（改关键词表 vs 查读取时机）。
+  static IntroMarker? detectAndLog(
+    List<IntroChapter> chapters, {
+    String label = '',
+  }) {
+    final prefix = label.isEmpty ? '' : '$label：';
+    if (chapters.isEmpty) {
+      diag.debug('片头', '$prefix没有章节标记');
+      return null;
+    }
+
+    final marker = detect(chapters);
+    if (marker == null) {
+      diag.info(
+        '片头',
+        '$prefix有 ${chapters.length} 个章节但没认出片头：'
+        '${chapters.map((c) => '"${c.title}"@${c.start.inSeconds}s').join(' ')}',
+      );
+      return null;
+    }
+
+    diag.info(
+      '片头',
+      '$prefix认出片头 ${marker.start.inSeconds}s→'
+      '${marker.end.inSeconds}s（${marker.length.inSeconds}s）',
+    );
+    return marker;
   }
 }
 

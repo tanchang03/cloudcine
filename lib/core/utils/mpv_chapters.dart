@@ -3,15 +3,22 @@ import 'package:media_kit/media_kit.dart';
 import '../../domain/services/intro_marker.dart';
 import '../diagnostics/diag_log.dart';
 
-/// 从正在播放的 mpv 里读容器章节，并认出片头。
+/// 从 mpv 里读容器章节。**只有 `MediaKitPlaybackEngine` 会调它**。
 ///
 /// ## 为什么放在 `core/utils/` 而不是 domain
 ///
 /// 它要 `import package:media_kit`（为了 `NativePlayer.getProperty`），
 /// 而 `domain/` 的规矩是**不碰插件**（见 `lib/domain/` 的目录约定）。
-/// 「怎么读」留在这一层，「读出来的东西是什么意思」全部在
-/// `domain/services/intro_marker.dart` 里 —— 两个播放器都只调这里，
-/// 所以规则仍然只有一份。
+/// 「怎么读」留在这一层；「读出来的东西是什么意思」（认片头）在
+/// `domain/services/intro_marker.dart` 里 —— 两个内核共用那一份判定。
+///
+/// ## ⚠️ 别从这里直接认片头
+///
+/// 这里曾经有一个 `detectIntro(player)` 的便捷方法，两个播放器都调它。
+/// 迁移到「两个内核按需路由」之后它变成了**第二个人口**：fvp 那边根本没有
+/// `Player`，走它只能拿到空章节，而症状是「DV 片源上跳片头静默失效」。
+/// 所以判定收口到契约（`PlaybackEngine.chapters` →
+/// [IntroMarkerDetector.detectAndLog]），本类只剩「怎么读」。
 ///
 /// ## 读取时机是**硬要求**：必须在容器解析完成之后
 ///
@@ -21,8 +28,8 @@ import '../diagnostics/diag_log.dart';
 /// 而且没有任何报错。
 ///
 /// 所以本类**不做轮询、也不在 `open()` 之后立刻读**，而是由调用方在
-/// 「`position` 已经大于 0」那一刻调一次（见 `PlaybackController` 里
-/// `_probeChaptersOnce` 的调用点）。那时容器一定已经解完。
+/// 「`position` 已经大于 0」那一刻调一次（见 `PlaybackController` /
+/// `player_window_app.dart` 里片头探测的调用点）。那时容器一定已经解完。
 abstract final class MpvChapters {
   const MpvChapters._();
 
@@ -48,42 +55,4 @@ abstract final class MpvChapters {
     }
   }
 
-  /// 读一次并直接给出片头区间。认不出来返回 `null`。
-  ///
-  /// [label] 只进诊断日志，用来对上「哪一集」—— 跳片头出问题时第一件要
-  /// 确认的事就是「到底有没有读到章节」。
-  static Future<IntroMarker?> detectIntro(
-    Player player, {
-    String label = '',
-  }) async {
-    final chapters = await read(player);
-    if (chapters.isEmpty) {
-      // 绝大多数网盘片源走到这里（压制时没写章节）。用 debug 而不是 info：
-      // 它是常态，不该把诊断日志刷满。
-      diag.debug('片头', '${_prefix(label)}没有章节标记');
-      return null;
-    }
-
-    final marker = IntroMarkerDetector.detect(chapters);
-    if (marker == null) {
-      // 有章节但没认出片头。这条**必须**留痕（info 级）：用户报「怎么不跳
-      // 片头」时，要能一眼看出是「章节名不匹配」还是「根本没读到章节」——
-      // 两者的修法完全不同（前者改关键词表，后者查读取时机）。
-      diag.info(
-        '片头',
-        '${_prefix(label)}有 ${chapters.length} 个章节但没认出片头：'
-        '${chapters.map((c) => '"${c.title}"@${c.start.inSeconds}s').join(' ')}',
-      );
-      return null;
-    }
-
-    diag.info(
-      '片头',
-      '${_prefix(label)}认出片头 ${marker.start.inSeconds}s→'
-      '${marker.end.inSeconds}s（${marker.length.inSeconds}s）',
-    );
-    return marker;
-  }
-
-  static String _prefix(String label) => label.isEmpty ? '' : '$label：';
 }

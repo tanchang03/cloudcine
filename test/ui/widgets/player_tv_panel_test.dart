@@ -229,15 +229,20 @@ void main() {
               '${AppTheme.tvSafeHorizontal}px 的过扫描带 —— 那一截在真机上是看不见的。',
         );
 
-        // ⛔ 这条守的是**面板的高度预算**：面板是按「7 行正好塞满」做的 ——
-        // 表头 56 + 分隔线 0.5 + 底部提示 60（那行会折成两行）+ 7×60 = 536.5，
-        // 而面板只有 540 高 → 只剩 **3.5px** 余量。
+        // ⛔ 这条守的是**面板的高度预算**：面板挂在页面最外层、纵向铺满整屏，
+        // 但卡片自己还要避让上下各 27 的过扫描带（`_kPanelMarginY = 28`）——
+        // 所以卡片只有 540 − 28×2 = **484** 高。而内容是
+        // 「表头 54 + 分隔线 0.5 + 底部键帽提示 ~39 + 列表（7 行 × 52 + 上下各 6
+        // 的内边距 = 376）」≈ **469** → 余量只剩十几像素。
+        //
         // 装不下的后果是最后一行「片头」要滚动才看得见，而**电视上没有滚动条**，
         // 用户根本不会知道下面还有一行。
-        // ⚠️ 实测来历：给面板加上下各 27 的过扫描内边距 → 立刻溢出 50.5px。
-        // 这条断言正是被那次改动「写出来」的，也是它把那次改动挡了下来。
+        //
+        // ⚠️ 这条断言是**被一次真实改动写出来的**：当初给面板加上下各 27 的
+        // 过扫描内边距，立刻溢出 50.5px，就是它把那次改动挡了下来。
         // 判据用 `maxScrollExtent == 0`：比量某一行的高度稳，也不受
         // `ListView` 的 `cacheExtent`（会预建屏幕外的行）干扰。
+        // 改行高（`_kRowHeight`）/ 表头内边距 / 键帽提示的内边距之前先读这里。
         final scrollable = tester.state<ScrollableState>(find.byType(Scrollable));
         expect(
           scrollable.position.maxScrollExtent,
@@ -504,6 +509,142 @@ void main() {
           reason: '二级页的返回必须先于关闭发生。做反了的话，用户想退回上一层'
               '却整个面板没了（还得重新按菜单键唤出）—— 而这两件事都「有反应」，'
               '所以不报错、只是难用');
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // ⚠️ 「菜单键能弹出 OSD，但上下键按不动」—— 这条反馈的回归守卫
+  //
+  // 根因不在面板内部（它的按键映射一直是对的），而在**焦点归属**：面板里那个
+  // `Focus(autofocus: true)` 在「所在 scope 已经有焦点」时是**空操作**，而播放页
+  // 的画面节点（`_stageNode`）早就把焦点占住了。于是面板画出来了、看着一切正常，
+  // 但一个按键都收不到 —— 没有报错、没有日志，只有用户觉得遥控器坏了。
+  //
+  // 修法是播放页在打开面板后显式 `requestFocus` 到面板自己的节点上（面板必须
+  // 收下这个节点，不能自建）。这一段把这两半都钉住。
+  // ------------------------------------------------------------------
+  group('⚠️ 焦点归属（「菜单键能弹出、上下键按不动」的根因）', () {
+    testWidgets('面板自己挂 autofocus 收不到按键 —— 画面已经占着焦点', (tester) async {
+      final stageNode = FocusNode(debugLabel: 'test-stage');
+      final panelNode = FocusNode(debugLabel: 'test-panel');
+      addTearDown(stageNode.dispose);
+      addTearDown(panelNode.dispose);
+
+      final selected = <int>[];
+      var opened = false;
+      late StateSetter rebuild;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.dark(),
+          home: Scaffold(
+            body: SizedBox(
+              height: 540,
+              child: StatefulBuilder(
+                builder: (context, setState) {
+                  rebuild = setState;
+                  return Stack(
+                    children: [
+                      // 「画面」——播放页里它 `autofocus: true`，先拿到焦点。
+                      Positioned.fill(
+                        child: Focus(
+                          focusNode: stageNode,
+                          autofocus: true,
+                          child: const ColoredBox(color: Color(0xFF000000)),
+                        ),
+                      ),
+                      if (opened)
+                        Positioned(
+                          top: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: PlayerTvPanel(
+                            focusNode: panelNode,
+                            rows: rows,
+                            selectedIndex: 0,
+                            onSelectedChanged: selected.add,
+                            onAdjust: (_, __) {},
+                            onActivate: (_) {},
+                            onClose: () {},
+                            onActivity: () {},
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(stageNode.hasPrimaryFocus, isTrue, reason: '前提：画面先占住焦点');
+
+      // 「按菜单键打开面板」。
+      rebuild(() => opened = true);
+      await tester.pump();
+      expect(
+        panelNode.hasPrimaryFocus,
+        isFalse,
+        reason: '`autofocus` 只在所在 scope **还没有焦点**时才生效 —— 这里已经有'
+            '（画面节点），所以它是空操作。面板必须由调用方显式 requestFocus。',
+      );
+
+      await press(tester, LogicalKeyboardKey.arrowDown);
+      expect(
+        selected,
+        isEmpty,
+        reason: '⚠️ 这就是用户报的那条：「点击遥控器菜单按钮可以弹出 osd 菜单，'
+            '但是上下按钮按不动」。面板看得见、却一个键都收不到。',
+      );
+
+      // 播放页的补救（`_PlayerPageState._openTvPanel` 里的 requestFocus）。
+      panelNode.requestFocus();
+      await tester.pump();
+      await press(tester, LogicalKeyboardKey.arrowDown);
+      expect(
+        selected,
+        [1],
+        reason: '焦点显式交给面板之后，↑↓ 才真的作用在它上面',
+      );
+    });
+
+    testWidgets('面板真的挂在调用方给的节点上 —— 否则 requestFocus 是打空靶',
+        (tester) async {
+      // 这条守的是另一半：`TvPanelShell` 必须把外部节点交给自己的 `Focus`。
+      // 少了这一步，播放页 requestFocus 到一个**没人用**的节点上 —— 表现与
+      // 上面那条一模一样（面板收不到按键），但改起来完全是另一处代码。
+      final node = FocusNode(debugLabel: 'page-owned');
+      addTearDown(node.dispose);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.dark(),
+          home: Scaffold(
+            body: SizedBox(
+              height: 540,
+              child: PlayerTvPanel(
+                focusNode: node,
+                rows: rows,
+                selectedIndex: 0,
+                onSelectedChanged: (_) {},
+                onAdjust: (_, __) {},
+                onActivate: (_) {},
+                onClose: () {},
+                onActivity: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(
+        node.hasPrimaryFocus,
+        isTrue,
+        reason: '面板没有真的挂在调用方给的节点上 —— 播放页的 requestFocus '
+            '打在了空靶子上，遥控器按下去还是没反应',
+      );
     });
   });
 }

@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fvp/fvp.dart' as fvp;
 import 'package:media_kit/media_kit.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -26,6 +27,30 @@ Future<void> main(List<String> args) async {
   // 注意它必须在**分流之前**：播放窗口是独立引擎，同样要自己初始化一次
   // media_kit，不能指望主窗口那边初始化过。
   MediaKit.ensureInitialized();
+
+  // 第二内核：fvp（libmdk）。**只服务杜比视界片源**，其余片源仍走 media_kit。
+  //
+  // ⛔ 必须**显式**注册，不能指望自动注册：fvp 的 pubspec 里 macOS 平台
+  // 只有 `pluginClass`、**没有 `dartPluginClass`**（只有 linux/windows/ohos/
+  // elinux 有 `VideoPlayerRegistrant`）。漏掉这一句，`video_player` 会用官方的
+  // `video_player_avfoundation`（Apple 那套栈）——**DV 依然渲染不对，而且不报
+  // 任何错**，排查时看起来像「换了内核也没用」。
+  //
+  // ⚠️ **只在 macOS 注册**。Android / TV 走的是 media_kit 的**真窗口 vo**
+  // （`android_video_controller` 设 `vo=gpu` + `wid`），本来就不受 render API
+  // 限制，不需要换内核 —— 换过去等于把一条已验的路径换成没验的。
+  //
+  // 位置与上面的 `MediaKit.ensureInitialized()` 同理，必须在**分流之前**：
+  // 播放窗口跑的是**独立引擎**，而 Dart 侧的平台实现注册是**每个引擎各一份**的，
+  // 主窗口注册过不代表播放窗口注册过。
+  //
+  // `platforms` 显式写出来是**双保险**：即便以后在别的平台也 import 了这里，
+  // 也只有 macOS 会被 fvp 接管。
+  if (Platform.isMacOS) {
+    fvp.registerWith(options: {
+      'platforms': ['macos'],
+    });
+  }
 
   // 分流要尽可能早：播放窗口跑的是播放界面，不该做媒体库的启动工作
   // （开数据库、建海报缓存、起 Riverpod 容器）。

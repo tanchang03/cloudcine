@@ -70,6 +70,7 @@ class PlayerTvOverlay extends StatefulWidget {
   const PlayerTvOverlay({
     super.key,
     required this.controller,
+    required this.focusNode,
     required this.item,
     required this.siblings,
     required this.activeAudioId,
@@ -85,6 +86,13 @@ class PlayerTvOverlay extends StatefulWidget {
   });
 
   final PlaybackController controller;
+
+  /// 面板的焦点节点，**由播放页持有**。
+  ///
+  /// ⛔ 不能让面板自己建一个 + `autofocus`：画面节点早就占着焦点了，
+  /// `autofocus` 是空操作，面板会收不到任何按键（用户报的「上下键按不动」
+  /// 就是这个）。播放页在打开面板后显式 `requestFocus` 到这个节点上。
+  final FocusNode focusNode;
 
   /// 当前这一集。**可能为 null**（还没加载出来）—— 那时「选集」行显示「—」。
   final MediaItem? item;
@@ -127,6 +135,7 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
     if (_episodes) {
       final siblings = widget.siblings;
       return PlayerTvEpisodeGrid(
+        focusNode: widget.focusNode,
         count: siblings.length,
         currentIndex: siblings.indexWhere((i) => i.id == widget.item?.id),
         labelOf: (i) => episodeCellLabel(siblings[i], i),
@@ -141,6 +150,7 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
     }
 
     return PlayerTvPanel(
+      focusNode: widget.focusNode,
       rows: _rows(),
       selectedIndex: _rowIndex,
       onSelectedChanged: (i) => setState(() => _rowIndex = i),

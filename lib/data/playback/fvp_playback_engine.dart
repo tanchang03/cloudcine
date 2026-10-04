@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 
 // 不加前缀：`FVPControllerExtensions` 是**扩展方法**，前缀导入不会把它带进
 // 隐式解析的作用域，于是 `controller.setAudioTracks(...)` 会编译不过。
 import 'package:fvp/fvp.dart';
 import 'package:fvp/mdk.dart' as mdk;
+import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../core/diagnostics/diag_log.dart';
@@ -30,6 +32,19 @@ import 'change_gate.dart';
 /// | 实时速率 | `demuxer-cache-state` | **没有** |
 /// | 引擎日志 | `stream.log` | **没有** |
 ///
+/// ## ✅ 本机 `http_proxy` 不会打断这条路（已核实，别再查一遍）
+///
+/// media_kit 那条路上有个著名陷阱：本机设了 `http_proxy` 时，ffmpeg 会把请求
+/// 交给 `httpproxy` 协议，而 mpv 的**协议白名单**没放行它 →
+/// `avformat_open_input() failed`（HLS 那个故障就是这么来的，只能靠本地中继绕）。
+///
+/// fvp 这条路**没有**这个问题，依据在 `fvp-0.39.0/lib/src/video_player_mdk.dart`
+/// 的 `_create`：网络源（`DataSourceType.network`）**根本不设**
+/// `avio.protocol_whitelist`，于是 FFmpeg 用它自己的默认（不限制），
+/// `httpproxy` 自然可用；而给本地文件设的那份白名单里也**显式写了
+/// `httpproxy`**。两处都放行，所以无论走直链还是走 `127.0.0.1` 的本地中继
+/// 都不会撞上它。
+///
 /// ## ⚠️ 本实现拿不到缓冲信息（fvp 的限制，不是 bug）
 ///
 /// fvp 的 `video_player` 平台实现**不上报 `buffered`**（全文件里没有这个词），
@@ -47,6 +62,9 @@ class FvpPlaybackEngine implements PlaybackEngine {
   VideoPlayerController? _controller;
   Timer? _trackTimer;
   bool _disposed = false;
+
+  /// 上一份「正文型」外挂字幕落成的临时文件。见 [loadExternalSubtitleText]。
+  String? _tempSubtitlePath;
 
   /// 交给 UI 的渲染句柄。
   ///
@@ -255,6 +273,67 @@ class FvpPlaybackEngine implements PlaybackEngine {
     _controller?.setExternalSubtitle(uri);
   }
 
+  /// mdk 的 `setExternalSubtitle` **只吃 URI**，所以这里必须把正文落成一个
+  /// 临时文件再下发（契约把这件事放在实现里，理由见契约的类文档）。
+  ///
+  /// ## 为什么扩展名是 `.srt`
+  ///
+  /// mdk 按扩展名挑解复用器。网盘字幕解码出来的是**纯文本**（SRT / ASS 都是
+  /// 文本，`SubtitleResolver` 已经统一成 UTF-8 文本），而 `.txt` 会让 FFmpeg
+  /// 挑不到字幕解析器 —— 表现是「挂上了但一个字都不显示」，且不报错。
+  ///
+  /// 写成 `.srt` 是安全的近似：FFmpeg 的 srt 解析器对 ASS 风格的时间轴也能
+  /// 容忍到「至少能显示」，而本实现只服务 DV 片源（少量路径）。
+  ///
+  /// ## 回收
+  ///
+  /// 新文件写下之后立刻删上一份；换源与 [dispose] 再兜一次
+  /// （见 [_teardownController]）。临时目录里的残留是无害的，但长片反复换
+  /// 字幕会攒出几十个文件，不值得留着。
+  @override
+  Future<void> loadExternalSubtitleText(
+    String text, {
+    String? title,
+    String? language,
+  }) async {
+    final c = _controller;
+    if (c == null) return;
+
+    final dir = await getTemporaryDirectory();
+    final file = File(
+      '${dir.path}/cloudcine-sub-'
+      '${DateTime.now().microsecondsSinceEpoch}.srt',
+    );
+    await file.writeAsString(text, flush: true);
+
+    final previous = _tempSubtitlePath;
+    _tempSubtitlePath = file.path;
+    if (previous != null && previous != file.path) {
+      unawaited(_deleteQuietly(previous));
+    }
+
+    // ⚠️ 传**路径**而不是 `file://` URL：mdk 把 uri 直接交给 FFmpeg 的
+    // avformat_open_input，而它认本地路径。加 scheme 反而多一层解析。
+    c.setExternalSubtitle(file.path);
+  }
+
+  /// 删掉上一份临时字幕。**任何失败都吞掉** —— 临时目录的清理不该影响播放。
+  Future<void> _deleteTempSubtitle() async {
+    final path = _tempSubtitlePath;
+    _tempSubtitlePath = null;
+    if (path == null) return;
+    await _deleteQuietly(path);
+  }
+
+  static Future<void> _deleteQuietly(String path) async {
+    try {
+      final f = File(path);
+      if (f.existsSync()) await f.delete();
+    } catch (e) {
+      diag.debug('字幕', '删临时字幕失败（无所谓）：$e');
+    }
+  }
+
   @override
   Future<List<EngineChapter>> chapters() async {
     final info = _controller?.getMediaInfo();
@@ -305,6 +384,9 @@ class FvpPlaybackEngine implements PlaybackEngine {
   Future<void> _teardownController() async {
     _trackTimer?.cancel();
     _trackTimer = null;
+    // 换源 / 销毁都要收掉上一份临时字幕：新流还没挂任何字幕，留着文件
+    // 只会让长片反复换字幕时攒出一堆残留。
+    await _deleteTempSubtitle();
     final c = _controller;
     _controller = null;
     if (c == null) return;
@@ -409,10 +491,20 @@ class FvpPlaybackEngine implements PlaybackEngine {
   /// **没有** `isDefault` 这个概念 —— 所以这里恒为 false。
   /// 上层（`_maybeRestoreAudio`）本来就把「没有偏好」当作「让引擎用默认」，
   /// 不受影响；只有内嵌字幕的「发布者标记为默认」那一条会退化。
+  ///
+  /// `codec` 从各子类的 `codec.codec` 拿（FFmpeg 的短名，与 mpv 那边口径一致）。
+  /// 基类 `StreamInfo` 上没有它，所以必须按子类分派 —— 写成
+  /// `s.metadata['codec']` 会拿到空值，因为 FFmpeg 不把编解码器名放进 metadata。
   EngineTrack _track(mdk.StreamInfo s) => EngineTrack(
         id: s.index,
         title: s.metadata['title'],
         language: s.metadata['language'],
+        codec: switch (s) {
+          mdk.AudioStreamInfo(:final codec) => codec.codec,
+          mdk.SubtitleStreamInfo(:final codec) => codec.codec,
+          mdk.VideoStreamInfo(:final codec) => codec.codec,
+          _ => null,
+        },
       );
 
   void _refreshActiveTracks() {

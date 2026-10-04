@@ -33,54 +33,67 @@ class PageHeader extends StatelessWidget {
     // 那正是遥控器唯一能做的事。
     if (AppTheme.isTvLayout(context)) {
       return Padding(
-        // 比桌面那版（18/14）压一点：TV 上垂直空间比水平更宝贵，而页头
-        // 现在多了整整一行。
-        padding: const EdgeInsets.fromLTRB(22, 14, 22, 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        // 上下各 10/8：TV 上垂直空间比水平更宝贵 —— 页头每省下 10px，
+        // 海报墙就多露出 10px 的封面（实测见下面 `Wrap` 那段）。
+        padding: const EdgeInsets.fromLTRB(22, 10, 22, 8),
+        child: Wrap(
+          // ⚠️ **`Wrap`，不能是 `Row`** —— 这一处实测溢出 145px。
+          //
+          // 媒体库页头有八个控件（刮削 / 重扫 / 视图切换 / 搜索框 / 排序 /
+          // 筛选 / 选择 / 刷新）。桌面版把它们横排在标题右侧，因为总宽度够；
+          // 电视上页面只拿到 624（960 − 过扫描 96 − 侧栏 240），页头自己再吃掉
+          // 44 的内边距 → **580**。`Row` 在 580 里塞不下这八个，会溢出
+          // 145px：Debug 下是一块黄黑斜纹，Release 下溢出部分**直接被裁掉**，
+          // 看起来就像「筛选和刷新这两个按钮本来就没有」—— 而它们其实还在
+          // 焦点链里，遥控器按得到、屏幕上却看不见，用户只会以为遥控器坏了。
+          spacing: 10,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            Text(
-              title,
-              style: const TextStyle(
-                fontSize: AppTheme.tvHeaderTitle,
-                fontWeight: FontWeight.w600,
-                color: AppTheme.text,
+            // ⚠️ **标题块是 `Wrap` 的第一项**，不是另起一行的 `Column`。
+            //
+            // 两种排法的实测差距（960×540、页面实得 624×486）：
+            //   * 标题独占一行 + 操作区折行 → 页头 **284px**（原来就是这样）；
+            //   * 标题当作第一个可折行的块   → 页头 **122px**。
+            // 省下的 162px 全归海报墙 —— 卡片高 166，原来一屏连**一行都露不全**。
+            //
+            // 折行的结果是：第一行「标题 · 刮削 · 重扫 · 封面/列表」，
+            // 第二行「搜索 · 排序 · 筛选 · 选择 · 刷新」—— 分组也正好合理。
+            ConstrainedBox(
+              // ⛔ 必须夹宽度：`Wrap` 给子项的约束是**无界**的，不夹的话
+              // 文件夹页那条长路径副标题会把整个页头撑出屏幕，而且
+              // `Wrap` 不像 `Row` 那样会报溢出 —— 它只是**静静地画到屏幕外**。
+              constraints: const BoxConstraints(maxWidth: 260),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: AppTheme.tvHeaderTitle,
+                      fontWeight: FontWeight.w600,
+                      color: AppTheme.text,
+                    ),
+                  ),
+                  if (subtitle != null) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: AppTheme.tvHeaderSubtitle,
+                        color: AppTheme.dim,
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
-            if (subtitle != null) ...[
-              const SizedBox(height: 4),
-              Text(
-                subtitle!,
-                style: const TextStyle(
-                  fontSize: AppTheme.tvHeaderSubtitle,
-                  color: AppTheme.dim,
-                ),
-              ),
-            ],
-            if (actions.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              // ⚠️ **必须是 `Wrap`，不能是 `Row`** —— 这一处实测溢出 145px。
-              //
-              // 媒体库页头这一行有六个控件（视图切换 / 搜索框 / 排序 / 筛选 /
-              // 选择 / 刷新）。桌面版把它们横排在标题右侧，因为总宽度够；电视上
-              // 页面只拿到 624（960 − 过扫描 96 − 侧栏 240），页头自己再吃掉
-              // 44 的内边距 → **580**。`Row` 在 580 里塞不下这六个，会溢出
-              // 145px：Debug 下是一块黄黑斜纹，Release 下溢出部分**直接被裁掉**，
-              // 看起来就像「筛选和刷新这两个按钮本来就没有」—— 而它们其实还在
-              // 焦点链里，遥控器按得到、屏幕上却看不见，用户只会以为遥控器坏了。
-              //
-              // 换行之后：所有控件都留在可见区内，宽度不够就自然折到第二行。
-              // TV 上页头多一行毫无代价（本来就已经为操作区单独占了一行），
-              // 而少一个看不见的按钮是实打实的可用性事故。
-              Wrap(
-                // 比页里那些 `SizedBox(width: 4/8)` 间隔稍大一点：折行后行内
-                // 控件各自独立成块，间距太小会让人读不出「这是几个不同的动作」。
-                spacing: 8,
-                runSpacing: 6,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: actions,
-              ),
-            ],
+            ...actions,
           ],
         ),
       );
@@ -116,7 +129,14 @@ class PageHeader extends StatelessWidget {
               ],
             ),
           ),
-          ...actions,
+          // 间距由这里统一给，调用方**不要**再往 `actions` 里塞
+          // `SizedBox(width: …)` 当间隔 —— TV 那一支是 `Wrap`，自带 `spacing`，
+          // 那些占位盒子会变成一个个「可以单独折到下一行」的 8px 宽小块，
+          // 折行位置因此变得不可预测（表现为页头忽高忽低）。
+          for (var i = 0; i < actions.length; i++) ...[
+            if (i > 0) const SizedBox(width: 8),
+            actions[i],
+          ],
         ],
       ),
     );

@@ -273,6 +273,39 @@ c = QuarkClient("; ".join(f"{k}={v}" for k, v in cookies.items()))
 
 因此不续播必须显式给 `Duration.zero`，`seek` 只用于**播放中**的跳转。
 
+#### ⚠️ 但 `startAt` 是一条**静默**的路 —— 换源后必须核对（2026-10-04）
+
+上面两条说的是「怎么给位置」，没说「给了到底生效没有」。**生效与否没有任何回调**：
+mpv 收下了 `start` 属性却照旧从 0 播，日志里只有一句看着完全正常的「起播=1800s」。
+用户报的「选择画质后都会重头就开始播放」就是这个形态（而且它**不能**归因成
+「HLS 不支持 start」——`PlaybackMedia` 的实测里 HLS 是有效的）。
+
+做法：换源时挂 `domain/services/playback_restore.dart` 的 `RestoreSeek`，
+由位置流核对，没落到位就补一次显式 `seek`。三条判据各有理由，**别简化**：
+
+1. **就绪之前不补** —— 就绪信号 = 时长解出来 或 位置开始推进。
+   （「open 之后立刻 seek 会被丢掉」，见上面第 1 条。）
+2. **「到位」要连续两拍才算** —— 换源期间**旧流还在播**（`_prepareSource` 的预热），
+   位置流上会夹一条旧流的值，而它**恰好等于目标**（目标就是从旧流取的）。
+   只认一拍会被它骗过去，于是新流真从头播也没人管。
+3. **补发有上限**（3 次）—— 遇上不可 seek 的流，无限补 = 每 100ms 一次空转。
+
+接线（`PlaybackController`）：挂在 `_loadIntoPlayer` 里 `open()` **之前**
+（不能提前到 `switchQuality` —— 预热期旧流的值会骗过它）；
+在 `open()` / `stop()` 里清（`open` 里那句尤其要紧：`resolveStream` 那段
+网络往返期间旧流还在推进，欠账留着会凭空补一次 seek）。
+
+⚠️ 排查看日志里有没有
+`起播位置没生效（现在 0s，应为 Xs）→ 补发 seek` ——
+**只有它出现过，才说明 `startAt` 真的失效过**。
+
+#### ⚠️ 既有缺口：内置播放页没有续播（2026-10-04 仍未修）
+
+`PlaybackController.open()` 签名里**没有起播位置**，`player_page._openItem`
+也不传 → **Android TV 上唯一的播放路径根本不续播**。
+`startPosition` 只存在于独立播放窗口那条路（`PlayRequest` / `PlaybackResume`）。
+修它等于改「进播放页从哪开始」的行为，属产品决策，**先问用户**。
+
 ### 「点卡片播哪一条」为什么第 ② 级不猜下一集
 
 `lastPlayedAt` 有值但续播点已清，有两种完全相反的成因：「看完了」和「点开 3 秒就关」。
@@ -1250,7 +1283,7 @@ x-oss-callback:{callbackB64}\nx-oss-date:{ossDate}\nx-oss-user-agent:{ua}\n
 - `player_window_bridge.dart` 的 `supportsMultiWindow` 排除 Android → `playItem` 自动回落内置播放页 ✅
 - 侧边栏在左、深色主题 ✅
 
-## Android 构建：三个坑串成一条链（2026-10-02 已打通）
+## Android 构建：四个坑串成一条链（2026-10-02 打通；坑四 2026-10-04）
 `flutter build apk --release` 已成功产出 `build/app/outputs/flutter-apk/app-release.apk`
 （53.8MB、4 个 ABI、debug 签名 —— 无 `android/key.properties` 时按设计退回 debug 签名）。
 下面三条**不是各自独立的毛病**，是同一串；报错位置和真因差得很远，照报错字面修会白花时间。
@@ -1278,8 +1311,13 @@ in SDK, PATH, or by cmake.dir property`，而 `~/Library/Android/sdk/cmake/3.22.
 得到 `/opt/homebrew/Caskroom/android-platform-tools/35.0.2`；而 `validSdkDirectory()` 只要求
 **`platform-tools/` 或 `licenses/` 存在其一** → 这个「只有 adb、没有 platforms/NDK/CMake」的目录被当成 SDK 收下。
 于是 AGP 在**错的根**下找 CMake → `[CXX1300]`。**CMake 报错和 SDK 路径是同一个问题。**
-**修法**：所有 flutter/gradle 命令显式 `export ANDROID_HOME=/Users/tandy/Library/Android/sdk`
-（第 2 步就命中，短路掉那个兜底）；保险起见在 `local.properties` 里同时钉 `sdk.dir` 与
+**修法**：**首选** `flutter config --android-sdk=/Users/tandy/Library/Android/sdk` —— 第 1 步就命中，
+最高优先级，**连 HOME 被重定向都不怕**，设一次永久生效（2026-10-04 采用）。也可所有 flutter/gradle
+命令显式 `export ANDROID_HOME=/Users/tandy/Library/Android/sdk`（第 2 步命中；2026-10-04 用
+`flutter build apk --release --config-only` 实测确实被采纳、写回的就是真实 SDK）。
+⚠️ 2026-10-04 还遇到过**一次**：`ANDROID_HOME` 已导出、跑完整 `flutter build apk` 却仍把 Caskroom
+路径写回 `local.properties`（原因未定位，`--config-only` 复现不出来）—— 所以推荐用 `flutter config`，
+它不依赖环境变量。保险起见在 `local.properties` 里同时钉 `sdk.dir` 与
 `cmake.dir=<sdk>/cmake/3.22.1`（`updateLocalProperties` 是逐键 `changeIfNecessary`，不会抹掉 `cmake.dir`）。
 ⚠️ 项目里**没有任何 `externalNativeBuild` / `CMakeLists.txt`**（全仓 + pub-cache 都搜过），
 所以别去 `app/build.gradle.kts` 里找 CMake 配置 —— 那条线索是假的。
@@ -1291,6 +1329,34 @@ in SDK, PATH, or by cmake.dir property`，而 `~/Library/Android/sdk/cmake/3.22.
 （别退回 1.8.22、也别跳 2.2 —— 2.2 删了 `kotlinOptions`，`app/build.gradle.kts` 还在用）。
 NDK 同理：12 个插件声明依赖 `27.0.12077973`，`app/build.gradle.kts` 已从 `flutter.ndkVersion`（26.3.x）
 改成钉死 27 —— 于是**本机 / CI 必须装 `ndk;27.0.12077973`**，否则配置期直接 `NDK not configured`。
+
+### 坑四：Android Studio 自带的 JDK 25 让 Kotlin 直接崩（报错只有 `25.0.3` 四个字符）
+症状：`flutter build apk` **3 秒**失败，`What went wrong:` 下面**只有一个版本号**：
+```
+* What went wrong:
+25.0.3
+* Exception is:
+java.lang.IllegalArgumentException: 25.0.3
+	at org.jetbrains.kotlin.com.intellij.util.lang.JavaVersion.parse(JavaVersion.java:305)
+	at org.jetbrains.kotlin.com.intellij.util.lang.JavaVersion.current(JavaVersion.java:174)
+	at org.jetbrains.kotlin.cli.jvm.modules.JavaVersionUtilsKt.isAtLeastJava9(javaVersionUtils.kt:11)
+```
+**真因**：Flutter 定位 JDK 的顺序是 ① `flutter config --jdk-dir` ② `JAVA_HOME` ③ **Android Studio 自带的 JBR**
+（`/Applications/Android Studio.app/Contents/jbr/Contents/Home`）。AS 2026.1 的 JBR 是 **OpenJDK 25**，
+而 Gradle 8.10.2 里打包的 Kotlin 编译器用的 `JavaVersion.parse` **解析不了 `25.0.3`** —— 崩在**编译
+settings 脚本**阶段，所以没有任何 `> Task` 行、堆栈也短。
+⛔ 别去查 AGP / Kotlin 插件版本，**那个孤零零的版本号就是 JDK 版本**。
+**判据**：`flutter build apk -v 2>&1 | grep "bin/java -version"` 会打印 Flutter 选中的 java 与版本。
+**修法**：`flutter config --jdk-dir=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home`
+（写进 `~/.config/flutter/settings`；JDK 21 与 Gradle 8.10.2 / AGP 8.7.0 / KGP 2.1.0 配套）。
+⚠️ 换 JDK 后**第一次**构建要重编 Flutter 自带的 gradle 插件（`<flutter_sdk>/packages/flutter_tools/gradle`），
+80 秒以上，且**可能先失败一次**并报无关的 `Your project requires a newer version of the Kotlin Gradle
+plugin` —— **再跑一次即可**，别真去动 Kotlin 版本（我为此白查了一轮）。
+⚠️ 同一次构建还会打 `e: … kotlin-stdlib-2.2.0.jar … metadata is 2.2.0, expected version is 2.0.0`：
+那是 Flutter 插件自己（Kotlin 2.0.0 编的）去读 2.2.0 的 stdlib，**不致命、不用管**。
+⚠️ 在 shell 里裸跑 `./gradlew assembleRelease` 时 `JAVA_HOME` 为空、`java` 是 17，**反而能过** ——
+「flutter 挂但 gradlew 好」这个对比本身就是 JDK 分歧的信号。
+⚠️ 该坑会让 `flutter-apk/` 里只剩 `app-release.apk`（构建没跑到打包），别误判成产物名机制坏了。
 
 ### 产物名与版本号：文件名被 Flutter 工具链**定死**
 
@@ -1305,6 +1371,23 @@ NDK 同理：12 个插件声明依赖 `27.0.12077973`，`app/build.gradle.kts` �
   （⛔ 别用 `doLast` —— 它的执行顺序取决于 Flutter 插件的注册时机），
   **复制**（⛔ 不能改名）成 `cloudcine-<versionName>-b<versionCode>-android.apk`。
 - 版本号在**配置期**取 `flutter.versionName` / `flutter.versionCode`。
+- ⛔ **ABI 段的提取**（2026-10-04 修，之前一直是错的）：Flutter 的命名是 `app-<abi>?-<mode>.apk`，
+  **普通构建没有 ABI 段**。原来的写法 `removePrefix("app-").removeSuffix("-$buildMode.apk")`
+  会**静默**出错：`app-release.apk` 摘掉前缀后是 `release.apk`，它不以 `-release.apk` 结尾
+  → `removeSuffix` 不生效 → ABI 成了 `release.apk` → 产物名变成
+  `cloudcine-0.1.0-b1-release.apk-android.apk`（多一截，且看不出哪段是 ABI）。
+  只去掉 `.apk` 再摘 `-release` 同样匹配不上（`release` 前面没有连字符）。
+  ✅ 正确写法 = **先摘 `.apk`、再摘不带连字符的 mode、最后摘可能多出来的 `-`**：
+  ```kotlin
+  val abi = source.name.removePrefix("app-").removeSuffix(".apk")
+      .removeSuffix(buildMode).removeSuffix("-")
+  ```
+- ⛔ `flutter build apk` 成功时**只打印** `✓ Built …/flutter-apk/app-release.apk` —— 它**永远**
+  是这个名字，品牌产物是旁边**另一个文件**，Flutter 不会提。**别拿这行当「品牌名没了」的证据**，
+  去看 `ls build/app/outputs/flutter-apk/`。
+- ⚠️ 全量 up-to-date 的增量构建**也会**重新生成品牌产物（finalizer 在 finalized 任务 up-to-date 时
+  照样执行；2026-10-04 实测：删掉品牌文件后 12s 的增量构建里又生成了一份）。所以「品牌文件不见了」
+  只可能是 ① 构建没跑到打包（见坑四）② 有人 `flutter clean` 或手工删过。
 
 ### 收尾验证（别只看「BUILD SUCCESSFUL」）
 `aapt2 dump badging <apk>` 要能看到 `leanback-launchable-activity` 与
@@ -3644,6 +3727,60 @@ UI 层按引擎的具体类型挑渲染组件，见（待建）`ui/widgets/playb
 
 ---
 
+## 阶段 3 已落地：两份播放器都接线到 `PlaybackEngine`（2026-10-04 傍晚）
+
+### 新增文件
+- `lib/domain/services/playback_engine_router.dart` —— **「用哪个内核」的唯一实现**，
+  两份播放器共用 → 不会「内置页切对了、独立窗口没切」。
+- `lib/core/utils/track_bridge.dart` —— `mk.Track` ↔ `EngineTrack` 的桥（UI 菜单仍吃
+  `mk.AudioTrack`，把改动面压到最小）。
+- `lib/data/stream/dolby_vision_probe.dart` —— Range 探头部字节 + 按 key 缓存。
+- `lib/ui/widgets/playback_surface.dart` —— 按引擎**具体类型**挑渲染组件
+  （`Video` vs `VideoPlayer`）。契约故意不带渲染方法（domain 不引 Flutter）。
+
+### ⛔ 最容易做错的三条
+1. **`fvp.registerWith(options: {'platforms': ['macos']})` 必须在 `main.dart` 里、
+   `runApp` 之前跑完。** 每个独立窗口 = 独立 Flutter engine，Dart 侧平台实现注册是
+   **按引擎**的；晚一步 → macOS 上 fvp 的 pubspec 没有 `dartPluginClass`，
+   静默走 `video_player_avfoundation`，**DV 颜色错、且不报任何错**。
+2. **选引擎必须「开播前」判**（`PlaybackEngineRouter.selectFor`），不能让播放器先开再问
+   —— 打开本身就要先定内核。判据回到容器元数据（`dolby_vision.dart` 探头部字节）。
+3. **换内核时停旧引擎是 fire-and-forget**（`unawaited(previous.stop()...)`），两个引擎
+   都由 router 的 `dispose()` 收口。⚠️ `PlaybackController._engine` 是 **getter 不是字段**
+   —— 内核会被路由换掉，存字段会拿到 stale 引用。
+
+### 路由规则（`selectFor`）
+- 只在 `profile==5 && compat==0` 时换内核（P8 有 HDR10 兼容层，退化播只是「不够好」，
+  不替它承担回归风险）。
+- ⛔ **跳过 HLS**（`media.m3u8`）—— 转码档是 SDR，与 DV 无关，不该触发探测。
+- ⛔ **跳过非 http(s)**（`asset://`、本地路径）—— 探不了、也没 DV 问题。
+- 探针结果**按 key 缓存**（`'${fileId}|${qualityId}'`）。
+
+### fvp 不受本机 `http_proxy` 白名单陷阱影响（已核实，别再查）
+media_kit/mpv 那条「HLS 必须走本地中继」的坑（见 `§转码档 HLS`）**对 fvp 不存在**：
+`fvp-0.39.0/lib/src/video_player_mdk.dart` 的 `_create` 里，**网络源从不设
+`avio.protocol_whitelist`**（FFmpeg 默认不限 → `httpproxy` 可用）；本地文件的白名单
+里也**显式含 `httpproxy`**。所以 DV 片源不需要为代理再绕中继。
+
+### 独立窗口保留 mpv 日志尾部
+`player_window_app.dart` 仍以 `verboseLog: true` 建 `MediaKitPlaybackEngine`：
+`isHttp4xxLog` 票据失效检测依赖 mpv 日志尾部。**契约 log 流**（字幕解码诊断分流）
+与 **mpv log 尾部**（票据检测）是两路订阅，别合并。
+
+### 能力置灰（用户定的口径）
+音效入口按 `capabilities.audioEffects` 置灰 + tooltip/提示语；
+`_applyAudioEffect()` 只在 `engine is MediaKitPlaybackEngine` 时跑。
+`mpv_chapters.dart` 的便捷方法 `detectIntro` **已删**（fvp 没有 `Player`）；
+`chapters()` 只由 `MediaKitPlaybackEngine` 经 `MpvChapters.read` 调。
+
+### 验证口径（阶段 3 收尾）
+`flutter test` 全量 **2234 例全过**；`flutter analyze` 仅 7 条既有 info（均与本工作无关）。
+⚠️ 跑测试必须清代理：`env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY
+-u HTTPS_PROXY -u ALL_PROXY NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+flutter test`（否则 flutter_tester 的 WebSocket 升级被代理打断，**每例都报错**）。
+
+---
+
 ## 两条取链路由：**原画 = 直链文件，转码档 = HLS**（2026-10-04 13:3x）
 
 ### ⛔ 验证 DV 必须选**原画**，选了转码档等于在测另一件事
@@ -3668,17 +3805,31 @@ UI 层按引擎的具体类型挑渲染组件，见（待建）`ui/widgets/playb
 已排除：`VideoController` 绑错 Player（绑定正确）、音效/缓冲参数（旧构建同样）、
 本地中继（HLS 根本不进中继）、mdk 的 FFmpeg（不影响 mpv）。
 
-### ⛔ mdk 的 FFmpeg **没有**被打进 macOS 产物（阶段 3 之前必须修）
-```
-otool -L macos/Pods/mdk/.../mdk.framework/mdk
-  @rpath/libavformat.63.dylib (weak) ← 产物里没有
-  @rpath/libavcodec.63.dylib  (weak) ← 产物里没有
-  @rpath/FFmpeg.framework/FFmpeg (weak) ← 产物里没有
-```
-`CloudCine.app/Contents/Frameworks/` 只有 `mdk.framework`。全是 weak import →
-**加载成功、拿不到 FFmpeg、解不了任何流**，而且**不报错**。
-media_kit 那套是 `Avformat.framework` **版本 60**（FFmpeg 6），mdk 要 **63**
-（FFmpeg 7/8）—— 两套**不能互用**，别指望它捡到 media_kit 那份。无关**。
+### ✅ 修正（2026-10-04 下午复查）：mdk 的 FFmpeg **就在产物里** —— 这条「拦路虎」不存在
+
+之前这里写「`CloudCine.app/Contents/Frameworks/` 只有 `mdk.framework` → 拿不到
+FFmpeg → 解不了任何流」，**是误判**。错在只看了 `otool -L` 里那串
+**`libav*.dylib` 分体布局**的 weak import，漏了同一张表里的
+**`@rpath/libffmpeg.9.dylib`** —— 那才是 mdk 自带的**合并版** FFmpeg。
+
+实测（对**已构建产物**，不是只看 Pods）：
+
+- `mdk.framework/Versions/A/` 里就有 `libffmpeg.9.dylib`（19 MB）、`libass.dylib`、
+  `libdav1d.dylib`、`libmdk-braw.dylib`、`libmdk-r3d.dylib`。
+- 它**能解析**：`mdk` 自己的 `LC_RPATH` 含 **`@loader_path`**
+  （= `mdk.framework/Versions/A/`）→ `@rpath/libffmpeg.9.dylib` 正好落在那里。
+- 决定性证据（`DYLD_PRINT_LIBRARIES=1` 跑产物）：
+  ```
+  .../Contents/Frameworks/mdk.framework/Versions/A/mdk
+  .../Contents/Frameworks/mdk.framework/Versions/A/libffmpeg.9.dylib   ← 真的加载了
+  ```
+  `fvp.framework` 也照样加载。
+
+⚠️ 取证口径：**必须对 `build/.../CloudCine.app/Contents/Frameworks/` 下那份**，
+并且**看 `dyld` 实际加载了什么**，而不是只看 `otool -L` 的 import 表 ——
+weak import 里有几项不存在是**正常**的（那是 mdk 支持的**另一种** FFmpeg 布局）。
+
+→ **结论：阶段 3 没有打包前置条件**；`mdk + fvp + libffmpeg` 在当前构建里全部可用。
 
 
 
@@ -3750,3 +3901,67 @@ media_kit 那套是 `Avformat.framework` **版本 60**（FFmpeg 6），mdk 要 *
   mpv 平时的话**全被两个过滤器丢掉**，这条尾巴是它唯一能留痕的地方。
 - 投链与刷新直链两处日志补上「HLS 还是直链」+ **Cookie 键名**
   （只看 `headers.keys` 永远只能看到「Cookie」这一项，而它**永远都在**）。
+
+---
+
+# §从 MEMORY.md 下沉（2026-10-04 整理，MEMORY 贴 8000 字符上限）
+
+MEMORY.md 只留红线与指针，下面是被下沉的原文细节。**没有新增结论**，
+只是搬家；改动前先看这里，别当成两条不同的规则。
+
+## 目录视图：三组条目 + 排序 + 直接播 + 多选删除（原文）
+
+一层列**全部条目**，三组**目录 → 视频 → 其他文件**（组间顺序是**结构**，
+不随排序变）。⛔ 分组只管「怎么排、行上给什么动作」，
+**入库判据仍只有 `classifyEntry` 一处**。
+
+- 下载取链**复用 `adapter.resolveStream`**（⛔ 别打 `/file/download`，
+  >50MiB 直接 23018）；`autoUncompress=false` + `Accept-Encoding: identity`
+  + `findProxy=DIRECT`。
+- 排序：`FolderSortMode`（文件夹页）与 `ItemSortMode`（详情页，
+  **默认**修改时间倒序）**各一份设置键**，都在**渲染时**排
+  （⛔ 前者别进 `driveListingProvider`）。⛔ **排序只改显示、不改 `primary`**。
+- 视频行**整行可点=播**（下载是右侧独立按钮）：未入库走 `playDriveEntry`
+  （**不写库**，与发现共用 `parseTransientMedia`）。
+  `local_stream_relay.dart` 现在**原画 + 转码档 HLS 都服务**。
+- **多选删除**：`folderSelectionProvider`（键=fid）；⛔ **换目录清空**、
+  **全选只勾当前可见**（`displayEntries` 是列表与全选**唯一**共用定义）。
+  `DriveCleanupController`：分块 100、凭证失效/断网**中止后续批次**
+  并把没发出去的算失败（`rateLimited` 不中止）、删成功的**连同本地索引**清；
+  ⛔ **失败的批次不清索引**。
+
+## 季 / 部 / 跨目录归一（原文）
+
+`MediaItem` + **`part/partLabel`**（v9）；`MediaWork` + **`seasonCount`**（v10）
++ **`mergedInto`**（v11）。层级**不落库**（现算）：**季在外、部在内**，
+某层**少于 2 个选项不画**。卡片三个计数是**并集**，
+`seasonCount` 是 `COUNT(DISTINCT)` **不能相加**。
+
+- **目录名当系列名**：判定单元是**目录不是文件**（`DirectoryTitle`），
+  **四处调用点都要传 `dirPath`**。
+- 自动归一 `work_merge_planner.dart`：**只认 `onlineId` 相同 + `source==online`
+  + kind 相同**，`manual` 不参与；目标 = itemCount 最大 → firstSeenAt 最早 →
+  key 升序。**本地片名相似度绝不参与**。`autoMergeByOnlineId` **默认开**
+  （`!= 'false'`）。
+- **手动归一**「合并到…」（`MergeWorkDialog`，**无刮削门槛**）：
+  留下**选中的那一部**；不能合 → 按钮灰 + 原因（自己 / 目标已别名 /
+  **源自己还折着别人**）；撤销 = 目标页「拆开」。
+- ⛔ **归一 = 打标记**：不删行、不改 `group_key`；列表/角标滤
+  `merged_into IS NULL`、`itemsForWork` 取并集、撤销 = 清标记。**不许链式**。
+  ⚠️ `mergeWorkForUpsert` 里**无条件取旧值**（照抄 = 重扫拆开）；
+  搜索穿透折叠内层表**必须起别名**。
+  ⛔ `_unionStats` 别改回 JOIN 里的 `OR`（本文件 §媒体库列表「显示特别慢」有实测数字）。
+
+## 媒体库三轴的「交互」细节（原文）
+
+`PlayTarget.resolve`：① 最近播过且留续播点 → 那集；② 播过但续播点已清 →
+**仍是那集**；③ 全新 → 第一集；**排掉 `isSampleOrExtra`**。
+`playItem()` 是唯一起播入口。
+
+`mergeWorkForUpsert`：`category` 取新值但**先按 `effectiveGenres` 折算**；
+**手动标记的行整列不动**；`posterUrl` **永不为空**；
+`source=manual` 只被**显式**刮削覆盖（开关名 `overrideManual`）。
+
+**路径**归一化只在 `core/utils/drive_paths.dart` 一处 ——
+`/电影` 与 `/电影/` 会变成两个键，于是**静默筛不到**；
+`dirPath` 带尾斜杠、内部不带。

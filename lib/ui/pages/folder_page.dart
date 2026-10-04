@@ -125,9 +125,11 @@ class _FolderPageState extends ConsumerState<FolderPage> {
               onChanged: _onSearchChanged,
               hint: '筛当前目录…',
             ),
-            const SizedBox(width: 8),
             // 「刷新」是个纯图标按钮：桌面上悬停会出 tooltip，电视上没有
             // hover —— 所以 TV 上补一个看得见的「刷新」标签。
+            // ⚠️ 不要在这里塞 `SizedBox` 当间隔：`PageHeader` 自己会给
+            // （桌面按 8、TV 那支的 `Wrap` 自带 `spacing`），重复给会让
+            // 折行位置随宽度飘。
             TvIconLabel(
               label: '刷新',
               child: IconButton(

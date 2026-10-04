@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/tv_device.dart';
 import '../../data/auth/quark_qr_login.dart';
 import '../../data/auth/secret_backend.dart';
 import '../../data/auth/secure_credential_store.dart';
@@ -12,10 +13,13 @@ import '../../data/db/media_repository_impl.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/http/dio_http_client.dart';
 import '../../data/http/http_client.dart';
+import '../../data/playback/fvp_playback_engine.dart';
+import '../../data/playback/media_kit_playback_engine.dart';
 import '../../data/registry/adapter_registry.dart';
 import '../../data/remote/quark/quark_adapter.dart';
 import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/poster_cache.dart';
+import '../../data/stream/dolby_vision_probe.dart';
 import '../../data/stream/local_stream_relay.dart';
 import '../../domain/adapters/credential_store.dart';
 import '../../domain/adapters/media_repository.dart';
@@ -183,11 +187,37 @@ final relayConfigSyncProvider = Provider<void>((ref) {
 /// 用 `Provider` + `ListenableBuilder` 而不是 `ChangeNotifierProvider`：
 /// 后者在 riverpod 2.6 已经标了 `@Deprecated('will be removed in 3.0.0')`，
 /// 而 `PlaybackController` 本身就是个 `ChangeNotifier`，直接听更直白。
+///
+/// ## 两个内核在这里装配（见 `PlaybackController` 的类文档）
+///
+///   - **默认内核**：media_kit（mpv）。除杜比视界以外的片源全走它。
+///   - **杜比视界内核**：fvp（libmdk），**惰性建**（`dolbyVisionEngine` 是工厂）。
+///
+/// ## ⛔ 只在 macOS 上开启 DV 路由
+///
+/// 判据与 `main.dart` 里那句 `fvp.registerWith` 必须**一致** —— 两处都是
+/// 「只在 macOS」。不一致的后果很隐蔽：
+///   - 这边开了、那边没注册 → `video_player` 静默走 Apple 那套栈，
+///     DV 依然渲染错，而且**不报任何错**；
+///   - 那边注册了、这边没开 → 只是白注册一次（无害）。
+///
+/// Android / Android TV 上**不做** DV 路由：那边是**真 window vo**，
+/// 本来就不受 media_kit 的 render API 限制，不需要换内核。
 final playbackControllerProvider = Provider<PlaybackController>((ref) {
+  // 杜比视界探测。缓存键是 `fileId|档位`，所以同一集只会真的探一次。
+  final dvProbe = DolbyVisionProbe();
+  final dvEnabled = Platform.isMacOS;
+
   final controller = PlaybackController(
     registry: ref.watch(adapterRegistryProvider),
     subtitleResolver: ref.watch(subtitleResolverProvider),
     relay: ref.watch(streamRelayProvider),
+    engine: MediaKitPlaybackEngine(tv: isTvDevice()),
+    dolbyVisionEngine: dvEnabled ? () => FvpPlaybackEngine() : null,
+    dolbyVisionProbe: dvEnabled
+        ? ({required key, required url, required headers}) =>
+            dvProbe.probe(key: key, url: url, headers: headers)
+        : null,
   );
 
   // 播放进度落库。**在组合根接而不是在播放页接**：这样即使用户在播放中
