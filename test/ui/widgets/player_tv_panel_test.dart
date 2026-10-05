@@ -244,16 +244,20 @@ void main() {
       );
     });
 
-    testWidgets('七行全部画出来 —— 少一行就等于那个功能在电视上不存在',
+    testWidgets('聚焦模式只显示**当前一个分类** —— 不一次加载所有菜单项',
         (tester) async {
-      await render(tester);
+      await render(tester); // selectedIndex=0 → 选集
 
-      for (final row in PlayerTvRow.values) {
-        expect(find.text(row.label), findsOneWidget, reason: row.label);
+      expect(find.text('选集'), findsOneWidget);
+      // 其它六个分类不显示：聚焦后每次只渲染当前 Y 分类，这是「不一次加载
+      // 所有菜单项」的核心（也是这次性能改动的目的）。
+      for (final label in ['画质', '字幕', '音轨', '音效', '倍速', '片头']) {
+        expect(find.text(label), findsNothing, reason: label);
       }
-      // 当前值也要看得见：只有标签没有值的话，用户要按一下才知道现在是什么。
+      // 位置指示让用户知道自己在第几个分类（看不到其它分类时靠它定位）。
+      expect(find.text('1/7'), findsOneWidget);
+      // 当前值也要看得见。
       expect(find.text('第 3 集'), findsOneWidget);
-      expect(find.text('当前 超清'), findsOneWidget);
     });
 
     testWidgets('没有可选项的那一行写「—」而不是留空', (tester) async {
@@ -309,14 +313,18 @@ void main() {
       // 「少哪一行」或者「画面还看不看得见」，而不是把数字改大。
       expect(
         sheet.height,
-        lessThanOrEqualTo(360),
-        reason: '菜单长到 ${sheet.height} 了 —— 画面只剩 '
-            '${540 - sheet.height - 27}px，换字幕时等于看不见字幕',
+        moreOrLessEquals(kPlayerTvSheetHeight, epsilon: 0.1),
       );
-      expect(sheet.height, kPlayerTvSheetHeight);
+      // 聚焦菜单比原七行版矮得多（约 115px）：换字幕时必须看得见画面，
+      // 这条把「菜单高度」钉在安全范围内。
+      expect(
+        sheet.height,
+        lessThan(160),
+        reason: '聚焦菜单长到 ${sheet.height} 了 —— 应该只有标题行 + 选项条',
+      );
       expect(sheet.width, greaterThan(480),
-          reason: '底部菜单是**横**排的（照夸克）—— 七行纵向挤在 400 宽里的话，'
-              '每一行的可用宽度会窄到放不下「简体中文（强制）」这种值');
+          reason: '底部菜单是**横**排的（照夸克）—— 分类名 + 当前值 + 位置指示'
+              '挤在 400 宽里的话放不下');
     });
 
     testWidgets('贴底，且内容让开电视的过扫描带', (tester) async {
@@ -385,22 +393,22 @@ void main() {
           bubbled: bubbled,
         );
 
-    FontWeight? weightOf(WidgetTester tester, String label) =>
-        tester.widget<Text>(find.text(label)).style?.fontWeight;
-
-    testWidgets('↓ 落到下一行，且选中态**移走**（不能两行同时亮着）',
+    testWidgets('↓ 切换到下一分类：标题行换项、位置指示前进、旧分类消失',
         (tester) async {
       await renderKeys(tester);
-      expect(weightOf(tester, '选集'), FontWeight.w600,
-          reason: '初始那一行要有可见的强调，否则用户不知道焦点在哪');
+      // 聚焦模式只显示当前分类 —— 初始是「选集」，其它分类都不该出现。
+      expect(find.text('选集'), findsOneWidget);
+      expect(find.text('画质'), findsNothing);
 
       await press(tester, LogicalKeyboardKey.arrowDown);
 
       expect(selected, [1]);
-      expect(weightOf(tester, '画质'), FontWeight.w600);
-      expect(weightOf(tester, '选集'), FontWeight.w400,
-          reason: '选中态必须移走。两行同时亮着等于没有焦点 —— 在电视上'
-              '用户只能靠这一条底色和字重判断「我按下去会改哪一项」');
+      expect(find.text('画质'), findsOneWidget,
+          reason: '按 ↓ 后标题行必须换成新分类，否则用户不知道焦点在哪');
+      expect(find.text('选集'), findsNothing,
+          reason: '聚焦模式同一时刻只有一个分类 —— 旧分类必须消失');
+      expect(find.text('2/7'), findsOneWidget,
+          reason: '位置指示从 1/7 走到 2/7，补上「看不到其它分类」的定位感');
     });
 
     testWidgets('↑ 从第一行绕到最后一行（短列表循环比撞墙好用）', (tester) async {

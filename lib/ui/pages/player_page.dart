@@ -1555,7 +1555,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         // ⚠️ TV 设置菜单**不在这里** —— 它挂在 `build` 最外层那个 `Stack` 上。
         //
         // 理由有两条，都不是「省一层 Stack」：
-        //   1. **高度**。菜单是贴底的一整块（`kPlayerTvSheetHeight` 346），
+        //   1. **高度**。菜单是贴底的一整块（`kPlayerTvSheetHeight`，聚焦版
+        //      约 115；选集网格页更高、单独传 [kPlayerTvEpisodeGridHeight]），
         //      而画面这一块在旧结构里是 `Column` 的 `Expanded`，可用高会被
         //      顶栏与控制栏啃掉一截。挂到最外层它才能拿到整屏、直接贴底。
         //   2. **字幕要让位**。菜单压着画面下缘，字幕得抬到它上面去 ——

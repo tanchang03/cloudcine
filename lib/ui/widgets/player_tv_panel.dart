@@ -137,52 +137,45 @@ int nextTvRowIndex({
 
 /// 一行的高度。
 ///
-/// ⚠️ 这是**高度预算**里最大的一块，改之前先看 [kPlayerTvSheetHeight]。
-const double _kRowHeight = 40;
+/// ⚠️ 这是聚焦菜单里**标题行**的高度（只显示当前分类那一行，不是七行列表）。
+const double _kRowHeight = 44;
 
-/// 选项条 / 说明条那一格的高度。**恒定**，与有没有选项无关 ——
-/// 变高变矮的话，焦点上下走的时候整块菜单会跟着跳。
+/// 选项条 / 说明条那一格的高度。**恒定**，与有没有选项无关。
 const double _kStripHeight = 50;
 
 /// 菜单内容的上下内边距。
-const double _kSheetPadding = 8;
+const double _kSheetPadding = 10;
 
 /// 卡片顶部那条描边有多粗。
 const double _kCardBorderWidth = 0.8;
 
-/// 菜单内容（七行 + 选项条 + 上下内边距）需要的高度。
+/// 聚焦式菜单内容（标题行 + 选项条 + 上下内边距）需要的高度。
 const double _kSheetContentHeight =
-    7 * _kRowHeight + _kStripHeight + _kSheetPadding * 2;
+    _kRowHeight + _kStripHeight + _kSheetPadding * 2;
 
 /// 底部菜单的总高。
 ///
 /// ## 这个数是怎么来的
 ///
-/// 内容 = 七行 × [_kRowHeight] + 选项条 [_kStripHeight] + 上下内边距
-///       = 7 × 40 + 50 + 8 × 2 = 330，再加上 [_kCardBorderWidth]。
+/// 2026-10-05 起菜单从「七行纵排 + 选中行下方选项条」改为**聚焦式 XY 交叉
+/// 菜单**：每次只显示**当前一个分类**（Y）及其选项条（X）。原因是 TV 上
+/// 4K 播放时（CPU 169%）每次按键重建全部七行（每行还带 140ms 动画）+ 大阴影
+/// 卡片会明显掉帧；聚焦后屏幕上永远只有 1 个分类 + 一组选项。
+///
+/// 内容 = 标题行 [_kRowHeight] + 选项条 [_kStripHeight] + 上下内边距
+///       = 44 + 50 + 10 × 2 = 114，再加上 [_kCardBorderWidth]。
 ///
 /// ⚠️ **末尾那 0.8 不能省。** `Container` 会把 `decoration` 上那条描边算成
 /// **内容的内边距**（`decoration.padding`），于是内容实得的高度比 `height`
-/// 少 0.8px。少了它，七行会溢出 0.8px —— Flutter 会把溢出画成黄黑斜纹，
-/// 而电视上没有滚动条，用户看到的是最下面一行被削掉一条边。
-/// 这不是理论：**这一条是被单测抓出来的**（`RenderFlex overflowed by 0.8
-/// pixels`），当时只是把行高从 46 收到 40，肉眼完全看不出来。
-///
-/// 菜单**不留滚动**：电视上没有滚动条，滚出去的行等于不存在（用户不会知道
-/// 下面还有「音效 / 倍速 / 片头」）。所以这个常量是「内容必须装得下」的
-/// 硬预算 —— 加一行、或把行高改大之前，先算一遍。
-///
-/// ## 屏幕还剩多少给画面
-///
-/// 960×540 上菜单贴着下缘、再避让 27 的过扫描带，于是顶边落在
-/// 540 − 27 − 346.8 ≈ **166**。画面仍然铺满整屏，只是下面这段被菜单盖住 ——
-/// 换字幕 / 换画质时看的就是上面那 166px。
-///
-/// ⚠️ 这也是字幕要**抬高**的原因：字幕原本贴在画面底部（距下缘 44），
-/// 正好在菜单后面。播放页在菜单打开时把字幕的内边距加大（见
-/// `_PlayerPageState._subtitleBottomPadding`），与夸克播放器的做法一致
-/// （它的字幕区固定在 y 215–315，菜单在它下面）。
+/// 少 0.8px。少了它，标题行会溢出 0.8px —— Flutter 会把溢出画成黄黑斜纹，
+/// 而电视上没有滚动条，用户看到的是内容被削掉一条边。
 const double kPlayerTvSheetHeight = _kSheetContentHeight + _kCardBorderWidth;
+
+/// 选集网格二级页的高度。
+///
+/// 网格页需要比行菜单高得多（要放得下好几行集数格子），所以它**显式传**
+/// 自己的高度，而不是沿用聚焦菜单的 [kPlayerTvSheetHeight]。
+const double kPlayerTvEpisodeGridHeight = 420;
 
 /// 选项条里一颗 chip 的高度。
 const double _kChipHeight = 34;
@@ -228,15 +221,18 @@ class TvSheetCard extends StatelessWidget {
           ),
         ),
         boxShadow: const [
+          // ⚠️ blur 从 44/60 收到 26/34：Mali GPU 上大 blur 阴影每帧重绘很贵，
+          // 而聚焦菜单比原七行版矮了 2/3，阴影面积本来就小。视觉上仍是
+          // 「浮在画面上的卡片」，只是不再为「更柔的边」付每一帧的 GPU。
           BoxShadow(
-            color: Color(0xD8000000),
-            blurRadius: 44,
-            spreadRadius: 4,
-            offset: Offset(0, -12),
+            color: Color(0xE0202738),
+            blurRadius: 26,
+            spreadRadius: 2,
+            offset: Offset(0, -10),
           ),
           BoxShadow(
             color: Color(0x1A5B8CFF),
-            blurRadius: 60,
+            blurRadius: 34,
             offset: Offset(0, -4),
           ),
         ],
@@ -410,29 +406,33 @@ class _KeyCap extends StatelessWidget {
   }
 }
 
-/// 底部菜单第一页：**纵向七行 + 选中行的横向选项条**。
+/// 底部菜单：**聚焦式 XY 交叉菜单**。
 ///
-/// ## 交互（照夸克播放器）
+/// ## 交互（照夸克播放器的「每次只显示一个分类的选项」）
 ///
-///   * ↑ / ↓ —— 在七行之间走（循环）；
-///   * ← / → —— 在**选中那一行**的选项条里走；那一行没有选项时交给
-///     [onAdjust]（目前只有「选集」用它来上一集 / 下一集）；
+///   * ↑ / ↓ —— **切换分类**（Y 轴），标题行换成本分类名 + 当前值 + 位置
+///     （如「画质 · 超清  2/7」）。每次只渲染**当前这一个分类**的选项条；
+///   * ← / → —— 在当前分类的选项条里走（X 轴）；这一行没有选项时交给
+///     [onAdjust]（「选集」用它直接换集）；
 ///   * OK —— 应用选中的那一颗（「片头」这种一次动作行则直接执行）；
 ///   * 菜单 / Esc —— 收起菜单。
+///
+/// ## 为什么从「七行全显示」改成「聚焦单分类」
+///
+/// 原版把七个分类全部竖排，选中行下方再铺选项条。在 TV 上播放 4K 时
+/// （CPU 169–232%），每次按键都要重建七行（每行带 140ms `AnimatedContainer`
+/// 动画）+ 整块大阴影卡片，Mali GPU 上明显掉帧。
+///
+/// 聚焦后屏幕上永远只有 **1 个标题行 + 1 组选项 chip**，每次按键 rebuild 的
+/// 子树从「整张七行表」缩成「一个分类」，动画 / 阴影面积也一并大幅减小。
+/// 代价是用户看不到其它分类 —— 用标题行上的「N/7」位置指示补上定位感。
 ///
 /// ## 为什么不要「焦点在按钮之间横移」
 ///
 /// 桌面那套控制栏把画质 / 字幕 / 音轨 / 音效 / 倍速排成一行按钮，鼠标点两下
 /// 就到。遥控器没有指针：要够到最右边那个按钮，得先按 ↓ 进控制栏、再按 →
-/// 一路挪过去，中途还会停在静音按钮和音量滑块上（而滑块**吃方向键**）。
-/// 于是「换个字幕」变成一件要按七八下的事 —— **全都看得见，但要花很久才
-/// 够得到**，这正是电视上最难受的一类交互。
-///
-/// ## 与「右侧竖排面板」那一版的区别
-///
-/// 那一版把选项收在「当前值」一个字符串里，改值只能逐档循环、看不到全貌。
-/// 这一版把选项**摊开**成一条 chip（照夸克），并且整块挪到了底部横排 ——
-/// 电视是 16:9 的，纵向挤七行会让每一行的可用宽度变得很窄。
+/// 一路挪过去。于是「换个字幕」变成一件要按七八下的事 —— 全都看得见，但
+/// 要花很久才够得到。聚焦式里「换分类」只要按一下 ↑/↓。
 class PlayerTvSheet extends StatefulWidget {
   const PlayerTvSheet({
     super.key,
@@ -449,25 +449,16 @@ class PlayerTvSheet extends StatefulWidget {
   final List<PlayerTvRowValue> rows;
   final int selectedIndex;
 
-  /// 选中行变了（↑ / ↓）。
+  /// 选中分类变了（↑ / ↓）。
   final ValueChanged<int> onSelectedChanged;
 
-  /// ← / → 落在**没有选项条**的行上时回调（目前只有「选集」）。
+  /// ← / → 落在**没有选项条**的分类上时回调（目前只有「选集」）。
   /// `delta` 为 -1（←）或 +1（→）。
-  ///
-  /// ⚠️ 有选项条的行**不走这里** —— 那几行的 ← / → 只是在挪光标，
-  /// 真正生效要等 OK。理由：挪一下画质就重取一次流，连按 → 会连取五次，
-  /// 而用户只是想看看有哪些档。
   final void Function(PlayerTvRow row, int delta) onAdjust;
 
-  /// OK 落在某一行上。
+  /// OK 落在某个分类上。
   ///
-  /// `optionIndex` 是选项条里被选中的那颗的下标；这一行没有选项条时为 -1。
-  ///
-  /// 交给调用方决定，是因为不同行的 OK 语义**根本不同**：「选集」是进二级页
-  /// （集数可能几十条，横着挪不过来）、「片头」是一次跳转、其余各项则是
-  /// 「应用选中的那一颗」。把这些塞进菜单里会让它变成一个什么都得知道的
-  /// 组件，而它本该只管导航。
+  /// `optionIndex` 是选项条里被选中的那颗的下标；这一分类没有选项条时为 -1。
   final void Function(PlayerTvRow row, int optionIndex) onActivate;
 
   final VoidCallback onClose;
@@ -479,11 +470,10 @@ class PlayerTvSheet extends StatefulWidget {
 }
 
 class _PlayerTvSheetState extends State<PlayerTvSheet> {
-  /// 选项条里光标的位置。**归菜单自己管**：它纯是界面状态，播放页不需要
-  /// 知道「用户正停在第三颗上」—— 只有按下 OK 的那一刻才有意义。
+  /// 选项条里光标的位置。**归菜单自己管**：它纯是界面状态。
   int _chip = 0;
 
-  /// 选项条横向滚动用。选项多到一行放不下（字幕轨多的时候）才用得上。
+  /// 选项条横向滚动用。选项多到一行放不下才用得上。
   final ScrollController _stripScroll = ScrollController();
 
   /// 每颗 chip 的 key —— 用来把新选中的那颗滚进视野。
@@ -499,15 +489,13 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   void didUpdateWidget(PlayerTvSheet oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.selectedIndex != oldWidget.selectedIndex) {
-      // 换行：光标回到「这一行当前生效的那一颗」。
-      //
-      // ⚠️ 不重置的话，从「倍速」第 6 档按 ↑ 到「画质」会落在画质的第 6 档上
-      // —— 而画质可能只有 4 档，`options[5]` 直接抛 RangeError。
+      // 换分类：光标回到「新分类当前生效的那一颗」。
       _chip = _currentOptionIndex();
+      _chipKeys.clear();
       if (_stripScroll.hasClients) _stripScroll.jumpTo(0);
       return;
     }
-    // 没换行但选项条变短了（例如字幕轨加载完、可用档位少了）：
+    // 没换分类但选项条变短了（例如字幕轨加载完、可用档位少了）：
     // 把光标夹回范围内，否则下面 `options[_chip]` 会越界。
     final total = _optionsOf(widget.selectedIndex).length;
     if (total > 0 && _chip >= total) _chip = total - 1;
@@ -526,7 +514,7 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
     return widget.rows[rowIndex].options;
   }
 
-  /// 光标该落在哪一颗：这一行当前生效的那颗；没有精确对应项时退回第 0 颗。
+  /// 光标该落在哪一颗：这一分类当前生效的那颗；没有精确对应项时退回第 0 颗。
   int _currentOptionIndex() {
     final total = _optionsOf(widget.selectedIndex).length;
     if (total == 0) return 0;
@@ -537,24 +525,17 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   @override
   Widget build(BuildContext context) {
     final rows = widget.rows;
-    final selected = widget.selectedIndex;
-
-    // 七行 + 选中行下面那一格选项条。选项条**插在选中行之后**（照夸克），
-    // 所以它的位置会随焦点上下走 —— 而总高度恒定（选项条那一格的高度与
-    // 有没有选项无关），于是整块菜单的上下缘不会跟着跳。
-    final children = <Widget>[];
-    for (var i = 0; i < rows.length; i++) {
-      children.add(
-        _SheetRow(
-          value: rows[i],
-          selected: i == selected,
-          onTap: () {
-            if (i != selected) widget.onSelectedChanged(i);
-          },
-        ),
+    if (rows.isEmpty) {
+      // 数据还没到的那一帧：一个空卡片，别崩也别画错。
+      return TvSheetShell(
+        focusNode: widget.focusNode,
+        onActivity: widget.onActivity,
+        onUnhandledKey: _onKey,
+        child: const SizedBox(height: _kRowHeight),
       );
-      if (i == selected) children.add(_buildStrip(rows[i]));
     }
+    final index = widget.selectedIndex.clamp(0, rows.length - 1);
+    final value = rows[index];
 
     return TvSheetShell(
       focusNode: widget.focusNode,
@@ -567,16 +548,22 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: children,
+              children: [
+                _FocusRowHeader(
+                  value: value,
+                  positionLabel: '${index + 1}/${rows.length}',
+                ),
+                _buildStrip(value),
+              ],
             ),
           ),
-          // 按键说明浮在右下角，**不占高度预算**（占的话就要从七行里抠）。
+          // 按键说明浮在右下角，**不占高度预算**。
           Positioned(
             right: 18,
-            bottom: 6,
+            bottom: 8,
             child: TvSheetKeyHints(
               hints: const [
-                ('↑↓', '换行'),
+                ('↑↓', '换项'),
                 ('←→', '选择'),
                 ('OK', '确定'),
                 ('菜单', '关闭'),
@@ -588,7 +575,7 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
     );
   }
 
-  /// 选中行下面那一格：有选项就画 chip，没有就写一句「按 OK 会怎样」。
+  /// 选项条：有选项就画 chip，没有就写一句「按 OK 会怎样」。
   Widget _buildStrip(PlayerTvRowValue value) {
     final options = value.options;
 
@@ -615,8 +602,6 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
       child: SingleChildScrollView(
         controller: _stripScroll,
         scrollDirection: Axis.horizontal,
-        // 全部 chip 一次建出来（不是懒加载），`Scrollable.ensureVisible`
-        // 才有东西可滚 —— 见 [_revealChip]。
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 22),
           child: Row(
@@ -675,17 +660,12 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
       case LogicalKeyboardKey.contextMenu || LogicalKeyboardKey.escape:
         widget.onClose();
       case _:
-        // 数字键、媒体键一律放行给外层：它们的语义（跳到 N%、播放/暂停）
-        // 与焦点在哪无关，不该被菜单吞掉。
         return false;
     }
     return true;
   }
 
   /// 在选项条里挪一格。**不循环**：撞到两端就停。
-  ///
-  /// 循环在这里是纯困惑 —— 选项条是**看得见**的一排，从最后一颗绕回第一颗
-  /// 会让人觉得光标「跳」了，而不是「绕回来了」。
   void _moveChip(int delta, List<PlayerTvOption> options) {
     var i = _chip;
     while (true) {
@@ -713,113 +693,85 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   }
 }
 
-/// 菜单里的一行：图标 + 名字 + 当前值 + 箭头。
-class _SheetRow extends StatelessWidget {
-  const _SheetRow({
-    required this.value,
-    required this.selected,
-    required this.onTap,
-  });
+/// 聚焦菜单的标题行：图标 + 分类名 + 当前值 + 「N/M」位置指示。
+///
+/// 它取代原版七行列表里那一行 `_SheetRow`，但只渲染**当前分类**这一个。
+/// 为了省 GPU：不用 `AnimatedContainer`（原版每行都有 140ms 动画，四行以上
+/// 就开始掉帧），选中态靠图标底 / 色条即时切换。
+class _FocusRowHeader extends StatelessWidget {
+  const _FocusRowHeader({required this.value, required this.positionLabel});
 
   final PlayerTvRowValue value;
-  final bool selected;
-  final VoidCallback onTap;
+  final String positionLabel;
 
   @override
   Widget build(BuildContext context) {
     final row = value.row;
-    final color = selected ? Colors.white : AppTheme.muted;
-    // 不可调的行：箭头压暗。判据只有 [PlayerTvRowValue.adjustable] 一处 ——
-    // 不在这里另判「值是不是空」。
-    final arrowColor = !value.adjustable
-        ? AppTheme.dim.withValues(alpha: 0.5)
-        : (selected ? Colors.white.withValues(alpha: 0.85) : AppTheme.dim);
-
-    return GestureDetector(
-      onTap: onTap,
-      behavior: HitTestBehavior.opaque,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 140),
-        curve: Curves.easeOut,
-        height: _kRowHeight,
-        // ⚠️ 只有**横向**留白，没有纵向 margin：纵向留白会算进高度预算，
-        // 七行各多 2px 就是 14px —— 正好把 [kPlayerTvSheetHeight] 撑破。
-        // 行与行之间不靠留白分开，靠选中行的圆角底色。
-        margin: const EdgeInsets.symmetric(horizontal: 10),
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        decoration: BoxDecoration(
-          // 夸克式选中行：白色 10% 底 + 左侧 3px 强调条 + 细边框。
-          // 比原来 accent 0.18 更通透，不把整行染蓝。
-          color: selected
-              ? Colors.white.withValues(alpha: 0.10)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: selected
-                ? Colors.white.withValues(alpha: 0.14)
-                : Colors.transparent,
-            width: 0.8,
-          ),
-        ),
+    return SizedBox(
+      height: _kRowHeight,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Row(
           children: [
-            // 左侧小色条：选中行才画（夸克式定位信号）。
-            AnimatedContainer(
-              duration: const Duration(milliseconds: 140),
+            // 左侧强调色条（选中定位信号）。
+            Container(
               width: 3,
               height: 18,
               decoration: BoxDecoration(
-                color: selected ? AppTheme.accent : Colors.transparent,
+                color: AppTheme.accent,
                 borderRadius: BorderRadius.circular(1.5),
               ),
             ),
             const SizedBox(width: 10),
-            // 图标放在圆角小方块里：选中时是强调色 tint，未选中是透明。
+            // 图标放在圆角小方块里。
             Container(
               width: 28,
               height: 28,
               decoration: BoxDecoration(
-                color: selected
-                    ? AppTheme.accent.withValues(alpha: 0.22)
-                    : Colors.white.withValues(alpha: 0.05),
+                color: AppTheme.accent.withValues(alpha: 0.22),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Icon(
-                row.icon,
-                size: 17,
-                color: selected ? Colors.white : AppTheme.muted,
-              ),
+              child: Icon(row.icon, size: 17, color: Colors.white),
             ),
             const SizedBox(width: 12),
             Text(
               row.label,
-              style: TextStyle(
+              style: const TextStyle(
                 fontSize: 15,
-                // ⚠️ 字重是「焦点落在哪一行」的主要信号之一（另一条是背景）。
-                // 单测直接断言它，别改成别的表达方式。
-                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-                color: color,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
               ),
             ),
-            const Spacer(),
+            const SizedBox(width: 10),
             Flexible(
               child: Text(
                 value.value.isEmpty ? '—' : value.value,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.end,
-                style: TextStyle(
+                style: const TextStyle(
                   fontSize: 14.5,
-                  fontWeight: selected ? FontWeight.w500 : FontWeight.w400,
-                  color: value.value.isEmpty
-                      ? AppTheme.dim
-                      : (selected ? AppTheme.text : AppTheme.muted),
+                  fontWeight: FontWeight.w500,
+                  color: AppTheme.text,
                 ),
               ),
             ),
-            const SizedBox(width: 8),
-            // 箭头灰掉 = 「这一项动不了」。见 [PlayerTvRowValue.adjustable]。
-            Icon(Icons.chevron_right_rounded, size: 18, color: arrowColor),
+            const Spacer(),
+            // 位置指示：让用户知道这是第几个分类（聚焦模式看不到其它分类）。
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                positionLabel,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white.withValues(alpha: 0.55),
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -983,6 +935,7 @@ class PlayerTvEpisodeGrid extends StatelessWidget {
         LogicalKeyboardKey.contextMenu || LogicalKeyboardKey.escape => _close(),
         _ => false,
       },
+      height: kPlayerTvEpisodeGridHeight,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
