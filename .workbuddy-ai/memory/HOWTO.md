@@ -4533,6 +4533,70 @@ SurfaceView 层，表现就正好是「有声音没画面」。
 - `test/domain/services/playback_engine_test.dart`：删掉那组「高分辨率换内核的判据」
   用例，原处留一条注释说明**不要加回来**。
 
+### ✅ 2026-10-04 复查（读上游源码，**没改一行代码**）：路线本身是通的，缺的是参数
+
+四条**已核实**的事实，修正/补强了上面几处推测：
+
+1. **`FvpVideoView.java` / `fvp_plugin.cpp` 是 pub.dev 上游原包内容，不是我们补的。**
+   全包文件 mtime 一致（`pub get` 那一刻），`pubspec.lock` 是
+   `source: hosted / url: pub.dev`。上游已经实现：`implements PlatformView,
+   SurfaceHolder.Callback`、tunnel 分支 `AMediaCodec:dv=1:image=0:surface=<ptr>`、
+   `surfaceId = -1000 - viewId`（负空间，避免与 texture id 撞）、hybrid composition
+   （`PlatformViewLink` + `initExpensiveAndroidView`，`video_player_mdk.dart:542-568`）。
+   ⇒ **不用自建原生播放器**就能拿到 SurfaceView 输出。
+
+2. **`fvp_plugin.cpp:67-76` 已经处理了「codec wedges → 下一个 surface 永不出帧」。**
+   释放时先 `setDecoders(Video, {})` 再 `updateNativeSurface(nullptr)`，注释原文
+   *"Release the codec BEFORE the surface dies, or it wedges (dequeue -10000) and the
+   stream is marked decode-error, so the next surface never shows a frame."*
+   ⇒ 「没画面」**不是这条路的设计缺陷**。
+
+3. **`tunnel` 是 `registerWith` 的全局项，不是 per-controller**
+   （`video_player_mdk.dart:178` `_tunnel = options["tunnel"]`）。
+   ⛔ 后果：macOS 的 DV 路必须 `tunnel: false`（texture 路给 tunnel 只会在
+   `updateTexture` 里被丢掉，源码留着 `// FIXME: set tunnel too late`），
+   而 TV 4K 想要 `true` —— 同一进程里两者**不能同时满足**，必须按平台条件注册
+   （`'tunnel': Platform.isAndroid`）。
+
+4. **第 1 轮「更卡」的机制**：不开 tunnel 时 `w,h` 由 `maxWidth/maxHeight` 钳
+   （`video_player_mdk.dart:394-417`；`if (_tunnel) { /* native size, no clamp */ }`
+   —— **钳制的开关在 Dart，不在 native**），没设就是原生 3840×2160 →
+   `setFixedSize(3840,2160)` → GL 在 4K 上渲染。上游注释原话
+   *"full 4K RGBA can push SurfaceFlinger into GPU composition on weak GPUs"*。
+   ⇒ **第 1 步的修法只是加两个注册参数，不用改 native。**
+
+5. `tunnel` 的代价（fvp 文档原文，写进 `EngineCapabilities` 用）：
+   *"some features are not supported, e.g. HDR tone mapping and frame readback
+   (snapshot), and fewer codecs."*
+
+### 📌 走 platformView 时的三条硬约束（读代码得出，**未真机验证**）
+
+- ⛔ `PlaybackSurface` 的 platformView 分支**不能再套 `AspectRatio`**：尺寸由原生
+  `setFixedSize` + Flutter 给的 rect 协商，外面套一层会让 hybrid composition 算错。
+- ⛔ **必须保留 `controller == null → 黑底` 的守卫**（`playback_surface.dart:85`）：
+  否则 `buildViewWithOptions` 拿 `playerId = kUninitializedPlayerId` 去查
+  `_platformViewParams`，查不到会退回 `Texture(textureId: -1)`（又一个无效纹理）。
+  ⚠️ 配套：`player_page.dart:808` 在 `await _controller.open(...)`（834 行）**之前**
+  就 `_ready = true`，所以这条守卫是**必需**的，不是可选。
+- ⛔ platform view 是 hybrid composition，**不能放在高频重建的子树里**：
+  `player_page.dart:1384` 现在在 `if (_ready)` 下的 Stack 里，每拍 position tick
+  都可能重建 → 要钉 `ValueKey` / `RepaintBoundary`，或抽到只依赖 engine 的子树。
+
+### 📌 「换内核 → SurfaceProducer 二次释放」是**纹理路**的病，架构上能绕开
+
+崩溃链：`FinalizerDaemon → SurfaceTextureWrapper.release → SurfaceTexture.release →
+ConsumerBase::onLastStrongRef`，**四个不同进程**都中，且**与 `viewType` 无关**。
+`PlaybackEngineRouter.selectFor` 换内核时只 `previous.stop()`，**不释放
+`VideoController`**，那个纹理输出还活着等 GC。
+
+⇒ 架构解法（**不是**加 try/catch）：**引擎在 `PlaybackSurface` 挂载前就是终态，
+一次播放内不再变**。把「用哪个内核」提前到点播放那一刻（`PlayTarget.resolve` /
+取直链时顺手探头部字节），结论随 `StreamTicket` 进播放页；没被选中的内核本次播放
+**从头到尾不碰视频输出**（不 `open()`、不建 SurfaceProducer）。
+附带好处：platformView 的 `playerId` 是**原生 handle**（`video_player_mdk.dart:386`
+`final id = player.nativeHandle`），换内核 = 换 handle，`PlatformViewLink` 必须整体
+重建 —— 提前定死就完全避开。
+
 4K 现在的取舍只有两条：用夸克的 **`super`(810p) 转码档**（同机实测只丢 0~7 帧、
 流畅、降画质），或接受原画卡顿。
 

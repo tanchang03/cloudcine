@@ -32,7 +32,7 @@ class _FakeAuth extends AuthController {
 
 /// 读设置库慢一拍的替身：用来把「最近记录还没读回来」那一帧**稳定**截住。
 class _SlowStore extends SettingsStore {
-  _SlowStore(AppDatabase db, this.delay) : super(db);
+  _SlowStore(super.db, this.delay);
 
   final Duration delay;
 

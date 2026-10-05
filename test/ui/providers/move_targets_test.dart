@@ -24,7 +24,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// 控制器那层已经验过「确认之后真的落库」，这里只测这份记录自己的
 /// 生命周期：读取时序、上限、坏数据、读写失败。
 class _SlowStore extends SettingsStore {
-  _SlowStore(AppDatabase db, this.delay) : super(db);
+  _SlowStore(super.db, this.delay);
 
   final Duration delay;
 
