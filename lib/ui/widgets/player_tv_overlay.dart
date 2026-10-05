@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart' as mk;
 
+import '../../core/utils/file_names.dart';
 import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/track_labels.dart';
 import '../../domain/entities/media_item.dart';
@@ -184,9 +185,17 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
         row: PlayerTvRow.episode,
         value: epIndex < 0 ? '' : episodeRowLabel(siblings[epIndex], epIndex),
         adjustable: siblings.length > 1,
-        // 「选集」没有选项条（集数可能几十条，横着铺不下），走二级网格页。
+        // 「选集」用**纵向列表**呈现（`vertical: true`）：文件名可能很长
+        // （含版本 / 分辨率），横着铺不下。交互照夸克：Y 轴选中选集 → 按 →
+        // 进入右侧列表 → ↑/↓ 选择 → ← / 返回键退回 Y 轴。
+        options: [
+          for (var i = 0; i < siblings.length; i++)
+            PlayerTvOption(baseNameOf(siblings[i].name)),
+        ],
+        vertical: true,
+        selectedOption: epIndex < 0 ? 0 : epIndex,
         hint: siblings.length > 1
-            ? '按 OK 打开选集 · ← → 直接换集'
+            ? null
             : '这一条不在剧集列表里（不是从库里进来的）',
       ),
       _qualityRow(c),
@@ -359,25 +368,36 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
   ///
   /// `optionIndex` 是选项条里被选中的那颗；这一行没有选项条时为 -1。
   ///
-  /// ⚠️ 「片头」跳完**收起菜单**：跳过去之后用户要看的是片子，留着菜单
-  /// 只会挡住下面三分之一画面。
+  /// ⚠️ 「片头」跳完**收起菜单**；「选集 / 画质 / 字幕」选完**也收起菜单**：
+  /// 选完用户要看的是切换的过渡效果（`_SwitchVeil` + 加载速率），留着菜单
+  /// 只会挡住画面。
   void _activate(PlayerTvRow row, int optionIndex) {
     switch (row) {
       case PlayerTvRow.episode:
-        if (widget.siblings.length > 1) setState(() => _episodes = true);
+        // 选集在右侧选项条直接选，不再进二级网格页（见 `_rows` 的注释）。
+        if (optionIndex < 0) break;
+        final siblings = widget.siblings;
+        if (optionIndex >= siblings.length) break;
+        unawaited(widget.onPickEpisode(siblings[optionIndex]));
+        widget.onClose();
       case PlayerTvRow.intro:
         unawaited(widget.onJumpIntro());
         widget.onClose();
       case PlayerTvRow.quality:
         _pickQuality(optionIndex);
+        widget.onClose();
       case PlayerTvRow.subtitle:
         _pickSubtitle(optionIndex);
+        widget.onClose();
       case PlayerTvRow.audioTrack:
         _pickAudio(optionIndex);
+        widget.onClose();
       case PlayerTvRow.audioEffect:
         _pickEffect(optionIndex);
+        widget.onClose();
       case PlayerTvRow.rate:
         _pickRate(optionIndex);
+        widget.onClose();
     }
   }
 

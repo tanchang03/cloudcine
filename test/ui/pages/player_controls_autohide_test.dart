@@ -3,16 +3,27 @@ import 'package:flutter_test/flutter_test.dart';
 
 /// 控制栏「无操作收起」的判据。
 ///
-/// 这条最容易漂：一旦控制栏上多了按钮，很容易有人随手加一句
-/// 「暂停时也藏」或「焦点在按钮上也藏」。两种都错 ——
-/// 前者把正在读的字幕盖掉，后者把控件从用户手底下抽走。
-/// 所以判据抽成纯函数、用断言钉死每一档。
+/// 2026-10-05 起判据收成两条：`!immersive && playing`。原来的第三条
+/// `stageFocused`（焦点必须在画面）被删掉 —— 遥控器用 OK 暂停 / 恢复播放
+/// 时焦点**停留在控制栏按钮上**而不是画面，于是「暂停 → 恢复播放」之后
+/// `stageFocused` 恒为 false，控制栏**永远不自动收起**（用户看到的就是
+/// 「暂停再播放后控制栏一直挂着」）。去掉它之后，只要在播放且非沉浸，
+/// 30 秒无操作就收起。
+///
+/// ⚠️ `stageFocused` 参数保留在签名里（调用点仍传），但**不再参与判据**。
 void main() {
-  test('播放中、焦点在画面、还没藏 → 该藏', () {
+  test('播放中、还没藏 → 该藏（不管焦点在不在画面）', () {
     expect(
       shouldAutoHideControls(immersive: false, playing: true, stageFocused: true),
       isTrue,
-      reason: '这是唯一的默认分支：遥控器静置，该只剩画面',
+      reason: '遥控器静置，该只剩画面',
+    );
+    // ⚠️ 焦点在控制栏按钮上（遥控器 OK 暂停/恢复后的常态）同样该藏 ——
+    // 这正是修掉的问题：否则「暂停再播放后控制栏一直挂着」。
+    expect(
+      shouldAutoHideControls(immersive: false, playing: true, stageFocused: false),
+      isTrue,
+      reason: '恢复播放后 30 秒无操作就该收起，焦点在哪不再决定它',
     );
   });
 
@@ -29,15 +40,6 @@ void main() {
       shouldAutoHideControls(immersive: false, playing: false, stageFocused: true),
       isFalse,
       reason: '暂停藏控制栏会把正看的东西盖掉',
-    );
-  });
-
-  test('焦点进了控制栏 / 字幕菜单 → 不该藏（正在操作）', () {
-    expect(
-      shouldAutoHideControls(immersive: false, playing: true, stageFocused: false),
-      isFalse,
-      reason: '焦点离开画面意味着用户正在控件的某一处 —— 这时把控件藏掉，'
-          '等于把它从手底下抽走',
     );
   });
 }

@@ -337,7 +337,9 @@ int? parseProcSelfIoBytes(String text, String key) {
 ///
 /// 跳过 `lo`（回环）：本地中继 127.0.0.1 的转发流量也在回环上，而这里要
 /// 回答的是「从网盘 CDN 实际收进来」的速率。
-@visibleForTesting
+///
+/// ⚠️ 生产代码也用（播放页的「切换中」过渡层显示下载速率），所以不是
+/// `@visibleForTesting` —— 它的依赖只有 dart:io 的纯解析。
 (int, int)? parseProcNetDev(String text) {
   var rx = 0;
   var tx = 0;

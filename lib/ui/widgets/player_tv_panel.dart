@@ -70,6 +70,7 @@ class PlayerTvRowValue {
     this.options = const <PlayerTvOption>[],
     this.selectedOption = 0,
     this.hint,
+    this.vertical = false,
   });
 
   final PlayerTvRow row;
@@ -103,6 +104,15 @@ class PlayerTvRowValue {
   /// 写法与「片头」那一行的值同一套：写的是**按 OK 会发生什么**，
   /// 而不是当前状态。
   final String? hint;
+
+  /// 这一行用**纵向列表**呈现（夸克式两阶段焦点）。
+  ///
+  /// 默认横向 chips 适合选项少 / 标签短；而「选集」的文件名很长（可能含
+  /// 版本 / 分辨率），横着铺不下。置 `true` 时：
+  ///   * 右侧选项区变成纵向可滚动列表；
+  ///   * 焦点在侧边栏时按 → **进入列表**，↑/↓ 在列表里选，← / 返回键
+  ///     退回侧边栏 —— 与夸克播放器的选集交互一致。
+  final bool vertical;
 }
 
 /// ↑ / ↓ 之后选中行落到哪一行。
@@ -484,6 +494,13 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   /// 每颗 chip 的 key —— 用来把新选中的那颗滚进视野。
   final Map<int, GlobalKey> _chipKeys = {};
 
+  /// 焦点是否已经「进入」右侧的**纵向列表**（夸克式两阶段焦点）。
+  ///
+  /// 只有 [PlayerTvRowValue.vertical] 的分类（选集）会用到：侧边栏按 →
+  /// 进入列表，↑/↓ 在列表里选，← / 返回键退回侧边栏。横向 chips 的分类
+  /// 恒为 false（←/→ 直接在 chips 里挪，不需要进列表）。
+  bool _inList = false;
+
   @override
   void initState() {
     super.initState();
@@ -494,9 +511,11 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   void didUpdateWidget(PlayerTvSheet oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.selectedIndex != oldWidget.selectedIndex) {
-      // 换分类：光标回到「新分类当前生效的那一颗」。
+      // 换分类：光标回到「新分类当前生效的那一颗」；焦点退回侧边栏
+      //（纵向列表的焦点归属当前分类，切走就该退出来）。
       _chip = _currentOptionIndex();
       _chipKeys.clear();
+      _inList = false;
       if (_stripScroll.hasClients) _stripScroll.jumpTo(0);
       return;
     }
@@ -611,6 +630,65 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
       );
     }
 
+    // 纵向列表（选集）：文件名长，横着铺不下。焦点进入列表后 ↑/↓ 选择，
+    // 当前项高亮（夸克式蓝底）。
+    if (value.vertical) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                Icon(
+                  value.row.icon,
+                  size: 18,
+                  color: Colors.white.withValues(alpha: 0.7),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  value.row.label,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  value.value.isEmpty ? '—' : value.value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 14.5,
+                    color: value.value.isEmpty ? AppTheme.dim : AppTheme.text,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              controller: _stripScroll,
+              padding: const EdgeInsets.only(right: 4),
+              itemCount: options.length,
+              itemBuilder: (context, i) => _ListRow(
+                key: _chipKeys.putIfAbsent(i, GlobalKey.new),
+                label: options[i].label,
+                selected: i == _chip,
+                enabled: options[i].enabled,
+                onTap: () {
+                  setState(() => _chip = i);
+                  widget.onActivate(value.row, i);
+                },
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -684,6 +762,27 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
     final value = rows[index];
     final options = value.options;
 
+    // ⛔ 纵向列表（选集）里的按键语义**不同**：焦点进入列表后，↑/↓ 是
+    // 在列表里选，不再是切 Y 轴分类；← / 返回键退回侧边栏。
+    if (_inList) {
+      switch (key) {
+        case LogicalKeyboardKey.arrowUp:
+          _moveChip(-1, options);
+        case LogicalKeyboardKey.arrowDown:
+          _moveChip(1, options);
+        case LogicalKeyboardKey.arrowLeft ||
+             LogicalKeyboardKey.contextMenu ||
+             LogicalKeyboardKey.escape:
+          // 退回 Y 轴菜单（不关整个 OSD）。
+          setState(() => _inList = false);
+        case LogicalKeyboardKey.select || LogicalKeyboardKey.enter:
+          widget.onActivate(value.row, _chip);
+        case _:
+          return false;
+      }
+      return true;
+    }
+
     switch (key) {
       case LogicalKeyboardKey.arrowUp:
         widget.onSelectedChanged(
@@ -696,12 +795,17 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
       case LogicalKeyboardKey.arrowLeft:
         if (options.isEmpty) {
           widget.onAdjust(value.row, -1);
+        } else if (value.vertical) {
+          // 纵向列表：← 在列表外没有可挪的，什么也不做。
         } else {
           _moveChip(-1, options);
         }
       case LogicalKeyboardKey.arrowRight:
         if (options.isEmpty) {
           widget.onAdjust(value.row, 1);
+        } else if (value.vertical) {
+          // ⛔ 纵向列表：→ 进入列表（夸克式两阶段焦点）。
+          setState(() => _inList = true);
         } else {
           _moveChip(1, options);
         }
@@ -850,6 +954,65 @@ class _SideBarTile extends StatelessWidget {
                   ? Colors.white.withValues(alpha: 0.6)
                   : AppTheme.dim.withValues(alpha: 0.35),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 纵向列表（选集）里的一行。
+///
+/// 与横向 chip 不同：文件名可能很长，整行横排占满宽度，省略号收尾。
+/// 光标所在行用夸克式蓝底高亮 —— 在列表里 ↑/↓ 移动时，这一条是
+/// 「我选中了哪个文件」的唯一指示。
+class _ListRow extends StatelessWidget {
+  const _ListRow({
+    super.key,
+    required this.label,
+    required this.selected,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: enabled ? onTap : null,
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        height: 38,
+        margin: const EdgeInsets.only(bottom: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF0066FF) : Colors.transparent,
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  color: selected
+                      ? Colors.white
+                      : (enabled ? AppTheme.text : AppTheme.dim),
+                ),
+              ),
+            ),
+            if (selected) ...[
+              const SizedBox(width: 8),
+              const Icon(Icons.check_rounded, size: 16, color: Colors.white),
+            ],
           ],
         ),
       ),

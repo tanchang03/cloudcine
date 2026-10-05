@@ -93,9 +93,10 @@ class _DebugOverlayState extends State<DebugOverlay> {
       }
     }
     _prevTicks = ticks;
-    _prevAt = now;
 
     // 网络速率：两次采样做差 / 墙钟时间。
+    // ⚠️ 必须用 `now.difference(_prevAt!)` —— `_prevAt` 是上一次采样的时刻，
+    // 不能先把它更新成 `now` 再拿来算（那样除数是 0 → Infinity）。
     final rx = reading.netRxBytes;
     final tx = reading.netTxBytes;
     if (rx != null && _prevRx != null && _prevAt != null) {
@@ -108,6 +109,7 @@ class _DebugOverlayState extends State<DebugOverlay> {
     }
     _prevRx = rx;
     _prevTx = tx;
+    _prevAt = now;
 
     setState(() {
       _reading = reading;

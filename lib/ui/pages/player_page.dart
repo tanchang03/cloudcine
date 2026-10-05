@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, visibleForTesting;
@@ -10,6 +11,7 @@ import 'package:media_kit/media_kit.dart' as mk;
 import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/diagnostics/resource_probe.dart';
 import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/seek_acceleration.dart';
 import '../../core/utils/track_labels.dart';
@@ -199,38 +201,43 @@ TvPanelKeyAction resolveTvPanelKey({
 ///     等于把控件从手底下抽走。
 ///
 /// 注意它只看「能不能藏」，不看「过了多少秒」—— 超时由调用方的定时器负责。
+/// 画面上该不该自动收起控制栏（进入沉浸）。
+///
+/// ## 判据只有两条
+///
+///   * **已经沉浸**（控制栏已藏）→ 不用再藏；
+///   * **暂停**时用户多半是停下来读字幕 / 调设置 → 藏了等于把正看的东西
+///     盖掉，宁可不藏。
+///
+/// ⚠️ 原来的判据还有一条 `stageFocused`（焦点必须在画面上）—— 但遥控器
+/// 用 OK 暂停 / 恢复播放时，焦点**停留在控制栏按钮上**而不是画面，于是
+/// 「暂停 → 恢复播放」之后 `stageFocused` 恒为 false，控制栏**永远不自动
+/// 收起**（用户看到的「暂停再播放后控制栏一直挂着」）。去掉它之后，只要
+/// 在播放且非沉浸，30 秒无操作就收起 —— 焦点在按钮上时 30 秒无操作也
+/// 算「没在操作」，收起来是合理的。
 bool shouldAutoHideControls({
   required bool immersive,
   required bool playing,
   required bool stageFocused,
 }) =>
-    !immersive && playing && stageFocused;
+    !immersive && playing;
 
-/// 画面上该不该显示「正在切换…」这一层。
+/// 画面上该不该显示「正在加载…」这一层。
 ///
 /// 抽成**纯函数**是为了可单测（与 [shouldAutoHideControls] 同理）——
-/// 「什么时候算换档」一旦散在 `build` 里，就会随状态字段增减而漂移。
+/// 「什么时候算加载」一旦散在 `build` 里，就会随状态字段增减而漂移。
 ///
 /// ## 判据
 ///
-/// `isLoading` 同时被 `open()`（首次开播 / 换集 / 重试）与 `switchQuality`
-/// 置位，光看它分不出「换档」和「首次载入」。所以用 `duration` 区分：
-///
-///   * `open()` 会把时长归零 —— 它换的是**另一个文件**，旧的时长没有意义；
-///   * `switchQuality` **不走** `open()`（见 `PlaybackController._loadIntoPlayer`），
-///     时长还在 —— 它换的是同一部片子的另一条转码流。
-///
-/// 于是「时长还在 + 正在加载」== 换档。首次载入时时长为零，不会误报。
-///
-/// ⚠️ **不要**把它改成页面自己的布尔标志位：那种锁存状态一旦有某条提前返回
-/// 的分支忘了清，指示就会永远挂在画面上（「永远不收」比「早收」糟得多）。
-/// 这里是从 `isLoading` 推导的，`switchQuality` 的 `try/finally` 保证它
-/// 一定会落回 false。
+/// 只有一条：`isLoading`。它同时被 `open()`（首次开播 / 换集 / 重试）与
+/// `switchQuality`（切画质）置位 —— 这几件事用户都该看到「加载中 + 下载
+/// 速率」的过渡（选完集 / 切完画质后 OSD 已收起，过渡层是唯一的反馈）。
+/// `switchQuality` 的 `try/finally` 保证它一定会落回 false。
 bool shouldShowSwitchVeil({
   required bool isLoading,
   required Duration duration,
 }) =>
-    isLoading && duration > Duration.zero;
+    isLoading;
 
 /// 进播放页要播的那一条：**调用方直接给的优先**，没给才按 id 查库。
 ///
@@ -1021,7 +1028,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                 Focus(
                   focusNode: _stageNode,
                   autofocus: true,
-                  child: _buildStage(controller),
+                  // ⛔ RepaintBoundary：画面层独立成层。position 节流后 UI 层
+                  // 仍会 rebuild（进度条等），画面像素不该跟着重绘 ——
+                  // 隔离后 Mali GPU 只需合成，不用重画 4K 纹理。
+                  child: RepaintBoundary(child: _buildStage(controller)),
                 ),
 
                 // 顶栏保持 `ExcludeFocus`：它那两个按钮遥控器都不需要 ——
@@ -2501,19 +2511,75 @@ class _MenuRow extends StatelessWidget {
 ///
 /// 两者在 `_buildStage` 里是**互斥**的：换档时画这一层，真正的网络卡顿才画
 /// 那个裸转圈。同一处叠两个圈会让「切档」和「网卡了」看起来一模一样。
-class _SwitchVeil extends StatelessWidget {
+/// 切换中的加载过渡层：半透明遮罩 + 加载动画 + **实时下载速率**。
+///
+/// 改成 Stateful：加载中每秒采样一次 `/proc/self/net/dev`（复用资源探针的
+/// 解析），把「下载速率 xx MB/s」显示出来 —— 用户选完集 / 切完画质后，
+/// 想知道「是真的在下、还是卡住了」，速率是唯一客观的答案。
+class _SwitchVeil extends StatefulWidget {
   const _SwitchVeil();
+
+  @override
+  State<_SwitchVeil> createState() => _SwitchVeilState();
+}
+
+class _SwitchVeilState extends State<_SwitchVeil> {
+  Timer? _timer;
+  int? _prevRx;
+  DateTime? _prevAt;
+  String _rateText = '';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_sample());
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) => unawaited(_sample()));
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _sample() async {
+    final now = DateTime.now();
+    final dev = await _readNetDev();
+    if (dev != null && _prevRx != null && _prevAt != null) {
+      final dt = now.difference(_prevAt!).inMicroseconds;
+      if (dt > 0) {
+        final kbs = (dev.$1 - _prevRx!) * 1e6 / dt / 1024;
+        if (!mounted) return;
+        setState(() {
+          _rateText = kbs >= 1024
+              ? '${(kbs / 1024).toStringAsFixed(1)} MB/s'
+              : '${kbs.toStringAsFixed(0)} KB/s';
+        });
+      }
+    }
+    _prevRx = dev?.$1;
+    _prevAt = now;
+  }
+
+  Future<(int, int)?> _readNetDev() async {
+    try {
+      final text = await File('/proc/self/net/dev').readAsString();
+      return parseProcNetDev(text);
+    } catch (_) {
+      return null;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return IgnorePointer(
       child: ColoredBox(
         color: Colors.black.withValues(alpha: 0.55),
-        child: const Center(
+        child: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              SizedBox(
+              const SizedBox(
                 width: 30,
                 height: 30,
                 child: CircularProgressIndicator(
@@ -2521,10 +2587,18 @@ class _SwitchVeil extends StatelessWidget {
                   color: Colors.white70,
                 ),
               ),
-              SizedBox(height: 12),
-              Text(
-                '正在切换…',
+              const SizedBox(height: 12),
+              const Text(
+                '正在加载…',
                 style: TextStyle(fontSize: 13, color: Colors.white),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _rateText.isEmpty ? '下载速率 —' : '下载速率 $_rateText',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.white.withValues(alpha: 0.75),
+                ),
               ),
             ],
           ),

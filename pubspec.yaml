@@ -91,6 +91,13 @@ dependencies:
   fvp: ^0.39.0
   video_player: ^2.10.1
 
+dependency_overrides:
+  # ⛔ vendored Android 实现：默认 ExoPlayer 缓冲上限只有 2.5MB，4K 高码率
+  # 下「播一会缓冲一会」、进度条看不到缓冲层。覆盖成 path 依赖，让
+  # `packages/video_player_android` 里调大的缓冲配置生效。
+  video_player_android:
+    path: packages/video_player_android
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -194,6 +194,15 @@ class PlaybackController extends ChangeNotifier {
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
 
+  /// 上一次「position 变化」触发 `notifyListeners` 的时刻 —— 节流用。
+  ///
+  /// 见 [_onEnginePosition] 的文档：引擎 position 约每 100ms 一条，UI 不需要
+  /// 10fps 的进度更新，节流到 250ms 让播放页 rebuild 减少 60%。
+  Duration _lastPositionNotifyAt = Duration.zero;
+
+  /// position 通知的最小间隔。进度条 4fps 更新肉眼无感。
+  static const Duration _positionNotifyMinInterval = Duration(milliseconds: 250);
+
   /// 本次打开的文件是否已经播到结尾。见 [onCompleted]（只在上升沿触发）。
   bool _completed = false;
 
@@ -722,6 +731,22 @@ class PlaybackController extends ChangeNotifier {
       return direct;
     }
 
+    // ⛔ 高分辨率（≥2048p，走 ExoPlayer）**跳过本地中继，直连 CDN**。
+    //
+    // 实测（2026-10-05）：4K 走 ExoPlayer 时解码只占 ~32%，但**两个 DartWorker
+    // 烧掉 117% CPU** —— 那是中继在 Dart 层转发整条 3.2GB 原画流（上游下载 →
+    // Dart 堆 → HttpServer flush），每个字节都过 Dart。夸克直连 CDN 没有这一层，
+    // 所以只有 30%。
+    //
+    // ExoPlayer 不需要中继（它没有 mpv 的 `http_proxy` 白名单问题，直连带
+    // Cookie 就能播），自带缓冲管理。直连预期把 4K 的 CPU 从 150% 压到 ~40%。
+    final height = _currentVideoHeight(ticket);
+    if (height != null && height >= 2048) {
+      diag.info('播放', '≥2048p 片源直连 CDN（跳过本地中继，省 Dart 转发 CPU）');
+      await _closeRelayToken(previousToken);
+      return direct;
+    }
+
     final endpoint = await relay.open(
       ticket,
       label: _item?.displayTitle,
@@ -1217,19 +1242,7 @@ class PlaybackController extends ChangeNotifier {
       notifyListeners();
     }));
 
-    _engineSubs.add(engine.position.listen((v) {
-      _position = v;
-      notifyListeners();
-      // 起播位置的核对挂在位置流上，且**必须在 `_position = v` 之后**：
-      // 它要用「内核此刻报的是哪儿」这个事实，读早了拿到的是上一拍的旧值。
-      _maybeRestoreSeek(v);
-      _maybeTickPosition(v);
-      // 章节探测与跳片头都挂在位置流上，且**必须在 `_position = v` 之后**：
-      // 两者都要用「流已经解析到哪儿了」这个事实（读早了章节是空的、
-      // 位置为 0 时 seek 会被丢掉）。
-      _probeChaptersOnce(v);
-      _maybeSkipIntro(v);
-    }));
+    _engineSubs.add(engine.position.listen(_onEnginePosition));
 
     _engineSubs.add(engine.duration.listen((v) {
       if (v == _duration) return;
@@ -1360,6 +1373,33 @@ class PlaybackController extends ChangeNotifier {
     diag.warn('播放', '内核报错：$msg');
     _error ??= '播放器报错：$msg';
     notifyListeners();
+  }
+
+  /// 引擎位置流的入口：更新状态 + **节流**通知 UI。
+  ///
+  /// ## 为什么节流到 250ms
+  ///
+  /// 引擎的 position 约每 100ms 一条，而播放页用 `ListenableBuilder` 监听
+  /// 本控制器 —— 每一条都会让整个播放页（画面 + 顶栏 + 控制栏 + OSD）全量
+  /// rebuild。实测 4K 播放时 Flutter UI 是 CPU 大头，节流到 250ms（4fps）
+  /// 进度条肉眼无感，但播放页 rebuild 次数减少 60%。
+  ///
+  /// ⚠️ 只有 position 走节流：playing / buffering / duration / error 等状态
+  /// 变化都**立即** notify（低频，且 UI 需要及时反应）。
+  void _onEnginePosition(Duration v) {
+    _position = v;
+    // 起播位置核对 / 进度落库 / 章节探测都挂在位置流上，且必须读到最新
+    // `_position` —— 它们不受节流影响，每条都跑。
+    _maybeRestoreSeek(v);
+    _maybeTickPosition(v);
+    _probeChaptersOnce(v);
+    _maybeSkipIntro(v);
+    // UI 节流。seek 回退（v 变小）要立即通知，否则进度条停在不该停的位置。
+    final delta = (v - _lastPositionNotifyAt).inMilliseconds.abs();
+    if (v < _lastPositionNotifyAt || delta >= _positionNotifyMinInterval.inMilliseconds) {
+      _lastPositionNotifyAt = v;
+      notifyListeners();
+    }
   }
 
   /// 进度存档节流。

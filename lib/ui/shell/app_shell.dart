@@ -37,6 +37,11 @@ class _AppShellState extends State<AppShell> {
   int _backTapCount = 0;
   Timer? _backTapTimer;
 
+  /// 「再按一次返回退出」的提示文案。非空时在屏幕顶部显示居中 toast，
+  /// 3 秒后由 [_backTapTimer] 清除 —— 与 SnackBar 不同，这是自绘浮层，
+  /// TV 上不会出现浮动态 SnackBar 的溢出异常。
+  String? _backHint;
+
   void _onBackTap() {
     if (_backTapCount == 0) {
       // 第一次：回到媒体库全部页（如果当前不在）。
@@ -46,18 +51,15 @@ class _AppShellState extends State<AppShell> {
       }
       _backTapCount = 1;
       _backTapTimer?.cancel();
+      // 提示显示 3 秒后连同计数一起清掉 —— 文案要「过一会自动消失」。
       _backTapTimer = Timer(const Duration(seconds: 3), () {
         if (!mounted) return;
-        _backTapCount = 0;
+        setState(() {
+          _backTapCount = 0;
+          _backHint = null;
+        });
       });
-      // 提示：用 SnackBar 而不是悬浮文字（不需要焦点）。
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('再按一次返回退出'),
-          duration: const Duration(seconds: 3),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+      setState(() => _backHint = '再按一次返回退出');
     } else {
       // 第二次：真正退出。
       // ⚠️ 用 `SystemNavigator.pop()` 而不是 `Navigator.pop()`：
@@ -66,6 +68,7 @@ class _AppShellState extends State<AppShell> {
       _backTapCount = 0;
       _backTapTimer?.cancel();
       _backTapTimer = null;
+      setState(() => _backHint = null);
       SystemNavigator.pop();
     }
   }
@@ -82,48 +85,65 @@ class _AppShellState extends State<AppShell> {
     final shell = widget.shell;
     return Scaffold(
       backgroundColor: Colors.transparent,
-      // 方向键兜底的中转站：自己**不吃焦点、不参与遍历**，只在默认逻辑走不动时
-      // 把焦点送到一级导航。为什么需要它见 [_onShellKey]。
-      body: PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (didPop, _) {
-          if (didPop) return;
-          _onBackTap();
-        },
-        child: Focus(
-          canRequestFocus: false,
-          onKeyEvent: _onShellKey,
-          // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉。
-          // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
-          child: Padding(
-            padding: AppTheme.safeAreaInsets(context),
-            // TV 走**顶部一级导航**（参考夸克网盘 TV 版媒体库首页）：
-            // 左右分栏在 960 宽下吃掉 240 + 过扫描 96，只剩 624 给内容；
-            // 顶部导航只吃纵向 ~60，内容区拿到 864 宽。遥控器左右切导航、
-            // 上下在导航与内容之间走，与夸克的「顶栏 Tab + 内容区」一致。
-            // 桌面仍走左侧栏（鼠标场景下侧栏信息密度更高）。
-            child: tv
-                ? Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _TopBar(key: _navKey, shell: shell),
-                      const Divider(height: 0.5, color: AppTheme.line),
-                      Expanded(child: shell),
-                    ],
-                  )
-                : Row(
-                    children: [
-                      _Sidebar(key: _navKey, shell: shell),
-                      const VerticalDivider(
-                        width: 0.5,
-                        thickness: 0.5,
-                        color: AppTheme.line,
+      body: Stack(
+        children: [
+          // 方向键兜底的中转站：自己**不吃焦点、不参与遍历**，只在默认逻辑走不动时
+          // 把焦点送到一级导航。为什么需要它见 [_onShellKey]。
+          PopScope(
+            canPop: false,
+            onPopInvokedWithResult: (didPop, _) {
+              if (didPop) return;
+              _onBackTap();
+            },
+            child: Focus(
+              canRequestFocus: false,
+              onKeyEvent: _onShellKey,
+              // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉。
+              // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
+              child: Padding(
+                padding: AppTheme.safeAreaInsets(context),
+                // TV 走**顶部一级导航**（参考夸克网盘 TV 版媒体库首页）：
+                // 左右分栏在 960 宽下吃掉 240 + 过扫描 96，只剩 624 给内容；
+                // 顶部导航只吃纵向 ~60，内容区拿到 864 宽。遥控器左右切导航、
+                // 上下在导航与内容之间走，与夸克的「顶栏 Tab + 内容区」一致。
+                // 桌面仍走左侧栏（鼠标场景下侧栏信息密度更高）。
+                child: tv
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _TopBar(key: _navKey, shell: shell),
+                          const Divider(height: 0.5, color: AppTheme.line),
+                          Expanded(child: shell),
+                        ],
+                      )
+                    : Row(
+                        children: [
+                          _Sidebar(key: _navKey, shell: shell),
+                          const VerticalDivider(
+                            width: 0.5,
+                            thickness: 0.5,
+                            color: AppTheme.line,
+                          ),
+                          Expanded(child: shell),
+                        ],
                       ),
-                      Expanded(child: shell),
-                    ],
-                  ),
+              ),
+            ),
           ),
-        ),
+          // 「再按一次返回退出」提示：自绘居中浮层，3 秒后自动消失。
+          // 不用 SnackBar —— TV 上浮动态 SnackBar 会溢出显示异常。
+          if (_backHint != null)
+            Positioned(
+              top: 28,
+              left: 0,
+              right: 0,
+              child: IgnorePointer(
+                child: Center(
+                  child: _BackHintToast(text: _backHint!),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -713,6 +733,45 @@ class _AccountBlock extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 「再按一次返回退出」的居中提示浮层。
+///
+/// 自绘而不是 SnackBar：TV 上浮动态 SnackBar 会溢出显示异常（屏幕宽 960、
+/// 高 540，SnackBar 的浮动态在这么矮的屏上容易压爆）。这是一个简单的胶囊，
+/// 由 AppShell 的 `_backTapTimer` 在 3 秒后清除。
+class _BackHintToast extends StatelessWidget {
+  const _BackHintToast({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+      decoration: BoxDecoration(
+        color: AppTheme.panel2.withValues(alpha: 0.96),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: AppTheme.line),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x40000000),
+            blurRadius: 16,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Text(
+        text,
+        maxLines: 1,
+        style: const TextStyle(
+          fontSize: 14,
+          fontWeight: FontWeight.w500,
+          color: AppTheme.text,
+        ),
       ),
     );
   }
