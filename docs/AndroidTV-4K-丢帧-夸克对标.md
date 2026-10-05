@@ -3,6 +3,11 @@
 > 对象：`kuakewangpan/kkwptvb_2.9.1702_dangbei.apk`（夸克网盘 TV 版 2.9.1702，当贝渠道）
 > 方法：`unzip` + `jadx 1.5.1` 全量反编译（`kuakewangpan/jadx_out/`）+ 对本仓 `lib/` 与 pub cache 的交叉核对
 > 结论日期：2026-10-04
+>
+> 📌 **本文件是「记录 / 证据」；要落地看的方案在
+> [`解决4k片源不卡顿解析方案.md`](./解决4k片源不卡顿解析方案.md)（2026-10-05 起草）。**
+> 那份文档基于对 `fvp 0.39.0` / `video_player 2.10.1` 上游源码的复查，
+> **修正了本文件 §4 P1 与 §4.5 的三处判断**（见各节的行内提示）。
 
 ---
 
@@ -276,7 +281,11 @@ unawaited(_verifyZeroCopyHwdec());       // 兜底 + 取证（起播 20s 内、�
 - `main.dart` 的 `fvp.registerWith(options: {'platforms': [...]})` 目前**只有 `macos`**，要加 `android`。
 - `PlaybackEngineRouter` 现在只在 DV P5 时换内核；扩一条规则：**Android TV 上 4K/高码率原画也换到 fvp**。
 - 创建播放器时用 `VideoViewType.platformView`（`MdkVideoPlayerPlatform` 只在 `Platform.isAndroid` 时尊重它）。
-- `PlaybackSurface` 已经按引擎分派（`FvpPlaybackEngine` → `vp.VideoPlayer`），不用改。
+- `PlaybackSurface` 已经按引擎分派（`FvpPlaybackEngine` → `vp.VideoPlayer`）。
+  ⛔ **但这一句后来被证伪了**（2026-10-05 复查）：对 `textureView` 成立，
+  对 `platformView` **不成立** —— 那条分支不能再套 `AspectRatio`、必须保留
+  `controller == null` 守卫、还必须与高频重建隔离。详见
+  [`解决4k片源不卡顿解析方案.md`](./解决4k片源不卡顿解析方案.md) §4.1。
 - ⚠️ fvp 的代价要提前认：音效灰掉（mdk 无 Avfilter 对等物）、字幕由 mdk/libass 自绘不走 Flutter 样式、`VideoControlsBuilder` 无效、`BoxFit` 只有 `contain`。这些都已在 `PlaybackSurface` / `EngineCapabilities` 里建模，UI 会置灰而不是静默失效。
 
 ### P2 · 把渲染目标钳到面板分辨率（1080p 屏上尤其值）
@@ -358,11 +367,17 @@ mdk 仍要跑一遍 GL 渲染器」→ 补上 `tunnel: true`（`AMediaCodec` 直
 ### 下次要查的第一个假设（**未证实**）
 
 fvp 的 tunnel 分支**显式跳过** `maxWidth/maxHeight` 钳制
-（`video_player_mdk.dart` 原文 *"'tunnel' has no GL renderer"*），于是
-`FvpVideoView` 的 `setFixedSize` 拿到的是**视频原生**尺寸 3840×2160，
-而 Android 显示层只有 1920×1080。若 SurfaceFlinger 拒绝合成一个比显示层还大的
-SurfaceView 层，就会表现成「有声音没画面」。**这条没有验证过**，
+（`lib/src/video_player_mdk.dart:392` 原文 *`if (_tunnel ?? false) { /* native size,
+no clamp */ }`* —— ⚠️ **钳制的开关在 Dart 侧，不在 native**；`fvp_plugin.cpp` 里的
+`if (tunnel)` 是选 `setDecoders(...surface=...)` 还是 `updateNativeSurface(...)`，
+与钳制无关）。于是 `FvpVideoView` 的 `setFixedSize` 拿到的是**视频原生**尺寸
+3840×2160，而 Android 显示层只有 1920×1080。若 SurfaceFlinger 拒绝合成一个比显示层
+还大的 SurfaceView 层，就会表现成「有声音没画面」。**这条没有验证过**，
 下次先试 `platformView` + **不开** tunnel + `maxWidth: 1920, maxHeight: 1080`。
+
+📌 这一步的**具体改法、判据、以及「第 1 轮为什么更卡」的源码级机制**（不开 tunnel
+时 `w,h` 保持原生 4K → GL 渲染器在 4K 上渲染），见
+[`解决4k片源不卡顿解析方案.md`](./解决4k片源不卡顿解析方案.md) §1.2 / §3 阶段 1。
 
 ### 回退后 4K 怎么办
 

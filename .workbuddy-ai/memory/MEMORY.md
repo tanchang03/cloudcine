@@ -17,6 +17,9 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 `isTvLayout`：android + 逻辑宽≥960（⛔ 判据读 view 宽，页面实得 624，**壳外页实得 960**）。⛔ **页头 `actions` 必须 `Wrap`**；⛔ TV 另一套缓冲（`cache=yes` + 硬解参数，见下节）；⛔ **过扫描内边距只有 `app_shell` 一处**，壳外页（`/work` `/diagnostics` `/auth/qr`）与**播放器覆盖层**自己加；⛔ 播放器遥控器 **↓ 绝不接管**；⛔ **侧栏方向键靠壳层兜底**（候选**只搜侧栏子树**）。→ `§电视（Android TV）分支`。
 
 ## Android TV 4K 丢帧（10-04，§，报告见 `docs/AndroidTV-4K-丢帧-夸克对标.md`）
+> 📌 **要动手看 `docs/解决4k片源不卡顿解析方案.md`**（10-05 起草）——那是方案；
+> 上面那份是证据/记录。方案里修正了旧文档的三处判断（`PlaybackSurface` 要改、
+> 钳制开关在 Dart 不在 native、`tunnel` 是全局项）。
 - 根因**不是解码、也不是网络**：真机 `解码丢帧=0 / 显示丢帧 21s 涨 44`，[中继] 零告警。瓶颈是 `mediacodec-copy` 的「拷回 CPU + 上传纹理」。
 - ⛔ `hwdec` 必须写成 **`mediacodec,auto-safe`**（逗号=带回退；⛔ 光写 `mediacodec` 失败只剩软解）。
 - 判据：起播后读 `hwdec-current`，带 `copy` = 拷贝档（`isCopyHwdec`，⛔ **空串不算**）。
