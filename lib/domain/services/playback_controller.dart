@@ -708,8 +708,17 @@ class PlaybackController extends ChangeNotifier {
 
     // 只有「换源」（存在旧会话）才等预热：这期间**旧流还在播**，等待是白赚的；
     // 而全新开播时没有旧流垫着，等它就是白白拖慢出画。
+    //
+    // ⚠️ 预热超时从默认 700ms 延长到 2500ms：换集 / 切清晰度时若新会话还没
+    // 备够数据就「直接切换」，播放器可能读到未就绪/损坏的头部字节 —— 实测
+    // 偶发 `ExoPlaybackException: Source error`（media3 解析 HEVC hvcC 崩溃）。
+    // 旧流还在播，多等两秒用户无感。
     if (previousToken != null) {
-      final ready = await warmUpRelay(relay, endpoint.token);
+      final ready = await warmUpRelay(
+        relay,
+        endpoint.token,
+        timeout: const Duration(milliseconds: 2500),
+      );
       diag.info('播放', ready ? '新中继已预热，关闭旧会话' : '新中继预热超时，直接切换');
     }
     await _closeRelayToken(previousToken);

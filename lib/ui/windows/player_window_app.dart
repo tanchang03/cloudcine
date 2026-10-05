@@ -2585,7 +2585,14 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // `warmUpRelay` 会立刻返回 false）。照走的话日志会打一句误导性的
     // 「预热超时」，看起来像出了问题。
     if (previousToken != null && !hls) {
-      final ready = await warmUpRelay(_relay, endpoint.token);
+      // ⚠️ 超时延长到 2500ms（默认 700ms）：换流时新会话没备够数据就
+      // 「直接切换」，播放器可能读到未就绪/损坏的头部字节 → 偶发 Source error。
+      // 旧流还在播，多等两秒用户无感。
+      final ready = await warmUpRelay(
+        _relay,
+        endpoint.token,
+        timeout: const Duration(milliseconds: 2500),
+      );
       diag.info('播放窗口', ready ? '新中继已预热，关闭旧会话' : '新中继预热超时，直接切换');
     }
 

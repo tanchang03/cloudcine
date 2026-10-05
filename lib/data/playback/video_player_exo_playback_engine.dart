@@ -95,6 +95,13 @@ class VideoPlayerExoPlaybackEngine implements PlaybackEngine {
   final _gActiveAudio = ChangeGate<int?>();
   final _gActiveSubtitle = ChangeGate<int?>();
 
+  /// 正在尝试重试。重试期间**抑制**错误上报 —— 否则第一次失败就会把
+  /// `_error` 拍进 `PlaybackController`，即使重试成功那个横幅也不消失。
+  bool _retrying = false;
+
+  /// 最后一次初始化失败的原始消息，重试仍失败时用它上报。
+  String? _lastInitError;
+
   @override
   Future<void> open(EngineMedia media, {bool play = true}) async {
     if (_disposed) return;
@@ -102,19 +109,22 @@ class VideoPlayerExoPlaybackEngine implements PlaybackEngine {
 
     diag.info('播放', '外接 ExoPlayer 引擎打开：起播=${media.startAt.inSeconds}s');
 
-    final controller = VideoPlayerController.networkUrl(
-      Uri.parse(media.url),
-      httpHeaders: media.headers,
-      viewType: VideoViewType.platformView,
-    );
-    _controller = controller;
-    controller.addListener(_onValueChanged);
+    var controller = await _initOnce(media);
+    _retrying = false;
 
-    try {
-      await controller.initialize();
-    } catch (e) {
-      _emitError('$e');
-      return;
+    if (controller == null) {
+      // ⛔ 偶发的一次性失败：media3 对损坏的 HEVC `hvcC`（参数集数组为空）是
+      // 直接抛 `IndexOutOfBoundsException` → `Source error`，而不是优雅报错。
+      // 触发源常是「换集时新中继还没就绪」或「上游一个块读坏」，**重试一次通常
+      // 就成功** —— 用户看到的是「切一下就报错」，重试一下又能播。
+      diag.warn('播放', 'ExoPlayer 首次初始化失败，自动重试一次（$_lastInitError）');
+      await _teardown();
+      _resetGates();
+      controller = await _initOnce(media);
+      if (controller == null) {
+        _emitError(_lastInitError ?? 'ExoPlayer 打开失败');
+        return;
+      }
     }
 
     if (media.startAt > Duration.zero) {
@@ -216,6 +226,34 @@ class VideoPlayerExoPlaybackEngine implements PlaybackEngine {
     }
   }
 
+  /// 创建一次 VideoPlayerController 并等待初始化完成。
+  ///
+  /// 失败（抛异常或 `errorDescription` 非空）返回 `null` —— 由 [open] 决定
+  /// 要不要重试。`_retrying` 期间 `_onValueChanged` 抑制错误上报，见 [open]。
+  Future<VideoPlayerController?> _initOnce(EngineMedia media) async {
+    _retrying = true;
+    final controller = VideoPlayerController.networkUrl(
+      Uri.parse(media.url),
+      httpHeaders: media.headers,
+      viewType: VideoViewType.platformView,
+    );
+    _controller = controller;
+    controller.addListener(_onValueChanged);
+
+    try {
+      await controller.initialize();
+    } catch (e) {
+      _lastInitError = '$e';
+      return null;
+    }
+    final err = controller.value.errorDescription;
+    if (err != null) {
+      _lastInitError = err;
+      return null;
+    }
+    return controller;
+  }
+
   void _resetGates() {
     _gPlaying.reset();
     _gBuffering.reset();
@@ -252,7 +290,7 @@ class VideoPlayerExoPlaybackEngine implements PlaybackEngine {
     if (_gVolume.accept(volume100)) _volume.add(volume100);
 
     final err = v.errorDescription;
-    if (err != null) _emitError(err);
+    if (err != null && !_retrying) _emitError(err);
 
     if (v.isInitialized) {
       final size = EngineVideoSize(v.size.width.toInt(), v.size.height.toInt());
