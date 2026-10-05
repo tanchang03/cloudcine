@@ -187,7 +187,7 @@ const double kPlayerTvSheetHeight = _kSheetContentHeight + _kCardBorderWidth;
 /// 选项条里一颗 chip 的高度。
 const double _kChipHeight = 34;
 
-/// 底部菜单的卡片本体：底色、描边、阴影、圆角。
+/// 底部菜单的卡片本体：底色、描边、阴影、圆角（夸克式毛玻璃）。
 ///
 /// 两个页面（行菜单 / 选集网格）共用一份 —— 各写一份的话，切到「选集」时
 /// 卡片的圆角与阴影会跳一下，而那种差异没人会当成 bug 去报。
@@ -208,32 +208,60 @@ class TvSheetCard extends StatelessWidget {
       // 选中行会盖住卡片的圆角，看着像卡片被啃掉一个角。
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(18)),
-        // 上深下浅的一点点渐变，比纯色多一层「这是一块浮起来的玻璃」的暗示。
-        // 末端留一点透明度：菜单只占下半屏，完全压死会让画面看起来被切断了。
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+        // 夸克式：顶部稍亮的 success 玻璃，下缘渐深。比纯色多一层浮起感，
+        // 末端留一点透明度，菜单只占下半屏，不把画面压死。
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
-            AppTheme.panel2.withValues(alpha: 0.97),
-            AppTheme.panel.withValues(alpha: 0.94),
+            const Color(0xFF262E42).withValues(alpha: 0.98),
+            const Color(0xFF141824).withValues(alpha: 0.96),
           ],
         ),
+        // ⚠️ 只能用单边 uniform 边框：`Border` 四边颜色不一致时不能配
+        // `borderRadius`（框架直接抛 FlutterError）。侧边那圈用阴影补。
         border: Border(
           top: BorderSide(
-            color: AppTheme.line.withValues(alpha: 0.9),
+            color: Colors.white.withValues(alpha: 0.14),
             width: _kCardBorderWidth,
           ),
         ),
         boxShadow: const [
           BoxShadow(
-            color: Color(0xCC000000),
-            blurRadius: 28,
-            offset: Offset(0, -8),
+            color: Color(0xD8000000),
+            blurRadius: 44,
+            spreadRadius: 4,
+            offset: Offset(0, -12),
+          ),
+          BoxShadow(
+            color: Color(0x1A5B8CFF),
+            blurRadius: 60,
+            offset: Offset(0, -4),
           ),
         ],
       ),
-      child: child,
+      child: Stack(
+        children: [
+          child,
+          // 顶部小横条（夸克式把手）：纯装饰，不占高度预算，浮在内容上。
+          Positioned(
+            top: 6,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.22),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -326,19 +354,30 @@ class TvSheetKeyHints extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        for (var i = 0; i < hints.length; i++) ...[
-          if (i > 0) const SizedBox(width: 10),
-          _KeyCap(hints[i].$1),
-          const SizedBox(width: 5),
-          Text(
-            hints[i].$2,
-            style: const TextStyle(fontSize: 11.5, color: AppTheme.dim),
-          ),
+    // 夸克式：整行坐在半透明 pill 上，浮在卡片右下角更整体。
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(14),
+        border:
+            Border.all(color: Colors.white.withValues(alpha: 0.08), width: 0.5),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < hints.length; i++) ...[
+            if (i > 0) const SizedBox(width: 10),
+            _KeyCap(hints[i].$1),
+            const SizedBox(width: 5),
+            Text(
+              hints[i].$2,
+              style: TextStyle(
+                  fontSize: 11.5, color: Colors.white.withValues(alpha: 0.55)),
+            ),
+          ],
         ],
-      ],
+      ),
     );
   }
 }
@@ -351,19 +390,20 @@ class _KeyCap extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
       decoration: BoxDecoration(
-        color: AppTheme.panel3.withValues(alpha: 0.8),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: AppTheme.line, width: 0.5),
+        color: Colors.white.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(7),
+        border:
+            Border.all(color: Colors.white.withValues(alpha: 0.14), width: 0.5),
       ),
       child: Text(
         label,
         style: const TextStyle(
           fontSize: 11,
           height: 1.15,
-          fontWeight: FontWeight.w600,
-          color: AppTheme.muted,
+          fontWeight: FontWeight.w700,
+          color: Colors.white,
         ),
       ),
     );
@@ -688,45 +728,69 @@ class _SheetRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final row = value.row;
-    final color = selected ? AppTheme.text : AppTheme.muted;
+    final color = selected ? Colors.white : AppTheme.muted;
     // 不可调的行：箭头压暗。判据只有 [PlayerTvRowValue.adjustable] 一处 ——
     // 不在这里另判「值是不是空」。
     final arrowColor = !value.adjustable
-        ? AppTheme.line
-        : (selected ? AppTheme.accent : AppTheme.muted);
+        ? AppTheme.dim.withValues(alpha: 0.5)
+        : (selected ? Colors.white.withValues(alpha: 0.85) : AppTheme.dim);
 
     return GestureDetector(
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 110),
+        duration: const Duration(milliseconds: 140),
         curve: Curves.easeOut,
         height: _kRowHeight,
         // ⚠️ 只有**横向**留白，没有纵向 margin：纵向留白会算进高度预算，
         // 七行各多 2px 就是 14px —— 正好把 [kPlayerTvSheetHeight] 撑破。
         // 行与行之间不靠留白分开，靠选中行的圆角底色。
-        margin: const EdgeInsets.symmetric(horizontal: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 14),
+        margin: const EdgeInsets.symmetric(horizontal: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
+          // 夸克式选中行：白色 10% 底 + 左侧 3px 强调条 + 细边框。
+          // 比原来 accent 0.18 更通透，不把整行染蓝。
           color: selected
-              ? AppTheme.accent.withValues(alpha: 0.18)
+              ? Colors.white.withValues(alpha: 0.10)
               : Colors.transparent,
-          borderRadius: BorderRadius.circular(10),
-          // ⛔ 这里**不画描边、也不发光**（原来是 1.5px 描边 + blurRadius 14
-          // 的辉光）。理由与 [TvFocusable] 完全同一条：电视上「一圈亮边」在
-          // 3 米外就是一团糊住内容的粗框 —— 实测截图里它比行内容还抢眼。
-          //
-          // 去掉不是「少了一个信号」：选中态本来就有两条更清楚的信号，
-          // 就是下面注释里说的**背景 0.18 蒙层**与**字重 w600**。描边和辉光
-          // 是叠在上面的冗余，去掉后与媒体库那边的「提亮罩」才是同一种语言。
-          //
-          // ⚠️ 0.18 这个数与 [TvFocusable] 的默认 `tint` 是同一个值，改一处
-          // 就要想另一处 —— 两边视觉要一致。
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected
+                ? Colors.white.withValues(alpha: 0.14)
+                : Colors.transparent,
+            width: 0.8,
+          ),
         ),
         child: Row(
           children: [
-            Icon(row.icon, size: 18, color: color),
-            const SizedBox(width: 14),
+            // 左侧小色条：选中行才画（夸克式定位信号）。
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 140),
+              width: 3,
+              height: 18,
+              decoration: BoxDecoration(
+                color: selected ? AppTheme.accent : Colors.transparent,
+                borderRadius: BorderRadius.circular(1.5),
+              ),
+            ),
+            const SizedBox(width: 10),
+            // 图标放在圆角小方块里：选中时是强调色 tint，未选中是透明。
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                color: selected
+                    ? AppTheme.accent.withValues(alpha: 0.22)
+                    : Colors.white.withValues(alpha: 0.05),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(
+                row.icon,
+                size: 17,
+                color: selected ? Colors.white : AppTheme.muted,
+              ),
+            ),
+            const SizedBox(width: 12),
             Text(
               row.label,
               style: TextStyle(
@@ -763,11 +827,11 @@ class _SheetRow extends StatelessWidget {
   }
 }
 
-/// 选项条里的一颗。
+/// 选项条里的一颗（夸克式 pill）。
 ///
 /// 三种状态**必须能一眼分开**（电视上没有 hover、没有指针）：
-///   * 当前生效（[selected]）—— 实心强调色 + 白字 + 勾；
-///   * 光标所在（[focused]）—— 提亮罩 + 轻微放大；
+///   * 当前生效（[selected]）—— 白底 + 深色字 + 勾（夸克选中态）；
+///   * 光标所在（[focused]）—— 放大 + 边框提亮 + 字变白；
 ///   * 不可选（`enabled == false`）—— 压暗、去色。
 ///
 /// 「光标所在」与「当前生效」是**两件事**：用户挪到「4K」上但还没按 OK 时，
@@ -792,21 +856,31 @@ class _SheetChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final Color text;
     final Color? fill;
+    final Color border;
     if (!enabled) {
-      text = AppTheme.dim;
-      fill = AppTheme.panel3.withValues(alpha: 0.6);
+      text = AppTheme.dim.withValues(alpha: 0.7);
+      fill = Colors.white.withValues(alpha: 0.04);
+      border = Colors.white.withValues(alpha: 0.06);
     } else if (selected) {
+      // 夸克式选中：白底 pill + 深色字，在一排深色 chip 里一眼定位。
+      text = const Color(0xFF141824);
+      fill = Colors.white;
+      border = Colors.white;
+    } else if (focused) {
       text = Colors.white;
-      fill = AppTheme.accent;
+      fill = Colors.white.withValues(alpha: 0.16);
+      border = Colors.white.withValues(alpha: 0.38);
     } else {
-      text = focused ? AppTheme.text : AppTheme.muted;
-      fill = AppTheme.panel3;
+      text = AppTheme.muted;
+      fill = Colors.white.withValues(alpha: 0.07);
+      border = Colors.white.withValues(alpha: 0.10);
     }
 
     return GestureDetector(
       onTap: enabled ? onTap : null,
       behavior: HitTestBehavior.opaque,
       child: AnimatedScale(
+        // ⚠️ 1.05 是单测断言的值（见 player_tv_panel_test），别改。
         scale: focused ? 1.05 : 1,
         duration: const Duration(milliseconds: 110),
         curve: Curves.easeOut,
@@ -817,28 +891,29 @@ class _SheetChip extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           decoration: BoxDecoration(
             color: fill,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(
-              color: selected
-                  ? Colors.transparent
-                  : AppTheme.line.withValues(alpha: 0.8),
-              width: 0.8,
-            ),
-            boxShadow: focused && !selected
-                ? const [
-                    BoxShadow(
-                      color: Color(0x33000000),
-                      blurRadius: 10,
-                      offset: Offset(0, 3),
-                    ),
-                  ]
-                : null,
+            borderRadius: BorderRadius.circular(17),
+            border: Border.all(color: border, width: 0.8),
+            boxShadow: [
+              if (selected)
+                const BoxShadow(
+                  color: Color(0x4DFFFFFF),
+                  blurRadius: 12,
+                  offset: Offset(0, 2),
+                )
+              else if (focused)
+                const BoxShadow(
+                  color: Color(0x40000000),
+                  blurRadius: 10,
+                  offset: Offset(0, 3),
+                ),
+            ],
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               if (selected) ...[
-                const Icon(Icons.check_rounded, size: 15, color: Colors.white),
+                Icon(Icons.check_rounded,
+                    size: 15, color: text),
                 const SizedBox(width: 5),
               ],
               Text(
@@ -952,33 +1027,48 @@ class TvSheetHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 12, 18, 6),
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
       child: Row(
         children: [
           Container(
-            width: 26,
-            height: 26,
+            width: 28,
+            height: 28,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(9),
               gradient: AppTheme.brandGradient,
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x405B8CFF),
+                  blurRadius: 12,
+                  offset: Offset(0, 3),
+                ),
+              ],
             ),
             child: Icon(
               icon ?? Icons.tune_rounded,
-              size: 15,
+              size: 16,
               color: Colors.white,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 11),
           Expanded(
             child: Text(
               title,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-                color: AppTheme.text,
+                fontSize: 16.5,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.3,
+                color: Colors.white,
               ),
+            ),
+          ),
+          Text(
+            'OK 选择 · 菜单返回',
+            style: TextStyle(
+              fontSize: 11.5,
+              color: Colors.white.withValues(alpha: 0.45),
             ),
           ),
         ],
@@ -1001,24 +1091,33 @@ class _EpisodeCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: current ? Colors.transparent : AppTheme.panel3,
-      borderRadius: BorderRadius.circular(10),
+      color: current ? Colors.transparent : Colors.white.withValues(alpha: 0.07),
+      borderRadius: BorderRadius.circular(12),
       child: Ink(
         // 「当前这一集」用品牌渐变而不是纯强调色：整块网格里只有一格是
         // 渐变的，扫一眼就能定位到「我在哪」。
         decoration: BoxDecoration(
           gradient: current ? AppTheme.brandGradient : null,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(12),
           border: Border.all(
             color: current
-                ? Colors.transparent
-                : AppTheme.line.withValues(alpha: 0.8),
+                ? Colors.white.withValues(alpha: 0.35)
+                : Colors.white.withValues(alpha: 0.10),
             width: 0.8,
           ),
+          boxShadow: current
+              ? const [
+                  BoxShadow(
+                    color: Color(0x505B8CFF),
+                    blurRadius: 14,
+                    offset: Offset(0, 3),
+                  ),
+                ]
+              : null,
         ),
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(12),
           child: Center(
             child: Text(
               label,

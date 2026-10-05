@@ -22,6 +22,7 @@ import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/tv_adjust_slider.dart';
+import '../widgets/tv_text_field.dart';
 
 /// 版本号。**必须与 `pubspec.yaml` 的 `version` 保持一致。**
 ///
@@ -638,10 +639,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   }) {
     final dirty = controller.text.trim() != saved.trim();
 
-    return TextField(
+    // TV 下用 [TvTextField]：焦点路过不弹键盘，只有按 OK 才进入编辑
+    // （遥控器焦点移动不再被系统输入法打断）。桌面行为与原来一致。
+    return TvTextField(
       controller: controller,
       // 只为重算上面的 `dirty`。
       onChanged: (_) => setState(() {}),
+      onSaved: () => setState(() {}),
       style: AppTheme.mono.copyWith(color: AppTheme.text, fontSize: 12),
       decoration: InputDecoration(
         isDense: true,

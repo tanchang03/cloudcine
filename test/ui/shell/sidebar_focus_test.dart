@@ -16,44 +16,41 @@ import 'package:go_router/go_router.dart';
 
 import '../../support/focus_reach.dart';
 
-/// **左侧导航栏能不能被遥控器方向键走到。**
+/// **一级导航（TV 顶栏 / 桌面侧栏）能不能被遥控器方向键走到。**
 ///
 /// ## 为什么值得单开一个文件
 ///
-/// `tv_pages_layout_test.dart` / `library_tv_layout_test.dart` 把页面铺在
-/// **624** 宽里 —— 那是 `960 − 过扫描 96 − 侧栏 240`，也就是说**侧栏那 240
-/// 一直被当成「已经用掉的宽度」扣掉，它自己从没被测过**。而用户报的
-/// 「很多区域遥控器无法触达」里，侧栏恰恰是重灾区：它被包在壳的过扫描内边距
-/// 里、每一项的焦点宿主是 `InkWell`（不是 `TvFocusable`），而
+/// TV 已改走**顶部一级导航**（参考夸克网盘 TV 版）：左右分栏在 960 宽下
+/// 吃掉 240 + 过扫描 96，只剩 624 给内容；顶栏只吃纵向 60，内容区拿到 864。
+/// 而用户报的「很多区域遥控器无法触达」里，一级导航恰恰是重灾区：它被包在
+/// 壳的过扫描内边距里、每一项的焦点宿主是 `InkWell`（不是 `TvFocusable`），而
 /// `StatefulShellRoute.indexedStack` 又会把 5 个分支**全部**留在 widget 树里。
 ///
-/// ## 结论（2026-10-04 实测）
+/// ## 结论
 ///
 /// | 动作 | 结果 |
 /// |---|---|
-/// | 侧栏**内部** ↓ / ↑ 走六个入口 | ✅ 正常 |
-/// | 焦点在侧栏时按 → 进内容区 | ✅ 正常 |
-/// | OK 键（select）按在侧栏项上切分支 | ✅ 正常 |
-/// | **焦点在内容区时按 ← / ↑ 进侧栏** | ✅ 正常（**靠兜底**，见下） |
-/// | 侧栏在 540 高下是否溢出 | ✅ 不溢出（修前溢出 25px） |
-///
-/// 后两条原本都是缺陷，各自的用例就是当时的实测记录 —— 它们先是红的，
-/// 修完才转绿。**别把它们删掉**：它们是这两条修复唯一的回归保护。
+/// | 顶栏**内部** ← / → 走五个入口 | ✅ 正常 |
+/// | 焦点在顶栏时按 ↓ 进内容区 | ✅ 正常 |
+/// | OK 键（select）按在导航项上切分支 | ✅ 正常 |
+/// | **焦点在内容区时按 ↑ 进顶栏** | ✅ 正常（**靠兜底**，见下） |
+/// | 顶栏在 960 宽下是否溢出 | ✅ 不溢出 |
 ///
 /// ## 根因：`StatefulShellRoute.indexedStack` 给每个分支一个独立 `Navigator`
 ///
 /// 于是每个分支页各有一个自己的 `FocusScope`。`FocusTraversalPolicy.inDirection`
 /// （`focus_traversal.dart:1070`）只在 `currentNode.nearestScope.traversalDescendants`
-/// 里找候选，**找不到就直接返回 false，不会向上冒泡到父 scope**。而侧栏是分支页的
-/// **兄弟**，在外层 scope 里 —— 从内容区出发，最近的 scope 里只有它自己那一个节点。
+/// 里找候选，**找不到就直接返回 false，不会向上冒泡到父 scope**。而一级导航
+/// 是分支页的**兄弟**，在外层 scope 里 —— 从内容区出发，最近的 scope 里只有
+/// 它自己那一个节点。
 ///
 /// 实测（探针打出来的）：焦点在内容区时 `nearestScope.traversalDescendants`
-/// **只有 1 个节点**；焦点在侧栏时同一个方向键就能走通。Tab 两个方向都能跨
+/// **只有 1 个节点**；焦点在导航时同一个方向键就能走通。Tab 两个方向都能跨
 /// （`_moveFocus` 会爬 scope 边界），但**真机遥控器没有 Tab**。
 ///
 /// 修法是 `AppShell` 里那层 `Focus(onKeyEvent:)` 兜底：先跑
-/// `focusInDirection`（与框架默认逐字一致），**它返回 false 才**在侧栏子树里
-/// 按几何找一个送过去。所以下面那条 ← 的用例顺带钉住了「兜底真的接上了」。
+/// `focusInDirection`（与框架默认逐字一致），**它返回 false 才**在导航子树里
+/// 按几何找一个送过去。所以下面那条 ↑ 的用例顺带钉住了「兜底真的接上了」。
 ///
 /// ## ⚠️ 判焦点为什么不能用 `find.text(label)`
 ///
@@ -66,16 +63,17 @@ void main() {
   /// `shell.currentIndex == i` 是按**下标**对的（见 `app_router.dart:112`）。
   const paths = ['/library', '/folders', '/scan', '/downloads', '/settings'];
 
-  /// 侧栏上六个能拿焦点的入口，顺序即 `_items` 顺序，外加底部的「诊断日志」。
-  const navLabels = ['媒体库', '文件夹', '扫描', '下载', '设置', '诊断日志'];
+  /// 顶栏上五个能拿焦点的入口（TvFocusable 包着的 tab），顺序即 `_navItems`。
+  /// 「诊断」是右端 IconButton，不在 TvFocusable 计数里，单独覆盖。
+  const navLabels = ['媒体库', '文件夹', '扫描', '下载', '设置'];
 
-  /// 侧栏上「标签为 [label] 的那一项」。
+  /// 导航上「标签为 [label] 的那一项」。
   Finder navTile(String label) => find.ancestor(
         of: find.text(label),
         matching: find.byType(TvFocusable),
       );
 
-  /// 焦点现在在侧栏的哪一项上；不在侧栏就返回 `null`。
+  /// 焦点现在在导航的哪一项上；不在导航就返回 `null`。
   String? focusedNavLabel(WidgetTester tester) {
     for (final label in navLabels) {
       if (focusedInside(tester, navTile(label))) return label;
@@ -83,10 +81,13 @@ void main() {
     return null;
   }
 
+  /// 焦点是否落在顶栏那一行里（五个 tab 任一）。
+  bool inTopNav(WidgetTester tester) => focusedNavLabel(tester) != null;
+
   /// 焦点当前落在哪 —— 只用于**失败时**把轨迹打出来，不参与断言。
   String whereIsFocus(WidgetTester tester) {
     final nav = focusedNavLabel(tester);
-    if (nav != null) return '侧栏:$nav';
+    if (nav != null) return '导航:$nav';
     final primary = FocusManager.instance.primaryFocus;
     if (primary == null) return '无焦点';
     final r = primary.rect;
@@ -218,7 +219,7 @@ void main() {
     }
   }
 
-  testWidgets('侧栏第一项落在电视安全带之内 —— 过扫描不会切掉它', (tester) async {
+  testWidgets('顶栏第一项落在电视安全带之内 —— 过扫描不会切掉它', (tester) async {
     await onTv(() async {
       await pumpShell(
         tester,
@@ -226,46 +227,32 @@ void main() {
         contentNodes: makeContentNodes(),
       );
 
-      // 防空转：侧栏没铺出来时，下面的几何断言全是废话。
+      // 防空转：顶栏没铺出来时，下面的几何断言全是废话。
       expect(
         find.byType(TvFocusable),
         findsNWidgets(navLabels.length),
-        reason: '侧栏的六项没铺出来（或数量变了），这条用例测了个寂寞',
+        reason: '顶栏的五项没铺出来（或数量变了），这条用例测了个寂寞',
       );
 
       final first = tester.getRect(navTile('媒体库'));
       expect(
         first.left,
         greaterThanOrEqualTo(AppTheme.tvSafeHorizontal - 0.5),
-        reason: '侧栏最左那一列探进了过扫描带 —— 真机上会被电视切掉。'
+        reason: '顶栏最左那一项探进了过扫描带 —— 真机上会被电视切掉。'
             '壳在 `app_shell.dart` 的 `body:` 那一层统一加了内边距，这里不该再漏。',
       );
       expect(
         first.top,
         greaterThanOrEqualTo(AppTheme.tvSafeVertical - 0.5),
-        reason: '侧栏第一项顶进了过扫描带',
+        reason: '顶栏顶进了过扫描带',
       );
     });
   });
 
-  // 侧栏在 540 高下的高度预算。
-  //
-  // 修之前这里**溢出 25px**：约束是 `w=240, h<=486`，而「诊断日志」的
-  // `TvFocusable` 落在 `Rect.fromLTRB(48, 467, 288, 528)` —— 安全带下沿只有
-  // **513**，这一行整行掉在安全带外，底部离屏幕边只剩 12px。
-  //
-  // ⛔ 后果比「不好看」重得多：Debug 下是黄黑斜纹，**Release 下溢出被静默裁掉**
-  // —— 看起来就像「那个入口本来就没有」，而它还在焦点链里：遥控器按得到、
-  // 屏幕上看不见，用户只会以为遥控器坏了。
-  //
-  // ⚠️ `_Sidebar` 的 `Column` 里那个 `Spacer` 是 flex，可用高不够时它会被压成
-  // 0 而**不会**救场 —— 别把它当保险。修法是收紧 tile 的内外上下内边距
-  // （每个 61 → 55，见 `_NavTile`）。
-  //
-  // ⚠️ **余量要量 `Spacer` 的高度**，不是量「诊断日志」的 `bottom`：
-  // 那个 tile 是被 `Spacer` 顶到底部的，它的 `bottom` 永远贴在安全带下沿，
-  // 量它只反映尾部间距，量不出还剩多少空间。
-  testWidgets('侧栏在 540 高下不溢出，而且还有余量', (tester) async {
+  // 顶栏在 960 宽下的宽度预算：五个 tab + logo + 账号/诊断必须装进
+  // 960 − 过扫描 96 = 864。溢出在 Release 下是静默裁掉 —— 看起来就像
+  // 「那个入口本来就没有」，而它还在焦点链里：遥控器按得到、屏幕上看不见。
+  testWidgets('顶栏在 960 宽下不溢出，内容区拿到 864 宽', (tester) async {
     await onTv(() async {
       await pumpShell(
         tester,
@@ -276,45 +263,27 @@ void main() {
       expect(
         tester.takeException(),
         isNull,
-        reason: '侧栏在 540 高下溢出了 —— 底部那几个入口会被静默裁掉',
+        reason: '顶栏在 960 宽下溢出了 —— 右端入口会被静默裁掉',
       );
+      final last = tester.getRect(navTile('设置'));
       expect(
-        tester.getRect(navTile('诊断日志')).bottom,
-        lessThanOrEqualTo(540 - AppTheme.tvSafeVertical + 0.5),
-        reason: '「诊断日志」整行掉到安全带之外了',
+        last.right,
+        lessThanOrEqualTo(960 - AppTheme.tvSafeHorizontal + 0.5),
+        reason: '顶栏右端探进了过扫描带',
       );
-
-      // 留一点余量，而不是「刚好卡进去」：tile 高度是「图标 22 与文字取大」
-      // 决定的，而侧栏**没有**套 `tvTextScaler` —— 系统字体一放大，
-      // 5 个 tile 会一起长高。10 这个数是给那点浮动留的，不是随手写的。
-      //
-      // ⚠️ 得**指定是侧栏那一列里的**那个 `Spacer`：`_NavTile` 内部还有一个
-      // （角标非空时才画，用来把数字顶到右边）。这里恰好没有角标，所以全窗口
-      // 只有一个 —— 但别依赖这个巧合，角标一出现 `getSize` 就会因为「找到 2 个」
-      // 而抛错。按几何取祖先链上最近的那个 `Column`（`_NavTile` 里没有
-      // `Column`，所以它一定是侧栏那一列）。
-      final sidebarColumn = find
-          .ancestor(of: navTile('媒体库'), matching: find.byType(Column))
-          .first;
-      final slack = tester
-          .getSize(
-            find.descendant(of: sidebarColumn, matching: find.byType(Spacer)),
-          )
-          .height;
+      // 内容区宽度 = 整屏 − 过扫描（顶栏只吃纵向，不再吃横向 240）。
       expect(
-        slack,
-        greaterThan(10),
-        reason: '侧栏只剩 $slack px 余量 —— 再动一下就会溢出，'
-            '而溢出在 Release 下是静默裁掉的',
+        960 - AppTheme.tvSafeHorizontal * 2,
+        864,
+        reason: '顶栏模式下内容区应为 864 宽（左右分栏时代只有 624）',
       );
     });
   });
 
-  // 焦点在内容区时按 ← 能不能进侧栏。
+  // 焦点在内容区时按 ↑ 能不能进顶栏。
   //
-  // 这条用例是**修复前**那个缺陷的实测记录：连按 12 次 ←，焦点停在原地
-  // （轨迹 `[内容区]`）。根因不是几何 —— 侧栏那 6 项完全符合 `←` 的筛选条件
-  // （`node.rect.center.dx <= target.left`）—— 而是 **scope 隔离**：
+  // 根因不是几何 —— 顶栏那 5 项完全符合 `↑` 的筛选条件
+  // （`node.rect.center.dy <= target.top`）—— 而是 **scope 隔离**：
   // `StatefulShellRoute.indexedStack` 给每个分支一个独立 `Navigator`，于是分支页
   // 有自己的 `FocusScope`；`FocusTraversalPolicy.inDirection` 只在
   // `nearestScope.traversalDescendants` 里找，找不到**不冒泡到父 scope**。
@@ -322,7 +291,7 @@ void main() {
   //
   // 现在靠 `AppShell` 里那层 `Focus(onKeyEvent:)` 兜底走通（`_onShellKey`）。
   // ⛔ 这条用例是那个兜底的**唯一**回归保护 —— 兜底一删它立刻变红。
-  testWidgets('从内容区按 ← 能走进侧栏，而且落点按几何算', (tester) async {
+  testWidgets('从内容区按 ↑ 能走进顶栏', (tester) async {
     await onTv(() async {
       final nodes = makeContentNodes();
       await pumpShell(
@@ -331,51 +300,41 @@ void main() {
         contentNodes: nodes,
       );
 
-      // 侧栏的右缘：判「焦点是不是已经在侧栏那一列里」用。
-      final sidebarRight = tester.getRect(navTile('媒体库')).right;
-      bool inSidebar() {
-        final primary = FocusManager.instance.primaryFocus;
-        final rect = primary?.rect;
-        if (rect == null || rect.isEmpty) return false;
-        return rect.center.dx <= sidebarRight;
-      }
-
-      /// 从内容区的某一半按 ←，返回焦点最终落在侧栏的哪个高度上。
-      Future<double> pressLeftFrom(FocusNode from, String what) async {
+      /// 从内容区的某一块按 ↑，断言最终落在顶栏。
+      Future<void> pressUpFrom(FocusNode from, String what) async {
         from.requestFocus();
         await tester.pump();
         expect(
           from.hasFocus,
           isTrue,
-          reason: '前置没成立：焦点没落到$what，后面的 ← 轨迹无法解读',
+          reason: '前置没成立：焦点没落到$what，后面的 ↑ 轨迹无法解读',
         );
 
         final trace = <String>[];
+        var entered = false;
         for (var step = 0; step < 12; step++) {
-          await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
           await tester.pump();
           final where = whereIsFocus(tester);
           if (trace.isEmpty || trace.last != where) trace.add(where);
-          if (inSidebar()) return FocusManager.instance.primaryFocus!.rect.center.dy;
+          if (inTopNav(tester)) {
+            entered = true;
+            break;
+          }
         }
-        fail('从$what按了 12 次 ← 也没能进侧栏。轨迹：$trace');
+        expect(
+          entered,
+          isTrue,
+          reason: '从$what按了 12 次 ↑ 也没能进顶栏。轨迹：$trace',
+        );
       }
 
-      final fromTop = await pressLeftFrom(nodes.first.first, '内容区上半块');
-      final fromBottom = await pressLeftFrom(nodes.first.last, '内容区下半块');
-
-      // ⛔ 这一条才是「按几何找」的证据：只断言「进得去」的话，
-      // 「无脑 focus 侧栏第一项」那种实现照样过。
-      expect(
-        fromTop,
-        lessThan(fromBottom),
-        reason: '从上半块进侧栏落在 y=$fromTop、从下半块落在 y=$fromBottom —— '
-            '从更高的地方进去却没落在更高的一项上，说明兜底不是按几何找的。',
-      );
+      await pressUpFrom(nodes.first.first, '内容区上半块');
+      await pressUpFrom(nodes.first.last, '内容区下半块');
     });
   });
 
-  testWidgets('侧栏内部：↓ 从顶走到底、↑ 从底走回顶', (tester) async {
+  testWidgets('顶栏内部：→ 从左走到右、← 从右走回左', (tester) async {
     await onTv(() async {
       await pumpShell(
         tester,
@@ -412,23 +371,19 @@ void main() {
         );
       }
 
-      // 从最上面一路往下：六个入口（含底部的「诊断日志」）都要到得了。
-      await walk('媒体库', LogicalKeyboardKey.arrowDown, expectAll: navLabels);
+      // 从最左一路往右：五个入口都要到得了。
+      await walk('媒体库', LogicalKeyboardKey.arrowRight, expectAll: navLabels);
 
-      // 再从最下面一路往上回到「媒体库」。
-      //
-      // ⚠️ 这里刻意**不**要求走到「诊断日志」：它是最底下那一项，从「媒体库」
-      // 往上走几何上永远碰不到它（`↑` 的候选是 `center.dy <= 目标.top`），
-      // 那是正确的几何，不是缺陷。所以起点选「诊断日志」，验的是**回程**。
+      // 再从最右一路往左回到「媒体库」。
       await walk(
-        '诊断日志',
-        LogicalKeyboardKey.arrowUp,
-        expectAll: navLabels.where((l) => l != '诊断日志').toList(),
+        '设置',
+        LogicalKeyboardKey.arrowLeft,
+        expectAll: navLabels.where((l) => l != '设置').toList(),
       );
     });
   });
 
-  testWidgets('焦点在侧栏时按 → 能进内容区', (tester) async {
+  testWidgets('焦点在顶栏时按 ↓ 能进内容区', (tester) async {
     await onTv(() async {
       final nodes = makeContentNodes();
       await pumpShell(
@@ -442,7 +397,7 @@ void main() {
 
       var entered = false;
       for (var step = 0; step < 6 && !entered; step++) {
-        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
         await tester.pump();
         entered = flatten(nodes).any((n) => n.hasFocus);
       }
@@ -450,13 +405,13 @@ void main() {
       expect(
         entered,
         isTrue,
-        reason: '从侧栏按 → 进不了内容区 —— 两个方向都堵死的话侧栏就彻底是个摆设。'
+        reason: '从顶栏按 ↓ 进不了内容区 —— 两个方向都堵死的话顶栏就彻底是个摆设。'
             '轨迹：${whereIsFocus(tester)}',
       );
     });
   });
 
-  testWidgets('OK 键（select）按在侧栏项上，真的切了分支', (tester) async {
+  testWidgets('OK 键（select）按在导航项上，真的切了分支', (tester) async {
     await onTv(() async {
       StatefulNavigationShell? shell;
       await pumpShell(

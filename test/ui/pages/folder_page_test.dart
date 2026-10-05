@@ -79,7 +79,13 @@ void main() {
     WidgetTester tester, {
     CloudAccount? account,
   }) async {
-    tester.view.physicalSize = const Size(1280, 800);
+    // ⚠️ 必须是桌面宽度（< 960）：`flutter test` 默认平台就是 android，
+    // 1280 会走进 TV 布局（`AppTheme.isTvLayout`），而 TV 下搜索框是
+    // `TvTextField`（只读态，焦点路过不弹键盘、按 OK 才进编辑）。
+    // 那是 TV 输入流程，另有 `tv_text_field_test.dart` 覆盖；
+    // 这一文件测的是文件夹本身的逻辑（筛当前层 / 不污染媒体库搜索词 /
+    // 多选删除），与输入法无关 —— 用桌面宽度跑才测得到正事。
+    tester.view.physicalSize = const Size(800, 600);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);

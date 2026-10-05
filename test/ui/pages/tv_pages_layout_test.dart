@@ -39,11 +39,11 @@ import '../../support/focus_reach.dart';
 /// 它们都用 1000–1100 宽的窗口 —— 那正是桌面尺寸，于是 TV 分支在那些用例里
 /// **一次都没被走到**。而「TV 上排版乱」这件事只有把 view 报成 960 才会显形。
 ///
-/// ## 宽度是 624，不是 960
+/// ## 宽度是 864，不是 960
 ///
-/// 见 `library_tv_layout_test.dart` 的长注释：真实链路上被吃掉两层 ——
-/// 过扫描 48×2 + 侧栏 240。只把 view 设成 960 而让页面占满，等于凭空多给
-/// 336px，测出来的「没溢出」是假的。
+/// TV 已改走顶部一级导航：真实链路只吃掉过扫描 48×2，内容区 = 960 − 96 = 864
+///（左右分栏时代是 624）。只把 view 设成 960 而让页面占满，等于凭空多给
+/// 96px，测出来的「没溢出」是假的；拿旧 624 去铺则是比真实更严，不会漏报。
 class _FakeAuth extends AuthController {
   @override
   Future<AuthState> build() async => AuthState(
@@ -110,10 +110,11 @@ DownloadTask _task(String fileId, DownloadStatus status) => DownloadTask(
     );
 
 void main() {
-  /// 真机上电视**壳内**页面区的尺寸：960 − 过扫描 96 − 侧栏 240 = **624**；
-  /// 540 − 过扫描 54 = **486**。
-  const tvPageWidth = 624.0;
-  const tvPageHeight = 486.0;
+  /// 真机上电视**壳内**页面区的尺寸：960 − 过扫描 96 = **864**（顶栏只吃纵向）；
+  /// 高度 = 540 − 过扫描 54 − 顶栏 60 = **426**。
+  /// （左右分栏时代是 624×486，见 git 历史。）
+  const tvPageWidth = 864.0;
+  const tvPageHeight = 426.0;
 
   /// 壳外那些**整幅页**（`/work`、`/diagnostics`、`/auth/qr`）的尺寸。
   ///
@@ -572,7 +573,7 @@ void main() {
     }
   });
 
-  testWidgets('这两页在电视上都还能往下滚 —— 486 高的视口装不下它们',
+  testWidgets('这两页在电视上都还能往下滚 —— 426 高的视口装不下它们',
       (tester) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
     try {
@@ -598,12 +599,12 @@ void main() {
       await tester.pump();
 
       // 能滚才说明「下面还有内容」这件事是可达的 —— 不滚的话，电视上
-      // 视口只有 486，下半页等于不存在（而它既不报错也不提示）。
+      // 视口只有 426，下半页等于不存在（而它既不报错也不提示）。
       expect(
         find.byType(Scrollable),
         findsWidgets,
         reason: '下载 / 设置这类长页面必须包在可滚动容器里，'
-            '否则 486 高的电视视口会把下半页整块吃掉',
+            '否则 426 高的电视视口会把下半页整块吃掉',
       );
     } finally {
       debugDefaultTargetPlatformOverride = null;

@@ -26,42 +26,58 @@ class AppShell extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final tv = AppTheme.isTvLayout(context);
     return Scaffold(
       backgroundColor: Colors.transparent,
       // 方向键兜底的中转站：自己**不吃焦点、不参与遍历**，只在默认逻辑走不动时
-      // 把焦点送到侧栏。为什么需要它见 [_onShellKey]。
+      // 把焦点送到一级导航。为什么需要它见 [_onShellKey]。
       body: Focus(
         canRequestFocus: false,
         onKeyEvent: _onShellKey,
-        // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉
-        // （侧栏最左边那列字首当其冲）。
+        // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉。
         // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
         child: Padding(
           padding: AppTheme.safeAreaInsets(context),
-          child: Row(
-            children: [
-              _Sidebar(key: _sidebarKey, shell: shell),
-              const VerticalDivider(
-                width: 0.5,
-                thickness: 0.5,
-                color: AppTheme.line,
-              ),
-              Expanded(child: shell),
-            ],
-          ),
+          // TV 走**顶部一级导航**（参考夸克网盘 TV 版媒体库首页）：
+          // 左右分栏在 960 宽下吃掉 240 + 过扫描 96，只剩 624 给内容；
+          // 顶部导航只吃纵向 ~60，内容区拿到 864 宽。遥控器左右切导航、
+          // 上下在导航与内容之间走，与夸克的「顶栏 Tab + 内容区」一致。
+          // 桌面仍走左侧栏（鼠标场景下侧栏信息密度更高）。
+          child: tv
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _TopBar(key: _navKey, shell: shell),
+                    const Divider(height: 0.5, color: AppTheme.line),
+                    Expanded(child: shell),
+                  ],
+                )
+              : Row(
+                  children: [
+                    _Sidebar(key: _navKey, shell: shell),
+                    const VerticalDivider(
+                      width: 0.5,
+                      thickness: 0.5,
+                      color: AppTheme.line,
+                    ),
+                    Expanded(child: shell),
+                  ],
+                ),
         ),
       ),
     );
   }
 }
 
-/// 侧栏那一列的根 widget —— 方向键兜底要在**它里面**找目标。
+/// 一级导航的根 widget —— 方向键兜底要在**它里面**找目标。
 ///
-/// ⛔ 兜底**只能**在侧栏子树里找，不能在整个窗口里按几何找。理由见
-/// [_nearestSidebarFocus] 里那段：`IndexedStack` 把另外 4 个分支也留在树里，
+/// TV 上它是顶栏，桌面上它是侧栏，共用同一个 key（同一时刻只渲染其一）。
+///
+/// ⛔ 兜底**只能**在导航子树里找，不能在整个窗口里按几何找。理由见
+/// [_nearestNavFocus] 里那段：`IndexedStack` 把另外 4 个分支也留在树里，
 /// 它们的坐标和当前页**完全重合**，全窗口搜索会把焦点送到一个**看不见**的
 /// 同坐标节点上 —— 用户看到的是「焦点凭空消失了」。
-final GlobalKey _sidebarKey = GlobalKey(debugLabel: 'cloudcine-sidebar');
+final GlobalKey _navKey = GlobalKey(debugLabel: 'cloudcine-nav');
 
 /// 方向键兜底。
 ///
@@ -72,19 +88,20 @@ final GlobalKey _sidebarKey = GlobalKey(debugLabel: 'cloudcine-sidebar');
 /// （`focus_traversal.dart:1070`）只在 `currentNode.nearestScope.traversalDescendants`
 /// 里找候选，**找不到就返回 false，不会向上冒泡到父 scope**。
 ///
-/// 侧栏是分支页的**兄弟**（在外层 scope 里），所以从内容区按 ← 永远走不进去 ——
-/// 实测：焦点在内容区时那个候选表**只有 1 个节点**（它自己）。同一方向键在焦点
-/// 位于侧栏时就能走通，因为那时最近 scope 换成了外层那个。
+/// 一级导航是分支页的**兄弟**（在外层 scope 里），所以从内容区按方向键
+/// 永远走不进去 —— 实测：焦点在内容区时那个候选表**只有 1 个节点**（它自己）。
+/// 同一方向键在焦点位于导航时就能走通，因为那时最近 scope 换成了外层那个。
+/// 桌面上是从内容区按 ← 进侧栏，TV 上是从内容区按 ↑ 进顶栏，根因同一条。
 ///
 /// 这是 `StatefulShellRoute` 的固有结构，不是接线错误：Tab 能跨（`_moveFocus`
-/// 会爬 scope 边界），**但真机遥控器没有 Tab**。
+/// 会爬 scope 边界），**但真机遥控器没有 Tab**.
 ///
 /// ## 只在「默认逻辑走不动」时出手
 ///
 /// ① 先跑 `focusInDirection` —— 与框架默认的 `_DirectionalFocusAction`
 /// **逐字一致**（含「方向反过来时回到上一个位置」那套 `_popPolicyDataIfNeeded`）。
 /// 它返回 true 就说明框架自己找到了，直接放行，**内容区内部的方向键行为一点不变**。
-/// ② 只有它返回 false（真的没得走）才轮到兜底，而且**只往侧栏送**。
+/// ② 只有它返回 false（真的没得走）才轮到兜底，而且**只往一级导航送**。
 KeyEventResult _onShellKey(FocusNode node, KeyEvent event) {
   final direction = _arrowDirectionOf(event);
   if (direction == null) return KeyEventResult.ignored;
@@ -96,7 +113,7 @@ KeyEventResult _onShellKey(FocusNode node, KeyEvent event) {
   if (focus.focusInDirection(direction)) return KeyEventResult.handled;
 
   // ② 兜底。
-  final next = _nearestSidebarFocus(focus, direction);
+  final next = _nearestNavFocus(focus, direction);
   if (next == null) {
     // 真的没得走 —— 交还给默认处理（例如 Ctrl+方向键的滚动），别把按键吞掉。
     return KeyEventResult.ignored;
@@ -121,7 +138,7 @@ TraversalDirection? _arrowDirectionOf(KeyEvent event) {
   };
 }
 
-/// 在**侧栏子树**里找 [direction] 方向上离 [from] 最近的那个可聚焦节点。
+/// 在**一级导航子树**里找 [direction] 方向上离 [from] 最近的那个可聚焦节点。
 ///
 /// 筛选规则照抄框架的 `_sortAndFilterHorizontally` / `_sortAndFilterVertically`
 /// （`focus_traversal.dart:906` / `:932`），这样「什么算在那个方向上」的判据与
@@ -130,8 +147,8 @@ TraversalDirection? _arrowDirectionOf(KeyEvent event) {
 ///   * 先挑「与 from 在垂直于方向轴上有重叠」的那批（带内），带内为空才放宽；
 ///   * 带内按方向轴上的间距取最近，同距时按垂直偏移取最近 —— 后者保证结果稳定，
 ///     不依赖焦点树的遍历顺序。
-FocusNode? _nearestSidebarFocus(FocusNode from, TraversalDirection direction) {
-  final root = _sidebarKey.currentContext;
+FocusNode? _nearestNavFocus(FocusNode from, TraversalDirection direction) {
+  final root = _navKey.currentContext;
   if (root == null) return null;
 
   final fromRect = from.rect;
@@ -214,28 +231,173 @@ bool _isInside(BuildContext node, BuildContext ancestor) {
   return found;
 }
 
+/// 一级导航入口（顶栏 / 侧栏共用同一份）。
+///
+/// ⚠️ 「文件夹」紧跟在「媒体库」后面是**刻意的**：两者都是「找片子」的
+/// 入口（一个是按作品找、一个是按网盘位置找），挨着放用户才不会来回扫。
+/// 顺序就是分支下标（`shell.currentIndex`），改这里必须同步改
+/// `app_router.dart` 里 `branches` 的顺序。
+const List<({IconData icon, String label, String path})> _navItems = [
+  (icon: Icons.grid_view_rounded, label: '媒体库', path: '/library'),
+  (icon: Icons.folder_rounded, label: '文件夹', path: '/folders'),
+  (icon: Icons.radar_rounded, label: '扫描', path: '/scan'),
+  (icon: Icons.download_rounded, label: '下载', path: '/downloads'),
+  (icon: Icons.settings_rounded, label: '设置', path: '/settings'),
+];
+
+/// 下载那一项在 `_navItems` 里的下标。
+///
+/// 写成常量而不是字面量 `3`：角标要挂在**特定的那一项**上，而入口顺序
+/// 是会被调整的 —— 调了顺序却忘了改这个数字，表现是「扫描那项上挂着一个
+/// 下载数」，一个看起来像数据错了的界面 bug。
+const int _downloadsIndex = 3;
+
+/// TV 顶部一级导航（参考夸克网盘 TV 版媒体库首页）。
+///
+/// 布局 = 左 logo + 中间横排 5 个入口 + 右账号/诊断：
+///   * 横排 Tab 让 864 宽的内容区完整让出来（左右分栏只剩 624）；
+///   * 遥控器 ←→ 在顶栏内走，↑ 从内容区回到顶栏（靠壳里的方向键兜底），
+///     ↓ 从顶栏进内容区（默认遍历即通）；
+///   * 选中态 = 强调色 pill + 白字（与 OSD 选中 chip 同一种语言），
+///     未选中 = 透明底 + muted 字，保证三米外一眼看出在哪。
+class _TopBar extends ConsumerWidget {
+  const _TopBar({super.key, required this.shell});
+
+  final StatefulNavigationShell shell;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final downloading = ref.watch(downloadActiveCountProvider);
+    final auth = ref.watch(authControllerProvider).valueOrNull;
+
+    return SizedBox(
+      height: AppTheme.tvTopBarHeight,
+      child: Row(
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(left: 4, right: 12),
+            child: AppLogo(showWordmark: false),
+          ),
+          for (var i = 0; i < _navItems.length; i++)
+            _TopNavTab(
+              icon: _navItems[i].icon,
+              label: _navItems[i].label,
+              selected: shell.currentIndex == i,
+              badge: i == _downloadsIndex ? downloading : null,
+              onTap: () => shell.goBranch(
+                i,
+                initialLocation: i == shell.currentIndex,
+              ),
+            ),
+          const Spacer(),
+          Text(
+            auth?.account?.label ?? '未登录',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, color: AppTheme.muted),
+          ),
+          const SizedBox(width: 8),
+          TvIconLabel(
+            label: '诊断',
+            child: IconButton(
+              tooltip: '诊断日志',
+              iconSize: 19,
+              onPressed: () => context.push('/diagnostics'),
+              icon: const Icon(Icons.receipt_long_rounded),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TopNavTab extends StatelessWidget {
+  const _TopNavTab({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.badge,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final int? badge;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = badge ?? 0;
+    final tab = Material(
+      color: selected ? AppTheme.accent : Colors.transparent,
+      borderRadius: BorderRadius.circular(22),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(22),
+        hoverColor: AppTheme.panel2.withValues(alpha: 0.6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 19,
+                color: selected ? Colors.white : AppTheme.muted,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: AppTheme.tvActionLabel,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                  color: selected ? Colors.white : AppTheme.muted,
+                ),
+              ),
+              if (count > 0) ...[
+                const SizedBox(width: 7),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: selected ? Colors.white : AppTheme.accent,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    count > 99 ? '99+' : '$count',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      height: 1.3,
+                      color: selected ? AppTheme.accent : AppTheme.bg,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+
+    // 选中态已有实心 pill，焦点只需轻微放大（与侧栏同一套语言，不再叠色罩）。
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      child: TvFocusable(
+        borderRadius: BorderRadius.circular(22),
+        focusScale: 1.05,
+        child: tab,
+      ),
+    );
+  }
+}
+
 class _Sidebar extends ConsumerWidget {
   const _Sidebar({super.key, required this.shell});
 
   final StatefulNavigationShell shell;
-
-  /// ⚠️ 「文件夹」紧跟在「媒体库」后面是**刻意的**：两者都是「找片子」的
-  /// 入口（一个是按作品找、一个是按网盘位置找），挨着放用户才不会在
-  /// 侧栏里来回扫。
-  static const List<({IconData icon, String label, String path})> _items = [
-    (icon: Icons.grid_view_rounded, label: '媒体库', path: '/library'),
-    (icon: Icons.folder_rounded, label: '文件夹', path: '/folders'),
-    (icon: Icons.radar_rounded, label: '扫描', path: '/scan'),
-    (icon: Icons.download_rounded, label: '下载', path: '/downloads'),
-    (icon: Icons.settings_rounded, label: '设置', path: '/settings'),
-  ];
-
-  /// 下载那一项在 `_items` 里的下标。
-  ///
-  /// 写成常量而不是字面量 `3`：角标要挂在**特定的那一项**上，而入口顺序
-  /// 是会被调整的 —— 调了顺序却忘了改这个数字，表现是「扫描那项上挂着一个
-  /// 下载数」，一个看起来像数据错了的界面 bug。
-  static const int _downloadsIndex = 3;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -246,11 +408,9 @@ class _Sidebar extends ConsumerWidget {
     final downloading = ref.watch(downloadActiveCountProvider);
 
     return SizedBox(
-      // TV 上加宽到 240：16sp 的标签 + 22px 的图标 + 焦点环需要地方，
-      // 桌面那 196 是按「鼠标精确点到 13sp 的小行」定的，电视上不够。
-      width: AppTheme.isTvLayout(context)
-          ? AppTheme.tvSidebarWidth
-          : AppTheme.sidebarWidth,
+      // 桌面侧栏固定 196（鼠标场景）。TV 走顶栏，不再进这一支；
+      // 这里不再按 TV 加宽到 240。
+      width: AppTheme.sidebarWidth,
       // ## ⚠️ 这一列的高度是**紧**的，改上面任何一项前先看这段
       //
       // 540 高的电视上可用高只有 540 − 过扫描 54 = **486**，要装下
@@ -279,10 +439,10 @@ class _Sidebar extends ConsumerWidget {
           ),
           const Divider(height: 0.5, color: AppTheme.line),
           const SizedBox(height: 8),
-          for (var i = 0; i < _items.length; i++)
+          for (var i = 0; i < _navItems.length; i++)
             _NavTile(
-              icon: _items[i].icon,
-              label: _items[i].label,
+              icon: _navItems[i].icon,
+              label: _navItems[i].label,
               selected: shell.currentIndex == i,
               badge: i == _downloadsIndex ? downloading : null,
               onTap: () => shell.goBranch(

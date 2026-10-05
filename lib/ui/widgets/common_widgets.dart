@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
 import 'tv_text.dart';
+import 'tv_text_field.dart';
 
 /// 页面标题栏。
 ///
@@ -179,14 +180,16 @@ class HeaderSearchBox extends StatelessWidget {
       // 高度仍然**写死**（理由见类文档：固定高的框才吃得住字号，不能套
       // `tvTextScaler`）。TV 上从 32 抬到 44 —— 15sp 的字在 32 高的框里会顶破。
       height: tv ? 44 : 32,
-      child: TextField(
+      // TV 下同样只有按 OK 才进编辑态（见 TvTextField）：搜索框坐在页头，
+      // 遥控器 ↑ 下来路过它就弹键盘的话，用户永远到不了海报墙。
+      child: TvTextField(
         controller: controller,
         onChanged: onChanged,
+        cursorHeight: tv ? 18 : 14,
         style: TextStyle(
           fontSize: tv ? AppTheme.tvActionLabel : 12.5,
           color: AppTheme.text,
         ),
-        cursorHeight: tv ? 18 : 14,
         decoration: InputDecoration(
           isDense: true,
           hintText: hint,

@@ -378,16 +378,20 @@ void main() {
     }
   });
 
-  testWidgets('电视上侧栏让出的宽度确实大于桌面（否则 580 这个数是拍的）',
-      (tester) async {
-    // 这条是上面两条的地基：如果哪天有人把 tvSidebarWidth 改小到跟桌面一样，
-    // 上面那两条仍然会绿 —— 因为它们只断言「在自己算出来的宽度里没溢出」。
-    expect(AppTheme.tvSidebarWidth, greaterThan(AppTheme.sidebarWidth));
+  testWidgets('电视上内容区宽度确实放大了（顶栏替代侧栏）', (tester) async {
+    // TV 已改走顶部一级导航：内容区 = 960 − 过扫描 96 = 864，
+    // 左右分栏时代只有 624。顶栏高度见 AppTheme.tvTopBarHeight。
+    expect(
+      960 - AppTheme.tvSafeHorizontal * 2,
+      864,
+      reason: '顶栏模式下内容区应为 864 宽（左右分栏时代只有 624）',
+    );
+    expect(AppTheme.tvTopBarHeight, greaterThan(0));
     expect(
       tvPageWidth,
-      960 - AppTheme.tvSafeHorizontal * 2 - AppTheme.tvSidebarWidth,
-      reason: 'tvPageWidth 必须与真实链路算出来的一致，否则这几条测试'
-          '测的是一个不存在的屏幕宽度',
+      624,
+      reason: '本文件的窄框 624 是刻意保留的更严检查（比真实 864 窄）：'
+          '在 624 里不溢出，在 864 里一定不溢出；反之不成立',
     );
   });
 }
