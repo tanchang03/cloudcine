@@ -104,9 +104,9 @@
              per-user 场景下的误报，理由见 build_package.ps1 里 -sice 那段。） -->
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
         <!-- 组件必须有 KeyPath。用注册表值而不是文件，卸载时不会因为
-             快捷方式被用户改过而留下残留。Root 用 HKMU：per-user 装映射到
-             HKCU，将来若改成 per-machine 会自动映射到 HKLM。 -->
-        <RegistryValue Root="HKMU" Key="Software\CloudCine" Name="StartMenuShortcut"
+             快捷方式被用户改过而留下残留。Root 用 HKCU（本包是 per-user 安装）；
+             若将来改成 per-machine，要同步改成 HKLM，否则触发 ICE57。 -->
+        <RegistryValue Root="HKCU" Key="Software\CloudCine" Name="StartMenuShortcut"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
