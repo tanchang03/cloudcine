@@ -135,46 +135,52 @@ int nextTvRowIndex({
 // 收在这里是为了让「改一个数字」只改一处 —— 两个页面共用。
 // ---------------------------------------------------------------------------
 
-/// 一行的高度。
-///
-/// ⚠️ 这是聚焦菜单里**标题行**的高度（只显示当前分类那一行，不是七行列表）。
-const double _kRowHeight = 44;
-
-/// 选项条 / 说明条那一格的高度。**恒定**，与有没有选项无关。
-const double _kStripHeight = 50;
-
-/// 菜单内容的上下内边距。
-const double _kSheetPadding = 10;
-
 /// 卡片顶部那条描边有多粗。
 const double _kCardBorderWidth = 0.8;
 
-/// 聚焦式菜单内容（标题行 + 选项条 + 上下内边距）需要的高度。
+/// 左侧侧边栏宽度。夸克 TV 同款约 180px，电视 16:9 上留足右侧选项区宽度。
+const double _kSideBarWidth = 180.0;
+
+/// 侧边栏的上下内边距。
+const EdgeInsets _kSideBarPadding = EdgeInsets.fromLTRB(0, 14, 0, 14);
+
+/// 侧边栏每行 tile 的高度。紧凑到 40：7 个分类全竖排也不至于盖住太多画面。
+const double _kSideBarTileHeight = 40.0;
+
+/// 侧边栏全部 tile 的高度和（7 个分类，顺序见 [PlayerTvRow]）。
+///
+/// ⚠️ 字面量 7 = `PlayerTvRow.values.length`（枚举的 `values.length` 在 const
+/// 上下文里取不到）。加 / 删分类时必须同步改这里与 `PlayerTvRow` ——
+/// 否则侧边栏要么装不下、要么空出一截。
+const double _kSideBarTotalHeight = _kSideBarTileHeight * 7;
+
+/// 菜单内容（侧边栏 + 上下内边距）需要的高度。
 const double _kSheetContentHeight =
-    _kRowHeight + _kStripHeight + _kSheetPadding * 2;
+    _kSideBarTotalHeight + 28 /* = _kSideBarPadding.vertical（14×2）*/;
 
 /// 底部菜单的总高。
 ///
 /// ## 这个数是怎么来的
 ///
-/// 2026-10-05 起菜单从「七行纵排 + 选中行下方选项条」改为**聚焦式 XY 交叉
-/// 菜单**：每次只显示**当前一个分类**（Y）及其选项条（X）。原因是 TV 上
-/// 4K 播放时（CPU 169%）每次按键重建全部七行（每行还带 140ms 动画）+ 大阴影
-/// 卡片会明显掉帧；聚焦后屏幕上永远只有 1 个分类 + 一组选项。
+/// 2026-10-05 起菜单是**夸克式 XY 交叉面板**：左侧固定侧边栏（7 个分类）
+/// + 右侧当前分类的选项区。侧边栏全竖排，所以高度由分类数决定：
 ///
-/// 内容 = 标题行 [_kRowHeight] + 选项条 [_kStripHeight] + 上下内边距
-///       = 44 + 50 + 10 × 2 = 114，再加上 [_kCardBorderWidth]。
+/// 内容 = 7 个 tile × [_kSideBarTileHeight] + 上下内边距
+///       = 7 × 40 + 28 = 308，再加上 [_kCardBorderWidth]。
+///
+/// 比原版七行版（346）略矮，画面还能留 200+；比单行聚焦版（115）高 ——
+/// 但换来的是「所有分类一眼可见 + 侧边栏不重建」的夸克交互。
 ///
 /// ⚠️ **末尾那 0.8 不能省。** `Container` 会把 `decoration` 上那条描边算成
 /// **内容的内边距**（`decoration.padding`），于是内容实得的高度比 `height`
-/// 少 0.8px。少了它，标题行会溢出 0.8px —— Flutter 会把溢出画成黄黑斜纹，
+/// 少 0.8px。少了它，侧边栏会溢出 0.8px —— Flutter 会把溢出画成黄黑斜纹，
 /// 而电视上没有滚动条，用户看到的是内容被削掉一条边。
 const double kPlayerTvSheetHeight = _kSheetContentHeight + _kCardBorderWidth;
 
 /// 选集网格二级页的高度。
 ///
 /// 网格页需要比行菜单高得多（要放得下好几行集数格子），所以它**显式传**
-/// 自己的高度，而不是沿用聚焦菜单的 [kPlayerTvSheetHeight]。
+/// 自己的高度，而不是沿用 [kPlayerTvSheetHeight]。
 const double kPlayerTvEpisodeGridHeight = 420;
 
 /// 选项条里一颗 chip 的高度。
@@ -406,33 +412,32 @@ class _KeyCap extends StatelessWidget {
   }
 }
 
-/// 底部菜单：**聚焦式 XY 交叉菜单**。
+/// 底部菜单：**夸克式 XY 交叉面板**（左侧固定侧边栏 + 右侧选项区切换）。
 ///
-/// ## 交互（照夸克播放器的「每次只显示一个分类的选项」）
+/// ## 布局
 ///
-///   * ↑ / ↓ —— **切换分类**（Y 轴），标题行换成本分类名 + 当前值 + 位置
-///     （如「画质 · 超清  2/7」）。每次只渲染**当前这一个分类**的选项条；
-///   * ← / → —— 在当前分类的选项条里走（X 轴）；这一行没有选项时交给
-///     [onAdjust]（「选集」用它直接换集）；
+///   * **左侧 Y 轴侧边栏**（约 180 宽）：竖排 7 个分类入口，**始终渲染**、
+///     不随分类切换 rebuild（参考 `kuakewangpan/` 的逆向工程截图）；
+///   * **右侧 X 轴选项区**（剩余宽度）：只显示**当前选中分类**的选项 chips
+///     （或「按 OK 打开选集」等 hint 文案）；切换分类时**整个右侧区域替换**。
+///
+/// ## 交互（照夸克）
+///
+///   * ↑ / ↓ —— 在左侧侧边栏里移动（循环）；右侧选项区跟着切换；
+///   * ← / → —— 在右侧当前分类的选项条里走（chip 间挪动）；没有选项条的行
+///     交给 [onAdjust]（「选集」用它直接换集）；
 ///   * OK —— 应用选中的那一颗（「片头」这种一次动作行则直接执行）；
 ///   * 菜单 / Esc —— 收起菜单。
 ///
-/// ## 为什么从「七行全显示」改成「聚焦单分类」
+/// ## 为什么这样比「单行标题 + 下方选项条」更快
 ///
-/// 原版把七个分类全部竖排，选中行下方再铺选项条。在 TV 上播放 4K 时
-/// （CPU 169–232%），每次按键都要重建七行（每行带 140ms `AnimatedContainer`
-/// 动画）+ 整块大阴影卡片，Mali GPU 上明显掉帧。
+/// 上一版每次 ↑ / ↓ 都要把**整张卡片**重建（标题行 + 选项条 + key hints +
+/// 渐变背景 + 阴影一起重绘），Mali GPU 上叠加 4K 解码（CPU 169%）掉帧明显。
 ///
-/// 聚焦后屏幕上永远只有 **1 个标题行 + 1 组选项 chip**，每次按键 rebuild 的
-/// 子树从「整张七行表」缩成「一个分类」，动画 / 阴影面积也一并大幅减小。
-/// 代价是用户看不到其它分类 —— 用标题行上的「N/7」位置指示补上定位感。
-///
-/// ## 为什么不要「焦点在按钮之间横移」
-///
-/// 桌面那套控制栏把画质 / 字幕 / 音轨 / 音效 / 倍速排成一行按钮，鼠标点两下
-/// 就到。遥控器没有指针：要够到最右边那个按钮，得先按 ↓ 进控制栏、再按 →
-/// 一路挪过去。于是「换个字幕」变成一件要按七八下的事 —— 全都看得见，但
-/// 要花很久才够得到。聚焦式里「换分类」只要按一下 ↑/↓。
+/// 侧边栏固定后：
+///   * 切分类（↑ / ↓）→ 只 rebuild 右侧选项区，左侧不动；
+///   * 选 chip（← / →）→ 只 rebuild 右侧 chip row；
+///   * 卡片背景（渐变 + 阴影）**永远不重建**，Mali 只需合成一次。
 class PlayerTvSheet extends StatefulWidget {
   const PlayerTvSheet({
     super.key,
@@ -531,7 +536,9 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
         focusNode: widget.focusNode,
         onActivity: widget.onActivity,
         onUnhandledKey: _onKey,
-        child: const SizedBox(height: _kRowHeight),
+        child: const SizedBox(
+          height: _kSideBarTileHeight * 3 + 28,
+        ),
       );
     }
     final index = widget.selectedIndex.clamp(0, rows.length - 1);
@@ -543,28 +550,38 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
       onUnhandledKey: _onKey,
       child: Stack(
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: _kSheetPadding),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _FocusRowHeader(
-                  value: value,
-                  positionLabel: '${index + 1}/${rows.length}',
-                ),
-                _buildStrip(value),
-              ],
+          // 左侧：固定侧边栏（所有分类入口，**始终渲染、不随切分类 rebuild**）。
+          // ⚠️ top/bottom 用 0：上下留白由 _SideBar 自己的 padding 负责，
+          // 否则双重 padding 会把 7 个 tile 挤出高度预算（实测溢出 28px）。
+          Positioned(
+            left: 0,
+            top: 0,
+            bottom: 0,
+            child: _SideBar(
+              rows: rows,
+              selectedIndex: index,
+              onSelect: (i) {
+                if (i == index) return;
+                widget.onSelectedChanged(i);
+              },
             ),
+          ),
+          // 右侧：当前分类的选项区（切分类时整个替换）。
+          Positioned(
+            left: _kSideBarWidth + 6,
+            right: 18,
+            top: _kSideBarPadding.top + 16,
+            bottom: 42,
+            child: _buildRightSide(value),
           ),
           // 按键说明浮在右下角，**不占高度预算**。
           Positioned(
             right: 18,
-            bottom: 8,
+            bottom: 6,
             child: TvSheetKeyHints(
               hints: const [
-                ('↑↓', '换项'),
-                ('←→', '选择'),
+                ('↑↓', '分类'),
+                ('←→', '选项'),
                 ('OK', '确定'),
                 ('菜单', '关闭'),
               ],
@@ -575,55 +592,88 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
     );
   }
 
-  /// 选项条：有选项就画 chip，没有就写一句「按 OK 会怎样」。
-  Widget _buildStrip(PlayerTvRowValue value) {
+  /// 右侧选项区：有选项就画 chip 横排，没有就写一句「按 OK 会怎样」。
+  Widget _buildRightSide(PlayerTvRowValue value) {
     final options = value.options;
 
     if (options.isEmpty) {
-      return SizedBox(
-        height: _kStripHeight,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(56, 0, 18, 0),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              value.hint ?? '',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 13.5, color: AppTheme.dim),
-            ),
+      return Padding(
+        padding: const EdgeInsets.only(top: 4),
+        child: Align(
+          alignment: Alignment.topLeft,
+          child: Text(
+            value.hint ?? '',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 15, color: AppTheme.muted),
           ),
         ),
       );
     }
 
-    return SizedBox(
-      height: _kStripHeight,
-      child: SingleChildScrollView(
-        controller: _stripScroll,
-        scrollDirection: Axis.horizontal,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 22),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // 当前分类名 + 当前值（夸克同款：右侧区域顶部显示分类名）。
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
           child: Row(
             children: [
-              for (var i = 0; i < options.length; i++) ...[
-                if (i > 0) const SizedBox(width: 10),
-                _SheetChip(
-                  key: _chipKeys.putIfAbsent(i, GlobalKey.new),
-                  label: options[i].label,
-                  focused: i == _chip,
-                  selected: i == value.selectedOption,
-                  enabled: options[i].enabled,
-                  onTap: () {
-                    setState(() => _chip = i);
-                    widget.onActivate(value.row, i);
-                  },
+              Icon(
+                value.row.icon,
+                size: 18,
+                color: Colors.white.withValues(alpha: 0.7),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                value.row.label,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
                 ),
-              ],
+              ),
+              const SizedBox(width: 12),
+              Text(
+                value.value.isEmpty ? '—' : value.value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 14.5,
+                  color: value.value.isEmpty ? AppTheme.dim : AppTheme.text,
+                ),
+              ),
             ],
           ),
         ),
-      ),
+        // 选项 chips 横排（可滚动）。
+        SizedBox(
+          height: _kChipHeight,
+          child: SingleChildScrollView(
+            controller: _stripScroll,
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                for (var i = 0; i < options.length; i++) ...[
+                  if (i > 0) const SizedBox(width: 12),
+                  _SheetChip(
+                    key: _chipKeys.putIfAbsent(i, GlobalKey.new),
+                    label: options[i].label,
+                    focused: i == _chip,
+                    selected: i == value.selectedOption,
+                    enabled: options[i].enabled,
+                    onTap: () {
+                      setState(() => _chip = i);
+                      widget.onActivate(value.row, i);
+                    },
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -693,84 +743,112 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   }
 }
 
-/// 聚焦菜单的标题行：图标 + 分类名 + 当前值 + 「N/M」位置指示。
-///
-/// 它取代原版七行列表里那一行 `_SheetRow`，但只渲染**当前分类**这一个。
-/// 为了省 GPU：不用 `AnimatedContainer`（原版每行都有 140ms 动画，四行以上
-/// 就开始掉帧），选中态靠图标底 / 色条即时切换。
-class _FocusRowHeader extends StatelessWidget {
-  const _FocusRowHeader({required this.value, required this.positionLabel});
+// ---------------------------------------------------------------------------
+// 左侧固定侧边栏（夸克式 Y 轴分类列表）
+// ---------------------------------------------------------------------------
 
-  final PlayerTvRowValue value;
-  final String positionLabel;
+/// 左侧**固定**侧边栏：所有分类入口，**始终渲染**。
+///
+/// 切分类（↑ / ↓）时它**完全不 rebuild** —— 只有选中行的背景色 / 图标 tint
+/// 会变（`AnimatedContainer` 120ms）。这是夸克方案比「整行替换」流畅的关键：
+/// GPU 每次按键只需重绘右侧一小块，左侧和卡片背景都不动。
+class _SideBar extends StatelessWidget {
+  const _SideBar({
+    required this.rows,
+    required this.selectedIndex,
+    required this.onSelect,
+  });
+
+  final List<PlayerTvRowValue> rows;
+  final int selectedIndex;
+  final void Function(int index) onSelect;
 
   @override
   Widget build(BuildContext context) {
-    final row = value.row;
-    return SizedBox(
-      height: _kRowHeight,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16),
+    return Container(
+      width: _kSideBarWidth,
+      padding: _kSideBarPadding,
+      child: Column(
+        children: [
+          for (var i = 0; i < rows.length; i++)
+            _SideBarTile(
+              row: rows[i].row,
+              value: rows[i].value,
+              selected: i == selectedIndex,
+              onTap: () => onSelect(i),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 侧边栏里的一行：图标 + 名称 + （选中时）当前值 + 箭头。
+class _SideBarTile extends StatelessWidget {
+  const _SideBarTile({
+    required this.row,
+    required this.value,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final PlayerTvRow row;
+  final String value;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
+        height: _kSideBarTileHeight,
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF0066FF) : Colors.transparent,
+          borderRadius: BorderRadius.circular(10),
+        ),
         child: Row(
           children: [
-            // 左侧强调色条（选中定位信号）。
-            Container(
-              width: 3,
-              height: 18,
-              decoration: BoxDecoration(
-                color: AppTheme.accent,
-                borderRadius: BorderRadius.circular(1.5),
-              ),
-            ),
-            const SizedBox(width: 10),
-            // 图标放在圆角小方块里。
-            Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                color: AppTheme.accent.withValues(alpha: 0.22),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Icon(row.icon, size: 17, color: Colors.white),
-            ),
-            const SizedBox(width: 12),
-            Text(
-              row.label,
-              style: const TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
-                color: Colors.white,
-              ),
+            Icon(
+              row.icon,
+              size: 20,
+              color: selected ? Colors.white : AppTheme.muted,
             ),
             const SizedBox(width: 10),
             Flexible(
               child: Text(
-                value.value.isEmpty ? '—' : value.value,
+                row.label,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 14.5,
-                  fontWeight: FontWeight.w500,
-                  color: AppTheme.text,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  color: selected ? Colors.white : AppTheme.muted,
                 ),
               ),
             ),
             const Spacer(),
-            // 位置指示：让用户知道这是第几个分类（聚焦模式看不到其它分类）。
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                positionLabel,
+            if (selected && value.isNotEmpty)
+              Text(
+                value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.white.withValues(alpha: 0.55),
+                  fontSize: 12,
+                  color: Colors.white.withValues(alpha: 0.7),
                 ),
               ),
+            const SizedBox(width: 6),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 18,
+              color: selected
+                  ? Colors.white.withValues(alpha: 0.6)
+                  : AppTheme.dim.withValues(alpha: 0.35),
             ),
           ],
         ),

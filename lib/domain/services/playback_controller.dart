@@ -14,6 +14,7 @@ import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/track_bridge.dart';
 import '../../core/utils/track_labels.dart';
 import '../../data/playback/media_kit_playback_engine.dart';
+import '../../data/playback/video_player_exo_playback_engine.dart';
 import '../adapters/cloud_drive_adapter.dart';
 import '../adapters/stream_relay.dart';
 import '../entities/media_item.dart';
@@ -130,6 +131,13 @@ class PlaybackController extends ChangeNotifier {
   String? _activeQualityId;
   bool _loading = false;
   String? _error;
+
+  /// 这一轮播放是否已经做过「ExoPlayer 失败 → 回退 mpv」。
+  ///
+  /// 每次 [open] 重置。回退后 [_selectEngineFor] 会锁定 mpv（判据再满足也不
+  /// 切回去），同时 [_onEngineError] 不再触发第二次回退 —— 否则 mpv 也报
+  /// Source error 时会形成死循环。
+  bool _fallbackTried = false;
 
   /// 这次失败是不是「网盘上已经没有这个文件」。
   ///
@@ -434,6 +442,8 @@ class PlaybackController extends ChangeNotifier {
     _fileMissing = false;
     _notice = null;
     _loading = true;
+    // 新一轮播放的回退额度归零（见 [_fallbackTried] 的文档）。
+    _fallbackTried = false;
     _position = Duration.zero;
     _duration = Duration.zero;
     // ⚠️ 上一轮换源留下的欠账必须在这里就清掉，**不能**等 [_loadIntoPlayer]。
@@ -600,6 +610,23 @@ class PlaybackController extends ChangeNotifier {
     );
   }
 
+  /// ExoPlayer 打开失败后的回退：切到 media_kit（mpv）并重新开流。
+  Future<void> _fallbackToMpv() async {
+    final ticket = _ticket;
+    if (ticket == null || _fallbackTried) return;
+    _fallbackTried = true;
+    diag.warn('播放', 'ExoPlayer 打不开（解析失败），回退 media_kit（mpv）内核');
+    _error = null;
+    notifyListeners();
+
+    final selection = await _router.switchToDefault();
+    if (selection.changed) {
+      _bindEngine(selection.engine);
+      notifyListeners();
+    }
+    await _loadIntoPlayer(ticket);
+  }
+
   /// 决定这条流**用哪个内核**。
   ///
   /// 判据、缓存键、以及「为什么要跳过 HLS」全部在
@@ -608,6 +635,16 @@ class PlaybackController extends ChangeNotifier {
   ///   1. 缓存键的构成（`fileId|档位`，只有本类同时知道这两者）；
   ///   2. 换了内核之后**重新接订阅**并通知 UI 换渲染组件。
   Future<void> _selectEngineFor(StreamTicket ticket) async {
+    // ⛔ 回退后锁定 mpv：ExoPlayer 已经对这个文件失败过一次，4K 判据再满足
+    // 也不该切回去（会无限失败）。`switchToDefault` 幂等，重复调用无副作用。
+    if (_fallbackTried) {
+      final selection = await _router.switchToDefault();
+      if (selection.changed) {
+        _bindEngine(selection.engine);
+        notifyListeners();
+      }
+      return;
+    }
     final selection = await _router.selectFor(
       key: '${_item?.fileId ?? ticket.url}|${_activeQualityId ?? "-"}',
       url: ticket.url,
@@ -627,8 +664,9 @@ class PlaybackController extends ChangeNotifier {
   /// 当前档位的视频高度（px）。拿不到时按档位标识推断。
   ///
   /// `QualityOption.height` 多数情况下有值，但「原画」常空着；标识是
-  /// `4k` / `2160p` 时可以直接当 ≥2160 处理 —— 这条线只用于路由判据，
-  /// 不用来换显示尺寸。
+  /// `4k` / `2160p` 时可以直接当 2160 处理 —— 这条线只用于路由判据
+  /// （阈值见 `PlaybackEngineRouter`：≥2048 视为 4K，覆盖 2152p 等
+  /// 宽银幕裁切的 origin 档），不用来换显示尺寸。
   int? _currentVideoHeight(StreamTicket ticket) {
     final q = ticket.qualityById(_activeQualityId ?? '');
     if (q?.height != null) return q!.height;
@@ -1306,6 +1344,19 @@ class PlaybackController extends ChangeNotifier {
     }
     final lower = msg.toLowerCase();
     if (!lower.contains('failed') && !lower.contains('error')) return;
+
+    // ⛔ ExoPlayer 打开失败 → 自动回退 mpv。
+    //
+    // media3 对部分 HEVC 文件（hvcC 参数集数组为空）会在解析 moov 时直接抛
+    // `IndexOutOfBoundsException` → `Source error`，而不是优雅报错。这类文件
+    // mpv/ffmpeg 能正常解。回退后 [_selectEngineFor] 锁定 mpv，不会又切回去。
+    if (_engine is VideoPlayerExoPlaybackEngine &&
+        (lower.contains('source error') || lower.contains('exoplaybackexception')) &&
+        !_fallbackTried) {
+      unawaited(_fallbackToMpv());
+      return;
+    }
+
     diag.warn('播放', '内核报错：$msg');
     _error ??= '播放器报错：$msg';
     notifyListeners();

@@ -80,6 +80,8 @@ class ResourceReading {
     this.diskAvailableBytes,
     this.ioReadBytes,
     this.ioWriteBytes,
+    this.netRxBytes,
+    this.netTxBytes,
     this.procsRunning,
     this.procsBlocked,
   });
@@ -117,6 +119,14 @@ class ResourceReading {
   /// 日志所在盘的可用空间，字节
   final int? diskAvailableBytes;
 
+  /// 进程网络命名空间内**累计**收 / 发字节（`/proc/self/net/dev`，不含回环）。
+  ///
+  /// 是**累计值**，要算速率得由调用方对两次采样做差（[DebugOverlay] 就这么
+  /// 做）。跳过 `lo`：本地中继（127.0.0.1）的转发流量也在回环上，而用户
+  /// 想看的「网络加载速率」是**从网盘 CDN 实际收进来**的那部分。
+  final int? netRxBytes;
+  final int? netTxBytes;
+
   /// 进程累计**真正落到设备**的读 / 写字节（`/proc/self/io` 的
   /// `read_bytes` / `write_bytes`）。
   ///
@@ -152,6 +162,8 @@ class ResourceReading {
       diskAvailableBytes == null &&
       ioReadBytes == null &&
       ioWriteBytes == null &&
+      netRxBytes == null &&
+      netTxBytes == null &&
       procsRunning == null &&
       procsBlocked == null;
 }
@@ -310,6 +322,41 @@ int? parseProcSelfIoBytes(String text, String key) {
   final match = RegExp('^$key:\\s+(\\d+)', multiLine: true).firstMatch(text);
   if (match == null) return null;
   return int.tryParse(match.group(1)!);
+}
+
+/// `/proc/self/net/dev` → 累计收 / 发字节。
+///
+/// 返回 `(rxBytes, txBytes)`；没有可用接口时返回 null。
+///
+/// ## 为什么按 `:` 切而不是按空白切
+///
+/// 每行格式是 `<接口名>: rx... | tx...`。接口名紧贴冒号、不含空格，
+/// 冒号前面的就是名字；冒号后面是 16 个数字字段，其中 `[0]` 是 rx_bytes、
+/// `[8]` 是 tx_bytes（中间隔着一个 `|` 管道符，但 trim 掉后连续数字的
+/// 下标不受影响）。
+///
+/// 跳过 `lo`（回环）：本地中继 127.0.0.1 的转发流量也在回环上，而这里要
+/// 回答的是「从网盘 CDN 实际收进来」的速率。
+@visibleForTesting
+(int, int)? parseProcNetDev(String text) {
+  var rx = 0;
+  var tx = 0;
+  var any = false;
+  for (final line in text.split('\n')) {
+    final colon = line.indexOf(':');
+    if (colon <= 0) continue; // 头两行（Inter-| 表头）没有冒号
+    final iface = line.substring(0, colon).trim();
+    if (iface == 'lo') continue;
+    final fields = line.substring(colon + 1).trim().split(RegExp(r'\s+'));
+    if (fields.length < 16) continue;
+    final rxBytes = int.tryParse(fields[0]);
+    final txBytes = int.tryParse(fields[8]);
+    if (rxBytes == null || txBytes == null) continue;
+    rx += rxBytes;
+    tx += txBytes;
+    any = true;
+  }
+  return any ? (rx, tx) : null;
 }
 
 /// `df -k` 的输出 → 可用字节数。
@@ -531,6 +578,8 @@ Future<ResourceReading> readDeviceResources({String? diskPath}) async {
   int? ioWrite;
   int? procsRunning;
   int? procsBlocked;
+  int? netRx;
+  int? netTx;
 
   // `/proc` 只在 Android / Linux 上有。macOS 上这些读全是 null，
   // 由下面的兜底补上内存那一项。
@@ -583,6 +632,15 @@ Future<ResourceReading> readDeviceResources({String? diskPath}) async {
       ioRead = parseProcSelfIoBytes(io, 'read_bytes');
       ioWrite = parseProcSelfIoBytes(io, 'write_bytes');
     }
+
+    final netDev = await _readOrNull('/proc/self/net/dev');
+    if (netDev != null) {
+      final net = parseProcNetDev(netDev);
+      if (net != null) {
+        netRx = net.$1;
+        netTx = net.$2;
+      }
+    }
   }
 
   // 没有 `/proc` 时的内存兜底：`dart:io` 自己知道 RSS。
@@ -607,6 +665,8 @@ Future<ResourceReading> readDeviceResources({String? diskPath}) async {
     diskAvailableBytes: disk,
     ioReadBytes: ioRead,
     ioWriteBytes: ioWrite,
+    netRxBytes: netRx,
+    netTxBytes: netTx,
     procsRunning: procsRunning,
     procsBlocked: procsBlocked,
   );

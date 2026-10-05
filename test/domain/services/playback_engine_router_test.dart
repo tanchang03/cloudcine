@@ -207,5 +207,37 @@ void main() {
       expect(probed, isFalse);
       expect(s.engine, same(fvp));
     });
+
+    test('switchToDefault：4K 路由到 fvp 后能强制切回 mpv（ExoPlayer 失败回退）',
+        () async {
+      final r = router();
+      final s = await r.selectFor(
+        key: 'k',
+        url: Uri.parse('https://example.com/a.mkv'),
+        headers: const {},
+        videoHeight: 2160,
+      );
+      expect(s.engine, same(fvp));
+
+      final back = await r.switchToDefault();
+      expect(back.engine, same(mpv));
+      expect(back.changed, isTrue);
+      // 切回来后 `selectFor` 仍会判回 fvp（4K 判据还在）——
+      // 所以回退路径必须由调用方记住「不再 selectFor」。
+      final again = await r.selectFor(
+        key: 'k',
+        url: Uri.parse('https://example.com/a.mkv'),
+        headers: const {},
+        videoHeight: 2160,
+      );
+      expect(again.engine, same(fvp));
+    });
+
+    test('switchToDefault 幂等：已在 mpv 上时 changed=false', () async {
+      final r = router();
+      final back = await r.switchToDefault();
+      expect(back.engine, same(mpv));
+      expect(back.changed, isFalse);
+    });
   });
 }

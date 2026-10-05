@@ -175,8 +175,14 @@ class PlaybackEngineRouter {
     if (reason.isEmpty &&
         highResTvRoute &&
         videoHeight != null &&
-        videoHeight >= 2160) {
-      reason = 'Android TV 上 4K（≥2160p）片源';
+        // ⚠️ 阈值 2048 而不是 2160：夸克 origin 原画的**视频高度**是
+        // 3840×2152（宽银幕裁切），不是标准 3840×2160。写成 ≥2160 会把
+        // 2152p 漏判成「非 4K」→ 走 mpv 渲染 4K（实测 CPU 234%、内存 1.2G，
+        // 系统可用内存只剩 51MB）—— 正是 4K 方案要避免的。2048 以上
+        // 都交给专用引擎（钳 1080p 渲染 + 硬解），CPU 降到 ~30%。
+        // 1080p(1920×1080) / 1440p(2560×1440) 都在阈值之下，不受影响。
+        videoHeight >= 2048) {
+      reason = 'Android TV 上 4K（≥2048p）片源';
     }
 
     final target = reason.isEmpty || factory == null
@@ -200,6 +206,28 @@ class PlaybackEngineRouter {
     );
 
     return EngineSelection(engine: target, changed: true);
+  }
+
+  /// 强制切回默认内核（media_kit / mpv）。
+  ///
+  /// 与 [selectFor] 的区别：它**不看任何判据**。用途是「ExoPlayer 打开失败
+  /// 后回退」——那时 4K 判据依然成立，用 [selectFor] 会立刻把引擎又切回去
+  /// 再失败一次。
+  ///
+  /// 幂等：已经在默认内核上时返回 `changed: false`，重复调用无副作用。
+  Future<EngineSelection> switchToDefault() async {
+    if (identical(_engine, _defaultEngine)) {
+      return EngineSelection(engine: _engine, changed: false);
+    }
+    final previous = _engine;
+    _engine = _defaultEngine;
+    diag.info(logTag, '回退 media_kit（mpv）内核');
+    unawaited(
+      previous.stop().catchError((Object e) {
+        diag.debug(logTag, '停旧内核失败（不影响本次播放）：$e');
+      }),
+    );
+    return EngineSelection(engine: _engine, changed: true);
   }
 
   /// 释放两个内核。**两个都要释放** —— 它们各自占着原生解码器。

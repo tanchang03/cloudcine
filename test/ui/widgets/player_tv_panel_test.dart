@@ -244,31 +244,34 @@ void main() {
       );
     });
 
-    testWidgets('聚焦模式只显示**当前一个分类** —— 不一次加载所有菜单项',
+    testWidgets('夸克式布局：侧边栏全分类 + 选项区只渲染当前分类的选项',
         (tester) async {
-      await render(tester); // selectedIndex=0 → 选集
+      await render(tester, selectedIndex: 1); // 画质
 
-      expect(find.text('选集'), findsOneWidget);
-      // 其它六个分类不显示：聚焦后每次只渲染当前 Y 分类，这是「不一次加载
-      // 所有菜单项」的核心（也是这次性能改动的目的）。
-      for (final label in ['画质', '字幕', '音轨', '音效', '倍速', '片头']) {
-        expect(find.text(label), findsNothing, reason: label);
+      // 侧边栏显示全部 7 个分类（Y 轴导航一眼可见）。
+      // ⚠️ 选中分类（画质）会出现**两次**：侧边栏 + 右侧选项区顶部标题。
+      for (final row in PlayerTvRow.values) {
+        final n = row == PlayerTvRow.quality ? 2 : 1;
+        expect(find.text(row.label), findsNWidgets(n), reason: row.label);
       }
-      // 位置指示让用户知道自己在第几个分类（看不到其它分类时靠它定位）。
-      expect(find.text('1/7'), findsOneWidget);
-      // 当前值也要看得见。
-      expect(find.text('第 3 集'), findsOneWidget);
+      // 右侧选项区只渲染**当前分类**（画质）的选项 —— 这是「不一次加载所有
+      // 菜单项」的核心（也是性能改动的目的）。
+      expect(find.text('原画'), findsOneWidget);
+      expect(find.text('4K'), findsOneWidget);
+      expect(find.text('超清'), findsOneWidget);
+      // 其它分类的选项不渲染。
+      expect(find.text('正常速度'), findsNothing, reason: '倍速的选项不该出现');
     });
 
-    testWidgets('没有可选项的那一行写「—」而不是留空', (tester) async {
+    testWidgets('没有可选项的那一行不画选项，只显示分类', (tester) async {
       await render(
         tester,
         rowList: const [PlayerTvRowValue(row: PlayerTvRow.subtitle, value: '')],
       );
 
-      // 空串会让那一行的值区域整块塌掉，看起来像「这一行画错了」；
-      // 「—」则明确表示「这一项现在没有值」。
-      expect(find.text('—'), findsOneWidget);
+      // 侧边栏照常显示「字幕」分类；右侧没有任何 chip，也不写「—」。
+      expect(find.text('字幕'), findsOneWidget);
+      expect(find.text('—'), findsNothing);
     });
 
     testWidgets('选中行下面铺开全部选项 —— 这是「照夸克做」的核心', (tester) async {
@@ -315,15 +318,16 @@ void main() {
         sheet.height,
         moreOrLessEquals(kPlayerTvSheetHeight, epsilon: 0.1),
       );
-      // 聚焦菜单比原七行版矮得多（约 115px）：换字幕时必须看得见画面，
-      // 这条把「菜单高度」钉在安全范围内。
+      // 夸克式侧边栏全竖排（7 分类 × 40），高度由分类数决定，约为 309。
+      // 上限 360：比它高就会顶破「画面还得看得见」的底线。
       expect(
         sheet.height,
-        lessThan(160),
-        reason: '聚焦菜单长到 ${sheet.height} 了 —— 应该只有标题行 + 选项条',
+        lessThanOrEqualTo(360),
+        reason: '菜单长到 ${sheet.height} 了 —— 画面只剩 '
+            '${540 - sheet.height - 27}px，换字幕时等于看不见字幕',
       );
       expect(sheet.width, greaterThan(480),
-          reason: '底部菜单是**横**排的（照夸克）—— 分类名 + 当前值 + 位置指示'
+          reason: '底部菜单是**横**排的（照夸克）—— 侧边栏 + 右侧选项区'
               '挤在 400 宽里的话放不下');
     });
 
@@ -393,22 +397,25 @@ void main() {
           bubbled: bubbled,
         );
 
-    testWidgets('↓ 切换到下一分类：标题行换项、位置指示前进、旧分类消失',
-        (tester) async {
-      await renderKeys(tester);
-      // 聚焦模式只显示当前分类 —— 初始是「选集」，其它分类都不该出现。
+    testWidgets('↓ 切换分类：侧边栏选中态移动、右侧选项区替换', (tester) async {
+      await renderKeys(tester); // 初始「选集」
+      // 侧边栏始终显示全部分类（夸克式导航）。
       expect(find.text('选集'), findsOneWidget);
-      expect(find.text('画质'), findsNothing);
+      expect(find.text('画质'), findsOneWidget);
+      // 右侧当前是「选集」的 hint（它没有选项条，走二级网格页）。
+      expect(find.text('按 OK 打开选集'), findsOneWidget);
 
       await press(tester, LogicalKeyboardKey.arrowDown);
 
       expect(selected, [1]);
-      expect(find.text('画质'), findsOneWidget,
-          reason: '按 ↓ 后标题行必须换成新分类，否则用户不知道焦点在哪');
-      expect(find.text('选集'), findsNothing,
-          reason: '聚焦模式同一时刻只有一个分类 —— 旧分类必须消失');
-      expect(find.text('2/7'), findsOneWidget,
-          reason: '位置指示从 1/7 走到 2/7，补上「看不到其它分类」的定位感');
+      // 侧边栏不动：分类入口都还在，只有选中态跟着走。
+      expect(find.text('选集'), findsOneWidget);
+      // 画质 = 侧边栏 1 次 + 右侧标题 1 次。
+      expect(find.text('画质'), findsNWidgets(2));
+      // 右侧整个换成「画质」的选项 chips。
+      expect(find.text('原画'), findsOneWidget);
+      expect(find.text('按 OK 打开选集'), findsNothing,
+          reason: '右侧是「当前分类」的专属区域，切走后旧内容必须消失');
     });
 
     testWidgets('↑ 从第一行绕到最后一行（短列表循环比撞墙好用）', (tester) async {

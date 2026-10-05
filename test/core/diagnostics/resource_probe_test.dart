@@ -190,6 +190,45 @@ softirq 111 222 333
     });
   });
 
+  group('parseProcNetDev：网络收发字节（不含回环）', () {
+    test('求和所有非 lo 接口的 rx / tx', () {
+      const dev = 'Inter-|   Receive                                                |  Transmit\n'
+          ' face |bytes    packets errs drop fifo frame compressed multicast|'
+          'bytes    packets errs drop fifo colls carrier compressed\n'
+          '  eth0: 1048576     100    0    0    0     0          0         0'
+          ' 2097152     200    0    0    0     0     0          0\n'
+          '  wlan0:  524288      50    0    0    0     0          0         0'
+          '  262144      25    0    0    0     0     0          0\n';
+      final net = parseProcNetDev(dev);
+      expect(net, isNotNull);
+      expect(net!.$1, 1048576 + 524288); // rx
+      expect(net.$2, 2097152 + 262144); // tx
+    });
+
+    test('回环接口不计入（本地中继的转发不该算网络流量）', () {
+      const dev = 'Inter-|   Receive                                                |  Transmit\n'
+          ' face |bytes    packets errs drop fifo frame compressed multicast|'
+          'bytes    packets errs drop fifo colls carrier compressed\n'
+          '    lo: 999999999   100    0    0    0     0          0         0'
+          ' 888888888   200    0    0    0     0     0          0\n'
+          '  eth0:   4096     1    0    0    0     0          0         0'
+          '   8192     2    0    0    0     0     0          0\n';
+      final net = parseProcNetDev(dev);
+      expect(net, isNotNull);
+      expect(net!.$1, 4096);
+      expect(net.$2, 8192);
+    });
+
+    test('没有非回环接口返回 null', () {
+      const dev = 'Inter-|   Receive                                                |  Transmit\n'
+          ' face |bytes    packets errs drop fifo frame compressed multicast|'
+          'bytes    packets errs drop fifo colls carrier compressed\n'
+          '    lo:   123     1    0    0    0     0          0         0'
+          '   456     2    0    0    0     0     0          0\n';
+      expect(parseProcNetDev(dev), isNull);
+    });
+  });
+
   group('parseDfAvailableBytes：挂载点里有空格也不能读错列', () {
     test('Android toybox 的形状', () {
       const out = 'Filesystem     1K-blocks     Used Available Use% Mounted on\n'

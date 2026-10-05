@@ -7,6 +7,7 @@ import 'providers/app_providers.dart';
 import 'router/app_router.dart';
 import 'theme/app_theme.dart';
 import 'widgets/app_logo.dart';
+import 'widgets/debug_overlay.dart';
 import 'widgets/window_top_inset.dart';
 import 'windows/player_bridge_host.dart';
 
@@ -48,7 +49,23 @@ class CloudCineApp extends ConsumerWidget {
       // （macOS），给红黄绿三个原生按钮让位 —— 系统标题栏已被
       // `MainFlutterWindow.swift` 的 `applyVirtualTitleBar()` 抹成透明。
       builder: (context, child) => DesignBackground(
-        child: WindowChrome(child: child ?? const SizedBox.shrink()),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: WindowChrome(child: child ?? const SizedBox.shrink()),
+            ),
+            // 调试浮层：浮在所有界面之上、不挡操作（IgnorePointer）。
+            // 只在 debug 模式启用（见 [kDebugOverlayEnabled]）。
+            if (kDebugOverlayEnabled)
+              Positioned(
+                top: 10,
+                right: 10,
+                child: IgnorePointer(
+                  child: DebugOverlay(),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
