@@ -245,6 +245,19 @@ class EngineTracks {
 /// 那是最难查的一类问题，而且用户会以为自己没设置对。
 ///
 /// 所以能力必须是**可查询的**，由 UI 决定置灰并给出说明。
+/// 出画面方式。
+///
+/// 同一个内核（fvp）在不同平台可以走不同的输出路：Android TV 用
+/// platformView（SurfaceView），macOS 用 textureView。把差异做成可查询的
+/// 能力位，UI 就能按它解释各自的取舍（§5 的表）。
+enum SurfaceOutput {
+  /// 纹理路（media_kit / mdk 的 textureView）。
+  texture,
+
+  /// 原生 SurfaceView hybrid composition。
+  platformView,
+}
+
 class EngineCapabilities {
   const EngineCapabilities({
     required this.audioEffects,
@@ -252,6 +265,7 @@ class EngineCapabilities {
     required this.rawLog,
     required this.chapters,
     required this.rawProperty,
+    required this.surfaceOutput,
   });
 
   /// 音效预设（声道布局 / 直通）。
@@ -269,6 +283,9 @@ class EngineCapabilities {
   /// 能否直接下发引擎原生属性（缓冲调优那一组）。
   final bool rawProperty;
 
+  /// 出画面走哪条路（纹理 / 原生 SurfaceView）。
+  final SurfaceOutput surfaceOutput;
+
   /// media_kit（mpv）：能力最全，但 macOS 上渲染不了 DV。
   static const mediaKit = EngineCapabilities(
     audioEffects: true,
@@ -276,6 +293,7 @@ class EngineCapabilities {
     rawLog: true,
     chapters: true,
     rawProperty: true,
+    surfaceOutput: SurfaceOutput.texture,
   );
 
   /// fvp（libmdk）：能渲染 DV，但上面三项没有对等物。
@@ -285,6 +303,17 @@ class EngineCapabilities {
     rawLog: false,
     chapters: true,
     rawProperty: false,
+    surfaceOutput: SurfaceOutput.texture,
+  );
+
+  /// fvp 在 Android TV 上的 platformView 输出。
+  static const mdkTv = EngineCapabilities(
+    audioEffects: false,
+    networkSpeed: false,
+    rawLog: false,
+    chapters: true,
+    rawProperty: false,
+    surfaceOutput: SurfaceOutput.platformView,
   );
 }
 

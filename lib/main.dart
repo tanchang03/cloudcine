@@ -28,7 +28,7 @@ Future<void> main(List<String> args) async {
   // media_kit，不能指望主窗口那边初始化过。
   MediaKit.ensureInitialized();
 
-  // 第二内核：fvp（libmdk）。**只服务杜比视界片源**，其余片源仍走 media_kit。
+  // 第二内核：fvp（libmdk）。macOS 服务杜比视界 P5；Android TV 服务 ≥4K。
   //
   // ⛔ 必须**显式**注册，不能指望自动注册：fvp 的 pubspec 里 macOS 平台
   // 只有 `pluginClass`、**没有 `dartPluginClass`**（只有 linux/windows/ohos/
@@ -36,40 +36,39 @@ Future<void> main(List<String> args) async {
   // `video_player_avfoundation`（Apple 那套栈）——**DV 依然渲染不对，而且不报
   // 任何错**，排查时看起来像「换了内核也没用」。
   //
-  // ⛔ **只注册 macOS**。2026-10-04 在 Android TV 上试过把它开到
-  // `['macos','android']` 走 4K 直出，**两轮都失败，已回退**，别再试同一套：
+  // 2026-10-05 起按 `docs/解决4k片源不卡顿解析方案.md` 恢复 Android TV 路由：
   //
-  //   1. 只设 `viewType: platformView`（SurfaceView）：用户报「更卡、音画不同步」。
-  //   2. 再加 `tunnel: true`（零拷贝）：用户报「4K 看不到画面，只有声音」。
-  //
-  // 日志证据（`cloudcine-log-android-20261004-213519.txt` + `logcat -b crash`）：
-  //   - 中继在推进（2MB→24MB→62MB），`[资源]` 显示进程 CPU 225~326%（单核口径），
-  //     说明**解码在跑**，但屏上什么都没有 → 出画面那一层没present。
-  //   - 同一次播放里进程**原生崩溃**：`libmdk.so` 的 `strlen→vfprintf→vsnprintf`
-  //     （mdk 自己的工作线程），以及反复出现的 `SurfaceTextureWrapper.release`
-  //     （FinalizerDaemon）。后者是 Flutter 引擎在 `SurfaceProducer` 被释放后
-  //     二次释放 —— 换内核就会触发，与 viewType 无关。
-  //
-  // 回退后 4K 回到 mpv：画面正常，但 `hwdec-current=mediacodec-copy` 的卡顿
-  // 仍在（那是 mpv 在 Android 上的结构性问题，见
-  // `docs/AndroidTV-4K-丢帧-夸克对标.md`）。
+  //   1. 第一轮失败的原因（「更卡、音画不同步」）：不开 tunnel 且不钳
+  //      `maxWidth/maxHeight` → GL 渲染器在 4K 上渲染。现在钳到 1920×1080。
+  //   2. 第二轮失败的原因（「4K 看不到画面」）：`tunnel: true` 走
+  //      `AMediaCodec:dv=1:...`，`dv=1` 嫌疑最大。现在 tunnel 仍**不开**。
+  //   3. 换内核触发的 `SurfaceTextureWrapper` 二次释放崩溃：由「引擎提前定死、
+  //      一次播放内不再换」解（router 的 open 前探测 + 单一判据）。
   //
   // 位置与上面的 `MediaKit.ensureInitialized()` 同理，必须在**分流之前**：
   // 播放窗口跑的是**独立引擎**，而 Dart 侧的平台实现注册是**每个引擎各一份**的，
   // 主窗口注册过不代表播放窗口注册过。
   //
   // `platforms` 显式写出来是**双保险**：即便以后在别的平台也 import 了这里，
-  // 也只有 macOS 会被 fvp 接管。
-  if (Platform.isMacOS) {
+  // 也只有 macOS 和 Android 会被 fvp 接管。
+  if (Platform.isMacOS || Platform.isAndroid) {
     fvp.registerWith(options: <String, Object>{
-      'platforms': <String>['macos'],
+      'platforms': <String>['macos', 'android'],
+      // ⚠️ 全局项。TV 的显示层只有 1920×1080，不钳的话 GL 渲染器会在 4K 上
+      // 渲染（上游注释：full 4K RGBA can push SurfaceFlinger into GPU
+      // composition on weak GPUs）。
+      'maxWidth': 1920,
+      'maxHeight': 1080,
+      // ⛔ tunnel 先不开。它是全局项，一旦为 true，macOS 的 DV 路也会带上
+      // （texture 路无效，但注册时是共享的）。
+      // 判据是 Platform.isAndroid 的 DV 路上也不能动它（见方案 §3 阶段 2）。
     });
     // 把实际下发的选项写进日志。
     //
     // **为什么值得占一行**：注册只让 `video_player` 改用 mdk 实现，是「配错了
     // 也不报错、只是静默走 Apple 那套栈」的那类开关，没有回读手段。它同时是
     // 独立播放窗口的判据：那个窗口有自己的引擎，这行会出现两次。
-    diag.info('播放', 'fvp 注册：platforms=[macos]');
+    diag.info('播放', 'fvp 注册：platforms=[macos,android] maxWidth=1920 maxHeight=1080');
   }
 
   // 分流要尽可能早：播放窗口跑的是播放界面，不该做媒体库的启动工作

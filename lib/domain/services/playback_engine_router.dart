@@ -64,18 +64,21 @@ class EngineSelection {
 /// （DV 片源是少数，绝大多数用户一次都用不到，而 `FvpPlaybackEngine`
 /// 一建出来就占住一份解码器配置），同样由 [dispose] 释放。
 ///
-/// ## ⛔ 曾经有过「第二条触发线」：Android TV 高分辨率。**已删除**
+/// ## 第二条触发线（2026-10-05 恢复）
 ///
-/// 10-04 试过「≥1440p 也切 fvp」，因为 mpv 在 Android 上拿不到零拷贝硬解
-/// （`hwdec-current` 恒为 `mediacodec-copy`，4K 每 21 秒丢 100~340 帧）。
-/// **两轮真机都失败**，最后一轮是「4K 看不到画面，只有声音」+ 原生崩溃。
-/// 经过与证据见 `main.dart` 的注册块注释与 `fvp_playback_engine.dart`
-/// 的类文档。判据收回到只剩杜比视界一条。
+/// 「≥4K 或 DV」→ fvp；其余 → media_kit。
+///
+/// 10-04 的第二条线（≥1440p）失败过两轮，判据已收窄：2026-10-05 起按
+/// `docs/解决4k片源不卡顿解析方案.md` 只保留「TV 上 ≥4K 或 DV」。
+/// 传入 [highResTvRoute] = `Platform.isAndroid && isTvDevice()` 才开启
+/// 这条线；macOS / 桌面仍只走 DV 判据。⛔ 不要 TV 全量替换（会丢掉
+/// mpv 的格式覆盖 / ASS 渲染 / 音效 / 缓冲调优）。
 class PlaybackEngineRouter {
   PlaybackEngineRouter({
     required PlaybackEngine defaultEngine,
     PlaybackEngine Function()? dolbyVisionEngine,
     DolbyVisionProbeFn? dolbyVisionProbe,
+    this.highResTvRoute = false,
     this.logTag = '播放',
   })  : _defaultEngine = defaultEngine,
         _dvEngineFactory = dolbyVisionEngine,
@@ -114,16 +117,20 @@ class PlaybackEngineRouter {
   /// 这个平台会不会做 DV 路由。
   bool get dolbyVisionEnabled => _dvEngineFactory != null && _dvProbe != null;
 
+  /// 是否启用「TV ≥4K」那条触发线（仅 Android TV 调用方打开）。
+  final bool highResTvRoute;
+
   /// 决定这条流**用哪个内核**，必要时切换。
   ///
-  /// ## 判据：只有杜比视界 P5 才换内核
-  ///
-  /// 探测一次流的头部字节（`DolbyVisionProbe`），认出
-  /// `profile == 5 && blSignalCompatibilityId == 0` 才切到 fvp。
-  ///
-  /// 这个判据很窄是有意的：P5 **没有**向后兼容的基础层，在只认 YCbCr 的
-  /// 解码链上会渲染成**偏绿**（而不是变成黑白或黑屏）—— 也就是说它必须换
-  /// 内核，否则用户看到的就是错的颜色。P8 有兼容层，走 media_kit 正常。
+   /// ## 判据：杜比视界 P5，或 TV 上 ≥4K
+   ///
+   /// 探测一次流的头部字节（`DolbyVisionProbe`），认出
+   /// `profile == 5 && blSignalCompatibilityId == 0` 才切到 fvp；
+   /// 在 [highResTvRoute] 打开时，`videoHeight >= 2160` 同样切 fvp。
+   ///
+   /// 这个判据很窄是有意的：P5 **没有**向后兼容的基础层，在只认 YCbCr 的
+   /// 解码链上会渲染成**偏绿**（而不是变成黑白或黑屏）—— 也就是说它必须换
+   /// 内核，否则用户看到的就是错的颜色。P8 有兼容层，走 media_kit 正常。
   ///
   /// ## 为什么要跳过 HLS
   ///
@@ -152,6 +159,7 @@ class PlaybackEngineRouter {
     required String key,
     required Uri url,
     required Map<String, String> headers,
+    int? videoHeight,
   }) async {
     final factory = _dvEngineFactory;
     final probe = _dvProbe;
@@ -163,6 +171,12 @@ class PlaybackEngineRouter {
       if (info?.needsDolbyVisionEngine ?? false) {
         reason = '这条片源是杜比视界 P5';
       }
+    }
+    if (reason.isEmpty &&
+        highResTvRoute &&
+        videoHeight != null &&
+        videoHeight >= 2160) {
+      reason = 'Android TV 上 4K（≥2160p）片源';
     }
 
     final target = reason.isEmpty || factory == null

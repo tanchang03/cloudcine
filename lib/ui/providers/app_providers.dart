@@ -193,13 +193,9 @@ final relayConfigSyncProvider = Provider<void>((ref) {
 ///   - **默认内核**：media_kit（mpv）。除杜比视界以外的片源全走它。
 ///   - **杜比视界内核**：fvp（libmdk），**惰性建**（`dolbyVisionEngine` 是工厂）。
 ///
-/// ## 备用内核只在 macOS 上开
+/// ## 备用内核在 macOS 与 Android TV 上都开
 ///
-/// 理由只有一个：**杜比视界 P5**（要探测流的头部字节）。
-///
-/// ⛔ 2026-10-04 试过在 Android TV 上也开（「≥1440p 走 fvp 直出」），
-/// **两轮真机都失败**，最后一轮是「4K 看不到画面，只有声音」+ 原生崩溃。
-/// 经过与证据见 `main.dart` 的注册块注释。别再开第二条线。
+/// 理由：macOS 为**杜比视界 P5**；Android TV 为「≥4K 或 DV」。
 ///
 /// ⛔ 判据与 `main.dart` 里那句 `fvp.registerWith` 的 `platforms` 必须
 /// **一致** —— 不一致的后果很隐蔽：
@@ -207,15 +203,14 @@ final relayConfigSyncProvider = Provider<void>((ref) {
 ///     什么都渲染不对，而且**不报任何错**；
 ///   - 那边注册了、这边没开 → 只是白注册一次（无害）。
 ///
-/// Android 上两个都不开：mpv 在那边虽然拿不到零拷贝硬解（4K 会卡），
-/// 但**有画面**；而 mdk 会丢掉音效、字幕样式、缓冲进度
-/// （见 `EngineCapabilities.mdk`），还带崩过进程。
+/// 两条线各自失败的历史见 `main.dart` 注册块注释与
+/// `docs/解决4k片源不卡顿解析方案.md`。
 final playbackControllerProvider = Provider<PlaybackController>((ref) {
   // 杜比视界探测。缓存键是 `fileId|档位`，所以同一集只会真的探一次。
   final dvProbe = DolbyVisionProbe();
   final tv = isTvDevice();
-  // 备用内核的**工厂**：只有 macOS 的 DV 要它。
-  final alternateAvailable = Platform.isMacOS;
+  // 备用内核的**工厂**：macOS 走 DV 路由，Android TV 走「≥4K 或 DV」。
+  final alternateAvailable = Platform.isMacOS || (Platform.isAndroid && tv);
 
   final controller = PlaybackController(
     registry: ref.watch(adapterRegistryProvider),
@@ -223,10 +218,11 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
     relay: ref.watch(streamRelayProvider),
     engine: MediaKitPlaybackEngine(tv: tv),
     dolbyVisionEngine: alternateAvailable ? () => FvpPlaybackEngine() : null,
-    dolbyVisionProbe: Platform.isMacOS
+    dolbyVisionProbe: alternateAvailable
         ? ({required key, required url, required headers}) =>
             dvProbe.probe(key: key, url: url, headers: headers)
         : null,
+    highResTvRoute: Platform.isAndroid && tv,
   );
 
   // 播放进度落库。**在组合根接而不是在播放页接**：这样即使用户在播放中

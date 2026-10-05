@@ -13,22 +13,12 @@ import '../../core/diagnostics/resource_probe.dart';
 import '../../domain/services/playback_engine.dart';
 import 'change_gate.dart';
 
-/// fvp（libmdk）引擎。**只服务杜比视界 P5**（macOS）。
+/// fvp（libmdk）引擎。macOS 服务杜比视界 P5；Android TV 服务 ≥4K 片源。
 ///
-/// ## ⛔ 2026-10-04 实测：这条路在 Android TV 上**不可用**，别再试
-///
-/// 起因是 mpv 在 Android 上拿不到零拷贝 —— 真机两次实测（`hwdec` 下发到位、
-/// Surface 也在、还重建过一次解码器）`hwdec-current` 恒为
-/// `mediacodec-copy`：MediaCodec 解到 CPU 内存再拷回，4K 上每 21 秒丢
-/// 100~340 帧；同一台机器播 810p 只丢 0~7 帧。于是想借 mdk 的
-/// `AMediaCodec` 直出（夸克 TV 的做法）绕过去。**两轮都没成**：
-///
-///   1. `viewType: platformView`（SurfaceView）→ 用户报「更卡、音画不同步」。
-///   2. 再加 `tunnel: true`（零拷贝）→ 用户报「4K 看不到画面，只有声音」。
-///
-/// 证据见 `main.dart` 注册块那段注释（中继在推进、CPU 225~326% 说明在解码，
-/// 但屏上没有东西；同一次播放里还有 `libmdk.so` 与 `SurfaceTextureWrapper`
-/// 两处原生崩溃）。**回退后 4K 回到 mpv**。
+/// 2026-10-05：Android TV 上按 `docs/解决4k片源不卡顿解析方案.md` 重新启用
+/// （platformView + 钳制 1080p，不开 tunnel）。2026-10-04 失败过两轮：
+/// 未钳 `maxWidth/maxHeight` 时 GL 渲染器在 4K 上渲染（更卡、音画不同步）；
+/// 开 `tunnel` 时走 `AMediaCodec:dv=1`（4K 无画面）。机制见 main.dart 注释。
 ///
 /// 顺带钉住两条读源码得到的事实，省得下次重查：
 ///   - `platformView` **不等于**零拷贝：mdk 仍要跑一遍 GL 渲染器把每帧画进
@@ -107,7 +97,8 @@ class FvpPlaybackEngine implements PlaybackEngine {
   VideoPlayerController? get videoController => _controller;
 
   @override
-  EngineCapabilities get capabilities => EngineCapabilities.mdk;
+  EngineCapabilities get capabilities =>
+      Platform.isAndroid ? EngineCapabilities.mdkTv : EngineCapabilities.mdk;
 
   // -------------------------------------------------------------------
   // 事件
@@ -208,12 +199,12 @@ class FvpPlaybackEngine implements PlaybackEngine {
       Uri.parse(media.url),
       // ⚠️ 夸克直链缺 Cookie 一律 412。fvp 会把它写成 mdk 的 `avio.headers`。
       httpHeaders: media.headers,
-      // ⛔ **不要**加 `viewType: VideoViewType.platformView`：2026-10-04 在
-      // Android TV 上试过（连带 `tunnel: true`），4K 直接看不到画面。
-      // 完整经过与证据见类文档与 `main.dart` 的注册块注释。
-      //
-      // 这里刻意保持默认的 `textureView` —— 它是 fvp 自己 example 用的那条路，
-      // macOS 的 DV 也是这么验的（`platformView` 是 Android 专属）。
+      // Android 上走 platformView（SurfaceView）：2026-10-05 起按
+      // `docs/解决4k片源不卡顿解析方案.md` 的阶段 1，钳制到 1080p 的
+      // GL 渲染器画进 ANativeWindow。macOS 上 video_player_mdk 只在
+      // Platform.isAndroid 时尊重 viewType，写不写都退回 textureView，安全。
+      // ⛔ tunnel 仍不开（全局项，见 main.dart 注册注释）。
+      viewType: VideoViewType.platformView,
     );
     _controller = controller;
     controller.addListener(_onValueChanged);

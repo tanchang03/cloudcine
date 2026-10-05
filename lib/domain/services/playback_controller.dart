@@ -66,6 +66,7 @@ class PlaybackController extends ChangeNotifier {
     DolbyVisionProbeFn? dolbyVisionProbe,
     StreamRelay? relay,
     Duration positionSaveInterval = const Duration(seconds: 10),
+    bool highResTvRoute = false,
   })  : _registry = registry,
         _subtitleResolver = subtitleResolver,
         _relay = relay,
@@ -74,6 +75,7 @@ class PlaybackController extends ChangeNotifier {
           defaultEngine: engine,
           dolbyVisionEngine: dolbyVisionEngine,
           dolbyVisionProbe: dolbyVisionProbe,
+          highResTvRoute: highResTvRoute,
         ) {
     _bindEngine(_router.engine);
   }
@@ -605,6 +607,7 @@ class PlaybackController extends ChangeNotifier {
       key: '${_item?.fileId ?? ticket.url}|${_activeQualityId ?? "-"}',
       url: ticket.url,
       headers: ticket.headers,
+      videoHeight: _currentVideoHeight(ticket),
     );
     if (!selection.changed) return;
 
@@ -614,6 +617,19 @@ class PlaybackController extends ChangeNotifier {
     _bindEngine(selection.engine);
     // UI 要据此换渲染组件（两个内核的句柄类型不同）。
     notifyListeners();
+  }
+
+  /// 当前档位的视频高度（px）。拿不到时按档位标识推断。
+  ///
+  /// `QualityOption.height` 多数情况下有值，但「原画」常空着；标识是
+  /// `4k` / `2160p` 时可以直接当 ≥2160 处理 —— 这条线只用于路由判据，
+  /// 不用来换显示尺寸。
+  int? _currentVideoHeight(StreamTicket ticket) {
+    final q = ticket.qualityById(_activeQualityId ?? '');
+    if (q?.height != null) return q!.height;
+    final id = (_activeQualityId ?? '').toLowerCase();
+    if (id == '4k' || id == '2160p') return 2160;
+    return null;
   }
 
   /// 重新下发「音效」预设。
