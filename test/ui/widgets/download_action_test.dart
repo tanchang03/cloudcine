@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:cloudcine/ui/widgets/download_action.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 
 /// 没有系统保存面板的平台（Android / TV）上，「文件存到哪」这条判定。
 ///
@@ -17,33 +18,36 @@ void main() {
     if (tmp.existsSync()) tmp.deleteSync(recursive: true);
   });
 
+  // ⚠️ 路径必须用 `p.join` 拼：手写 `'${tmp.path}/xxx'` 在 Windows 上是
+  // 混用分隔符（`C:\…\tmp/片子.zip`），而 `dedupePath` 内部走 `package:path`，
+  // 返回的是 `C:\…\tmp\片子 (1).zip` —— 字符串逐字比对必然失败。
   test('不撞名时原样返回，不加后缀', () {
-    final path = '${tmp.path}/片子.zip';
+    final path = p.join(tmp.path, '片子.zip');
     expect(dedupePath(path), path,
         reason: '第一次下载不该被改名 —— 平白多一个 `(1)` 会让人以为下重了');
   });
 
   test('撞名时加 `(1)`，且后缀在扩展名**之前**', () {
-    final path = '${tmp.path}/片子.zip';
+    final path = p.join(tmp.path, '片子.zip');
     File(path).writeAsStringSync('第一份');
 
     final second = dedupePath(path);
-    expect(second, '${tmp.path}/片子 (1).zip');
+    expect(second, p.join(tmp.path, '片子 (1).zip'));
     expect(File(second).existsSync(), isFalse);
 
     File(second).writeAsStringSync('第二份');
-    expect(dedupePath(path), '${tmp.path}/片子 (2).zip');
+    expect(dedupePath(path), p.join(tmp.path, '片子 (2).zip'));
   });
 
   test('连扩展名都没有的文件也能去重', () {
-    final path = '${tmp.path}/README';
+    final path = p.join(tmp.path, 'README');
     File(path).writeAsStringSync('x');
-    expect(dedupePath(path), '${tmp.path}/README (1)');
+    expect(dedupePath(path), p.join(tmp.path, 'README (1)'));
   });
 
   test('多个点号时只认最后一段当扩展名', () {
-    final path = '${tmp.path}/Show.S01E01.chs.srt';
+    final path = p.join(tmp.path, 'Show.S01E01.chs.srt');
     File(path).writeAsStringSync('x');
-    expect(dedupePath(path), '${tmp.path}/Show.S01E01.chs (1).srt');
+    expect(dedupePath(path), p.join(tmp.path, 'Show.S01E01.chs (1).srt'));
   });
 }

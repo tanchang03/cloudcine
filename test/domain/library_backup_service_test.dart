@@ -249,7 +249,12 @@ void main() {
       required DateTime? remoteModifiedAt,
       String deviceId = 'remote-machine',
     }) async {
-      final remoteDir = Directory('${tempDir.path}/remote_${deviceId}_$remoteModifiedAt')
+      // ⚠️ 目录名不能直接插 `DateTime.toString()`：`2026-09-01 08:00:00.000Z`
+      // 里的 `:` 在 Windows 上是非法文件名字符（errno 123），macOS 上没事。
+      // 时间只是让目录名唯一，冒号换成 `-` 语义不变。
+      final stamp =
+          remoteModifiedAt?.toIso8601String().replaceAll(':', '-');
+      final remoteDir = Directory('${tempDir.path}/remote_${deviceId}_$stamp')
         ..createSync(recursive: true);
       final remoteDb = File('${remoteDir.path}/cloudcine.sqlite');
       await remoteDb.writeAsBytes(_fakeSqliteHeader());

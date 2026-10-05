@@ -114,19 +114,28 @@ void main() {
   });
 
   group('PosterCache.relativeNameOf', () {
+    // ⚠️ 路径必须按当前平台的分隔符拼：实现里用 `Platform.pathSeparator`
+    // 做前缀匹配，手写 `/tmp/cache/abc.jpg` 在 Windows 上永远走不进前缀
+    // （前缀是 `\tmp\cache\`），测到的只是「不匹配返回 null」而不是还原逻辑。
+    String p(List<String> parts) => parts.join(Platform.pathSeparator);
+    final cacheDir = p(['', 'tmp', 'cache']);
+
     test('把绝对路径还原成相对文件名', () {
       expect(
-        PosterCache.relativeNameOf('/tmp/cache/abc.jpg', '/tmp/cache'),
+        PosterCache.relativeNameOf(p(['', 'tmp', 'cache', 'abc.jpg']), cacheDir),
         'abc.jpg',
       );
     });
 
     test('不在缓存目录下的路径返回 null', () {
-      expect(PosterCache.relativeNameOf('/elsewhere/abc.jpg', '/tmp/cache'), isNull);
+      expect(
+          PosterCache.relativeNameOf(
+              p(['', 'elsewhere', 'abc.jpg']), cacheDir),
+          isNull);
     });
 
     test('null 进 null 出', () {
-      expect(PosterCache.relativeNameOf(null, '/tmp/cache'), isNull);
+      expect(PosterCache.relativeNameOf(null, cacheDir), isNull);
     });
   });
 

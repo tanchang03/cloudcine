@@ -311,7 +311,12 @@ void main() {
         savePath: pathFor('f1.bin'));
     await _settle();
     service.calls.single.release();
-    await _settle();
+    // ⚠️ 不能只 `_settle()` 固定拍数：失败落盘要走两次真文件 IO
+    // （`_partLength` 的 exists + length），Windows 跑步机磁盘忙时 8 个
+    // 空转可能不够，读到的是「还没失败」的中间态（error 为 null）。
+    // 等终态（failed）再断言，超时没到才是真失败。
+    await _settleUntil(
+        () => _task(queue, 'quark:f1').status == DownloadStatus.failed);
 
     final t = _task(queue, 'quark:f1');
     expect(t.error, isNot(contains('too many requests')),
@@ -586,6 +591,26 @@ Future<void> _settle([int turns = 8]) async {
   for (var i = 0; i < turns; i++) {
     await Future<void>.delayed(Duration.zero);
   }
+}
+
+/// 一直等到 [done] 为真（带超时），而不是固定空转 N 拍。
+///
+/// 队列里失败/完成落盘要走真文件 IO，跑步机磁盘忙时固定拍数可能停在
+/// 中间态 —— 而中间态的断言失败看起来像产品 bug，其实只是没等够。
+/// 超时（约 5 秒）还没到终态就让测试失败，不会无限卡住 CI。
+Future<void> _settleUntil(
+  bool Function() done, {
+  Duration timeout = const Duration(seconds: 5),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!done()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw StateError('等不到终态（超过 $timeout），任务疑似卡住');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  // 终态落定之后再让微任务跑完：`_setStatus` 之后还有 `unawaited(_persist)`。
+  await _settle();
 }
 
 DownloadTask _task(DownloadQueue queue, String id) =>
