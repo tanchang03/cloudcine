@@ -55,8 +55,30 @@
     <MediaTemplate EmbedCab="yes" />
 
     <!-- 应用跑不起来的最低系统。给一句明确的话，好过让用户看到一个
-         语焉不详的「安装失败」。 -->
-    <Condition Message="云影 CloudCine 需要 Windows 10 或更高版本。">VersionNT &gt;= 1000</Condition>
+         语焉不详的「安装失败」。
+
+         ⛔ 这里**绝不能**写 `VersionNT >= 1000`（这里原来就是这么写的，后果是
+         在 Windows 10 / 11 上**反而装不上**，用户看到的正是下面这句提示）。
+
+         原因：Windows Installer 为了向后兼容，把 VersionNT 钳在 **603**
+         （= Windows 8.1），在 Windows 10 和 Windows 11 上读出来都是 603，
+         不是 1000。两处出处：
+           · 微软 KB3202260：Windows 10 / Server 2016 / Server 2019 上
+             VersionNT = 603，"This version numbering is by design"；
+           · Advanced Installer 文档：默认情况下 Windows 10 和 Windows 11
+             都把 VersionNT 置为 603（他们家自己的包会改写成 1000 / 1100，
+             那是安装包生成器额外做的事，裸 WiX 没有这一步）。
+         于是 `>= 1000` 在**任何**真实 Windows 上都不成立 —— 这条启动条件
+         永远失败，MSI 谁也装不上。
+
+         ✅ 真正的判据是 WindowsBuild（真实构建号，不被钳制）：
+              Windows 7 = 7601 · 8.1 = 9600 · 10 = 10240 起 · 11 = 22000 起
+            `>= 10240` 恰好等价于「Windows 10 或更高」，8.1 及以下照样拦住。
+         前面的 `Installed OR` 是必须的：启动条件在所有安装模式下都会被求值
+         （含维护 / 卸载），少了它，已装好的机器在卸载时会被自己这条条件挡住。
+         用 WindowsBuild 需要 Windows Installer 5.0（Win7+），
+         Package/@InstallerVersion="500" 已经保证了这一点。 -->
+    <Condition Message="云影 CloudCine 需要 Windows 10 或更高版本。">Installed OR WindowsBuild &gt;= 10240</Condition>
 
     <!-- 「设置 → 应用」里那一行 -->
     <Property Id="ARPPRODUCTICON" Value="CloudCineIcon" />
