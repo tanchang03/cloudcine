@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -19,50 +21,108 @@ import '../widgets/tv_focus.dart';
 /// ⚠️ `_Sidebar._items` 的**顺序就是分支下标**（`shell.currentIndex`）。
 /// 增删入口时必须同时改 `app_router.dart` 里 `branches` 的顺序 ——
 /// 只改一处的表现是「点一个入口，高亮跳到另一个」，而页面确实切对了。
-class AppShell extends ConsumerWidget {
+class AppShell extends StatefulWidget {
   const AppShell({super.key, required this.shell});
 
   final StatefulNavigationShell shell;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  /// 全局返回键双层确认。TV 上任意页面按返回：
+  /// 第一次 → 回到媒体库「全部」页（如果当前不是）；
+  /// 第二次 → 退出 App。
+  int _backTapCount = 0;
+  Timer? _backTapTimer;
+
+  void _onBackTap() {
+    if (_backTapCount == 0) {
+      // 第一次：回到媒体库全部页（如果当前不在）。
+      final currentIndex = widget.shell.currentIndex;
+      if (currentIndex != 0) {
+        widget.shell.goBranch(0, initialLocation: true);
+      }
+      _backTapCount = 1;
+      _backTapTimer?.cancel();
+      _backTapTimer = Timer(const Duration(seconds: 3), () {
+        if (!mounted) return;
+        _backTapCount = 0;
+      });
+      // 提示：用 SnackBar 而不是悬浮文字（不需要焦点）。
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('再按一次返回退出'),
+          duration: const Duration(seconds: 3),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } else {
+      // 第二次：真正退出。
+      // ⚠️ 用 `SystemNavigator.pop()` 而不是 `Navigator.pop()`：
+      // 后者只会退路由（回到上一个页面），前者会请求 Android 系统
+      // 销毁整个 Task，等同于「杀进程」。电视上用户期望的是后者。
+      _backTapCount = 0;
+      _backTapTimer?.cancel();
+      _backTapTimer = null;
+      SystemNavigator.pop();
+    }
+  }
+
+  @override
+  void dispose() {
+    _backTapTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final tv = AppTheme.isTvLayout(context);
+    final shell = widget.shell;
     return Scaffold(
       backgroundColor: Colors.transparent,
       // 方向键兜底的中转站：自己**不吃焦点、不参与遍历**，只在默认逻辑走不动时
       // 把焦点送到一级导航。为什么需要它见 [_onShellKey]。
-      body: Focus(
-        canRequestFocus: false,
-        onKeyEvent: _onShellKey,
-        // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉。
-        // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
-        child: Padding(
-          padding: AppTheme.safeAreaInsets(context),
-          // TV 走**顶部一级导航**（参考夸克网盘 TV 版媒体库首页）：
-          // 左右分栏在 960 宽下吃掉 240 + 过扫描 96，只剩 624 给内容；
-          // 顶部导航只吃纵向 ~60，内容区拿到 864 宽。遥控器左右切导航、
-          // 上下在导航与内容之间走，与夸克的「顶栏 Tab + 内容区」一致。
-          // 桌面仍走左侧栏（鼠标场景下侧栏信息密度更高）。
-          child: tv
-              ? Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    _TopBar(key: _navKey, shell: shell),
-                    const Divider(height: 0.5, color: AppTheme.line),
-                    Expanded(child: shell),
-                  ],
-                )
-              : Row(
-                  children: [
-                    _Sidebar(key: _navKey, shell: shell),
-                    const VerticalDivider(
-                      width: 0.5,
-                      thickness: 0.5,
-                      color: AppTheme.line,
-                    ),
-                    Expanded(child: shell),
-                  ],
-                ),
+      body: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (didPop) return;
+          _onBackTap();
+        },
+        child: Focus(
+          canRequestFocus: false,
+          onKeyEvent: _onShellKey,
+          // TV 上先把过扫描区域让出来，否则真机会把最外圈的内容切掉。
+          // 非 TV 上 `safeAreaInsets` 返回 `EdgeInsets.zero`，桌面与手机完全不受影响。
+          child: Padding(
+            padding: AppTheme.safeAreaInsets(context),
+            // TV 走**顶部一级导航**（参考夸克网盘 TV 版媒体库首页）：
+            // 左右分栏在 960 宽下吃掉 240 + 过扫描 96，只剩 624 给内容；
+            // 顶部导航只吃纵向 ~60，内容区拿到 864 宽。遥控器左右切导航、
+            // 上下在导航与内容之间走，与夸克的「顶栏 Tab + 内容区」一致。
+            // 桌面仍走左侧栏（鼠标场景下侧栏信息密度更高）。
+            child: tv
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _TopBar(key: _navKey, shell: shell),
+                      const Divider(height: 0.5, color: AppTheme.line),
+                      Expanded(child: shell),
+                    ],
+                  )
+                : Row(
+                    children: [
+                      _Sidebar(key: _navKey, shell: shell),
+                      const VerticalDivider(
+                        width: 0.5,
+                        thickness: 0.5,
+                        color: AppTheme.line,
+                      ),
+                      Expanded(child: shell),
+                    ],
+                  ),
+          ),
         ),
       ),
     );

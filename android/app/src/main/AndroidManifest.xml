@@ -53,6 +53,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 禁用 OnBackInvokedCallback：设备是 Android 9 (SDK 28)，
+             该 API 从 SDK 33 才引入。不写这条会导致 FlutterActivity
+             的 init 阶段找不到类而初始化失败 → 黑屏。 -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableOnBackInvokedCallback"
+            android:value="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

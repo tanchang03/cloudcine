@@ -18,7 +18,11 @@ class SplashPage extends ConsumerWidget {
     final auth = ref.watch(authControllerProvider);
 
     return Scaffold(
-      backgroundColor: Colors.transparent,
+      // ⚠️ 必须用 `AppTheme.bg` 而不是 `Colors.transparent`：透明底色在
+      // Android TV 上会导致首帧渲染为白色（系统给透明 Surface 的默认清屏色
+      // 是白色），用户看到的是 2-4 秒白屏再切到深色 Splash。用深色底立刻
+      // 覆盖，视觉上等同于「无白屏」。
+      backgroundColor: AppTheme.bg,
       body: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,

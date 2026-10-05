@@ -372,6 +372,18 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 退出播放页就该忘掉。独立播放窗口另有一份（不同引擎，共享不了）。
   final SeekRepeatTracker _seekRepeat = SeekRepeatTracker();
 
+  /// 「再按一次返回才退出」的双层确认。
+  ///
+  /// `PopScope` 的 `onPopInvoked` 在 TV 上只被系统返回键触发一次，而
+  /// 用户按一次返回时我们只想关 OSD 面板 / 控制栏—— 只有第二次才真正退出。
+  /// 这里用「距离上次按键过去了多久」作窗口，避免用户只是误触了一下就把
+  /// 半集片子退掉了。
+  int _backTapCount = 0;
+  Timer? _backTapTimer;
+  String? _backHint;
+
+
+
   /// 拖动进度条时的临时值。拖动过程中不能让 `position` 流把滑块拽回去。
   double? _dragFraction;
 
@@ -564,6 +576,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 一个取不到地址的档位 —— 表现是「一进播放页就报错」，而用户上次只是
   /// 随手点了一下。
   Future<void> _changeQuality(String id) async {
+    // ⚠️ 切换画质时**不关 OSD**：用户需要看到切换结果（成功 / 失败提示）。
+    // 原来不加处理的话，`switchQuality` 异步期间 `isLoading=true` 触发 rebuild，
+    // 但 OSD 本身不会被关掉 —— 除非用户在切换过程中按了返回/菜单键。
     await _controller.switchQuality(id);
     if (_controller.activeQualityId != id) return;
     await _savePref((p) => p.withQuality(id));
@@ -947,14 +962,42 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
     return Scaffold(
       backgroundColor: AppTheme.cinema,
-      body: PopScope(
-        // 面板开着时，返回键**先关面板**，而不是退出播放。
-        //
-        // 电视上返回键既是唯一的退出手段，也是唯一的「取消」手段 —— 不拦的话，
-        // 用户想取消一次误开的面板，结果整部片退出了、还得重新找进度。
-        canPop: !_tvPanelOpen,
-        onPopInvokedWithResult: (didPop, _) {
-          if (!didPop && _tvPanelOpen) _closeTvPanel();
+      // ⚠️ 用 `WillPopScope` 而不是 `PopScope`：Android TV 的系统返回键
+      // 走的是 `onWillPop` 回调，`PopScope` 的 `onPopInvokedWithResult`
+      // 在真机上不一定被调用（实测：按返回键后回调没有触发）。
+      // `WillPopScope` 是旧 API 但行为更可预测。
+      endDrawer: const SizedBox.shrink(),
+      key: const Key('player-page'),
+      body: WillPopScope(
+        onWillPop: () async {
+          // 面板开着时，返回键**先关面板**，而不是退出播放。
+          if (_tvPanelOpen) {
+            _closeTvPanel();
+            return false;
+          }
+          // 还没显示控制栏时：第一下把它叫出来，第二下再退。
+          if (_immersive) {
+            setState(() => _immersive = false);
+            _scheduleControlsHide();
+            return false;
+          }
+          // 进入确认退出：再按一次才真退。
+          _backTapCount++;
+          if (_backTapCount == 1) {
+            setState(() => _backHint = '再按一次返回退出');
+            _backTapTimer?.cancel();
+            _backTapTimer = Timer(const Duration(seconds: 3), () {
+              if (!mounted) return;
+              _backTapCount = 0;
+            });
+            return false;
+          }
+          // 第二次 → 真正退出。
+          _backTapCount = 0;
+          _backHint = null;
+          _backTapTimer?.cancel();
+          _backTapTimer = null;
+          return true;
         },
         child: ListenableBuilder(
           listenable: controller,
@@ -1234,11 +1277,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   ///
   /// 这也与「播放器恒全屏」那条需求同向：画面本来就一直铺满整屏，菜单只是
   /// 浮在上面的一层，关掉它就该什么都不剩。
-  void _closeTvPanel() {
+  void _closeTvPanel({bool keepImmersive = false}) {
     if (!_tvPanelOpen) return;
     setState(() {
       _tvPanelOpen = false;
-      _immersive = true;
+      if (!keepImmersive) _immersive = true;
     });
     // 焦点必须交回画面。菜单的 `Focus(autofocus: true)` 拿走焦点之后不主动
     // 还回去的话，↑ / ↓ 会继续被菜单吃掉、OK 也不再是播放/暂停 ——
@@ -1276,10 +1319,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         ),
       ),
       padding: EdgeInsets.fromLTRB(8 + safe.left, safe.top, 8 + safe.right, 0),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          IconButton(
-            onPressed: () => context.pop(),
+          Row(
+            children: [
+              IconButton(
+                onPressed: () => context.pop(),
             iconSize: 18,
             tooltip: '返回',
             icon: const Icon(Icons.arrow_back_rounded, color: AppTheme.text),
@@ -1318,6 +1364,33 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             iconSize: 17,
             tooltip: '收起控制栏',
             icon: const Icon(Icons.fullscreen_rounded, color: AppTheme.muted),
+          ),
+        ],
+      ),
+        if (_backHint != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                decoration: BoxDecoration(
+                  color: AppTheme.accent.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: AppTheme.accent.withValues(alpha: 0.5),
+                    width: 0.5,
+                  ),
+                ),
+                child: Text(
+                  _backHint!,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.accent,
+                  ),
+                ),
+              ),
+            ),
           ),
         ],
       ),
@@ -1410,16 +1483,28 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
             ),
           ),
 
-        // 换档走这一支：半透明罩 + 文案，**不盖掉上一帧**（用户视线里的位置
-        // 一点没变）。它与下面那个通用缓冲圈互斥 —— 否则同一处会叠两个圈。
+        // 换档 / 缓冲：半透明罩 + 文案 + 进度信息。**不盖掉上一帧**（用户视线
+        // 里的位置一点没变）。与报错浮层互斥。
+        // ⚠️ 缓冲时**也要显示控制栏**：不能让画面变黑 —— 用户需要知道「还在播、
+        // 只是卡一下」。所以 buffering 时不隐藏控制栏（`_immersive` 不变）。
         if (switching && error == null)
           const _SwitchVeil()
         else if (controller.isBuffering && error == null)
-          const Center(
-            child: SizedBox(
-              width: 26,
-              height: 26,
-              child: CircularProgressIndicator(strokeWidth: 2),
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 26,
+                  height: 26,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '缓冲中…',
+                  style: const TextStyle(fontSize: 12, color: Colors.white70),
+                ),
+              ],
             ),
           ),
 
@@ -1515,8 +1600,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // `flutter test` 里起不来（`PlaybackController` 的 `Player` 是字段初始化器，
     // 一构造就启 libmpv）。真机上请顺带看一眼控制栏有没有被切。
     final safe = AppTheme.safeAreaInsets(context);
+    // TV 上控制栏高度：两行内容（进度条 + 按钮）+ 内边距必须装得下。
+    // 用 `mainAxisSize: min` 让 Column 按需收缩，不再硬猜高度。
+    // 不用固定 height：Fixed height 在不同内容组合下容易 overflow。
     return Container(
-      height: AppTheme.playerBarHeight + safe.bottom,
       // 与控制栏同理：覆盖层用自下而上渐隐的遮罩，而不是不透明底色。
       decoration: BoxDecoration(
         gradient: LinearGradient(
@@ -1532,9 +1619,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         12 + safe.left,
         0,
         12 + safe.right,
-        6 + safe.bottom,
+        _isTv ? 8 + safe.bottom : 6 + safe.bottom,
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Row(

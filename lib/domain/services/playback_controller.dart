@@ -333,6 +333,11 @@ class PlaybackController extends ChangeNotifier {
 
   double get rate => _rate;
 
+  /// 缓冲速度（字节/秒）。由 [bufferedEnd] 变化率估算，
+  /// 时长已知时返回有效值，否则 null。
+  // bufferSpeedBps 暂不暴露：需要字节级计数器，当前只有时间戳。
+  // 如需显示缓冲网速，需在 [_cacheEnd] 更新时记录前后值并计算差值。
+
   /// 当前「音效」预设。菜单据此打勾。见 [_audioEffect]。
   AudioEffectPreset get audioEffect => _audioEffect;
 
