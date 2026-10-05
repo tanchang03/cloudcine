@@ -60,7 +60,7 @@ import 'relay_reader_arbiter.dart';
 class LocalStreamRelay implements StreamRelay {
   LocalStreamRelay({
     int connections = 8,
-    this.chunkSize = 8 * 1024 * 1024,
+    this.chunkSize = 2 * 1024 * 1024,
     this.prefetchBytes = 256 * 1024 * 1024,
     this.maxCacheBytes = 256 * 1024 * 1024,
     bool enabled = true,
@@ -88,6 +88,28 @@ class LocalStreamRelay implements StreamRelay {
     if (next != null && next > 0) _connections = next;
   }
 
+  /// 单块的字节数。**它同时决定了「首字节延迟」**，所以不能只按吞吐挑。
+  ///
+  /// ⛔ **别为了省请求数把它放大。** [_fetchChunk] 是「整块读完才 `cache.put` +
+  /// `_settle`」，而 [warmUpRelay] 的就绪判据是 `downloadedBytes >= 1 MiB`、
+  /// 而 `downloadedBytes` **只在整块落地时才增加** —— 于是：
+  ///
+  ///     首字节延迟 ≈ 单块下载耗时 ∝ chunkSize
+  ///
+  /// 而它上面压着三个超时，**全都不会因为块变大而变长**：
+  /// 中继预热 2500ms（`playback_controller.dart`）、mpv 打开 ~5s、ExoPlayer ~20s。
+  /// 一旦首块超过 2.5s，日志里就必然出现「新中继预热超时，直接切换」，随后
+  /// 播放器读到一个还没有任何数据的会话 → `Failed to open` / `Source error`。
+  ///
+  /// ⛔ **实测（2026-10-05 22:37 那次把它改成 8 MiB 的后果，同机同批 4K 片源）**：
+  ///
+  /// | chunkSize | 首块延迟 | 结果 |
+  /// |---|---|---|
+  /// | 2 MiB | **1.18s** | 连续播 8 分钟以上 |
+  /// | 8 MiB | **12.8~45.5s** | 每次换片都 `Source error` → 回退 → `Failed to open` |
+  ///
+  /// 8 MiB 下预热**一次都没成功过**（12.8s 已是最快的一次，仍是 2500ms 的 5 倍）。
+  /// 想提速就调 [connections] 或 [prefetchBytes]；**块大小只影响首字节延迟**。
   final int chunkSize;
 
   /// 从当前播放位置往前预取的字节数。
@@ -482,6 +504,10 @@ class LocalStreamRelay implements StreamRelay {
     // **上游取回**的字节数，两者不是一回事。
     var delivered = 0;
     var aborted = false;
+    // 首字节延迟的起点。**这是「切换影片经常打不开」的第一现场证据** ——
+    // 它直接由 `chunkSize` 决定（见 `chunkSize` 的文档），却只有在读第一块
+    // 的耗时被写出来时才看得见。只算到「首块已下发」，不参与任何判断。
+    final startedAt = DateTime.now();
     // 已经单独记过原因的分支（416）：别让 finally 再补一条「0 字节」的 warn，
     // 同一件事记两遍只会让现场日志更难读。
     var explained = false;
@@ -544,10 +570,15 @@ class LocalStreamRelay implements StreamRelay {
             firstChunk = false;
             // 「首块已下发」= 上游确实取到数据了。没有这一条、播放器却仍报
             // Failed to open，问题就不在中继 —— 它连第一个字节都没能给出。
+            //
+            // ⚠️ **耗时一定要打**：它是 `chunkSize` 是否过大的唯一直接读数。
+            // 中继预热 2500ms、mpv 打开 ~5s 都压在这上面，超过就是「换片必打
+            // 不开」。判据：这一行 > 2.5s 且日志里有「新中继预热超时」→ 块太大。
+            final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
             diag.debug(
               '中继',
               '会话 ${session.token} 读取器 #$reader 首块已下发'
-              '（${bytes.length} 字节）',
+              '（${bytes.length} 字节，耗时 ${(elapsedMs / 1000).toStringAsFixed(2)}s）',
             );
           }
           response.add(bytes);

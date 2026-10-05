@@ -25,12 +25,27 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 - 判据：起播后读 `hwdec-current`，带 `copy` = 拷贝档（`isCopyHwdec`，⛔ **空串不算**）。
 - ⛔ `VideoControllerConfiguration.hwdec` 与 `PlayerBufferConfig.apply` **必须同值**，且**都排在 media_kit `create()` 之前** → Surface 就绪后要再写一次才生效。
 - 对标（逆向夸克 TV APK）：夸克用 Apollo(ExoPlayer 分支)/ijkplayer，**MediaCodec 直出 SurfaceView，零拷贝**；云影 mpv 出在 **Flutter 纹理**上，多一层合成。
-- ⛔⛔ **10-04 试过「4K 切 fvp」并已全部回退，别再走一遍**（`§HOWTO` 有完整证据，报告见 `docs/AndroidTV-4K-丢帧-夸克对标.md §4.5`）。两轮真机都失败：① 只加 `VideoViewType.platformView` → 用户报「更卡、音画不同步」；② 再加 `tunnel: true`（零拷贝）→ 用户报「**4K 看不到画面，只有声音**」。判据已从路由里删掉（`needsAlternateForResolution` / `highResolutionEngine` 全没了），`main.dart` 的注册范围收回 `['macos']`。
+- ⛔⛔ **10-04 试过的那两轮具体形态别再走**（`§HOWTO` 有完整证据，报告见 `docs/AndroidTV-4K-丢帧-夸克对标.md §4.5`）：① 只加 `VideoViewType.platformView` → 用户报「更卡、音画不同步」；② 再加 `tunnel: true`（零拷贝）→ 用户报「**4K 看不到画面，只有声音**」。
+  - ⚠️ **但「4K 切 fvp」本身 10-05 已按 `docs/解决4k片源不卡顿解析方案.md` 恢复上线**（别再照旧记忆说「已全部回退」）：`PlaybackEngineRouter.highResTvRoute`，接线在 `app_providers.dart` = `Platform.isAndroid && tv`，判据 `videoHeight >= 2048`（⛔ 不是 2160，宽银幕裁切的原画是 3840×2152）。10-05 22:55 的日志里这条路是**活的**（`Android TV 上 4K（≥2048p）片源，切到 fvp`）。
+  - ⚠️ **fvp 本身不是坏的**：10-05 20:14/20:30/20:40/20:53/21:02 的 4K 会话（fvp + 中继 + 2 MiB 块）都连续播了 8~13 分钟。它失败**只**发生在中继首块迟到时（见下节）。
+  - `main.dart` 的 `fvp.registerWith` 范围与路由判据**必须一致**，改一处要同时看另一处。
   - 崩溃证据（`logcat -b crash`）：`libmdk.so` 的 `strlen→vfprintf→vsnprintf`（mdk 工作线程）；以及反复出现的 `SurfaceTextureWrapper.release`（FinalizerDaemon）—— 后者是 Flutter 引擎在 `SurfaceProducer` 释放后**二次释放**，**换内核就触发、与 viewType 无关**。
   - ⛔ **mpv 在 Android 上做不到零拷贝，是结构性的**：`media_kit_video-1.3.1/android/.../VideoOutput.java` **写死** `textureRegistry.createSurfaceProducer()`，永远是 Flutter 纹理，没有 platformView 选项。调 mpv 参数没用。
   - ⚠️ **下次要查的第一个假设（未证实）**：fvp 的 tunnel 分支**显式跳过** `maxWidth/maxHeight` 钳制 → `FvpVideoView.setFixedSize` 拿到视频原生 3840×2160，而 Android 显示层只有 1920×1080。先试「platformView + **不开** tunnel + `maxWidth:1920,maxHeight:1080`」。
   - 📌 **面板事实**：`ro.boot.mi.panel_resolution=3840x2160`（65 寸 4K），但 Android 显示层**只有 1920×1080**（`dumpsys display`：`real 1920 x 1080`，唯一 mode 1920×1080@60）。⇒ 应用内渲染最高 1080p，由电视倍线到 4K；**只有 SurfaceView 才可能真 4K 扫描输出**。
   - 4K 现在的取舍只有两条：用 **`super`(810p) 转码档**（同机实测只丢 0~7 帧、流畅、降画质），或接受原画卡顿。
+
+## 本地中继的「块大小 ↔ 首字节延迟」耦合（10-05，实测血案）
+`data/stream/local_stream_relay.dart` 的 `_fetchChunk` **把一整块读完才 `cache.put` + `_settle`**，所以**首字节延迟 ≈ 单块下载耗时**，与 `chunkSize` 成正比。
+- ⛔ **`chunkSize` 别随便放大**。10-05 22:37 把它从 `2 MiB` 改成 `8 MiB`（HEAD `7118319`），同机同一批 4K 片源：2 MiB 时首块 **1.18s**、连续播 8~13 分钟；8 MiB 时首块 **15~45s**、**零成功播放**，每次换片都是 `ExoPlayer Source error` → 回退 → `Failed to open http://127.0.0.1:<port>/sN`。
+  - ✅ **10-05 23:25 已改回 2 MiB**，并加了回归测试 `test/data/stream/local_stream_relay_test.dart` →「默认 chunkSize 的首字节预算」（断言 `chunkSize / 0.6MiB < 5000ms`；改成 8 MiB 会红）。想提速调 `connections` / `prefetchBytes`。
+  - ✅ 日志已加「首块已下发（… 字节，耗时 x.xxs）」——判据：这行 > 2.5s + 有「新中继预热超时」= 块太大。
+  - ⚠️ 判据统计口径：只看**每个会话的第一个读取器**的 GET→首块（那才决定 `Failed to open`）。按此口径 2 MiB 时 9/12 个会话 < 5s，8 MiB 时 **0/12**。
+  - ⚠️ **排除过「网络那天慢」**：两个时段的聚合速率一样（2 MiB 时代 3.8~11.9 MiB/s，8 MiB 时代 2.1~13.2 MiB/s）。
+- 两个超时都远小于 8 MiB 的首块延迟，所以**必然**失败：中继预热 `warmUpRelay(timeout: 2500ms)`（`playback_controller.dart`）→ 恒打印「新中继预热超时，直接切换」；mpv 打开超时 ~5s；ExoPlayer ~20s。判据：日志里出现 `× 8 MiB 块` + `新中继预热超时` 就该怀疑这里。
+- ⛔ **判据不是「网络慢」**：同一时刻 [中继] 无上游错误、`进程磁盘IO=0`、CPU 只有 30~40%，纯粹是「等一整块」。
+- ⛔ 换源时 `fvp 失败 → 回退 media_kit` 会**再建一个中继会话**（同一文件两条会话 sN/sN+1），一次用户换片 = 2 次首块等待 + 2 倍上游churn。所以块大小出问题时，症状会被放大成「切换影片经常卡死」。
+- ⚠️ 同一窗口还有**跨内核的陈旧事件**：`切回 media_kit（mpv）内核` 之后 2.2s 仍收到 `ExoPlayer 首次初始化失败`（那时引擎已是 media_kit → 旧内核的错误流没随切换退订）。→ 待查。
 
 ## 资源采样：CPU / 内存 / 磁盘（10-04，§）
 `core/diagnostics/resource_probe.dart`：`ResourceProbe`（引擎 `open()` 起、`stop()`/`dispose()` 停，两个引擎各持一个）+ 一整套纯解析函数。**fvp 那条路没有视频探针**（mpv 属性在 mdk 上无对等物），所以这是它唯一的周期性证据。
@@ -90,7 +105,7 @@ macOS 独立窗口 `player_window_app.dart` + 内置页 `player_page.dart`。**�
 缓冲条共用 `buffered_slider.dart`（**0..1 比例**，⛔ `demuxer-cache-time` 是**绝对时间戳**）。音轨过 `TrackLabels.realTracks`；搜索走 `subtitle_query.dart`（⛔ 别拿 `displayTitle`）；缩略图走 `fetchThumbnail`。
 **音效 ≠ 音轨**：⛔ 无可用 Avfilter、**`af set` 返回值不能当依据**；⛔ macOS `audio-spdif` 直通必卡死。
 **逐影片偏好**表 `playback_prefs`（v14，同 `groupKey` 非空最新、写整条覆盖；音量/倍速仍全局）。**进度两列** `resumePositionMs`（起播，看完清）vs `maxPositionMs`（显示，v15，只增不减）⛔ 别合并。
-**DV P5**：⛔ macOS libmpv **架构上做不到**（`gpu-next` 零命中）→ 调 mpv 参数无用。唯一出路 **fvp/libmdk**：**只 DV 片走 fvp**、TV 不动、音效置灰。契约 `PlaybackEngine` + 两份实现在 `playback_engine.dart`、`data/playback/`；选引擎走 `playback_engine_router.dart`（**开播前探头部字节**）；`main.dart` 的 `fvp.registerWith` **必须先于分窗**；画面走 `playback_surface.dart`。⚠️ `registerWith` 的 platforms 与「DV 只在 macOS」两处判据**必须一致**。
+**DV P5**：⛔ macOS libmpv **架构上做不到**（`gpu-next` 零命中）→ 调 mpv 参数无用。唯一出路 **fvp/libmdk**：**DV P5 片 + TV 上 ≥2048p 片走 fvp**（⚠️ 10-05 起 TV 4K 也走，不再是「TV 不动」）、音效置灰。契约 `PlaybackEngine` + 两份实现在 `playback_engine.dart`、`data/playback/`；选引擎走 `playback_engine_router.dart`（**开播前探头部字节**）；`main.dart` 的 `fvp.registerWith` **必须先于分窗**；画面走 `playback_surface.dart`。⚠️ `registerWith` 的 platforms 与路由判据**必须一致**。
 
 ## 媒体库三轴（不能互推/合并，§）
 `MediaKind`（结构，只看文件名 `SxxExx`）· `MediaCategory`（语义，落库 `media_works.category`，空串≠other）·「最近播放」（视图，`LibraryFilter.playedOnly`，与 `category` 互斥、与 `query` 叠加）。`MediaCategoryGuesser.guess` 序：TMDB genres→目录路径→片名+文件名→结构兜底。
@@ -114,3 +129,10 @@ macOS 独立窗口 `player_window_app.dart` + 内置页 `player_page.dart`。**�
 
 ## 测试取向（§）
 纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据=红的在不在我改的文件里。其余见 `§测试取向`。
+
+## 播放页 OSD 卡顿的结构性成因（10-05 分析，§详见当日日志）
+⛔ **不是 Flutter 太重**，是三处开销叠在 4 核 SoC 上。动手前先认这三条：
+- **整页 rebuild ≈10 次/秒**：`player_page.dart` 的 `ListenableBuilder` 包着整棵页面树。position 已节流 250ms，但 **`bufferEnd`（mpv `demuxer-cache-time`）没节流** → 下载中每拍都变。⇒ 要加节流或拆独立 `ValueNotifier`。
+- ⛔ **`SubtitleViewConfiguration` 无 `operator ==`**（media_kit_video 1.3.1）：页面里内联 new → `VideoState.didUpdateWidget` 恒判不等 → 每拍 post-frame 再重建一次画面子树、多一帧。⇒ 缓存实例，或给 media_kit 那条路也包「输入没变就返回缓存 widget」的壳（**现在只有 `_FvpPlaybackSurface` 有**）。
+- `PlayerTvOverlay._rows()` 每 build 重算全部选项（含每集 `baseNameOf`）。
+- 真机实测：4K 拷贝档 `进程CPU 152~186%`（4 核 38~46%）、**显示丢帧 2.7/秒**、设备仅 2.5 GB 内存而进程涨到 862 MB。

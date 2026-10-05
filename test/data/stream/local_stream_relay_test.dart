@@ -174,6 +174,46 @@ void main() {
     });
   });
 
+  group('默认 chunkSize 的首字节预算', () {
+    test('默认块大小必须让首块落在播放器的打开超时之内', () {
+      // 为什么这条断言重要：
+      //
+      // `_fetchChunk` 是「整块读完才落缓存 + 叫醒读取器」，而 `_settle` 之前
+      // 读取器一个字节都拿不到，于是
+      //
+      //     首字节延迟 ≈ chunkSize / 单连接速率
+      //
+      // 而它上面压着三个**不会因为块变大而变长**的超时：中继预热 2500ms
+      // （`playback_controller.dart`）、mpv 打开 ~5s、ExoPlayer ~20s。
+      //
+      // 2026-10-05 22:37 把默认值从 2 MiB 改成 8 MiB，真机后果（同机同批
+      // 4K 片源，每个会话的第一个读取器）：
+      //   2 MiB → 首块 1.2 / 2.7 / 2.8 / 3.8 / 4.0s …… 12 次里 9 次 < 5s，连续播 8 分钟以上
+      //   8 MiB → 首块 12.8 ~ 45.5s，12 次里 0 次 < 5s，另有 3 次一个字节都没发出
+      // 8 MiB 下中继预热一次都没成功过（最快的一次 12.8s，仍是 2500ms 的 5 倍），
+      // 每次换片都是 ExoPlayer Source error → 回退 → mpv Failed to open。
+      //
+      // 速率取实测的单连接下限：真机 2 MiB 首块耗时 2.7~4.0s ⇒ 约 0.5~0.75 MiB/s，
+      // 这里取偏乐观的 0.6 MiB/s —— 连这个都过不去，就说明块已经大到不能用了。
+      const double minRate = 0.6 * 1024 * 1024; // 字节/秒
+      const int playerOpenTimeoutMs = 5000; // mpv 实测约 5s 就报 Failed to open
+      final relay = LocalStreamRelay();
+
+      final worstMs = relay.chunkSize / minRate * 1000;
+      expect(
+        worstMs,
+        lessThan(playerOpenTimeoutMs),
+        reason: '首块预算 ${worstMs.round()}ms 已超过播放器的打开超时：'
+            '首字节延迟 ∝ chunkSize，块越大越晚，换片会必然报 Failed to open。'
+            '要提速请调 connections / prefetchBytes，不要放大 chunkSize。',
+      );
+
+      // 单块还得够得着预热的就绪门槛：`downloadedBytes` 只在**整块落地**时才
+      // 增加，块比门槛还小的话预热永远等不到达标（minBytes 默认 1 MiB）。
+      expect(relay.chunkSize, greaterThanOrEqualTo(1 << 20));
+    });
+  });
+
   group('LocalStreamRelay 端到端', () {
     test('拿到的字节与源流一致，Cookie 被带给上游，数据按块取', () async {
       const total = 1000;
