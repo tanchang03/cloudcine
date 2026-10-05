@@ -51,3 +51,4 @@ docs/封面问题-实测/原始缩略图-640x360.png
 # 本机签名配置（含真实证书名 / Team ID）。模板见同目录 *.example。
 macos/Runner/Configs/Signing.local.xcconfig
 kuakewangpan/*
+logs

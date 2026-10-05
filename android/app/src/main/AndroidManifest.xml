@@ -14,10 +14,11 @@
         android:required="false" />
 
     <application
-        android:label="云影 CloudCine"
+        android:label="影视 CloudCine"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:banner="@drawable/banner">
+        android:banner="@drawable/banner"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"

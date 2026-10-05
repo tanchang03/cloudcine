@@ -15,6 +15,7 @@ import '../../data/http/dio_http_client.dart';
 import '../../data/http/http_client.dart';
 import '../../data/playback/fvp_playback_engine.dart';
 import '../../data/playback/media_kit_playback_engine.dart';
+import '../../data/playback/video_player_exo_playback_engine.dart';
 import '../../data/registry/adapter_registry.dart';
 import '../../data/remote/quark/quark_adapter.dart';
 import '../../data/scrape/douban_client.dart';
@@ -217,7 +218,14 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
     subtitleResolver: ref.watch(subtitleResolverProvider),
     relay: ref.watch(streamRelayProvider),
     engine: MediaKitPlaybackEngine(tv: tv),
-    dolbyVisionEngine: alternateAvailable ? () => FvpPlaybackEngine() : null,
+    // Android TV 的「备用内核」改用官方 video_player（= Media3 ExoPlayer）：
+    // fvp/libmdk 在 MiTV 上拿不到硬解（VDEC exit + 300% CPU），ExoPlayer 是
+    // 夸克那套。macOS 仍用 fvp 走 DV 路。
+    dolbyVisionEngine: alternateAvailable
+        ? () => Platform.isAndroid
+            ? VideoPlayerExoPlaybackEngine()
+            : FvpPlaybackEngine()
+        : null,
     dolbyVisionProbe: alternateAvailable
         ? ({required key, required url, required headers}) =>
             dvProbe.probe(key: key, url: url, headers: headers)

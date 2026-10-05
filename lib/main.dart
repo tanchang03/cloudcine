@@ -28,7 +28,10 @@ Future<void> main(List<String> args) async {
   // media_kit，不能指望主窗口那边初始化过。
   MediaKit.ensureInitialized();
 
-  // 第二内核：fvp（libmdk）。macOS 服务杜比视界 P5；Android TV 服务 ≥4K。
+  // 第二内核：fvp（libmdk）。**只服务 macOS 杜比视界片源**。Android TV 上
+  // fvp/libmdk 的 MediaCodec 链拿不到硬解（MiTV VDEC exit + 300% CPU），
+  // 改由 `VideoPlayerExoPlaybackEngine`（官方 video_player_android = Media3
+  // ExoPlayer）接管 TV 高分辨率，这里不再注册 android。
   //
   // ⛔ 必须**显式**注册，不能指望自动注册：fvp 的 pubspec 里 macOS 平台
   // 只有 `pluginClass`、**没有 `dartPluginClass`**（只有 linux/windows/ohos/
@@ -51,24 +54,11 @@ Future<void> main(List<String> args) async {
   //
   // `platforms` 显式写出来是**双保险**：即便以后在别的平台也 import 了这里，
   // 也只有 macOS 和 Android 会被 fvp 接管。
-  if (Platform.isMacOS || Platform.isAndroid) {
+  if (Platform.isMacOS) {
     fvp.registerWith(options: <String, Object>{
-      'platforms': <String>['macos', 'android'],
-      // ⚠️ 全局项。TV 的显示层只有 1920×1080，不钳的话 GL 渲染器会在 4K 上
-      // 渲染（上游注释：full 4K RGBA can push SurfaceFlinger into GPU
-      // composition on weak GPUs）。
-      'maxWidth': 1920,
-      'maxHeight': 1080,
-      // ⛔ tunnel 先不开。它是全局项，一旦为 true，macOS 的 DV 路也会带上
-      // （texture 路无效，但注册时是共享的）。
-      // 判据是 Platform.isAndroid 的 DV 路上也不能动它（见方案 §3 阶段 2）。
+      'platforms': <String>['macos'],
     });
-    // 把实际下发的选项写进日志。
-    //
-    // **为什么值得占一行**：注册只让 `video_player` 改用 mdk 实现，是「配错了
-    // 也不报错、只是静默走 Apple 那套栈」的那类开关，没有回读手段。它同时是
-    // 独立播放窗口的判据：那个窗口有自己的引擎，这行会出现两次。
-    diag.info('播放', 'fvp 注册：platforms=[macos,android] maxWidth=1920 maxHeight=1080');
+    diag.info('播放', 'fvp 注册：platforms=[macos]');
   }
 
   // 分流要尽可能早：播放窗口跑的是播放界面，不该做媒体库的启动工作

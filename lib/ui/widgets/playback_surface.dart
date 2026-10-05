@@ -4,6 +4,7 @@ import 'package:video_player/video_player.dart' as vp;
 
 import '../../data/playback/fvp_playback_engine.dart';
 import '../../data/playback/media_kit_playback_engine.dart';
+import '../../data/playback/video_player_exo_playback_engine.dart';
 import '../../domain/services/playback_engine.dart';
 
 /// 出画面的那一层。**按当前引擎挑渲染组件**。
@@ -89,6 +90,13 @@ class PlaybackSurface extends StatelessWidget {
         fill: fill,
       );
     }
+    if (e is VideoPlayerExoPlaybackEngine) {
+      return _FvpPlaybackSurface(
+        key: ValueKey(e),
+        engine: e,
+        fill: fill,
+      );
+    }
 
     // 未知实现：不猜。画一块底色比抛异常好 —— 这层在播放页的 Stack 里，
     // 抛出去会把整个播放页带崩。
@@ -110,7 +118,7 @@ class _FvpPlaybackSurface extends StatefulWidget {
     required this.fill,
   });
 
-  final FvpPlaybackEngine engine;
+  final Object engine;
   final Color fill;
 
   @override
@@ -156,7 +164,11 @@ class _FvpPlaybackSurfaceState extends State<_FvpPlaybackSurface> {
 
   @override
   Widget build(BuildContext context) {
-    final controller = widget.engine.videoController;
+    final controller = switch (widget.engine) {
+      FvpPlaybackEngine e => e.videoController,
+      VideoPlayerExoPlaybackEngine e => e.videoController,
+      _ => null,
+    };
     // controller 可能因为「引擎重开」而换实例。
     if (!identical(controller, _bound)) {
       _unbind();
