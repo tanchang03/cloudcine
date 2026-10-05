@@ -2,8 +2,15 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:media_kit/media_kit.dart' as mk;
 
 import '../../core/diagnostics/resource_probe.dart';
+import '../../data/playback/fvp_playback_engine.dart';
+import '../../data/playback/media_kit_playback_engine.dart';
+import '../../data/playback/video_player_exo_playback_engine.dart';
+import '../../domain/services/playback_controller.dart';
+import '../providers/app_providers.dart';
 
 /// 调试浮层开关。
 ///
@@ -12,7 +19,7 @@ import '../../core/diagnostics/resource_probe.dart';
 /// 重新构建即可。
 const bool kDebugOverlayEnabled = true;
 
-/// 实时资源指标浮层：CPU / 内存 / FPS / 线程 / 负载。
+/// 实时资源指标浮层：CPU / 内存 / FPS / 线程 / 负载 / **解码内核与硬解状态**。
 ///
 /// 挂在 `MaterialApp.builder` 上（Navigator 之上），浮在画面右上角。
 /// 用途是**真机调优时实时看资源** —— 之前「OSD 卡顿是不是 CPU 满」这种
@@ -20,19 +27,24 @@ const bool kDebugOverlayEnabled = true;
 /// 发生了什么」。这个浮层每秒刷新一次，CPU 是两次 `/proc/stat` 的增量口径
 /// （与 `adb top` 一致，234% = 用了 2.34 个核）。
 ///
+/// 解码信息：读 `PlaybackController` 的当前引擎 —— mpv（media_kit）显示
+/// `hwdec-current`（mediacodec-copy = 硬解拷贝档，直通 = 硬解零拷贝）；
+/// ExoPlayer / fvp 恒为 MediaCodec 硬解。这一行回答「到底是不是硬解、走的
+/// 哪个内核」—— 之前要靠事后翻日志才能确认。
+///
 /// ⚠️ 数据源 [readDeviceResources] 依赖 `/proc`（Android / Linux）。在 macOS
 /// 上跑开发时大半字段为空，浮层会显示「—」—— 这是预期，不是 bug。
-class DebugOverlay extends StatefulWidget {
+class DebugOverlay extends ConsumerStatefulWidget {
   const DebugOverlay({super.key, this.refreshInterval = const Duration(seconds: 1)});
 
   /// 刷新周期。1 秒足够「实时」，再短会把 CPU 读数搅成噪声。
   final Duration refreshInterval;
 
   @override
-  State<DebugOverlay> createState() => _DebugOverlayState();
+  ConsumerState<DebugOverlay> createState() => _DebugOverlayState();
 }
 
-class _DebugOverlayState extends State<DebugOverlay> {
+class _DebugOverlayState extends ConsumerState<DebugOverlay> {
   Timer? _timer;
 
   /// 回调已随 dispose 失效。Flutter 3.29 的 `addPersistentFrameCallback` 没有
@@ -56,6 +68,11 @@ class _DebugOverlayState extends State<DebugOverlay> {
   int? _prevTx;
   double _netRxKbs = 0;
   double _netTxKbs = 0;
+
+  /// 当前解码内核标签（mpv / ExoPlayer / fvp）。
+  String _kernel = '—';
+  /// 解码机制标签（硬解直通 / 硬解拷贝 / 软解 / 解码器未起）。
+  String _decode = '—';
 
   @override
   void initState() {
@@ -111,13 +128,56 @@ class _DebugOverlayState extends State<DebugOverlay> {
     _prevTx = tx;
     _prevAt = now;
 
+    // 解码内核 + 硬解状态。读 `PlaybackController` 的当前引擎，1Hz 一次
+    // channel 读取，开销可忽略。
+    final (kernel, decode) = await _readDecoderInfo();
+
+    if (!mounted) return;
     setState(() {
+      _kernel = kernel;
+      _decode = decode;
       _reading = reading;
       // 帧率 = 本周期帧数 / 周期时长。首帧回调在 initState 之前可能已跑，
       // 所以这里不算「启动第一秒」的失真 —— 它本来就该是瞬时的。
       _fps = _frames * 1000 / widget.refreshInterval.inMilliseconds;
       _frames = 0;
     });
+  }
+
+  /// 读当前解码内核与硬解状态。
+  ///
+  /// 内核按引擎类型区分；硬解状态：
+  ///   * ExoPlayer / fvp —— MediaCodec 硬解（PlatformView 直通 Surface）；
+  ///   * mpv —— 读 `hwdec-current` 属性：`mediacodec-copy` = 硬解但拷贝档
+  ///     （每帧拷回 CPU），`mediacodec` = 硬解零拷贝，空串 = 解码器未起。
+  Future<(String, String)> _readDecoderInfo() async {
+    final PlaybackController controller;
+    try {
+      controller = ref.read(playbackControllerProvider);
+    } catch (_) {
+      return ('—', '—');
+    }
+    final engine = controller.engine;
+    if (engine is VideoPlayerExoPlaybackEngine) {
+      return ('ExoPlayer', '硬解(直通)');
+    }
+    if (engine is FvpPlaybackEngine) {
+      return ('fvp/mdk', '硬解(直通)');
+    }
+    if (engine is MediaKitPlaybackEngine) {
+      try {
+        final platform = engine.player.platform;
+        if (platform is! mk.NativePlayer) return ('mpv', '—');
+        final hwdec = (await platform.getProperty('hwdec-current')).trim();
+        if (hwdec.isEmpty) return ('mpv', '解码器未起');
+        if (hwdec.contains('mediacodec-copy')) return ('mpv', '硬解(copy)');
+        if (hwdec.contains('mediacodec')) return ('mpv', '硬解(直通)');
+        return ('mpv', '软解($hwdec)');
+      } catch (_) {
+        return ('mpv', '—');
+      }
+    }
+    return (engine.runtimeType.toString(), '—');
   }
 
   @override
@@ -155,6 +215,25 @@ class _DebugOverlayState extends State<DebugOverlay> {
             ),
           ),
           const SizedBox(height: 2),
+          // 解码内核 + 硬解状态：回答「是不是硬解、走的哪个内核」。
+          Text(
+            '内核  $_kernel',
+            style: const TextStyle(
+              fontSize: 11.5,
+              color: Color(0xB3FFFFFF),
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+          Text(
+            '解码  $_decode',
+            style: TextStyle(
+              fontSize: 11.5,
+              fontFeatures: const [FontFeature.tabularFigures()],
+              color: _decode.startsWith('硬解')
+                  ? const Color(0xFF6BCB77)
+                  : const Color(0xFFFFB020),
+            ),
+          ),
           _line('RSS', rssMb == null ? '—' : '${rssMb.toStringAsFixed(0)} MB'),
           _line(
             '内存',

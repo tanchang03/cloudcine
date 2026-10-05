@@ -731,21 +731,13 @@ class PlaybackController extends ChangeNotifier {
       return direct;
     }
 
-    // ⛔ 高分辨率（≥2048p，走 ExoPlayer）**跳过本地中继，直连 CDN**。
+    // ⚠️ 4K **仍走中继**（2026-10-05 回退「≥2048p 直连」）。
     //
-    // 实测（2026-10-05）：4K 走 ExoPlayer 时解码只占 ~32%，但**两个 DartWorker
-    // 烧掉 117% CPU** —— 那是中继在 Dart 层转发整条 3.2GB 原画流（上游下载 →
-    // Dart 堆 → HttpServer flush），每个字节都过 Dart。夸克直连 CDN 没有这一层，
-    // 所以只有 30%。
-    //
-    // ExoPlayer 不需要中继（它没有 mpv 的 `http_proxy` 白名单问题，直连带
-    // Cookie 就能播），自带缓冲管理。直连预期把 4K 的 CPU 从 150% 压到 ~40%。
-    final height = _currentVideoHeight(ticket);
-    if (height != null && height >= 2048) {
-      diag.info('播放', '≥2048p 片源直连 CDN（跳过本地中继，省 Dart 转发 CPU）');
-      await _closeRelayToken(previousToken);
-      return direct;
-    }
+    // 直连是 ExoPlayer **单连接**拉 origin 大文件（3GB+），CDN 对单连接限速 /
+    // 挂起（实测 10 秒 0 流量、画面一直缓冲）—— 夸克流畅是因为多连接并发
+    // 榨干带宽。中继 8 连接 × 2MiB 块并行预取能绕开单连接限速，是唯一在
+    // 保持 origin 原画的同时充分利用带宽的方案。代价是中继在 Dart 层转发
+    // 数据会占 CPU（4K 约 100%+），但「带宽不足卡顿」比「CPU 高」严重得多。
 
     final endpoint = await relay.open(
       ticket,

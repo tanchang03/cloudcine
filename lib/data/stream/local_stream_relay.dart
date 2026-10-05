@@ -60,7 +60,7 @@ import 'relay_reader_arbiter.dart';
 class LocalStreamRelay implements StreamRelay {
   LocalStreamRelay({
     int connections = 8,
-    this.chunkSize = 2 * 1024 * 1024,
+    this.chunkSize = 8 * 1024 * 1024,
     this.prefetchBytes = 256 * 1024 * 1024,
     this.maxCacheBytes = 256 * 1024 * 1024,
     bool enabled = true,
