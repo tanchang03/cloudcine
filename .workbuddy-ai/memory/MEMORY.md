@@ -61,6 +61,12 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 ## Android 产物名与版本号（10-03）
 ⛔ 产物名由 Flutter 工具链**定死**，改 AGP `outputFileName` 无效；做法：给 `assemble<Mode>` 挂 **finalizer**（⛔ 别 doLast）**复制**（⛔ 不能改名）成 `cloudcine-<versionName>-b<versionCode>-android.apk`。⛔ 报错只剩一个版本号 = **JBR 25 崩了 Kotlin**，指 JDK 21。
 
+## Windows 安装包（WiX v3 MSI，10-05）
+`windows/packaging/cloudcine.wxs` + `build_package.ps1`（per-user 装到 `%LOCALAPPDATA%\Programs\CloudCine`，`-arch x64`，`InstallerVersion=500`）。
+- ⛔ **启动条件绝不能写 `VersionNT >= 1000`**：Windows Installer 把 VersionNT **钳在 603**（= Win8.1），Win10/Win11 上读出来都是 603 → 该条件**在任何真实 Windows 上都失败**，用户看到的正是「需要 Windows 10 或更高版本」（10-05 的实际故障；不是 Win11 特有，是**谁也装不上**）。判据用 **`WindowsBuild >= 10240`**（Win7=7601 / 8.1=9600 / 10=10240+ / 11=22000+），并带 `Installed OR`（否则已装机器卸载/维护会被自己挡住）。出处：微软 KB3202260、Advanced Installer 文档；细节见 `2026-10-05.md`。
+- ⚠️ **MSI 条件语法不支持括号**，多条件只能靠优先级（比较 > AND/OR）。
+- ⛔ `-sice` 只压 ICE38/ICE64/ICE91 三条 per-user 误报，**别图省事换成 `-sval`**（会吞掉 ICE61/ICE30 真问题）。
+
 ## macOS 签名与 entitlements（§）
 ⛔ 不许写 `keychain-access-groups`（→ **启动即 SIGKILL**）；`app-sandbox` 必须 **`false`**；两份都要 `network.client/server`·`files.user-selected.read-write`；`DebugProfile` 另加 `get-task-allow`。Podfile 与 `RegisterGeneratedPlugins` 的补丁别删。
 
