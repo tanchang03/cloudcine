@@ -45,7 +45,15 @@ dependencies:
   #
   # 备选 `multiview_desktop`（单引擎多窗口，无需拆引擎）要求 Flutter ≥3.38.2，
   # 当前 3.29 装不上。
-  desktop_multi_window: ^0.3.1
+  #
+  # ⚠️ 必须精确钉在 0.3.0，不能用 ^0.3.1：0.3.1 的 Windows 原生代码调了
+  # `DartProject::set_ui_thread_policy(flutter::UIThreadPolicy::…)`，
+  # 这个 API 只在更新的 Flutter 引擎头文件里存在 —— Flutter 3.29 下
+  # `flutter build windows` 直接报 `C2039: 'set_ui_thread_policy' is not
+  # a member of 'flutter::DartProject'`。0.3.0 与 0.3.1 的 Dart 层 API
+  # 完全一致（`WindowController` / `WindowConfiguration` /
+  # `WindowMethodChannel`），降级不影响任何 Dart 调用点。
+  desktop_multi_window: 0.3.0
 
   # 浏览器授权（备选通道：登录后抓取 Cookie）
   flutter_inappwebview: ^6.1.5

@@ -234,11 +234,18 @@ void main() {
       greaterThan(flutterDefaultAlpha),
       reason: '默认的 12% 白色蒙层在电视上等于没有焦点指示，必须换掉',
     );
+    // 中性提亮、不染色：真机反馈是带颜色的罩子（上一版 `accent @ 0.30`）
+    // 把内容染蓝、「看起来有点多余，也不太美观」。r/g/b 必须相等，
+    // 否则「焦点」会被读成「选中」。
     expect(
-      focus.a,
-      greaterThanOrEqualTo(0.3),
-      reason: '换掉就要换够 —— 低于 30% 在电视上仍然看不出来',
+      focus.r == focus.g && focus.g == focus.b,
+      isTrue,
+      reason: 'focusColor 必须是中性白（只抬亮度、不动色相），与 TvFocusable '
+          '的 brighten 是同一种语言',
     );
+    // 海报墙的焦点不靠这一行（ink 画在海报下面，多亮都盖得住），
+    // 靠 `TvFocusable` 的放大 + 提亮兜底 —— 所以这里不断言具体 alpha 下限，
+    // 只要求比 Flutter 默认强。
   });
 
   testWidgets('筛选浮层（MenuAnchor）遥控器能不能进出', (tester) async {
