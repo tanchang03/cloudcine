@@ -225,7 +225,14 @@ class StatsOverlay(context: Context) : TextView(context) {
                     rssMb,
                 )
             )
-            append(String.format(Locale.US, "系统可用内存 %.0f MB\n", sysAvailMb))
+            // ⛔ Java 堆必须单独看：ExoPlayer 的缓冲字节数组吃的是它，
+            //    而本机 `heapgrowthlimit=192m` —— 堆贴近上限就是崩溃前兆。
+            append(
+                String.format(
+                    Locale.US, "Java 堆 %.0f/%.0f MB · 系统可用内存 %.0f MB\n",
+                    heapUsedMb(), heapMaxMb(), sysAvailMb,
+                )
+            )
             append(
                 String.format(
                     Locale.US, "UI %.1f fps · 最大帧间隔 %.1f ms\n",
@@ -255,9 +262,14 @@ class StatsOverlay(context: Context) : TextView(context) {
      *
      * ⛔ **必须按最后一个 `)` 切**：`comm`（进程名）允许含空格与括号，
      * 按空白 split 会让后面所有字段整体错位 —— 而且**不报错**，只是 CPU 变成垃圾值。
+     *
+     * ⛔ 用 `readLine()` 只读第一行，**不要 `readText()`**：`/proc/self/stat` 确实
+     * 只有一行，但 `readText()` 会先按 16KB 起分配缓冲。堆被占满时，就是这一下
+     * 把主线程打死的（实测崩溃栈顶正是这里要的 16400 字节）。
+     * 读什么都会死是事实，但**别让自己成为压死骆驼的那根稻草**。
      */
     private fun readSelfTicks(): Long? = try {
-        val s = File("/proc/self/stat").readText()
+        val s = File("/proc/self/stat").bufferedReader().use { it.readLine() } ?: return null
         val i = s.lastIndexOf(')')
         if (i < 0) null else {
             val parts = s.substring(i + 2).split(' ')
@@ -269,14 +281,35 @@ class StatsOverlay(context: Context) : TextView(context) {
         null
     }
 
+    /** 同理：逐行读到 `VmRSS:` 就停，别把整份 `/proc/self/status` 读成一个 List。 */
     private fun readVmRssKb(): Double = try {
-        File("/proc/self/status").readLines()
-            .firstOrNull { it.startsWith("VmRSS:") }
-            ?.filter { it.isDigit() }
-            ?.toDoubleOrNull() ?: 0.0
+        val line = File("/proc/self/status").bufferedReader().use { r ->
+            var found: String? = null
+            while (found == null) {
+                val l = r.readLine() ?: break
+                if (l.startsWith("VmRSS:")) found = l
+            }
+            found
+        }
+        line?.filter { it.isDigit() }?.toDoubleOrNull() ?: 0.0
     } catch (_: Exception) {
         0.0
     }
+
+    /**
+     * Java 堆用量 / 上限（MB）。
+     *
+     * ⛔ **这一项是必须的**：`setTargetBufferBytes` 吃的是 Java 堆，而本机
+     * `heapgrowthlimit=192m`。之前把缓冲上限写死成 192MiB 时，堆被 ExoPlayer
+     * 的字节数组占满，表现为「播 4K 一分钟后崩」。有这一行，下次一眼就能看出
+     * 是「缓冲把堆吃了」还是「别处漏了」。
+     */
+    private fun heapUsedMb(): Double {
+        val rt = Runtime.getRuntime()
+        return (rt.totalMemory() - rt.freeMemory()) / 1048576.0
+    }
+
+    private fun heapMaxMb(): Double = Runtime.getRuntime().maxMemory() / 1048576.0
 
     private fun readSysAvailMb(): Double = try {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager

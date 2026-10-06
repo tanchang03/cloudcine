@@ -78,10 +78,35 @@ class PlayerActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
 
-    /** 「没人按键就把控制栏收起来」的那一拍。 */
-    private val hideControls = Runnable { if (!isBuffering) controls.visibility = View.GONE }
+    /**
+     * 「没人按键就把控制栏收起来」的那一拍。
+     *
+     * ⛔ 到点也不能无脑收 —— 先问 [keepControlsVisible]。见那边的注释。
+     */
+    private val hideControls = Runnable {
+        if (!keepControlsVisible()) controls.visibility = View.GONE
+    }
 
     private var isBuffering = false
+
+    /**
+     * 控制栏该不该**一直**留在屏幕上（即：不许自动收起）。
+     *
+     * ⛔ 判据不是「用户有没有按键」，而是**他是不是正在读控制栏上的数字**：
+     *
+     *   * **缓冲中** —— 他在看「缓冲中 · 3.2 MB/s」；
+     *   * **已暂停** —— 他在看「已暂停 · 已缓冲 +118s」还会不会继续长。
+     *
+     * 这两种情况下把控制栏收掉，等于把他正盯着看的读数抢走。暂停态尤其明显：
+     * 用户按暂停十有八九**就是为了**确认「暂停后还在不在继续缓冲」，
+     * 4 秒后自己消失正好把答案盖住。
+     *
+     * ⚠️ `isPlaying == false` 在**缓冲中**同样成立（playWhenReady 还是 true，
+     * 但状态是 BUFFERING）。这里不需要特意排除：两者都是「要留着」。
+     * 播完（`STATE_ENDED`）也是 false ⇒ 控制栏留在屏幕上，这也合理 ——
+     * 用户要看播到哪了。
+     */
+    private fun keepControlsVisible(): Boolean = isBuffering || player?.isPlaying == false
 
     /**
      * 下载速率：`ByteCounter` 在**数据源那一层**数字节，[NetRateMeter] 做差分。
@@ -499,11 +524,50 @@ class PlayerActivity : Activity() {
         //    以为暂停就不缓冲了。给到 120s。
         // ⛔ `bufferForPlaybackMs` 从默认 2500 降到 1500：首帧更快（实测
         //    原画首帧 2.4s，其中约 1s 是在等这条阈值）。
-        // ⛔ `setTargetBufferBytes(192MiB)` 是**内存护栏**：4K 原画 2.75MB/s
-        //    × 120s = 330MB，这台电视总共才 2.5GB 内存，不封顶会被 LMK 杀。
-        //    192MiB 在 4K 下约等于 70s，在超清档下约等于 6 分钟。
-        // ⛔ `setBackBuffer(60s, true)` 让**回拖**也在缓冲里：默认后缓冲很短，
+        //
+        // ── 缓冲字节上限：**必须按堆算，不能写死** ─────────────────
+        //
+        // ⛔⛔ 这里踩过一个把 App 直接打死的坑。原来写死 `192 * 1024 * 1024`，
+        //    当时的想法是「192MiB 是个安全的内存护栏」。**它是整块 Java 堆。**
+        //
+        //    这台电视 `ro.config.low_ram=true`、`dalvik.vm.heapgrowthlimit=192m`
+        //    （`getprop` 实测），manifest 又没开 `largeHeap` ⇒ App 能用的
+        //    Java 堆就是 **192MiB**。
+        //
+        //    而 `setTargetBufferBytes` 是给 ExoPlayer 的 allocator 用的
+        //    **Java 字节数组**总额（`DefaultAllocator` 里就是 `new byte[]`），
+        //    **不是原生内存、也不走 SurfaceView**。所以「上限 = 堆」等于
+        //    「允许它把堆占满」⇒ 播高码率片源时 loader 一路分配，堆满之后
+        //    任何一次小分配都会 `OutOfMemoryError` 崩主线程。
+        //
+        //    实测崩溃（`logcat -b crash`）：
+        //      OutOfMemoryError: Failed to allocate a 16400 byte allocation
+        //      with 13416 free bytes … max allowed footprint 201326592,
+        //      growth limit 201326592
+        //      at StatsOverlay.readSelfTicks(StatsOverlay.kt:260)   ← 只是受害者
+        //    受害者是「每秒读一次 /proc/self/stat」要的 16KB —— 堆已经满了，
+        //    读什么都会死。**现象是「播 4K 约 1 分钟后必崩」**
+        //    （192MiB ÷ 2.75MB/s ≈ 70s）。
+        //
+        //    改成堆的 **1/4**，并封顶 64MiB：
+        //      * 这台电视：192MiB ÷ 4 = **48MiB** ⇒ 4K 原画约 17s 前向缓冲；
+        //        超清档（0.14MB/s）下 48MiB ≈ 6 分钟，所以 `maxBufferMs=120s`
+        //        在低码率档下仍然是先撞到的那个，需求不受影响。
+        //      * 大堆机型（512MiB）：min(128MiB, 64MiB) = 64MiB，与
+        //        ExoPlayer 自己的默认值同量级。
+        val heapMax = Runtime.getRuntime().maxMemory()
+        val bufferBytes = minOf(heapMax / 4, 64L * 1024 * 1024)
+        Log.i(
+            TAG,
+            "Java 堆上限 ${heapMax / 1048576} MiB ⇒ 缓冲字节上限 " +
+                "${bufferBytes / 1048576} MiB（不许再写死）",
+        )
+
+        // ⛔ `setBackBuffer(30s, true)` 让**回拖**也在缓冲里：默认后缓冲很短，
         //    往左拖 10s 看着在浅色区间内、其实数据已经丢了，照样重新缓冲。
+        //    ⛔ 但**别给到 60s**：后缓冲和前向缓冲共用同一个字节上限，4K 下
+        //    60s 就是 165MB，会把 48MiB 的额度全吃光、前向缓冲饿死。
+        //    30s 在超清档下才 4MB，完全放得下。
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 30_000,   // minBufferMs：低于它一定继续下载
@@ -511,8 +575,8 @@ class PlayerActivity : Activity() {
                 1_500,    // bufferForPlaybackMs：起播阈值
                 5_000,    // bufferForPlaybackAfterRebufferMs：卡完恢复的阈值
             )
-            .setBackBuffer(60_000, true)
-            .setTargetBufferBytes(192 * 1024 * 1024)
+            .setBackBuffer(30_000, true)
+            .setTargetBufferBytes(bufferBytes.toInt())
             .build()
 
         val exo = ExoPlayer.Builder(this, DefaultRenderersFactory(this), mediaSourceFactory)
@@ -535,6 +599,24 @@ class PlayerActivity : Activity() {
                     hideNotice()
                     scheduleHideControls()
                 }
+            }
+
+            /**
+             * 播放/暂停**切换的那一刻**。
+             *
+             * ⛔ 暂停时要把控制栏叫回来、并且**不许它自动收起**：用户按暂停
+             *    十有八九就是为了看「已暂停 · 已缓冲 +118s」还会不会继续长。
+             *    只靠 [hideControls] 里那道兜底也能拦住「已排的收起」，但那时
+             *    控制栏可能已经因为别的原因不可见，这里显式叫一次最稳。
+             */
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying) return
+                // ⛔ 缓冲中 `isPlaying` 也是 false（`playWhenReady` 还是 true），
+                //    那不是「用户暂停」—— 缓冲期由 `onPlaybackStateChanged` 管，
+                //    别在这儿重复触发（否则每次缓冲都会多一条「已暂停」日志）。
+                if (exo.playWhenReady) return
+                Log.i(TAG, "已暂停 ⇒ 控制栏常驻（看缓冲进度）")
+                showControls(autoHide = false)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -1191,21 +1273,23 @@ class PlayerActivity : Activity() {
     /**
      * 亮出控制栏。
      *
-     * @param autoHide 是否 4 秒后自动收起。**缓冲中必须传 false** ——
-     *   用户正盯着「缓冲中 · 3.2 MB/s」判断是不是网络问题，收起来很讨厌。
-     *   缓冲状态本身由 [hideControls] 里那道 `isBuffering` 兜底，
-     *   所以就算排了收起，缓冲开始时也会被拦下。
+     * @param autoHide 是否 4 秒后自动收起。**缓冲中与暂停时必须传 false** ——
+     *   用户正盯着「缓冲中 · 3.2 MB/s」判断是不是网络问题、盯着
+     *   「已暂停 · 已缓冲 +118s」看它还会不会长，收起来等于把读数抢走。
+     *   ⛔ 就算传了 true 也不怕：[keepControlsVisible] 会兜底，
+     *      排了收起也不会真的收。
      */
     private fun showControls(autoHide: Boolean = true) {
         if (!::controls.isInitialized) return
         controls.visibility = View.VISIBLE
         ui.removeCallbacks(hideControls)
-        if (autoHide) ui.postDelayed(hideControls, CONTROLS_HIDE_MS)
+        // ⛔ 正在「被读」时就别排这一拍：省一次无谓的唤醒，也让意图在代码里看得见。
+        if (autoHide && !keepControlsVisible()) ui.postDelayed(hideControls, CONTROLS_HIDE_MS)
     }
 
     private fun scheduleHideControls() {
         ui.removeCallbacks(hideControls)
-        ui.postDelayed(hideControls, CONTROLS_HIDE_MS)
+        if (!keepControlsVisible()) ui.postDelayed(hideControls, CONTROLS_HIDE_MS)
     }
 
     /** 用户主动收（返回键），**不受缓冲状态阻挡**。 */
