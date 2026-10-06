@@ -447,6 +447,17 @@ class TvOsdView(context: Context) : FrameLayout(context) {
 
     private fun dp(v: Float): Float = v * resources.displayMetrics.density
 
+    /**
+     * 菜单卡片贴底占用的**总高度**（px，含底边距）。
+     *
+     * 给字幕用：菜单打开时字幕必须抬到卡片上沿（见 `PlayerActivity.updateSubtitleInset`），
+     * 而卡片几何（`SAFE_V` / `CARD_H`）只在本类里。
+     *
+     * ⛔ 别让调用方另抄一份 `27 + 7×40 + 28` 的算式 —— 几何一改两边就不一致，
+     *    表现是「菜单一开字幕正好被压在菜单上」，而且只在某些行数下才露馅。
+     */
+    fun sheetHeightPx(): Int = dp(SAFE_V + CARD_H).toInt()
+
     /** 纵向列表的 adapter —— 一行一个 TextView，选中态蓝底（照对标播放器）。 */
     private inner class RowListAdapter(private val row: Row) : BaseAdapter() {
         override fun getCount(): Int = row.options.size

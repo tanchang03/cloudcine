@@ -1,0 +1,663 @@
+diff --git a/android/app/src/main/java/com/cloudcine/tv/PlayerActivity.kt b/android/app/src/main/java/com/cloudcine/tv/PlayerActivity.kt
+index 2c2a51a..814221f 100644
+--- a/android/app/src/main/java/com/cloudcine/tv/PlayerActivity.kt
++++ b/android/app/src/main/java/com/cloudcine/tv/PlayerActivity.kt
+@@ -26,6 +26,7 @@ import androidx.media3.common.TrackGroup
+ import androidx.media3.common.TrackSelectionOverride
+ import androidx.media3.common.Tracks
+ import androidx.media3.common.VideoSize
++import androidx.media3.common.text.CueGroup
+ import androidx.media3.datasource.DataSource
+ import androidx.media3.datasource.DataSpec
+ import androidx.media3.datasource.cache.Cache
+@@ -89,6 +90,18 @@ class PlayerActivity : Activity() {
+     private lateinit var controls: PlayerControlsView
+     private lateinit var confirmExit: ConfirmDialogView
+ 
++    /** 整页根容器。字幕抬高时要读它的高度（见 [updateSubtitleInset]）。 */
++    private lateinit var root: FrameLayout
++
++    /**
++     * 内嵌字幕的**绘制出口**。
++     *
++     * ⛔ 少了它（或少了 [Player.Listener.onCues] 那一句），字幕就是
++     *    「选得上、不上屏、零报错」—— `TextRenderer` 解出来的 cue 没有
++     *    任何 `TextOutput` 接，被直接丢掉。机理见 [SubtitleOverlayView]。
++     */
++    private lateinit var subtitles: SubtitleOverlayView
++
+     private val ui = Handler(Looper.getMainLooper())
+ 
+     /**
+@@ -97,7 +110,7 @@ class PlayerActivity : Activity() {
+      * ⛔ 到点也不能无脑收 —— 先问 [keepControlsVisible]。见那边的注释。
+      */
+     private val hideControls = Runnable {
+-        if (!keepControlsVisible()) controls.visibility = View.GONE
++        if (!keepControlsVisible()) setControlsShown(false)
+     }
+ 
+     private var isBuffering = false
+@@ -318,7 +331,7 @@ class PlayerActivity : Activity() {
+         //    MATCH_PARENT —— 否则片源（如 1440×612，2.35:1）会被拉伸铺满
+         //    1920×1080 的屏，画面横向拉长。OSD 与浮层则要留在外层铺满整屏，
+         //    否则菜单会被一起压进画面矩形、在信箱边上留一圈点不到的死区。
+-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
++        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+ 
+         videoBox = AspectRatioFrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+         surfaceView = SurfaceView(this)
+@@ -337,6 +350,21 @@ class PlayerActivity : Activity() {
+             ),
+         )
+ 
++        // ── 字幕（内嵌字幕的上屏出口）──────────────────────────────
++        //
++        // ⛔ 与统计浮层同理，它**不进 AspectRatioFrameLayout**：要能盖到信箱
++        //    边上，也要能在 OSD 打开时抬到菜单上方（[updateSubtitleInset]）。
++        // ⛔ 顺序有讲究 —— 它在 videoBox **之后**、stats/controls/osd **之前**：
++        //    字幕该被控制栏和菜单压住，而不是反过来。
++        subtitles = SubtitleOverlayView(this)
++        root.addView(
++            subtitles,
++            FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT,
++                ViewGroup.LayoutParams.MATCH_PARENT,
++            ),
++        )
++
+         stats = StatsOverlay(this)
+         root.addView(
+             stats,
+@@ -416,6 +444,9 @@ class PlayerActivity : Activity() {
+         )
+ 
+         setContentView(root)
++        // 起播前先把字幕底距摆好：`bottomInsetPx` 默认 0 = 贴屏幕最底，
++        // 那位置在电视上常被过扫描吃掉。见 [updateSubtitleInset]。
++        updateSubtitleInset()
+ 
+         // 两条入口：按 fid 自己取链（正常路径），或直接给 URL（对照用）。
+         spec = StreamSpec.fromIntent(intent)
+@@ -1069,6 +1100,23 @@ class PlayerActivity : Activity() {
+                 if (osd.visibility == View.VISIBLE) rebindOsd()
+             }
+ 
++            /**
++             * 字幕 cue 到货 —— **内嵌字幕唯一的上屏通道**。
++             *
++             * ⛔ 这一句就是「内嵌字幕选得上、不上屏」的修复本体。
++             *    `TextRenderer` 把 cue 交给注册过的 `TextOutput`；本工程刻意不引
++             *    `media3-ui`，没有 `PlayerView`/`SubtitleView` 那种现成出口，
++             *    而 `Player.Listener` 的 `onCues` 是 media3 给的**等价入口**，
++             *    不需要额外依赖。
++             * ⛔ 别改成只接已废弃的 `onCues(List<Cue>)`：1.5.1 里
++             *    `CueGroup` 版本才是主路径，`CueGroup` 还带 `presentationTimeUs`。
++             * ⚠️ 字幕间隙 ExoPlayer 会回传**空** cue 组，[SubtitleOverlayView]
++             *    按内容去重，空组同样是一次有效的「清屏」。
++             */
++            override fun onCues(cueGroup: CueGroup) {
++                subtitles.setCues(cueGroup.cues)
++            }
++
+             /**
+              * 片源尺寸一变就重算显示矩形。
+              *
+@@ -1899,12 +1947,15 @@ class PlayerActivity : Activity() {
+         rebindOsd()
+         osd.resetSelectionForTest()
+         osd.visibility = View.VISIBLE
++        // ⛔ 必须紧跟着抬字幕：菜单卡片占了屏幕下半截，不抬的话字幕正好被压住。
++        updateSubtitleInset()
+         stats.markKey()
+         Log.i(TAG, "OSD 打开（${osdRows.size} 行：${osdRows.joinToString("/") { it.id }}）")
+     }
+ 
+     private fun hideOsd() {
+         osd.visibility = View.GONE
++        updateSubtitleInset()
+         Log.i(TAG, "OSD 关闭")
+     }
+ 
+@@ -1923,7 +1974,7 @@ class PlayerActivity : Activity() {
+      */
+     private fun showControls(autoHide: Boolean = true) {
+         if (!::controls.isInitialized) return
+-        controls.visibility = View.VISIBLE
++        setControlsShown(true)
+         ui.removeCallbacks(hideControls)
+         // ⛔ 正在「被读」时就别排这一拍：省一次无谓的唤醒，也让意图在代码里看得见。
+         if (autoHide && !keepControlsVisible()) ui.postDelayed(hideControls, CONTROLS_HIDE_MS)
+@@ -1937,7 +1988,45 @@ class PlayerActivity : Activity() {
+     /** 用户主动收（返回键），**不受缓冲状态阻挡**。 */
+     private fun hideControlsNow() {
+         ui.removeCallbacks(hideControls)
+-        controls.visibility = View.GONE
++        setControlsShown(false)
++    }
++
++    /**
++     * 控制栏显隐的**唯一**入口。
++     *
++     * ⛔ 别退回直接写 `controls.visibility`：字幕的底距要跟着控制栏走
++     *    （见 [updateSubtitleInset]），漏掉一处就会出现「控制栏弹出来把字幕
++     *    压在底下」—— 而这台电视上字幕看不见，用户第一反应是「字幕又没了」。
++     */
++    private fun setControlsShown(shown: Boolean) {
++        if (!::controls.isInitialized) return
++        controls.visibility = if (shown) View.VISIBLE else View.GONE
++        updateSubtitleInset()
++    }
++
++    /**
++     * 重算字幕底距：**贴画面下缘，被控制栏 / OSD 挡住时抬到它们上面**。
++     *
++     * 三档取值（单位 px，本机 density=320 ⇒ 1 dp = 2 px）：
++     *   * 什么都没有 —— [SUBTITLE_BASE_INSET_DP]，正好落在宽银幕片源的下信箱边里；
++     *   * 控制栏亮着 —— 抬到控制栏上沿再留一口气；
++     *   * OSD 开着 —— 抬到菜单卡片上沿（卡片是 7×40dp + 28dp，见 `TvOsdView`）。
++     *
++     * ⛔ 用 `maxOf` 而不是相加：控制栏与菜单在布局上**互斥**（菜单开着时不画
++     *    控制栏），相加只会把字幕顶到屏幕中间去。
++     */
++    private fun updateSubtitleInset() {
++        if (!::subtitles.isInitialized) return
++        var inset = dp(SUBTITLE_BASE_INSET_DP)
++        if (::controls.isInitialized && controls.visibility == View.VISIBLE) {
++            // 布局前 `controls.height` 还是 0，用估算值兜底。
++            val h = if (controls.height > 0) controls.height else dp(CONTROLS_FALLBACK_DP)
++            inset = maxOf(inset, h + dp(SUBTITLE_GAP_DP))
++        }
++        if (::osd.isInitialized && osd.visibility == View.VISIBLE) {
++            inset = maxOf(inset, osd.sheetHeightPx() + dp(SUBTITLE_GAP_DP))
++        }
++        subtitles.bottomInsetPx = inset
+     }
+ 
+     /**
+@@ -2122,5 +2211,26 @@ class PlayerActivity : Activity() {
+          * 「每 tick 重建整页」的负担（见 PlayerControlsView 的注释）。
+          */
+         private const val PLAYHEAD_TICK_MS = 1_000L
++
++        /**
++         * 字幕**底距**（dp）。
++         *
++         * 1080p / density=320 下是 144 px。挑这个值是为了让宽银幕片源（如
++         * 2.39:1）的字幕正好落在下信箱边里 —— 信箱边实测约 138 px 高。
++         * ⛔ 别按「贴着屏幕底」来设：屏幕最底下那几十像素在电视上常被
++         *    机壳/过扫描吃掉，贴底的字幕会被切掉下半截。
++         */
++        private const val SUBTITLE_BASE_INSET_DP = 72
++
++        /** 字幕与控制栏 / 菜单之间的呼吸位（dp）。 */
++        private const val SUBTITLE_GAP_DP = 16
++
++        /**
++         * 控制栏高度的**估算值**（dp），只在布局完成前兜底用。
++         *
++         * 布局后一律以 `controls.height` 实测为准；估算值存在的意义是
++         * 「控制栏刚 VISIBLE、还没量过」的那一拍别把字幕压在它底下。
++         */
++        private const val CONTROLS_FALLBACK_DP = 96
+     }
+ }
+diff --git a/android/app/src/main/java/com/cloudcine/tv/SubtitleOverlayView.kt b/android/app/src/main/java/com/cloudcine/tv/SubtitleOverlayView.kt
+new file mode 100644
+index 0000000..2b703c7
+--- /dev/null
++++ b/android/app/src/main/java/com/cloudcine/tv/SubtitleOverlayView.kt
+@@ -0,0 +1,336 @@
++package com.cloudcine.tv
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.Rect
++import android.graphics.RectF
++import android.text.Layout
++import android.text.StaticLayout
++import android.text.TextPaint
++import android.util.Log
++import android.view.View
++import androidx.media3.common.text.Cue
++
++/**
++ * 内嵌字幕的**绘制出口**。
++ *
++ * ## 为什么必须有这个类（2026-10-06 定案）
++ *
++ * `androidx.media3.exoplayer.text.TextRenderer` 的构造签名是
++ * `TextRenderer(TextOutput output, Looper looper, …)` —— 它**要一个出口**。
++ * 而本工程刻意不引 `media3-ui`（见 `AspectRatioFrameLayout` 的注释），也就
++ * 没有 `PlayerView` / `SubtitleView` 这两个现成的 `TextOutput`，画面又是裸
++ * `SurfaceView`（`setVideoSurfaceView`）。于是：
++ *
++ *   * 轨道**选得上**（`setOverrideForType` 生效，`onTracksChanged` 里
++ *     `#0 西班牙语 … ← 选中`、菜单高亮正确）；
++ *   * cue 也被 `CueDecoder` **解出来了**（`TextRenderer` 自带该字段，
++ *     `application/x-media3-cues` 就是它认的格式）；
++ *   * 但**没有任何 `TextOutput` 注册在 ExoPlayer 上** ⇒ 解出来的 cue
++ *     被**直接丢掉**，屏幕上什么都没有，且**一条错都不报**。
++ *
++ * 这正是「选内嵌字幕成功、但字幕不上屏」的真因。本类补上那个出口：
++ * `PlayerActivity` 在已有的 `Player.Listener` 里接 `onCues(CueGroup)`，
++ * 把 `cueGroup.cues` 交过来画。
++ *
++ * ## 为什么不用 `media3-ui` 的 `SubtitleView`
++ *
++ * 两条路都能通。引 `media3-ui` 只需 `SubtitleView` 一个类（它本身就是
++ * `TextOutput`），排版/位图/PGS 都是现成的；但 `media3-ui` **不在 Gradle
++ * 缓存里**，会破坏「离线可构建」。本类只覆盖本片源实际会用到的两种情况 ——
++ * **文字**（`Cue.text`，本片 7 条内嵌字幕全是这种）与**位图**（`Cue.bitmap`，
++ * PGS/VobSub）—— 用不到一百行，换来零新依赖。
++ *
++ * ## 与 OSD / 控制栏的关系
++ *
++ * 字幕是**外层 `FrameLayout` 的兄弟节点**（与统计浮层同理），不放进
++ * `AspectRatioFrameLayout`：它要能盖到信箱边上，而且要在 OSD 打开时**抬到
++ * 菜单上方**。抬高由 [bottomInsetPx] 控制，值由 `PlayerActivity` 按
++ * 控制栏 / OSD 的可见状态算（见那边的 `updateSubtitleInset`）。
++ *
++ * ## 性能
++ *
++ * `onCues` 是**按字幕事件**回调的（不是每帧），但为稳妥起见这里仍按内容做了
++ * 去重（[signature]）——同一批 cue 重复送达时直接 return，不重排
++ * `StaticLayout`。这台电视只有 4 核，字幕不该跟解码抢 CPU。
++ */
++class SubtitleOverlayView(context: Context) : View(context) {
++
++    private var cues: List<Cue> = emptyList()
++
++    /** 上次画的内容指纹，用来吃掉重复的 `onCues`。 */
++    private var signature: String? = null
++
++    private var loggedFirstCue = false
++
++    /** 容器给的原始对齐只记一次，用来确认「右对齐」这个判断。 */
++    private var loggedAlignment = false
++
++    /**
++     * 字幕底距（px）。**0 表示贴 View 底部**。
++     *
++     * ⛔ 由 `PlayerActivity.updateSubtitleInset()` 改写，别在这里算 ——
++     *    它要同时知道控制栏高度与 OSD 卡片高度，那两样只有 Activity 有。
++     */
++    var bottomInsetPx: Int = 0
++        set(value) {
++            if (field == value) return
++            field = value
++            invalidate()
++        }
++
++    private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
++        color = Color.WHITE
++        // ⛔ 必须是 LEFT：换行/对齐由 `StaticLayout` 的 Alignment 负责，
++        //    把 textAlign 设成 CENTER 会让 `drawText` 再偏一次，整块文字飞出屏幕。
++        textAlign = Paint.Align.LEFT
++    }
++
++    private val windowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
++    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
++
++    private val dst = Rect()
++    private val box = RectF()
++
++    init {
++        // 纯 `View` 默认就会走 onDraw，这里只是把意图写明（被包进 ViewGroup 后
++        // 若有人调 setWillNotDraw(true)，字幕会静默消失）。
++        setWillNotDraw(false)
++    }
++
++    /**
++     * 交给上屏的一批 cue。**空列表 = 清屏**（ExoPlayer 在字幕间隙会回传空）。
++     *
++     * ⚠️ `CueGroup.cues` 是 `ImmutableList`，可以安全持有到下次回调 ——
++     *    但本类不依赖这一点：只在内容变化时替换引用。
++     */
++    fun setCues(newCues: List<Cue>) {
++        val sig = signatureOf(newCues)
++        if (sig == signature) return
++        signature = sig
++        cues = newCues
++        if (newCues.isNotEmpty() && !loggedFirstCue) {
++            loggedFirstCue = true
++            // ⛔ 这条日志是**唯一**能证明「出口通了」的现场证据：硬件视频层下
++            //    `screencap` 全黑、播放中 `uiautomator dump` 也拿不到画面。
++            Log.i(TAG, "首条字幕上屏：${newCues.size} 条 · ${newCues.firstOrNull()?.text}")
++        }
++        invalidate()
++    }
++
++    /**
++     * 内容指纹。
++     *
++     * ⛔ 别用 `List<Cue>.equals`：`Cue.text` 常是 `SpannableString` 之类**没有
++     *    重写 equals** 的 CharSequence，逐次回调都会判「不等」⇒ 每拍重排一次
++     *    `StaticLayout`。这里只取**文字本身**与**位图身份**。
++     */
++    private fun signatureOf(list: List<Cue>): String {
++        if (list.isEmpty()) return ""
++        val sb = StringBuilder(list.size * 16)
++        for (c in list) {
++            val bmp = c.bitmap
++            if (bmp != null) {
++                sb.append('B').append(System.identityHashCode(bmp))
++            } else {
++                sb.append('T').append(c.text ?: "")
++            }
++            sb.append('\u0001')
++        }
++        return sb.toString()
++    }
++
++    override fun onDraw(canvas: Canvas) {
++        val list = cues
++        if (list.isEmpty()) return
++
++        // 从下往上叠：**最后一条贴底**（与播放器一致），前面的往上排。
++        var bottom = (height - bottomInsetPx).toFloat()
++        for (i in list.indices.reversed()) {
++            val cue = list[i]
++            val bmp = cue.bitmap
++            bottom = if (bmp != null) {
++                drawBitmapCue(canvas, bmp, cue, bottom)
++            } else {
++                drawTextCue(canvas, cue, bottom)
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // 文字字幕
++    // ------------------------------------------------------------------
++
++    private fun drawTextCue(canvas: Canvas, cue: Cue, bottom: Float): Float {
++        val text = cue.text
++        if (text.isNullOrBlank()) return bottom
++
++        val size = textSizePx(cue)
++        textPaint.textSize = size
++        // 描边随字号缩放 —— 电视上亮画面里没这层黑边，白字会糊掉。
++        textPaint.setShadowLayer(size * 0.14f, 0f, size * 0.05f, SHADOW_COLOR)
++
++        val sidePad = width * SIDE_PAD_FRACTION
++        val maxWidth = (width - 2 * sidePad).coerceAtLeast(1f).toInt()
++
++        // ⛔⛔ **一律居中，忽略 `cue.textAlignment`**（2026-10-06 修正）。
++        //
++        // 本片源（`tx3g → application/x-media3-cues`）给每条 cue 带的
++        // `textAlignment` 是**右对齐**。照搬进 `StaticLayout` 后，每行会在
++        // maxWidth 里靠右排，整块字幕就贴到屏幕右边 —— 就是用户看到的
++        // 「字幕右对齐，好奇怪」。
++        //
++        // 字幕的行业默认就是**居中**；`textAlignment` 只在做竖排/特殊定位
++        // 时才值得尊重，而那类 cue 本工程不处理。恒居中永远不会错。
++        if (cue.textAlignment != null && !loggedAlignment) {
++            loggedAlignment = true
++            Log.i(TAG, "容器给的原始对齐 = ${cue.textAlignment}（已忽略，一律居中）")
++        }
++
++        @Suppress("DEPRECATION")
++        val layout = StaticLayout(
++            text, textPaint, maxWidth, Layout.Alignment.ALIGN_CENTER, 1f, 0f, false,
++        )
++
++        // 真实文字块宽度：多行取最宽那行。`layout.width` 恒等于 maxWidth
++        // （就是传进去的约束），所以不能拿它当文字宽度。
++        var textW = 0f
++        for (line in 0 until layout.lineCount) {
++            textW = maxOf(textW, layout.getLineWidth(line))
++        }
++        val layoutW = layout.width.toFloat()
++
++        // 摆放：`StaticLayout` 已经把**每一行**在 maxWidth 内居中，所以只要把
++        // 整个 layout 盒居中，文字就居中 —— 单行/多行都对。
++        val left = (width - layoutW) / 2f
++        // 文字实际覆盖的水平范围（用于 `windowColor` 底色）。所有行都以 textW
++        // 那条最宽行为准居中，取它的左右边界即可盖住全部行。
++        val textLeft = left + (layoutW - textW) / 2f
++
++        val top = cueTop(cue, layout.height.toFloat(), bottom)
++
++        if (cue.windowColorSet) {
++            val padH = size * 0.4f
++            val padV = size * 0.16f
++            windowPaint.color = cue.windowColor
++            box.set(
++                textLeft - padH,
++                top - padV,
++                textLeft + textW + padH,
++                top + layout.height + padV,
++            )
++            canvas.drawRoundRect(box, size * 0.12f, size * 0.12f, windowPaint)
++        }
++
++        canvas.save()
++        canvas.translate(left, top)
++        layout.draw(canvas)
++        canvas.restore()
++
++        return top - size * LINE_GAP
++    }
++
++    /** 字号：优先用 cue 自带的，缺省按屏高定 —— 1080p 下约 52 px。 */
++    private fun textSizePx(cue: Cue): Float {
++        val ts = cue.textSize
++        if (ts == Cue.DIMEN_UNSET || ts <= 0f) return height * DEFAULT_TEXT_FRACTION
++        return when (cue.textSizeType) {
++            Cue.TEXT_SIZE_TYPE_FRACTIONAL,
++            Cue.TEXT_SIZE_TYPE_FRACTIONAL_IGNORE_PADDING,
++            -> ts * height
++
++            else -> ts
++        }
++    }
++
++    /**
++     * 这一条的**顶边** y。
++     *
++     * 默认贴 [bottom]（也就是从下往上叠）。只有 cue 明确给了 `line` 才改 ——
++     * 本片源的 `tx3g → application/x-media3-cues` 不带定位，走的都是默认分支。
++     */
++    private fun cueTop(cue: Cue, h: Float, bottom: Float): Float {
++        if (cue.lineType == Cue.TYPE_UNSET || cue.line == Cue.DIMEN_UNSET) return bottom - h
++        val lineY = when (cue.lineType) {
++            Cue.LINE_TYPE_FRACTION -> cue.line * height
++            // 行号：media3 的语义是**从下往上数**（0 = 最下面一行）。
++            Cue.LINE_TYPE_NUMBER -> bottom - (cue.line + 1) * h
++            else -> return bottom - h
++        }
++        return when (cue.lineAnchor) {
++            Cue.ANCHOR_TYPE_START -> lineY
++            Cue.ANCHOR_TYPE_MIDDLE -> lineY - h / 2f
++            else -> lineY - h
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // 位图字幕（PGS / VobSub）
++    // ------------------------------------------------------------------
++
++    private fun drawBitmapCue(canvas: Canvas, bmp: Bitmap, cue: Cue, bottom: Float): Float {
++        if (bmp.width <= 0 || bmp.height <= 0) return bottom
++
++        var h = if (cue.bitmapHeight != Cue.DIMEN_UNSET && cue.bitmapHeight > 0f) {
++            cue.bitmapHeight * height
++        } else {
++            bmp.height.toFloat()
++        }
++        var w = h * bmp.width / bmp.height
++        // 别越出画面（PGS 有时按 4K 出图，屏只有 1080p）。
++        val maxW = width * 0.96f
++        if (w > maxW) {
++            w = maxW
++            h = w * bmp.height / bmp.width
++        }
++
++        val top = cueTop(cue, h, bottom)
++        val cx = horizontalCenter(cue, w)
++        dst.set(
++            (cx - w / 2f).toInt(),
++            top.toInt(),
++            (cx + w / 2f).toInt(),
++            (top + h).toInt(),
++        )
++        canvas.drawBitmap(bmp, null, dst, bitmapPaint)
++        return top - h * LINE_GAP
++    }
++
++    /**
++     * 水平中心。缺省屏中心；cue 给了 `position` 才按它算。
++     *
++     * ⚠️ `positionAnchor` 说的是「`position` 指的是这条的哪条边」，不是
++     *    「往哪边对齐」—— 搞反了整条字幕会偏出半屏。
++     */
++    private fun horizontalCenter(cue: Cue, w: Float): Float {
++        if (cue.position == Cue.DIMEN_UNSET) return width / 2f
++        val p = cue.position * width
++        return when (cue.positionAnchor) {
++            // position 指的是这条的**左**边 ⇒ 中心要往右挪半个宽。
++            Cue.ANCHOR_TYPE_START -> p + w / 2f
++            // 指的是**右**边 ⇒ 往左挪半个宽。
++            Cue.ANCHOR_TYPE_END -> p - w / 2f
++            // MIDDLE / 未设：position 就是中心。
++            else -> p
++        }
++    }
++
++    private companion object {
++        const val TAG = "CloudCine"
++
++        /** 缺省字号占屏高的比例（1080p ≈ 52 px）。 */
++        const val DEFAULT_TEXT_FRACTION = 0.048f
++
++        /** 左右安全边距占屏宽的比例。 */
++        const val SIDE_PAD_FRACTION = 0.05f
++
++        /** 多条 cue 之间的行距（相对字号）。 */
++        const val LINE_GAP = 0.35f
++
++        /** 文字描边。白字 + 黑边，亮画面上也读得清。 */
++        const val SHADOW_COLOR = 0xE6000000.toInt()
++    }
++}
+diff --git a/android/app/src/main/java/com/cloudcine/tv/TvOsdView.kt b/android/app/src/main/java/com/cloudcine/tv/TvOsdView.kt
+index e90020f..d1a78a1 100644
+--- a/android/app/src/main/java/com/cloudcine/tv/TvOsdView.kt
++++ b/android/app/src/main/java/com/cloudcine/tv/TvOsdView.kt
+@@ -447,6 +447,17 @@ class TvOsdView(context: Context) : FrameLayout(context) {
+ 
+     private fun dp(v: Float): Float = v * resources.displayMetrics.density
+ 
++    /**
++     * 菜单卡片贴底占用的**总高度**（px，含底边距）。
++     *
++     * 给字幕用：菜单打开时字幕必须抬到卡片上沿（见 `PlayerActivity.updateSubtitleInset`），
++     * 而卡片几何（`SAFE_V` / `CARD_H`）只在本类里。
++     *
++     * ⛔ 别让调用方另抄一份 `27 + 7×40 + 28` 的算式 —— 几何一改两边就不一致，
++     *    表现是「菜单一开字幕正好被压在菜单上」，而且只在某些行数下才露馅。
++     */
++    fun sheetHeightPx(): Int = dp(SAFE_V + CARD_H).toInt()
++
+     /** 纵向列表的 adapter —— 一行一个 TextView，选中态蓝底（照对标播放器）。 */
+     private inner class RowListAdapter(private val row: Row) : BaseAdapter() {
+         override fun getCount(): Int = row.options.size
+diff --git a/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java b/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+deleted file mode 100644
+index 40d9a1d..0000000
+--- a/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
++++ /dev/null
+@@ -1,89 +0,0 @@
+-package io.flutter.plugins;
+-
+-import androidx.annotation.Keep;
+-import androidx.annotation.NonNull;
+-import io.flutter.Log;
+-
+-import io.flutter.embedding.engine.FlutterEngine;
+-
+-/**
+- * Generated file. Do not edit.
+- * This file is generated by the Flutter tool based on the
+- * plugins that support the Android platform.
+- */
+-@Keep
+-public final class GeneratedPluginRegistrant {
+-  private static final String TAG = "GeneratedPluginRegistrant";
+-  public static void registerWith(@NonNull FlutterEngine flutterEngine) {
+-    try {
+-      flutterEngine.getPlugins().add(new dev.flutter.packages.file_selector_android.FileSelectorAndroidPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin file_selector_android, dev.flutter.packages.file_selector_android.FileSelectorAndroidPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.pichillilorenzo.flutter_inappwebview_android.InAppWebViewFlutterPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin flutter_inappwebview_android, com.pichillilorenzo.flutter_inappwebview_android.InAppWebViewFlutterPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.it_nomads.fluttersecurestorage.FlutterSecureStoragePlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin flutter_secure_storage, com.it_nomads.fluttersecurestorage.FlutterSecureStoragePlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.mediadevkit.fvp.FvpPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin fvp, com.mediadevkit.fvp.FvpPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.alexmercerind.media_kit_libs_android_video.MediaKitLibsAndroidVideoPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin media_kit_libs_android_video, com.alexmercerind.media_kit_libs_android_video.MediaKitLibsAndroidVideoPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.alexmercerind.media_kit_video.MediaKitVideoPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin media_kit_video, com.alexmercerind.media_kit_video.MediaKitVideoPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new dev.fluttercommunity.plus.packageinfo.PackageInfoPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin package_info_plus, dev.fluttercommunity.plus.packageinfo.PackageInfoPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new io.flutter.plugins.pathprovider.PathProviderPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin path_provider_android, io.flutter.plugins.pathprovider.PathProviderPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.aaassseee.screen_brightness_android.ScreenBrightnessAndroidPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin screen_brightness_android, com.aaassseee.screen_brightness_android.ScreenBrightnessAndroidPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new eu.simonbinder.sqlite3_flutter_libs.Sqlite3FlutterLibsPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin sqlite3_flutter_libs, eu.simonbinder.sqlite3_flutter_libs.Sqlite3FlutterLibsPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new io.flutter.plugins.urllauncher.UrlLauncherPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin url_launcher_android, io.flutter.plugins.urllauncher.UrlLauncherPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new io.flutter.plugins.videoplayer.VideoPlayerPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin video_player_android, io.flutter.plugins.videoplayer.VideoPlayerPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new com.kurenai7968.volume_controller.VolumeControllerPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin volume_controller, com.kurenai7968.volume_controller.VolumeControllerPlugin", e);
+-    }
+-    try {
+-      flutterEngine.getPlugins().add(new dev.fluttercommunity.plus.wakelock.WakelockPlusPlugin());
+-    } catch (Exception e) {
+-      Log.e(TAG, "Error registering plugin wakelock_plus, dev.fluttercommunity.plus.wakelock.WakelockPlusPlugin", e);
+-    }
+-  }
+-}

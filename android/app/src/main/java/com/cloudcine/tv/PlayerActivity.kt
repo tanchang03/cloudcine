@@ -26,6 +26,7 @@ import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
+import androidx.media3.common.text.CueGroup
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.Cache
@@ -89,6 +90,18 @@ class PlayerActivity : Activity() {
     private lateinit var controls: PlayerControlsView
     private lateinit var confirmExit: ConfirmDialogView
 
+    /** 整页根容器。字幕抬高时要读它的高度（见 [updateSubtitleInset]）。 */
+    private lateinit var root: FrameLayout
+
+    /**
+     * 内嵌字幕的**绘制出口**。
+     *
+     * ⛔ 少了它（或少了 [Player.Listener.onCues] 那一句），字幕就是
+     *    「选得上、不上屏、零报错」—— `TextRenderer` 解出来的 cue 没有
+     *    任何 `TextOutput` 接，被直接丢掉。机理见 [SubtitleOverlayView]。
+     */
+    private lateinit var subtitles: SubtitleOverlayView
+
     private val ui = Handler(Looper.getMainLooper())
 
     /**
@@ -97,7 +110,7 @@ class PlayerActivity : Activity() {
      * ⛔ 到点也不能无脑收 —— 先问 [keepControlsVisible]。见那边的注释。
      */
     private val hideControls = Runnable {
-        if (!keepControlsVisible()) controls.visibility = View.GONE
+        if (!keepControlsVisible()) setControlsShown(false)
     }
 
     private var isBuffering = false
@@ -318,7 +331,7 @@ class PlayerActivity : Activity() {
         //    MATCH_PARENT —— 否则片源（如 1440×612，2.35:1）会被拉伸铺满
         //    1920×1080 的屏，画面横向拉长。OSD 与浮层则要留在外层铺满整屏，
         //    否则菜单会被一起压进画面矩形、在信箱边上留一圈点不到的死区。
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         videoBox = AspectRatioFrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
@@ -331,6 +344,21 @@ class PlayerActivity : Activity() {
         )
         root.addView(
             videoBox,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+
+        // ── 字幕（内嵌字幕的上屏出口）──────────────────────────────
+        //
+        // ⛔ 与统计浮层同理，它**不进 AspectRatioFrameLayout**：要能盖到信箱
+        //    边上，也要能在 OSD 打开时抬到菜单上方（[updateSubtitleInset]）。
+        // ⛔ 顺序有讲究 —— 它在 videoBox **之后**、stats/controls/osd **之前**：
+        //    字幕该被控制栏和菜单压住，而不是反过来。
+        subtitles = SubtitleOverlayView(this)
+        root.addView(
+            subtitles,
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -416,6 +444,9 @@ class PlayerActivity : Activity() {
         )
 
         setContentView(root)
+        // 起播前先把字幕底距摆好：`bottomInsetPx` 默认 0 = 贴屏幕最底，
+        // 那位置在电视上常被过扫描吃掉。见 [updateSubtitleInset]。
+        updateSubtitleInset()
 
         // 两条入口：按 fid 自己取链（正常路径），或直接给 URL（对照用）。
         spec = StreamSpec.fromIntent(intent)
@@ -1067,6 +1098,23 @@ class PlayerActivity : Activity() {
                 // 菜单开着就立刻刷新：用户按完 OK 要马上看到光标跳到新选项上。
                 // （菜单没开时不用重建 View —— 那纯属白干活，`showOsd` 会补上。）
                 if (osd.visibility == View.VISIBLE) rebindOsd()
+            }
+
+            /**
+             * 字幕 cue 到货 —— **内嵌字幕唯一的上屏通道**。
+             *
+             * ⛔ 这一句就是「内嵌字幕选得上、不上屏」的修复本体。
+             *    `TextRenderer` 把 cue 交给注册过的 `TextOutput`；本工程刻意不引
+             *    `media3-ui`，没有 `PlayerView`/`SubtitleView` 那种现成出口，
+             *    而 `Player.Listener` 的 `onCues` 是 media3 给的**等价入口**，
+             *    不需要额外依赖。
+             * ⛔ 别改成只接已废弃的 `onCues(List<Cue>)`：1.5.1 里
+             *    `CueGroup` 版本才是主路径，`CueGroup` 还带 `presentationTimeUs`。
+             * ⚠️ 字幕间隙 ExoPlayer 会回传**空** cue 组，[SubtitleOverlayView]
+             *    按内容去重，空组同样是一次有效的「清屏」。
+             */
+            override fun onCues(cueGroup: CueGroup) {
+                subtitles.setCues(cueGroup.cues)
             }
 
             /**
@@ -1899,12 +1947,15 @@ class PlayerActivity : Activity() {
         rebindOsd()
         osd.resetSelectionForTest()
         osd.visibility = View.VISIBLE
+        // ⛔ 必须紧跟着抬字幕：菜单卡片占了屏幕下半截，不抬的话字幕正好被压住。
+        updateSubtitleInset()
         stats.markKey()
         Log.i(TAG, "OSD 打开（${osdRows.size} 行：${osdRows.joinToString("/") { it.id }}）")
     }
 
     private fun hideOsd() {
         osd.visibility = View.GONE
+        updateSubtitleInset()
         Log.i(TAG, "OSD 关闭")
     }
 
@@ -1923,7 +1974,7 @@ class PlayerActivity : Activity() {
      */
     private fun showControls(autoHide: Boolean = true) {
         if (!::controls.isInitialized) return
-        controls.visibility = View.VISIBLE
+        setControlsShown(true)
         ui.removeCallbacks(hideControls)
         // ⛔ 正在「被读」时就别排这一拍：省一次无谓的唤醒，也让意图在代码里看得见。
         if (autoHide && !keepControlsVisible()) ui.postDelayed(hideControls, CONTROLS_HIDE_MS)
@@ -1937,7 +1988,45 @@ class PlayerActivity : Activity() {
     /** 用户主动收（返回键），**不受缓冲状态阻挡**。 */
     private fun hideControlsNow() {
         ui.removeCallbacks(hideControls)
-        controls.visibility = View.GONE
+        setControlsShown(false)
+    }
+
+    /**
+     * 控制栏显隐的**唯一**入口。
+     *
+     * ⛔ 别退回直接写 `controls.visibility`：字幕的底距要跟着控制栏走
+     *    （见 [updateSubtitleInset]），漏掉一处就会出现「控制栏弹出来把字幕
+     *    压在底下」—— 而这台电视上字幕看不见，用户第一反应是「字幕又没了」。
+     */
+    private fun setControlsShown(shown: Boolean) {
+        if (!::controls.isInitialized) return
+        controls.visibility = if (shown) View.VISIBLE else View.GONE
+        updateSubtitleInset()
+    }
+
+    /**
+     * 重算字幕底距：**贴画面下缘，被控制栏 / OSD 挡住时抬到它们上面**。
+     *
+     * 三档取值（单位 px，本机 density=320 ⇒ 1 dp = 2 px）：
+     *   * 什么都没有 —— [SUBTITLE_BASE_INSET_DP]，正好落在宽银幕片源的下信箱边里；
+     *   * 控制栏亮着 —— 抬到控制栏上沿再留一口气；
+     *   * OSD 开着 —— 抬到菜单卡片上沿（卡片是 7×40dp + 28dp，见 `TvOsdView`）。
+     *
+     * ⛔ 用 `maxOf` 而不是相加：控制栏与菜单在布局上**互斥**（菜单开着时不画
+     *    控制栏），相加只会把字幕顶到屏幕中间去。
+     */
+    private fun updateSubtitleInset() {
+        if (!::subtitles.isInitialized) return
+        var inset = dp(SUBTITLE_BASE_INSET_DP)
+        if (::controls.isInitialized && controls.visibility == View.VISIBLE) {
+            // 布局前 `controls.height` 还是 0，用估算值兜底。
+            val h = if (controls.height > 0) controls.height else dp(CONTROLS_FALLBACK_DP)
+            inset = maxOf(inset, h + dp(SUBTITLE_GAP_DP))
+        }
+        if (::osd.isInitialized && osd.visibility == View.VISIBLE) {
+            inset = maxOf(inset, osd.sheetHeightPx() + dp(SUBTITLE_GAP_DP))
+        }
+        subtitles.bottomInsetPx = inset
     }
 
     /**
@@ -2122,5 +2211,26 @@ class PlayerActivity : Activity() {
          * 「每 tick 重建整页」的负担（见 PlayerControlsView 的注释）。
          */
         private const val PLAYHEAD_TICK_MS = 1_000L
+
+        /**
+         * 字幕**底距**（dp）。
+         *
+         * 1080p / density=320 下是 144 px。挑这个值是为了让宽银幕片源（如
+         * 2.39:1）的字幕正好落在下信箱边里 —— 信箱边实测约 138 px 高。
+         * ⛔ 别按「贴着屏幕底」来设：屏幕最底下那几十像素在电视上常被
+         *    机壳/过扫描吃掉，贴底的字幕会被切掉下半截。
+         */
+        private const val SUBTITLE_BASE_INSET_DP = 72
+
+        /** 字幕与控制栏 / 菜单之间的呼吸位（dp）。 */
+        private const val SUBTITLE_GAP_DP = 16
+
+        /**
+         * 控制栏高度的**估算值**（dp），只在布局完成前兜底用。
+         *
+         * 布局后一律以 `controls.height` 实测为准；估算值存在的意义是
+         * 「控制栏刚 VISIBLE、还没量过」的那一拍别把字幕压在它底下。
+         */
+        private const val CONTROLS_FALLBACK_DP = 96
     }
 }

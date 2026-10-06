@@ -5253,3 +5253,227 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 - **Windows MSI（10-05）**：`windows/packaging/cloudcine.wxs` + `build_package.ps1`（per-user 装到 `%LOCALAPPDATA%\Programs\CloudCine`，`InstallerVersion=500`）。⛔ **启动条件绝不能写 `VersionNT >= 1000`**：Windows Installer 把 VersionNT **钳在 603** ⇒ 该条件**在任何真实 Windows 上都失败**；判据用 **`WindowsBuild >= 10240`** + `Installed OR`（微软 KB3202260）。⚠️ **MSI 条件语法不支持括号**。⛔ `-sice` 只压 ICE38/ICE64/ICE91，**别换成 `-sval`**。
 - **macOS 签名与凭证**：⛔ 不许写 `keychain-access-groups`（→ **启动即 SIGKILL**）；`app-sandbox` 必须 **`false`**；两份都要 `network.client/server`·`files.user-selected.read-write`；`DebugProfile` 另加 `get-task-allow`。凭证 macOS 走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串，其余平台 `flutter_secure_storage`），密钥由 `IOPlatformUUID` 派生（**别掺易变环境值**）。
 - **测试取向**：纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据=红的在不在我改的文件里。
+
+---
+
+# ★★ 2026-10-06 17:50 仓库结构大调整（本节取代旧记忆中所有「Flutter 在 Android 上」的结论）
+
+用户定调：**Android 走原生 Kotlin 独立工程；Flutter 只用于 PC 端（macOS / Windows）**；
+范围收紧为「只需要关心 `android/`，desktop 先不用理会」。
+
+## 结构
+```
+仓库根/
+├── android/   ← Android 端正式实现（原生 Kotlin，包名 com.cloudcine.tv，原 prototype/cloudcine）
+├── lib/ macos/ windows/ test/ packages/ pubspec.yaml …  ← Flutter（PC 端）
+├── docs/ tool/ .github/
+```
+- Flutter 的 Android 宿主（`com.cloudcine.cloudcine`，含 `TvOsdView.kt` 等 22 个受控文件）
+  **整体移出仓库**，备份在 `~/.workbuddy-ai/backups/cloudcine-flutter-android-20261006-173700/`。
+- `git mv prototype/cloudcine android`；`prototype/` 已删；`rootProject.name = cloudcine-android`。
+- `android/app/build.gradle.kts`：新增 release 构建类型 + 发布签名
+  （`android/keystore.properties` → 环境变量 → 退回 debug 签名，三者兜底）；
+  `brandReleaseApk` 把产物另存为 `cloudcine-<ver>-b<code>-android.apk`。
+- ⛔ `Copy` **不能写回 `outputs/apk/release/`**：那是 `createReleaseApkListingFileRedirect`
+  的声明输出，往里写会触发 Gradle 隐式依赖校验直接失败 ⇒ 品牌化产物落 `outputs/apk/branded/`。
+- ⛔ `isMinifyEnabled` 故意保持 false：media3 的 extractor/renderer 有反射按名加载，
+  规则写在 `proguard-rules.pro` 里但**没在真机跑过完整回归**。
+- CI：`ci.yml` / `release.yml` 的 Android job 从「Flutter APK」改成原生 Gradle
+  （不装 Flutter、不装 cmake/NDK，`working-directory: android`，校验包名 `com.cloudcine.tv`）。
+  macOS / Windows 两个 Flutter job 未动。
+
+## 已被取代的旧结论（只作历史证据）
+- Flutter 侧 fvp/ExoPlayer 引擎路由、`app_providers.dart` 的 Android 分支、
+  `media_kit_video` 在 Android 上写死 `createSurfaceProducer()`（做不到零拷贝）、
+  `TvOsdView` 挂在 FlutterView 之上、Dart 主 isolate 中继喂 4K ——
+  **这些都只对「Flutter 跑在 Android 上」成立，现已不适用**。
+- 云影在 Android 上**现在是原生**：ExoPlayer + SurfaceView 零拷贝 + 8 连接并行取流
+  + 磁盘旁路预取 + 原生 View OSD。参考实现是 `kuakewangpan/`（夸克 TV 版 APK 逆向）
+  与原型，两者结论仍有效（它们本来就是原生的）。
+
+## 遗留待办（我没动）
+- 根目录 `tool/adb_tv.sh` 与 `tool/build_android.sh` 已死（指向已删的 Flutter Android 宿主
+  与 `build/app/outputs/flutter-apk`）⇒ 替代品 `android/tool/adb_tv.sh`。
+- `android:largeHeap` / `applicationId = com.cloudcine.tv` 保留未改（换包名会让已装设备
+  变成另一个应用、且丢掉磁盘缓存，属产品决策）。
+- `versionCode = 1 / versionName = "1.0.0"`，发版前需手动递增。
+- `packages/video_player_android` 仍在仓库根（pubspec 的 path 依赖，删了 `flutter pub get`
+  会失败）；它是 Android-only 插件，PC 端用不到。
+
+---
+
+# ★★ 媒体库数据结构 —— 跨端同步的**唯一契约**（Android 端实现媒体库时的逐项依据）
+
+## 1. 库文件 `cloudcine.sqlite`
+- PC 端路径：`getApplicationSupportDirectory()/cloudcine.sqlite`（`openAppDatabase()`）。
+- drift `schemaVersion = 16`，写在 SQLite 的 **`user_version`** pragma 里。
+- 7 张表（列名 = Dart 字段的 snake_case，权威定义 `lib/data/db/tables.dart`）：
+
+| 表 | 主键 | 说明 |
+|---|---|---|
+| `media_items` | `id`（文本 `provider:fileId`） | 文件级媒体项 |
+| `media_works` | `key`（文本，归组键） | 作品级元数据 / 海报 / 简介 |
+| `subtitle_refs` | `id`（文本 `itemId#fileId`） | 字幕引用，**只存引用不存正文** |
+| `scan_cursors` | `provider` | 续扫游标，BFS 队列存 JSON |
+| `settings` | `key` | 通用键值设置（TMDB key / 豆瓣 Cookie…） |
+| `playback_prefs` | `itemId` | **逐文件**播放偏好，`prefs` 存 JSON |
+| `download_tasks` | `id`（文本 `provider:fileId`） | 下载记录，`.part` 是断点真源 |
+
+### 关键列（跨端读写必须一致）
+- `media_items`：`id provider file_id name dir_id dir_path group_key kind title year season
+  episode episode_end part part_label container resolution size_bytes modified_at duration_ms
+  source video_codec audio_codec flags release_group is_sample_or_extra first_seen_at
+  updated_at last_played_at resume_position_ms max_position_ms thumb_url face_anchor_x
+  video_width video_height`
+- `media_works`：`key provider kind category category_manual title original_title year overview
+  poster_url poster_file poster_face_x backdrop_url backdrop_file rating genres genres_manual
+  online_id source scraped_at item_count total_bytes season_count last_modified_at
+  first_seen_at last_played_at updated_at merged_into intro_start_ms intro_end_ms`
+- ⛔ `category` 默认**空串**（= 还没判定过），`other` 是**判定结果**，两者不能混。
+- ⛔ `resolution` / `status` / `container` 存**枚举名字符串**（不存序号：加档时序号错位会静默变档）。
+- ⛔ `flags` / `genres` 是 **JSON 数组字符串**，默认 `'[]'`。
+- ⛔ 布尔列 drift 存 **0/1 整数**，默认 false。
+- ⛔ 时间列 drift 存 **Unix 秒**（`DateTimeColumn` 默认 `DateTimeToSql`，可带小数秒）——
+  跨端解析要注意单位。
+- ⛔ 主键都是**文本**，不是自增。
+- 迁移史 v1→v16 见 `lib/data/db/app_database.dart` 的 `onUpgrade`；
+  **有回填逻辑的只有 v6 / v7 / v10 / v15**，其余靠 NULL / DEFAULT 语义自然兼容。
+
+## 2. 备份包 `.ccbak`（`lib/domain/services/library_backup_service.dart`）
+```
+[magic 'CCBK'(4)][manifestLen(4, BE uint32)][manifest JSON utf8]
+[dbLen(4, BE uint32)][db 原始字节][posters 打包字节(可选)]
+```
+- 海报目录打包（`_packDirectory`）：每文件 `[nameLen(4)][name utf8][dataLen(4)][data]`，
+  末尾 `[0]` 终止；解包 `_unpackDirectory` 读不懂就 break。
+- 扩展名 `.ccbak`；网盘默认目录 **`云影备份`**（`LibraryBackupService.defaultBackupDir`）。
+- manifest 字段：`deviceId / deviceName / createdAt / libraryModifiedAt / schemaVersion /
+  fileNames / note`；`fileNames` 含 `cloudcine.sqlite` 与（有海报时）`posters/`。
+- 同名覆盖是**先删后传** ⇒ 上传文件名**必须带时间戳**（否则一次失败的上传会把上一份也带走）。
+
+### ★★ 同步判据（LWW）
+- **比的是 `libraryModifiedAt`（库内容最后变更时间），绝不是 `createdAt`（备份文件生成时间）**。
+  用 `createdAt` ⇒ 本机永远"新" ⇒ 只会把网盘上的好备份冲成空库。
+  空库没有 `libraryModifiedAt`，`effectiveModifiedAt` 退化成 epoch ⇒ 远程自然赢（新机器该有的行为）。
+- 两侧空库规则：本地空库（`hasLibraryContent == false`）**让远程赢**；
+  远程空备份**绝不覆盖本地**（否则空库会把本地攒好的清掉）。
+- 冲突：**不同设备**且时间差 < 60 s（`conflictsWith`）。
+- `deviceId` 目前 = `${Platform.localHostname}_${Platform.operatingSystem}`。
+- ⛔ 不备份网盘凭证（会话 Cookie 会过期，新机器必须重新扫码登录）。
+- ⛔ `includeSettings` / `restoreSettings` 目前是**空开关**（只改日志与 `note`）——
+  导出的是整个 db 文件原始字节，SQLite 没法在字节层剔表；UI 三条通道全传 `true`。
+- 要真正做到「不带走设置」：`VACUUM INTO` 一份副本 → 副本上 `DELETE FROM settings` → 读副本字节（**目前没做**）。
+
+---
+
+# 附：MEMORY.md 全量快照（2026-10-06 19:2x，为给 MEMORY.md 瘦身而整体下沉；此快照是当时的最新版）
+
+# 云影（cloudcine）项目长期约定
+
+**两个互不引用的工程**（10-06 17:50 定调）：
+- `android/` —— ★ **Android / Android TV 正式实现**：原生 Kotlin，包名 `com.cloudcine.tv`。
+- `lib/ macos/ windows/ pubspec.yaml` —— **Flutter PC 端（macOS / Windows）**，含完整媒体库 / 刮削 / 备份同步 / 播放器。
+- 本机通用事实（gvm / `NO_PROXY` / 沙箱 / `ps`→`pgrep` / `git push` 要 `HOME` / **同文件两条 Edit 会互相覆盖**）见 `~/.workbuddy-ai/MEMORY.md`。
+- **理由、实测证据、逐行细节在 `HOWTO.md`**；逐日经过在 `YYYY-MM-DD.md`；Android 产品文档在 `android/README.md`。本文件只留**红线 + 标识符**。
+- ⚠️ 本文件**超过约 1.1 万字符就被注入截断** ⇒ 加新条目**先删旧的**；细节一律下沉 `HOWTO.md`。
+
+## 仓库结构（10-06）
+- 用户定调：**Android 走原生 Kotlin 独立工程；Flutter 只用于 PC 端**；范围「只需要关心 `android/`」。
+- Flutter 的 Android 宿主（`com.cloudcine.cloudcine`，含 `TvOsdView.kt` 等 22 个文件）**整体移出仓库**，备份在 `~/.workbuddy-ai/backups/cloudcine-flutter-android-20261006-173700/`。`git mv prototype/cloudcine android`；`prototype/` 已删。
+- ⛔ ⇒ **旧记忆里一切「Flutter 在 Android 上」的结论都失效**（fvp/ExoPlayer 路由、media_kit 零拷贝、TvOsdView 挂 FlutterView、Dart 主 isolate 中继……），只对 PC 端或历史取证有效。
+- ⛔ 根目录 `tool/adb_tv.sh` / `tool/build_android.sh` **已死** ⇒ 用 `android/tool/adb_tv.sh`。
+- ⛔ `packages/video_player_android` 仍在仓库根（pubspec path 依赖，删了 `flutter pub get` 会失败）。
+- ⛔ `applicationId=com.cloudcine.tv` / `versionCode=1` / `versionName=1.0.0` 保留未改（换包名 = 已装设备变另一个应用且丢磁盘缓存，属产品决策）。
+
+## 版本控制
+- **攒够一小轮就 commit**；`git clean` 先 `-nd` 干跑（untracked 被 `-df` 删掉**救不回**）。
+- ⛔ **不代用户 `git add`/`git commit`**（分别授权）。提交前核对 `git diff --cached`：用户中途 `git add` 存过快照时，会**静默提交一个已废弃但能编译的设计**，修法 `git add -A`。
+- ⛔ **别对仓库文件跑 `dart format`**；补救 `git show HEAD:<f>`。
+
+## ★★ 媒体库数据结构 —— 跨端同步的**唯一契约**（逐项依据见 HOWTO §同名章节）
+### 1. 库文件 `cloudcine.sqlite`
+- PC 端路径 `getApplicationSupportDirectory()/cloudcine.sqlite`；drift `schemaVersion = 16`，写在 SQLite 的 **`user_version`** pragma 里。
+- 7 张表（列名 = Dart 字段 snake_case，权威定义 `lib/data/db/tables.dart`）：
+  `media_items`（PK `id`）· `media_works`（PK `key`）· `subtitle_refs`（PK `id`）· `scan_cursors`（PK `provider`）· `settings`（PK `key`）· `playback_prefs`（PK `itemId`）· `download_tasks`（PK `id`）。
+- ⛔ 主键全是**文本**（`provider:fileId` 口径），不是自增。
+- ⛔ `media_works.category` 默认**空串**（= 还没判定过），`other` 是**判定结果**，两者不能混。
+- ⛔ `resolution` / `container` / `download_tasks.status` 存**枚举名字符串**（不存序号：加档时序号错位会静默变档）。
+- ⛔ `flags` / `genres` 是 **JSON 数组字符串**，默认 `'[]'`。布尔列存 **0/1 整数**。
+- ⛔ 时间列 drift 存 **Unix 秒**（`DateTimeToSql`，可带小数秒）—— 跨端解析注意单位。
+- 迁移 v1→v16 见 `app_database.dart` 的 `onUpgrade`；**有回填的只有 v6/v7/v10/v15**，其余靠 NULL / DEFAULT 语义自然兼容。
+
+### 2. 备份包 `.ccbak`（`lib/domain/services/library_backup_service.dart`）
+```
+[magic 'CCBK'(4)][manifestLen(4, BE)][manifest JSON utf8]
+[dbLen(4, BE)][db 原始字节][posters 打包字节(可选)]
+```
+- 海报打包：每文件 `[nameLen(4)][name utf8][dataLen(4)][data]`，末尾 `[0]` 终止。
+- 扩展名 `.ccbak`；网盘默认目录 **`云影备份`**（`defaultBackupDir`）。manifest：`deviceId / deviceName / createdAt / libraryModifiedAt / schemaVersion / fileNames / note`。
+- 同名覆盖是**先删后传** ⇒ 上传文件名**必须带时间戳**。
+- ★★ **同步判据是 `libraryModifiedAt`（库内容最后变更时间），绝不是 `createdAt`（备份文件生成时间）**。用 `createdAt` ⇒ 本机永远"新" ⇒ 只会把网盘上的好备份冲成空库。空库无此值 ⇒ `effectiveModifiedAt` 退化成 epoch ⇒ 远程自然赢。
+- ★ 本地空库（`hasLibraryContent == false`）**让远程赢**；远程空备份**绝不覆盖本地**。冲突：不同设备且时间差 < 60s（`conflictsWith`）。
+- ⛔ 不备份网盘凭证（会话 Cookie 会过期，新机器必须重新扫码）。
+- ⛔ `includeSettings` / `restoreSettings` 是**空开关**（导出的是整个 db 原始字节，SQLite 没法在字节层剔表）；UI 三条通道全传 `true`。
+
+## 架构（Flutter PC 端）
+`core/` 纯工具 · `domain/` 实体+服务+适配器抽象（**不 import Flutter/drift**）· `data/` 夸克/drift/刮削/凭证 · `ui/` Riverpod 组合根 + go_router + 页面。跨层信号放叶子文件。
+
+## ★★ 4K 卡顿的真因：**播错了档位**（10-06 Mac 实测，`tool/quark_probe.py`）
+`黑亚当 2160p`（7490s，原文件 21.9 GiB）：原画 3840×1606 / 21.9 GiB / **3.00 MB/s**；`4k` 3840×1606 / 4.6 GiB / **0.63 MB/s**；`super` 1440×602 / 1.03 GiB / 0.14 MB/s；`high` 960×402 / 678 MiB / 0.09 MB/s。
+- ★ **夸克自己的 `default_resolution` 是 `super`**；云影默认播**原画** ⇒ 单连接喂不动 ⇒ 靠 8 连接中继 ⇒ 主线程饿死。**这就是全部秘密**（不是解码、不是渲染面、不是 OSD 画法）。
+- ★ 单连接直连实测（Mac，带 Cookie）：`4k` **4.57 MiB/s**、原画 **6.76 MiB/s** ⇒ 够用。「直连只有 1.1 MB/s」**只在电视 WiFi 上成立**。
+- ⇒ 治本：**默认播转码档（≥`4k`），不播原画**。Android 端现状：`probeThroughput` 测速 → `chooseQuality` 选「带宽扛得住的最清晰档」（同分辨率取最省带宽，留 30% 余量）。
+
+### 直链 Cookie 规则（10-06 四种组合实测，★ 极易踩）
+| 请求带的 Cookie | 结果 |
+|---|---|
+| 带 `__puus`（**新旧都行**） | **206** |
+| 有 `__pus` 等会话 Cookie 但**缺** `__puus` | **412** |
+| 完全不带 Cookie | **206** |
+
+⇒ **「要么不带，要么带全」**；带一半最坏（列表能刷、一播就 412/转圈）。`__puus` 在**每个** API 响应里轮换下发（Flutter `quark_adapter.dart:1285` / Android `PanApi.absorbCookies` 都已处理）。
+- ⛔ `batch/file/play/info` **必须带 `pr=ucpro&fr=pc`**，漏了回 `HTTP 401 code=31001 require login [guest]`（像没登录，其实缺参数）。
+- ⚠️ `hls_type` 实测 **`none`** ⇒ 转码档是**普通 MP4**（`video/mp4`），**不是 m3u8**。
+- ⛔ `HttpURLConnection.useCaches = false` 不能省：播放地址带签名，命中缓存会拿到过期地址（「列目录正常、一播就 403」）。
+- ⛔ 解析 `video_list` **必须跳过 `audio_list`**：那条是纯音频流，没有分辨率字段，容易被当成「原画」⇒ 有声音、进度条在走、**没画面、不报错**。
+
+## Android 原生端（`android/app/src/main/java/com/cloudcine/tv/`）
+> 产品文档与全部踩坑见 **`android/README.md`**；本节只留最容易再犯的红线。
+- 形态：`MainActivity`（登录态路由）→ `LoginActivity`（CAS 扫码，zxing）→ `BrowseActivity`（`ListView`，天生支持 D-pad）→ `PlayerActivity`（ExoPlayer + `SurfaceView` 零拷贝 + 原生 OSD）。
+- `pan/`：`PanHttp`（`HttpURLConnection`，**不引 OkHttp**）/ `PanApi`（列目录 / 取链 / `absorbCookies`）/ `QrLogin`（业务码读 **`bizCode`**：网盘用 `code`、CAS 用 `status`）/ `PanModels` / `CredStore` / `Bg`（后台池，主线程只 setText）。
+- 取流 `ParallelRangeReader` + `ParallelRangeDataSource`（1 条 Range 拆 8 连接）；缓存 `DiskPrefetcher`（**旁路**预取，不走 loader）+ `PrefetchCache` / `DiskCacheEvictor` / `DiskSpace`。
+  - ⛔ 缓存键 = **`quark:<fid>:<画质档 id>`**，**不是 URL**。⛔ **档位 id 不能省**：原画与转码档是不同字节流，只按 fid 会把原画字节喂给转码档解析器 ⇒ **解码出乱码且不报错**。⛔ `cacheKeyFactory` 必须**优先认 `dataSpec.key`**；两边复用同一个 `cacheKeyFor()`。
+  - ⛔ **播放器不许写磁盘缓存**（`setCacheWriteDataSinkFactory(null)`）：两个写者撞同一 span 时 `SimpleCache.startFile` 抛 `IllegalStateException`，而 `CacheDataSource` 只吞 `IOException` ⇒ 直接崩。写入方只留 `DiskPrefetcher`。
+  - ⛔ 预取器**绝不能在预取线程读 `player.currentPosition`**（未捕获异常带走整个进程）。只读主线程刷新的快照。⛔ `bufferedPosition` **必须在 `seekTo` 之前读**。
+- `SeekPlan`（纯函数）：拖动中不动进度、**松手才 `seekTo`**（遥控器自动重复 ~20 次/秒 ⇒ seek 风暴 ⇒ 2 秒 28 次 seek 打满 Java 堆）；前 2 秒不加速，之后 ×2/×4/×8/×12；兜底窗口 800 ms **必须大于遥控器自动重复间隔**。
+- `TvOsdView`（原生 OSD，挂 `android.R.id.content` 之上）。⛔ 回调只回传**行下标**，行数不固定 ⇒ 一律按 `TvOsdView.Row.id` 分派，别 `when(row){0->…}`。
+- ⛔ 速率**不能**取 `AnalyticsListener.onBandwidthEstimate`（一次传输完才发一次）⇒ 用 `CountingDataSource` 在 `read()` 上数字节。⛔ 目录判定**只认 `dir` 布尔位**，`file_type` 仅兜底（`0`=目录、`1`=文件，与直觉相反）。
+- ⛔ `ListView` 用 `divider = null` 看不出选中项；⛔ XML 注释里不能出现 `--`。调试通道 `Log.i("CloudCine", "[统计] …")` / `[按键] → 下一帧 x.x ms`（`android/tool/adb_tv.sh log`）⛔ **不是调试残留**：有硬件视频层时 `screencap` 拿不到画面、播放中 `uiautomator dump` 也拿不到 UI。
+- ⛔⛔ **`UI fps` 不可用于比较**：`StatsOverlay.doFrame` 里 `choreographer.postFrameCallback(this)` 自己重排自己 ⇒ 恒≈刷新率。唯一可比的是**「按键→下一帧」**与 SurfaceFlinger `--latency`。
+
+## Flutter PC 端红线（**逐条理由与实测在 HOWTO**，此处只列标识符）
+- **引擎/硬解**：⛔ `hwdec` 写 **`mediacodec,auto-safe`**（逗号=回退）；`VideoControllerConfiguration.hwdec` 与 `PlayerBufferConfig.apply` **必须同值**且都在 `create()` 之前；判据读 `hwdec-current`（带 `copy` = 拷贝档，⛔ 空串不算）。⛔⛔ **10-04 那两轮别再走**：① 只加 `VideoViewType.platformView` →「更卡、音画不同步」；② 再加 `tunnel: true` →「4K 看不到画面，只有声音」。`main.dart:57` 只在 **macOS** 注册 fvp；DV P5 唯一出路是 **fvp/libmdk**。契约 `playback_engine.dart` / 路由 `playback_engine_router.dart` / 画面 `playback_surface.dart`。
+- **中继** `data/stream/local_stream_relay.dart`：⛔ **没有 `Isolate`/`compute`**（全在 Dart isolate）；只在用户显式选原画时才需要。`core/utils/http_range.dart` = `sealed class RangeRequest`（`NoRangeRequest`/`SatisfiableRange`/`UnsatisfiableRange`）+ `parseRangeRequest()`：⛔ **起点越界必须回 416**，别把「不知道流多长」（→200）与「要不到」（→416）合成一个返回值（旧实现用一个 `null` 表达两件事 ⇒ 416 成死代码、测试一直绿 ⇒ media3 丢前几 GB 对齐偏移 ⇒ **「正在加载…」永不消失**）。⛔ **`chunkSize` 别放大**（2 MiB→8 MiB 后首块 1.18s→15~45s、零成功播放；回归测试断言 `chunkSize/0.6MiB < 5000ms`）；提速调 `connections`/`prefetchBytes`。
+- **媒体库三轴（不能互推/合并）**：`MediaKind`（结构，只看文件名 `SxxExx`）· `MediaCategory`（语义，落 `media_works.category`）·「最近播放」（视图 `LibraryFilter.playedOnly`，与 `category` 互斥）。层级**不落库**（现算）：**季在外、部在内**，某层**少于 2 个选项不画**。⛔ **归一 = 打标记**（`mergedInto`）：不删行、不改 `group_key`、**不许链式**；⛔ `mergeWorkForUpsert` **无条件取旧值**（`mergedInto` / `introStartMs`/`introEndMs` 都是「扫描不许清」的列）。⛔ **目录名当系列名**：判定单元是**目录不是文件**（`DirectoryTitle`），**四处调用点都要传 `dirPath`**。⛔ 筛选「已刮削」= **`source==online`**（不是 `isScraped`）。⛔ `posterFaceX` 与 `posterUrl` **必须成对**（`faceAnchorX` 与 `thumbUrl` 同源成对）。⛔ 路径归一化只在 `core/utils/drive_paths.dart`。⛔ 字幕字节走 `decodeTextBytes`（先 UTF-8 后 GBK）。
+- **播放器/页面**：⛔ **两份实现，别只改一个**（`player_window_app.dart` + `player_page.dart`：键位表/菜单/偏好还原/换流提示/hover 唤醒都要改两处）。⛔ 起播只走 `Media(start:)`（入口 `PlaybackMedia.build`，`seek` 只在播放中跳转；⚠️ 它**静默** ⇒ 换源后核对 `RestoreSeek`）。⛔ 进度两列别合并：`resumePositionMs`（起播，看完清）vs `maxPositionMs`（v15，只增不减）。⛔ 落库接 `PlaybackController.onPositionTick`，不暴露 `Player`。**音效 ≠ 音轨**（⛔ `af set` 返回值不能当依据；⛔ macOS `audio-spdif` 直通必卡死）。
+- **侧栏五项** 媒体库 `/library` · 文件夹 `/folders` · 扫描 · 下载 · 设置：⛔ `app_shell._items` 与 `app_router.branches` **必须同序**（判据是下标）；文件夹读**网盘实时目录**、媒体库读**本地索引**，**搜索词各一份**。
+- **目录视图**：三组**目录 → 视频 → 其他文件**（组间顺序是**结构**）。⛔ 入库判据只有 `classifyEntry` 一处。⛔ 下载取链**复用 `adapter.resolveStream`**（别打 `/file/download`，>50MiB 直接 23018）。
+- **下载（v16）**：⛔ `.part` 是断点**唯一真源**；服务端**忽略 Range 回 200 必须从 0 重写**；`parse` 读不懂退 **paused**。
+- **文件夹模式**：本地索引只做**「已入库」叠加层**，共用 `media_entry_classifier.dart`（镜像判定在视频判定**之前**）。⛔ **绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。
+- **TV**：`isTvLayout` = android + 逻辑宽≥960（⛔ 判据读 view 宽，页面实得 624，**壳外页实得 960**）。⛔ 页头 `actions` 必须 `Wrap`；⛔ **过扫描内边距只有 `app_shell` 一处**；⛔ 遥控器 **↓ 绝不接管**；⛔ **`SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。
+- ⛔ **播放页 OSD 卡顿**：整页 rebuild ≈10 次/秒（`bufferEnd` 没节流）+ `SubtitleViewConfiguration` 无 `operator ==`（内联 new ⇒ 每拍重建）+ `DebugOverlay` 的 `kDebugOverlayEnabled = true` **硬编码**（release 也显示，每秒重建整棵树 + spawn 一个 `df`）。
+
+## 资源采样 / 电视取证（细节 §HOWTO）
+- ⛔ 采样**周期 10 秒**，**故意不与**视频探针的 21 秒相等（会**拍频锁定**；10 与 21 互质）。**读不到一律留空、整段从日志行消失**，不许退化成 0。⛔ 进程 CPU 是**单核口径**，必须写「折合 N 核」；系统 CPU「忙」**不含 iowait**；`/proc/stat` 只认汇总行 `cpu `。⛔ `/proc/loadavg` 在电视上 `Permission denied`；`/proc/pressure/*` 在 Android 9 不存在 ⇒ 用 `procs_running`/`procs_blocked`，写「可运行进程=N（4 核，超订 x.xx×）」。⛔ `/proc/self/stat` **按最后一个 `)` 切**；⛔ `df` 正则**从左锚定**。macOS 无 `/proc`：内存退回 `ProcessInfo.currentRss`，CPU/负载留空属**正常**。
+- **应用日志是文件、不是 logcat**：`DiagLog` 同步写 `files/logs/cloudcine-YYYY-MM-DD.log`（⛔ mtime 不涨 = 应用真没做事）。**线程名读 `/proc/<pid>/task/*/comm`**（`top -H` 在 Android 9 全打进程名）。⛔ `exec-out screencap` 会被引擎日志污染 ⇒ `shell screencap -p` + `pull`。
+- **★ 视频真帧率用 SurfaceFlinger 量，别信 HUD**：`dumpsys SurfaceFlinger --list` 找层 → `--latency '<层名>'`。实测 `activeBuffer=[3840x2160:3840,Unknown 0x13]` 才是**视频层**；`SurfaceView #0` 是 `1920x1080 RGBA`。⛔ **LMK 会杀掉后台的云影**（电视仅 2.5 GB）⇒ 先 `am kill-all`。
+
+## 打包 / 签名（细节 §HOWTO）
+- **Windows MSI**：⛔ 启动条件绝不能写 `VersionNT >= 1000`（Windows Installer 把 VersionNT **钳在 603** ⇒ 在任何真实 Windows 上都失败）；用 **`WindowsBuild >= 10240`** + `Installed OR`。⚠️ MSI 条件语法**不支持括号**。
+- **macOS**：⛔ 不许写 `keychain-access-groups`（→ 启动即 SIGKILL）；`app-sandbox` 必须 **`false`**。凭证走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串），密钥由 `IOPlatformUUID` 派生。
+- **Android**：Gradle 8.10.2 / AGP 8.7.0 / Kotlin 2.1.0 / compileSdk 36 / minSdk 21 / targetSdk 34 / Media3 **1.5.1**。⛔ **首次构建必须联网**；`JAVA_HOME` 必须 **JDK 21**（JBR 25 会崩 Kotlin）。⛔ 不引 `media3-ui` / AppCompat / Material / RecyclerView。⛔ `isMinifyEnabled` 故意 false。⛔ 品牌化产物落 `outputs/apk/branded/`。
+- ⚠️ **本机出不了 Flutter release/profile 包**：AOT 快照工具是 `darwin-x64`，Apple Silicon 无 Rosetta ⇒ `gen_snapshot ... incorrect architecture`。解法（需 sudo）：`sudo softwareupdate --install-rosetta --agree-to-license`。
+
+## 测试取向
+- 纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据 = 红的在不在我改的文件里。
+- Android：`./gradlew :app:testDebugUnitTest`（107 例 0 失败基线）；`assembleRelease` 会自动带上单测。
