@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -26,8 +27,10 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheKeyFactory
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -164,6 +167,57 @@ class PlayerActivity : Activity() {
      * 那是整个缓存目录的占用，含别的片源的残留（踩过，见 `diskText`）。
      */
     private var cacheRef: Cache? = null
+
+    /** 当前片的夸克 `fid`（来自 `EXTRA_FID`）；空 = 走「直接给 URL」的对照路径。 */
+    private var currentFid = ""
+
+    /** 当前档位的 id（`Quality.id`，如 `super` / `4k` / `ORIGIN`）。 */
+    private var currentQualityId = ""
+
+    /**
+     * **稳定缓存键** —— 磁盘缓存能不能跨会话复用的**唯一**决定因素。
+     *
+     * ## 为什么不能用 URL 当键（2026-10-06 实测）
+     *
+     * media3 的 [CacheKeyFactory.DEFAULT] 就是**拿 URL 字符串当键**。而夸克直链
+     * 是**每次起播现取、带签名的临时地址**（`api.resolve(fid)`）⇒ 换一次会话
+     * URL 就变 ⇒ 键变 ⇒ 上次下的数据**一个字节都命中不了**。
+     *
+     * 实测：盘上 4.9 GB / 61 个 span 文件，强杀重开播同一部片，
+     * 面板 `磁盘 本片` 从 `972 MiB · 8 段` 直接掉到 **`0 B`**；
+     * 缓存目录里还多出两个**全新的键前缀**（`13`/`14`）。用户看到的现象就是
+     * 「同一部片下次打开还要重新缓冲」。
+     *
+     * ## 键的构成
+     *
+     * `quark:<fid>:<画质档 id>`
+     *
+     * ⛔ **画质档 id 不能省**：原画与各转码档是**完全不同的字节流**。只按 `fid`
+     *    做键的话，先看原画、再切到 `super` 档，会把原画的字节喂给转码档的
+     *    解析器 —— 直接解码出乱码/花屏，而且**不报错**。
+     *
+     * ⛔ 空（对照路径，没有 fid）时返回空串，调用方要**退回默认键** ——
+     *    见 [cacheKeyFor]。
+     */
+    private val stableCacheKey: String
+        get() = if (currentFid.isEmpty()) "" else "quark:$currentFid:$currentQualityId"
+
+    /**
+     * 给数据源用的键工厂。
+     *
+     * ⛔ **必须优先认 `dataSpec.key`**：预取器的 `CacheWriter` 会显式带 key
+     *    （`DataSpec(uri, from, length, cacheKey)`），而它带的就是 [stableCacheKey]。
+     *    如果这里无脑返回 [stableCacheKey]、把 `dataSpec.key` 丢掉，两者就分家了。
+     */
+    private val cacheKeyFactory = CacheKeyFactory { dataSpec ->
+        dataSpec.key ?: cacheKeyFor(dataSpec.uri)
+    }
+
+    /** 没有稳定键（对照路径）时退回 media3 默认的「按 URL」行为。 */
+    private fun cacheKeyFor(uri: Uri): String {
+        val k = stableCacheKey
+        return if (k.isNotEmpty()) k else CacheKeyFactory.DEFAULT.buildCacheKey(DataSpec(uri))
+    }
 
     /**
      * 播放头在文件里的**字节位置**，由主线程每秒刷新的快照。
@@ -384,6 +438,9 @@ class PlayerActivity : Activity() {
         val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
         showNotice("正在取链…\n$name")
         api = PanApi(store)
+        // ⛔ 记下来源 fid —— 它是**稳定缓存键**的前半段（见 [stableCacheKey]）。
+        //    不记的话就只能退回按 URL 做键，磁盘缓存永远跨不了会话。
+        currentFid = fid
         Bg.run({ api!!.resolve(fid) }) { pi, err ->
             if (err != null) {
                 Log.e(TAG, "取链失败", err)
@@ -512,6 +569,10 @@ class PlayerActivity : Activity() {
                 "${formatSize(q.sizeBytes)} 需 %.2f MB/s".format(q.requiredMbPerSec),
         )
         current = q
+        // ⛔ 换档**必须**更新缓存键的这半段：原画与转码档是不同的字节流，
+        //    键里不带档位就会互相串数据（解码出乱码、且不报错）。
+        //    见 [stableCacheKey]。
+        currentQualityId = q.id
 
         if (player == null) {
             startPlayer(q.url, headersForCdn())
@@ -667,10 +728,17 @@ class PlayerActivity : Activity() {
         }
 
         val lead = (PrefetchCache.limitBytes() * 7 / 10).coerceAtLeast(64L * 1024 * 1024)
+        val uri = Uri.parse(url)
+        // ⛔ 预取器与播放器的缓存键**必须是同一个** —— 见 [cacheKeyFor]。
+        //    两边各算各的（哪怕公式一样）迟早会分家：只要有一处改了规则，
+        //    预取下的东西播放器就一个字节都命中不了，而现象只是「缓冲白下了」，
+        //    不报任何错。所以这里**复用同一个函数**，不复制公式。
+        val key = cacheKeyFor(uri)
         val p = DiskPrefetcher(
             cache = cache,
             dataSourceFactory = upstream,
-            uri = Uri.parse(url),
+            uri = uri,
+            cacheKey = key,
             startPositionBytes = 0L,
             totalBytes = -1L,
             maxLeadBytes = lead,
@@ -682,7 +750,8 @@ class PlayerActivity : Activity() {
         p.start()
         Log.i(
             TAG,
-            "磁盘预取：已启动（码率 %.2f MiB/s ⇒ 领先上限 ${lead / 1048576} MiB）".format(rate),
+            "磁盘预取：已启动（键 $key · 码率 %.2f MiB/s ⇒ 领先上限 ${lead / 1048576} MiB）"
+                .format(rate),
         )
     }
 
@@ -774,6 +843,11 @@ class PlayerActivity : Activity() {
                 .setCache(cache)
                 .setUpstreamDataSourceFactory(countingParallel)
                 .setCacheWriteDataSinkFactory(null)
+                // ⛔ **必须**换掉默认的键工厂。默认那个拿 URL 当键，而夸克直链
+                //    每次起播都换（带签名），于是磁盘缓存**永远跨不了会话** ——
+                //    实测重开后同一部片 `磁盘 本片` 从 972 MiB 掉到 0 B。
+                //    详见 [stableCacheKey]。
+                .setCacheKeyFactory(cacheKeyFactory)
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         } else {
             countingParallel
@@ -784,6 +858,7 @@ class PlayerActivity : Activity() {
             TAG,
             "数据源：多连接并行（${prefs.parallelConnections} 条 × " +
                 "${ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES / 1024} KiB/块）· " +
+                "缓存键 ${stableCacheKey.ifEmpty { "（按 URL，对照路径）" }} · " +
                 PrefetchCache.describe(this),
         )
 
@@ -1570,10 +1645,26 @@ class PlayerActivity : Activity() {
      * 「菜单能弹出来，但上下键按不动」。
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        // ⛔ 只认 `ACTION_DOWN`。遥控器长按连发在 Android TV 上本来就是
+        val code = event.keyCode
+
+        // ── 快进/快退键的**松手** ──────────────────────────────────
+        // ⛔ 这一段必须放在「只认 ACTION_DOWN」那道门**之前**：用户按住方向键
+        //    时系统只送一串 ACTION_DOWN，松手才送 ACTION_UP —— 那是「拖动结束」
+        //    的**精确**信号。靠它提交，就不可能出现「还没松手，进度已经被调了」。
+        // ⛔ 但覆盖层（退出确认 / OSD）开着时方向键归它们，不能当快进 ——
+        //    所以这里要和下面那两道判断用同一套条件。
+        if (event.action == KeyEvent.ACTION_UP &&
+            !confirmExit.isShowing &&
+            osd.visibility != View.VISIBLE &&
+            onSeekKeyUp(code)
+        ) {
+            stats.markKey()
+            return true
+        }
+
+        // ⛔ 其余只认 `ACTION_DOWN`。遥控器长按连发在 Android TV 上本来就是
         //    一串独立的 ACTION_DOWN，收 ACTION_MULTIPLE 只会多一条没用的分支。
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
-        val code = event.keyCode
 
         // ── 第 0 层：退出确认框 ────────────────────────────────────
         // 它在最上面，开着的时候**所有**按键都归它，一个都不能漏到播放器上
@@ -1688,10 +1779,28 @@ class PlayerActivity : Activity() {
     private var pendingSeekMs = -1L
 
     /**
-     * 把 [pendingSeekMs] 落成真正的 `seekTo`。
+     * 本轮「连续快进」的起始时刻（`elapsedRealtime`）；**`< 0` = 没有在进行中**。
      *
-     * ⛔ 必须能被后续按键**取消并重排**（`removeCallbacks` + `postDelayed`）——
-     *    那正是防抖本身。
+     * 用它算「按住多久了」，交给 [SeekPlan.multiplier] 决定加速倍率。
+     * ⛔ 必须在**提交时清零**：否则下一轮拖动会接着上一轮的时长继续加速，
+     *    变成「按一下就飞到底」。
+     */
+    private var seekSessionStartMs = -1L
+
+    /**
+     * 兜底提交的定时器。
+     *
+     * ⛔ **主路径不是它，而是按键的 `ACTION_UP`**（见 [onSeekKeyUp]）。
+     *    遥控器松手会送来一个 `ACTION_UP` —— 那是「拖动结束」的**精确**信号，
+     *    比任何时间窗口都准。
+     *
+     * ⛔ 之所以还要这个兜底：个别遥控器/机顶盒**不发 `ACTION_UP`**。
+     *    没有兜底就会「按完永远不跳」—— 那比跳早了更糟。
+     *
+     * ⛔ 窗口必须**大于遥控器的自动重复间隔**。实测过：原来的 400ms 小于
+     *    某些遥控器的重复间隔（约 500ms），于是按住时每按一下就提交一次 ——
+     *    用户的原话是「拖动过程中会触发影片进度调整，实际上并没有释放
+     *    拖动按钮」。800ms 留出余量，同时又不会让「按一下」等太久。
      */
     private val seekCommit = Runnable { commitPendingSeek() }
 
@@ -1709,18 +1818,60 @@ class PlayerActivity : Activity() {
      */
     private fun seekBy(deltaMs: Long) {
         val p = player ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (seekSessionStartMs < 0L) seekSessionStartMs = now
+        // 按住越久步子越大 —— 否则 2 小时的片子要按住 36 秒才到底。
+        // 倍率表与「前 2 秒必须 ×1」的约定都在 [SeekPlan.multiplier] 里。
+        val step = SeekPlan.acceleratedDelta(deltaMs, now - seekSessionStartMs)
         // 累加与夹取的算术在 [SeekPlan.step] 里，**有单测**（含溢出与
         // 「时长未知时不许拿 -1 去夹」两个坑）。
-        val target = SeekPlan.step(pendingSeekMs, p.currentPosition, deltaMs, p.duration)
+        val target = SeekPlan.step(pendingSeekMs, p.currentPosition, step, p.duration)
         pendingSeekMs = target
         // 立刻把进度条与时间文字挪过去 —— 「跟手」就来自这一步。
         controls.showPendingSeek(target)
         ui.removeCallbacks(seekCommit)
-        ui.postDelayed(seekCommit, SEEK_DEBOUNCE_MS)
+        ui.postDelayed(seekCommit, SEEK_FALLBACK_MS)
     }
 
     /**
-     * 防抖窗口结束后，把攒下的目标落成**一次**跳转。
+     * 快进/快退键**松手**。
+     *
+     * ⛔ **不能在这里直接 `seekTo`** —— 松手只是「可以提交了」的信号，不是
+     *    「马上提交」。直接提交的话，**快速连点**（`DOWN/UP` 成对、间隔
+     *    几十毫秒）会变成一串 seek，而实测 28 次 seek 就能把堆打满
+     *    （`FATAL EXCEPTION: cc-range-1 / OutOfMemoryError`）。
+     *
+     * 所以这里的动作是：把兜底窗口从 [SEEK_FALLBACK_MS] **缩短**成
+     * [SEEK_RELEASE_MS]。于是：
+     *   * **长按**：一串 `ACTION_DOWN` 不断把窗口重置成 800ms，最后那个
+     *     `ACTION_UP` 把它缩到 150ms ⇒ 松手后 150ms 提交**一次**；
+     *   * **连点**：每个 `UP` 都把窗口缩到 150ms，而下一对按键 67ms 后又
+     *     把它重置 ⇒ 最后一次之后 150ms 才提交，同样只有**一次**；
+     *   * **单击**：150ms 后生效 —— 快到用户感觉不到。
+     *
+     * @return 是否消费掉了这个事件
+     */
+    private fun onSeekKeyUp(code: Int): Boolean {
+        if (!isSeekKey(code)) return false
+        // ⛔ 兜底定时器已经提交过（`pendingSeekMs < 0`）就什么都不做，
+        //    但**事件仍要吞掉** —— 否则它漏给 `super` 会被系统当成一次
+        //    「按键未处理」去做别的默认动作。
+        if (pendingSeekMs >= 0L) {
+            ui.removeCallbacks(seekCommit)
+            ui.postDelayed(seekCommit, SEEK_RELEASE_MS)
+        }
+        return true
+    }
+
+    /** 这几个键才走「累加 + 防抖」那条路（见 [seekBy]）。 */
+    private fun isSeekKey(code: Int): Boolean =
+        code == KeyEvent.KEYCODE_DPAD_LEFT ||
+            code == KeyEvent.KEYCODE_DPAD_RIGHT ||
+            code == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD ||
+            code == KeyEvent.KEYCODE_MEDIA_REWIND
+
+    /**
+     * 把攒下的目标落成**一次**跳转。
      *
      * 走的是与触摸拖拽**同一条** [seekToPosition]：同一份日志、同一份
      * 「内存/磁盘是否命中」判断。两处各写一套必然漂移，而漂移的读数会被
@@ -1728,9 +1879,11 @@ class PlayerActivity : Activity() {
      */
     private fun commitPendingSeek() {
         val target = pendingSeekMs
-        if (target < 0L) return
         pendingSeekMs = -1L
-        seekToPosition(target)
+        // ⛔ 加速档位跟着本轮结束一起清零，否则下一轮会「按一下就飞到底」。
+        seekSessionStartMs = -1L
+        if (target < 0L) return
+        seekToPosition(target, "快进")
     }
 
     private fun showOsd() {
@@ -1803,7 +1956,8 @@ class PlayerActivity : Activity() {
         // 遥控器快进的提交还没落地，用户又去拖了进度条，两个跳转会打架。
         ui.removeCallbacks(seekCommit)
         pendingSeekMs = -1L
-        seekToPosition(target)
+        seekSessionStartMs = -1L
+        seekToPosition(target, "触摸")
     }
 
     /**
@@ -1811,8 +1965,12 @@ class PlayerActivity : Activity() {
      *
      * ⛔ 两处各写一遍 `seekTo` 会让日志口径与「内存/磁盘是否命中」的判断
      *    漂移，而漂移的读数会被当成 bug 追。
+     *
+     * @param source 只进日志：`触摸` / `快进`。排查「谁在拖」时这一栏是
+     *               分水岭 —— 曾经因为看不出是触摸还是按键，把一个
+     *               「松手前就提交」的问题误判成了别的原因。
      */
-    private fun seekToPosition(targetMs: Long) {
+    private fun seekToPosition(targetMs: Long, source: String) {
         val p = player ?: return
         val d = p.duration
         val max = if (d == C.TIME_UNSET || d <= 0L) Long.MAX_VALUE else d
@@ -1830,7 +1988,7 @@ class PlayerActivity : Activity() {
         val inDisk = !inBuffer && diskCacheSnapshot().covers(estimatedBytes(target))
         Log.i(
             TAG,
-            "跳转提交 → ${target / 1000}s（跳前内存缓冲到 ${bufferedBefore / 1000}s，" +
+            "跳转提交[$source] → ${target / 1000}s（跳前内存缓冲到 ${bufferedBefore / 1000}s，" +
                 when {
                     inBuffer -> "内存区间内，不需重新缓冲）"
                     inDisk -> "内存区间外、磁盘缓存命中，不需重新缓冲）"
@@ -1925,14 +2083,29 @@ class PlayerActivity : Activity() {
         private const val SEEK_STEP_MS = 10_000L
 
         /**
-         * 连续快进的**合并窗口**（毫秒）：最后一次按键之后静默这么久，
-         * 才把攒下的目标落成一次真跳转。
+         * **兜底**提交窗口（毫秒）：用户还在按键时，用它等「按完」。
          *
-         * ⛔ 别调到 100ms 以下：遥控器自动重复的间隔本身约 50ms，窗口太短
-         *    就退化成「每次按键都提交」，防抖白做。
-         * ⛔ 也别调大过 600ms：松手后用户会明显感到「等一下才动」。
+         * ⛔ 主路径不是它 —— 是按键的 `ACTION_UP`（见 [onSeekKeyUp]），
+         *    它会把窗口缩短成 [SEEK_RELEASE_MS]。这里只为「遥控器不发
+         *    `ACTION_UP`」的机型兜底，所以宁可给宽一点。
+         *
+         * ⛔ **必须大于遥控器的自动重复间隔**。原来是 400ms，而部分遥控器
+         *    的重复间隔约 500ms ⇒ 按住时每按一下就提交一次，表现成
+         *    「拖动过程中会触发影片进度调整，实际上并没有释放拖动按钮」
+         *    （2026-10-06 用户原话）。800ms 留出余量。
+         * ⛔ 也别调到 1.5s 以上：真遇到不发 `ACTION_UP` 的机型，用户会觉得
+         *    「按完半天不动」。
          */
-        private const val SEEK_DEBOUNCE_MS = 400L
+        private const val SEEK_FALLBACK_MS = 800L
+
+        /**
+         * **松手**之后的提交延迟（毫秒）。
+         *
+         * 用户已经松手，可以尽快生效；但留 150ms 是为了让**连点**也能合并
+         * —— 见 [onSeekKeyUp] 的三种情形。低于 100ms 就接近「每次按键都提交」
+         * 了，连点会退化成 seek 风暴。
+         */
+        private const val SEEK_RELEASE_MS = 150L
 
         /**
          * 「播放头字节位置」快照的刷新周期。

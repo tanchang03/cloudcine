@@ -7,7 +7,6 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.CacheKeyFactory
 import androidx.media3.datasource.cache.CacheWriter
 
 /**
@@ -69,6 +68,21 @@ class DiskPrefetcher(
     private val cache: Cache,
     private val dataSourceFactory: DataSource.Factory,
     private val uri: Uri,
+    /**
+     * 缓存键。**由调用方注入**，且必须与播放器 `CacheDataSource` 用**同一个**
+     * —— 否则预取下的东西播放器一个字节都命中不了。
+     *
+     * ⛔ **不要退回「按 uri 现算」**（`CacheKeyFactory.DEFAULT`）。夸克直链是
+     *    每次起播现取的带签名地址，按 URL 算键会让磁盘缓存**跨不了会话**：
+     *    实测重开后同一部片 `磁盘 本片` 从 972 MiB 掉到 0 B，用户看到的就是
+     *    「同一部片下次打开还要重新缓冲」。稳定键是 `quark:<fid>:<画质档 id>`，
+     *    见 `PlayerActivity.stableCacheKey`。
+     *
+     * 对外可见是为了让播放器能按**同一个键**去 `Cache.getCachedSpans(key)`
+     * 查「本片在盘上覆盖了哪些区间」（进度条那层淡蓝要用）—— 见
+     * `PlayerActivity.diskCacheSnapshot()`。
+     */
+    val cacheKey: String,
     /** 从哪开始预取（字节）。一般是起播位置。 */
     private val startPositionBytes: Long,
     /** 文件总长（字节）；**负数 = 未知**。 */
@@ -154,18 +168,6 @@ class DiskPrefetcher(
      * 那一眼就能确认「预取器有没有跟过去」。
      */
     val leadBytes: Long get() = nextPositionBytes - playheadBytes()
-
-    /**
-     * 缓存键。**必须与播放器 `CacheDataSource` 用的一致**，
-     * 否则预取下的东西播放器一个字节都命中不了 —— 两边都用默认的
-     * [CacheKeyFactory.DEFAULT]（按 uri 生成），所以这里也用它。
-     *
-     * 对外可见是为了让播放器能按同一个键去 `Cache.getCachedSpans(key)`
-     * 查「本片在盘上覆盖了哪些区间」（进度条那层淡蓝要用）。
-     */
-    val cacheKey: String by lazy {
-        CacheKeyFactory.DEFAULT.buildCacheKey(DataSpec(uri))
-    }
 
     fun start() {
         synchronized(startLock) {

@@ -1,6 +1,7 @@
 package com.cloudcine.tv
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -156,5 +157,84 @@ class SeekPlanTest {
         val tenMin = 600_000L
         assertEquals(hour, SeekPlan.step(SeekPlan.NO_PENDING, hour - min, tenMin, hour))
         assertEquals(0L, SeekPlan.step(SeekPlan.NO_PENDING, min, -tenMin, hour))
+    }
+
+    // ── 加速加成 ────────────────────────────────────────────────
+
+    @Test
+    fun `前两秒必须不加速`() {
+        // ⛔ 这是**手感约定**，不是随手取的数：用户原话是「不要太快，否则
+        //    没有反应时间就拖完」。前 2 秒按 20 次/秒算 = 40 次 × 10 秒 =
+        //    400 秒的可调范围，而落点精度仍是 10 秒 —— 那 2 秒是留给
+        //    「我要精确停在这里」的。改倍率表就必须先改这条断言。
+        assertEquals(1, SeekPlan.multiplier(0L))
+        assertEquals(1, SeekPlan.multiplier(500L))
+        assertEquals(1, SeekPlan.multiplier(1_999L))
+        assertEquals(10_000L, SeekPlan.acceleratedDelta(10_000L, 1_999L))
+    }
+
+    @Test
+    fun `倍率按按住时长逐级上升`() {
+        assertEquals(2, SeekPlan.multiplier(2_000L))
+        assertEquals(2, SeekPlan.multiplier(3_999L))
+        assertEquals(4, SeekPlan.multiplier(4_000L))
+        assertEquals(4, SeekPlan.multiplier(5_999L))
+        assertEquals(8, SeekPlan.multiplier(6_000L))
+        assertEquals(8, SeekPlan.multiplier(8_999L))
+        assertEquals(12, SeekPlan.multiplier(9_000L))
+        // 按住很久也**封顶** —— 不封顶就会变成「一按到底」，同样是
+        // 「没有反应时间」。
+        assertEquals(12, SeekPlan.multiplier(60_000L))
+        assertEquals(12, SeekPlan.multiplier(Long.MAX_VALUE))
+    }
+
+    @Test
+    fun `倍率单调不降`() {
+        // 加速档位一旦回退，用户会看到「按着按着反而变慢了」。
+        var prev = 0
+        var t = 0L
+        while (t < 20_000L) {
+            val m = SeekPlan.multiplier(t)
+            assertTrue("t=$t 倍率回退了：$prev → $m", m >= prev)
+            prev = m
+            t += 100L
+        }
+    }
+
+    @Test
+    fun `快退的加速必须保持负号`() {
+        // ⛔ 这里错一次就是「按快退往前跳」。别在实现里做 abs()。
+        assertEquals(-10_000L, SeekPlan.acceleratedDelta(-10_000L, 0L))
+        assertEquals(-20_000L, SeekPlan.acceleratedDelta(-10_000L, 2_500L))
+        assertEquals(-120_000L, SeekPlan.acceleratedDelta(-10_000L, 10_000L))
+    }
+
+    @Test
+    fun `加速后的步进仍受片长夹取`() {
+        // 加速只是把步长放大，夹取的责任仍在 step 里。
+        val step = SeekPlan.acceleratedDelta(10_000L, 10_000L) // ×12 = 120s
+        assertEquals(120_000L, step)
+        assertEquals(
+            hour,
+            SeekPlan.step(SeekPlan.NO_PENDING, hour - 1_000L, step, hour),
+        )
+    }
+
+    @Test
+    fun `按二十次每秒估算两小时片长九秒左右到底`() {
+        // 这条把「手感」变成可核对的算术：模拟 20 次/秒按住，看多久走完
+        // 一部 2 小时的片子。**不是**精确规格，是防止有人把倍率表改到
+        // 「要么拖不动、要么一按到底」的极端。
+        val twoHours = 2 * hour
+        var pending = SeekPlan.NO_PENDING
+        var elapsed = 0L
+        val tick = 50L
+        while (elapsed < 30_000L && pending < twoHours) {
+            val step = SeekPlan.acceleratedDelta(10_000L, elapsed)
+            pending = SeekPlan.step(pending, 0L, step, twoHours)
+            elapsed += tick
+        }
+        assertTrue("2 小时片长不该超过 15 秒才拖到底，实测 ${elapsed}ms", elapsed < 15_000L)
+        assertTrue("也不该快到 3 秒以内（没有反应时间），实测 ${elapsed}ms", elapsed > 3_000L)
     }
 }
