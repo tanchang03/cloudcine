@@ -1,16 +1,20 @@
 package com.cloudcine.tv
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AbsListView
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
@@ -66,16 +70,86 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         val id: String = "",
         /** 当前生效项的下标；`-1` 表示「这行没有生效态」（如调试开关）。 */
         val active: Int = -1,
+        /**
+         * 每一项左边的**网盘封面**地址（`media_items.thumb_url`）。空 = 不画图。
+         *
+         * ⛔ 与 [options] **等长**（没有封面那几项给空串），不要写成「短的
+         *    那个按顺序贴上去」—— `ListView` 会回收 View，靠下标取值的
+         *    地方一旦错位，表现是「第 7 集的封面贴在第 3 集上」，
+         *    而且只在滚动之后才出现。
+         * ⛔ 只有 [vertical] 的行用得上它。chips 是 34dp 高的文字胶囊，
+         *    塞不下图，也从来不传。
+         */
+        val thumbs: List<String> = emptyList(),
+        /**
+         * 每一项的**历史播放进度**（`0.0~1.0`）；**负数 = 这一条不画进度条**。
+         *
+         * ⛔ 负数与 `0.0` 必须分开：`0.0` 是「看过、但只看了开头」，负数才是
+         *    「没看过 ⇒ 把条子整个藏起来」。混成 0 的话一整列空条看着像
+         *    「全都卡在加载中」。
+         * ⛔ 与 [options] **等长**（没有进度的那一项给 `-1.0`），理由同 [thumbs]。
+         */
+        val progress: List<Double> = emptyList(),
     ) {
         fun isEnabled(i: Int): Boolean = enabled.getOrElse(i) { true }
+
+        fun thumbAt(i: Int): String = thumbs.getOrElse(i) { "" }
+
+        /** 这一条的进度；`< 0` = 没进度（不画条）。 */
+        fun progressAt(i: Int): Double = progress.getOrElse(i) { -1.0 }
+    }
+
+    /**
+     * 纵向列表里那些封面的来源。
+     *
+     * ⛔ OSD **自己不做网络、也不做磁盘** —— 它只负责「问」。理由与整个
+     *    OSD 被改写成原生 View 是同一条：这台电视上按键→上屏的预算只有
+     *    几毫秒，任何一次 `File.exists()` 或解码都会变成可见的卡顿。
+     *    取图由播放页（`EpisodeThumbs` + `PanApi`）在后台线程做。
+     */
+    interface ThumbSource {
+        /**
+         * 内存里已经解码好的就返回它 —— **主线程可调**，必须立即返回。
+         * 没命中返回 `null`，列表先画占位块。
+         */
+        fun cached(url: String): Bitmap?
+
+        /**
+         * 已经确认「拿不到」的地址 —— 主线程可调。
+         *
+         * ⛔ 有这个判据，列表才不会对约三成「服务端没生成过预览图」的条目
+         *    反复重试（表现是「滚一格卡一下」）。
+         */
+        fun isKnownBad(url: String): Boolean
+
+        /**
+         * 异步取图，**完成后在主线程回调 [onReady]**。
+         *
+         * ⛔ [onReady] 的语义是「重新画一遍这个列表」，不是「这一行现在有图了」
+         *    —— OSD 只会拿它去 `notifyDataSetChanged()`。回调里再去摸
+         *    `ListView` 的具体某一项，会踩到「取回来时用户已经滚走了」。
+         */
+        fun fetch(url: String, targetPx: Int, onReady: () -> Unit)
     }
 
     var onActivate: ((row: Int, chip: Int) -> Unit)? = null
     var onClose: (() -> Unit)? = null
 
+    /** 纵向列表里封面的来源。不设 = 列表只画文字（和以前一样）。 */
+    var thumbs: ThumbSource? = null
+
     /** 当前是否已把焦点「进入」纵向列表（云影的 `_inList`）。 */
     var inList: Boolean = false
         private set
+
+    /**
+     * 是否处于「纵向列表展开」态 —— 卡片在这个态下会**长高**。
+     *
+     * ⛔ 见 [CARD_LIST_H]：不长的后果不是「不好看」，是**选不到后面几集**
+     *    —— 卡片只有 [CARD_H] 那么高时，右侧列表一屏只放得下 4 行，
+     *    一部 24 集的剧要按 6 屏方向键。
+     */
+    private var listMode = false
 
     private val card: LinearLayout
     private val sidebarBox: LinearLayout
@@ -157,6 +231,11 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         selRow = selRow.coerceIn(0, rows.size - 1)
         selChip = currentOptionIndex()
         inList = false
+        listMode = false
+        // ⛔ 行数是**可变**的（没有画质行 / 没有选集行都会少几行），所以卡片
+        //    高度每次重绑都按行数重算 —— 写死一个 CARD_H 的话，少一行的情形
+        //    会在卡片底部留一条空带，多一行的情形会把最后一行挤出可视区。
+        applyCardHeight()
         rebuildSidebar()
         rebuildRight()
     }
@@ -171,8 +250,38 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         selRow = 0
         selChip = currentOptionIndex()
         inList = false
+        listMode = false
+        applyCardHeight()
         applySidebarSelection()
         rebuildRight()
+    }
+
+    /**
+     * 卡片当前应该多高（dp）。
+     *
+     * ⛔ 默认态 = **行数 × 每行高 + 上下内边距**，不是那个写死的 `CARD_H`
+     *    （它只是「7 行时」的取值，见常量注释）。行数会变，高度就得跟着变。
+     * ⛔ 展开态 = [CARD_LIST_H]（见那里的理由）。
+     */
+    private fun targetCardHeightDp(): Float = if (listMode) {
+        CARD_LIST_H
+    } else {
+        rows.size.coerceAtLeast(1) * TILE_H + SIDEBAR_PAD_V * 2 + 0.8f
+    }
+
+    private fun applyCardHeight() {
+        val lp = card.layoutParams as? LayoutParams ?: return
+        val want = dp(targetCardHeightDp()).toInt()
+        if (lp.height == want) return
+        lp.height = want
+        card.layoutParams = lp
+    }
+
+    /** 进出纵向列表时切卡片高度 —— 见 [CARD_LIST_H]。 */
+    private fun setListMode(on: Boolean) {
+        if (listMode == on) return
+        listMode = on
+        applyCardHeight()
     }
 
     /**
@@ -213,6 +322,7 @@ class TvOsdView(context: Context) : FrameLayout(context) {
                 KeyEvent.KEYCODE_DPAD_DOWN -> { moveChip(1); return true }
                 KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                     inList = false
+                    setListMode(false)
                     rebuildRight()
                     return true
                 }
@@ -235,11 +345,17 @@ class TvOsdView(context: Context) : FrameLayout(context) {
             }
             KeyEvent.KEYCODE_DPAD_RIGHT -> {
                 if (row.options.isEmpty()) return false
-                if (row.vertical) { inList = true; rebuildRight(); return true }
+                if (row.vertical) { enterList(); return true }
                 moveChip(1)
                 return true
             }
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                // ⛔ 纵向列表这一行，**OK 也是「进入列表」**，不是「直接生效」。
+                //    照云影/夸克的原设计这里只有 → 能进列表，但遥控器上
+                //    「按 OK 没反应」是最容易被当成 bug 的表现 —— 用户不会
+                //    想到要去按方向键。两种按法都进列表，换集统一发生在列表里，
+                //    这样也顺手避免了「在菜单上误按 OK 直接跳集」。
+                if (row.vertical && row.options.size > 1) { enterList(); return true }
                 onActivate?.invoke(selRow, if (row.options.isEmpty()) -1 else selChip)
                 return true
             }
@@ -248,11 +364,20 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         }
     }
 
+    /** 焦点进右侧纵向列表（云影的 `_inList = true`）。 */
+    private fun enterList() {
+        inList = true
+        setListMode(true)
+        rebuildRight()
+    }
+
     private fun moveRow(delta: Int) {
         val n = rows.size
         selRow = ((selRow + delta) % n + n) % n
         selChip = currentOptionIndex()
         inList = false
+        // 换行必然离开列表态：另一行要么是 chips，要么没有选项。
+        setListMode(false)
         applySidebarSelection()
         rebuildRight()
     }
@@ -394,6 +519,13 @@ class TvOsdView(context: Context) : FrameLayout(context) {
                         setPadding(dp(14f).toInt(), 0, dp(14f).toInt(), 0)
                         background = chipBackground(row, i)
                         setTextColor(chipTextColor(row, i))
+                        // ⛔ 单个 chip 的宽度上限：调用方给短名（`4K` / `超清`），但
+                        //    服务端偶尔会给出映射表里没有的档位 id（`tierLabel` 会
+                        //    原样回退），那种串能一个 chip 撑满整行、把后面的档全顶
+                        //    出面板。截断比撑破好 —— 完整档位名在 `CloudCine` 日志里。
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        maxWidth = dp(MAX_CHIP_W).toInt()
                     }
                     chipViews.add(chip)
                     rowBox.addView(chip, LinearLayout.LayoutParams(
@@ -498,36 +630,213 @@ class TvOsdView(context: Context) : FrameLayout(context) {
      * ⛔ 别让调用方另抄一份 `27 + 7×40 + 28` 的算式 —— 几何一改两边就不一致，
      *    表现是「菜单一开字幕正好被压在菜单上」，而且只在某些行数下才露馅。
      */
-    fun sheetHeightPx(): Int = dp(SAFE_V + CARD_H).toInt()
+    fun sheetHeightPx(): Int = dp(SAFE_V).toInt() + cardHeightPx()
 
-    /** 纵向列表的 adapter —— 一行一个 TextView，选中态蓝底（照对标播放器）。 */
+    /**
+     * 卡片**当前实际**高度（px）。
+     *
+     * ⛔ 必须读实测值，不能拿 `CARD_H` 算：行数会变（有没有选集行）、
+     *    展开纵向列表时还会长高。拿常量算的表现是「菜单一开字幕正好压在
+     *    菜单上」，而且**只在某些行数下才露馅** —— 极难复现。
+     */
+    fun cardHeightPx(): Int =
+        card.layoutParams?.height?.takeIf { it > 0 } ?: dp(CARD_H).toInt()
+
+    /**
+     * 纵向列表的 adapter —— 一行 = **封面 + 集号 + 文件名**。
+     *
+     * ## 三个状态必须能同时分辨
+     *
+     * | 状态 | 画法 |
+     * |---|---|
+     * | **光标**（用户此刻停在这） | 实心 ACCENT 圆角块 + 左侧 4dp **白**条 + 白字 |
+     * | **正在播**（现在放的就是它） | 左侧 4dp **ACCENT** 条 + 标题前缀 `▶` + 标题亮白 |
+     * | 其它 | 无条，标题常规色、副标题压暗 |
+     *
+     * ⛔ 「光标」与「正在播」**是两件事**，必须分开画：打开菜单时光标落在
+     *    正在播的那一集上（`Row.active`），用户按一下 ↓ 之后两者就分家了。
+     *    只画一个的话，用户会以为自己刚才把正在播的那集切掉了 ——
+     *    而实际上什么都没发生。
+     * ⛔ 一律**不画边框**（用户就这条提过三次）：对比全部来自实心面的明度。
+     */
     private inner class RowListAdapter(private val row: Row) : BaseAdapter() {
         override fun getCount(): Int = row.options.size
         override fun getItem(position: Int): Any = row.options[position]
         override fun getItemId(position: Int): Long = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val tv = (convertView as? TextView) ?: TextView(context).apply {
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(14f).toInt(), 0, dp(10f).toInt(), 0)
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-            }
+            val cell = (convertView as? LinearLayout) ?: buildListRow()
+            val bar = cell.getChildAt(0) as View
+            val thumbBox = cell.getChildAt(1) as FrameLayout
+            val image = thumbBox.getChildAt(0) as ImageView
+            val placeholder = thumbBox.getChildAt(1) as TextView
+            val textBox = cell.getChildAt(2) as LinearLayout
+            val title = textBox.getChildAt(0) as TextView
+            val strip = textBox.getChildAt(1) as LinearLayout
+
             val selected = position == selChip
-            tv.text = row.options[position]
-            tv.background = GradientDrawable().apply {
+            val playing = position == row.active
+            val enabled = row.isEnabled(position)
+
+            // ── 封面 ──────────────────────────────────────────────
+            val url = row.thumbAt(position)
+            val bmp = if (url.isEmpty()) null else thumbs?.cached(url)
+            if (bmp != null) {
+                image.setImageBitmap(bmp)
+                image.visibility = View.VISIBLE
+                placeholder.visibility = View.GONE
+            } else {
+                image.setImageDrawable(null)
+                image.visibility = View.INVISIBLE
+                // ⛔ 占位块上写**集号**而不是「无封面」：集号本来就要靠
+                //    标题那一行读，缩略图位空着不如让它承担同样的信息 ——
+                //    而且服务端对约三成视频根本没生成过预览图，那个位置
+                //    长期是空的，写「无封面」等于三成条目挂着一句废话。
+                placeholder.text = row.options[position].take(6)
+                placeholder.visibility = View.VISIBLE
+                // 没下过、也没确认拿不到 → 排一次后台下载。
+                if (url.isNotEmpty() && thumbs?.isKnownBad(url) != true) {
+                    val self = this
+                    thumbs?.fetch(url, dp(LIST_THUMB_W).toInt()) {
+                        // ⛔ `post` 不能省：`getView` 有可能就在这一拍里被调用，
+                        //    而**在布局过程中 `notifyDataSetChanged` 会抛
+                        //    「The content of the adapter has changed but
+                        //    ListView did not receive a notification」**。
+                        // ⛔ 还要确认这期间菜单没被重建成别的 adapter。
+                        listView?.post { if (listAdapter === self) self.notifyDataSetChanged() }
+                    }
+                }
+            }
+            // 选中行整块是 ACCENT 实心，图片也压暗一点，免得亮图盖过白字。
+            image.alpha = if (selected) 0.75f else 1f
+            placeholder.alpha = image.alpha
+
+            // ── 左侧竖条 ──────────────────────────────────────────
+            bar.setBackgroundColor(
+                when {
+                    selected -> Color.WHITE
+                    playing -> ACCENT
+                    else -> Color.TRANSPARENT
+                }
+            )
+
+            // ── 文字 ──────────────────────────────────────────────
+            title.text = if (playing) "▶ ${row.options[position]}" else row.options[position]
+            title.setTextColor(
+                when {
+                    selected -> Color.WHITE
+                    !enabled -> DIM
+                    playing -> Color.WHITE
+                    else -> 0xFFD3D1C7.toInt()
+                }
+            )
+
+            // ── 历史进度条 ────────────────────────────────────────
+            val fraction = row.progressAt(position)
+            if (fraction < 0.0) {
+                strip.visibility = View.GONE
+            } else {
+                strip.visibility = View.VISIBLE
+                val f = fraction.coerceIn(0.0, 1.0)
+                (strip.getChildAt(0).layoutParams as LinearLayout.LayoutParams).weight = f.toFloat()
+                (strip.getChildAt(1).layoutParams as LinearLayout.LayoutParams).weight =
+                    (1.0 - f).toFloat()
+                // 选中行整块已经是 ACCENT 实心，再用品牌紫画进度条就糊成一片
+                // ⇒ 选中时改画**白色**，靠明度差把「看过多少」说清楚。
+                strip.getChildAt(0).setBackgroundColor(if (selected) Color.WHITE else ACCENT)
+                strip.requestLayout()
+            }
+
+            cell.background = GradientDrawable().apply {
                 cornerRadius = dp(8f)
                 setColor(if (selected) ACCENT else Color.TRANSPARENT)
             }
-            tv.setTextColor(
-                if (selected) Color.WHITE
-                else if (row.isEnabled(position)) 0xFFD3D1C7.toInt() else DIM
+            cell.layoutParams = AbsListView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(LIST_ROW_H).toInt(),
             )
-            tv.layoutParams = android.widget.AbsListView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(36f).toInt(),
+            return cell
+        }
+
+        /**
+         * 造一行的骨架。子节点**顺序即契约**（`getView` 按下标取）：
+         * `[0] 竖条 · [1] 封面框{图, 占位字} · [2] 文字列{文件名, 进度条{看过, 没看}}`。
+         */
+        private fun buildListRow(): LinearLayout {
+            val cell = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8f).toInt(), 0, dp(12f).toInt(), 0)
+            }
+
+            cell.addView(
+                View(context),
+                LinearLayout.LayoutParams(dp(4f).toInt(), ViewGroup.LayoutParams.MATCH_PARENT)
+                    .apply { marginEnd = dp(10f).toInt() },
             )
-            return tv
+
+            val thumbBox = FrameLayout(context)
+            thumbBox.addView(
+                ImageView(context).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setBackgroundColor(0xFF232833.toInt())
+                },
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            thumbBox.addView(
+                TextView(context).apply {
+                    setTextColor(0xFF6B7686.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                    gravity = Gravity.CENTER
+                    setBackgroundColor(0xFF232833.toInt())
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                },
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            cell.addView(
+                thumbBox,
+                LinearLayout.LayoutParams(
+                    dp(LIST_THUMB_W).toInt(), dp(LIST_THUMB_H).toInt(),
+                ),
+            )
+
+            val textBox = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            textBox.addView(
+                TextView(context).apply {
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            // 历史进度条 —— 与海报墙那条（`LibraryActivity.paintProgress`）
+            // **同一套画法**：一条细槽，按比例分成「看过 / 没看」两段。
+            // ⛔ 用权重分段而不是「设固定宽度」：行宽会随卡片宽度变，
+            //    固定宽度在窄屏上会溢出、在宽屏上只剩下半截。
+            val strip = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setBackgroundColor(0x33FFFFFF)
+            }
+            strip.addView(View(context), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0f))
+            strip.addView(View(context), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            textBox.addView(
+                strip,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(PROGRESS_H).toInt(),
+                ).apply { topMargin = dp(6f).toInt() },
+            )
+            cell.addView(
+                textBox,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { marginStart = dp(12f).toInt() },
+            )
+            return cell
         }
     }
 
@@ -538,9 +847,56 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         const val TILE_H = 40f
         const val SIDEBAR_PAD_V = 14f
 
-        /** 7 × 40 + 28 + 0.8（与云影 `kPlayerTvSheetHeight` 同一个算式）。 */
+        /**
+         * 卡片高度：`行数 × 40 + 上下内边距 28 + 0.8`（与云影
+         * `kPlayerTvSheetHeight` 同一个算式）。
+         *
+         * ⛔ 这是**「7 行时」的取值**，不是恒定值 —— 真实高度由
+         *    [targetCardHeightDp] 按当前行数算（Android 侧多了「选集」行，
+         *    也多了展开态）。这个常量留下来只做「还没绑过数据」时的兜底，
+         *    以及给单测一个对照值。
+         */
         const val CARD_H = 7 * TILE_H + 28f + 0.8f
         const val CHIP_H = 34f
+
+        /**
+         * 展开纵向列表（选集）时的卡片高度（dp）。
+         *
+         * ## 为什么必须长高
+         *
+         * 1080p 电视在 dp 口径下只有 **540dp 高**，卡片默认高度
+         * （8 行 = 348.8dp）里能分给右侧列表的只有约 240dp。一行「封面 +
+         * 集号 + 文件名」最少要 60dp ⇒ **一屏只看得见 4 集**。一部 24 集的
+         * 剧要按 6 屏方向键才能到底 —— 那已经不是「不好用」，是「没法用」。
+         *
+         * 460dp 时右侧列表能放 **6 行**，且卡片顶沿仍在屏幕上方 50dp 处
+         * （`SAFE_V` 27 + 460 = 487 < 540），不会顶到状态栏 / 安全区。
+         * ⛔ 再高就会盖住左上角的调试浮层（`StatsOverlay`，贴 `topMargin 27dp`）。
+         */
+        const val CARD_LIST_H = 460f
+
+        /** 纵向列表一行的高度（dp）：封面 54 + 上下各 3 的呼吸位。 */
+        const val LIST_ROW_H = 60f
+
+        /** 列表行里封面的尺寸（dp）。16:9，与夸克 `preview_url` 同比例。 */
+        const val LIST_THUMB_W = 96f
+        const val LIST_THUMB_H = 54f
+
+        /**
+         * 列表行里那条历史进度条的高度（dp）。
+         *
+         * 3dp 是「沙发距离下看得见比例、又不至于抢了文件名」的值 ——
+         * 与海报墙上那条同厚。
+         */
+        const val PROGRESS_H = 3f
+
+        /**
+         * 单个 chip 的宽度上限（dp）。
+         *
+         * 面板右侧可用宽度 ≈ 屏幕宽 − `SAFE_H` − `SIDEBAR_W`，在 1080p 上约 560dp；
+         * 取 160dp 是「放得下 5~6 个汉字，但绝不至于一个 chip 占掉半行」。
+         */
+        const val MAX_CHIP_W = 160f
 
         const val CARD_TOP = 0xFA262E42.toInt()
         const val CARD_BOTTOM = 0xF5141824.toInt()

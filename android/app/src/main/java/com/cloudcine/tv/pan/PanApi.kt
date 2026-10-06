@@ -74,13 +74,22 @@ class PanApi(private val store: CredStore) {
             val o = list.optJSONObject(i) ?: continue
             val name = o.optString("file_name").ifEmpty { o.optString("file_name_display") }
             if (name.isEmpty()) continue
+            // ⛔ 先判目录再取文件字段：目录上这些字段要么缺失、要么是垃圾值
+            //    （`video_width=0`），照抄下去会让分辨率归挡算出一个荒唐的档位。
+            val dir = isDir(o)
             out.add(
                 DriveEntry(
                     fid = o.optString("fid").ifEmpty { o.optString("id") },
                     name = name,
-                    isDir = isDir(o),
+                    isDir = dir,
                     sizeBytes = o.optLong("size", 0L),
                     updatedAtMs = normalizeTimestamp(o.optLong("updated_at", 0L)),
+                    parentId = o.optString("pdir_fid").ifEmpty { null },
+                    previewUrl = if (dir) null else o.optString("preview_url").ifEmpty { null },
+                    videoWidth = if (dir) null else positive(o.optInt("video_width", 0)),
+                    videoHeight = if (dir) null else positive(o.optInt("video_height", 0)),
+                    // 夸克 `duration` 下发的是**秒**（PC 端 `parseDurationMs` 同口径）。
+                    durationMs = if (dir) null else secondsToMs(o.optLong("duration", 0L)),
                 ),
             )
         }
@@ -565,8 +574,20 @@ class PanApi(private val store: CredStore) {
      * 而直链要求「要么不带 Cookie，要么带 `__puus`」。少了它，列表能刷、
      * 一直播就 412。
      */
-    private fun absorbCookies(res: PanResponse) {
-        val puus = res.cookieValue("__puus")
+    private fun absorbCookies(res: PanResponse) = absorbSetCookies(res.setCookies)
+
+    /**
+     * 把响应里轮换下发的 `__puus` / `Video-Auth` 收回凭证库。
+     *
+     * ⛔ 与 [absorbCookies] 是同一件事，分成两层是因为**二进制响应**
+     *    （网盘缩略图，见 [thumbBytes]）拿不到 `PanResponse`，只有原始
+     *    `Set-Cookie` 行。两处各写一份的话，缩略图那条路会漏掉 `__puus`，
+     *    而漏掉的后果不是「图片糊了」—— 是**下一次取链 412**，
+     *    完全看不出和翻选集有什么关系。
+     */
+    private fun absorbSetCookies(setCookies: List<String>) {
+        if (setCookies.isEmpty()) return
+        val puus = cookieValueOf(setCookies, "__puus")
         if (!puus.isNullOrEmpty()) {
             val cur = store.cookie
             store.cookie = if (cur.contains("__puus=")) {
@@ -575,7 +596,43 @@ class PanApi(private val store: CredStore) {
                 "$cur; __puus=$puus"
             }
         }
-        res.cookieValue("Video-Auth")?.takeIf { it.isNotEmpty() }?.let { store.videoAuth = it }
+        cookieValueOf(setCookies, "Video-Auth")?.takeIf { it.isNotEmpty() }?.let { store.videoAuth = it }
+    }
+
+    /** 从 `Set-Cookie` 行里取某个键的值 —— 与 `PanResponse.cookieValue` 同口径。 */
+    private fun cookieValueOf(setCookies: List<String>, name: String): String? {
+        for (line in setCookies) {
+            val semi = line.indexOf(';')
+            val pair = if (semi < 0) line else line.substring(0, semi)
+            val eq = pair.indexOf('=')
+            if (eq <= 0) continue
+            if (pair.substring(0, eq).trim() == name) return pair.substring(eq + 1).trim()
+        }
+        return null
+    }
+
+    /**
+     * 取一张**网盘缩略图**（`media_items.thumb_url` → 夸克 `preview_url`）。
+     *
+     * ⛔ 必须带 Cookie：裸链回 `401 code=31001 require login`（实测，
+     *    见 `docs/媒体库体验优化-逆向评估.md §2.2`）。
+     * ⛔ 取完**必须**把响应里的 `Set-Cookie` 收回去 —— 见 [absorbSetCookies]。
+     * ⛔ 走 `preview_url`（640×360，约 12 KiB）而不是 `thumbnail`（178×100）：
+     *    库里只存了前者，而且列表行里的封面在 2× 屏上要 ~192px 宽，
+     *    178 那一档明显发糊。
+     *
+     * 这个方法**只在后台线程调**（要发网络请求）。
+     */
+    fun thumbBytes(url: String, maxBytes: Int = 3 * 1024 * 1024): ByteArray {
+        val res = PanHttp.getBytesWithCookies(
+            url = url,
+            cookie = store.requestCookie(),
+            maxBytes = maxBytes,
+            // 缩略图是「看得见就行」的东西，不值得让它占着连接 20 秒。
+            timeoutMs = 12_000,
+        )
+        absorbSetCookies(res.setCookies)
+        return res.bytes
     }
 
     private fun ensureOk(res: PanResponse, what: String) {
@@ -647,6 +704,17 @@ class PanApi(private val store: CredStore) {
 
     /** `updated_at` 秒/毫秒两种都可能，统一成毫秒。 */
     private fun normalizeTimestamp(v: Long): Long = if (v in 1..9_999_999_999L) v * 1000L else v
+
+    /**
+     * 正整数归一：`null` / `0` / 负数一律当「不知道」。
+     *
+     * 「0 = 网盘还没刮削到」是这家的惯用约定（`duration` 同样如此），
+     * 所以宽高也按同一口径处理 —— 把 `0` 传下去会让分辨率归挡算出荒唐的档位。
+     */
+    private fun positive(v: Int): Int? = if (v > 0) v else null
+
+    /** 夸克的 `duration` 是**秒**，库里统一存毫秒。`<= 0` 当不知道。 */
+    private fun secondsToMs(v: Long): Long? = if (v > 0) v * 1000L else null
 
     private fun tierLabel(id: String): String = when (id.lowercase()) {
         "4k" -> "4K"

@@ -108,6 +108,21 @@ class RawResponse(
 }
 
 /**
+ * 一次**二进制** GET 的结果：字节 + 响应里全部的 `Set-Cookie` 行。
+ *
+ * ⛔ 与 [PanResponse] 分开：那条路的 `body` 是 UTF-8 解出来的 `String`，
+ *    对图片是**破坏性的**（WebP 里的任意字节序列过一遍字符解码再编回去，
+ *    长度和内容都不再一样）。图片只能走字节。
+ * ⛔ 与 [RawResponse] 也分开：那个只留 `ETag` / `Content-Type` / `Content-Length`
+ *    三个头，而这里真正要的是 `Set-Cookie`（见 [PanHttp.getBytesWithCookies]）。
+ */
+class BytesResponse(
+    val bytes: ByteArray,
+    /** 原始 `Set-Cookie` 行，**未解析**（解析在 `PanApi.absorbSetCookies`）。 */
+    val setCookies: List<String> = emptyList(),
+)
+
+/**
  * 极简 HTTP 客户端。**所有请求都绕开系统代理** —— 网盘的接口与直链都必须
  * 走真实网络，被代理劫持的表现是「一直转圈」或「412」，很难往代理上想。
  *
@@ -320,7 +335,33 @@ object PanHttp {
         headers: Map<String, String> = emptyMap(),
         maxBytes: Int = 8 * 1024 * 1024,
         timeoutMs: Int = 20_000,
-    ): ByteArray {
+    ): ByteArray = getBytesWithCookies(url, cookie, headers, maxBytes, timeoutMs).bytes
+
+    /**
+     * 同 [getBytes]，但**额外把响应里的 `Set-Cookie` 带回来**。
+     *
+     * ## ⛔ 为什么不能只用 [getBytes]
+     *
+     * 夸克在**每个**响应的 `Set-Cookie` 里轮换 `__puus`，而 `__puus` 是
+     * 「直链 / 缩略图能不能过防重放校验」的唯一凭据（见 `PanApi.headersForCdn`
+     * 那张四种组合的实测表：**带一半的 Cookie 最坏** —— 列表能刷、一播就 412）。
+     *
+     * 原来 `getBytes` 只回字节、把响应头整份丢掉。对**外挂字幕**没影响
+     * （它用的是 `file/audioplay` 现签的临时地址，不依赖 `__puus`），
+     * 但**网盘缩略图**依赖 —— 而且缩略图是一张一张按需拉的，几十次请求
+     * 足够让服务端轮换好几轮。丢掉的那些新 `__puus` 会让**下一次取链**
+     * 用一个过期值，表现是「翻了一圈选集，再点播放就 412」。
+     *
+     * 所以这里把 `Set-Cookie` 原样交回给调用方（`PanApi.thumbBytes` 会
+     * 用 `absorbSetCookies` 收下）。
+     */
+    fun getBytesWithCookies(
+        url: String,
+        cookie: String = "",
+        headers: Map<String, String> = emptyMap(),
+        maxBytes: Int = 8 * 1024 * 1024,
+        timeoutMs: Int = 20_000,
+    ): BytesResponse {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = timeoutMs
@@ -340,6 +381,9 @@ object PanHttp {
             if (status !in 200..299) {
                 throw IOException("HTTP $status ${conn.responseMessage.orEmpty()}".trim())
             }
+            // ⛔ 读**字节**之前先把 Set-Cookie 抄下来：`headerFields` 在
+            //    `disconnect()` 之后就是空的，而下面那个 `finally` 一定会调它。
+            val setCookies = collectSetCookies(conn)
             val out = ByteArrayOutputStream()
             conn.inputStream.use { input ->
                 val buf = ByteArray(64 * 1024)
@@ -348,14 +392,33 @@ object PanHttp {
                     if (n < 0) break
                     out.write(buf, 0, n)
                     if (out.size() > maxBytes) {
-                        throw IOException("响应超过 ${maxBytes / 1048576} MiB，不像是字幕文件")
+                        throw IOException("响应超过 ${maxBytes / 1048576} MiB，不像是图片/字幕")
                     }
                 }
             }
-            return out.toByteArray()
+            return BytesResponse(out.toByteArray(), setCookies)
         } finally {
             conn.disconnect()
         }
+    }
+
+    /**
+     * 抄下响应里全部 `Set-Cookie` 行。
+     *
+     * ⛔ 不能用 `conn.getHeaderField("Set-Cookie")` —— 它**只回第一条**，
+     *    而夸克一次响应里能同时下 `__puus` 与 `Video-Auth`，漏掉哪一条都会
+     *    让后续请求莫名其妙地失败。必须走 `headerFields` 拿全部。
+     * ⛔ 键要判空：`headerFields` 的迭代里第一项是状态行，键是 `null`，
+     *    在 Kotlin 里解构会直接 NPE。
+     */
+    private fun collectSetCookies(conn: HttpURLConnection): List<String> {
+        val out = ArrayList<String>(2)
+        for ((key, values) in conn.headerFields) {
+            if (key == null || !key.equals("Set-Cookie", ignoreCase = true)) continue
+            if (values == null) continue
+            for (v in values) if (v.isNotEmpty()) out.add(v)
+        }
+        return out
     }
 
     /** 只读响应体前若干字节 —— 用来量「单连接真实带宽」。 */

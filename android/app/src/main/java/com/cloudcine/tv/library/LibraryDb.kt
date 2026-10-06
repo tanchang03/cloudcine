@@ -49,6 +49,12 @@ class LibraryDb(val file: File) {
         // ⛔ 必须在任何写入之前设；见类文档「不用 WAL」。
         opened.rawQuery("PRAGMA journal_mode=DELETE", null).use { it.moveToFirst() }
         opened.rawQuery("PRAGMA foreign_keys=ON", null).use { it.moveToFirst() }
+        // ⛔ 忙等超时：扫描（后台写事务）与界面（主线程读）会**同时**碰这个库，
+        //    而默认超时是 0ms —— 撞上一次写事务就直接抛 `database is locked`，
+        //    症状是「扫描到一半，海报墙突然报读取失败」。
+        //    设 5 秒让读等一会儿，而不是立刻失败。用 PRAGMA 而不是
+        //    `setBusyTimeout()`：后者在部分 API 级别上是隐藏接口。
+        opened.rawQuery("PRAGMA busy_timeout=5000", null).use { it.moveToFirst() }
         if (fresh) Log.i(TAG, "索引库不存在，新建：${file.absolutePath}")
         ensureSchema(opened)
         db = opened
@@ -199,6 +205,16 @@ class LibraryDb(val file: File) {
         recentAdded("最近添加"),
         recentPlayed("最近播放"),
         rating("评分"),
+
+        /**
+         * 按上映年份倒序。
+         *
+         * ⛔ 位置**必须**与 PC 端 `WorkSort` 对齐（声明顺序就是菜单顺序）：
+         *    两端不一致的话，同一个用户在两个端上看到的排序菜单是两套顺序。
+         *    PC 端是 `recentModified / recentAdded / recentPlayed / rating /
+         *    year / title` —— 所以这里插在 `rating` 与 `title` 之间。
+         */
+        year("年份"),
         title("标题"),
     }
 
@@ -214,14 +230,110 @@ class LibraryDb(val file: File) {
     fun listWorks(
         sort: Sort = Sort.recentModified,
         playedOnly: Boolean = false,
+        category: String? = null,
+        years: Set<Int> = emptySet(),
+        genres: Set<String> = emptySet(),
+        scrapedOnly: Boolean = false,
         keyword: String? = null,
         limit: Int = 500,
         offset: Int = 0,
     ): List<Work> {
+        val (where, args) = workWhere(
+            category = category,
+            playedOnly = playedOnly,
+            scrapedOnly = scrapedOnly,
+            years = years,
+            genres = genres,
+            keyword = keyword,
+        )
+
+        val order = when (sort) {
+            Sort.recentModified -> "last_modified_at DESC, year DESC, title ASC"
+            Sort.recentAdded -> "first_seen_at DESC, year DESC, title ASC"
+            Sort.recentPlayed -> "last_played_at DESC, year DESC, title ASC"
+            Sort.rating -> "rating DESC, year DESC, title ASC"
+            // ⛔ 按年份排时**没有 `year DESC` 这个 tie-breaker**（自己跟自己比），
+            //    照抄 PC 端 `_orderingFor`：年份相同时按标题。
+            Sort.year -> "year DESC, title ASC"
+            Sort.title -> "title ASC"
+        }
+
+        val sql = buildString {
+            append("SELECT $WORK_COLUMNS FROM media_works")
+            append(" WHERE ").append(where)
+            append(" ORDER BY ").append(order)
+            append(" LIMIT ").append(limit).append(" OFFSET ").append(offset)
+        }
+        return queryWorks(sql, args)
+    }
+
+    fun workByKey(key: String): Work? =
+        queryWorks("SELECT $WORK_COLUMNS FROM media_works WHERE key = ? LIMIT 1", arrayOf(key))
+            .firstOrNull()
+
+    // ------------------------------------------------------------------
+    // 筛选：条件拼装
+    // ------------------------------------------------------------------
+
+    /**
+     * 把「分类 / 最近播放 / 已刮削 / 年份 / 类型 / 搜索词」拼成 WHERE 与参数。
+     *
+     * ⛔ **`listWorks` 与两个分面计数共用本函数**。分开写的话必然出现
+     *    「列表 11 部、面板角标写 12」这种用户一眼看得见、却极难查的不一致
+     *    （PC 端为此专门写了 `_workConditions` 给三处共用，同一条理由）。
+     *
+     * ⛔ `years` / `genres` 内部是**或**、维度之间是**与**：一部片子只有
+     *    一两个类型、一个年份，取交集几乎永远筛不出东西。这与 PC 端
+     *    `listWorks` 的接口文档一致。
+     *
+     * @return `WHERE 子句`（已含 `merged_into IS NULL`）与 `参数数组`。
+     */
+    private fun workWhere(
+        category: String? = null,
+        playedOnly: Boolean = false,
+        scrapedOnly: Boolean = false,
+        years: Set<Int> = emptySet(),
+        genres: Set<String> = emptySet(),
+        keyword: String? = null,
+    ): Pair<String, Array<String>> {
         val where = ArrayList<String>()
         val args = ArrayList<String>()
         where.add("merged_into IS NULL")
+
+        // 「最近播放」的判据是 `last_played_at IS NOT NULL`，**不是**「比某个时间新」：
+        // 后者会把「上个月看过」也算成没看过，而这一栏的意思是「我看过的」，
+        // 「最近」由排序负责。
         if (playedOnly) where.add("last_played_at IS NOT NULL")
+
+        // 「已刮削」的判据是 `source = 'online'`，**不是**「有海报 / 有简介」——
+        // PC 端特意避开了 `MediaWork.isScraped`，因为那一位还含 `manual`，
+        // 而「自定义」恰恰会清掉在线信息。
+        if (scrapedOnly) where.add("source = 'online'")
+
+        if (!category.isNullOrEmpty()) {
+            where.add(categoryCondition(category))
+            args.addAll(categoryArgs(category))
+        }
+
+        if (years.isNotEmpty()) {
+            // ⛔ `year IS NULL` 的行在任何年份条件下都不命中 —— `IN` 对 NULL
+            //    求值为 NULL（假）。这与面板角标一致（`yearCounts` 也不数它们）。
+            where.add("year IN (" + years.joinToString(",") { "?" } + ")")
+            for (y in years) args.add(y.toString())
+        }
+
+        if (genres.isNotEmpty()) {
+            // ⛔ `genres` 是 JSON 数组文本（`["动画","科幻"]`），所以匹配串
+            //    **必须带上引号**：`LIKE '%动画%'` 会把「动画片」也捞进来，
+            //    而 `LIKE '%"动画"%'` 只在它确实是数组里一个独立元素时命中。
+            val ors = ArrayList<String>(genres.size)
+            for (g in genres) {
+                ors.add("genres LIKE ?")
+                args.add("%\"${g.replace("\"", "\"\"")}\"%")
+            }
+            where.add("(" + ors.joinToString(" OR ") + ")")
+        }
+
         val kw = keyword?.trim().orEmpty()
         if (kw.isNotEmpty()) {
             where.add("(title LIKE ? OR original_title LIKE ? OR key LIKE ?)")
@@ -229,26 +341,152 @@ class LibraryDb(val file: File) {
             args.add(like); args.add(like); args.add(like)
         }
 
-        val order = when (sort) {
-            Sort.recentModified -> "last_modified_at DESC, year DESC, title ASC"
-            Sort.recentAdded -> "first_seen_at DESC, year DESC, title ASC"
-            Sort.recentPlayed -> "last_played_at DESC, year DESC, title ASC"
-            Sort.rating -> "rating DESC, year DESC, title ASC"
-            Sort.title -> "title ASC"
-        }
-
-        val sql = buildString {
-            append("SELECT $WORK_COLUMNS FROM media_works")
-            append(" WHERE ").append(where.joinToString(" AND "))
-            append(" ORDER BY ").append(order)
-            append(" LIMIT ").append(limit).append(" OFFSET ").append(offset)
-        }
-        return queryWorks(sql, args.toTypedArray())
+        return where.joinToString(" AND ") to args.toTypedArray()
     }
 
-    fun workByKey(key: String): Work? =
-        queryWorks("SELECT $WORK_COLUMNS FROM media_works WHERE key = ? LIMIT 1", arrayOf(key))
-            .firstOrNull()
+    /**
+     * 单个分类的条件 —— 照抄 PC 端 `_categoryCondition`。
+     *
+     * ⛔ **`movie` / `series` / `other` 三个桶有空串兜底**，其余三个没有。
+     *    原因是老库（PC 端 v3 之前入库的行）的 `category` 是**空串**，
+     *    而那时唯一能用来分类的信息是 `kind`。不做兜底的话，这批作品
+     *    在「电影 / 剧集 / 其他」三栏里**一部都不出现**，只在「全部」里看得见 ——
+     *    用户会以为自己的片子被删了。
+     *    动漫 / 综艺 / 纪录片是**语义**分类，`kind` 推不出来（动漫剧集和普通
+     *    剧集的 `kind` 都是 `episode`），所以那三栏没有兜底可言。
+     *
+     * ⚠️ 与 PC 端的一处**有意修正**：PC 写的是 `category = ''`，而 SQL 里
+     *    `NULL = ''` 求值为 NULL（假）—— 也就是 `category` 为 **NULL** 的行
+     *    在 PC 端既进不了兜底、又不属于任何分类。这里改成
+     *    `(category IS NULL OR category = '')`，把 NULL 一并纳入。
+     */
+    private fun categoryCondition(category: String): String = when (category) {
+        MediaCategoryNames.MOVIE ->
+            "(category = 'movie' OR ((category IS NULL OR category = '') AND kind = 'movie'))"
+        MediaCategoryNames.SERIES ->
+            "(category = 'series' OR ((category IS NULL OR category = '') AND kind = 'episode'))"
+        MediaCategoryNames.OTHER ->
+            "(category = 'other' OR ((category IS NULL OR category = '') AND kind = 'unknown'))"
+        // 动漫 / 综艺 / 纪录片（以及将来新增的分类）：只看那一列。
+        else -> "category = ?"
+    }
+
+    /** [categoryCondition] 只在 `else` 分支用了 `?` 占位，那时才需要参数。 */
+    private fun categoryArgs(category: String): List<String> = when (category) {
+        MediaCategoryNames.MOVIE,
+        MediaCategoryNames.SERIES,
+        MediaCategoryNames.OTHER,
+        -> emptyList()
+        else -> listOf(category)
+    }
+
+    /** 「最近播放」栏的角标：播过的作品数（`last_played_at IS NOT NULL`）。 */
+    fun playedCount(): Int = require().rawQuery(
+        "SELECT COUNT(*) FROM media_works " +
+            "WHERE merged_into IS NULL AND last_played_at IS NOT NULL",
+        null,
+    ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+
+    /**
+     * 各年份的作品数（筛选面板「年份」那一组）。
+     *
+     * ⛔ 统计范围是 `category / playedOnly / scrapedOnly / keyword`，
+     *    **不含** `years` / `genres` 自己 —— 否则用户每勾一个类型，
+     *    剩下的类型角标就会跟着变，勾到第二个时列表已经空了。
+     *    而面板唯一的承诺是「点下去至少有一条结果」。
+     */
+    fun yearCounts(
+        category: String? = null,
+        playedOnly: Boolean = false,
+        scrapedOnly: Boolean = false,
+        keyword: String? = null,
+    ): Map<Int, Int> {
+        val (where, args) = workWhere(
+            category = category,
+            playedOnly = playedOnly,
+            scrapedOnly = scrapedOnly,
+            keyword = keyword,
+        )
+        val out = LinkedHashMap<Int, Int>()
+        require().rawQuery(
+            "SELECT year, COUNT(*) FROM media_works " +
+                "WHERE ($where) AND year IS NOT NULL AND year > 0 " +
+                "GROUP BY year ORDER BY year DESC",
+            args,
+        ).use { c ->
+            while (c.moveToNext()) out[c.getInt(0)] = c.getInt(1)
+        }
+        return out
+    }
+
+    /**
+     * 各类型的作品数（筛选面板「类型」那一组）。
+     *
+     * ⛔ `genres` 是 JSON 数组文本，**SQL 数不出来** —— 只能把那一列读出来在
+     *    Kotlin 里拆（PC 端 `countWorksByGenre` 走的是同一条路）。仍然只读
+     *    **一列**、不碰整行，所以比 `listWorks` 便宜得多。
+     * ⛔ 同一个类型在一行里理论上不重复，但数据脏了时角标也不该大于作品数
+     *    —— 所以按行去重。
+     */
+    fun genreCounts(
+        category: String? = null,
+        playedOnly: Boolean = false,
+        scrapedOnly: Boolean = false,
+        keyword: String? = null,
+    ): Map<String, Int> {
+        val (where, args) = workWhere(
+            category = category,
+            playedOnly = playedOnly,
+            scrapedOnly = scrapedOnly,
+            keyword = keyword,
+        )
+        val out = HashMap<String, Int>()
+        require().rawQuery("SELECT genres FROM media_works WHERE $where", args).use { c ->
+            while (c.moveToNext()) {
+                for (g in parseJsonArray(c.getString(0)).toSet()) {
+                    out[g] = (out[g] ?: 0) + 1
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * 每个分类的作品数（分类栏上的角标）。
+     *
+     * ⛔ **一次查完**，不要「每个标签各查一次」—— 7 个标签就是 7 次全表扫描，
+     *    而这一步在**每次切分类/刷新**时都会跑。
+     * ⛔ 分桶规则必须与 [categoryCondition] **逐字对齐**（含空串兜底），
+     *    否则会出现「角标写 72、点进去 68」这种自相矛盾。这里是同一套规则
+     *    写成 SQL：先把 `category` 列归成 6 个桶之一，再 `GROUP BY` 那个桶。
+     * @return `分类名 → 数量`。
+     */
+    fun categoryCounts(): Map<String, Int> {
+        val out = HashMap<String, Int>()
+        require().rawQuery(
+            "SELECT CASE " +
+                "WHEN category IN ('movie','series','anime','variety','documentary') " +
+                "THEN category " +
+                "WHEN category = 'other' THEN 'other' " +
+                "WHEN kind = 'movie' THEN 'movie' " +
+                "WHEN kind = 'episode' THEN 'series' " +
+                "ELSE 'other' END AS bucket, COUNT(*) " +
+                "FROM media_works WHERE merged_into IS NULL GROUP BY bucket",
+            null,
+        ).use { c ->
+            while (c.moveToNext()) {
+                out[c.getString(0) ?: MediaCategoryNames.OTHER] = c.getInt(1)
+            }
+        }
+        return out
+    }
+
+    /** 「看过但没看完」的作品数 —— 给筛选行上的角标用。 */
+    fun unfinishedCount(): Int = require().rawQuery(
+        "SELECT COUNT(DISTINCT w.key) FROM media_works w JOIN media_items i ON i.group_key = w.key " +
+            "WHERE w.merged_into IS NULL AND i.resume_position_ms > 0",
+        null,
+    ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
 
     /**
      * 一部作品下的所有文件。
@@ -451,6 +689,370 @@ class LibraryDb(val file: File) {
     fun fileSizeBytes(): Long = if (file.exists()) file.length() else 0L
 
     // ------------------------------------------------------------------
+    // 写：扫描入库
+    // ------------------------------------------------------------------
+
+    /**
+     * 已有的媒体项 `id → group_key`。
+     *
+     * ⛔ 扫描**必须**先查这个再决定怎么分组：库里那些行是 PC 端按它自己的解析器
+     *    分好的组，而 Android 侧的解析器是移植版 —— 两边对同一个文件给出**不同**
+     *    `group_key` 是完全可能的（PC 端加了一条新规则、或移植时的边角差异）。
+     *    不复用的话，一次「重新扫描」会把整库拆成两份：原来那部剧还在，旁边
+     *    又多出一部同名的、只含新扫到的那几集。
+     *
+     * 分批查（`IN` 里最多 400 个占位符）：SQLite 的变量上限是 999，而一次扫描
+     * 能扫出几千个文件 —— 一次拼完会直接抛 `too many SQL variables`。
+     */
+    fun groupKeysOf(ids: Collection<String>): Map<String, String> {
+        if (ids.isEmpty()) return emptyMap()
+        val out = HashMap<String, String>(ids.size * 2)
+        val d = require()
+        for (chunk in ids.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT id, group_key FROM media_items WHERE id IN ($marks)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) out[c.getString(0)] = c.getString(1)
+            }
+        }
+        return out
+    }
+
+    /** 库里已有的全部作品 key（扫描时用来判断「这部是不是新的」）。 */
+    fun workKeys(): Set<String> {
+        val out = HashSet<String>(512)
+        require().rawQuery("SELECT key FROM media_works", null).use { c ->
+            while (c.moveToNext()) out.add(c.getString(0))
+        }
+        return out
+    }
+
+    /**
+     * 扫描结果入库。
+     *
+     * ## ⛔ 为什么不用 `INSERT OR REPLACE`
+     *
+     * `REPLACE` 在冲突时是**先 DELETE 再 INSERT** —— 那会把 `resume_position_ms`、
+     * `max_position_ms`、`last_played_at`、`first_seen_at` 一起抹掉。
+     * 用户重扫一次库，全部观看进度归零，而这件事**不会报错**。
+     *
+     * ## ⛔ 为什么也不用 `ON CONFLICT … DO UPDATE`
+     *
+     * 那是 SQLite **3.24（2018-06）**才有的语法，而本机目标设备的 SQLite 是
+     * 随 Android 9 一起发布的 3.22 —— 语法不支持，运行期直接抛。
+     *
+     * 所以这里**显式分两支**：已存在的行只更新「文件事实」那几列（大小 / 修改时间 /
+     * 容器 / 分辨率 / 编码 / 花絮标记），新行才整行插入。分成两支还有一个好处：
+     * 「扫描到底改了哪些列」这件事在代码里是看得见的，而不是藏在一条 SQL 里。
+     *
+     * 返回 `(新增, 更新)`。
+     */
+    fun applyScanItems(items: List<ScanItem>, nowSec: Long = nowSec()): Pair<Int, Int> {
+        if (items.isEmpty()) return 0 to 0
+        val d = require()
+        val existing = groupKeysOf(items.map { it.id })
+        var inserted = 0
+        var updated = 0
+        d.beginTransaction()
+        try {
+            for (it in items) {
+                if (existing.containsKey(it.id)) {
+                    d.update(
+                        "media_items",
+                        ContentValues().apply {
+                            put("name", it.name)
+                            put("dir_id", it.dirId)
+                            put("dir_path", it.dirPath)
+                            it.sizeBytes?.let { v -> put("size_bytes", v) } ?: putNull("size_bytes")
+                            it.modifiedAt?.let { v -> put("modified_at", v) } ?: putNull("modified_at")
+                            // ⛔ 与新增分支同一条规矩：这三个**只在拿到值时才写**。
+                            //    服务端这次没告诉我们时长，不等于这个文件没有时长 ——
+                            //    写成 NULL 会把上一次的好值抹掉。
+                            it.durationMs?.let { v -> put("duration_ms", v) }
+                            it.videoWidth?.let { v -> put("video_width", v) }
+                            it.videoHeight?.let { v -> put("video_height", v) }
+                            put("container", it.container)
+                            it.resolution?.let { v -> put("resolution", v) } ?: putNull("resolution")
+                            it.source?.let { v -> put("source", v) } ?: putNull("source")
+                            it.videoCodec?.let { v -> put("video_codec", v) } ?: putNull("video_codec")
+                            it.audioCodec?.let { v -> put("audio_codec", v) } ?: putNull("audio_codec")
+                            put("flags", jsonArray(it.flags))
+                            it.releaseGroup?.let { v -> put("release_group", v) }
+                                ?: putNull("release_group")
+                            put("is_sample_or_extra", if (it.isSampleOrExtra) 1 else 0)
+                            put("updated_at", nowSec)
+                        },
+                        "id = ?",
+                        arrayOf(it.id),
+                    )
+                    updated++
+                } else {
+                    d.insert(
+                        "media_items",
+                        // `nullColumnHack`：SQLite 的 `INSERT` 在「一个列都没给」时会
+                        // 语法错误，这个参数就是那种情况下的兜底列名。我们每行都给了
+                        // 一堆 NOT NULL 列，用不上它 —— 但这个参数**不能省**，
+                        // 它没有 2 参数的重载。
+                        null,
+                        ContentValues().apply {
+                            put("id", it.id)
+                            put("provider", it.provider)
+                            put("file_id", it.fileId)
+                            put("name", it.name)
+                            put("dir_id", it.dirId)
+                            put("dir_path", it.dirPath)
+                            put("group_key", it.groupKey)
+                            put("kind", it.kind)
+                            it.title?.let { v -> put("title", v) } ?: putNull("title")
+                            it.year?.let { v -> put("year", v) } ?: putNull("year")
+                            it.season?.let { v -> put("season", v) } ?: putNull("season")
+                            it.episode?.let { v -> put("episode", v) } ?: putNull("episode")
+                            it.episodeEnd?.let { v -> put("episode_end", v) }
+                                ?: putNull("episode_end")
+                            it.part?.let { v -> put("part", v) } ?: putNull("part")
+                            it.partLabel?.let { v -> put("part_label", v) }
+                                ?: putNull("part_label")
+                            put("container", it.container)
+                            it.resolution?.let { v -> put("resolution", v) } ?: putNull("resolution")
+                            it.sizeBytes?.let { v -> put("size_bytes", v) } ?: putNull("size_bytes")
+                            it.modifiedAt?.let { v -> put("modified_at", v) } ?: putNull("modified_at")
+                            // ⛔ 这三个**只在拿到值时才写**（不像邻居那样写 NULL）。
+                            //    它们表达的是「服务端告诉我们多长 / 多大」，
+                            //    拿不到 ≠ 文件没有时长。写成 NULL 会把上一次
+                            //    扫到的（或 PC 端刮到的）好值抹掉，而「继续观看」
+                            //    的进度条正是靠 `duration_ms > 0` 才画得出来。
+                            it.durationMs?.let { v -> put("duration_ms", v) }
+                            it.videoWidth?.let { v -> put("video_width", v) }
+                            it.videoHeight?.let { v -> put("video_height", v) }
+                            it.source?.let { v -> put("source", v) } ?: putNull("source")
+                            it.videoCodec?.let { v -> put("video_codec", v) } ?: putNull("video_codec")
+                            it.audioCodec?.let { v -> put("audio_codec", v) } ?: putNull("audio_codec")
+                            put("flags", jsonArray(it.flags))
+                            it.releaseGroup?.let { v -> put("release_group", v) }
+                                ?: putNull("release_group")
+                            put("is_sample_or_extra", if (it.isSampleOrExtra) 1 else 0)
+                            it.thumbUrl?.let { v -> put("thumb_url", v) } ?: putNull("thumb_url")
+                            it.faceAnchorX?.let { v -> put("face_anchor_x", v) }
+                                ?: putNull("face_anchor_x")
+                            // ⛔ 新行才写 `first_seen_at`：「入库时间」是「最近添加」
+                            //    排序的依据，重扫不该把它刷新成现在。
+                            put("first_seen_at", nowSec)
+                            put("updated_at", nowSec)
+                        },
+                    )
+                    inserted++
+                }
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+        return inserted to updated
+    }
+
+    /**
+     * 补建**缺失的**作品行。
+     *
+     * ⛔ 用 `INSERT OR IGNORE`，**绝不更新已存在的行**。已有的作品行上挂着
+     *    刮削结果（片名 / 年份 / 简介 / 海报 / 类型 / 评分）和用户手改过的分类
+     *    （`category_manual` / `genres_manual`）—— 扫描是「发现文件」，不是
+     *    「重算元数据」。覆盖掉的话，用户重扫一次库，海报和简介全没了。
+     *
+     * 返回新建的作品数。
+     */
+    fun insertMissingWorks(works: List<ScanWork>, nowSec: Long = nowSec()): Int {
+        if (works.isEmpty()) return 0
+        val d = require()
+        var n = 0
+        d.beginTransaction()
+        try {
+            for (w in works) {
+                val row = ContentValues().apply {
+                    put("key", w.key)
+                    put("provider", w.provider)
+                    put("kind", w.kind)
+                    put("category", w.category)
+                    put("title", w.title)
+                    w.year?.let { v -> put("year", v) } ?: putNull("year")
+                    // 兜底封面：网盘缩略图。**不覆盖**已有作品行（见本函数的
+                    // `CONFLICT_IGNORE`），所以这里只在「新作品」时落一次。
+                    w.posterUrl?.let { v -> put("poster_url", v) }
+                    put("genres", "[]")
+                    // `source = 'local'` —— 「已刮削」的判据是 `source = 'online'`，
+                    // 所以本地扫出来的作品**不会**被算成已刮削（这是对的：
+                    // 它的片名 / 年份都还没核实过）。
+                    put("source", "local")
+                    put("item_count", w.itemCount)
+                    put("total_bytes", w.totalBytes)
+                    put("season_count", w.seasonCount)
+                    w.lastModifiedAt?.let { v -> put("last_modified_at", v) }
+                        ?: putNull("last_modified_at")
+                    put("first_seen_at", nowSec)
+                    put("updated_at", nowSec)
+                }
+                n += d.insertWithOnConflict(
+                    "media_works",
+                    null,
+                    row,
+                    android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE,
+                ).let { if (it == -1L) 0 else 1 }
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+        return n
+    }
+
+    /**
+     * 重算受影响作品的三个冗余列（`item_count` / `total_bytes` / `season_count`）
+     * 与 `last_modified_at`。
+     *
+     * ⛔ 必须重算：卡片上要显示「24 集」而不想每次 `COUNT(*)`，所以那三列是
+     *    冗余存储。新扫进来的文件不重算的话，卡片会一直写着旧数字 ——
+     *    用户刚扫完看到数字没变，只会以为扫描没生效。
+     *
+     * ⛔ 口径是**存值**（只看 `group_key` 等于这个 key 的行），不是
+     *    `listWorks` 那套并集口径：折叠进来的源作品的文件由 `listWorks` 在读的
+     *    时候并进去，这里若再并一次就会被数两遍。
+     */
+    fun refreshWorkStats(keys: Collection<String>, nowSec: Long = nowSec()) {
+        if (keys.isEmpty()) return
+        val d = require()
+
+        // ① 一条 `GROUP BY` 把参与统计的行算完。
+        //
+        // ⛔ 不要写成「每个 key 一条带 4 个相关子查询的 UPDATE」：`media_items.group_key`
+        //    上**没有索引**，那种写法是「作品数 × 4 × 全表扫描」——
+        //    实测口径下几百部作品就要几十秒，而这段时间里库是被写事务占住的。
+        //    `GROUP BY` 只扫一遍表，之后按主键更新是纯值写入（微秒级）。
+        val stats = HashMap<String, Stat>(keys.size * 2)
+        for (chunk in keys.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT group_key, COUNT(*), COALESCE(SUM(size_bytes), 0), " +
+                    "COUNT(DISTINCT CASE WHEN season > 0 THEN season END), " +
+                    "MAX(modified_at) " +
+                    "FROM media_items WHERE group_key IN ($marks) GROUP BY group_key",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) {
+                    stats[c.getString(0)] = Stat(
+                        items = c.getLong(1),
+                        bytes = c.getLong(2),
+                        seasons = c.getInt(3),
+                        lastModifiedAt = if (c.isNull(4)) null else c.getLong(4),
+                    )
+                }
+            }
+        }
+
+        // ② 按主键逐条更新。
+        //
+        // ⛔ 查不到聚合行的 key 要写**零**而不是跳过：那正是「这部作品的文件
+        //    全被清掉了」的情况，跳过的话卡片会一直显示旧集数。
+        d.beginTransaction()
+        try {
+            for (key in keys) {
+                val s = stats[key]
+                d.execSQL(
+                    "UPDATE media_works SET item_count = ?, total_bytes = ?, " +
+                        "season_count = ?, last_modified_at = ?, updated_at = ? " +
+                        "WHERE key = ?",
+                    arrayOf<Any?>(
+                        s?.items ?: 0L,
+                        s?.bytes ?: 0L,
+                        s?.seasons ?: 0,
+                        s?.lastModifiedAt,
+                        nowSec,
+                        key,
+                    ),
+                )
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+    }
+
+    /** [refreshWorkStats] 用的一行聚合结果。 */
+    private data class Stat(
+        val items: Long,
+        val bytes: Long,
+        val seasons: Int,
+        val lastModifiedAt: Long?,
+    )
+
+    /**
+     * 清理「网盘侧已经不存在」的陈旧媒体项。
+     *
+     * 口径与 PC 端 `MediaRepositoryImpl.deleteItemsNotIn` **一致**：
+     *   * 只删 `media_items`（**不删 `media_works`** —— 作品行上挂着刮削结果与
+     *     用户手改的分类，删了要重刮；计数由 [refreshWorkStats] 重算成 0，
+     *     列表里会显示「0 集」而不是凭空消失）；
+     *   * 删完顺手清**孤儿**字幕引用与播放偏好（两张表都挂在 `item_id` 上，
+     *     而它们与 `media_items` 之间**没有外键** —— 不手动清就永远躺在表里，
+     *     在任何界面上都看不到）。
+     *
+     * ## ⛔ 白名单式删除在「白名单本身不完整」时是有害的
+     *
+     * 调用方必须保证 [keep] 是**本次完整扫描**扫到的全部 id，并且**中途没有
+     * 目录列失败**。少一个目录就会把那个目录下的文件全判成「已删除」，
+     * 连带着把它们的播放进度一起删掉。守在哪一侧？—— 守在这里太晚了
+     * （函数看不出白名单完不完整），所以守 [LibraryScanner] 那三个前置条件。
+     *
+     * 分批删（`IN` 里最多 400 个占位符）：一次扫出几千个文件，
+     * 拼一条超长 `IN` 会直接抛 `too many SQL variables`（SQLite 上限 999）。
+     */
+    fun pruneMissingItems(provider: String, keep: Set<String>): Int {
+        // 先把「库里在、白名单里没有」的 id 收齐，再按批删。
+        // ⛔ 不用 `NOT IN (几千个)`：同样是变量上限问题，而且大 `NOT IN`
+        //    在 SQLite 3.22 上走的是全表扫 + 逐个比较，比按主键 `IN` 删慢得多。
+        val gone = ArrayList<String>(256)
+        require().rawQuery(
+            "SELECT id FROM media_items WHERE provider = ?",
+            arrayOf(provider),
+        ).use { c ->
+            while (c.moveToNext()) {
+                val id = c.getString(0)
+                if (!keep.contains(id)) gone.add(id)
+            }
+        }
+        if (gone.isEmpty()) return 0
+
+        val d = require()
+        var n = 0
+        d.beginTransaction()
+        try {
+            for (chunk in gone.chunked(400)) {
+                val marks = chunk.joinToString(",") { "?" }
+                n += d.delete("media_items", "id IN ($marks)", chunk.toTypedArray())
+            }
+            if (n > 0) {
+                d.execSQL(
+                    "DELETE FROM subtitle_refs WHERE item_id NOT IN " +
+                        "(SELECT id FROM media_items)",
+                )
+                d.execSQL(
+                    "DELETE FROM playback_prefs WHERE item_id NOT IN " +
+                        "(SELECT id FROM media_items)",
+                )
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+        return n
+    }
+
+    private fun jsonArray(items: List<String>): String {
+        if (items.isEmpty()) return "[]"
+        return items.joinToString(",", "[", "]") { "\"" + it.replace("\"", "\\\"") + "\"" }
+    }
+
+    // ------------------------------------------------------------------
     // 清空
     // ------------------------------------------------------------------
 
@@ -503,6 +1105,11 @@ class LibraryDb(val file: File) {
                         lastModifiedAt = c.longOrNull("last_modified_at"),
                         firstSeenAt = c.longOrNull("first_seen_at"),
                         lastPlayedAt = c.longOrNull("last_played_at"),
+                        // ⛔ 钳到 [0,1]：position 越过 duration（片尾曲/时长估短）时
+                        //    进度条不能溢出格子。0 也归 null —— 「看过 0 秒」不画条。
+                        resumeFraction = c.doubleOrNull("resume_fraction")
+                            ?.takeIf { it > 0.0 }
+                            ?.coerceAtMost(1.0),
                     ),
                 )
             }
@@ -542,6 +1149,7 @@ class LibraryDb(val file: File) {
                         faceAnchorX = c.doubleOrNull("face_anchor_x"),
                         videoWidth = c.intOrNull("video_width"),
                         videoHeight = c.intOrNull("video_height"),
+                        isSampleOrExtra = c.boolOrFalse("is_sample_or_extra"),
                     ),
                 )
             }
@@ -564,16 +1172,30 @@ class LibraryDb(val file: File) {
     companion object {
         private const val TAG = "CloudCine"
 
+        /**
+         * 作品级列清单。
+         *
+         * ⛔ `resume_fraction` 是**相关子查询**，不是表上的列 —— 它引用外层表名
+         *    `media_works`，所以 `SELECT $WORK_COLUMNS` 的外层 FROM **必须**是
+         *    `media_works` 本身、**不能起别名**（`FROM media_works w` 会让 SQLite
+         *    找不到 `media_works.key` 而直接报错）。
+         * ⛔ 用 `MAX(CASE WHEN …)` 而不是 `MAX(resume/duration)`：`duration_ms` 为 0
+         *    或 NULL 的项会产生 NULL，SQLite 的 `MAX` **忽略 NULL**，所以两种写法
+         *    在正常数据上等价；但显式 CASE 把「除零」写死成不参与比较，语义更硬。
+         */
         private const val WORK_COLUMNS =
             "key, kind, category, title, original_title, year, overview, poster_url, " +
                 "poster_file, poster_face_x, rating, genres, source, item_count, " +
-                "total_bytes, season_count, last_modified_at, first_seen_at, last_played_at"
+                "total_bytes, season_count, last_modified_at, first_seen_at, last_played_at, " +
+                "(SELECT MAX(CASE WHEN i.duration_ms > 0 AND i.resume_position_ms > 0 " +
+                "THEN CAST(i.resume_position_ms AS REAL) / i.duration_ms END) " +
+                "FROM media_items i WHERE i.group_key = media_works.key) AS resume_fraction"
 
         private const val ITEM_COLUMNS =
             "id, provider, file_id, dir_id, name, dir_path, group_key, kind, title, year, season, " +
                 "episode, episode_end, part, part_label, container, resolution, size_bytes, " +
                 "duration_ms, resume_position_ms, max_position_ms, last_played_at, " +
-                "thumb_url, face_anchor_x, video_width, video_height"
+                "thumb_url, face_anchor_x, video_width, video_height, is_sample_or_extra"
 
         /** 当前 Unix 秒。⛔ 全库时间列都是秒，不是毫秒。 */
         fun nowSec(): Long = System.currentTimeMillis() / 1000L
@@ -604,6 +1226,18 @@ class LibraryDb(val file: File) {
         private fun Cursor.doubleOrNull(name: String): Double? {
             val i = getColumnIndexOrThrow(name)
             return if (isNull(i)) null else getDouble(i)
+        }
+
+        /**
+         * 布尔列（库里存 0/1）。
+         *
+         * ⛔ 读不到就当 `false`：`is_sample_or_extra` 的默认值就是 false，
+         *    而**认成「是花絮」会让那条文件从「点卡片直接播」的候选里消失** ——
+         *    症状是「点海报没反应」，比误播一条花絮难查得多。
+         */
+        private fun Cursor.boolOrFalse(name: String): Boolean {
+            val i = getColumnIndexOrThrow(name)
+            return !isNull(i) && getInt(i) != 0
         }
     }
 }

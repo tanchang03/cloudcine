@@ -1,6 +1,7 @@
 package com.cloudcine.tv
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -37,6 +38,13 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultAllocator
+import com.cloudcine.tv.library.EpisodeLabels
+import com.cloudcine.tv.library.EpisodeThumbs
+import com.cloudcine.tv.library.LibraryDb
+import com.cloudcine.tv.library.LibraryItem
+import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.PlaybackResume
+import com.cloudcine.tv.library.ScanItem
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.PlayInfo
 import com.cloudcine.tv.pan.Quality
@@ -377,6 +385,63 @@ class PlayerActivity : Activity() {
      */
     private var osdRows: List<TvOsdView.Row> = emptyList()
 
+    // ── 选集（同一部作品下的其它文件）──────────────────────────────
+    //
+    // 需求：「剧集播放中应该支持选择文件列表（哪一集）」。实现是**照 PC 端**
+    // 那一行 —— OSD 第一行「选集」→ 按 →（或 OK）进右侧纵向列表 → 上下选 →
+    // OK 换集。区别只在**列表行里多了网盘封面**（用户明确要求）。
+    //
+    // ⛔ 播放页原来**完全不碰媒体库**：它只拿到一个 `fid` 就去取链。所以
+    //    「同一部作品还有哪些文件」这个信息必须由**列表页**带进来
+    //    （`EXTRA_GROUP_KEY`），再用 [libDb] 查一次。网盘没有「查兄弟文件」
+    //    的接口，靠文件名去猜同作品更是必错。
+
+    /**
+     * 媒体库句柄。**惰性打开**：只有从媒体库进来的（有 `EXTRA_GROUP_KEY`）
+     * 才需要它，「直接给 URL」的对照路径连库文件都不碰。
+     */
+    private var libDb: LibraryDb? = null
+
+    /** 同一部作品下的全部条目（已按「季 → 部 → 集 → 名称」排序）。 */
+    private var siblings: List<LibraryItem> = emptyList()
+
+    /** 当前正在播的那一条在 [siblings] 里的下标；`-1` = 不在里面。 */
+    private var episodeIndex = -1
+
+    /** 选集列表里那些网盘封面的取用（内存 + 落盘 + 失败标记）。 */
+    private var episodeThumbs: EpisodeThumbs? = null
+
+    // ── 播放进度（续播点）──────────────────────────────────────────
+    //
+    // 需求：「每次打开剧集都从最近播放的那一集的最后播放记录继续播放」。
+    //
+    // 要成立需要**两头都通**：
+    //   * 进来 —— [resumeAtMs]（列表页随起播意图带来）在起播时跳过去；
+    //   * 出去 —— [reportProgress] 把看到哪儿了写回 `media_items`。
+    // ⛔ 2026-10-06 之前**两头都断着**：播放页从不写进度、也从不读进度，
+    //    于是续播点永远是「从 PC 端同步过来的那个值」—— 电视上看的进度
+    //    一条都不会留下来。
+
+    /** 起播要跳到的位置（毫秒）；`<= 0` = 从头播。 */
+    private var resumeAtMs = 0L
+
+    /** 上一次上报的位置（毫秒）。用来跳过「位置没变」的空写。 */
+    private var lastReportedMs = -1L
+
+    /**
+     * 进度上报心跳。
+     *
+     * ⛔ 10 秒而不是每秒：写库是磁盘 I/O，而这部机器上的磁盘正被预取器
+     *    以几 MiB/s 的强度在写。每秒一次等于给已经在抖的缓冲又加一份抖动。
+     *    10 秒与 PC 端同口径，且「退出时补写」能把误差压到 0。
+     */
+    private val progressTick = object : Runnable {
+        override fun run() {
+            reportProgress(flushAtExit = false)
+            ui.postDelayed(this, PROGRESS_TICK_MS)
+        }
+    }
+
     // ── 外挂字幕（网盘同目录）──────────────────────────────────────
     //
     // 需求：「1. 自动识别网盘当前目录中的字幕文件 2. 选择字幕文件」。
@@ -517,10 +582,31 @@ class PlayerActivity : Activity() {
             ).apply { gravity = Gravity.BOTTOM },
         )
 
+        episodeThumbs = EpisodeThumbs(
+            dir = LibraryPaths.thumbDir(this),
+            cacheBytes = THUMB_CACHE_BYTES,
+        )
         osd = TvOsdView(this).apply {
             visibility = View.GONE
             onActivate = { row, chip -> onOsdActivate(row, chip) }
             onClose = { hideOsd() }
+            // ⛔ 封面由播放页在**后台线程**取，OSD 只负责问。OSD 自己一旦
+            //    碰网络或磁盘，「按键→上屏」那几毫秒的预算立刻就没了。
+            thumbs = object : TvOsdView.ThumbSource {
+                override fun cached(url: String) = episodeThumbs?.cached(url)
+
+                override fun isKnownBad(url: String) = episodeThumbs?.isKnownBad(url) ?: true
+
+                override fun fetch(url: String, targetPx: Int, onReady: () -> Unit) {
+                    val api = api ?: return
+                    val store = episodeThumbs ?: return
+                    Bg.run({ store.load(url, api, targetPx) }) { _, _ ->
+                        // 失败也回调：`load` 已经把地址记进「拿不到」，
+                        // 重画一次列表它就不会再问了（否则每次 getView 都重试）。
+                        onReady()
+                    }
+                }
+            }
         }
         root.addView(
             osd,
@@ -549,22 +635,8 @@ class PlayerActivity : Activity() {
         updateSubtitleInset()
 
         // 两条入口：按 fid 自己取链（正常路径），或直接给 URL（对照用）。
-        spec = StreamSpec.fromIntent(intent)
-        val fid = intent.getStringExtra(EXTRA_FID)?.trim().orEmpty()
-        when {
-            fid.isNotEmpty() -> resolveAndPlay(fid)
-            spec != null -> {
-                Log.i(TAG, "直接用给定 URL 播放（对照路径）：${spec!!.url}")
-                startPlayer(spec!!.url, spec!!.headers)
-                // 这条路径没有 PlayInfo ⇒ 没有「画质」行，行下标与常规路径不同。
-                // 正因如此回调才按 id 分派（见 [onOsdActivate]）。
-                rebindOsd()
-            }
-            else -> {
-                Log.w(TAG, "既没有 fid 也没有 url，回列表页")
-                finish()
-            }
-        }
+        // ⛔ 与换集（[onNewIntent]）**同一条路**，别在这里另写一份。
+        startFromIntent(intent)
     }
 
     // ------------------------------------------------------------------
@@ -612,6 +684,260 @@ class PlayerActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------------
+    // 选集
+    // ------------------------------------------------------------------
+
+    /**
+     * 把同一部作品下的全部条目读进来（为了「选集」那一行）。
+     *
+     * ⛔ **必须在后台线程查**：一部剧能有两百多条，主线程查库就是一次可见的卡顿
+     *    —— 而且它发生在 `onCreate`，卡的是「起播前那段黑屏」。
+     * ⛔ 读不到库（没同步过 / 文件坏了）时**静默降级**：选集行不出现，
+     *    播放本身完全不受影响。这条路径不该因为「库没了」而播不了片。
+     */
+    private fun loadSiblings(groupKey: String, fid: String) {
+        if (groupKey.isEmpty()) return
+        Bg.run({ ensureLib().itemsForWork(groupKey) }) { list, err ->
+            if (err != null) {
+                Log.w(TAG, "读选集失败（groupKey=$groupKey），选集行不可用", err)
+                return@run
+            }
+            val items = list.orEmpty()
+            siblings = items
+            episodeIndex = items.indexOfFirst { it.fileId == fid }
+            Log.i(
+                TAG,
+                "选集：$groupKey 共 ${items.size} 条，当前下标 $episodeIndex" +
+                    if (episodeIndex < 0) "（当前文件不在这个作品里）" else "",
+            )
+            // ⛔ 只有**真的能选**（两条以上）才重绑：一条时选集行不会出现，
+            //    重绑只会白白把用户的菜单光标重置回第一行。
+            if (items.size > 1) rebindOsd()
+        }
+    }
+
+    /**
+     * 换到同一作品下的另一条。
+     *
+     * ## ⛔ 为什么**不能** `startActivity` 之后 `finish()`
+     *
+     * `AndroidManifest.xml` 里这一页是 `android:launchMode="singleTask"` ——
+     * 全工程**只允许存在一个播放页**（这是有意的：两个播放器会抢同一把
+     * 磁盘缓存锁）。而 singleTask 下再 `startActivity(PlayerActivity)`，
+     * 系统**不会**新建实例，只把 Intent 送回当前这个实例的 [onNewIntent]。
+     * 于是「起新页 + finish 旧页」会变成「什么都没做 + 把自己关掉」
+     * —— 真机表现正是用户报的那句：**换集之后播放器直接退出**。
+     *
+     * 所以这里只 `startActivity`，由 [onNewIntent] 接住并把旧的那条流整个换掉。
+     *
+     * ## 为什么复用同一个实例、而不是就地换 media source
+     *
+     * 就地换（像 [playQuality] 那样 `setMediaItem`）看着更省事，但**换集和换档
+     * 不是一回事**：换档是同一份字节的不同码率，而换集是**另一个文件** ——
+     * 外挂字幕要重新扫目录、轨道选择要整套丢掉、续播点要换成新那一集的、
+     * 连缓存键的 fid 都变了。这些事 [startFromIntent] 那条路径**已经全都做对了**，
+     * 就地换等于把它们再抄一遍，抄漏一条就是「换集后字幕还是上一集的」。
+     *
+     * 附带的好处：没有 Activity 切换，也就没有那 0.3~0.8 秒的黑场。
+     * 而**测速**那 3 秒不能忍 —— 同一条 WiFi、同一个 CDN，刚量过的带宽没必要
+     * 每集重量一遍，所以把上一次的实测值随 intent 带过去
+     * （见 [EXTRA_REUSE_BANDWIDTH] 与 [probeThenPlay]）。
+     */
+    private fun switchEpisode(index: Int) {
+        val item = siblings.getOrNull(index) ?: return
+        if (item.fileId == currentFid) {
+            Log.i(TAG, "选集：选中的就是正在播的那一条（${item.name}），不重开")
+            hideOsd()
+            return
+        }
+        Log.i(
+            TAG,
+            "选集 → 第 ${index + 1}/${siblings.size} 条：${item.name}" +
+                (EpisodeLabels.progressLabel(item)?.let { "（历史进度 $it）" } ?: ""),
+        )
+        // 先收菜单：singleTask 下 `startActivity` 会**同步**走到 [onNewIntent]，
+        //    那边接手之后这一页的 OSD 数据就已经是上一个文件的了。
+        hideOsd()
+        startActivity(
+            Intent(this, PlayerActivity::class.java)
+                .putExtra(EXTRA_FID, item.fileId)
+                .putExtra(EXTRA_NAME, item.name)
+                .putExtra(EXTRA_HEADERS, intent.getStringExtra(EXTRA_HEADERS))
+                .putExtra(EXTRA_PDIR, item.dirId)
+                .putExtra(EXTRA_GROUP_KEY, item.groupKey)
+                // ⛔ 换过去那一集**自己的**续播点：列表里可能好几集都看过，
+                //    切到第 5 集就该从第 5 集上次停的地方开始，不是 0，
+                //    更不是上一集留下的位置。
+                .putExtra(EXTRA_RESUME_MS, item.resumePositionMs ?: 0L)
+                // 已经量过的带宽 —— 别让用户每换一集等 3 秒测速。
+                .putExtra(EXTRA_REUSE_BANDWIDTH, measuredMbPerSec),
+        )
+        // ⛔ **不要 `finish()`**：这一页是 singleTask，`finish()` 会把整个
+        //    播放页关掉（新 Intent 只会回到自己身上）—— 见上面的类注释。
+    }
+
+    /**
+     * singleTask 下**换集**（以及 adb 再次 `am start`）会走到这里，而不是
+     * [onCreate] —— 见 [switchEpisode] 的类注释。
+     *
+     * ⛔ 必须先 `setIntent(intent)`：`resolveAndPlay` 读的是 Activity 的
+     *    `intent` 字段（`EXTRA_NAME` / `EXTRA_PDIR`），不换掉的话它拿到的
+     *    还是**上一集**的名字与父目录 —— 表现为「换集成功，但字幕扫的是
+     *    上一集那个目录」。
+     *
+     * ⛔ 换之前必须把**上一个文件的全部残留**清干净：轨道 override、外挂
+     *    字幕、已扫到的字幕文件、缓存键… 漏掉一条就是「换集后字幕/音轨
+     *    还是上一集的」。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+
+        val previous = currentFid
+        Log.i(TAG, "换集：复用当前播放页（旧 fid=$previous）")
+
+        // ⛔ 上一集的位置**必须先存下来**：换集到这里时，`player` 还活着，
+        //    再往下走就要 release 了 —— 之后 `currentPosition` 就没了。
+        reportProgress(flushAtExit = true)
+        lastReportedMs = -1L
+
+        // ── 清掉上一集的一切 ──────────────────────────────────────
+        ui.removeCallbacks(progressTick)
+        prefetcher?.cancel()
+        prefetcher = null
+        stopExternalSubtitle()
+        externalSub = null
+        externalActive = null
+        externalPending = null
+        subtitleFiles = emptyList()
+        tracks = null
+        pendingTracks = null
+        info = null
+        current = null
+        currentFid = ""
+        currentQualityId = ""
+        currentIsPlaylist = false
+        siblings = emptyList()
+        episodeIndex = -1
+        firstFrameRendered = false
+        player?.release()
+        player = null
+        // 倍速**故意保留**：那是观看习惯，不是「上一个文件的属性」。
+        // 控制栏留在屏幕上，新一集起播时 `showControls()` 会自己更新。
+        hideOsd()
+
+        startFromIntent(intent)
+    }
+
+    /**
+     * 按当前 `intent` 起播 —— [onCreate] 与 [onNewIntent] **共用这一条路**。
+     *
+     * ⛔ 不能两边各写一份 `when { fid -> … spec -> … }`：换集走过的那条分支
+     *    会比首次启动少做一两件事（历史上正是这么漏掉外挂字幕的），而这种
+     *    「首次正常、换集后不对」的 bug 极难复现 —— 用户只会觉得它时好时坏。
+     */
+    private fun startFromIntent(intent: Intent) {
+        val fid = intent.getStringExtra(EXTRA_FID)?.trim().orEmpty()
+        spec = StreamSpec.fromIntent(intent)
+        resumeAtMs = intent.getLongExtra(EXTRA_RESUME_MS, 0L)
+        loadSiblings(intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty(), fid)
+        when {
+            fid.isNotEmpty() -> resolveAndPlay(fid)
+            spec != null -> {
+                Log.i(TAG, "直接用给定 URL 播放（对照路径）：${spec!!.url}")
+                startPlayer(spec!!.url, spec!!.headers)
+                // 这条路径没有 PlayInfo ⇒ 没有「画质」行，行下标与常规路径不同。
+                // 正因如此回调才按 id 分派（见 [onOsdActivate]）。
+                rebindOsd()
+            }
+            else -> {
+                Log.w(TAG, "既没有 fid 也没有 url，回列表页")
+                finish()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 播放进度（写回媒体库）
+    // ------------------------------------------------------------------
+
+    /**
+     * 把「看到哪儿了」写回媒体库。
+     *
+     * ## 写三样东西，三样各有各的用处
+     *
+     * | 列 | 用处 | 判据 |
+     * |---|---|---|
+     * | `last_played_at`（item + work） | 「最近播放」的排序依据 | 每次播过就写 |
+     * | `max_position_ms` | 列表里那条细进度条（`看过没有 / 看到哪儿了`） | **只增不减**、永不清除 |
+     * | `resume_position_ms` | 「下次从哪儿接着播」 | 会变、也会被**清掉** |
+     *
+     * ⛔ `max` 与 `resume` **必须分开**：看完的一集 `resume` 要清成 NULL、
+     *    而 `max` 必须保留 —— 用续播点画进度条的话，看完的一集会显示成 0%。
+     *
+     * ## ⛔ 为什么看完要**清掉**续播点
+     *
+     * 留着的话，下次打开会从「还差一分钟」开始，看两秒就出字幕 —— 用户只会
+     * 以为这一集坏了。判据见 [PlaybackResume.isFinished]。
+     *
+     * ## ⛔ 为什么落库失败不能打断播放
+     *
+     * 落库失败只记日志。它是「下次能不能续」的问题，不是「现在能不能看」的问题，
+     * 弹个 toast 把正在看的画面打断是最坏的取舍。但不能**静默** —— 否则
+     * 「续播位置丢了」会变成一个无从查起的问题。
+     *
+     * @param flushAtExit true = 退出前的最后一次（跳过「位置没变」的优化）。
+     */
+    private fun reportProgress(flushAtExit: Boolean) {
+        val p = player ?: return
+        val fid = currentFid
+        // 「直接给 URL」的对照路径没有 fid，也就没有库里的那一行 —— 写不进去。
+        if (fid.isEmpty()) return
+        val positionMs = p.currentPosition
+        if (positionMs <= 0L) return
+        if (!flushAtExit && positionMs == lastReportedMs) return
+        lastReportedMs = positionMs
+
+        val totalMs = p.duration.takeIf { it > 0 } ?: 0L
+        val itemId = ScanItem.idOf("quark", fid)
+        val keep = PlaybackResume.worthKeeping(positionMs, totalMs)
+        Bg.run({
+            val db = ensureLib()
+            db.markPlayed(itemId)
+            if (totalMs > 0L) db.saveMaxPosition(itemId, positionMs)
+            // ⛔ 看完 / 不足 5 秒 ⇒ 传 `null`，由 `saveResumePosition` 写成 NULL。
+            db.saveResumePosition(itemId, if (keep) positionMs else null)
+            Triple(itemId, positionMs, keep)
+        }) { r, err ->
+            if (err != null) {
+                Log.w(TAG, "进度落库失败（不影响播放）：${err.message}")
+                return@run
+            }
+            if (r == null) return@run
+            Log.i(
+                TAG,
+                "进度：${r.first} @ ${r.second / 1000}s / ${totalMs / 1000}s" +
+                    if (r.third) "" else "（已看完或太短 ⇒ 清掉续播点）",
+            )
+        }
+    }
+
+    /**
+     * 惰性打开媒体库。**只能在后台线程调**（要开文件、可能建表）。
+     *
+     * ⛔ 与 [libDb] 的关系：这里是唯一的赋值处，而 [loadSiblings] 也走这里 ——
+     *    两处各 new 一个 `LibraryDb` 的话，同一个文件会有两个句柄，
+     *    在 `journal_mode=DELETE`（不用 WAL，见 `LibraryDb` 类注释）下更容易
+     *    撞上 `database is locked`。
+     */
+    private fun ensureLib(): LibraryDb {
+        libDb?.let { return it }
+        val db = LibraryDb(LibraryPaths.dbFile(this))
+        libDb = db
+        return db
+    }
+
     /**
      * 先量一次真实带宽，再据此挑档。
      *
@@ -639,6 +965,24 @@ class PlayerActivity : Activity() {
      * 探测成本：最多 3 秒 / 12 MiB。用最高档的地址探（同域名同 CDN，速率可比）。
      */
     private fun probeThenPlay(pi: PlayInfo) {
+        // 换集时复用上一次的实测带宽 —— 同一条 WiFi、同一个 CDN，刚量过的数
+        // 没必要每集重量一遍（那是每换一集白等 3 秒）。
+        // ⛔ 只走**换集**这条路（[switchEpisode] 才会带这个 extra）。正常起播
+        //    一律实测：换片、换网络之后旧值就不作数了，而「量一下再挑档」
+        //    正是本工程不卡顿的全部理由，不能为了省 3 秒把它常态化掉。
+        val reused = intent.getDoubleExtra(EXTRA_REUSE_BANDWIDTH, 0.0)
+        if (reused > 0.0) {
+            measuredMbPerSec = reused
+            val pick = chooseQuality(pi)
+            Log.i(
+                TAG,
+                "换集：复用上次实测 %.2f MB/s（跳过测速），选档 ${pick.id}" +
+                    "（${pick.label}，需 %.2f MB/s）".format(reused, pick.requiredMbPerSec),
+            )
+            playQuality(pick)
+            return
+        }
+
         val probeTarget = pi.qualities.maxByOrNull { it.height } ?: pi.qualities.first()
         val conns = prefs.parallelConnections
         showNotice("正在测速…\n（按最高档 ${probeTarget.label}、$conns 条连接探 3 秒）")
@@ -1425,6 +1769,27 @@ class PlayerActivity : Activity() {
         exo.setMediaItem(MediaItem.fromUri(url))
         openedAtMs = System.currentTimeMillis()
         exo.prepare()
+        // 续播点 ——「每次打开剧集都从最近播放的那一集的最后播放记录继续播放」。
+        //
+        // ⛔ 必须在 `prepare()` **之后**再 `seekTo`：之前这一列只存在于库里、
+        //    从来没被用过，于是「同一个文件换了播放器就从头开始」。
+        // ⛔ `resumeAtMs` 由**列表页**随意图带来（`PlayTarget.resolve` 已经挑好了
+        //    该播哪一集），不是这里去猜 —— 播哪一集与从哪儿续，判据必须同一处。
+        val startMs = resumeAtMs
+        if (startMs > 0L) {
+            exo.seekTo(startMs)
+            // ⛔ 不要在这里 `showNotice`：下面紧接着就是「正在打开…」，
+            //    两行相隔几毫秒，用户只看得见后面那句（还会以为跳续失败了）。
+            //    续播这件事由**控制栏上跳动的进度条**自己说话 —— 它本来就
+            //    会亮出来（见下面 `showControls()`）。
+            Log.i(TAG, "续播：起播跳到 ${startMs / 1000}s（库里记的续播点）")
+        }
+        // ⛔ 进度心跳在建好播放器之后才起：之前没有 `currentPosition` 可报。
+        // ⛔ 先 `removeCallbacks`：`startPlayer` 会被**重建播放器**那条路再调一次
+        //    （换音效），不取消就会有两个心跳同时在跑 —— 写库频率翻倍，
+        //    而且这种重复只有在「切过一次音效之后」才出现。
+        ui.removeCallbacks(progressTick)
+        ui.postDelayed(progressTick, PROGRESS_TICK_MS)
         exo.playWhenReady = true
 
         // ⛔ 传给预取器的是 `countingParallel`（**同一把计数器**），不是 `parallel`：
@@ -1442,7 +1807,14 @@ class PlayerActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // ⛔ 退出前**必须补写一次进度**，而且必须在 `player.release()` **之前**
+        //    —— 释放之后 `currentPosition` 就没有了。
+        //    没有这一笔的话：用户在第 12 分钟退出，而下一次定时上报（10 秒一次）
+        //    最多是 10 秒前写的 ⇒ 每次退出都丢最多 10 秒。真正致命的是
+        //    「看了两分钟就退出」这种情形：一次都没上报过，进度全丢。
+        reportProgress(flushAtExit = true)
         ui.removeCallbacks(hideControls)
+        ui.removeCallbacks(progressTick)
         // ⛔ 防抖里的跳转也要取消：player 释放后再跑会崩，而且此时跳转
         //    已经没有意义（用户都离开播放页了）。
         ui.removeCallbacks(seekCommit)
@@ -1464,6 +1836,11 @@ class PlayerActivity : Activity() {
         stats.bindBufferBudget(null, 0)
         player?.release()
         player = null
+        // ⛔ **故意不关** `libDb`：上面那次退出补写是**异步**的（Bg 线程），
+        //    在这里 `close()` 会与它撞上 —— 表现为偶发的 `IllegalStateException:
+        //    attempt to re-open an already-closed object`，而且只在「退出时正好
+        //    赶上写库」这个窗口里出现。一个 SQLite 句柄比一次崩溃便宜得多，
+        //    进程结束会自然回收。
         super.onDestroy()
     }
 
@@ -1653,10 +2030,23 @@ class PlayerActivity : Activity() {
                 "${r.label}=${r.value} → $opts"
             },
         )
+        // 画质档位的分辨率 / 码率 / 需带宽不进菜单（太长，见 `buildRows`），
+        // 但必须留在日志里：「4K 卡顿」排查的第一步就是对照这几档的需带宽
+        // （原画 3.00 MB/s vs 4k 0.63 MB/s，差 5 倍 —— 见 `PanModels.Quality`）。
+        info?.let { pi ->
+            Log.i(
+                TAG,
+                "画质档位：" + pi.qualities.joinToString(" | ") { "${it.label}(${it.id}) ${it.detail}" },
+            )
+        }
     }
 
     private fun buildRows(): List<TvOsdView.Row> {
-        val out = ArrayList<TvOsdView.Row>(7)
+        val out = ArrayList<TvOsdView.Row>(8)
+        // 「选集」在第一行 —— **照 PC 端**（`buildPlayerTvRows` 里它就是第一项）。
+        // 顺序在这里是有意义的：打开菜单时光标停在第一行，而「换一集」是
+        // 剧集播放中最常做的事，排第一等于「按一下 OK 就到」。
+        episodeRow()?.let { out += it }
         // 「画质」只在有 PlayInfo（正常取链路径）时才有。直接给 URL 的对照路径
         // 没有档位概念 ⇒ 少一行 —— 这正是回调要按 id 而不是按下标分派的原因。
         info?.let { pi ->
@@ -1664,9 +2054,14 @@ class PlayerActivity : Activity() {
                 id = ROW_QUALITY,
                 label = "画质",
                 value = current?.label ?: "—",
-                // 选项带真实分辨率与「需要多少带宽」—— 这是选档时最该看的数字，
-                // 藏进日志就没人看了。
-                options = pi.qualities.map { "${it.label}  ${it.detail}" },
+                // ⛔ 选项**只放短名**（`原画` / `4K` / `超清` / `高清` / `标清` / `流畅`）。
+                //    曾经拼过 `${label}  ${detail}`（`4K  3840×1606 · 5.2 Mbps · 需
+                //    0.63 MB/s`），一个 chip 就吃掉大半行，后面几档全被挤出面板 ——
+                //    用户的原话是「选项过于冗长，超出设置面板」。
+                //    分辨率 / 码率 / 需带宽 挪进日志（见 `rebindOsd`）：选档时真正
+                //    要判断的是「哪一档能流畅播」，那件事已由 `chooseQuality` 按实测
+                //    带宽自动做掉，不该让用户对着数字心算。
+                options = pi.qualities.map { it.label },
                 active = pi.qualities.indexOfFirst { it.id == current?.id },
             )
         }
@@ -1683,6 +2078,57 @@ class PlayerActivity : Activity() {
         out += rateRow(currentSpeed)
         out += debugRow()
         return out
+    }
+
+    /**
+     * 「选集」那一行 —— 照 PC 端，但列表里多一张**网盘封面**。
+     *
+     * ## 形态
+     *
+     * `vertical = true`：焦点在这一行按 **→**（或 OK）进右侧纵向列表，
+     * 上下选、OK 换集、← / 返回退回侧栏 —— 按键语义与云影/夸克一致，
+     * 由 [TvOsdView] 负责。
+     *
+     * ## ⛔ 什么时候**不**给这一行
+     *
+     * `siblings.size <= 1` 时返回 `null`：一部电影、或者一部只有一条文件的
+     * 剧，没有「集」可选，多一行只是让菜单变长。
+     * ⛔ 也正因如此**行数不是固定的** —— 回调一律按 [TvOsdView.Row.id] 分派
+     *    （见 [onOsdActivate]），绝不能按下标 `when`。
+     *
+     * ## 列表三样东西怎么来的
+     *
+     * | 位置 | 内容 | 为什么 |
+     * |---|---|---|
+     * | 封面 | `media_items.thumb_url`（夸克 640×360 预览图） | 用户明确要求「网盘封面」 |
+     * | 主标题 | [EpisodeLabels.fileLabel]（文件名去扩展名） | ⛔ **不写「第 N 集」** —— 见 `EpisodeLabels` 的类注释 |
+     * | 进度条 | [EpisodeLabels.progressFraction]（读 **历史最大位置**） | 一眼看出「这一集看过没有 / 看到哪儿了」 |
+     */
+    private fun episodeRow(): TvOsdView.Row? {
+        if (siblings.size <= 1) return null
+        val options = ArrayList<String>(siblings.size)
+        val progress = ArrayList<Double>(siblings.size)
+        val thumbs = ArrayList<String>(siblings.size)
+        for (item in siblings) {
+            options.add(EpisodeLabels.fileLabel(item))
+            // `-1.0` = 这一条没进度 ⇒ 条子整个藏起来（不是画一条空槽）。
+            progress.add(EpisodeLabels.progressFraction(item) ?: -1.0)
+            // ⛔ 与 options **等长**：没有预览图的那一条也要占一个空位，
+            //    不能「跳过去」。`ListView` 按下标取值，错位了就是
+            //    「第 7 集的封面贴在第 3 集上」，而且只在滚动之后才出现。
+            thumbs.add(item.thumbUrl.orEmpty())
+        }
+        val idx = episodeIndex
+        return TvOsdView.Row(
+            id = ROW_EPISODE,
+            label = "选集",
+            value = if (idx in siblings.indices) options[idx] else "—",
+            options = options,
+            progress = progress,
+            thumbs = thumbs,
+            vertical = true,
+            active = idx,
+        )
     }
 
     /**
@@ -1810,6 +2256,12 @@ class PlayerActivity : Activity() {
      */
     private fun onOsdActivate(row: Int, chip: Int) {
         when (osdRows.getOrNull(row)?.id) {
+            ROW_EPISODE -> {
+                // ⛔ 换集**收菜单**：新一集起播后旧的那份行数据（音轨 / 字幕 /
+                //    画质档位）全都是上一个文件的，留着就是错的。
+                //    而且换集本身会重开播放页，菜单在那边是关着的。
+                switchEpisode(chip)
+            }
             ROW_QUALITY -> {
                 info?.qualities?.getOrNull(chip)?.let { playQuality(it) }
                 hideOsd()
@@ -2652,6 +3104,36 @@ class PlayerActivity : Activity() {
          */
         const val EXTRA_PDIR = "pdir"
 
+        /**
+         * 本片**所属作品**的 `group_key` —— 「选集」的唯一入口。
+         *
+         * ⛔ 播放页原来完全不碰媒体库，只拿一个 `fid` 就去取链，于是「同一部
+         *    作品还有哪些文件」这件事**无从得知**（网盘没有「查兄弟文件」的
+         *    接口；按文件名去猜同作品更是必错）。只能由**列表页**随起播意图
+         *    带过来，播放页再拿它去查一次库（见 `loadSiblings`）。
+         *
+         * 没有它时选集行不出现，播放本身完全不受影响 —— 从「文件浏览」页
+         *    直接点一个文件进来就是这种情形。
+         */
+        const val EXTRA_GROUP_KEY = "groupKey"
+
+        /**
+         * 起播要跳到的位置（毫秒）；`<= 0` = 从头播。
+         *
+         * ⛔ 由**列表页**带过来（`PlayTarget.resolve` 挑好那一集之后顺手取的
+         *    `resume_position_ms`）。播放页不自己查库 —— 见 `onCreate` 那处注释。
+         */
+        const val EXTRA_RESUME_MS = "resumeMs"
+
+        /**
+         * 上一次实测的并行带宽（MiB/s）—— 只有**换集**才带。
+         *
+         * ⛔ 换集会重开播放页，而量一次带宽要 3 秒；同一条 WiFi、同一个 CDN，
+         *    刚量过的数没必要每集重量一遍。见 `probeThenPlay`。
+         * ⛔ `0.0` = 没有（正常起播），此时一律实测。
+         */
+        const val EXTRA_REUSE_BANDWIDTH = "reuseBandwidth"
+
         private const val BrowserUa =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -2662,6 +3144,7 @@ class PlayerActivity : Activity() {
         // ⛔ 原生 OSD 只回传**行下标**，而「画质」行在对照路径上不存在、
         //    「字幕/音效」行在片源没有对应轨道时会退化成一句提示 —— 行数
         //    不是固定的。所以分派一律走这些 id，不要 `when (row) { 0 -> ... }`。
+        private const val ROW_EPISODE = "episode"
         private const val ROW_QUALITY = "quality"
         private const val ROW_PARALLEL = "parallel"
         private const val ROW_AUDIO = "audio"
@@ -2672,6 +3155,24 @@ class PlayerActivity : Activity() {
 
         /** 字幕那一行最前面的「关闭」项。 */
         private const val OFF_LABEL = "关闭"
+
+        /**
+         * 进度写库的心跳（毫秒）—— 与 PC 端同口径（10 秒）。
+         *
+         * ⛔ 别调快：写库是磁盘 I/O，而预取器正在以几 MiB/s 往同一块盘写。
+         *    每秒一次等于给已经在抖的缓冲再加一份抖动。误差由「退出时补写」
+         *    兜住，所以慢一点没有任何代价。
+         */
+        private const val PROGRESS_TICK_MS = 10_000L
+
+        /**
+         * 选集封面在内存里的缓存上限（字节）。
+         *
+         * 一张封面解码后是 `320×180 RGB_565` ≈ 115 KiB；8 MiB ≈ 70 张。
+         * 一屏只看得见 6 行，70 张足够上下翻好几屏不至于重新解码，
+         * 又不会把「从头翻到尾」的整部剧留在堆里（这台电视只有 512 MB）。
+         */
+        private const val THUMB_CACHE_BYTES = 8 * 1024 * 1024
 
         /** 没人按键就把控制栏收起来。4 秒够看清缓冲进度在长，又不挡画面。 */
         private const val CONTROLS_HIDE_MS = 4_000L

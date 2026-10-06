@@ -14,6 +14,37 @@ data class DriveEntry(
     val isDir: Boolean,
     val sizeBytes: Long,
     val updatedAtMs: Long,
+    /**
+     * 父目录 fid（夸克 `pdir_fid`）。
+     *
+     * ⛔ 扫描入库要用它填 `media_items.dir_id` —— 起播时播放页靠这个值去
+     *    同目录扫外挂字幕。单个文件的 fid **推不出**父目录，网盘也没有
+     *    「查父目录」的接口，所以只能列目录时顺手记下来。
+     *
+     * 浏览页（[com.cloudcine.tv.BrowseActivity]）不用它，BFS 自己知道父 fid。
+     */
+    val parentId: String? = null,
+    /**
+     * 服务端生成的**大预览图**地址（夸克 `preview_url`，实测 640×360 WebP）。
+     *
+     * ⛔ 只有视频有，且**字段缺失时不要自己拼 URL** —— 服务端只对已经生成过
+     *    预览图的文件下发（实测覆盖约 70%），拼出来的地址对剩下的只会拿到
+     *    404/401，白费一次请求。
+     *
+     * 它是「没有在线刮削海报时」的封面兜底：扫描时存进 `media_items.thumb_url`，
+     * 作品建行时取分组里第一条有图的当封面。
+     */
+    val previewUrl: String? = null,
+    /** 服务端读文件头得到的宽 / 高（实测覆盖率 100%，比文件名里的 `2160p` 可靠）。 */
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    /**
+     * 时长（毫秒）。夸克 `duration` 下发的是**秒**，这里已经乘过 1000。
+     *
+     * ⛔ 播放页**不**用这个值当进度条分母（真时长以播放器解出来的为准），
+     *    它只在库里当参考 —— 有它才能算出「看完了百分之多少」。
+     */
+    val durationMs: Long? = null,
 ) {
     /** 只用来决定「点 OK 是进目录还是起播」。 */
     val isVideo: Boolean

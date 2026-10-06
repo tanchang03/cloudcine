@@ -5609,7 +5609,39 @@ MEMORY.md 只留**标识符索引**，下列为**理由与完整判据**。
 - 侧栏五项 媒体库 `/library` · 文件夹 `/folders` · 扫描 · 下载 · 设置：⛔ `app_shell._items` 与 `app_router.branches` **必须同序**（判据是**下标**）；文件夹读**网盘实时目录**、媒体库读**本地索引**，**搜索词各一份**。
 - 三组**目录 → 视频 → 其他文件**（**组间顺序是结构**）。⛔ 入库判据只有 `classifyEntry` 一处。
 - ⛔ 下载取链**复用 `adapter.resolveStream`**（别打 `/file/download`，>50MiB 直接 23018）；⛔ `.part` 是断点**唯一真源**，服务端**忽略 Range 回 200 必须从 0 重写**，`parse` 读不懂退 **paused**。
-- 文件夹模式只做**「已入库」叠加层**（镜像判定在视频判定**之前**）：⛔ **绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。
+- 文件夹模式只做**「已入库」叠加层**（镜像判定在视频判定**之前**）：⛔ **绝不清理陈旧记录**、⛔ **绝不写续扫游标**、**深度从本次目标算第 0 层**。
+
+---
+
+## §AND-1 Android 媒体库 / UI / OSD（2026-10-06 从 `MEMORY.md` 下沉，逐条细节）
+
+> `MEMORY.md` 只留红线短句 + 索引；**判据原文在此**。新增条目请往这里加，别把 MEMORY 撑爆。
+
+### 1. 媒体库数据结构（Android 侧 `library/`）
+- `LibrarySchema` = **唯一真源**，7 条 DDL 与 Dart（`lib/data/db/tables.dart` / drift）**逐字一致**，`LibrarySchemaTest` 守着。
+- `LibraryDb`：打开即**补表补列** + 对齐 `user_version`；⛔ **不做 v1→v16 迁移**；补列**必须 `col.copy(notNull = false)`**（照抄 DDL 的 NOT NULL 会让老库 ALTER 失败）；⛔ **不用 WAL**，`journal_mode=DELETE`（备份要直接拷文件，WAL 会把新数据留在 `-wal` 里 ⇒ 备份丢最近改动）。
+- `LibraryModels` · `LibraryPaths` · `LibraryBackupService`。
+  - ⛔ `rawBytes()` 必须先 `close()`；`replaceWithRawBytes()` 必须先删 `-journal`/`-wal`/`-shm`。
+  - ⛔ `LibraryItem` 必须带 `dirId`（起播传 `EXTRA_PDIR`，用来扫同目录字幕）。
+- 备份包 `.ccbak` 的 Android 侧：`BackupPackage` · `BackupManifest`（含手写 `IsoTime`，⛔ 不能用 `SimpleDateFormat` 拼时区）· `SyncDecision`（纯函数，**分支顺序不能动**）· `MiniJson`（⛔ `org.json` 在 JVM 单测里是空壳；整数不能写成 `16.0`）。
+- ★ **drift 的 DDL 两处反直觉**：可空列**显式写 ` NULL`**；主键写在**表尾**（`ADD COLUMN` 同一套规则）。
+
+### 2. 媒体库 UI（`LibraryActivity` / `BrowseActivity`）
+- ⛔⛔ **`AbsListView.OnItemClickListener` 在电视上按 OK 不触发**（实测 `input keyevent 23` 零反应）⇒ 必须在 `dispatchKeyEvent` 里自管 OK，**DOWN 与 UP 都要吞**（只吞 DOWN ⇒ UP 再触发一次 `performItemClick`，一按播两遍）。`OnItemClickListener` 只留触摸路径。
+- ⛔ **`applyWorks` 里无条件 `requestFocus()` = 一级导航「点不动」**。守卫 `if (!tabsFocused && !filterVisible && !overlayVisible)`。
+- ⛔ **光标态与生效态必须分离**：←→ 只移 `navIndex`（不查询），OK 才 `applyTab()` 落 `category`；否则连按 = 6 次全量查询。
+- ★ **取片算法 `PlayTarget.resolve`**（移植 `lib/domain/services/play_target.dart`，`library/PlayTarget.kt`，10 例单测）：①有续播点（`resume>0`）的一集，多条取 `lastPlayedAt` 最大、全无时刻退**列表最后一个** → ②有播放记录但已看完 ⇒ **仍播那一集，绝不猜下一集** → ③第一条。**先滤 `is_sample_or_extra`**（花絮），全花絮才退回全部。⛔ `Cursor.boolOrFalse` 读不到当 `false`（误判花絮 ⇒ 文件从候选消失 ⇒ 症状「点海报没反应」）。
+- ★ **海报文件名要自己算**：`media_works.poster_file` **PC 端从不回写**（128 部全空）⇒ 按 `poster_cache.dart` 规则 `{sanitize(key)}_{FNV-1a32(url) 8位}.jpg` 现算。`PosterNaming.kt` + 18 例单测与 Dart 逐字对拍（真机 **命中 128/128**）。⛔ FNV 溢出即回绕；`0x811C9DC5 > Int.MAX_VALUE` ⇒ 写 `0x811C9DC5L.toInt()`；Dart `\s` 比 Java 宽（含 `\u00A0/\u3000/\uFEFF/\u2000-\u200A`，但 **`\u200B/\u200C` 不算**）。
+- ★ **分类口径**（PC `_categoryCondition`）：`movie`/`series`/`other` 三桶带**空串兜底**；`anime`/`variety`/`documentary` 只看那一列。**Android 有意修正**：PC 写 `category = ''`，而 SQL `NULL = ''` 为假 ⇒ 改 `(category IS NULL OR category = '')`。⛔ 分类计数必须与筛选条件**逐字对齐**（`CASE` 分桶），否则「角标 72、点进去 68」。
+- ★ **`genres` 是 JSON 文本** ⇒ `LIKE '%"动画"%'`（带引号）才不捞进「动画片」；**项间是「或」**，「与」只发生在维度之间。⛔ 分面角标作用域**不含 years/genres 自己**（否则勾第一个类型后其余角标就变、勾第二个列表已空）；⛔ **「已选但当前范围没有」的项仍要画**（`stale`/「无结果」），否则那颗 chip 消失但它仍生效。
+- ★★ **深色 UI 的层次靠实心面明度，不靠描边**（用户**两次**点名「线框不高级/难看」）。选中态 = 实心圆角块 + 左侧 4dp 强调竖条（`MenuRow.kt`，`0xFF3A3268` 底 / 白字）；一级导航三态全实心（生效 `BRAND_TINT`+深字 / 光标 `0xFF4A4278` / 常态 `0x14FFFFFF`）；⛔ **导航带不许画整体贯通外框**（`tabsBox.background = null`）。卡片焦点三层：非选中 `alpha=0.62` + 描边 + `scale 1.05`（`clipChildren=false`）；选中项变化要 `post { notifyDataSetChanged() }` 重画可见卡片。
+- 筛选面板 = **一维列表**（不做二维网格：电视上折行位置随数量变，最易「按右键跳得莫名其妙」）；`openMenu()` 用 `ArrayList<Pair<String, () -> Unit>>`，⛔ 别用「labels + `when(index)`」（插项后下标错位，其中一项是不可逆的「从网盘恢复」）。
+
+### 3. 播放器 OSD 的「画质」行（10-06 用户反馈：选项过长、超出面板）
+- **现象与修法**：`PlayerActivity.buildRows()` 里画质 chip 曾经拼 `"${label}  ${detail}"`（`4K  3840×1606 · 5.2 Mbps · 需 0.63 MB/s`）⇒ 一个 chip 就吃掉大半行，后面几档全被挤出右侧面板（用户原话「选项过于冗长，超出设置面板，只需要 4K 原画 超清等名称即可」）。现改为**只放短名** `pi.qualities.map { it.label }`。
+- **短名来源**：`PanApi.tierLabel(id)` = `4k→4K` · `2k→2K` · `super→超清` · `high→高清` · `normal→标清` · `low→流畅`；映射表外的 id **原样回退**（所以 chip 必须设宽度上限）。
+- **信息不丢**：分辨率 / 码率 / `需 X MB/s` 改由 `rebindOsd()` 追加一行 `Log.i("CloudCine", "画质档位：…")` 输出 —— 「4K 卡顿」排查第一步就是对照这几档的需带宽（原画 3.00 vs 4k 0.63 MB/s）。菜单里那点数字本来也没人算，选档已由 `chooseQuality` 按实测带宽自动做掉。
+- **防御**：`TvOsdView` 里每个 chip 设 `maxWidth = MAX_CHIP_W`（160dp）+ `maxLines = 1` + `ellipsize = END`，防服务端给出超长档位 id 时一个 chip 撑满整行。面板右侧可用宽 ≈ 屏宽 − `SAFE_H`(48dp) − `SIDEBAR_W`(180dp)，1080p 上约 560dp。
 
 ## 7. PC TV 布局 / OSD 卡顿
 - `isTvLayout` = android + 逻辑宽≥960（⛔ 判据读 **view 宽**）。⛔ 页头 `actions` 必须 `Wrap`；⛔ **过扫描内边距只有 `app_shell` 一处**；⛔ 遥控器 **↓ 绝不接管**；⛔ **`SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。

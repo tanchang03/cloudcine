@@ -163,17 +163,18 @@ class BrowseActivity : Activity() {
         }
         overlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            // 与媒体库的菜单同一套：**不描边**（线框在深色 UI 里只剩一条细线），
+            // 层次靠比背景亮一档的实心面 + 更大的圆角。
             background = GradientDrawable().apply {
-                cornerRadius = dp(14).toFloat()
-                setColor(0xFF1B1F27.toInt())
-                setStroke(dp(1), 0xFF3A4150.toInt())
+                cornerRadius = dp(18).toFloat()
+                setColor(0xFF1E232C.toInt())
             }
-            setPadding(dp(28), dp(22), dp(28), dp(18))
+            setPadding(dp(16), dp(20), dp(16), dp(14))
         }
         overlayTitle = TextView(this).apply {
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            setPadding(0, 0, 0, dp(10))
+            setPadding(dp(12), 0, dp(12), dp(12))
         }
         overlay.addView(overlayTitle)
         overlayRowsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -196,12 +197,16 @@ class BrowseActivity : Activity() {
         overlayIndex = 0
         overlayRowsBox.removeAllViews()
         for (label in labels) {
-            overlayRowsBox.addView(TextView(this).apply {
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                setPadding(dp(14), dp(11), dp(14), dp(11))
-                text = label
-            })
+            // ⛔ 走 MenuRow（与媒体库菜单**同一套实现**）：选中 = 实心圆角块 +
+            //    左侧竖条，未选中 = 透明底。这里**不要**自己 setBackgroundColor
+            //    造直角色块 —— 那是上一版的样式，用户明确说「太难看」。
+            overlayRowsBox.addView(
+                MenuRow.create(this, label),
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { bottomMargin = dp(2) },
+            )
         }
         paintOverlaySelection()
         overlayScrim.visibility = View.VISIBLE
@@ -210,9 +215,7 @@ class BrowseActivity : Activity() {
 
     private fun paintOverlaySelection() {
         for (i in 0 until overlayRowsBox.childCount) {
-            val v = overlayRowsBox.getChildAt(i) as TextView
-            v.setBackgroundColor(if (i == overlayIndex) BRAND_SELECT else Color.TRANSPARENT)
-            v.setTextColor(if (i == overlayIndex) BRAND_TINT else Color.WHITE)
+            MenuRow.paint(overlayRowsBox.getChildAt(i), i == overlayIndex)
         }
     }
 
@@ -232,9 +235,19 @@ class BrowseActivity : Activity() {
             when (index) {
                 // 媒体库读的是**同步下来的本地索引**，不需要登录态；
                 // 进页面后再按菜单做「同步 / 上传备份 / 从网盘恢复」。
+                //
+                // ⛔ 用 `CLEAR_TOP` 而不是 `startActivity + finish`：媒体库现在是
+                //    App 首页，通常在栈里已经有一份。`CLEAR_TOP` 会**复用**那一份
+                //    （它同时会把它上面的都弹掉），而不会越堆越多层；从别处直接
+                //    打开网盘目录时（比如 adb 调试），栈里没有媒体库，`CLEAR_TOP`
+                //    就会新建一个 —— 两种情况都对。
                 0 -> {
                     hideOverlay()
-                    startActivity(Intent(this, LibraryActivity::class.java))
+                    startActivity(
+                        Intent(this, LibraryActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                    )
+                    finish()
                 }
                 else -> {
                     // 重新登录：清凭证回登录页。本 App 上「退出登录」的唯一入口。

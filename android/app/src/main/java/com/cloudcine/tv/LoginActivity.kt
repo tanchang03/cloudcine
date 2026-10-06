@@ -93,10 +93,10 @@ class LoginActivity : Activity() {
 
         setContentView(root)
 
-        // 已登录就直接进列表（省一次扫码）
+        // 已登录就直接进**媒体库**（首页，省一次扫码）
         if (store.loggedIn) {
             Log.i(TAG, "已有凭证，跳过登录")
-            gotoBrowse()
+            gotoLibrary()
             return
         }
         startLogin()
@@ -170,13 +170,20 @@ class LoginActivity : Activity() {
             }
             nick?.let { store.nickname = it }
             Log.i(TAG, "登录成功，昵称=${nick ?: "（未取到）"}")
-            status.text = "登录成功${if (nick.isNullOrEmpty()) "" else "，$nick"}，正在进入文件列表…"
-            status.postDelayed({ if (!stopped) gotoBrowse() }, 600)
+            status.text = "登录成功${if (nick.isNullOrEmpty()) "" else "，$nick"}，正在进入媒体库…"
+            status.postDelayed({ if (!stopped) gotoLibrary() }, 600)
         }
     }
 
-    private fun gotoBrowse() {
-        startActivity(Intent(this, BrowseActivity::class.java))
+    /**
+     * 登录成功后进**媒体库**（不是网盘文件列表）。
+     *
+     * ⛔ 与 `MainActivity` 的口径必须一致：那一边按登录态直达媒体库，这一边登录完
+     *    却送去文件列表的话，用户会觉得「登录之后又跳到了另一个地方」。
+     *    网盘目录仍然是媒体库里的一个入口。
+     */
+    private fun gotoLibrary() {
+        startActivity(Intent(this, LibraryActivity::class.java))
         finish()
     }
 
