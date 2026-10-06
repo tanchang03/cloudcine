@@ -62,6 +62,21 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
      */
     var networkRateSupplier: (() -> Long)? = null
 
+    /**
+     * 后缓冲保留时长（毫秒）。由 Activity 挂上 [BufferPlan] 算出的那个值。
+     *
+     * 进度条用它把内存缓冲区间向**左**延伸到播放头后面那段 ——
+     * 见 [SeekBarView.bufferStartRatio] 里「为什么不能只画到 0」。
+     */
+    var backBufferMsSupplier: (() -> Long)? = null
+
+    /**
+     * 磁盘缓存已经下到的**媒体时间**（毫秒）；没启用缓存时返回 0。
+     *
+     * 这是进度条上那层**淡蓝**（见 [SeekBarView.diskCacheRatio]）。
+     */
+    var diskCacheEndMsSupplier: (() -> Long)? = null
+
     /** 用户拖完进度条后回调（比例 0..1）。 */
     var onSeek: ((Float) -> Unit)? = null
 
@@ -154,15 +169,32 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
             } else {
                 "${fmtTime(pos)} / ${fmtTime(dur)}"
             }
-            seekBar.progressRatio = if (dur == null || dur <= 0) 0f else (pos.toFloat() / dur)
-            seekBar.bufferedRatio = if (dur == null || dur <= 0) 0f else (buf.toFloat() / dur)
+            if (dur != null && dur > 0) {
+                val d = dur.toFloat()
+                seekBar.progressRatio = pos.toFloat() / d
+                seekBar.bufferedRatio = buf.toFloat() / d
+                // 后缓冲：把内存缓冲区间**向左延伸**到播放头后面那段。
+                // ⛔ 不能只画到 0 —— 那会让「已播过但还在缓冲里」看起来像
+                //    「已经播过、要重下」，回拖时用户会被骗。
+                val backMs = backBufferMsSupplier?.invoke() ?: 0L
+                seekBar.bufferStartRatio = (pos - backMs).coerceAtLeast(0L).toFloat() / d
+                // 磁盘缓存：从片头画到「预取器已经下到哪」。它和内存缓冲是两套
+                // 账本（一个受 48 MiB 约束、一个在盘上），所以单独一层颜色。
+                seekBar.diskCacheRatio = (diskCacheEndMsSupplier?.invoke() ?: 0L).toFloat() / d
+            } else {
+                seekBar.progressRatio = 0f
+                seekBar.bufferedRatio = 0f
+                seekBar.bufferStartRatio = 0f
+                seekBar.diskCacheRatio = 0f
+            }
         }
 
         // ⛔ 速率每拍**只拉一次**。拉两次 = 同一拍塞两个采样点，窗口被压短、
         //    读数开始抖，而且「窗口内无新字节就衰减到 0」这条判据也会失真。
         val rate = networkRateSupplier?.invoke() ?: 0L
+        val disk = diskCacheText()
 
-        statusText.text = statusLine(p, buf - pos, rate)
+        statusText.text = statusLine(p, buf - pos, rate, disk)
         statusText.setTextColor(
             if (p.playbackState == Player.STATE_BUFFERING) {
                 0xFF8FB6FF.toInt()
@@ -182,6 +214,7 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
                 "[控制栏] ${fmtTime(pos)} / ${if (dur == null) "--:--" else fmtTime(dur)}" +
                     " · 已缓冲+${(buf - pos) / 1000}s" +
                     " · 速率 ${fmtSpeed(rate)}" +
+                    (if (disk != null) " · $disk" else "") +
                     " · ${statusText.text}",
             )
         }
@@ -194,8 +227,10 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
      *   - **缓冲中** → 必须带上实时网速（用户明确要的）
      *   - **暂停** → 说清「还在持续缓冲」，否则用户会以为暂停就不下载了
      *   - **播放中** → 速率 + 缓冲余量
+     *
+     * @param disk 磁盘缓存那一小段（[diskCacheText]）；没启用时是 null
      */
-    private fun statusLine(p: Player, aheadMs: Long, rate: Long): String {
+    private fun statusLine(p: Player, aheadMs: Long, rate: Long, disk: String?): String {
         val speed = fmtSpeed(rate)
         val buffering = p.playbackState == Player.STATE_BUFFERING
         val paused = !p.playWhenReady
@@ -203,6 +238,12 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
         return when {
             buffering && rate > 0 -> "缓冲中 · $speed"
             buffering -> "缓冲中…"
+            // ⛔ 暂停时**必须**把磁盘缓存亮出来。用户暂停就是想看「还在不在下」，
+            //    而「已缓冲 Ns」读的是 ExoPlayer 的 `SampleQueue`（48 MiB 上限），
+            //    预取器写进磁盘的数据根本进不了它 —— 数字会一直不动，
+            //    用户就会以为「暂停后不缓冲了」。实测就是这么误判的：
+            //    磁盘里已经写了 512 MiB，屏幕上还写着「已暂停 · 已缓冲 9s」。
+            paused && disk != null -> "已暂停 · 内存 ${ahead}s · $disk"
             paused && rate > 0 -> "已暂停 · 持续缓冲 · $speed"
             paused && ahead > 0 -> "已暂停 · 已缓冲 ${ahead}s"
             paused -> "已暂停"
@@ -213,6 +254,20 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
             ahead > 0 -> "已缓冲 ${ahead}s"
             else -> ""
         }
+    }
+
+    /**
+     * 磁盘缓存那一小段文字，例如 `磁盘 16:10`；**没启用或还没下到东西时返回 null**。
+     *
+     * ⛔ 用**本片**已下到的时间（[diskCacheEndMsSupplier]），**不要**用
+     *    `PrefetchCache.usedBytes()` —— 那是整个缓存目录的占用，含别的片源的
+     *    残留。用它会出现「控制栏写着 2.2 GiB、进度条却画 0」这种自相矛盾的
+     *    画面（实测就是这么撞出来的），用户完全没法判断缓存到底生效没有。
+     */
+    private fun diskCacheText(): String? {
+        val endMs = diskCacheEndMsSupplier?.invoke() ?: 0L
+        if (endMs <= 0L) return null
+        return "磁盘 ${fmtTime(endMs)}"
     }
 
     /** `C.TIME_UNSET` 与负数都要当成「还不知道时长」。 */
@@ -273,6 +328,34 @@ class SeekBarView(context: Context) : View(context) {
             invalidate()
         }
 
+    /**
+     * 内存缓冲区间的**起点**比例（0..1）。
+     *
+     * ⛔ 存在的理由是**后缓冲**：`bufferedPosition` 只给前向的终点，
+     *    而 ExoPlayer 其实还保留着播放头**后面**一段（可回拖、不必重下）。
+     *    只画 `[0, bufferedRatio]` 等于把后缓冲画成了「已经播过」，
+     *    用户回拖时看到浅色区间却还要重新缓冲 —— 那是云影踩过的坑。
+     */
+    var bufferStartRatio = 0f
+        set(v) {
+            field = v.coerceIn(0f, 1f)
+            invalidate()
+        }
+
+    /**
+     * **磁盘缓存**已经下到哪的比例（0..1）。
+     *
+     * 这一层与内存缓冲是两回事：内存缓冲受 `SampleQueue` 的 48 MiB 约束
+     * （原画只够 9 秒），而磁盘缓存由 [DiskPrefetcher] 绕开播放器预算
+     * 顺序灌入，能到 GB 级。**两者必须画成不同颜色**，否则用户没法判断
+     * 「暂停时到底有没有在继续下」—— 那正是这个需求要解决的困惑。
+     */
+    var diskCacheRatio = 0f
+        set(v) {
+            field = v.coerceIn(0f, 1f)
+            invalidate()
+        }
+
     var scrubbing = false
         private set
 
@@ -282,6 +365,18 @@ class SeekBarView(context: Context) : View(context) {
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x33FFFFFF
     }
+
+    /**
+     * 磁盘缓存层：**淡蓝**。
+     *
+     * ⛔ 用色调（蓝）而不是亮度来区分内存缓冲：两者都是浅色的话，
+     *    在电视这种对比度差的面板上根本分不出来。蓝色 = 「已经在盘上」，
+     *    白色 = 「在内存里」，纯蓝 = 「已播过」。
+     */
+    private val diskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x593D7EFF
+    }
+
     private val bufferPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x8CFFFFFF.toInt()
     }
@@ -307,11 +402,24 @@ class SeekBarView(context: Context) : View(context) {
         if (w <= 0) return
         val half = trackH / 2f
 
+        // 从下往上四层，顺序不能反：
+        //   轨道 → 磁盘缓存 → 内存缓冲（前向+后向）→ 已播放
         rect.set(left, cy - half, right, cy + half)
         canvas.drawRoundRect(rect, half, half, trackPaint)
 
-        if (bufferedRatio > 0f) {
-            rect.set(left, cy - half, left + w * bufferedRatio, cy + half)
+        if (diskCacheRatio > 0f) {
+            rect.set(left, cy - half, left + w * diskCacheRatio, cy + half)
+            canvas.drawRoundRect(rect, half, half, diskPaint)
+        }
+        // ⛔ 宽度判据是 `> bufferStartRatio`（不是 `> 0`）：后缓冲让起点右移，
+        //    若还按 0 判，会画出一个「左端点到 bufferedRatio」的假区间。
+        if (bufferedRatio > bufferStartRatio) {
+            rect.set(
+                left + w * bufferStartRatio,
+                cy - half,
+                left + w * bufferedRatio,
+                cy + half,
+            )
             canvas.drawRoundRect(rect, half, half, bufferPaint)
         }
         if (progressRatio > 0f) {

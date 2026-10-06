@@ -2,6 +2,7 @@ package com.cloudcine.tv
 
 import android.app.Activity
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -24,6 +25,9 @@ import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.cache.Cache
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -117,6 +121,51 @@ class PlayerActivity : Activity() {
 
     private var player: ExoPlayer? = null
     private lateinit var store: CredStore
+
+    /**
+     * 磁盘缓存的**旁路预取器**。它不经过 ExoPlayer 的 `SampleQueue`，
+     * 所以暂停时照样往前下 —— 见 [DiskPrefetcher] 的类注释。
+     *
+     * 生命周期：起播时新建、[onDestroy] 取消。**不能跨播放页复用** ——
+     * 换片就换 url，缓存键也换了。
+     */
+    private var prefetcher: DiskPrefetcher? = null
+
+    /**
+     * 播放头在文件里的**字节位置**，由主线程每秒刷新的快照。
+     *
+     * ⛔ 它存在的唯一理由：`ExoPlayer.currentPosition` **只能在主线程读**。
+     *    在别的线程读会抛 `IllegalStateException: Player is accessed on the
+     *    wrong thread`，而预取线程的未捕获异常**会带走整个进程** ——
+     *    用户看到的就是「无法打开影片，闪退」（2026-10-06 实测）。
+     *    所以预取线程只许读这个快照，绝不碰 `player`。
+     */
+    @Volatile
+    private var playheadBytesCache = 0L
+
+    /** 当前档位的码率（字节/秒），把 [playheadBytesCache] 换算出来用。主线程写。 */
+    @Volatile
+    private var bytesPerSecCache = 0.0
+
+    /**
+     * 后缓冲保留时长（毫秒），[BufferPlan] 算出来的那个值。
+     *
+     * 进度条用它把内存缓冲区间向左延伸（见 `SeekBarView.bufferStartRatio`）。
+     * ⛔ 存下来是因为**它和字节预算是联动算的**，进度条那边不能自己再猜一遍。
+     */
+    @Volatile
+    private var backBufferMsCache = 0L
+
+    /** 每秒把播放位置换算成字节，写进 [playheadBytesCache]。 */
+    private val playheadTick = object : Runnable {
+        override fun run() {
+            val p = player
+            if (p != null && bytesPerSecCache > 0.0) {
+                playheadBytesCache = (p.currentPosition / 1000.0 * bytesPerSecCache).toLong()
+            }
+            ui.postDelayed(this, PLAYHEAD_TICK_MS)
+        }
+    }
 
     /** 全局参数（调试浮层开关等），与登录态分开存。 */
     private lateinit var prefs: AppPrefs
@@ -514,6 +563,92 @@ class PlayerActivity : Activity() {
     // 播放器
     // ------------------------------------------------------------------
 
+    /**
+     * 当前档位的码率（MiB/s），交给 [BufferPlan] 反算后缓冲时长。
+     *
+     * ⛔ `-e url` 那条**对照路径**（[onCreate] 里直接起播）没有档位信息，
+     *    返回 0 ⇒ [BufferPlan] 用它的保守兜底。宁可后缓冲偏小 —— 偏小的代价是
+     *    「回拖几秒要重下」，偏大的代价是「前向饿死、暂停后一个字节都不读」。
+     */
+    private fun assumedBitrateMibps(): Double =
+        current?.requiredMbPerSec?.takeIf { it > 0.0 } ?: 0.0
+
+    /**
+     * 起一条**旁路预取**：绕开 ExoPlayer 的缓冲预算，直接往磁盘缓存灌数据。
+     *
+     * 这是「暂停时也能一直缓冲」的**唯一实现方式**。播放器自己的 loader
+     * 受 `SampleQueue`（48 MiB）约束，暂停时一个字节都不读；
+     * 而这条线程不经过 loader，因此暂停时照样往前下 —— 见 [DiskPrefetcher]。
+     *
+     * ## 为什么起点是 0 而不是播放位置
+     *
+     * 文件头（`moov` / 索引）每次起播都要读一遍。从 0 开始下，
+     * 第二次打开同一个文件时那段就能命中缓存，省掉一次
+     * `pos=0` 的嗅探往返（实测 250~500ms）。
+     *
+     * ## 领先量为什么是「缓存上限的 70%」
+     *
+     * ⛔ 不能设成无上限：那会一口气把缓存灌满，而用户可能看 5 分钟就退出 ——
+     * 白下、白写盘。70% 留出余量给播放器自己写的那部分（已播段），
+     * 让 LRU 有腾挪空间。
+     *
+     * @param cache 为 null（空间不够 / 初始化失败）时**直接不预取**，
+     *   播放走纯网络 —— 这是正常路径，不是错误。
+     */
+    private fun startDiskPrefetch(
+        url: String,
+        cache: Cache?,
+        parallel: DataSource.Factory,
+        bitrateMibps: Double,
+    ) {
+        prefetcher?.cancel()
+        prefetcher = null
+
+        val rate = if (bitrateMibps > 0.0) bitrateMibps else BufferPlan.ASSUMED_BITRATE_MIBPS
+        val bytesPerSec = rate * 1048576.0
+
+        // ── 控制栏 / 进度条的数据源（**与有没有磁盘缓存无关**，先挂上）──
+        // ⛔ 一律传**取值器**而不是当时的数值：换档时码率会变，
+        //    传死值会让「磁盘缓存换算成时长」一路用旧码率算下去。
+        bytesPerSecCache = bytesPerSec
+        playheadBytesCache = 0L
+        controls.backBufferMsSupplier = { backBufferMsCache }
+        controls.diskCacheEndMsSupplier = {
+            val r = bytesPerSecCache
+            // 预取器还没起来（或已收工）时是 0 ⇒ 进度条上那层淡蓝不画。
+            val next = prefetcher?.nextPositionBytes ?: 0L
+            if (r > 0.0) (next / r * 1000.0).toLong() else 0L
+        }
+        // 先开「播放头快照」的定时器，再起预取：否则预取第一轮读到的是 0，
+        // 会误判成「播放头在片头」，领先量算错。
+        ui.removeCallbacks(playheadTick)
+        ui.post(playheadTick)
+
+        if (cache == null) {
+            Log.i(TAG, "磁盘预取：未启用（缓存不可用），播放走纯网络")
+            return
+        }
+
+        val lead = (PrefetchCache.limitBytes() * 7 / 10).coerceAtLeast(64L * 1024 * 1024)
+        val p = DiskPrefetcher(
+            cache = cache,
+            dataSourceFactory = parallel,
+            uri = Uri.parse(url),
+            startPositionBytes = 0L,
+            totalBytes = -1L,
+            maxLeadBytes = lead,
+            // ⛔ 只读主线程写好的**快照**，绝不在这里碰 `player` ——
+            //    见 [playheadBytesCache] 的注释（踩过一次，直接闪退）。
+            playheadBytes = { playheadBytesCache },
+        )
+        prefetcher = p
+        p.start()
+        Log.i(
+            TAG,
+            "磁盘预取：已启动（码率 %.2f MiB/s ⇒ 领先上限 ${lead / 1048576} MiB）".format(rate),
+        )
+    }
+
     private fun startPlayer(url: String, headers: Map<String, String>) {
         // ── 数据源：**多连接并行**（本原型要验证的核心）──────────────
         //
@@ -539,18 +674,41 @@ class PlayerActivity : Activity() {
             readTimeoutMs = StreamSpec.DEFAULT_TIMEOUT_MS,
         )
 
+        // ── 磁盘缓存：**只读不写**，写入方只留预取器一个 ──────────────
+        //
+        // ⛔ 包装顺序：`CacheDataSource(upstream = 计数(并行))`。
+        //    把计数放在缓存**外面**的话，`NetRateMeter` 会把「缓存命中的读」
+        //    也算成网络流量 —— 速率虚高，而且「缓存到底有没有生效」没法判断。
+        //
+        // ⛔ **播放器不许写缓存**（`setCacheWriteDataSinkFactory(null)`）：
+        //    两个写者撞上同一个 span 时，`SimpleCache.startFile` 抛的是
+        //    `IllegalStateException`，而 `CacheDataSource` 只吞 `IOException`
+        //    ⇒ 会直接崩。让 [DiskPrefetcher] 当唯一写者，换来零崩溃风险；
+        //    代价只是「起播头十几秒那一段会被重复下载」（原画约 40 MiB）。
+        val cache = PrefetchCache.get(this)
+        val countingParallel = CountingDataSourceFactory(parallel, netBytes)
+        val upstream: DataSource.Factory = if (cache != null) {
+            CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(countingParallel)
+                .setCacheWriteDataSinkFactory(null)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        } else {
+            countingParallel
+        }
+
         // ⛔ 速率**不走** `AnalyticsListener.onBandwidthEstimate`：那个回调
         //    一次传输结束才发一次（`DefaultBandwidthMeter` 在 `onTransferEnd`
         //    里通知），缓冲中好几秒才有一个样本 ⇒ 窗口里没有新字节 ⇒ 界面
         //    上只剩「缓冲中」、看不到速率（实测就是这个现象）。
         //    改成在数据源上数 `read()` 的返回值：字节是连续进来的。
-        val mediaSourceFactory =
-            DefaultMediaSourceFactory(CountingDataSourceFactory(parallel, netBytes))
+        val mediaSourceFactory = DefaultMediaSourceFactory(upstream)
 
         Log.i(
             TAG,
             "数据源：多连接并行（${prefs.parallelConnections} 条 × " +
-                "${ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES / 1024} KiB/块）",
+                "${ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES / 1024} KiB/块）· " +
+                PrefetchCache.describe(this),
         )
 
         // ── 缓冲策略（三条需求都落在这里）──────────────────────────
@@ -600,19 +758,48 @@ class PlayerActivity : Activity() {
                 "${bufferBytes / 1048576} MiB（不许再写死）",
         )
 
-        // ⛔ `setBackBuffer(30s, true)` 让**回拖**也在缓冲里：默认后缓冲很短，
-        //    往左拖 10s 看着在浅色区间内、其实数据已经丢了，照样重新缓冲。
-        //    ⛔ 但**别给到 60s**：后缓冲和前向缓冲共用同一个字节上限，4K 下
-        //    60s 就是 165MB，会把 48MiB 的额度全吃光、前向缓冲饿死。
-        //    30s 在超清档下才 4MB，完全放得下。
+        // ── 后缓冲：**按字节预算反算，不许写死秒数**（2026-10-06 实测修正）──
+        //
+        // ⛔⛔ 原来写 `setBackBuffer(30_000, true)` = 「保留 30 秒」。当时的
+        //    算账是「30s 在超清档下才 4MB，放得下」—— 低码率档确实放得下，
+        //    但**原画档 30s = 3.67 × 30 = 110 MiB**，是 48 MiB 总预算的 2.3 倍。
+        //
+        //    而 `setTargetBufferBytes` 的额度是**前向 + 后向共用**的
+        //    （`DefaultAllocator.getTotalBytesAllocated()` 两边都算进去），
+        //    ⇒ 后缓冲把额度吃光，前向只剩 2~7s（实测）。
+        //      * 播放中：锯齿 —— `15.35 → 0.98 → 3.00 → 12.79 → 0 MB/s`；
+        //      * **暂停时更糟**：播放头不动 ⇒ 后缓冲样本永不回收 ⇒ 分配器恒满
+        //        ⇒ `shouldContinueLoading` 因 `targetBufferSizeReached` 恒 false
+        //        ⇒ **一个字节都不读**（实测「已暂停 · 已缓冲+2s · 速率 0 KB/s」
+        //        卡了整整 30 秒，用户看到的就是「暂停后不缓冲了」）。
+        //
+        // ⇒ 改成：后缓冲**最多占字节预算的 1/4**，时长按**当前档位码率**反算，
+        //    并钳在 [2s, 30s]。低码率档仍然拿得到 30s
+        //    （48MiB ÷ 4 ÷ 0.31 ≈ 39s → 钳 30s），原画档只留 3.3s（12 MiB），
+        //    把剩下的 36 MiB 让给前向 ≈ 9.8s。
+        //
+        // ⛔ 别想着打开 `setPrioritizeTimeOverSizeThresholds(true)` 来「按秒保住」
+        //    后缓冲：那个开关的意思是**允许突破字节上限**，正是 10-04 那次
+        //    `OutOfMemoryError` 崩溃的成因。字节上限是不许动的红线。
+        val bitrateMibps = assumedBitrateMibps()
+        val backBufferMs = BufferPlan.backBufferMs(bufferBytes, bitrateMibps)
+        // 进度条要用它把内存缓冲区间向左延伸（后缓冲那段）。
+        backBufferMsCache = backBufferMs.toLong()
+        Log.i(
+            TAG,
+            "后缓冲 ${backBufferMs}ms（码率 %.2f MiB/s，后缓冲只占预算的 %d MiB）".format(
+                if (bitrateMibps > 0.0) bitrateMibps else BufferPlan.ASSUMED_BITRATE_MIBPS,
+                bufferBytes / 1048576 / 4,
+            ),
+        )
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 30_000,   // minBufferMs：低于它一定继续下载
-                120_000,  // maxBufferMs：暂停时能一直缓冲到这里
+                120_000,  // maxBufferMs：暂停时能一直缓冲到这里（低码率档可达）
                 1_500,    // bufferForPlaybackMs：起播阈值
                 5_000,    // bufferForPlaybackAfterRebufferMs：卡完恢复的阈值
             )
-            .setBackBuffer(30_000, true)
+            .setBackBuffer(backBufferMs, true)
             .setTargetBufferBytes(bufferBytes.toInt())
             .build()
 
@@ -758,6 +945,8 @@ class PlayerActivity : Activity() {
         exo.prepare()
         exo.playWhenReady = true
 
+        startDiskPrefetch(url, cache, parallel, bitrateMibps)
+
         showNotice("正在打开…")
         // 播放器一建好就把控制栏亮出来（4 秒后自动收），让用户立刻看到
         // 进度条与缓冲进度在长 —— 这是本原型要验证的东西。
@@ -766,7 +955,13 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         ui.removeCallbacks(hideControls)
+        // ⛔ 快照定时器也要停：它读 `player.currentPosition`，
+        //    player 释放后再跑会崩。
+        ui.removeCallbacks(playheadTick)
         controls.unbind()
+        prefetcher?.cancel()
+        prefetcher = null
+        Log.i(TAG, "退出播放页 · ${PrefetchCache.describe(this)}")
         stats.stop()
         player?.release()
         player = null
@@ -1472,5 +1667,15 @@ class PlayerActivity : Activity() {
          * 所以「按住左/右」天然就是连续拖拽。
          */
         private const val SEEK_STEP_MS = 10_000L
+
+        /**
+         * 「播放头字节位置」快照的刷新周期。
+         *
+         * 1 秒足够：它只用来决定预取器「能领先播放头多少」，
+         * 而领先量是几百 MiB 的量级，误差几百毫秒无所谓。
+         * ⛔ 别调快：这个回调跑在主线程上，而主线程已经背着
+         * 「每 tick 重建整页」的负担（见 PlayerControlsView 的注释）。
+         */
+        private const val PLAYHEAD_TICK_MS = 1_000L
     }
 }
