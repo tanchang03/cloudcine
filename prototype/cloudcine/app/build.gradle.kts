@@ -41,6 +41,16 @@ android {
             isMinifyEnabled = false
         }
     }
+
+    testOptions {
+        // ⛔ 必须开：`ParallelRangeReader` / `ParallelProbe` 里都调了
+        //    `android.util.Log`，而 JVM 单测跑的是 android.jar 的**空壳实现**
+        //    —— 默认行为是**抛异常**（`RuntimeException: Method i in
+        //    android.util.Log not mocked`），每个用例都会挂。
+        //    开这个开关后它们退化成「返回默认值」（`Log.i` 返回 0），
+        //    于是纯逻辑单测能跑，而不必引 Robolectric。
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -54,4 +64,14 @@ dependencies {
     // ⛔ 不自己写 QR 编码器：掩码/纠错级别选错时**不报错**，只是「有些手机
     //    扫不出来」，在电视上排查一次要十分钟。
     implementation("com.google.zxing:core:3.5.3")
+
+    // ── 单测 ──────────────────────────────────────────────────────────
+    // 只测**纯逻辑**：`RangePlan`（分块边界，错了不崩、只静默少下几个字节）
+    // 与 `ParallelRangeReader`（顺序 / 背压 / EOF / 重试续传，靠 JDK 自带的
+    // `com.sun.net.httpserver` 起一个支持 Range 的本地服务）。
+    //
+    // ⛔ 本机 Gradle 缓存里**只有 `junit-bom`（一个 pom），没有 jar**
+    //    ⇒ 首次构建**必须联网**拉 `junit:junit` + `hamcrest-core`（各几百 KB）。
+    //    拉过一次就进缓存了，之后仍可 `--offline`。
+    testImplementation("junit:junit:4.13.2")
 }

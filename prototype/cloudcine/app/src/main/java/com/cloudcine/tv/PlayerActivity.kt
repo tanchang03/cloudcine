@@ -24,7 +24,6 @@ import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -333,35 +332,50 @@ class PlayerActivity : Activity() {
      *
      * 服务端给的是 **`super`**（1440×810 那种），在 4K 片源上**肉眼就能看出糊**。
      * 照抄它等于「用服务端的保守默认，替用户做了降画质的决定」。
-     * 但反过来一律上最高档也不行 —— 4K 原画要 2.75~3 MB/s，这台电视的 WiFi
+     * 但反过来一律上最高档也不行 —— 4K 原画要 3.67 MiB/s，这台电视的 WiFi
      * 未必给得起，硬上就退化成云影那种「加载-播放-加载」。
      *
      * 所以：**量一下，再选「带宽扛得住的最清晰那一档」**，并留 30% 余量
-     * （单连接测速只能反映那一个 CDN 节点，且播放本身还有抖动）。
+     * （短窗口测速仍偏乐观，且播放本身还有抖动）。
      *
-     * 探测成本：最多 2 秒 / 4 MiB。用最高档的地址探（同域名同 CDN，速率可比）。
+     * ## ⛔ 探测必须**与播放同构**（2026-10-06 改）
+     *
+     * 原来走 [PanHttp.probeThroughput]：**单连接**、12 MiB / 2 秒。电视上实测
+     * 它量到 `12.00 MiB / 1.97s = 6.08 MiB/s`，于是判「原画余量 40%」→ 选原画
+     * → 播 1 分钟后掉到 **1021 KB/s** → 一直卡。
+     *
+     * 错在两点：**连接数不对**（夸克按连接限速 1 MiB/s，1 条连接量到的数与
+     * 播放实际用几条无关）+ **窗口落在突发段里**（新连接前 ~10 秒能跑 2.3~2.9 MiB/s）。
+     * 换成 [ParallelProbe]（复用 [ParallelRangeReader]，连接数与播放同一个取值器）
+     * 之后，量到的数就是播放能拿到的数。
+     *
+     * 探测成本：最多 3 秒 / 12 MiB。用最高档的地址探（同域名同 CDN，速率可比）。
      */
     private fun probeThenPlay(pi: PlayInfo) {
         val probeTarget = pi.qualities.maxByOrNull { it.height } ?: pi.qualities.first()
-        showNotice("正在测速…\n（按最高档 ${probeTarget.label} 探 2 秒）")
+        val conns = prefs.parallelConnections
+        showNotice("正在测速…\n（按最高档 ${probeTarget.label}、$conns 条连接探 3 秒）")
         Bg.run({
-            PanHttp.probeThroughput(
+            ParallelProbe.measure(
                 url = probeTarget.url,
-                cookie = cdnCookie(),
-                // ⛔ 别缩回 4 MiB：那个量在 0.7s 就读满，量到的是**突发**速率，
-                //    不是可持续速率。实测电视上突发 5.49 MiB/s、可持续只有
-                //    ~1 MB/s —— 用突发值去选档，必然选到 4K 原画然后一直卡。
-                //    12 MiB 能把窗口拉到 ~2s，是个折中（再长用户等不起）。
+                // ⛔ 用 [headersForCdn] 而不是裸 cookie：它与播放**同一套判据**
+                //    （缺 `__puus` 就不带 Cookie）。两处各写一份的话，
+                //    很容易只改了一处，于是「播放正常、测速 412」或反过来。
+                headers = headersForCdn(),
+                connections = conns,
+                // ⛔ 别把窗口缩到 2 秒以内：那样连「每条连接是否都吃上活」都看不出来
+                //    （8 条连接要一点时间才铺开）。3 秒是「能看出连接铺开」与
+                //    「用户等得起」的折中。
                 maxBytes = 12L * 1024 * 1024,
-                maxMillis = 2_000,
+                maxMillis = 3_000,
             )
-        }) { tp, err ->
-            measuredMbPerSec = tp?.mibPerSec ?: 0.0
-            if (err != null || tp == null) {
-                Log.w(TAG, "测速失败，退回服务端的默认档", err)
+        }) { r, err ->
+            measuredMbPerSec = r?.mibPerSec ?: 0.0
+            if (err != null || r == null) {
+                Log.w(TAG, "并行测速失败，退回服务端的默认档", err)
                 measuredMbPerSec = 0.0
             } else {
-                Log.i(TAG, "★ 实测单连接带宽：$tp（HTTP ${tp.status}）")
+                Log.i(TAG, "★ 实测并行带宽：$r")
             }
             val pick = chooseQuality(pi)
             Log.i(
@@ -501,12 +515,29 @@ class PlayerActivity : Activity() {
     // ------------------------------------------------------------------
 
     private fun startPlayer(url: String, headers: Map<String, String>) {
-        val http = DefaultHttpDataSource.Factory()
-            .setUserAgent(headers["User-Agent"] ?: BrowserUa)
-            .setConnectTimeoutMs(StreamSpec.DEFAULT_TIMEOUT_MS)
-            .setReadTimeoutMs(StreamSpec.DEFAULT_TIMEOUT_MS)
-            .setDefaultRequestProperties(headers)
-            .setAllowCrossProtocolRedirects(true)
+        // ── 数据源：**多连接并行**（本原型要验证的核心）──────────────
+        //
+        // ⛔ 不再是 `DefaultHttpDataSource`。理由（全部是 2026-10-06 实测）：
+        //    夸克对**单条连接**限速约 1 MiB/s（单连接稳态 1016~1022 KB/s、
+        //    波动 <0.3%；8 连接 120s 稳态 8.03 MiB/s，`8.03/8 = 1.004` 逐位吻合）。
+        //    而 4K 原画要 **3.67 MiB/s** ⇒ 单连接只有 27.8%，
+        //    必然「播 1 分钟就掉到 1 MB/s、然后一直卡」。
+        //
+        // ⛔ 包装顺序**并行源在内、计数在外**：计数层只转发 `read()` 的返回值，
+        //    放在外面 ⇒ `NetRateMeter` 读到的仍是真实网络速率，
+        //    与单连接时的口径完全一致，1 ↔ 8 的 A/B 才可比。
+        //    （放反了会把「每条连接各自 1 MiB/s」数成 8 倍，读数虚高。）
+        //
+        // ⛔ 连接数用 `() -> Int` **取值器**而不是当场取一个 Int：播放器建一次
+        //    长期复用（换档走 `setMediaItem`），而 Factory 是建播放器时就交出去的。
+        //    传取值器 ⇒ 菜单里改完，**下一次 `open()` 立刻生效**，不必重建播放器。
+        val parallel = ParallelRangeDataSourceFactory(
+            headers = headers,
+            connections = { prefs.parallelConnections },
+            chunkBytes = ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES,
+            connectTimeoutMs = StreamSpec.DEFAULT_TIMEOUT_MS,
+            readTimeoutMs = StreamSpec.DEFAULT_TIMEOUT_MS,
+        )
 
         // ⛔ 速率**不走** `AnalyticsListener.onBandwidthEstimate`：那个回调
         //    一次传输结束才发一次（`DefaultBandwidthMeter` 在 `onTransferEnd`
@@ -514,7 +545,13 @@ class PlayerActivity : Activity() {
         //    上只剩「缓冲中」、看不到速率（实测就是这个现象）。
         //    改成在数据源上数 `read()` 的返回值：字节是连续进来的。
         val mediaSourceFactory =
-            DefaultMediaSourceFactory(CountingDataSourceFactory(http, netBytes))
+            DefaultMediaSourceFactory(CountingDataSourceFactory(parallel, netBytes))
+
+        Log.i(
+            TAG,
+            "数据源：多连接并行（${prefs.parallelConnections} 条 × " +
+                "${ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES / 1024} KiB/块）",
+        )
 
         // ── 缓冲策略（三条需求都落在这里）──────────────────────────
         //
@@ -768,7 +805,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun buildRows(): List<TvOsdView.Row> {
-        val out = ArrayList<TvOsdView.Row>(5)
+        val out = ArrayList<TvOsdView.Row>(6)
         // 「画质」只在有 PlayInfo（正常取链路径）时才有。直接给 URL 的对照路径
         // 没有档位概念 ⇒ 少一行 —— 这正是回调要按 id 而不是按下标分派的原因。
         info?.let { pi ->
@@ -782,6 +819,7 @@ class PlayerActivity : Activity() {
                 active = pi.qualities.indexOfFirst { it.id == current?.id },
             )
         }
+        out += parallelRow()
         out += trackRow(ROW_AUDIO, "音效", C.TRACK_TYPE_AUDIO, withOff = false)
         out += trackRow(ROW_SUBTITLE, "字幕", C.TRACK_TYPE_TEXT, withOff = true)
         out += rateRow(currentSpeed)
@@ -817,6 +855,31 @@ class PlayerActivity : Activity() {
             value = choices.firstOrNull { it.selected }?.label ?: "—",
             options = choices.map { it.label },
             active = choices.indexOfFirst { it.selected },
+        )
+    }
+
+    /**
+     * 「连接数」那一行 —— 多连接并行下载开几条连接。
+     *
+     * ⛔ 这是**全局参数**（存 `AppPrefs`，跨影片跨重启都记得），不是逐影片的
+     *    播放偏好。
+     *
+     * ⛔ 改完**要重开这条流才生效**：`DataSourceFactory` 里传的是取值器
+     *    （见 [startPlayer]），正在跑的那条流不会中途改连接数。
+     *    `1 条（关）` 保留下来是为了能**现场做 A/B** —— 1 ↔ 8 一换，
+     *    「卡」与「不卡」肉眼可见，比任何日志都有说服力。
+     */
+    private fun parallelRow(): TvOsdView.Row {
+        val n = prefs.parallelConnections
+        val choices = AppPrefs.PARALLEL_CHOICES
+        return TvOsdView.Row(
+            id = ROW_PARALLEL,
+            label = "连接数",
+            value = if (n <= 1) "1 条（关）" else "$n 条",
+            options = choices.map { if (it <= 1) "1 条（关）" else "$it 条" },
+            // ⛔ `active` 可能为 -1（存量偏好里存了个不在候选里的数）——
+            //    OSD 对 -1 的语义就是「这行没有生效态」，不会崩，也不会误高亮。
+            active = choices.indexOfFirst { it == n },
         )
     }
 
@@ -873,6 +936,17 @@ class PlayerActivity : Activity() {
                 currentSpeed = rate
                 player?.setPlaybackSpeed(rate.toFloat())
                 Log.i(TAG, "OSD 倍速 → ${rateLabel(rate)}")
+                rebindOsd()
+            }
+            ROW_PARALLEL -> {
+                val n = AppPrefs.PARALLEL_CHOICES.getOrNull(chip) ?: AppPrefs.DEFAULT_PARALLEL_CONNECTIONS
+                setParallelConnections(n)
+                // ⛔ 必须**明确告诉用户要重开**：连接数是在 `open()` 时读的，
+                //    正在跑的那条流不会变。不提示的话，用户会以为「切了没反应」，
+                //    然后去怀疑是别的地方坏了。
+                showNoticeBriefly(
+                    if (n <= 1) "连接数 → 1 条（关）\n重开本条流生效" else "连接数 → $n 条\n重开本条流生效",
+                )
                 rebindOsd()
             }
             ROW_DEBUG -> setDebugOverlay(chip == 1)
@@ -1113,6 +1187,18 @@ class PlayerActivity : Activity() {
         rebindOsd()
     }
 
+    /**
+     * 改多连接并行的连接数。
+     *
+     * ⛔ **不重建播放器**：连接数是 `DataSourceFactory` 里的取值器，下一次
+     *    `open()`（换档 / 重开这条流 / seek 到未缓冲区）就会用新值。
+     *    正在跑的那条流不受影响 —— 这一点必须提示用户（见 [onOsdActivate]）。
+     */
+    private fun setParallelConnections(n: Int) {
+        prefs.parallelConnections = n
+        Log.i(TAG, "连接数（全局参数）= $n 条（重开本条流生效）")
+    }
+
     private fun applyDebugOverlay() {
         val on = prefs.debugOverlay
         stats.visibility = if (on) View.VISIBLE else View.GONE
@@ -1328,6 +1414,23 @@ class PlayerActivity : Activity() {
         notice.visibility = View.VISIBLE
     }
 
+    /**
+     * 临时提示：`ms` 后自动收掉。
+     *
+     * ⛔ 不能直接用 [showNotice]：它只在**播放状态变化**时才被 [hideNotice] 收掉，
+     *    而「改连接数」不改变播放状态（尤其暂停时）—— 提示会一直挂在画面正中，
+     *    比不提示还烦。
+     * ⛔ 用**文本比对**而不是无脑 `postDelayed(::hideNotice)`：连点两次时，
+     *    第一次排的那一拍会在第二次的提示还显示着的时候把它收掉，
+     *    看起来就像「第二次没生效」。
+     */
+    private fun showNoticeBriefly(text: String, ms: Long = 2_500L) {
+        showNotice(text)
+        ui.postDelayed({
+            if (notice.text.toString() == text) hideNotice()
+        }, ms)
+    }
+
     private fun hideNotice() {
         notice.visibility = View.GONE
     }
@@ -1351,6 +1454,7 @@ class PlayerActivity : Activity() {
         //    「字幕/音效」行在片源没有对应轨道时会退化成一句提示 —— 行数
         //    不是固定的。所以分派一律走这些 id，不要 `when (row) { 0 -> ... }`。
         private const val ROW_QUALITY = "quality"
+        private const val ROW_PARALLEL = "parallel"
         private const val ROW_AUDIO = "audio"
         private const val ROW_SUBTITLE = "subtitle"
         private const val ROW_SPEED = "speed"
