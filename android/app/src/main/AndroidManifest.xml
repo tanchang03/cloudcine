@@ -70,6 +70,17 @@
             android:screenOrientation="landscape"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- 媒体库页：读**同步下来的本地索引**（`cloudcine.sqlite`），
+             菜单里做「同步 / 上传备份 / 从网盘恢复」。
+             exported=true 与 PlayerActivity 同理：保留
+             `adb shell am start -n com.cloudcine.tv/.LibraryActivity`
+             这条直连路径，否则每次测备份都得先走一遍遥控器菜单。 -->
+        <activity
+            android:name=".LibraryActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- 播放页：ExoPlayer + SurfaceView + 原生 OSD。这是要验证的那一页。
              exported=true 是为了保留「am start 时用 -e url 传地址」这条对照路径。 -->
         <activity

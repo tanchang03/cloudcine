@@ -3,6 +3,7 @@ package com.cloudcine.tv
 import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.util.Log
 import android.util.TypedValue
@@ -11,6 +12,7 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -39,6 +41,21 @@ class BrowseActivity : Activity() {
     private lateinit var title: TextView
     private lateinit var status: TextView
 
+    private lateinit var overlay: LinearLayout
+    private lateinit var overlayTitle: TextView
+    private lateinit var overlayRowsBox: LinearLayout
+    private lateinit var overlayScrim: FrameLayout
+
+    /**
+     * 覆盖层（菜单）的状态。可见时方向键 / OK / 返回**全部**由
+     * [dispatchKeyEvent] 接管 —— 不走焦点系统，因为电视遥控器的焦点
+     * 遍历在动态加进去的 View 上不可控（`TvOsdView` 同一套做法）。
+     */
+    private var overlayVisible = false
+    private var overlayIndex = 0
+    private var overlayLabels: List<String> = emptyList()
+    private var overlayOnPick: ((Int) -> Unit)? = null
+
     private val stack = ArrayList<Pair<String, String>>() // (fid, 显示名)
     private val entries = ArrayList<DriveEntry>()
     private lateinit var adapter: EntryAdapter
@@ -54,7 +71,7 @@ class BrowseActivity : Activity() {
             return
         }
 
-        val root = LinearLayout(this).apply {
+        val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#101216"))
         }
@@ -81,14 +98,14 @@ class BrowseActivity : Activity() {
             title,
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
-        root.addView(head)
+        column.addView(head)
 
         status = TextView(this).apply {
             setTextColor(0xFF9AA3B2.toInt())
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(dp(48), 0, dp(48), dp(8))
         }
-        root.addView(status)
+        column.addView(status)
 
         adapter = EntryAdapter()
         listView = ListView(this).apply {
@@ -100,20 +117,134 @@ class BrowseActivity : Activity() {
             isFocusable = true
             isFocusableInTouchMode = true
         }
-        root.addView(listView, LinearLayout.LayoutParams(
+        column.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
         ))
 
-        root.addView(TextView(this).apply {
-            text = "↑↓ 选择 · OK 进入/播放 · 返回 上一层 · 菜单 重新登录"
+        column.addView(TextView(this).apply {
+            text = "↑↓ 选择 · OK 进入/播放 · 返回 上一层 · 菜单 更多"
             setTextColor(0xFF6B7280.toInt())
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(dp(48), dp(6), dp(48), dp(20))
         })
 
-        setContentView(root)
+        // 菜单用覆盖层而不是弹 Dialog：Dialog 会另起一个 Window，遥控器焦点
+        // 会跑到新 Window 上，返回键也要多按一次；覆盖层留在本 Window 里，
+        // 按键全部由 dispatchKeyEvent 直接分派。
+        val frame = FrameLayout(this).apply { setBackgroundColor(Color.parseColor("#101216")) }
+        frame.addView(
+            column,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        frame.addView(
+            buildOverlay(),
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        setContentView(frame)
 
         open(PanApi.ROOT, "云影")
+    }
+
+    // ------------------------------------------------------------------
+    // 覆盖层菜单
+    // ------------------------------------------------------------------
+
+    private fun buildOverlay(): View {
+        val scrim = FrameLayout(this).apply {
+            setBackgroundColor(0xB3000000.toInt())
+            isClickable = true
+            visibility = View.GONE
+        }
+        overlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(0xFF1B1F27.toInt())
+                setStroke(dp(1), 0xFF3A4150.toInt())
+            }
+            setPadding(dp(28), dp(22), dp(28), dp(18))
+        }
+        overlayTitle = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setPadding(0, 0, 0, dp(10))
+        }
+        overlay.addView(overlayTitle)
+        overlayRowsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        overlay.addView(overlayRowsBox)
+
+        scrim.addView(
+            overlay,
+            FrameLayout.LayoutParams(dp(520), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.CENTER
+            },
+        )
+        overlayScrim = scrim
+        return scrim
+    }
+
+    private fun showOverlay(titleText: String, labels: List<String>, onPick: (Int) -> Unit) {
+        overlayTitle.text = titleText
+        overlayLabels = labels
+        overlayOnPick = onPick
+        overlayIndex = 0
+        overlayRowsBox.removeAllViews()
+        for (label in labels) {
+            overlayRowsBox.addView(TextView(this).apply {
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setPadding(dp(14), dp(11), dp(14), dp(11))
+                text = label
+            })
+        }
+        paintOverlaySelection()
+        overlayScrim.visibility = View.VISIBLE
+        overlayVisible = true
+    }
+
+    private fun paintOverlaySelection() {
+        for (i in 0 until overlayRowsBox.childCount) {
+            val v = overlayRowsBox.getChildAt(i) as TextView
+            v.setBackgroundColor(if (i == overlayIndex) BRAND_SELECT else Color.TRANSPARENT)
+            v.setTextColor(if (i == overlayIndex) BRAND_TINT else Color.WHITE)
+        }
+    }
+
+    private fun hideOverlay() {
+        overlayScrim.visibility = View.GONE
+        overlayVisible = false
+        overlayOnPick = null
+        overlayLabels = emptyList()
+        listView.requestFocus()
+    }
+
+    private fun openMenu() {
+        showOverlay(
+            titleText = "云影",
+            labels = listOf("媒体库", "重新登录"),
+        ) { index ->
+            when (index) {
+                // 媒体库读的是**同步下来的本地索引**，不需要登录态；
+                // 进页面后再按菜单做「同步 / 上传备份 / 从网盘恢复」。
+                0 -> {
+                    hideOverlay()
+                    startActivity(Intent(this, LibraryActivity::class.java))
+                }
+                else -> {
+                    // 重新登录：清凭证回登录页。本 App 上「退出登录」的唯一入口。
+                    hideOverlay()
+                    store.clear()
+                    startActivity(Intent(this, LoginActivity::class.java))
+                    finish()
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -147,9 +278,14 @@ class BrowseActivity : Activity() {
                 Intent(this, PlayerActivity::class.java)
                     .putExtra(PlayerActivity.EXTRA_FID, e.fid)
                     .putExtra(PlayerActivity.EXTRA_NAME, e.name)
-                    .putExtra(PlayerActivity.EXTRA_HEADERS, store.requestCookie()),
+                    .putExtra(PlayerActivity.EXTRA_HEADERS, store.requestCookie())
+                    // ⛔ 把**当前目录**的 fid 一起带过去 —— 播放页靠它扫同目录的
+                    //    外挂字幕。单个文件的 fid 推不出父目录，网盘也没有
+                    //    「查父目录」的接口，所以只能在这里给。
+                    //    目录栈的栈顶就是当前列表，`onEntry` 只会在它上面被调用。
+                    .putExtra(PlayerActivity.EXTRA_PDIR, stack.lastOrNull()?.first.orEmpty()),
             )
-            e.isSubtitle -> status.text = "字幕文件（当前只支持内嵌字幕）：${e.name}"
+            e.isSubtitle -> status.text = "字幕文件：${e.name}\n（在视频里用「字幕」那一行选）"
             else -> status.text = "不是视频：${e.name}"
         }
     }
@@ -167,13 +303,46 @@ class BrowseActivity : Activity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
+
+        // 覆盖层可见时**独占**按键：上下移动、OK 生效、返回/菜单 关闭。
+        // ⛔ 不依赖焦点系统：动态加进 ViewGroup 的 TextView 在电视上
+        //    不一定拿得到焦点，`requestFocus()` 也常静默失败。
+        if (overlayVisible) {
+            if (overlayLabels.isEmpty()) {
+                hideOverlay()
+                return true
+            }
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    overlayIndex = (overlayIndex - 1 + overlayLabels.size) % overlayLabels.size
+                    paintOverlaySelection()
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    overlayIndex = (overlayIndex + 1) % overlayLabels.size
+                    paintOverlaySelection()
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                    // ⛔ 先取出来再回调：回调里 `hideOverlay()` 会把
+                    //    `overlayOnPick` 置空，直接调用会空指针。
+                    val pick = overlayOnPick
+                    pick?.invoke(overlayIndex)
+                    return true
+                }
+                KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_MENU -> {
+                    hideOverlay()
+                    return true
+                }
+            }
+            // 覆盖层开着时吞掉其它键，避免误触到底层列表。
+            return true
+        }
+
         when (event.keyCode) {
             KeyEvent.KEYCODE_BACK -> if (goUp()) return true
             KeyEvent.KEYCODE_MENU -> {
-                // 重新登录：清凭证回登录页。本 App 上「退出登录」的唯一入口。
-                store.clear()
-                startActivity(Intent(this, LoginActivity::class.java))
-                finish()
+                openMenu()
                 return true
             }
         }

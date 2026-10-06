@@ -88,6 +88,16 @@ class TvOsdView(context: Context) : FrameLayout(context) {
 
     private var chipRow: LinearLayout? = null
     private var chipViews = ArrayList<TextView>()
+
+    /**
+     * chips 行外面那层横向滚动容器。
+     *
+     * ⛔ 留着它是为了**把选中项滚进可视区**。这个 `HorizontalScrollView` 里的
+     *    chip 全是普通 `TextView`，没有焦点 —— 框架的「聚焦自动滚动」**不会**
+     *    生效。以前选项少（最多 8 条字幕）时看不出问题，加进外挂字幕之后
+     *    一屏放不下，用户就会「按了右键，高亮没了，也不知道选中了哪一条」。
+     */
+    private var chipStrip: HorizontalScrollView? = null
     private var listView: ListView? = null
     private var listAdapter: RowListAdapter? = null
     private var headerLabel: TextView? = null
@@ -298,6 +308,7 @@ class TvOsdView(context: Context) : FrameLayout(context) {
     private fun rebuildRight() {
         rightHost.removeAllViews()
         chipRow = null
+        chipStrip = null
         chipViews = ArrayList()
         listView = null
         listAdapter = null
@@ -391,9 +402,14 @@ class TvOsdView(context: Context) : FrameLayout(context) {
                 }
                 strip.addView(rowBox)
                 chipRow = rowBox
+                chipStrip = strip
                 root.addView(strip, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, dp(CHIP_H).toInt(),
                 ))
+                // 重建之后 chips 还没测量，`scrollChipIntoView` 读到的宽度是 0。
+                // 排到下一拍，让「打开菜单时光标停在当前生效项」也能立刻被滚到
+                // 可见区里 —— 否则菜单一开，用户看到的是一个空白的 chip 行。
+                strip.post { scrollChipIntoView() }
             }
         }
 
@@ -408,6 +424,32 @@ class TvOsdView(context: Context) : FrameLayout(context) {
             tv.background = chipBackground(row, i)
             tv.setTextColor(chipTextColor(row, i))
         }
+        scrollChipIntoView()
+    }
+
+    /**
+     * 把当前选中的 chip 滚进可视区。
+     *
+     * ⛔ 用 `scrollTo`（**瞬间**）而不是 `smoothScrollTo`：这台电视上 OSD 的
+     *    整个设计取舍就是「一帧到位、不做动画」（见类注释），这里跟着动画
+     *    会让「按键→上屏」的测量多出一段无谓的时间。
+     * ⛔ 只在**真的越界**时才滚，否则每次按键都 `scrollTo` 会把用户手动滚过
+     *    的位置弹回去。
+     */
+    private fun scrollChipIntoView() {
+        val strip = chipStrip ?: return
+        val chip = chipViews.getOrNull(selChip) ?: return
+        val viewW = strip.width
+        if (viewW <= 0) return
+        // chip 的父节点就是 strip 的内容根，所以 `chip.left/right` 就是内容坐标。
+        val pad = dp(24f).toInt()
+        val cur = strip.scrollX
+        val target = when {
+            chip.left - pad < cur -> chip.left - pad
+            chip.right + pad > cur + viewW -> chip.right + pad - viewW
+            else -> return
+        }
+        strip.scrollTo(target.coerceAtLeast(0), 0)
     }
 
     // ------------------------------------------------------------------

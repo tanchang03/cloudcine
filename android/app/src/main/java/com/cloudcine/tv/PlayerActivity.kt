@@ -33,7 +33,6 @@ import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheKeyFactory
 import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -43,6 +42,7 @@ import com.cloudcine.tv.pan.PlayInfo
 import com.cloudcine.tv.pan.Quality
 import com.cloudcine.tv.pan.PanApi
 import com.cloudcine.tv.pan.PanHttp
+import com.cloudcine.tv.pan.SubtitleFile
 import com.cloudcine.tv.pan.CredStore
 import com.cloudcine.tv.pan.formatSize
 import java.util.Locale
@@ -232,11 +232,53 @@ class PlayerActivity : Activity() {
         dataSpec.key ?: cacheKeyFor(dataSpec.uri)
     }
 
-    /** 没有稳定键（对照路径）时退回 media3 默认的「按 URL」行为。 */
+    /**
+     * 没有稳定键（对照路径）时退回 media3 默认的「按 URL」行为。
+     *
+     * ⛔ **HLS/DASH 必须按 URL 分键**，不能共用 `quark:<fid>:<档位>`：
+     *    那种媒体**不是一个文件**，而是「一个播放列表 + N 个分片」，
+     *    每个 URL 都是一条独立的字节流。共用一个键的后果是
+     *    **分片请求命中播放列表的字节**，解封装器报
+     *    `Cannot find sync byte. Most likely not a Transport Stream` ——
+     *    看起来像片源坏了，其实是两条流被串成了一条
+     *    （2026-10-06 真机实测：`179.mkv` 的 4K 档）。
+     *
+     * ⛔⛔ 判据必须用 [currentIsPlaylist]（**档位级**），**不能**只看当前
+     *    URL 的后缀：HLS 的**分片**地址通常不带 `.m3u8`（如 `…/media_0.ts`），
+     *    只按 URL 判就会漏掉分片 —— 实测第一次修就是这样，
+     *    播放列表走了新键（网络实读 0.12 MiB），分片却落回旧键、
+     *    **从缓存里读到播放列表文本**，网络一次都没开就报同一个错。
+     *
+     * ⛔ 这里**故意**用完整 URL（含签名）当后半段，而不是只用路径：
+     *    路径不保证唯一（分片可能同路径、只差 query），而键撞了就是**静默**
+     *    播错数据。HLS 的分片本来就只读一次，跨会话复用毫无价值 ——
+     *    用「零碰撞」换掉那点收益是划算的。
+     */
     private fun cacheKeyFor(uri: Uri): String {
         val k = stableCacheKey
-        return if (k.isNotEmpty()) k else CacheKeyFactory.DEFAULT.buildCacheKey(DataSpec(uri))
+        if (k.isEmpty()) return CacheKeyFactory.DEFAULT.buildCacheKey(DataSpec(uri))
+        val url = uri.toString()
+        // 只打**第一条分片**：它的末段长什么样，正是「分片不带 `.m3u8`」
+        // 这个判据的直接证据。每片都打会刷屏。
+        if (currentIsPlaylist && !loggedSegmentUrl && !PlaylistUrl.isPlaylist(url)) {
+            loggedSegmentUrl = true
+            Log.i(TAG, "HLS 分片地址末段=${uri.lastPathSegment}（不带 .m3u8 ⇒ 只能靠档位级标记分键）")
+        }
+        return if (currentIsPlaylist || PlaylistUrl.isPlaylist(url)) "$k#$url" else k
     }
+
+    /** 见 [cacheKeyFor]：日志去重用，只关心第一次。 */
+    @Volatile
+    private var loggedSegmentUrl = false
+
+    /**
+     * **当前档位**是不是 HLS/DASH 播放列表。
+     *
+     * ⛔ 见 [cacheKeyFor]：必须是**档位级**状态，逐 URL 判断会漏掉分片。
+     *    由 [playQuality] 在换档时写入，早于任何一次 `open()`。
+     */
+    @Volatile
+    private var currentIsPlaylist = false
 
     /**
      * 播放头在文件里的**字节位置**，由主线程每秒刷新的快照。
@@ -312,12 +354,70 @@ class PlayerActivity : Activity() {
     private var tracks: Tracks? = null
 
     /**
+     * 重建播放器后要还原的轨道选择（按**标签**匹配，不按下标）。
+     *
+     * 目前唯一的写入方是 [applyAudioEffect]：改音效必须重建播放器，而
+     * `TrackSelectionOverride` 是**指向具体 `TrackGroup` 的对象**，跨播放器
+     * 带不过去（见 [tracks] 的注释）。所以只能记住「用户选的是哪一条」的
+     * **标签**，等新播放器报出轨道表后按标签重新选中。
+     *
+     * ⛔ `null` 表示没有待还原的东西 —— 每次还原**消费一次就清空**，
+     *    否则用户之后手动切的轨会被反复拽回去（`onTracksChanged` 会多次回调）。
+     */
+    private var pendingTracks: PendingTracks? = null
+
+    /** [pendingTracks] 的内容：音轨与字幕各一个「标签」，`null` = 没选过。 */
+    private class PendingTracks(val audio: String?, val subtitle: String?)
+
+    /**
      * 当前绑给 OSD 的行。
      *
      * ⛔ 按键回调只回传**行下标**，靠 [TvOsdView.Row.id] 还原语义 ——
      *    所以这张表必须与 `osd.bind()` 的那张是同一份，别各建各的。
      */
     private var osdRows: List<TvOsdView.Row> = emptyList()
+
+    // ── 外挂字幕（网盘同目录）──────────────────────────────────────
+    //
+    // 需求：「1. 自动识别网盘当前目录中的字幕文件 2. 选择字幕文件」。
+    // 实现方式见 [ExternalSubtitle] 的类注释 —— 关键是**不重建 media source**，
+    // 所以换字幕不会让画面卡一下。
+
+    /**
+     * 同目录扫到的字幕文件（已把「像本片字幕」的排前面）。
+     *
+     * 空 = 没扫到，或压根没扫（「直接给 URL」的对照路径没有父目录）。
+     */
+    private var subtitleFiles: List<SubtitleFile> = emptyList()
+
+    /** 已经加载生效的外挂字幕。`null` = 走内嵌 / 关闭那条路。 */
+    private var externalSub: ExternalSubtitle? = null
+
+    /** 正在下载解析的那一条的文件名（菜单里显示「加载中…」）。 */
+    private var externalPending: String? = null
+
+    /** 已经生效的那一条的文件名。 */
+    private var externalActive: String? = null
+
+    /**
+     * 外挂字幕的**上屏心跳**。
+     *
+     * ⛔ 用 100ms 轮询，而不是「算出下一条 cue 的边界再排一次定时器」：
+     *    后者更省 CPU，但只要有一处边界算漏（最典型的是 seek 之后没重排），
+     *    字幕就会**永久卡在某一句上** —— 而这个成本是每秒 10 次主线程唤醒
+     *    加一次二分查找，相对 4K 解码可以忽略。可靠性优先。
+     * ⛔ [SubtitleOverlayView.setCues] 内部按内容指纹去重，所以字幕间隙里的
+     *    空转 tick 不会引起任何重绘。
+     */
+    private val subtitleTick = object : Runnable {
+        override fun run() {
+            val sub = externalSub ?: return
+            // 播放器还没建好（外挂字幕先一步加载完）时也要继续排 —— 建好之后
+            // 这一拍自然就接上了。
+            player?.let { subtitles.setCues(sub.cuesAt(it.currentPosition)) }
+            ui.postDelayed(this, SUBTITLE_TICK_MS)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -502,6 +602,13 @@ class PlayerActivity : Activity() {
                 )
             }
             probeThenPlay(pi)
+
+            // 同目录字幕的**自动识别**。放在这里（取链成功之后）而不是
+            // `onCreate` 里，是为了不与 `resolve` 抢同一份 Cookie ——
+            // `PanApi.absorbCookies` 是「读改写」，两条并发请求会丢一次
+            // `__puus` 轮换。这里与下面的测速并行，不占起播的关键路径。
+            intent.getStringExtra(EXTRA_PDIR)?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { discoverSubtitles(it) }
         }
     }
 
@@ -611,6 +718,24 @@ class PlayerActivity : Activity() {
         //    见 [stableCacheKey]。
         currentQualityId = q.id
 
+        // ⛔ **URL 的后缀决定 Media3 走哪条解封装路径**，而 `MediaItem.fromUri`
+        //    只给 URI、不给 MIME ⇒ `DefaultMediaSourceFactory` 会按
+        //    `Uri.getLastPathSegment()` 的后缀自己猜：
+        //      `.m3u8` ⇒ HLS（按 TS/fMP4 分片解）· 其它 ⇒ Progressive（整文件解）。
+        //    猜错的后果是**解封装器报「不是 TS」**，看起来像片源坏了，
+        //    其实是「拿整文件当 HLS 分片」——所以这一行必须能看见。
+        //
+        // ⛔ 同时要把结果**记成档位级状态**：分片地址不带 `.m3u8`，
+        //    缓存键必须靠这个标记才能和播放列表分开 —— 见 [cacheKeyFor]。
+        val parsed = runCatching { Uri.parse(q.url) }.getOrNull()
+        currentIsPlaylist = PlaylistUrl.isPlaylist(q.url)
+        loggedSegmentUrl = false
+        Log.i(
+            TAG,
+            "档位 URL：host=${parsed?.host} path 末段=${parsed?.lastPathSegment}" +
+                if (currentIsPlaylist) " ⇒ HLS/DASH（磁盘缓存按**每个 URL**分键）" else "",
+        )
+
         if (player == null) {
             startPlayer(q.url, headersForCdn())
         } else {
@@ -634,6 +759,76 @@ class PlayerActivity : Activity() {
             player?.playWhenReady = wasPlaying
             showNotice("正在切换：${q.label}…")
         }
+        rebindOsd()
+    }
+
+    /**
+     * 切换「音效」。
+     *
+     * ## ⛔ 为什么必须**重建播放器**，而不能像换档那样只 `setMediaItem`
+     *
+     * 音效是靠给 `AudioSink` 装一个 `ChannelMixingAudioProcessor` 实现的，而它的
+     * **输出声道数在 `onConfigure()` 里就定死了**（`queueInput()` 虽然每块都重读
+     * 矩阵，但输出缓冲区是按当时那个声道数分配的）。所以「透传 ↔ 下混」这种
+     * **改声道数**的切换，光改矩阵不重建 sink 只会把 6 声道的字节写进 2 声道的
+     * 缓冲区 —— 而 `AudioSink` 是 `DefaultRenderersFactory.buildAudioSink()` 在
+     * **建播放器时**造出来的，media3 1.5.1 没有运行期换它的接口。
+     *
+     * 代价与「换档」同级：画面黑一下、从当前位置重新缓冲。位置、播放态、倍速，
+     * 以及**用户选过的音轨与字幕**（按标签，见 [restorePendingTracks]）都会带过去。
+     */
+    private fun applyAudioEffect(effect: AudioEffect) {
+        if (prefs.audioEffect == effect) {
+            Log.i(TAG, "音效未变（${effect.label}），不重建播放器")
+            return
+        }
+        // ⛔ **先落库再重建**：重建要一秒多，中途若进程被杀，至少不会出现
+        //    「点了没生效、下次进来还是旧的」。
+        prefs.audioEffect = effect
+
+        val q = current
+        val p = player
+        if (q == null || p == null) {
+            // 「直接给 URL」的对照路径（`-e url`）没有档位，重建不了 ——
+            // 记下来，下次起播自然生效。⛔ 必须**明说**，别让用户以为切了没反应。
+            Log.i(TAG, "音效 → ${effect.label}（当前没有档位，下次起播生效）")
+            showNoticeBriefly("音效 → ${effect.label}\n下次起播生效")
+            return
+        }
+
+        val resumeMs = p.currentPosition.coerceAtLeast(0L)
+        val wasPlaying = p.playWhenReady
+        // ⛔ 记住用户选过的音轨 / 字幕（按**标签**）。不记的话，切一次音效
+        //    字幕就没了 —— 而用户根本不会把这两件事联系起来。
+        val audioLabel = trackChoices(C.TRACK_TYPE_AUDIO, withOff = false)
+            .firstOrNull { it.selected }?.label
+        val textLabel = trackChoices(C.TRACK_TYPE_TEXT, withOff = true)
+            .firstOrNull { it.selected }?.label
+        pendingTracks = if (audioLabel != null || textLabel != null) {
+            PendingTracks(audioLabel, textLabel)
+        } else {
+            null
+        }
+
+        Log.i(
+            TAG,
+            "音效 → ${effect.label}（${effect.detail}）：重建播放器" +
+                "（AudioSink 只能在建播放器时换）· 进度 ${resumeMs / 1000}s 保留",
+        )
+        // ⛔ 先停预取器：它拿着 SimpleCache 在写盘，而 [startPlayer] 会重建它。
+        //    `startDiskPrefetch` 里本来也会 cancel 旧的，这里显式先停是为了
+        //    在「释放旧播放器」与「起新播放器」之间不留一个还在跑的写者。
+        prefetcher?.cancel()
+        prefetcher = null
+        tracks = null
+        p.release()
+        player = null
+
+        startPlayer(q.url, headersForCdn())
+        if (resumeMs > 0) player?.seekTo(resumeMs)
+        player?.setPlaybackSpeed(currentSpeed.toFloat())
+        player?.playWhenReady = wasPlaying
+        showNotice("正在切换音效：${effect.label}…")
         rebindOsd()
     }
 
@@ -741,6 +936,16 @@ class PlayerActivity : Activity() {
     ) {
         prefetcher?.cancel()
         prefetcher = null
+
+        // ⛔ **播放列表（HLS）不起预取器**：预取器的模型是「一条字节流，
+        //    按播放头往前领跑」，而 HLS 是「一个播放列表 + N 个分片」——
+        //    它只会把那个 100 多 KiB 的播放列表当正片下下来（实测写进缓存
+        //    125 KiB），既没有意义，又**污染了缓存键**（见 [cacheKeyFor]）。
+        //    HLS 的深缓冲交给播放器自己的内存缓冲（`maxBufferMs = 120s`）。
+        if (PlaylistUrl.isPlaylist(url)) {
+            Log.i(TAG, "磁盘预取：跳过（这是 HLS/DASH 播放列表，一个媒体对应多个 URL，按流预取不成立）")
+            return
+        }
 
         val rate = if (bitrateMibps > 0.0) bitrateMibps else BufferPlan.ASSUMED_BITRATE_MIBPS
         val bytesPerSec = rate * 1048576.0
@@ -1004,7 +1209,12 @@ class PlayerActivity : Activity() {
             .setTargetBufferBytes(bufferBytes.toInt())
             .build()
 
-        val exo = ExoPlayer.Builder(this, DefaultRenderersFactory(this), mediaSourceFactory)
+        // ⛔ 音效必须在**建播放器时**就交给 AudioSink（见 [AudioEffectRenderersFactory]）。
+        //    media3 没有「运行期换 AudioSink / 换处理器链」的接口，所以
+        //    [applyAudioEffect] 走的是**重建播放器**这条路，而不是改一个属性。
+        val renderers = AudioEffectRenderersFactory(this, prefs.audioEffect)
+        Log.i(TAG, "音效：${prefs.audioEffect.label}（${prefs.audioEffect.detail}）")
+        val exo = ExoPlayer.Builder(this, renderers, mediaSourceFactory)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .setLoadControl(loadControl)
             .build()
@@ -1095,6 +1305,9 @@ class PlayerActivity : Activity() {
             override fun onTracksChanged(tracks: Tracks) {
                 this@PlayerActivity.tracks = tracks
                 Log.i(TAG, describeTracks(tracks))
+                // ⛔ 紧跟着日志、且在 `rebindOsd()` 之前：重建播放器后要把用户
+                //    原来选的音轨 / 字幕按**标签**选回来，菜单才显示得对。
+                restorePendingTracks()
                 // 菜单开着就立刻刷新：用户按完 OK 要马上看到光标跳到新选项上。
                 // （菜单没开时不用重建 View —— 那纯属白干活，`showOsd` 会补上。）
                 if (osd.visibility == View.VISIBLE) rebindOsd()
@@ -1114,6 +1327,9 @@ class PlayerActivity : Activity() {
              *    按内容去重，空组同样是一次有效的「清屏」。
              */
             override fun onCues(cueGroup: CueGroup) {
+                // ⛔ 外挂字幕生效时**让路**：那条路由 [subtitleTick] 驱动，
+                //    两个来源一起写 `subtitles` 会互相覆盖，表现为字幕一闪一闪。
+                if (externalSub != null) return
                 subtitles.setCues(cueGroup.cues)
             }
 
@@ -1188,6 +1404,10 @@ class PlayerActivity : Activity() {
         })
 
         player = exo
+        // 外挂字幕可能**先一步**加载完（同目录扫得快，而取链+测速要几秒）——
+        // 那时 `disableEmbeddedText()` 因为 `player == null` 空转了一次。
+        // 这里补一刀：播放器一建好就把内嵌文字轨关掉。
+        if (externalSub != null) disableEmbeddedText()
         stats.bind(exo)
         // ── 调试浮层要的三样（2026-10-06 加）─────────────────────────
         // ⛔ 分配器与预算**必须一起给**：分子分母同源，否则会显示
@@ -1230,6 +1450,9 @@ class PlayerActivity : Activity() {
         // ⛔ 快照定时器也要停：它读 `player.currentPosition`，
         //    player 释放后再跑会崩。
         ui.removeCallbacks(playheadTick)
+        // ⛔ 外挂字幕的心跳也要停：它读 `player.currentPosition`，
+        //    player 释放后再跑会崩（与 playheadTick 同一个原因）。
+        ui.removeCallbacks(subtitleTick)
         controls.unbind()
         prefetcher?.cancel()
         prefetcher = null
@@ -1245,7 +1468,164 @@ class PlayerActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // OSD —— 画质 / 音效（音轨）/ 字幕 / 倍速 / 调试
+    // 外挂字幕（网盘同目录）
+    // ------------------------------------------------------------------
+
+    /**
+     * 扫一遍本片所在的网盘目录，挑出能当字幕的文件。
+     *
+     * ⛔ 在**后台线程**做（[Bg]），主线程只收结果 —— 列目录是一次网络往返，
+     *    放在主线程只会让起播那几秒更卡。
+     * ⛔ 父目录 fid **只能由列表页带过来**：单个 `fid` 推不出它的父目录，
+     *    而网盘没有「查父目录」的接口（见 `BrowseActivity` 的目录栈）。
+     *    没有它就不扫，功能静默降级 —— 播放本身不受影响。
+     */
+    private fun discoverSubtitles(pdir: String) {
+        val a = api ?: return
+        Bg.run({ a.listDirectory(pdir) }) { list, err ->
+            if (err != null) {
+                Log.w(TAG, "扫同目录字幕失败（不影响播放）：${err.message}")
+                return@run
+            }
+            // ⛔ 用 [ExternalSubtitle.isSupported] 而不是只看 `isSubtitle`：
+            //    `.sub` / `.idx` / `.sup` 都是图形字幕，media3 没有解析器，
+            //    摆进菜单只会得到「选了没反应」。
+            val found = (list ?: emptyList())
+                .filter { it.isSubtitle && ExternalSubtitle.isSupported(it.name) }
+                .map { SubtitleFile(it.fid, it.name, it.sizeBytes) }
+            if (found.isEmpty()) {
+                Log.i(TAG, "同目录没有可用字幕文件")
+                return@run
+            }
+
+            val videoStem = ExternalSubtitle.normalize(
+                intent.getStringExtra(EXTRA_NAME).orEmpty(),
+            )
+            val matchable = ExternalSubtitle.isMatchable(videoStem)
+            // 「自动识别」的排序依据就这一条：归一化主干相等的排最前。
+            val sorted = found.sortedByDescending { f ->
+                val s = ExternalSubtitle.normalize(f.name)
+                if (matchable && ExternalSubtitle.isMatchable(s) && s == videoStem) 1 else 0
+            }
+            subtitleFiles = sorted
+            Log.i(
+                TAG,
+                "同目录字幕 ${sorted.size} 个（视频主干=${videoStem.ifEmpty { "—" }}）：" +
+                    sorted.joinToString("、") { it.name },
+            )
+
+            // 与片名主干完全相等 ⇒ 认定为「本片的字幕」，自动加载。
+            // 这是所有播放器（Kodi / VLC / PotPlayer）的通行约定，也是需求里
+            // 「自动识别」最有用的一半。⛔ 只认**相等**，不做模糊 ——
+            // 配错字幕比不配更烦人（用户会以为字幕坏了）。
+            val auto = if (matchable) {
+                sorted.firstOrNull {
+                    val s = ExternalSubtitle.normalize(it.name)
+                    ExternalSubtitle.isMatchable(s) && s == videoStem
+                }
+            } else {
+                null
+            }
+            if (auto != null) {
+                Log.i(TAG, "自动匹配到外挂字幕：${auto.name}")
+                startExternalSubtitle(auto)
+            }
+            if (osd.visibility == View.VISIBLE) rebindOsd()
+        }
+    }
+
+    /**
+     * 下载并解析一条外挂字幕，成功后接管上屏。
+     *
+     * ⛔ 两步都在后台：`fileBytesUrl` 是一次网盘 API 往返，`getBytes` 是
+     *    一次 CDN 下载。字幕虽然只有几十 KiB，但在电视的 WiFi 上仍可能
+     *    几百毫秒 —— 放在主线程就是一次可见的掉帧。
+     */
+    private fun startExternalSubtitle(file: SubtitleFile) {
+        val a = api ?: return
+        externalPending = file.name
+        if (osd.visibility == View.VISIBLE) rebindOsd()
+        showNoticeBriefly("正在加载字幕…\n${file.name}", 1_200L)
+
+        Bg.run({
+            val url = a.fileBytesUrl(file.fid)
+            val bytes = PanHttp.getBytes(url, cookie = store.requestCookie())
+            ExternalSubtitle.parse(file.name, bytes)
+        }) { sub, err ->
+            // ⛔ 结果可能**已经过期**：用户在这几百毫秒里又换了别的字幕
+            //    （或者选了「关闭」）。不校验的话，先点的那条晚到的结果会把
+            //    后点的覆盖掉 —— 表现为「选了半天，最后生效的是第一次点的那个」。
+            if (externalPending != file.name) {
+                Log.i(TAG, "丢弃过期的字幕加载结果：${file.name}")
+                return@run
+            }
+            externalPending = null
+            if (err != null || sub == null) {
+                Log.e(TAG, "字幕加载失败：${file.name}", err)
+                showNoticeBriefly("字幕加载失败\n${err?.message ?: "未知原因"}", 3_500L)
+                if (osd.visibility == View.VISIBLE) rebindOsd()
+                return@run
+            }
+
+            externalSub = sub
+            externalActive = file.name
+            // 内嵌文字轨必须让路：两条都往 `subtitles` 里写会互相覆盖，
+            // 表现为「字幕一闪一闪」。
+            disableEmbeddedText()
+            Log.i(
+                TAG,
+                "外挂字幕已加载：${file.name} · ${sub.cueCount} 条 · 覆盖到 ${sub.spanMs / 1000}s",
+            )
+            // 立刻喂一次，别等下一个 tick —— 否则最多有 100ms 的空窗。
+            player?.let { subtitles.setCues(sub.cuesAt(it.currentPosition)) }
+            ui.removeCallbacks(subtitleTick)
+            ui.post(subtitleTick)
+            showNoticeBriefly("字幕：${file.name}", 1_800L)
+            if (osd.visibility == View.VISIBLE) rebindOsd()
+        }
+    }
+
+    /**
+     * 停掉外挂字幕，把上屏权交还内嵌 / 关闭。
+     *
+     * ⛔ `externalPending` 也要清：清掉之后，还在路上的那次加载回来时
+     *    `externalPending != file.name` 成立，结果会被自然丢弃。
+     */
+    private fun stopExternalSubtitle() {
+        ui.removeCallbacks(subtitleTick)
+        externalSub = null
+        externalActive = null
+        externalPending = null
+        if (::subtitles.isInitialized) subtitles.setCues(emptyList())
+    }
+
+    /**
+     * 关掉内嵌文字轨。
+     *
+     * ⛔ 光清 override **不够** —— 没有 override 时 ExoPlayer 会按
+     *    `preferredTextLanguages` 自己再挑一条，内嵌字幕照样出来、与外挂
+     *    叠在一起。（同 [applyTrackChoice] 里「关闭」那条路的注释。）
+     */
+    private fun disableEmbeddedText() {
+        val p = player ?: return
+        val b = p.trackSelectionParameters.buildUpon()
+        b.clearOverridesOfType(C.TRACK_TYPE_TEXT)
+        b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+        p.trackSelectionParameters = b.build()
+    }
+
+    /**
+     * 外挂字幕在菜单里显示的名字。
+     *
+     * 去掉扩展名：一屏 chips 里 `.srt` / `.ass` 是纯噪音，格式在日志里看得到。
+     */
+    private fun externalLabel(f: SubtitleFile): String {
+        val base = f.name.substringBeforeLast('.', f.name)
+        return if (f.name == externalPending) "$base（加载中…）" else base
+    }
+
+    // ------------------------------------------------------------------
+    // OSD —— 画质 / 连接数 / 音轨 / 音效 / 字幕 / 倍速 / 调试
     // ------------------------------------------------------------------
 
     /**
@@ -1276,7 +1656,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun buildRows(): List<TvOsdView.Row> {
-        val out = ArrayList<TvOsdView.Row>(6)
+        val out = ArrayList<TvOsdView.Row>(7)
         // 「画质」只在有 PlayInfo（正常取链路径）时才有。直接给 URL 的对照路径
         // 没有档位概念 ⇒ 少一行 —— 这正是回调要按 id 而不是按下标分派的原因。
         info?.let { pi ->
@@ -1291,7 +1671,14 @@ class PlayerActivity : Activity() {
             )
         }
         out += parallelRow()
-        out += trackRow(ROW_AUDIO, "音效", C.TRACK_TYPE_AUDIO, withOff = false)
+        // ⛔ 这一行的标签是**「音轨」**，不是「音效」。
+        //    它列的是**片源里封着的流**（语言 / 声道 / 环绕编码），chip 文案形如
+        //    「韩语 · 立体声 · 杜比+」。2026-10-06 之前这里写的是「音效」，
+        //    用户看到菜单里一列语言，反馈就是「音效感觉像是音轨，找不到音轨在哪」。
+        //    PC 端的 `player_audio_effect.dart` 里早就写着这条后果，两边是同一个坑。
+        out += trackRow(ROW_AUDIO, "音轨", C.TRACK_TYPE_AUDIO, withOff = false)
+        // ⛔「音效」紧跟「音轨」：两者解决的是同一个听感问题的两半，摆一起最好找。
+        out += audioEffectRow()
         out += trackRow(ROW_SUBTITLE, "字幕", C.TRACK_TYPE_TEXT, withOff = true)
         out += rateRow(currentSpeed)
         out += debugRow()
@@ -1317,7 +1704,14 @@ class PlayerActivity : Activity() {
                 id = id,
                 label = label,
                 value = "—",
-                hint = if (type == C.TRACK_TYPE_TEXT) "该片源没有内嵌字幕" else "该片源没有音轨",
+                hint = when {
+                    // ⛔ 这句要区分「片源没有内嵌字幕」和「同目录也没有外挂字幕」——
+                    //    只说前者的话，用户看到「没有内嵌字幕」会以为没救了，
+                    //    而实际上他可能只是没把 .srt 放到同一个目录里。
+                    type != C.TRACK_TYPE_TEXT -> "该片源没有音轨"
+                    subtitleFiles.isEmpty() -> "没有内嵌字幕，同目录也没有字幕文件"
+                    else -> "该片源没有内嵌字幕"
+                },
             )
         }
         return TvOsdView.Row(
@@ -1355,6 +1749,31 @@ class PlayerActivity : Activity() {
     }
 
     /**
+     * 「音效」那一行 —— 播放端对输出的处理方式（跟随片源 / 强制立体声）。
+     *
+     * ⛔ 与上一行「音轨」是**两件完全不同的事**，别合并（理由见 [AudioEffect]）：
+     *    音轨是片源里封着的流（语言），音效是这台设备怎么处理输出。
+     *
+     * ⛔ 这是**全局参数**（存 `AppPrefs`）：它描述的是「这台电视怎么接音箱」，
+     *    与正在放哪部片无关 —— 换片、换集都不该把它重置掉。
+     *
+     * ⚠️ 切换**要重建播放器**（见 [applyAudioEffect]），所以不像倍速那样
+     *    「点了立刻听到区别」：画面会黑一下、从当前位置重新缓冲。这是 media3
+     *    没给「运行期换 AudioSink」的接口导致的，不是没做。
+     */
+    private fun audioEffectRow(): TvOsdView.Row {
+        val cur = prefs.audioEffect
+        val all = AudioEffect.ALL
+        return TvOsdView.Row(
+            id = ROW_AUDIO_EFFECT,
+            label = "音效",
+            value = cur.label,
+            options = all.map { it.label },
+            active = all.indexOf(cur),
+        )
+    }
+
+    /**
      * 「调试」那一行 —— 开关左上角那块浮层。
      *
      * ⛔ 这是**全局参数**（存 `AppPrefs`，跨影片跨重启都记得），不是逐影片的
@@ -1384,8 +1803,9 @@ class PlayerActivity : Activity() {
      *    用下标 `when` 迟早把「字幕」接到「倍速」上。
      *
      * 菜单开合的取舍（照对标播放器）：
-     *   * **画质** —— 换档要重建 media source、画面会黑一下，菜单收掉；
-     *   * **音效 / 字幕 / 倍速 / 调试** —— 留在菜单里。挑字幕往往要连试几条，
+     *   * **画质 / 音效** —— 两者都要重建播放链路（画质换 media source、
+     *     音效换 AudioSink），画面会黑一下，菜单收掉；
+     *   * **音轨 / 字幕 / 倍速 / 调试** —— 留在菜单里。挑字幕往往要连试几条，
      *     每点一下就关菜单等于逼用户重开五遍。
      */
     private fun onOsdActivate(row: Int, chip: Int) {
@@ -1397,6 +1817,10 @@ class PlayerActivity : Activity() {
             ROW_AUDIO -> {
                 applyTrackChoice(C.TRACK_TYPE_AUDIO, withOff = false, chip = chip)
                 rebindOsd()
+            }
+            ROW_AUDIO_EFFECT -> {
+                AudioEffect.ALL.getOrNull(chip)?.let { applyAudioEffect(it) }
+                hideOsd()
             }
             ROW_SUBTITLE -> {
                 applyTrackChoice(C.TRACK_TYPE_TEXT, withOff = true, chip = chip)
@@ -1432,12 +1856,23 @@ class PlayerActivity : Activity() {
     // 轨道（字幕 / 音轨）
     // ------------------------------------------------------------------
 
-    /** 一条可选轨道。`group == null` 表示「关闭」—— 只有字幕会用到。 */
+    /**
+     * 一条可选轨道。
+     *
+     * `group == null` 表示**不是片源里的轨道** —— 只有字幕会用到，两种情况：
+     *   * [external] 为 `null` —— 「关闭」；
+     *   * [external] 非空 —— 网盘同目录的**外挂字幕**。
+     *
+     * ⛔ 外挂字幕不能靠 `index` 表达（它根本不在 `Tracks` 里），所以必须
+     *    单独一个字段。用「index = -1 就是关闭」那种约定会在加上外挂之后
+     *    立刻分不清「关」和「外挂第 0 条」。
+     */
     private class TrackChoice(
         val label: String,
         val group: TrackGroup?,
         val index: Int,
         val selected: Boolean,
+        val external: SubtitleFile? = null,
     )
 
     /**
@@ -1450,22 +1885,43 @@ class PlayerActivity : Activity() {
      *   音轨**不要** —— 关掉音轨等于把片子变默片，不是个有用的选项。
      */
     private fun trackChoices(type: Int, withOff: Boolean): List<TrackChoice> {
-        val t = tracks ?: return emptyList()
         val out = ArrayList<TrackChoice>()
         if (withOff) out.add(TrackChoice(OFF_LABEL, null, -1, selected = false))
         var ordinal = 0
         var anySelected = false
-        for (g in t.groups) {
-            if (g.type != type) continue
-            for (i in 0 until g.length) {
-                ordinal++
-                val sel = g.isTrackSelected(i)
-                if (sel) anySelected = true
-                out.add(TrackChoice(trackLabel(g, i, ordinal), g.mediaTrackGroup, i, sel))
+        val t = tracks
+        if (t != null) {
+            for (g in t.groups) {
+                if (g.type != type) continue
+                for (i in 0 until g.length) {
+                    ordinal++
+                    val sel = g.isTrackSelected(i)
+                    if (sel) anySelected = true
+                    out.add(TrackChoice(trackLabel(g, i, ordinal), g.mediaTrackGroup, i, sel))
+                }
             }
         }
-        // 有轨道但一条都没选中 ⇒ 现在就是「关闭」状态，把光标指到那一项
-        if (withOff && !anySelected && out.size > 1) {
+        // 外挂字幕**并进同一行** —— 「选字幕」在用户眼里就是一件事，
+        // 拆成两行之后「现在到底用的是哪条」反而说不清，而且两条行会互相打架
+        // （选了内嵌却忘了关外挂，字幕就叠在一起）。
+        if (type == C.TRACK_TYPE_TEXT) {
+            for (f in subtitleFiles) {
+                out.add(
+                    TrackChoice(
+                        label = externalLabel(f),
+                        group = null,
+                        index = -1,
+                        selected = f.name == externalActive,
+                        external = f,
+                    ),
+                )
+            }
+        }
+        // 内嵌一条都没选中、外挂也没有在生效 ⇒ 现在就是「关闭」状态。
+        // ⛔ `externalActive == null` 这个条件不能漏：外挂生效时内嵌必然是
+        //    一条都没选中的（我们主动把它关了），少了它光标会停在「关闭」上，
+        //    而实际正在放的是外挂字幕。
+        if (withOff && !anySelected && externalActive == null && out.size > 1) {
             out[0] = TrackChoice(OFF_LABEL, null, -1, selected = true)
         }
         disambiguate(out)
@@ -1506,12 +1962,26 @@ class PlayerActivity : Activity() {
      *    `preferredTextLanguages` 自己再挑一条，字幕照样出来。
      */
     private fun applyTrackChoice(type: Int, withOff: Boolean, chip: Int) {
-        val p = player ?: return
         val choice = trackChoices(type, withOff).getOrNull(chip)
         if (choice == null) {
             Log.w(TAG, "轨道下标越界：type=$type chip=$chip")
             return
         }
+
+        // 外挂字幕：**不走** ExoPlayer 的轨道机制 —— 自己下载解析后接管上屏
+        // （见 [ExternalSubtitle] 的类注释：挂到 media source 上要重建播放器）。
+        if (type == C.TRACK_TYPE_TEXT && choice.external != null) {
+            Log.i(TAG, "切字幕 → 外挂 ${choice.external.name}")
+            startExternalSubtitle(choice.external)
+            return
+        }
+
+        val p = player ?: return
+        // 内嵌 / 关闭都要先把外挂摘掉：两条会同时往 `subtitles` 里写。
+        if (type == C.TRACK_TYPE_TEXT && (externalSub != null || externalPending != null)) {
+            stopExternalSubtitle()
+        }
+
         val b = p.trackSelectionParameters.buildUpon()
         if (choice.group == null) {
             b.clearOverridesOfType(type)
@@ -1527,6 +1997,35 @@ class PlayerActivity : Activity() {
             )
         }
         p.trackSelectionParameters = b.build()
+    }
+
+    /**
+     * 把重建播放器前记住的轨道选择按**标签**重新选上。见 [pendingTracks]。
+     *
+     * ⛔ 轨道表为空就**先不消费** `pendingTracks`：`prepare()` 之后
+     *    `onTracksChanged` 常常回调两三次，头一两次可能是空的。这时候消费掉
+     *    就等于「还原失败」，用户看到的是「切了个音效，字幕没了」。
+     * ⛔ 匹配不上一律**放弃**（不动任何东西）：片源里那条轨可能压根不在，
+     *    硬按旧下标去选会选错一条 —— 症状是「切了个音效，语言变了」。
+     */
+    private fun restorePendingTracks() {
+        val want = pendingTracks ?: return
+        val groups = tracks?.groups ?: return
+        if (groups.isEmpty()) return
+        pendingTracks = null
+        want.audio?.let { restoreTrack(C.TRACK_TYPE_AUDIO, withOff = false, label = it) }
+        want.subtitle?.let { restoreTrack(C.TRACK_TYPE_TEXT, withOff = true, label = it) }
+    }
+
+    private fun restoreTrack(type: Int, withOff: Boolean, label: String) {
+        val choices = trackChoices(type, withOff)
+        val idx = choices.indexOfFirst { it.label == label }
+        if (idx < 0) {
+            Log.i(TAG, "还原${trackTypeName(type)}「$label」：新片源里没有这一条，保持默认")
+            return
+        }
+        applyTrackChoice(type, withOff, idx)
+        Log.i(TAG, "还原${trackTypeName(type)} → $label")
     }
 
     private fun trackLabel(g: Tracks.Group, i: Int, ordinal: Int): String {
@@ -2144,6 +2643,15 @@ class PlayerActivity : Activity() {
         const val EXTRA_NAME = "name"
         const val EXTRA_HEADERS = "headers"
 
+        /**
+         * 本片**所在目录**的 fid —— 「自动识别同目录字幕」的唯一依据。
+         *
+         * ⛔ 单个 `fid` 推不出父目录，网盘也没有「查父目录」的接口，
+         *    所以它必须由列表页随起播意图一起带过来（见 `BrowseActivity.onEntry`）。
+         *    没有它时外挂字幕功能静默降级，播放不受影响。
+         */
+        const val EXTRA_PDIR = "pdir"
+
         private const val BrowserUa =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -2157,6 +2665,7 @@ class PlayerActivity : Activity() {
         private const val ROW_QUALITY = "quality"
         private const val ROW_PARALLEL = "parallel"
         private const val ROW_AUDIO = "audio"
+        private const val ROW_AUDIO_EFFECT = "audioEffect"
         private const val ROW_SUBTITLE = "subtitle"
         private const val ROW_SPEED = "speed"
         private const val ROW_DEBUG = "debug"
@@ -2211,6 +2720,15 @@ class PlayerActivity : Activity() {
          * 「每 tick 重建整页」的负担（见 PlayerControlsView 的注释）。
          */
         private const val PLAYHEAD_TICK_MS = 1_000L
+
+        /**
+         * 外挂字幕的上屏周期（毫秒）。
+         *
+         * ⛔ 见 [subtitleTick] 的注释：这里**故意**用轮询而不是「按 cue 边界排
+         *    定时器」。100ms 是「人眼察觉不到的延迟」与「几乎不耗 CPU」的交点 ——
+         *    每次只做一次二分 + 一次内容指纹比对，字幕间隙里几乎零成本。
+         */
+        private const val SUBTITLE_TICK_MS = 100L
 
         /**
          * 字幕**底距**（dp）。

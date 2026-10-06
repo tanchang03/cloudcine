@@ -32,6 +32,20 @@ data class DriveEntry(
 }
 
 /**
+ * 网盘上的一个**字幕文件**。
+ *
+ * 只有「同目录里扫到的候选」才用这个类型 —— 真正能解析哪些格式由
+ * `ExternalSubtitle.mimeFor` 决定（`.sub` 在 `SUB_EXT` 里，但 MicroDVD/SubViewer
+ * 没有解析器，会被筛掉）。两者**故意不合并**：前者是「网盘上像个字幕」，
+ * 后者是「本工程解得开」，判据不同。
+ */
+data class SubtitleFile(
+    val fid: String,
+    val name: String,
+    val sizeBytes: Long,
+)
+
+/**
  * 一个可播档位。
  *
  * 服务端给两类东西，**必须分清楚**：
@@ -80,8 +94,7 @@ data class Quality(
         }
 }
 
-/** 一次起播需要的全部信息。 */
-data class PlayInfo(
+/** 一次起播需要的全部信息。 */data class PlayInfo(
     val fileName: String,
     val durationMs: Long,
     /** 服务端认为该播哪一档（`default_resolution`）。 */

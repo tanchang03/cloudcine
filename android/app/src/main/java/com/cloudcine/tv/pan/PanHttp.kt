@@ -4,6 +4,7 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -75,6 +76,38 @@ class PanResponse(
 }
 
 /**
+ * 一次**原始** HTTP 响应 —— 给 OSS 分片上传用。
+ *
+ * ⛔ 与 [PanResponse] 分开是有原因的，不是重复：[PanResponse] 面向
+ * 「网盘的信封 JSON」（`code` / `message` / `data`），而 OSS 的响应
+ * **既不是 JSON、也不带信封** —— 分片 PUT 成功时 body 是空的，
+ * 唯一的产出是响应头里的 **`ETag`**，而 `ETag` 是后面
+ * `CompleteMultipartUpload` XML 的必要输入。拿不到它整次上传就白做。
+ *
+ * ⛔ 响应头**只留几个真正要用的**，键统一转小写。不整份拷贝
+ * `HttpURLConnection.headerFields` 是因为那张表里可能有 `null` 键
+ * （第一行是状态行），在 Kotlin 里迭代解构会直接 NPE。
+ */
+class RawResponse(
+    val status: Int,
+    val body: String,
+    /** 只含 [CAPTURED_HEADERS] 里那几个，键**已转小写**。 */
+    val headers: Map<String, String> = emptyMap(),
+) {
+    /** 取响应头，大小写不敏感。 */
+    fun header(name: String): String? = headers[name.lowercase()]
+
+    val isOk: Boolean get() = status in 200..299
+
+    /** 失败时拿来拼错误信息 —— body 可能很长（OSS 会回一大段 XML）。 */
+    fun brief(max: Int = 300): String = body.take(max)
+
+    companion object {
+        val CAPTURED_HEADERS = listOf("ETag", "Content-Type", "Content-Length")
+    }
+}
+
+/**
  * 极简 HTTP 客户端。**所有请求都绕开系统代理** —— 网盘的接口与直链都必须
  * 走真实网络，被代理劫持的表现是「一直转圈」或「412」，很难往代理上想。
  *
@@ -95,6 +128,9 @@ object PanHttp {
     const val ACCEPT = "application/json, text/plain, */*"
     const val ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
 
+    /** 网盘那套 JSON 接口的 Content-Type。OSS 那边用的是 `application/xml`。 */
+    const val JSON_CONTENT_TYPE = "application/json;charset=UTF-8"
+
     /**
      * 发一次请求。
      *
@@ -102,16 +138,21 @@ object PanHttp {
      * 并可能命中缓存，而 `play/info` 每次返回的地址都不同（带签名），
      * 命中缓存会拿到过期地址 —— 表现是「列目录正常、一播就 403」。
      */
-    private fun call(
+    /**
+     * 建立连接。`call` 与 [callRaw] 共用这一段 —— 少一处「改了 UA 忘了改另一边」
+     * 的机会。
+     */
+    private fun open(
         url: String,
         method: String,
-        query: Map<String, String> = emptyMap(),
-        body: String? = null,
-        headers: Map<String, String> = emptyMap(),
-        timeoutMs: Int = 20_000,
-    ): PanResponse {
+        query: Map<String, String>,
+        hasBody: Boolean,
+        contentType: String?,
+        headers: Map<String, String>,
+        timeoutMs: Int,
+    ): HttpURLConnection {
         val full = if (query.isEmpty()) url else "$url?${encodeQuery(query)}"
-        val conn = (URL(full).openConnection() as HttpURLConnection).apply {
+        return (URL(full).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = timeoutMs
             readTimeout = timeoutMs
@@ -121,14 +162,34 @@ object PanHttp {
             setRequestProperty("Accept-Language", ACCEPT_LANGUAGE)
             setRequestProperty("User-Agent", UA)
             setRequestProperty("Referer", REFERER)
+            if (hasBody && contentType != null) {
+                setRequestProperty("Content-Type", contentType)
+            }
+            // ⛔ 调用方给的 header 放在**最后**，这样它能覆盖上面的默认值
+            //    （分片 PUT 要自己指定 `Content-Type: application/octet-stream`）。
             for ((k, v) in headers) {
                 if (v.isNotEmpty()) setRequestProperty(k, v)
             }
-            if (body != null) {
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json;charset=UTF-8")
-            }
         }
+    }
+
+    private fun call(
+        url: String,
+        method: String,
+        query: Map<String, String> = emptyMap(),
+        body: String? = null,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMs: Int = 20_000,
+    ): PanResponse {
+        val conn = open(
+            url = url,
+            method = method,
+            query = query,
+            hasBody = body != null,
+            contentType = if (body != null) JSON_CONTENT_TYPE else null,
+            headers = headers,
+            timeoutMs = timeoutMs,
+        )
 
         try {
             if (body != null) {
@@ -149,6 +210,53 @@ object PanHttp {
         }
     }
 
+    /**
+     * 发一次请求，**把响应头一起带回来**（分片上传要读 `ETag`）。
+     *
+     * ⛔ 响应头必须在 `disconnect()` **之前**读 —— 断开之后再
+     *    `getHeaderField` 拿不到值（连接已经归还连接池）。
+     */
+    private fun callRaw(
+        url: String,
+        method: String,
+        query: Map<String, String> = emptyMap(),
+        body: ByteArray? = null,
+        contentType: String? = null,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMs: Int = 20_000,
+    ): RawResponse {
+        val conn = open(
+            url = url,
+            method = method,
+            query = query,
+            hasBody = body != null,
+            contentType = contentType,
+            headers = headers,
+            timeoutMs = timeoutMs,
+        )
+        try {
+            if (body != null) {
+                // ⛔ 必须 `use {}`（关流才真正发出请求）。分片是 4 MiB，
+                //    不关流的话 `responseCode` 会一直等下去。
+                conn.outputStream.use { it.write(body) }
+            }
+            val status = conn.responseCode
+            val stream: InputStream? =
+                if (status in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.use { readAll(it) }.orEmpty()
+
+            val heads = LinkedHashMap<String, String>()
+            for (name in RawResponse.CAPTURED_HEADERS) {
+                // 用 `getHeaderField(name)` 而不是遍历 `headerFields`：
+                // 前者大小写不敏感且不会碰到状态行那个 null 键。
+                conn.getHeaderField(name)?.let { heads[name.lowercase()] = it }
+            }
+            return RawResponse(status = status, body = text, headers = heads)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     fun get(
         url: String,
         query: Map<String, String> = emptyMap(),
@@ -164,6 +272,91 @@ object PanHttp {
         headers: Map<String, String> = emptyMap(),
     ): PanResponse =
         call(url, "POST", query = query, body = body.toString(), headers = withCookie(cookie, headers))
+
+    /**
+     * `PUT` 一段原始字节（OSS 分片上传）。
+     *
+     * ⛔ **不带 Cookie** —— 这是往阿里云 OSS 发，不是往夸克发。鉴权全靠
+     *    `Authorization` 头（夸克用 `file/upload/auth` 现签的 `auth_key`）。
+     *    带上夸克的 Cookie 反而会被 OSS 当成无关头。
+     */
+    fun putBytes(
+        url: String,
+        body: ByteArray,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMs: Int = 180_000,
+    ): RawResponse = callRaw(url, "PUT", body = body, headers = headers, timeoutMs = timeoutMs)
+
+    /**
+     * `POST` 一段原始字节（OSS `CompleteMultipartUpload` 要发 XML）。
+     *
+     * ⛔ `Content-Type` 走 [headers]，**不**用 [JSON_CONTENT_TYPE] ——
+     *    OSS 对合并请求要求 `application/xml`，而且那个值会参与签名计算
+     *    （见 `OssAuth.completeAuthMeta` 的第三行），写错就是 403。
+     */
+    fun postBytes(
+        url: String,
+        body: ByteArray,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMs: Int = 180_000,
+    ): RawResponse = callRaw(url, "POST", body = body, headers = headers, timeoutMs = timeoutMs)
+
+    /**
+     * 把一个 URL 的**全部字节**读回来（外挂字幕走这条）。
+     *
+     * ⛔ 不能用 [get]：那条路把响应体按 **UTF-8** 解成 `String`
+     *    （`out.toString("UTF-8")`）。而中文 `.srt` 大量是 **GBK/GB18030**，
+     *    按 UTF-8 解出来全是 `锟斤拷`，而且**不报错** —— 表现为「字幕加载成功、
+     *    上屏全是乱码」。字节必须先原样拿回来，再由 `ExternalSubtitle`
+     *    统一做编码判定。
+     *
+     * ⛔ [maxBytes] 是**防呆**不是限制：字幕文件通常几十 KiB。真的返回了几
+     *    MB，说明拿到的不是字幕（比如地址被换成了视频直链），此时宁可报错，
+     *    也不要把它读进堆里 —— 这台电视只有 512 MB Java 堆。
+     */
+    fun getBytes(
+        url: String,
+        cookie: String = "",
+        headers: Map<String, String> = emptyMap(),
+        maxBytes: Int = 8 * 1024 * 1024,
+        timeoutMs: Int = 20_000,
+    ): ByteArray {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = timeoutMs
+            readTimeout = timeoutMs
+            // 同 [call]：直链带签名，命中缓存会拿到过期地址。
+            useCaches = false
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", UA)
+            setRequestProperty("Referer", REFERER)
+            if (cookie.isNotEmpty()) setRequestProperty("Cookie", cookie)
+            for ((k, v) in headers) {
+                if (v.isNotEmpty()) setRequestProperty(k, v)
+            }
+        }
+        try {
+            val status = conn.responseCode
+            if (status !in 200..299) {
+                throw IOException("HTTP $status ${conn.responseMessage.orEmpty()}".trim())
+            }
+            val out = ByteArrayOutputStream()
+            conn.inputStream.use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    if (out.size() > maxBytes) {
+                        throw IOException("响应超过 ${maxBytes / 1048576} MiB，不像是字幕文件")
+                    }
+                }
+            }
+            return out.toByteArray()
+        } finally {
+            conn.disconnect()
+        }
+    }
 
     /** 只读响应体前若干字节 —— 用来量「单连接真实带宽」。 */
     fun probeThroughput(

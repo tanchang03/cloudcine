@@ -5477,3 +5477,145 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 ## 测试取向
 - 纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据 = 红的在不在我改的文件里。
 - Android：`./gradlew :app:testDebugUnitTest`（107 例 0 失败基线）；`assembleRelease` 会自动带上单测。
+
+---
+
+# ★ 2026-10-06 Android 媒体库：实现细节与两个坑
+
+## 1. drift 的 DDL 有两个「看不出但比对不过」的写法
+
+从 PC 端 `sqlite_master.sql` dump 出来的原文里有两条规则，凭直觉写生成器**一定错**：
+
+| 规则 | 直觉写法 | drift 实际 |
+|---|---|---|
+| 可空列 | `"language_code" TEXT` | `"language_code" TEXT NULL` ← **显式写出 `NULL`** |
+| 主键 | 列上写 `PRIMARY KEY` | 表尾 `, PRIMARY KEY ("id")` |
+
+省略 `NULL` 在 SQLite 里语义**完全相同**，所以不会报错、也不影响读写 —— 但
+`LibrarySchemaTest` 的逐字比对会红（第一版 5 条全红，差异都停在第 166/255/260/209/180 个字符）。
+`ALTER TABLE … ADD COLUMN` 生成的补列 DDL 也走同一套规则（同样带 `NULL`）。
+
+⇒ 生成器只有一处 `columnSql()`，两边共用；`assertDdl()` 在失败时打印**第一处差异的上下文**，
+比整串 `assertEquals` 有用得多（几百字符的单行没法读）。
+
+## 2. `library/` 与 `pan/` 的设计取舍（逐条）
+
+- **不做 v1→v16 迁移**：Android 打开库只做「补缺表 / 补缺列 + 对齐 `user_version`」。
+  补列**必须去掉 `NOT NULL`** —— SQLite 的 `ALTER TABLE ADD COLUMN` 拒绝
+  「`NOT NULL` 且无默认值」的列（报 `Cannot add a NOT NULL column with default value NULL`），
+  而 v16 的 `first_seen_at` / `updated_at` 正是这种。跨端互操作只认列名与类型。
+- **不用 WAL**：备份包装的是**单个文件的原始字节**。WAL 下最新数据可能还在 `-wal` 里 ⇒
+  导出去的是**旧库**，而且不报任何错。所以显式 `PRAGMA journal_mode=DELETE`。
+  `LibraryDb.rawBytes()` 必须先 `close()`；`replaceWithRawBytes()` 必须先删
+  `-journal` / `-wal` / `-shm`（否则下次打开会把**旧库的回滚日志回放到新库上**）。
+- **自写 `MiniJson`**：`org.json` 在 JVM 单测里是空壳（`isReturnDefaultValues` 下方法体被抹掉、
+  返回 null），而备份清单是跨端契约里最要紧的一块，必须能被纯 JVM 单测覆盖。
+  ⛔ 整数必须写成整数（`16` 而不是 `16.0`）—— Dart 那边 `as int?` 遇到 double 会给 null，
+  版本号就悄悄退化成默认值 1。
+- **自写 `IsoTime`**：`java.time` 要 API 26 而 minSdk 21（会被没关掉的 `NewApi` lint 拦下）；
+  `SimpleDateFormat` 吃不下不定长小数秒（Dart 的 `toIso8601String()` 在微秒非零时输出 **6 位**）。
+  输出固定 `yyyy-MM-dd'T'HH:mm:ss.SSS'Z'`，解析容忍 1~9 位小数秒 / `Z` / `±HH:MM` / `±HHMM` / 无后缀（按 UTC）。
+  ⛔ 输出**必须带 `Z`**，否则 Dart 按本地时间解析，比较偏掉一个时区。
+- **`SyncDecision` 抽成纯函数**：它是「新机器会不会把网盘上的好备份冲成空库」的唯一防线，
+  而它的错法**全是静默的**（两边都显示「同步成功」）。分支顺序与 PC 端一字不差：
+  ① 远程为 null → 上传 ② 本地空库 → 让远程赢 ③ 远程空备份 → 用本地覆盖
+  ④ 不同设备且差 < 60s → 冲突 ⑤ 比 `effectiveModifiedAt`。
+  ⛔ 把 ④ 提到 ② 前面，新机器第一次同步就会看到「冲突，请手动选择」。
+- **`OssAuth` 抽成纯函数**：签名串 / XML / Base64 错了全是静默的（403 或「合并失败」）。
+  自写 Base64 的理由：`android.util.Base64` 在 JVM 单测里是空壳；且 **DEFAULT 会换行**，
+  而 `x-oss-callback` 的 Base64 会进签名串，插了 `\r\n` 就再也对不上。
+
+## 3. ★ 模块编译被并发会话挡住时，怎么拿到确定结论（可复用）
+
+2026-10-06 19:44~19:48 另一个会话正在改 `PlayerActivity.kt` / `BrowseActivity.kt` /
+`TvOsdView.kt` / `AppPrefs.kt`，并新增 `AudioEffect.kt` / `ExternalSubtitle.kt`。
+每次重试报的错都不一样（`SUBTITLE_TICK_MS` → `ROW_AUDIO_EFFECT` → `restorePendingTracks`），
+**全部在他们的文件里** —— 只要他们没写完，`./gradlew` 就永远红。
+
+**做法**：复制一份到 `/tmp`，把他们改过的文件还原成 HEAD，再在那里构建。
+
+```bash
+rm -rf /tmp/ccverify && mkdir -p /tmp/ccverify
+rsync -a --exclude 'build/' --exclude '.gradle/' android/ /tmp/ccverify/android/
+D=/tmp/ccverify/android/app/src/main/java/com/cloudcine/tv
+for f in PlayerActivity.kt BrowseActivity.kt TvOsdView.kt AppPrefs.kt; do
+  git show "HEAD:android/app/src/main/java/com/cloudcine/tv/$f" > "$D/$f"
+done
+rm -f "$D/AudioEffect.kt" "$D/ExternalSubtitle.kt"
+# 测试目录里他们的新测试文件同理
+cd /tmp/ccverify/android && export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home
+./gradlew :app:testDebugUnitTest --tests "com.cloudcine.tv.library.*" --offline
+```
+
+- 判据：**`e:` 行里没有我的文件** = 我的代码编译通过（Kotlin 前端一次报告整个模块的诊断）。
+- 关键点：**只还原「他们改过的」文件**，别还原 `pan/`（那里有我的改动）。
+  `git diff --stat HEAD -- <dir>` 能一眼看出哪些文件属于他们。
+- 复制的副本里 `local.properties` 会跟着过去（`sdk.dir` 在里面），不用重配 SDK。
+- 跑完 `rm -rf /tmp/ccverify`。仓库**零改动**。
+- ⛔ 不要为了「让它编过」去动他们的文件 —— 那会覆盖对方正在写的内容。
+
+## 4. 本轮验证结果
+
+`./gradlew :app:testDebugUnitTest --tests "com.cloudcine.tv.library.*" --tests "com.cloudcine.tv.pan.*"`
+→ **94 例 0 失败**（LibrarySchema 13 / BackupManifest 22 / BackupPackage 15 / MiniJson 13 /
+SyncDecision 10 / LibraryBackupService 3 / OssAuth 18），零编译错误。
+
+---
+
+# ★ PC 端红线细节（2026-10-06 从 MEMORY.md 下沉，起因：MEMORY.md 超 1.4 万字节被注入截断）
+
+MEMORY.md 只留**标识符索引**，下列为**理由与完整判据**。
+
+## 1. 已失效的「Flutter 跑在 Android 上」整条线（⛔ 别再引用）
+`hwdec=mediacodec,auto-safe`（光写 `mediacodec` 失败只剩软解；判据读 `hwdec-current`，带 `copy` = 拷贝档）
+· `VideoControllerConfiguration.hwdec` 与 `PlayerBufferConfig.apply` **必须同值**且**都排在 media_kit `create()` 之前**，Surface 就绪后要再写一次
+· `VideoViewType.platformView`（10-04 实测「更卡、音画不同步」）· `tunnel: true`（「4K 看不到画面，只有声音」）
+· `fvp.registerWith` 只在 macOS · Android 备用内核 `VideoPlayerExoPlaybackEngine()` · `highResTvRoute` = `Platform.isAndroid && tv`
+· `playback_engine_router.dart:184` 判据 `videoHeight >= 2048`（⛔ 不是 2160）· `:199` 日志文案写死「切到 fvp（libmdk）」实际是 ExoPlayer（**待修**）
+· mpv 在 Android 上**做不到零拷贝**（`media_kit_video-1.3.1/android/.../VideoOutput.java` 写死 `createSurfaceProducer()`）· 崩溃证据 `libmdk.so` 的 `strlen→vfprintf` / `SurfaceTextureWrapper.release`
+· `ro.boot.mi.panel_resolution=3840x2160` 但 Android 显示层只有 1920×1080（`dumpsys display`）
+· 旧观察（已废弃）：真机 `解码丢帧=0 / 显示丢帧 21s 涨 44`、[中继] 零告警 ⇒ 瓶颈不在解码。
+  证据 `docs/AndroidTV-4K-丢帧-夸克对标.md`，方案 `docs/解决4k片源不卡顿解析方案.md`。
+
+## 2. 中继 416 契约的完整由来
+`core/utils/http_range.dart` 旧 `parseRangeHeader` 用**一个 `null`** 同时表达「没要求区间」（→200 整文件）和「起点越界」（→416）；
+调用方 `clampRange(requested ?? ByteRange(0,total-1), total)` 只能二选一、选了整文件 ⇒ **416 成死代码**；旧单测注释还写「交给 416」—— **契约两半分家，测试一直绿**。
+后果（`凡人` 4K 3.13 GiB）：播放器问 `bytes=5014520206-`，中继回 `200 bytes 0-3358116481/…`；
+「对带 Range 的请求回 200」=「这是完整资源」⇒ media3 丢掉前 5.01 GB 去对齐偏移，可整条流只有 3.13 GiB ⇒ 读完才 EOF ⇒ **「正在加载…」永不消失**。
+判据：`[中继]` 出现 `读取器 #N → 200 bytes 0-<总长-1>/<总长>` 且请求 `Range: bytes=<大于总长>-`。
+
+## 3. `chunkSize` ↔ 首字节延迟（10-05 血案完整版）
+`_fetchChunk` **整块读完才 `cache.put` + `_settle`** ⇒ 首字节延迟 ≈ 单块下载耗时，与 `chunkSize` 成正比。
+2 MiB→8 MiB 后首块 1.18s→**15~45s**、**零成功播放**、每次换片 `Source error`。✅ 已改回 2 MiB；
+回归测试 `test/data/stream/local_stream_relay_test.dart`「默认 chunkSize 的首字节预算」（断言 `chunkSize/0.6MiB < 5000ms`）。提速调 `connections`/`prefetchBytes`。
+⛔ **`Source error` 的真判据不是「首帧 > 8s」**（原型首帧 12.3s 却没错）。`DefaultHttpDataSource` readTimeout 是**单次 socket 读**空闲上限：
+2 MiB 中继 ~2.8s 出首字节；8 MiB **整块读完才发第一字节**，>8s 零字节 ⇒ 必炸。`warmUpRelay(timeout:2500ms)` / mpv ~5s / ExoPlayer ~20s 都远小于它。
+⛔ 换源时 `fvp 失败 → 回退 media_kit` 会**再建一个中继会话**（sN/sN+1）⇒ 一次换片 = 2 次首块等待。
+⚠️ 同窗口有**跨内核陈旧事件**（切回 mpv 后 2.2s 仍收 `ExoPlayer 首次初始化失败`）→ 待查。
+
+## 4. PC 媒体库三轴 / 层级 / 归一
+- 三轴**不能互推、不能合并**：`MediaKind`（**结构**，只看文件名 `SxxExx`）· `MediaCategory`（**语义**，落 `media_works.category`）·「最近播放」（`playedOnly`，与 `category` **互斥**）。
+- 层级**不落库**（现算）：**季在外、部在内**；某层**少于 2 个选项不画**。
+- ⛔ **归一 = 打标记**（`mergedInto`）：**不删行、不改 `group_key`、不许链式**。
+- ⛔ **目录名当系列名**：判定单元是**目录不是文件**，**四处调用点都要传 `dirPath`**。
+- ⛔ 「已刮削」= **`source==online`**。⛔ `posterFaceX` 与 `posterUrl` **必须成对**。⛔ 字幕字节走 `decodeTextBytes`（先 UTF-8 后 GBK）。
+
+## 5. PC 播放器 / 进度 / 音效
+- ⛔ **两份实现，别只改一个**（`player_window_app.dart` + `player_page.dart`）。⛔ 起播只走 `Media(start:)`。
+- ⛔ 进度两列**别合并**：`resumePositionMs`（起播，看完清）vs `maxPositionMs`（v15，只增不减）。
+- ★ **音效 ≠ 音轨**（**别合并菜单**）：`音轨` = 片源里封着的流；`音效` = 播放端对输出的处理。⛔ macOS `audio-spdif` 直通必卡死 ⇒ macOS `passthroughAvailable == false`。
+
+## 6. PC 导航 / 目录视图 / 文件夹模式 / 下载
+- 侧栏五项 媒体库 `/library` · 文件夹 `/folders` · 扫描 · 下载 · 设置：⛔ `app_shell._items` 与 `app_router.branches` **必须同序**（判据是**下标**）；文件夹读**网盘实时目录**、媒体库读**本地索引**，**搜索词各一份**。
+- 三组**目录 → 视频 → 其他文件**（**组间顺序是结构**）。⛔ 入库判据只有 `classifyEntry` 一处。
+- ⛔ 下载取链**复用 `adapter.resolveStream`**（别打 `/file/download`，>50MiB 直接 23018）；⛔ `.part` 是断点**唯一真源**，服务端**忽略 Range 回 200 必须从 0 重写**，`parse` 读不懂退 **paused**。
+- 文件夹模式只做**「已入库」叠加层**（镜像判定在视频判定**之前**）：⛔ **绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。
+
+## 7. PC TV 布局 / OSD 卡顿
+- `isTvLayout` = android + 逻辑宽≥960（⛔ 判据读 **view 宽**）。⛔ 页头 `actions` 必须 `Wrap`；⛔ **过扫描内边距只有 `app_shell` 一处**；⛔ 遥控器 **↓ 绝不接管**；⛔ **`SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。
+- ⛔ **播放页 OSD 卡顿**：整页 rebuild ≈10 次/秒（`bufferEnd` 没节流）+ `SubtitleViewConfiguration` 无 `operator ==` + `DebugOverlay` 的 `kDebugOverlayEnabled = true` **硬编码**。
+
+## 8. 资源采样 / 日志 / 打包（判据细节）
+- 采样：⛔ 周期 **10 秒**，**故意不与**视频探针的 21 秒相等（会**拍频锁定**；10 与 21 互质）。⛔ **读不到一律留空、整段从日志行消失**，不许退化成 0。⛔ 进程 CPU 是**单核口径**，必须写「折合 N 核」。⛔ 系统 CPU「忙」**不含 iowait**；`/proc/stat` 只认汇总行 `cpu `（**别用 `cpu0`**）。⛔ `/proc/loadavg` 在电视上 `Permission denied`；`/proc/pressure/*` 在 Android 9 不存在 ⇒ 用 `procs_running`/`procs_blocked`（`parseProcStatProcs`，**同文件、不额外读盘**），写「可运行进程=N（4 核，超订 x.xx×）」——⛔ **核数必须一起写**。⛔ `/proc/self/stat` **按最后一个 `)` 切**。⛔ `df` 正则**从左锚定**、不按列 split；用异步 `Process.run`。macOS 无 `/proc`：内存退回 `ProcessInfo.currentRss`，CPU/负载留空属**正常**。
+- 取证：应用日志是**文件、不是 logcat** —— `DiagLog` 同步写 `files/logs/cloudcine-YYYY-MM-DD.log`，读 `adb shell run-as com.cloudcine.cloudcine cat files/logs/cloudcine-<日期>.log`；⛔ logcat `I/flutter` 基本只有引擎启动几行；⛔ **文件 mtime 不涨 = 应用真没做事**。**线程名读 `/proc/<pid>/task/*/comm`**：`top -H` 在 Android 9 全打进程名；⛔ 取字段写 `${12}`/`${13}`；切字段按**最后一个 `)`**。⛔ `exec-out screencap` 被 fvp 的 `Init wrapper sys mutex successful.` 污染 ⇒ 用 `shell screencap -p /sdcard/x.png` + `pull`。**`uiautomator dump` + `input tap X Y` 比猜 DPAD 可靠**；⛔ Flutter 语义树只在无障碍被触发后才暴露。★ **视频真帧率用 SurfaceFlinger 量**：`dumpsys SurfaceFlinger --list` 找层 → `--latency '<层名>'`（首行=刷新周期 ns，其后 128 帧三列时间戳）；**Flutter UI 帧率**用 `dumpsys gfxinfo <包名>` 两次取差。实测 `activeBuffer=[3840x2160:3840,Unknown 0x13]` 才是**视频层**；`SurfaceView #0` 是 `1920x1080 RGBA`。⛔ **LMK 会杀掉后台的云影**（电视仅 2.5 GB）⇒ 中继喂原型只有 2~3 分钟窗口；先 `am kill-all` 腾内存。
+- 打包：⛔ MSI 启动条件绝不能写 `VersionNT >= 1000`（钳在 603）⇒ 用 **`WindowsBuild >= 10240`** + `Installed OR`（MSI 条件**不支持括号**）。⛔ macOS 不许写 `keychain-access-groups`（→ 启动即 SIGKILL）、`app-sandbox` 必须 **`false`**。⚠️ 本机**出不了 Flutter release/profile 包**（对比云影与原型本身不公平：原型是原生 Kotlin，`debuggable` 几乎无代价；云影是 Flutter `app-debug.apk` = JIT，实测进程合计 **467%/400%**，主线程 200% + `DartWorker` 199% + `1.raster` 42%，ExoPlayer 只拿 12%）。

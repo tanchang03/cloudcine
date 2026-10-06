@@ -40,6 +40,23 @@ class AppPrefs(context: Context) {
         get() = sp.getInt(KEY_PARALLEL_CONNECTIONS, DEFAULT_PARALLEL_CONNECTIONS)
         set(v) = sp.edit().putInt(KEY_PARALLEL_CONNECTIONS, v).apply()
 
+    /**
+     * 播放器的**音效**（跟随片源 / 强制立体声）。见 [AudioEffect]。
+     *
+     * ⛔ 与「音轨」是两件不同的事：音轨是**片源里封着的流**（语言），
+     *    而音效是**播放端对输出的处理方式**。别把两者合成一个菜单。
+     *
+     * ⛔ 存的是 [AudioEffect.id] 这个**字符串**，不是枚举序号 —— 以后在中间
+     *    插一档，序号会错位，把用户的「强制立体声」静默变成别的档。
+     *    （与 PC 端 `tables.dart` 的「枚举存名字不存序号」同一条约定。）
+     *
+     * ⛔ 这是**全局参数**：它描述的是「这台电视怎么接音箱」，与正在放哪部片
+     *    无关 —— 换片、换集都不该把它重置掉。所以它不进逐文件的 `playback_prefs`。
+     */
+    var audioEffect: AudioEffect
+        get() = AudioEffect.parse(sp.getString(KEY_AUDIO_EFFECT, null))
+        set(v) = sp.edit().putString(KEY_AUDIO_EFFECT, v.id).apply()
+
     companion object {
         /** 8 条是实测过的稳态点（见 [parallelConnections] 注释）。 */
         const val DEFAULT_PARALLEL_CONNECTIONS = 8
@@ -49,5 +66,6 @@ class AppPrefs(context: Context) {
 
         private const val KEY_DEBUG_OVERLAY = "debug_overlay"
         private const val KEY_PARALLEL_CONNECTIONS = "parallel_connections"
+        private const val KEY_AUDIO_EFFECT = "audio_effect"
     }
 }

@@ -87,6 +87,31 @@ class PanApi(private val store: CredStore) {
         return out
     }
 
+    /**
+     * 取**任意文件**的原始字节地址 —— 外挂字幕走这条。
+     *
+     * ⛔ 用 `file/audioplay` 而**不是** `file/download`。两者都返回原文件本身，
+     *    但 `file/download` 单文件超过约 50 MiB 直接回 `code=23018`
+     *    （见 `lib/domain/services/drive_download.dart` 的实测记录），
+     *    而 `audioplay` 实测**对任意 fid 都返回原文件本身**且不限体积 ——
+     *    连被服务端判成 `text/plain` 的文件也照原样给字节。
+     *    字幕虽然小，但「用哪条路由」这件事只该有一个答案。
+     *
+     * ⛔ 返回的是**带签名的临时地址**，别缓存、别复用；每次要用现取。
+     */
+    fun fileBytesUrl(fid: String): String {
+        val res = PanHttp.get(
+            url = "$PC$PATH_AUDIOPLAY",
+            query = commonQuery() + mapOf("fid" to fid),
+            cookie = store.requestCookie(),
+        )
+        absorbCookies(res)
+        ensureOk(res, "取文件地址")
+        val url = res.data?.optString("audio_url").orEmpty()
+        if (url.isEmpty()) throw ApiException(-1, "服务端没给出文件地址（fid=$fid）")
+        return url
+    }
+
     /** 用户信息，只在标题栏显示昵称。失败不抛 —— 它纯装饰。 */
     fun fetchNickname(): String? = runCatching {
         val res = PanHttp.get("$PC$PATH_MEMBER", commonQuery(), store.requestCookie())
@@ -238,6 +263,298 @@ class PanApi(private val store: CredStore) {
     }
 
     // ------------------------------------------------------------------
+    // 文件管理：建目录 / 删除 / 上传 / 下载
+    //
+    // 这一组是**媒体库备份互操作**的全部依赖：备份包要能被放进网盘的
+    // 「云影备份」目录、被列出来、被下载回来。播放链路一条都不用它们。
+    // ------------------------------------------------------------------
+
+    /**
+     * 在 `parentId` 下创建目录，返回它的 fid。
+     *
+     * 同名重复创建是**幂等**的（服务端返回已存在的那个 fid），所以调用方
+     * 不必先查重 —— [ensureFolder] 之所以还是先列一次，是为了省掉一次写操作。
+     */
+    fun createFolder(parentId: String, name: String): String {
+        val res = post(
+            PATH_FILE_CREATE,
+            JSONObject().apply {
+                put("dir_init_lock", false)
+                put("dir_path", "")
+                put("file_name", name)
+                put("pdir_fid", parentId.ifEmpty { ROOT })
+            },
+            "创建目录",
+        )
+        val fid = parseFid(res.data)
+        if (fid.isEmpty()) throw ApiException(-1, "创建目录失败：响应中没有返回目录 ID")
+        return fid
+    }
+
+    /**
+     * 确保 `parentId` 下存在名为 `name` 的目录，返回它的 fid。
+     *
+     * ⛔ 先列目录再建，而不是直接建：直接建也能work（幂等），但会在每次
+     *    同步时都往网盘写一次 —— 而「只读的同步」不该有副作用。
+     */
+    fun ensureFolder(parentId: String, name: String): String {
+        listDirectory(parentId.ifEmpty { ROOT }, page = 1, size = 200)
+            .firstOrNull { it.isDir && it.name == name }
+            ?.let { return it.fid }
+        return createFolder(parentId, name)
+    }
+
+    /**
+     * **永久**删除一批文件/目录（`action_type=2`）。
+     *
+     * ⚠️ 不可逆。调用方必须做 UI 二次确认。
+     *
+     * ## 返回值是**入参回显**，不是逐条核实的结果
+     *
+     * 夸克的删除响应只有信封（`code` / `message`），没有可读的逐条结果。
+     * 所以这个列表的含义是「请求成功了几条」，**不是**「网盘上真的少了几条」。
+     * 服务端在同一批里跳过某几个（无权限、已在回收站、fid 已失效）时，
+     * 我们照旧报成功 —— 这个偏差**看不见**。
+     *
+     * ⛔ 别改成「删完立刻重列目录来核对」：删除在服务端未必立刻可见，
+     *    刚删完就重列很可能仍然看得到，那会把成功报成失败 —— 比少报更糟。
+     */
+    fun deleteFiles(fileIds: List<String>): List<String> {
+        if (fileIds.isEmpty()) return emptyList()
+        post(
+            PATH_FILE_DELETE,
+            JSONObject().apply {
+                put("action_type", 2) // 2 = 永久删除
+                put("filelist", JSONArray(fileIds))
+                put("exclude_fids", JSONArray())
+            },
+            "删除文件",
+        )
+        return fileIds
+    }
+
+    /**
+     * 把一个文件**全部**读回来（下载备份包走这条）。
+     *
+     * ⛔ 走 `file/audioplay` 取的地址，**不是** `file/download` ——
+     *    后者单文件超过约 50 MiB 直接回 `code=23018`，而备份包很容易超。
+     *    理由与 [fileBytesUrl] 一字不差，只是那边是给字幕用的。
+     *
+     * ⛔ [maxBytes] 是**防呆**不是限制。这台电视只有 512 MB Java 堆，
+     *    而这条路会把整个文件读进内存 —— 上限没兜住的话，
+     *    表现不是「报错」而是 `OutOfMemoryError` 把进程带走。
+     */
+    fun fileBytes(fid: String, maxBytes: Int = MAX_DOWNLOAD_BYTES): ByteArray =
+        PanHttp.getBytes(
+            url = fileBytesUrl(fid),
+            cookie = store.requestCookie(),
+            maxBytes = maxBytes,
+            timeoutMs = 60_000,
+        )
+
+    /**
+     * 上传一个文件到 `parentId`，返回新文件的 fid。
+     *
+     * ## 流程（与 PC 端 `QuarkAdapter.uploadFile` 逐步对齐）
+     *
+     * 1. `file/upload/pre` 预上传 —— 拿到 `task_id`、OSS 的
+     *    `bucket` / `obj_key` / `upload_id` / `auth_info` / `callback`；
+     * 2. `file/update/hash` 秒传判定 —— `data.finish == true` 就**直接结束**，
+     *    一个字节都不用传（备份包在两端之间来回传时命中率很高）；
+     * 3. 逐片取 `auth_key`（`file/upload/auth`）→ `PUT` 到 OSS → 收 ETag；
+     * 4. **两步**收尾：OSS `CompleteMultipartUpload`（带 `x-oss-callback`）
+     *    → `file/upload/finish`（body 只有 `task_id` + `obj_key`）。
+     *
+     * ⛔ 第 4 步的**两步缺一不可，顺序也不能反**。只调
+     *    `file/upload/finish` 会得到
+     *    `code=43001 request cpp error[complete file failed!]` ——
+     *    服务端找不到可合并的对象。这一条在 PC 端是踩过的坑，
+     *    `QuarkEndpoints.uploadFinish` 的注释里留着原话。
+     *
+     * ⛔ [onProgress] 在**调用线程**上回调（本类所有方法都是阻塞的，
+     *    调用方负责放到 [Bg] 里）。别在回调里碰 View。
+     */
+    fun uploadFile(
+        parentId: String,
+        fileName: String,
+        bytes: ByteArray,
+        onProgress: ((sent: Int, total: Int) -> Unit)? = null,
+    ): String {
+        val size = bytes.size
+        val nowMs = System.currentTimeMillis()
+        val pdir = parentId.ifEmpty { ROOT }
+
+        // ① 预上传
+        val preData = post(
+            PATH_UPLOAD_PRE,
+            JSONObject().apply {
+                put("ccp_hash_update", true)
+                put("dir_name", "")
+                put("file_name", fileName)
+                put("format_type", "application/octet-stream")
+                put("l_created_at", nowMs)
+                put("l_updated_at", nowMs)
+                put("pdir_fid", pdir)
+                put("size", size)
+            },
+            "上传预请求",
+        ).data ?: throw ApiException(-1, "上传预请求失败：响应中没有 data")
+
+        val taskId = preData.optString("task_id")
+        if (taskId.isEmpty()) throw ApiException(-1, "上传预请求失败：没有返回 task_id")
+
+        // ② 秒传判定
+        val hashData = post(
+            PATH_UPLOAD_HASH,
+            JSONObject().apply {
+                put("md5", OssAuth.md5Hex(bytes))
+                put("sha1", OssAuth.sha1Hex(bytes))
+                put("task_id", taskId)
+            },
+            "秒传判定",
+        ).data
+        if (hashData != null && hashData.optBoolean("finish", false)) {
+            val fid = parseFid(hashData)
+            if (fid.isNotEmpty()) {
+                Log.i(TAG, "上传：秒传命中「$fileName」→ fid=$fid")
+                onProgress?.invoke(size, size)
+                return fid
+            }
+        }
+
+        // ③ 分片上传到 OSS
+        val bucket = preData.optString("bucket")
+        val objKey = preData.optString("obj_key")
+        val uploadId = preData.optString("upload_id")
+        val ossBase = OssAuth.ossBase(preData.optString("upload_url"), bucket, objKey)
+        val authInfo = if (preData.has("auth_info")) preData.get("auth_info") else null
+
+        val partSize = preData.optInt("part_size").takeIf { it > 0 }
+            ?: preData.optJSONObject("metadata")?.optInt("part_size")?.takeIf { it > 0 }
+            ?: DEFAULT_PART_SIZE
+
+        // ⛔ 空文件也要传一片（`totalParts` 至少为 1），否则 OSS 那边
+        //    一个分片都没有、合并必然失败。
+        val totalParts = if (size == 0) 1 else (size + partSize - 1) / partSize
+        Log.i(TAG, "上传：分片 $totalParts 片 × $partSize 字节（OSS: $bucket/$objKey）")
+
+        val parts = ArrayList<OssAuth.Part>(totalParts)
+        for (pn in 1..totalParts) {
+            val from = (pn - 1) * partSize
+            val to = minOf(from + partSize, size)
+            val chunk = bytes.copyOfRange(from, to)
+
+            val ts = OssAuth.ossTimestamp(System.currentTimeMillis())
+            val authKey = post(
+                PATH_UPLOAD_AUTH,
+                JSONObject().apply {
+                    put("auth_info", authInfo)
+                    put("auth_meta", OssAuth.partAuthMeta(bucket, objKey, pn, uploadId, ts))
+                    put("task_id", taskId)
+                },
+                "分片授权($pn/$totalParts)",
+            ).data?.optString("auth_key").orEmpty()
+
+            val res = PanHttp.putBytes(
+                url = "$ossBase?partNumber=$pn&uploadId=$uploadId",
+                body = chunk,
+                headers = mapOf(
+                    "Authorization" to authKey,
+                    "Content-Type" to "application/octet-stream",
+                    "x-oss-date" to ts,
+                    "x-oss-user-agent" to OssAuth.OSS_USER_AGENT,
+                ),
+            )
+            if (!res.isOk) {
+                throw ApiException(-1, "分片 $pn/$totalParts 上传失败：HTTP ${res.status} ${res.brief()}")
+            }
+            val etag = OssAuth.stripEtagQuotes(res.header("ETag").orEmpty())
+            if (etag.isEmpty()) {
+                throw ApiException(-1, "分片 $pn/$totalParts 没有返回 ETag（缺了它无法合并）")
+            }
+            parts.add(OssAuth.Part(pn, etag))
+            onProgress?.invoke(to, size)
+        }
+
+        // ④ 收尾（两步，缺一不可）
+        return finishUpload(taskId, ossBase, bucket, objKey, uploadId, authInfo, preData, parts)
+    }
+
+    /**
+     * 上传收尾。
+     *
+     * 拆出来只是为了让 [uploadFile] 的主干能一眼看完 —— 它**不是**可选步骤。
+     */
+    private fun finishUpload(
+        taskId: String,
+        ossBase: String,
+        bucket: String,
+        objKey: String,
+        uploadId: String,
+        authInfo: Any?,
+        preData: JSONObject,
+        parts: List<OssAuth.Part>,
+    ): String {
+        // ⛔ callback 是预上传响应里给的配置对象。**必须原样回填给 OSS** ——
+        //    它决定 OSS 合并完成后回调夸克哪个地址去登记文件。缺了它
+        //    `x-oss-callback` 头就没法构造，签名串也少一行。
+        if (!preData.has("callback")) {
+            throw ApiException(-1, "上传预请求没有返回 callback，无法完成 OSS 合并上传")
+        }
+        val callbackJson = preData.get("callback").toString()
+
+        val xml = OssAuth.completeMultipartXml(parts)
+        val xmlBytes = xml.toByteArray(Charsets.UTF_8)
+        val contentMd5 = OssAuth.md5Base64(xmlBytes)
+        val callbackBase64 = OssAuth.base64(callbackJson.toByteArray(Charsets.UTF_8))
+
+        val ts = OssAuth.ossTimestamp(System.currentTimeMillis())
+        val authKey = post(
+            PATH_UPLOAD_AUTH,
+            JSONObject().apply {
+                put("auth_info", authInfo)
+                put(
+                    "auth_meta",
+                    OssAuth.completeAuthMeta(bucket, objKey, uploadId, ts, contentMd5, callbackBase64),
+                )
+                put("task_id", taskId)
+            },
+            "完成上传授权",
+        ).data?.optString("auth_key").orEmpty()
+
+        // 5. POST XML 到 OSS —— 合并分片，并由 OSS 触发 callback
+        val res = PanHttp.postBytes(
+            url = "$ossBase?uploadId=$uploadId",
+            body = xmlBytes,
+            headers = mapOf(
+                "Authorization" to authKey,
+                "Content-MD5" to contentMd5,
+                "Content-Type" to "application/xml",
+                "x-oss-callback" to callbackBase64,
+                "x-oss-date" to ts,
+                "x-oss-user-agent" to OssAuth.OSS_USER_AGENT,
+            ),
+        )
+        if (!res.isOk) {
+            throw ApiException(-1, "OSS 合并分片失败：HTTP ${res.status} ${res.brief()}")
+        }
+
+        // 6. 通知夸克：把合并后的对象登记成文件
+        val fid = parseFid(
+            post(
+                PATH_UPLOAD_FINISH,
+                JSONObject().apply {
+                    put("task_id", taskId)
+                    put("obj_key", objKey)
+                },
+                "完成上传",
+            ).data,
+        )
+        if (fid.isEmpty()) throw ApiException(-1, "完成上传响应中没有返回文件 ID")
+        return fid
+    }
+
+    // ------------------------------------------------------------------
     // 内部
     // ------------------------------------------------------------------
 
@@ -270,6 +587,33 @@ class PanApi(private val store: CredStore) {
             "$what 失败：HTTP ${res.status} code=${res.code} ${res.message}".trim(),
             needsReauth = reauth,
         )
+    }
+
+    /** POST 一个 JSON body 到网盘端点，回填 Cookie 并校验业务码。 */
+    private fun post(path: String, body: JSONObject, what: String): PanResponse {
+        val res = PanHttp.postJson("$PC$path", commonQuery(), body, store.requestCookie())
+        absorbCookies(res)
+        ensureOk(res, what)
+        return res
+    }
+
+    /**
+     * 从响应 `data` 里挖出文件 fid。
+     *
+     * 口径照抄 PC 端 `QuarkMapper.parseFid`：`fid` → `file_id` → `id`，
+     * 值可能是字符串也可能是数字（服务端两种都给过）。
+     */
+    private fun parseFid(data: JSONObject?): String {
+        if (data == null) return ""
+        for (key in FID_KEYS) {
+            if (!data.has(key)) continue
+            when (val v = data.opt(key)) {
+                is String -> if (v.isNotEmpty()) return v
+                is Number -> return v.toString()
+                else -> Unit
+            }
+        }
+        return ""
     }
 
     /**
@@ -327,6 +671,29 @@ class PanApi(private val store: CredStore) {
         const val PATH_FILE_SORT = "/1/clouddrive/file/sort"
         const val PATH_PLAY_INFO = "/1/clouddrive/batch/file/play/info"
         const val PATH_AUDIOPLAY = "/1/clouddrive/file/audioplay"
+
+        // ── 文件管理（媒体库备份互操作）─────────────────────────────
+        const val PATH_FILE_CREATE = "/1/clouddrive/file"
+        const val PATH_FILE_DELETE = "/1/clouddrive/file/delete"
+        const val PATH_UPLOAD_PRE = "/1/clouddrive/file/upload/pre"
+        const val PATH_UPLOAD_HASH = "/1/clouddrive/file/update/hash"
+        const val PATH_UPLOAD_AUTH = "/1/clouddrive/file/upload/auth"
+        const val PATH_UPLOAD_FINISH = "/1/clouddrive/file/upload/finish"
+
+        /** 一次上传的分片大小。夸克预上传响应里的 `part_size` 一般是 4 MiB。 */
+        const val DEFAULT_PART_SIZE = 4 * 1024 * 1024
+
+        /**
+         * 单次下载的字节上限。
+         *
+         * 备份包通常是几 MB（库 + 海报），但用户勾了「含海报」之后可能到
+         * 几十 MB。**不能设成「不限」** —— 这台电视只有 512 MB Java 堆，
+         * 越界的表现是 `OutOfMemoryError` 直接把进程带走，不是一条错误日志。
+         */
+        const val MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
+
+        /** `parseFid` 的候选键，顺序即优先级。 */
+        val FID_KEYS = listOf("fid", "file_id", "id")
 
         const val ROOT = "0"
 

@@ -71,7 +71,10 @@ object LibrarySchema {
 
     private fun columnSql(c: Column): String {
         val sb = StringBuilder("${q(c.name)} ${c.type}")
-        if (c.notNull) sb.append(" NOT NULL")
+        // ⛔ drift **显式写出可空性**（可空列也带 ` NULL`），不是省略。
+        //    省略在 SQLite 里语义相同，但会让这里的逐字比对永远差几个字符，
+        //    而「比对失败」正是这个文件唯一的验收方式 —— 所以照抄。
+        sb.append(if (c.notNull) " NOT NULL" else " NULL")
         c.default?.let { sb.append(" DEFAULT $it") }
         c.check?.let { sb.append(" CHECK ($it)") }
         return sb.toString()
