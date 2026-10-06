@@ -513,42 +513,61 @@ class LocalStreamRelay implements StreamRelay {
     var explained = false;
     try {
       final total = session.totalLength;
-      final requested =
-          parseRangeHeader(request.headers.value(HttpHeaders.rangeHeader), total);
-      final range = clampRange(requested ?? ByteRange(0, total - 1), total);
-      if (range == null) {
-        // 成因只有一个：请求的范围完全落在流长度之外（拿旧会话的长度去读
-        // 新流时会出现）。它是 416 而不是 404，但播放器同样只报一句
-        // `Failed to open`，所以必须自己留下痕迹。
-        diag.warn(
-          '中继',
-          '会话 ${session.token} 拒绝读取器 #$reader：Range 超出流长度'
-          '（流长 $total 字节，请求 '
-          '${request.headers.value(HttpHeaders.rangeHeader) ?? "无"}）',
-        );
-        explained = true;
-        response
-          ..statusCode = HttpStatus.requestedRangeNotSatisfiable
-          ..headers.set('content-range', 'bytes */$total')
-          ..headers.set(HttpHeaders.contentLengthHeader, 0);
-        return;
+      final spec = parseRangeRequest(
+        request.headers.value(HttpHeaders.rangeHeader),
+        total,
+      );
+
+      // ⛔ 起点越界**必须**回 416，**绝不能**降级成「整文件从 0 开始」——
+      //    HTTP 上「对带 Range 的请求回 200」等于「不支持区间，这是完整
+      //    资源」，播放器于是按它要的偏移去**跳过整条流**；偏移比流还长时
+      //    它会把整部片子读完丢掉，才报 EOF。表现就是「正在加载…」永不
+      //    消失（见 `RangeRequest` 的文档与实测记录）。
+      final ByteRange serveRange;
+      // 客户端是否**明确**要了区间 —— 决定回 206 还是 200。
+      final bool hasRange;
+      switch (spec) {
+        case UnsatisfiableRange():
+          // 成因：拿旧会话的长度去读新流，或播放器自己算出越界偏移。
+          // 它是 416 而不是 404，但播放器同样只报一句 `Failed to open`，
+          // 所以必须自己留下痕迹。
+          diag.warn(
+            '中继',
+            '会话 ${session.token} 拒绝读取器 #$reader：Range 超出流长度'
+            '（流长 $total 字节，请求 '
+            '${request.headers.value(HttpHeaders.rangeHeader) ?? "无"}）',
+          );
+          explained = true;
+          response
+            ..statusCode = HttpStatus.requestedRangeNotSatisfiable
+            ..headers.set('content-range', 'bytes */$total')
+            ..headers.set(HttpHeaders.contentLengthHeader, 0);
+          return;
+        case SatisfiableRange(:final range):
+          serveRange = range;
+          hasRange = true;
+        case NoRangeRequest():
+          // 没要求区间（或算不出终点）：整文件。`total<=0` 时区间退化成空，
+          // 与改动前 `clampRange` 的行为一致。
+          serveRange = ByteRange(0, total - 1);
+          hasRange = false;
       }
 
       // 登记这个读取器。范围够长才算「在放片子」，才有资格推动预取窗口 ——
       // 读 MKV `Cues` 的探索引（请求文件尾那一小段）不算，见 [RelayReaderArbiter]。
-      session.attachReader(reader, range.length);
+      session.attachReader(reader, serveRange.length);
 
       response
-        ..statusCode = requested == null ? HttpStatus.ok : HttpStatus.partialContent
+        ..statusCode = hasRange ? HttpStatus.partialContent : HttpStatus.ok
         ..headers.set(HttpHeaders.contentTypeHeader, session.contentType)
         // ⚠️ 必须声明支持 Range：mpv 靠它判断能不能 seek。少了这一行的
         // 表现是「能播但进度条拖不动」。
         ..headers.set(HttpHeaders.acceptRangesHeader, 'bytes')
-        ..headers.set(HttpHeaders.contentLengthHeader, range.length);
-      if (requested != null) {
+        ..headers.set(HttpHeaders.contentLengthHeader, serveRange.length);
+      if (hasRange) {
         response.headers.set(
           HttpHeaders.contentRangeHeader,
-          formatContentRange(range, total),
+          formatContentRange(serveRange, total),
         );
       }
       // 长度已知，不要分块编码 —— mpv 对 chunked 的流无法做范围估算。
@@ -560,12 +579,12 @@ class LocalStreamRelay implements StreamRelay {
       diag.debug(
         '中继',
         '会话 ${session.token} 读取器 #$reader → ${response.statusCode} '
-        '${formatContentRange(range, total)}',
+        '${formatContentRange(serveRange, total)}',
       );
 
       var firstChunk = true;
       if (request.method != 'HEAD') {
-        await for (final bytes in session.read(range, reader)) {
+        await for (final bytes in session.read(serveRange, reader)) {
           if (firstChunk) {
             firstChunk = false;
             // 「首块已下发」= 上游确实取到数据了。没有这一条、播放器却仍报

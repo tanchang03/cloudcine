@@ -11,6 +11,7 @@ import 'package:media_kit/media_kit.dart' as mk;
 import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/diagnostics/player_diag.dart';
 import '../../core/diagnostics/resource_probe.dart';
 import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/seek_acceleration.dart';
@@ -24,6 +25,7 @@ import '../../domain/entities/subtitle_track.dart';
 import '../../domain/services/episode_queue.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/playback_exit_policy.dart';
+import '../platform/tv_osd_channel.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/anchored_menu.dart';
@@ -437,6 +439,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 各自的决定，而电视上返回键是唯一的退出手段，分错一次就是「按了没反应」。
   bool _tvPanelOpen = false;
 
+  /// 当前这块菜单是**原生 View** 画的那块，而不是 [PlayerTvOverlay]。
+  ///
+  /// 决定 `build` 里要不要跳过 Flutter 版菜单（两个都画就会重叠）。
+  /// Android TV 上它恒为 `true`；只有原生侧没接住时才会退回 Flutter 版。
+  bool _tvPanelIsNative = false;
+
   /// 同一部作品下的全部条目（「选集」用）。
   ///
   /// 与 `_playNextEpisode` 取的是**同一份**（`itemsForWork` 的并集）——
@@ -485,6 +493,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 不摘的话它会在页面销毁之后继续持有这个 State 的闭包（`_onCompleted`
     // 里要 `setState` / 读 provider），下一次播完会打到已销毁的页面上。
     _controller.onCompleted = _onCompleted;
+    // 原生 TV 菜单（`android/.../TvOsdView.kt`）的两个事件。与 `onCompleted`
+    // 同理：**在这里挂、在 `dispose` 摘** —— 不摘的话原生侧一次 `onClose`
+    // 会打到已经销毁的这个 State 上。
+    TvOsdChannel.attach(
+      onActivate: _onTvOsdActivate,
+      onClose: _closeTvPanel,
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
   }
 
@@ -705,6 +720,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   @override
   void dispose() {
+    // 原生菜单是挂在 Activity 上的**独立图层**，页面走了它不会自己消失 ——
+    // 不显式收掉的话，退回媒体库之后菜单还浮在那儿。
+    unawaited(TvOsdChannel.hide());
+    TvOsdChannel.detach();
     _controller.removeListener(_onPlayStateChanged);
     // 摘掉自动连播回调：它是**全局唯一**的那个（控制器是单例），
     // 留着会让下一次播完打到这个已经销毁的 State 上。
@@ -1059,7 +1078,9 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
                 // TV 设置菜单。**挂在页面最外层**，不在画面那一块里 ——
                 // 见下面那段「为什么不能放进 `_buildStage`」。
-                if (_tvPanelOpen)
+                // ⛔ 原生菜单（Android TV 的默认路径）**不在这里画** ——
+                // 它是挂在 Activity 上的独立图层，两边都画会重叠。
+                if (_tvPanelOpen && !_tvPanelIsNative)
                   Positioned(
                     left: 0,
                     right: 0,
@@ -1072,19 +1093,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                       activeAudioId: _audioId,
                       onPickQuality: _changeQuality,
                       onPickSubtitle: _changeSubtitle,
-                      onPickAudioTrack: (track, index) {
-                        setState(() => _audioId = track.id);
-                        unawaited(controller.selectAudioTrack(track));
-                        unawaited(_rememberAudio(track, index));
-                      },
+                      onPickAudioTrack: _pickAudioTrack,
                       onPickAudioEffect: _setAudioEffect,
                       onPickRate: controller.setRate,
                       onPickEpisode: _openItem,
-                      onJumpIntro: () async {
-                        final marker = controller.introMarker;
-                        if (marker == null) return;
-                        await controller.seek(marker.start);
-                      },
+                      onJumpIntro: _jumpIntro,
                       onClose: _closeTvPanel,
                       onActivity: _scheduleControlsHide,
                     ),
@@ -1131,6 +1144,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
+
+    // 「跟手」埋点：见 `player_diag.dart`。⛔ 必须放在**任何会改 UI 的调用之前**
+    // —— 放到后面就把这一拍自己的工作也算进延迟里了，读数会随改动位置漂移。
+    KeyFrameLatency.mark(event.logicalKey.debugName ?? '');
 
     // 任意一次按键都算「用户还在」—— 重置收起倒计时。放在路由判断之前，
     // 这样连「放行给焦点系统」的方向键（↑/↓）也会重置，而不是只有播放 /
@@ -1249,8 +1266,47 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   void _openTvPanel() {
     if (_tvPanelOpen) return;
+    // Android TV 上优先用**原生菜单**：它是挂在 Activity 上的独立图层，
+    // 按键与重绘不经过 Dart —— 中继再忙也跟手（见 `TvOsdChannel` 的文档）。
+    if (_isTv && TvOsdChannel.supported) {
+      unawaited(_openNativeTvPanel());
+      return;
+    }
+    _openFlutterTvPanel();
+  }
+
+  /// 打开**原生**菜单。
+  ///
+  /// 行数据与 Flutter 版**同一份**（[buildPlayerTvRows]），所以两块菜单
+  /// 不会出现「原生少一档、Flutter 多一档」这种没人能发现的偏差。
+  Future<void> _openNativeTvPanel() async {
+    final rows = buildPlayerTvRows(
+      controller: _controller,
+      siblings: _siblings,
+      item: _item,
+      activeAudioId: _audioId,
+    );
+    final ok = await TvOsdChannel.show(rows: rows);
+    if (!mounted) return;
+    if (!ok) {
+      // 原生侧没接住（拿不到内容视图）。**必须**退回 Flutter 版 ——
+      // 否则用户按了菜单键什么都看不到，只会以为遥控器坏了。
+      _openFlutterTvPanel();
+      return;
+    }
     setState(() {
       _tvPanelOpen = true;
+      _tvPanelIsNative = true;
+      _immersive = false;
+    });
+    _scheduleControlsHide();
+  }
+
+  /// 打开 Flutter 版菜单（桌面端 / 原生侧不可用时的回退路径）。
+  void _openFlutterTvPanel() {
+    setState(() {
+      _tvPanelOpen = true;
+      _tvPanelIsNative = false;
       // 菜单显示时顶栏也要在：它是「我在看什么片子」的唯一说明。
       // 控制栏则相反 —— 它被菜单盖住，`build` 里会跳过它（见那段注释）。
       _immersive = false;
@@ -1270,7 +1326,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 下一帧再要焦点：这一帧菜单还没建出来，`requestFocus` 会落到一个
     // 还没有 `context` 的节点上。
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_tvPanelOpen) return;
+      if (!mounted || !_tvPanelOpen || _tvPanelIsNative) return;
       _tvPanelNode.requestFocus();
     });
     _scheduleControlsHide();
@@ -1291,8 +1347,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (!_tvPanelOpen) return;
     setState(() {
       _tvPanelOpen = false;
+      _tvPanelIsNative = false;
       if (!keepImmersive) _immersive = true;
     });
+    // 原生那块菜单是挂在 Activity 上的独立图层，Dart 侧「关了」它不会自己
+    // 消失 —— 必须显式收。没显示时是空操作（原生侧先判 `visibility`），
+    // 所以这里无条件调，不必再记一个「这块是不是原生的」标志。
+    unawaited(TvOsdChannel.hide());
     // 焦点必须交回画面。菜单的 `Focus(autofocus: true)` 拿走焦点之后不主动
     // 还回去的话，↑ / ↓ 会继续被菜单吃掉、OK 也不再是播放/暂停 ——
     // 而画面上没有任何东西提示「焦点现在在别处」，用户只会以为播放器卡了。
@@ -1301,6 +1362,59 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 到点时再判一次 `shouldAutoHideControls`（沉浸 → 直接返回 false）。
     // 留着它只会让「用户按任意键唤回控制栏」那一刻多一次无意义的取消。
     _cancelIdleHide();
+  }
+
+  // -------------------------------------------------------------------
+  // 原生 TV 菜单（Android TV 的默认路径）
+  // -------------------------------------------------------------------
+
+  /// 原生菜单上按了 OK。
+  ///
+  /// `row` 是**行下标**：行顺序就是 [PlayerTvRow] 的声明顺序
+  /// （[buildPlayerTvRows] 按同一个顺序吐行，原生侧按下标回传），
+  /// 所以这里用 `PlayerTvRow.values[row]` 还原。
+  void _onTvOsdActivate(int row, int chip) {
+    if (row < 0 || row >= PlayerTvRow.values.length) return;
+    applyPlayerTvRowAction(
+      row: PlayerTvRow.values[row],
+      optionIndex: chip,
+      siblings: _siblings,
+      qualities: _controller.qualities,
+      subtitles: _controller.allSubtitles,
+      audioTracks: _controller.embeddedAudioTracks,
+      target: _tvOsdActions(),
+    );
+  }
+
+  /// 交给 TV 菜单的动作表。
+  ///
+  /// ⛔ 与 [PlayerTvOverlay] 那份**必须**是同一组方法：两块菜单共用
+  /// [applyPlayerTvRowAction]，这里只是把回调指过去。指错一个（例如把
+  /// 「音效」指到「音轨」）不会有任何报错，只会在真机上静默做错事。
+  TvOsdActionTarget _tvOsdActions() => TvOsdActionTarget(
+        onPickQuality: _changeQuality,
+        onPickSubtitle: _changeSubtitle,
+        onPickAudioTrack: _pickAudioTrack,
+        onPickAudioEffect: _setAudioEffect,
+        onPickRate: _controller.setRate,
+        onPickEpisode: _openItem,
+        onJumpIntro: _jumpIntro,
+        onClose: _closeTvPanel,
+      );
+
+  /// 换音轨：先记下「现在选的是哪条」（控制器只给列表、不给选中项），
+  /// 再切、再落库。
+  void _pickAudioTrack(mk.AudioTrack track, int index) {
+    setState(() => _audioId = track.id);
+    unawaited(_controller.selectAudioTrack(track));
+    unawaited(_rememberAudio(track, index));
+  }
+
+  /// 跳到片头起点。TV 上**只跳不标**（标记入口在桌面控制栏）。
+  Future<void> _jumpIntro() async {
+    final marker = _controller.introMarker;
+    if (marker == null) return;
+    await _controller.seek(marker.start);
   }
 
   // -------------------------------------------------------------------

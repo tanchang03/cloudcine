@@ -1,9 +1,9 @@
 # 云影（cloudcine）项目长期约定
 
 Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接夸克。
-- 本机通用事实（gvm/`NO_PROXY`/沙箱/`ps`→`pgrep`/同文件两条 Edit/Android 构建）见 `~/.workbuddy-ai/MEMORY.md`。
-- **理由、实测证据、标识符细节都在 `HOWTO.md`**（`§` 指其章节）；逐日经过在 `YYYY-MM-DD.md`。
-- 本文件上限 **80000 字符**（10-04 用户改，原 8000）。细节仍优先下沉到 `HOWTO.md`，但**不必为省字数删红线**。
+- 本机通用事实（gvm/`NO_PROXY`/沙箱/`ps`→`pgrep`/Android 构建/`git push` 要 `HOME`/**同文件两条 Edit 会互相覆盖**）见 `~/.workbuddy-ai/MEMORY.md`。
+- **理由、实测证据、标识符细节在 `HOWTO.md`**（`§` 指其章节）；逐日经过在 `YYYY-MM-DD.md`。本文件只留**红线 + 标识符**。
+- ⚠️ 本文件**超过约 1.1 万字符就被注入截断**（后半段读不到）⇒ 加新条目**先删旧的**；细节一律下沉 `HOWTO.md`。
 
 ## 版本控制
 - **攒够一小轮就 commit**；`git clean` 先 `-nd` 干跑（untracked 被 `-df` 删掉**救不回**）。
@@ -13,80 +13,111 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 ## 架构
 `core/` 纯工具 · `domain/` 实体+服务+适配器抽象（**不 import Flutter/drift**）· `data/` 夸克/drift/刮削/凭证 · `ui/` Riverpod 组合根 + go_router + 页面。跨层信号放叶子文件。
 
-## 电视分支（§）
-`isTvLayout`：android + 逻辑宽≥960（⛔ 判据读 view 宽，页面实得 624，**壳外页实得 960**）。⛔ **页头 `actions` 必须 `Wrap`**；⛔ TV 另一套缓冲（`cache=yes` + 硬解参数，见下节）；⛔ **过扫描内边距只有 `app_shell` 一处**，壳外页（`/work` `/diagnostics` `/auth/qr`）与**播放器覆盖层**自己加；⛔ 播放器遥控器 **↓ 绝不接管**；⛔ **侧栏方向键靠壳层兜底**（候选**只搜侧栏子树**）。→ `§电视（Android TV）分支`。
+## ★★ 4K 卡顿的真因：**播错了档位**（10-06 Mac 实测，`tool/quark_probe.py`）
+`黑亚当 2160p`（7490s，原文件 21.9 GiB）实测档位：
 
-## Android TV 4K 丢帧（10-04，§，报告见 `docs/AndroidTV-4K-丢帧-夸克对标.md`）
-> 📌 **要动手看 `docs/解决4k片源不卡顿解析方案.md`**（10-05 起草）——那是方案；
-> 上面那份是证据/记录。方案里修正了旧文档的三处判断（`PlaybackSurface` 要改、
-> 钳制开关在 Dart 不在 native、`tunnel` 是全局项）。
-- 根因**不是解码、也不是网络**：真机 `解码丢帧=0 / 显示丢帧 21s 涨 44`，[中继] 零告警。瓶颈是 `mediacodec-copy` 的「拷回 CPU + 上传纹理」。
-- ⛔ `hwdec` 必须写成 **`mediacodec,auto-safe`**（逗号=带回退；⛔ 光写 `mediacodec` 失败只剩软解）。
-- 判据：起播后读 `hwdec-current`，带 `copy` = 拷贝档（`isCopyHwdec`，⛔ **空串不算**）。
+| 档位 | 分辨率 | 体积 | **需要带宽** |
+|---|---|---|---|
+| 原画 | 3840×1606 | 21.9 GiB | **3.00 MB/s** |
+| `4k` | 3840×1606 | 4.6 GiB | **0.63 MB/s** |
+| `super` | 1440×602 | 1.03 GiB | 0.14 MB/s |
+| `high` | 960×402 | 678 MiB | 0.09 MB/s |
+
+- ★ **夸克自己的 `default_resolution` 是 `super`**；云影默认播**原画**（3 MB/s）⇒ 单连接喂不动 ⇒ 靠 8 连接中继 ⇒ 中继跑在 **Dart 主 isolate** ⇒ **UI 饿死 + 加载-播放-加载**。**这就是全部秘密**（不是解码、不是渲染面、不是 OSD 画法）。
+- ★ 单连接直连实测（Mac，带 Cookie）：`4k` **4.57 MiB/s**、原画 **6.76 MiB/s** ⇒ 够用。内存里「直连只有 1.1 MB/s」**只在电视 WiFi 上成立**，不是普适结论。
+- ⇒ 治本：**默认播转码档（≥`4k`），不播原画**；中继只在用户显式选原画时才需要。
+- 电视上夸克 TV 版实测 app 23.5% / `media.codec` 20.5%（≈ 4 核 11%）。
+
+### 直链 Cookie 规则（10-06 四种组合实测，★ 极易踩）
+| 请求带的 Cookie | 结果 |
+|---|---|
+| 带 `__puus`（**新旧都行**） | **206** |
+| 有 `__pus` 等会话 Cookie 但**缺** `__puus` | **412** |
+| 完全不带 Cookie | **206** |
+
+⇒ **「要么不带，要么带全」**；带一半最坏（列表能刷、一播就 412/转圈）。`__puus` 在**每个** API 响应里轮换下发（`quark_adapter.dart:1285` 已处理）。
+- ⛔ `batch/file/play/info` **必须带 `pr=ucpro&fr=pc`**，漏了回 `HTTP 401 code=31001 require login [guest]`（像没登录，其实缺参数）。
+- ⚠️ `hls_type` 实测 **`none`** ⇒ 转码档是**普通 MP4**（`video/mp4`），**不是 m3u8**。旧记忆「取链改成 `media.m3u8`」**已过时**。
+
+## 引擎路由 / 硬解（10-04~10-06，§）
+- ⛔ `hwdec` 必须写 **`mediacodec,auto-safe`**（逗号=带回退；光写 `mediacodec` 失败只剩软解）。判据：读 `hwdec-current`，带 `copy` = 拷贝档（`isCopyHwdec`，⛔ **空串不算**）。
 - ⛔ `VideoControllerConfiguration.hwdec` 与 `PlayerBufferConfig.apply` **必须同值**，且**都排在 media_kit `create()` 之前** → Surface 就绪后要再写一次才生效。
-- 对标（逆向夸克 TV APK）：夸克用 Apollo(ExoPlayer 分支)/ijkplayer，**MediaCodec 直出 SurfaceView，零拷贝**；云影 mpv 出在 **Flutter 纹理**上，多一层合成。
-- ⛔⛔ **10-04 试过的那两轮具体形态别再走**（`§HOWTO` 有完整证据，报告见 `docs/AndroidTV-4K-丢帧-夸克对标.md §4.5`）：① 只加 `VideoViewType.platformView` → 用户报「更卡、音画不同步」；② 再加 `tunnel: true`（零拷贝）→ 用户报「**4K 看不到画面，只有声音**」。
-  - ⚠️ **但「4K 切 fvp」本身 10-05 已按 `docs/解决4k片源不卡顿解析方案.md` 恢复上线**（别再照旧记忆说「已全部回退」）：`PlaybackEngineRouter.highResTvRoute`，接线在 `app_providers.dart` = `Platform.isAndroid && tv`，判据 `videoHeight >= 2048`（⛔ 不是 2160，宽银幕裁切的原画是 3840×2152）。10-05 22:55 的日志里这条路是**活的**（`Android TV 上 4K（≥2048p）片源，切到 fvp`）。
-  - ⚠️ **fvp 本身不是坏的**：10-05 20:14/20:30/20:40/20:53/21:02 的 4K 会话（fvp + 中继 + 2 MiB 块）都连续播了 8~13 分钟。它失败**只**发生在中继首块迟到时（见下节）。
-  - `main.dart` 的 `fvp.registerWith` 范围与路由判据**必须一致**，改一处要同时看另一处。
-  - 崩溃证据（`logcat -b crash`）：`libmdk.so` 的 `strlen→vfprintf→vsnprintf`（mdk 工作线程）；以及反复出现的 `SurfaceTextureWrapper.release`（FinalizerDaemon）—— 后者是 Flutter 引擎在 `SurfaceProducer` 释放后**二次释放**，**换内核就触发、与 viewType 无关**。
-  - ⛔ **mpv 在 Android 上做不到零拷贝，是结构性的**：`media_kit_video-1.3.1/android/.../VideoOutput.java` **写死** `textureRegistry.createSurfaceProducer()`，永远是 Flutter 纹理，没有 platformView 选项。调 mpv 参数没用。
-  - ⚠️ **下次要查的第一个假设（未证实）**：fvp 的 tunnel 分支**显式跳过** `maxWidth/maxHeight` 钳制 → `FvpVideoView.setFixedSize` 拿到视频原生 3840×2160，而 Android 显示层只有 1920×1080。先试「platformView + **不开** tunnel + `maxWidth:1920,maxHeight:1080`」。
-  - 📌 **面板事实**：`ro.boot.mi.panel_resolution=3840x2160`（65 寸 4K），但 Android 显示层**只有 1920×1080**（`dumpsys display`：`real 1920 x 1080`，唯一 mode 1920×1080@60）。⇒ 应用内渲染最高 1080p，由电视倍线到 4K；**只有 SurfaceView 才可能真 4K 扫描输出**。
-  - 4K 现在的取舍只有两条：用 **`super`(810p) 转码档**（同机实测只丢 0~7 帧、流畅、降画质），或接受原画卡顿。
+- ⛔⛔ **10-04 那两轮别再走**（§4.5）：① 只加 `VideoViewType.platformView` →「更卡、音画不同步」；② 再加 `tunnel: true` →「**4K 看不到画面，只有声音**」。
+- ⚠️ **旧记忆「4K 切 fvp」已过时**：`main.dart:57` 只在 **macOS** 注册 fvp；Android 备用内核是 **`VideoPlayerExoPlaybackEngine()`**（`app_providers.dart:224-228`），`:233` `highResTvRoute` = `Platform.isAndroid && tv`，判据 `playback_engine_router.dart:184` `videoHeight >= 2048`（⛔ 不是 2160）。⇒ **Android TV 上 ≥2048p 与 DV P5 都走 ExoPlayer**（10-06 HUD 实证 `内核 ExoPlayer`/`解码 硬解(直通)`）。`fvp.registerWith` 范围与路由判据**必须一致**。
+  - ⛔ `:199` 日志文案写死「切到 fvp（libmdk）」→ 实际 ExoPlayer，**待修**。⚠️ `:190` `_dvEngine ??= factory()` ⇒ Android DV P5 也走 ExoPlayer，与 `docs/ExoPlayer-硬解路线方案.md §2.4` 不一致，**待用户确认**。
+  - ⛔ **mpv 在 Android 上做不到零拷贝，是结构性的**：`media_kit_video-1.3.1/android/.../VideoOutput.java` **写死** `createSurfaceProducer()`。调 mpv 参数没用。崩溃证据：`libmdk.so` 的 `strlen→vfprintf`；`SurfaceTextureWrapper.release`（引擎二次释放，**换内核就触发、与 viewType 无关**）。
+  - 📌 面板 `ro.boot.mi.panel_resolution=3840x2160`，但 Android 显示层**只有 1920×1080**（`dumpsys display`）⇒ 应用内渲染最高 1080p，由电视倍线。
+  - 10-04 的观察（**已被上面取代，只作证据**）：真机 `解码丢帧=0 / 显示丢帧 21s 涨 44`、[中继] 零告警 ⇒ 瓶颈不在解码。证据 `docs/AndroidTV-4K-丢帧-夸克对标.md`，方案 `docs/解决4k片源不卡顿解析方案.md`。
 
-## 本地中继的「块大小 ↔ 首字节延迟」耦合（10-05，实测血案）
-`data/stream/local_stream_relay.dart` 的 `_fetchChunk` **把一整块读完才 `cache.put` + `_settle`**，所以**首字节延迟 ≈ 单块下载耗时**，与 `chunkSize` 成正比。
-- ⛔ **`chunkSize` 别随便放大**。10-05 22:37 把它从 `2 MiB` 改成 `8 MiB`（HEAD `7118319`），同机同一批 4K 片源：2 MiB 时首块 **1.18s**、连续播 8~13 分钟；8 MiB 时首块 **15~45s**、**零成功播放**，每次换片都是 `ExoPlayer Source error` → 回退 → `Failed to open http://127.0.0.1:<port>/sN`。
-  - ✅ **10-05 23:25 已改回 2 MiB**，并加了回归测试 `test/data/stream/local_stream_relay_test.dart` →「默认 chunkSize 的首字节预算」（断言 `chunkSize / 0.6MiB < 5000ms`；改成 8 MiB 会红）。想提速调 `connections` / `prefetchBytes`。
-  - ✅ 日志已加「首块已下发（… 字节，耗时 x.xxs）」——判据：这行 > 2.5s + 有「新中继预热超时」= 块太大。
-  - ⚠️ 判据统计口径：只看**每个会话的第一个读取器**的 GET→首块（那才决定 `Failed to open`）。按此口径 2 MiB 时 9/12 个会话 < 5s，8 MiB 时 **0/12**。
-  - ⚠️ **排除过「网络那天慢」**：两个时段的聚合速率一样（2 MiB 时代 3.8~11.9 MiB/s，8 MiB 时代 2.1~13.2 MiB/s）。
-- 两个超时都远小于 8 MiB 的首块延迟，所以**必然**失败：中继预热 `warmUpRelay(timeout: 2500ms)`（`playback_controller.dart`）→ 恒打印「新中继预热超时，直接切换」；mpv 打开超时 ~5s；ExoPlayer ~20s。判据：日志里出现 `× 8 MiB 块` + `新中继预热超时` 就该怀疑这里。
-- ⛔ **判据不是「网络慢」**：同一时刻 [中继] 无上游错误、`进程磁盘IO=0`、CPU 只有 30~40%，纯粹是「等一整块」。
-- ⛔ 换源时 `fvp 失败 → 回退 media_kit` 会**再建一个中继会话**（同一文件两条会话 sN/sN+1），一次用户换片 = 2 次首块等待 + 2 倍上游churn。所以块大小出问题时，症状会被放大成「切换影片经常卡死」。
-- ⚠️ 同一窗口还有**跨内核的陈旧事件**：`切回 media_kit（mpv）内核` 之后 2.2s 仍收到 `ExoPlayer 首次初始化失败`（那时引擎已是 media_kit → 旧内核的错误流没随切换退订）。→ 待查。
+## 本地中继 `data/stream/local_stream_relay.dart`
+⛔ **没有 `Isolate`/`compute`**：上游 TLS/解密/HTTP/分块拷贝**全在 Dart isolate**，而 Flutter 的 Dart isolate **就是 Android 主线程**（`/proc/PID/task` 里**没有 `1.ui`**）。
+### Range 语义（10-06，★ 卡死首帧的根因）
+`core/utils/http_range.dart` = **`sealed class RangeRequest`**（`NoRangeRequest`/`SatisfiableRange`/`UnsatisfiableRange`）+ `parseRangeRequest()`。
+- ⛔ **起点越界必须回 416**。旧 `parseRangeHeader` 用**一个 `null`** 同时表达「没要求区间」（→200 整文件）和「起点越界」（→416）；调用方 `clampRange(requested ?? ByteRange(0,total-1), total)` 只能二选一、选了整文件 ⇒ **416 成死代码**；旧单测注释还写「交给 416」—— **契约两半分家，测试一直绿**。
+- 后果（`凡人` 4K 3.13 GiB）：播放器问 `bytes=5014520206-`，中继回 `200 bytes 0-3358116481/…`。「对带 Range 的请求回 200」=「这是完整资源」⇒ media3 丢掉前 5.01 GB 去对齐偏移，可整条流只有 3.13 GiB ⇒ 读完才 EOF ⇒ **「正在加载…」永不消失**。判据：`[中继]` 出现 `读取器 #N → 200 bytes 0-<总长-1>/<总长>` 且请求 `Range: bytes=<大于总长>-`。
+- ⛔ 别再把「不知道流多长」（→200）与「要不到」（→416）合成一个返回值。`clampRange` 保留但**中继已不再调用**。
+### 「块大小 ↔ 首字节延迟」耦合（10-05 血案）
+`_fetchChunk` **整块读完才 `cache.put` + `_settle`** ⇒ 首字节延迟 ≈ 单块下载耗时，与 `chunkSize` 成正比。
+- ⛔ **`chunkSize` 别放大**。2 MiB→8 MiB 后首块 1.18s→**15~45s**、**零成功播放**、每次换片 `Source error`。✅ 已改回 2 MiB；回归测试 `test/data/stream/local_stream_relay_test.dart`「默认 chunkSize 的首字节预算」（断言 `chunkSize/0.6MiB < 5000ms`）。提速调 `connections`/`prefetchBytes`。
+- ⛔ **`Source error` 的真判据不是「首帧 > 8s」**（原型首帧 12.3s 却没错）。`DefaultHttpDataSource` readTimeout 是**单次 socket 读**空闲上限：2 MiB 中继 ~2.8s 出首字节；8 MiB **整块读完才发第一字节**，>8s 零字节 ⇒ 必炸。`warmUpRelay(timeout:2500ms)`/mpv ~5s/ExoPlayer ~20s 都远小于它。
+- ⛔ 换源时 `fvp 失败 → 回退 media_kit` 会**再建一个中继会话**（sN/sN+1）⇒ 一次换片 = 2 次首块等待。⚠️ 同窗口有**跨内核陈旧事件**（切回 mpv 后 2.2s 仍收 `ExoPlayer 首次初始化失败`）→ 待查。
 
 ## 资源采样：CPU / 内存 / 磁盘（10-04，§）
-`core/diagnostics/resource_probe.dart`：`ResourceProbe`（引擎 `open()` 起、`stop()`/`dispose()` 停，两个引擎各持一个）+ 一整套纯解析函数。**fvp 那条路没有视频探针**（mpv 属性在 mdk 上无对等物），所以这是它唯一的周期性证据。
-- ⛔ **周期 10 秒**，**故意不与**视频探针的 21 秒相等：用户报的正是「每 21 秒掉一批帧」，周期相等会**拍频锁定**、把规律整个掩盖（10 与 21 互质）。
-- ⛔ **读不到一律留空、整段从日志行消失**，不许退化成 0 ——「未知」写成「空闲」比不写还糟。
-- ⛔ 进程 CPU 是**单核口径**（4 核盒子要 400% 才叫满载），日志必须写明「折合 N 核」，否则 48% 被误读成「很闲」。
-- ⛔ 系统 CPU 的「忙」**不含 iowait**（iowait 是「在等磁盘」，算进去会让磁盘慢伪装成 CPU 忙）；⛔ `/proc/stat` 只认汇总行 `cpu `，**别用 `cpu0`**。
-- ⛔ **`/proc/loadavg` 在目标电视上是 `Permission denied`**（实测连 `ls -l` 都拒），**`/proc/pressure/*` 在 Android 9 上不存在**。替代读数是 `/proc/stat` 里的 `procs_running` / `procs_blocked`（`parseProcStatProcs`，**与系统 CPU 同一个文件、不额外读盘**）。日志里写 `可运行进程=N（4 核，超订 x.xx×）` —— ⛔ **核数必须一起写**，否则 14 在 4 核是 3.5 倍超订、在 16 核是空闲。`阻塞IO进程` 只在 > 0 时写（常态是 0，每拍都写会掩盖异常）。
-- ⛔ `/proc/self/stat` 的字段**必须按最后一个 `)` 切**：comm（进程名）允许含空格与括号，按空白 split 会让后面字段整体错位，**且不报错**。
-- ⛔ `df` 用正则**从左锚定**、不按列 split（挂载点可含空格）；⛔ 用异步 `Process.run` 而非 `runSync`（别让诊断自己变成卡顿源）。
-- macOS 无 `/proc`：内存退回 `ProcessInfo.currentRss`，CPU/负载留空 —— 属**正常**，不是 bug。
+`core/diagnostics/resource_probe.dart`：`ResourceProbe`（引擎 `open()` 起、`stop()`/`dispose()` 停，两引擎各一）+ 纯解析函数。**fvp 那条路没有视频探针**。
+- ⛔ **周期 10 秒**，**故意不与**视频探针的 21 秒相等（会**拍频锁定**；10 与 21 互质）。
+- ⛔ **读不到一律留空、整段从日志行消失**，不许退化成 0。⛔ 进程 CPU 是**单核口径**，必须写「折合 N 核」。⛔ 系统 CPU「忙」**不含 iowait**；`/proc/stat` 只认汇总行 `cpu `（**别用 `cpu0`**）。
+- ⛔ `/proc/loadavg` 在电视上 `Permission denied`；`/proc/pressure/*` 在 Android 9 不存在。替代 `/proc/stat` 的 `procs_running`/`procs_blocked`（`parseProcStatProcs`，**同文件、不额外读盘**），写「可运行进程=N（4 核，超订 x.xx×）」——⛔ **核数必须一起写**。
+- ⛔ `/proc/self/stat` **按最后一个 `)` 切**。⛔ `df` 正则**从左锚定**、不按列 split；用异步 `Process.run`。macOS 无 `/proc`：内存退回 `ProcessInfo.currentRss`，CPU/负载留空属**正常**。
 
-## TV 播放器 OSD：贴底 XY 菜单（§）
-**照夸克做**：`PlayerTvSheet` 贴底横排，选中行下面铺 chip 条；`↑↓` 换行（循环）、`←→` 挪光标（不循环、**跳过灰掉的**）、**`OK` 才生效**；`←→` 只在**没有 chip 条**的行回调 `onAdjust`。⛔ **菜单开着时不画控制栏**；⛔ 字幕要**抬高**（`_subtitleBottomPadding`）；⛔ `kPlayerTvSheetHeight` 末尾 `+0.8` 是描边算成内边距，删了就溢出。→ `§夸克 TV 播放器的 OSD 实测几何`。
+## TV OSD：已换成**原生 View**（10-06，§）
+`android/.../TvOsdView.kt`（移植 `prototype/kuake` 的 `KuakeOsdView`，几何常量逐字相同）挂在 `android.R.id.content` 之上，由 `MainActivity.dispatchKeyEvent` 直连。起因是硬读数：**按 MENU → 上屏 524 ms**（原型同口径 0.3~8.3 ms）—— Flutter 版菜单挂在 `ListenableBuilder(listenable: controller)` 里、进度每 tick 重建整页，而中继**全在 Dart 主 isolate**；原生 OSD 与 Dart 彻底解耦，这才是「跟手」的结构性原因（不是画法、不是引擎）。
+- ⛔ **行模型只有一份**：`lib/ui/widgets/player_tv_rows.dart`。`PlayerTvOverlay` 降级为**回退路径**（`TvOsdChannel.show` 返回 false 时用），但它 **re-export** 那份模型。
+- ⛔ **原生回调只回传「行下标」** ⇒ **枚举顺序就是原生菜单的下标顺序**，动枚举必须同时改 `TvOsdView` 与单测。
+- ⛔ 原生 `show` **必须返回 bool**（取不到 `android.R.id.content` 时 false）。⛔ OSD **不能挂进 FlutterView**。
+- ⛔ 有硬件视频层时 **`screencap` 全黑** ⇒ 验证只看 logcat tag **`CloudCineOsd`**。
+- ★ 云影在电视上**本来就是 ExoPlayer + SurfaceView**（`video_player_exo_playback_engine.dart:238`）⇒「换引擎/换渲染面」**已经是原型方案**，真正缺的只有 OSD。
+- 贴底 XY 菜单几何（照夸克）：`PlayerTvSheet` 贴底横排，选中行下面铺 chip 条；`↑↓` 换行（循环）、`←→` 挪光标（不循环、**跳过灰掉的**）、**`OK` 才生效**；`←→` 只在**没有 chip 条**的行回调 `onAdjust`。⛔ **菜单开着时不画控制栏**；⛔ 字幕**抬高**；⛔ `kPlayerTvSheetHeight` 末尾 `+0.8` 是描边算成内边距，删了就溢出。
 
-## 侧栏一级导航（10-03）
-五项：媒体库 `/library` · **文件夹 `/folders`** · 扫描 · 下载 · 设置；`app_shell._items` 与 `app_router.branches` **必须同序**（判据是下标）。⛔ 文件夹读**网盘实时目录**、媒体库读**本地索引**，两者**并列**；**搜索词各一份**。
+## 电视上取证（10-06，★ 省一整轮）
+1. **应用日志是文件、不是 logcat**：`DiagLog` 同步写 `files/logs/cloudcine-YYYY-MM-DD.log`，读 `adb shell run-as com.cloudcine.cloudcine cat files/logs/cloudcine-<日期>.log`。⛔ logcat `I/flutter` 基本只有引擎启动几行；⛔ **文件 mtime 不涨 = 应用真没做事**。
+2. **线程名读 `/proc/<pid>/task/*/comm`**：`top -H` 在 Android 9 全打进程名。⛔ 取字段写 `${12}`/`${13}`；切字段按**最后一个 `)`**。
+3. **`exec-out screencap` 被 fvp 的 `Init wrapper sys mutex successful.` 污染** ⇒ 用 `shell screencap -p /sdcard/x.png` + `pull`。
+4. **`uiautomator dump` + `input tap X Y` 比猜 DPAD 可靠**。⛔ Flutter 语义树只在无障碍被触发后才暴露，重启后常取不到。
+5. **★ 视频真帧率用 SurfaceFlinger 量，别信 HUD**：`dumpsys SurfaceFlinger --list` 找层 → `--latency '<层名>'`（首行=刷新周期 ns，其后 128 帧三列时间戳）。**Flutter UI 帧率**用 `dumpsys gfxinfo <包名>` 两次取差。实测 `activeBuffer=[3840x2160:3840,Unknown 0x13]` 才是**视频层**；`SurfaceView #0` 是 `1920x1080 RGBA`。
+6. ⛔ **LMK 会杀掉后台的云影**（电视仅 2.5 GB）⇒ 中继喂原型只有 2~3 分钟窗口；先 `am kill-all` 腾内存。
 
-## 文件夹模式与局部发现（10-01）
-本地索引在这页只做**「已入库」叠加层**。与全盘扫描共用三份唯一实现：`media_entry_classifier.dart`（镜像判定必须在视频判定**之前**）、`work_builder.dart`、`request_throttle.dart`。三条硬约束（做错不报错、只悄悄坏数据）：**绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。发现让着扫描（`DiscoveryController.canStart`）。
+## 云影 vs 原型的对比**本身不公平**（10-06，★ 别再用它下结论）
+- 原型是**原生 Kotlin**，`debuggable` 几乎无代价；云影是 **Flutter `app-debug.apk` = JIT**。实测进程合计 **467%/400%**（主线程 200% + `DartWorker` 199% + `1.raster` 42%，ExoPlayer 只拿 12%）。
+- ⚠️ **本机出不了 release/profile 包**：Flutter 的 Android AOT 快照工具是 `darwin-x64` 二进制，Apple Silicon 无 Rosetta ⇒ `gen_snapshot ... incorrect architecture`。解法（需 sudo）：`sudo softwareupdate --install-rosetta --agree-to-license`。
+- ⚠️ 引擎切换用 `unawaited(previous.stop())`（fire-and-forget）⇒ 旧内核可能没拆干净。
+- ⛔⛔ **两边 `fps` 都不是流畅度，别再互相比较**：云影 `DebugOverlay` 数**引擎实际出帧**；原型 `StatsOverlay.kt:104` 的 `doFrame` 里 `postFrameCallback(this)` **自己重排自己** ⇒ `uiFps` 恒≈刷新率（实测 **100**）。
+- ✅ **唯一可比的是「按键→下一帧」与 SurfaceFlinger `--latency`**。10-06 实测视频流畅度两边一样（~25 fps），差的是 **CPU 1.2~3.0% vs ~22%**、**RSS 124 MB vs ~570 MB**、**按键 0.3~3.9 ms vs 524 ms**。
 
-## 目录视图：三组条目 + 排序 + 直接播 + 多选删除（§）
-三组**目录 → 视频 → 其他文件**（组间顺序是**结构**，不随排序变）。⛔ 分组只管排布，**入库判据仍只有 `classifyEntry` 一处**。⛔ 下载取链**复用 `adapter.resolveStream`**（别打 `/file/download`，>50MiB 直接 23018）。⛔ `FolderSortMode`/`ItemSortMode` **各一份设置键**、都在**渲染时**排，**只改显示、不改 `primary`**。视频行**整行可点=播**（未入库走 `playDriveEntry`，**不写库**）。⛔ 多选：`folderSelectionProvider` 键=fid、**换目录清空**、**全选只勾当前可见**。→ `§从 MEMORY.md 下沉`。
+## 播放页 OSD 卡顿的结构性成因（10-05，§）
+⛔ **不是 Flutter 太重**，是三处开销叠在 4 核 SoC 上：
+- **整页 rebuild ≈10 次/秒**：`player_page.dart` 的 `ListenableBuilder` 包着整棵树。position 已节流 250ms，但 **`bufferEnd`（mpv `demuxer-cache-time`）没节流** ⇒ 要加节流或拆 `ValueNotifier`。
+- ⛔ **`SubtitleViewConfiguration` 无 `operator ==`**（media_kit_video 1.3.1）：页面里内联 new ⇒ `VideoState.didUpdateWidget` 恒判不等 ⇒ 每拍 post-frame 再重建画面子树。⇒ 缓存实例（**现在只有 `_FvpPlaybackSurface` 有**）。
+- `PlayerTvOverlay._rows()` 每 build 重算全部选项（含每集 `baseNameOf`）。
+- ⛔ `DebugOverlay` 的 `kDebugOverlayEnabled = true` **硬编码**（release 也显示），挂 `MaterialApp.builder`、`refreshInterval = 1 秒` ⇒ **每秒重建整棵应用树**，还每秒 spawn 一个 `df`。
 
-## 下载记录与断点续传（v16，§）
-表 `download_tasks`（主键 `provider:fileId`）。⛔ `.part` 是断点**唯一真源**；服务端**忽略 Range 回 200 必须从 0 重写**；`parse` 读不懂退 **paused**（退 queued 会一开应用自动开下）。⛔ `downloadQueueProvider` **不能 autoDispose**、`settingsProvider` 用 `listen` 不用 `watch`。角标只数**排队 + 下载中**。多连接 8×2 MiB、writer 顺序落盘。
+## 夸克方案验证原型（分支 `feature/kuake`，`prototype/kuake/`）
+**独立 Android 工程**（不含 Flutter）—— 只要 Flutter 引擎在同一进程，「每秒 10 次整页 rebuild」就撇不干净。
+- 形态：`ExoPlayer`（Media3 **1.5.1**）+ `setVideoSurfaceView`（零拷贝）+ **原生 View OSD**（⛔ 故意去掉圆角裁剪/blur 阴影/隐式动画）。
+- 10-06 扩成完整原型：`MainActivity`（路由）→ `LoginActivity`（CAS 扫码，zxing）→ `BrowseActivity`（`ListView`，天生支持 D-pad）→ `PlayerActivity`（按 fid 取链）。
+- `quark/` 包：`QuarkHttp`（`HttpURLConnection`，**不引 OkHttp**；`useCaches=false` 必开）/ `QuarkApi`（`absorbCookies` 回填轮换 `__puus`）/ `QuarkQrLogin`（业务码读 **`bizCode`**：网盘用 `code`、CAS 用 `status`）/ `QuarkModels` / `Bg`（后台池，主线程只 setText）。
+- ⛔ `PlayerActivity` 保留 `-e url` 这条**对照路径**（`StreamSpec`），跑「云影中继 vs 直连」。
+- 10-06 新增：`AspectRatioFrameLayout`（按 `VideoSize`+PAR+旋转定界；⛔ **只包 SurfaceView、不包 OSD**，否则菜单被压进画面矩形）；起播前 `probeThroughput` 测速 → `chooseQuality` 选「带宽扛得住的最清晰档」（同分辨率取最省带宽，留 30% 余量）。
+- 构建：Gradle 8.10.2 / AGP 8.7.0 / Kotlin 2.1.0 / compileSdk 36 / minSdk 21 / targetSdk 34。⛔ **首次构建必须联网**。⛔ 不引 `media3-ui`/AppCompat/Material/RecyclerView。命令：`JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home ./gradlew assembleDebug` —— ⛔ **别用 Android Studio 的 JBR**（现在是 25，会崩 Kotlin，报错只剩一个版本号）。
+- ⛔ Media3 1.5.1 的 `DecoderCounters` 全是 **`int`**，且**没有 `inputBufferCount`** → 用 `queuedInputBufferCount`。
+- 取数：`adb logcat -s KuakeProto`（`StatsOverlay` 每秒打同一行，**必需通道**）。
+- Mac 侧 API 探针 `tool/quark_probe.py`（扫码登录 → 列目录 → `play/info`/`audioplay` → 测带宽），Cookie 落 `.quark_probe/cookie.json`。⛔ 含凭据，**别提交**（已在 `.gitignore`）。
 
-## Android 产物名与版本号（10-03）
-⛔ 产物名由 Flutter 工具链**定死**，改 AGP `outputFileName` 无效；做法：给 `assemble<Mode>` 挂 **finalizer**（⛔ 别 doLast）**复制**（⛔ 不能改名）成 `cloudcine-<versionName>-b<versionCode>-android.apk`。⛔ 报错只剩一个版本号 = **JBR 25 崩了 Kotlin**，指 JDK 21。
+## 取链（10-04，⚠️ 部分已过时，§）
+⛔ 鉴权靠 `play/info` 下发的 **`Video-Auth`** cookie（必须进 `knownCookieNames`，否则分片 **404**）。⛔ **HLS 必须走本地中继**：本机 `http_proxy` 会让 ffmpeg 选**未列白名单**的 `httpproxy` → `avformat_open_input() failed`；该故障**护栏会放行** ⇒ 诊断触发必须**独立于** `isRealEnd`。⛔ **TV 的 mpv 只开 `error` 级** ⇒ `Failed to open 127.0.0.1/sN` 只靠中继日志还原。
+⚠️ 旧记「`video_list[].video_info.url` 换成了 `media.m3u8`」**已过时**（10-06 实测 `hls_type=none`，转码档是普通 MP4）。
 
-## Windows 安装包（WiX v3 MSI，10-05）
-`windows/packaging/cloudcine.wxs` + `build_package.ps1`（per-user 装到 `%LOCALAPPDATA%\Programs\CloudCine`，`-arch x64`，`InstallerVersion=500`）。
-- ⛔ **启动条件绝不能写 `VersionNT >= 1000`**：Windows Installer 把 VersionNT **钳在 603**（= Win8.1），Win10/Win11 上读出来都是 603 → 该条件**在任何真实 Windows 上都失败**，用户看到的正是「需要 Windows 10 或更高版本」（10-05 的实际故障；不是 Win11 特有，是**谁也装不上**）。判据用 **`WindowsBuild >= 10240`**（Win7=7601 / 8.1=9600 / 10=10240+ / 11=22000+），并带 `Installed OR`（否则已装机器卸载/维护会被自己挡住）。出处：微软 KB3202260、Advanced Installer 文档；细节见 `2026-10-05.md`。
-- ⚠️ **MSI 条件语法不支持括号**，多条件只能靠优先级（比较 > AND/OR）。
-- ⛔ `-sice` 只压 ICE38/ICE64/ICE91 三条 per-user 误报，**别图省事换成 `-sval`**（会吞掉 ICE61/ICE30 真问题）。
-
-## macOS 签名与 entitlements（§）
-⛔ 不许写 `keychain-access-groups`（→ **启动即 SIGKILL**）；`app-sandbox` 必须 **`false`**；两份都要 `network.client/server`·`files.user-selected.read-write`；`DebugProfile` 另加 `get-task-allow`。Podfile 与 `RegisterGeneratedPlugins` 的补丁别删。
-
-## 凭证存储（§335）
-macOS 走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串，其余平台 `flutter_secure_storage`）；密钥由 `IOPlatformUUID` 派生（**别掺易变环境值**）。
+## 电视分支（§）
+`isTvLayout`：android + 逻辑宽≥960（⛔ 判据读 view 宽，页面实得 624，**壳外页实得 960**）。⛔ **页头 `actions` 必须 `Wrap`**；⛔ TV 另一套缓冲（`cache=yes` + 硬解参数）；⛔ **过扫描内边距只有 `app_shell` 一处**，壳外页（`/work` `/diagnostics` `/auth/qr`）与**播放器覆盖层**自己加；⛔ 播放器遥控器 **↓ 绝不接管**；⛔ **侧栏方向键靠壳层兜底**（候选**只搜侧栏子树**）。
 
 ## 不可动摇的设计约束
 1. 本地解析永远可用，在线刮削是增强；`LocalFilenameScraper` 排 `ScraperPipeline` 末位。
@@ -100,39 +131,16 @@ macOS 走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串，其余平台 `
 9. 夸克上传收尾**两步**、备份同步比 `libraryModifiedAt`，各有空守卫；`includeSettings`/`restoreSettings` 是**空开关**。
 10. **TV 上 `SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。
 
-## 播放器（两份实现，别只改一个）
-macOS 独立窗口 `player_window_app.dart` + 内置页 `player_page.dart`。**键位表、菜单、偏好还原、换流提示、hover 唤醒都要改两处**；⛔ 独立窗口要 `mouseTrackingMode=.always` + `onEnter`；菜单统一走 `anchored_menu.dart`。
-缓冲条共用 `buffered_slider.dart`（**0..1 比例**，⛔ `demuxer-cache-time` 是**绝对时间戳**）。音轨过 `TrackLabels.realTracks`；搜索走 `subtitle_query.dart`（⛔ 别拿 `displayTitle`）；缩略图走 `fetchThumbnail`。
-**音效 ≠ 音轨**：⛔ 无可用 Avfilter、**`af set` 返回值不能当依据**；⛔ macOS `audio-spdif` 直通必卡死。
-**逐影片偏好**表 `playback_prefs`（v14，同 `groupKey` 非空最新、写整条覆盖；音量/倍速仍全局）。**进度两列** `resumePositionMs`（起播，看完清）vs `maxPositionMs`（显示，v15，只增不减）⛔ 别合并。
-**DV P5**：⛔ macOS libmpv **架构上做不到**（`gpu-next` 零命中）→ 调 mpv 参数无用。唯一出路 **fvp/libmdk**：**DV P5 片 + TV 上 ≥2048p 片走 fvp**（⚠️ 10-05 起 TV 4K 也走，不再是「TV 不动」）、音效置灰。契约 `PlaybackEngine` + 两份实现在 `playback_engine.dart`、`data/playback/`；选引擎走 `playback_engine_router.dart`（**开播前探头部字节**）；`main.dart` 的 `fvp.registerWith` **必须先于分窗**；画面走 `playback_surface.dart`。⚠️ `registerWith` 的 platforms 与路由判据**必须一致**。
-
-## 媒体库三轴（不能互推/合并，§）
-`MediaKind`（结构，只看文件名 `SxxExx`）· `MediaCategory`（语义，落库 `media_works.category`，空串≠other）·「最近播放」（视图，`LibraryFilter.playedOnly`，与 `category` 互斥、与 `query` 叠加）。`MediaCategoryGuesser.guess` 序：TMDB genres→目录路径→片名+文件名→结构兜底。
-**交互**：`PlayTarget.resolve` 三档；`playItem()` 唯一起播入口。⛔ 路径归一化只在 `core/utils/drive_paths.dart`。→ `§媒体库三轴的「交互」细节`。
-
-## 季 / 部 / 跨目录归一（§）
-`MediaItem`+`part/partLabel`（v9）；`MediaWork`+`seasonCount`（v10）+`mergedInto`（v11）。层级**不落库**（现算）：**季在外、部在内**，某层**少于 2 个选项不画**。`seasonCount` 是 `COUNT(DISTINCT)` **不能相加**。
-- **目录名当系列名**：判定单元是**目录不是文件**（`DirectoryTitle`），**四处调用点都要传 `dirPath`**。
-- 自动归一：只认 `onlineId` 相同 + `source==online` + kind 相同；**本地片名相似度绝不参与**。`autoMergeByOnlineId` 默认开。
-- 手动归一「合并到…」（`MergeWorkDialog`，**无刮削门槛**）：留下**选中的那一部**；撤销=目标页「拆开」。
-- ⛔ **归一 = 打标记**：不删行、不改 `group_key`；滤 `merged_into IS NULL`、`itemsForWork` 取并集。**不许链式**。⚠️ `mergeWorkForUpsert` 里**无条件取旧值**；搜索穿透折叠内层表**必须起别名**。⛔ `_unionStats` 别改回 JOIN 里的 `OR`。→ `§从 MEMORY.md 下沉`。
-
-## 筛选面板（§）
-⛔ **已刮削判据 = `source==online`**，不是 `isScraped`；算进 `hasExtra`/`clearExtra` 且**进 `_facetScope`**。⛔ `==`/`hashCode` 按**集合内容**比（`setEquals`+`Object.hashAllUnordered`）。
-
-## 封面与刮削（§）
-⛔ `posterFaceX` 与 `posterUrl` **必须成对**。熔断只计**网络层**失败。TMDB/豆瓣响应形状**≠夸克信封**。**TMDB `/search/*` 必须过 `ScrapeMatch` 闸门**。⛔ **手动刮削通道**三条交互不许改；**「自定义」** `customizeWork` **整行写、不过 merge**。**候选链** `ScrapeQuery.fallbacks` = 文件名 → 目录名逐级向上、串行命中即停，⛔ 本地兜底只用主查询、⛔ 两个调用点都要传 `dirPath`。⚠️ 待办 `DirectoryTitle._clean` 清年份/画质标记（⛔ 别用 `_parseDotted`）。
-
-## 取链：转码档现在是 HLS（10-04，§）
-⛔ 夸克把 `video_list[].video_info.url` 从签名直链换成了 `media.m3u8`。鉴权靠 `play/info` 下发的 **`Video-Auth`** cookie（必须进 `knownCookieNames`，否则分片 **404**）。⛔ **HLS 必须走本地中继**：本机 `http_proxy` 会让 ffmpeg 选**未列白名单**的 `httpproxy` → `avformat_open_input() failed`。⛔ 该故障**护栏会放行** → 诊断触发必须**独立于** `isRealEnd`。⛔ **TV 的 mpv 只开 `error` 级**（内置页）→ `Failed to open 127.0.0.1/sN` 只靠中继日志还原。
-
-## 测试取向（§）
-纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据=红的在不在我改的文件里。其余见 `§测试取向`。
-
-## 播放页 OSD 卡顿的结构性成因（10-05 分析，§详见当日日志）
-⛔ **不是 Flutter 太重**，是三处开销叠在 4 核 SoC 上。动手前先认这三条：
-- **整页 rebuild ≈10 次/秒**：`player_page.dart` 的 `ListenableBuilder` 包着整棵页面树。position 已节流 250ms，但 **`bufferEnd`（mpv `demuxer-cache-time`）没节流** → 下载中每拍都变。⇒ 要加节流或拆独立 `ValueNotifier`。
-- ⛔ **`SubtitleViewConfiguration` 无 `operator ==`**（media_kit_video 1.3.1）：页面里内联 new → `VideoState.didUpdateWidget` 恒判不等 → 每拍 post-frame 再重建一次画面子树、多一帧。⇒ 缓存实例，或给 media_kit 那条路也包「输入没变就返回缓存 widget」的壳（**现在只有 `_FvpPlaybackSurface` 有**）。
-- `PlayerTvOverlay._rows()` 每 build 重算全部选项（含每集 `baseNameOf`）。
-- 真机实测：4K 拷贝档 `进程CPU 152~186%`（4 核 38~46%）、**显示丢帧 2.7/秒**、设备仅 2.5 GB 内存而进程涨到 862 MB。
+## 其余模块（细节见 `HOWTO.md`，此处只留红线）
+- **侧栏（10-03）**：五项 媒体库 `/library` · 文件夹 `/folders` · 扫描 · 下载 · 设置；`app_shell._items` 与 `app_router.branches` **必须同序**（判据是下标）。⛔ 文件夹读**网盘实时目录**、媒体库读**本地索引**，两者并列；**搜索词各一份**。
+- **文件夹模式（10-01）**：本地索引只做**「已入库」叠加层**。与全盘扫描共用 `media_entry_classifier.dart`（镜像判定必须在视频判定**之前**）、`work_builder.dart`、`request_throttle.dart`。⛔ **绝不清理陈旧记录**、**绝不写续扫游标**、**深度从本次目标算第 0 层**。发现让着扫描（`DiscoveryController.canStart`）。
+- **目录视图**：三组**目录 → 视频 → 其他文件**（组间顺序是**结构**）。⛔ 分组只管排布，**入库判据仍只有 `classifyEntry` 一处**。⛔ 下载取链**复用 `adapter.resolveStream`**（别打 `/file/download`，>50MiB 直接 23018）。⛔ `FolderSortMode`/`ItemSortMode` **各一份设置键**、**渲染时**排、**只改显示不改 `primary`**。视频行**整行可点=播**。⛔ 多选：`folderSelectionProvider` 键=fid、**换目录清空**、**全选只勾当前可见**。
+- **下载（v16）**：表 `download_tasks`（主键 `provider:fileId`）。⛔ `.part` 是断点**唯一真源**；服务端**忽略 Range 回 200 必须从 0 重写**；`parse` 读不懂退 **paused**。⛔ `downloadQueueProvider` **不能 autoDispose**、`settingsProvider` 用 `listen` 不用 `watch`。多连接 8×2 MiB、writer 顺序落盘。
+- **播放器（两份实现，别只改一个）**：`player_window_app.dart` + `player_page.dart`。**键位表、菜单、偏好还原、换流提示、hover 唤醒都要改两处**；⛔ 独立窗口要 `mouseTrackingMode=.always` + `onEnter`；菜单统一走 `anchored_menu.dart`。`buffered_slider.dart` 是 **0..1 比例**（⛔ `demuxer-cache-time` 是**绝对时间戳**）。音轨过 `TrackLabels.realTracks`；搜索走 `subtitle_query.dart`（⛔ 别拿 `displayTitle`）。**音效 ≠ 音轨**：⛔ 无可用 Avfilter、**`af set` 返回值不能当依据**；⛔ macOS `audio-spdif` 直通必卡死。`playback_prefs`（v14）**写整条覆盖**；进度两列 `resumePositionMs`（起播，看完清）vs `maxPositionMs`（显示，v15，只增不减）⛔ 别合并。**DV P5**：⛔ macOS libmpv **架构上做不到**（`gpu-next` 零命中）→ 唯一出路 **fvp/libmdk**；契约 `PlaybackEngine` 在 `playback_engine.dart`、选引擎走 `playback_engine_router.dart`（**开播前探头部字节**）、画面走 `playback_surface.dart`。
+- **媒体库三轴（不能互推/合并）**：`MediaKind`（结构，只看文件名 `SxxExx`）· `MediaCategory`（语义，落库 `media_works.category`，空串≠other）·「最近播放」（视图，`LibraryFilter.playedOnly`，与 `category` 互斥）。`MediaCategoryGuesser.guess` 序：TMDB genres→目录路径→片名+文件名→结构兜底。**交互**：`PlayTarget.resolve` 三档；`playItem()` 唯一起播入口。⛔ 路径归一化只在 `core/utils/drive_paths.dart`。
+- **季/部/归一**：`MediaItem`+`part/partLabel`（v9）· `MediaWork`+`seasonCount`（v10）+`mergedInto`（v11）。层级**不落库**（现算）：**季在外、部在内**，某层**少于 2 个选项不画**；`seasonCount` 是 `COUNT(DISTINCT)` **不能相加**。**目录名当系列名**：判定单元是**目录不是文件**（`DirectoryTitle`），**四处调用点都要传 `dirPath`**。自动归一：只认 `onlineId` 相同 + `source==online` + kind 相同；**本地片名相似度绝不参与**。⛔ **归一 = 打标记**：不删行、不改 `group_key`；滤 `merged_into IS NULL`、`itemsForWork` 取并集、**不许链式**。⚠️ `mergeWorkForUpsert` 里**无条件取旧值**；搜索穿透折叠内层表**必须起别名**；⛔ `_unionStats` 别改回 JOIN 里的 `OR`。
+- **筛选/封面刮削**：⛔ 筛选「已刮削」判据 = **`source==online`**（不是 `isScraped`），且**进 `_facetScope`**。⛔ `==`/`hashCode` 按**集合内容**比（`setEquals`+`Object.hashAllUnordered`）。⛔ `posterFaceX` 与 `posterUrl` **必须成对**；熔断只计**网络层**失败。**TMDB `/search/*` 必须过 `ScrapeMatch` 闸门**。⛔ 手动刮削通道三条交互不许改；**「自定义」** `customizeWork` **整行写、不过 merge**。**候选链** `ScrapeQuery.fallbacks` = 文件名 → 目录名逐级向上、串行命中即停；⛔ 本地兜底只用主查询、⛔ 两个调用点都要传 `dirPath`。⚠️ 待办 `DirectoryTitle._clean` 清年份/画质标记（⛔ 别用 `_parseDotted`）。
+- **Android 产物名（10-03）**：⛔ 产物名由 Flutter 工具链**定死**，改 AGP `outputFileName` 无效；做法是给 `assemble<Mode>` 挂 **finalizer**（⛔ 别 doLast）**复制**成 `cloudcine-<versionName>-b<versionCode>-android.apk`。⛔ **别信产物文件名**：**只有通用的 `app-debug.apk` 会被重新构建**，per-ABI 那份停在旧 mtime ⇒ `-b1006-` 与 `-b1007-` **内容完全一样**；装前 `aapt2 dump badging <apk> | grep -E "^package|native-code"`。⛔ **`adb install` 被中途打断会留下装了一半的包**；装完复核 `dumpsys package … | grep versionCode`。
+- **Windows MSI（10-05）**：`windows/packaging/cloudcine.wxs` + `build_package.ps1`（per-user 装到 `%LOCALAPPDATA%\Programs\CloudCine`，`InstallerVersion=500`）。⛔ **启动条件绝不能写 `VersionNT >= 1000`**：Windows Installer 把 VersionNT **钳在 603** ⇒ 该条件**在任何真实 Windows 上都失败**；判据用 **`WindowsBuild >= 10240`** + `Installed OR`（微软 KB3202260）。⚠️ **MSI 条件语法不支持括号**。⛔ `-sice` 只压 ICE38/ICE64/ICE91，**别换成 `-sval`**。
+- **macOS 签名与凭证**：⛔ 不许写 `keychain-access-groups`（→ **启动即 SIGKILL**）；`app-sandbox` 必须 **`false`**；两份都要 `network.client/server`·`files.user-selected.read-write`；`DebugProfile` 另加 `get-task-allow`。凭证 macOS 走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串，其余平台 `flutter_secure_storage`），密钥由 `IOPlatformUUID` 派生（**别掺易变环境值**）。
+- **测试取向**：纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据=红的在不在我改的文件里。

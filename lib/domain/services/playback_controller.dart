@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:media_kit/media_kit.dart' as mk;
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/diagnostics/player_diag.dart';
 import '../../core/error/drive_error.dart';
 import '../../core/utils/mpv_subtitle_log.dart';
 import '../../core/utils/playback_seek.dart';
@@ -722,6 +723,14 @@ class PlaybackController extends ChangeNotifier {
     final relay = _relay;
     final length = ticket.contentLength;
     final direct = _PlaybackSource(ticket.url.toString(), ticket.headers);
+    // 诊断开关：量「中继自己吃掉了多少 Dart 主线程时间」。见 `player_diag.dart`。
+    // ⚠️ 它同时会砍掉带宽（上游退回单连接顺序读），所以**只用来对比 CPU 与
+    //    跟手，不能用来对比流畅度**。
+    if (kDiagBypassRelay) {
+      diag.info('播放', '诊断：CC_DIAG_BYPASS_RELAY 已开，跳过本地中继直连');
+      await _closeRelayToken(previousToken);
+      return direct;
+    }
     if (relay == null || length == null || length <= 0) {
       await _closeRelayToken(previousToken);
       return direct;

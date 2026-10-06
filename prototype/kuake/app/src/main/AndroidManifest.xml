@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 唤醒锁：ExoPlayer 的 setWakeMode 用它，播放中不让系统休眠。
+         云影那边是 media_kit 的 wakelock 插件在管，这里直接声明。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- 电视上要能装：触摸屏与 leanback 都不作为硬性要求。 -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <!-- ⛔ 必须开：本地中继是明文 http://127.0.0.1:xxxxx，Android 9 起默认禁止。 -->
+    <application
+        android:label="夸克原型"
+        android:banner="@drawable/banner"
+        android:icon="@drawable/banner"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true"
+        android:theme="@style/AppTheme">
+
+        <!-- 启动页：只看登录态，然后转去登录页或文件列表。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- 电视首页入口（遥控器能直接点开，不用每次都 adb）。 -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 扫码登录页：二维码画在电视上，手机夸克 App 扫。 -->
+        <activity
+            android:name=".LoginActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 文件列表页：遥控器上下选择，OK 进目录 / 起播。 -->
+        <activity
+            android:name=".BrowseActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 播放页：ExoPlayer + SurfaceView + 原生 OSD。这是要验证的那一页。
+             exported=true 是为了保留「am start 时用 -e url 传地址」这条对照路径。 -->
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+    </application>
+</manifest>

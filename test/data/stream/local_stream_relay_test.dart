@@ -232,11 +232,10 @@ void main() {
         cookies.add(request.headers.value('Cookie'));
         ranges.add(request.headers.value('Range'));
         ports.add(request.connectionInfo?.remotePort);
-        final range = parseRangeHeader(
-              request.headers.value('Range'),
-              total,
-            ) ??
-            const ByteRange(0, total - 1);
+        final spec = parseRangeRequest(request.headers.value('Range'), total);
+        final range = spec is SatisfiableRange
+            ? spec.range
+            : const ByteRange(0, total - 1);
         request.response
           ..statusCode = HttpStatus.partialContent
           ..headers.contentType = ContentType.binary
@@ -390,8 +389,10 @@ void main() {
       final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(upstream.close);
       upstream.listen((request) async {
-        final range = parseRangeHeader(request.headers.value('Range'), total) ??
-            const ByteRange(0, total - 1);
+        final spec = parseRangeRequest(request.headers.value('Range'), total);
+        final range = spec is SatisfiableRange
+            ? spec.range
+            : const ByteRange(0, total - 1);
         ranges.add(range);
         request.response
           ..statusCode = HttpStatus.partialContent
@@ -497,8 +498,9 @@ void main() {
       final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(upstream.close);
       upstream.listen((request) async {
-        final range = parseRangeHeader(request.headers.value('Range'), total) ??
-            ByteRange(0, total - 1);
+        final spec = parseRangeRequest(request.headers.value('Range'), total);
+        final range =
+            spec is SatisfiableRange ? spec.range : ByteRange(0, total - 1);
         request.response
           ..statusCode = HttpStatus.partialContent
           ..headers.set(
@@ -591,6 +593,53 @@ void main() {
       // 播放器只会报一句笼统的 Failed to open，分不出 404 来自中继。
       expect(logs(), contains('拒绝 GET /s999'));
       expect(logs(), contains('会话不存在'));
+    });
+
+    test('起点越界的 Range 必须回 416，**绝不能**回「200 + 整文件」', () async {
+      // 现场（小米电视，`凡人` 4K，3.13 GiB）：播放器发来
+      //   `Range: bytes=5014520206-`（问一条 3.13 GiB 的流要第 5.01 GB）
+      // 中继回的是
+      //   `200 bytes 0-3358116481/3358116482`（整文件从 0 开始）
+      //
+      // ⛔ 按 HTTP 语义，「对带 Range 的请求回 200」=「我不支持区间，这是
+      //    完整资源」。播放器（media3 `DefaultHttpDataSource`）于是把响应体
+      //    **前 5.01 GB 丢掉**去对齐它要的偏移 —— 可整条流只有 3.13 GiB，
+      //    它把整部片子读完、丢掉，才报 EOF。屏幕上就是「正在加载…」永不
+      //    消失（实测：loopback 稳定 2.1 MB/s、读满 7 分钟仍未出首帧）。
+      //
+      // 这里钉的是**状态码**：416 = 「这个偏移不存在」，播放器会据此收场；
+      // 200 + 整文件 = 「你要的偏移在 0 后面」，它只会一直读下去。
+      const total = 1000;
+      final port = await goodUpstream(total);
+      final relay = LocalStreamRelay(chunkSize: 100, prefetchBytes: 100);
+      addTearDown(relay.dispose);
+
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:$port/demo.mkv'),
+          contentLength: total,
+        ),
+      ))!;
+
+      final client = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(client.close);
+      final request = await client.getUrl(endpoint.uri);
+      // 起点 == 流长：闭区间里最后一个合法字节是 total-1，所以这是越界。
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=$total-');
+      final response = await request.close();
+
+      expect(
+        response.statusCode,
+        HttpStatus.requestedRangeNotSatisfiable,
+        reason: '起点越界必须 416；回 200 会让播放器去跳过整条流，卡死在首帧',
+      );
+      // 416 必须说明「流有多长」，播放器靠它收场；带正文就等于又回到那个 bug。
+      expect(response.headers.value('content-range'), 'bytes */$total');
+      expect(response.headers.value(HttpHeaders.contentLengthHeader), '0');
+      await response.drain<void>();
+
+      expect(logs(), contains('Range 超出流长度'));
+      expect(logs(), contains('请求 bytes=$total-'));
     });
 
     test('上游取不到数据 → 一个字节都没发出，必须落 warn（Failed to open 的直接机制）',
