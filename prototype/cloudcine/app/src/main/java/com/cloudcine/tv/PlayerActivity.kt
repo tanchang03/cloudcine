@@ -33,6 +33,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultAllocator
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.PlayInfo
 import com.cloudcine.tv.pan.Quality
@@ -119,6 +120,29 @@ class PlayerActivity : Activity() {
     private val netBytes = ByteCounter()
     private val netMeter = NetRateMeter()
 
+    /**
+     * 最近一次算出的网速（字节/秒）。给**第二个**消费者（调试浮层）读。
+     *
+     * ⛔ 只在主线程读写（两个消费者都是 View 的 ticker），所以不用 volatile。
+     */
+    private var lastRatePerSec = 0L
+
+    /**
+     * 网速取值器（字节/秒）。**控制栏与调试浮层共用这一个。**
+     *
+     * ⛔ 不能让两边各建一个表：[NetRateMeter.onCumulativeBytes] 是**采样**
+     *    （往窗口里塞点），两边各采一份 = 采样率翻倍、窗口边界各走各的 ⇒
+     *    同一时刻两个地方显示两个数，用户会来问哪个是真的。
+     *    所以只留一个入口，并把结果缓存给第二个消费者。
+     *    控制栏 500ms 一拍是较快的那一个，由它负责采样。
+     */
+    private val rateSupplier: () -> Long = {
+        netMeter.onCumulativeBytes(netBytes.bytes)
+        val r = netMeter.ratePerSec()
+        lastRatePerSec = r
+        r
+    }
+
     private var player: ExoPlayer? = null
     private lateinit var store: CredStore
 
@@ -130,6 +154,16 @@ class PlayerActivity : Activity() {
      * 换片就换 url，缓存键也换了。
      */
     private var prefetcher: DiskPrefetcher? = null
+
+    /**
+     * 当前片的磁盘缓存句柄（`null` = 没启用 / 空间不够）。
+     *
+     * ⛔ 留着它是为了让控制栏能按 [DiskPrefetcher.cacheKey] 去
+     * `Cache.getCachedSpans()` 查「本片在盘上覆盖了哪些区间」——
+     * 进度条那层淡蓝要的正是这个。**不能**改用 `PrefetchCache.usedBytes()`：
+     * 那是整个缓存目录的占用，含别的片源的残留（踩过，见 `diskText`）。
+     */
+    private var cacheRef: Cache? = null
 
     /**
      * 播放头在文件里的**字节位置**，由主线程每秒刷新的快照。
@@ -160,8 +194,12 @@ class PlayerActivity : Activity() {
     private val playheadTick = object : Runnable {
         override fun run() {
             val p = player
-            if (p != null && bytesPerSecCache > 0.0) {
-                playheadBytesCache = (p.currentPosition / 1000.0 * bytesPerSecCache).toLong()
+            if (p != null) {
+                // 换算不了（拿不到码率）就**保留上一次的值**，不要写 0 ——
+                // 写 0 会让预取器以为播放头回到了片头，从而丢掉「领先太多就等」
+                // 这道刹车，一口气把缓存灌满。
+                val b = estimatedBytes(p.currentPosition)
+                if (b >= 0L) playheadBytesCache = b
             }
             ui.postDelayed(this, PLAYHEAD_TICK_MS)
         }
@@ -278,10 +316,9 @@ class PlayerActivity : Activity() {
         //    播放器建好后才由 [showControls] 亮出来。
         controls = PlayerControlsView(this).apply {
             visibility = View.GONE
-            networkRateSupplier = {
-                netMeter.onCumulativeBytes(netBytes.bytes)
-                netMeter.ratePerSec()
-            }
+            // ⛔ 取值器**共用一个**（见 [rateSupplier]）：控制栏负责采样，
+            //    调试浮层读缓存值，两处显示的永远是同一个数。
+            networkRateSupplier = rateSupplier
             onSeek = { ratio -> seekToRatio(ratio) }
         }
         root.addView(
@@ -594,11 +631,14 @@ class PlayerActivity : Activity() {
      *
      * @param cache 为 null（空间不够 / 初始化失败）时**直接不预取**，
      *   播放走纯网络 —— 这是正常路径，不是错误。
+     * @param upstream 上游数据源。**应当传「带计数的那一层」**
+     *   （[CountingDataSourceFactory] 包过的并行源），否则界面上的速率
+     *   只数播放器自己的流量、恒为 0 —— 见调用点的注释。
      */
     private fun startDiskPrefetch(
         url: String,
         cache: Cache?,
-        parallel: DataSource.Factory,
+        upstream: DataSource.Factory,
         bitrateMibps: Double,
     ) {
         prefetcher?.cancel()
@@ -608,17 +648,14 @@ class PlayerActivity : Activity() {
         val bytesPerSec = rate * 1048576.0
 
         // ── 控制栏 / 进度条的数据源（**与有没有磁盘缓存无关**，先挂上）──
-        // ⛔ 一律传**取值器**而不是当时的数值：换档时码率会变，
-        //    传死值会让「磁盘缓存换算成时长」一路用旧码率算下去。
+        // ⛔ 一律传**取值器**而不是当时的数值：换档、跳转、LRU 淘汰都会让它变。
+        //    这里的 `bytesPerSecCache` 是「字节 ↔ 时间」的唯一换算桥梁，
+        //    换档后它必须跟着变，否则进度条那层淡蓝会一路按旧码率画。
         bytesPerSecCache = bytesPerSec
         playheadBytesCache = 0L
+        cacheRef = cache
         controls.backBufferMsSupplier = { backBufferMsCache }
-        controls.diskCacheEndMsSupplier = {
-            val r = bytesPerSecCache
-            // 预取器还没起来（或已收工）时是 0 ⇒ 进度条上那层淡蓝不画。
-            val next = prefetcher?.nextPositionBytes ?: 0L
-            if (r > 0.0) (next / r * 1000.0).toLong() else 0L
-        }
+        controls.diskCacheSupplier = { diskCacheSnapshot() }
         // 先开「播放头快照」的定时器，再起预取：否则预取第一轮读到的是 0，
         // 会误判成「播放头在片头」，领先量算错。
         ui.removeCallbacks(playheadTick)
@@ -632,7 +669,7 @@ class PlayerActivity : Activity() {
         val lead = (PrefetchCache.limitBytes() * 7 / 10).coerceAtLeast(64L * 1024 * 1024)
         val p = DiskPrefetcher(
             cache = cache,
-            dataSourceFactory = parallel,
+            dataSourceFactory = upstream,
             uri = Uri.parse(url),
             startPositionBytes = 0L,
             totalBytes = -1L,
@@ -647,6 +684,51 @@ class PlayerActivity : Activity() {
             TAG,
             "磁盘预取：已启动（码率 %.2f MiB/s ⇒ 领先上限 ${lead / 1048576} MiB）".format(rate),
         )
+    }
+
+    /**
+     * 取一次「**本片**在磁盘上覆盖了哪些区间」的快照，给进度条那层淡蓝用。
+     *
+     * ⛔ **必须由主线程调**（控制栏的 ticker 就在主线程）：里面要读
+     *    `player.duration`，而 `ExoPlayer` 只在主线程可读 —— 踩过，
+     *    见 [playheadBytesCache] 的注释（那次直接闪退）。
+     *
+     * ⛔ 用 `getCachedSpans` 而**不是** `prefetcher.nextPositionBytes`：
+     *    跳转后预取器会跟到新位置（[DiskPrefetcher.reanchor]），盘上就成了
+     *    两段、中间是真空洞。只报一个「下到哪」会把空洞画成有数据。
+     *
+     * ⚠️ 换算桥梁是**估算**的码率（`Quality.requiredMbPerSec`），所以画出来的
+     *    位置只是「大概」—— VBR 片源必然有偏差。这一点消不掉：`SimpleCache`
+     *    只知道字节，进度条只知道时间。
+     *
+     * ⚠️ 代价：`getCachedSpans` 拿的是 `SimpleCache` 的**对象锁**，与写者提交
+     *    文件时是同一把。控制栏 500ms 一拍、span 是几十个量级，可以忽略；
+     *    但**分块若改小**（比如 128 MiB → 8 MiB），span 会涨到几百上千个，
+     *    那时就得改成后台线程取、或者降频。
+     */
+    private fun diskCacheSnapshot(): DiskCacheSnapshot {
+        val c = cacheRef ?: return DiskCacheSnapshot.EMPTY
+        val key = prefetcher?.cacheKey ?: return DiskCacheSnapshot.EMPTY
+        val ranges = runCatching {
+            val spans = c.getCachedSpans(key)
+            val out = LongArray(spans.size * 2)
+            var i = 0
+            for (s in spans) {
+                // ⛔ 只算**已提交**的 span。正在写的那一段 `isCached = false`，
+                //    且 `length` 是 `C.LENGTH_UNSET`（-1）—— 收进来会画出一个
+                //    起点在终点右边的「负宽度」矩形。
+                if (!s.isCached || s.length <= 0L) continue
+                out[i++] = s.position
+                out[i++] = s.position + s.length
+            }
+            out.copyOf(i)
+        }.getOrElse {
+            // 读缓存元数据失败不该影响播放：这一拍不画淡蓝而已。
+            Log.w(TAG, "读磁盘缓存区间失败（不影响播放）：${it.message}")
+            return DiskCacheSnapshot.EMPTY
+        }
+        val dur = player?.duration ?: return DiskCacheSnapshot.EMPTY
+        return DiskCachePlan.snapshot(ranges, bytesPerSecCache, dur)
     }
 
     private fun startPlayer(url: String, headers: Map<String, String>) {
@@ -696,12 +778,6 @@ class PlayerActivity : Activity() {
         } else {
             countingParallel
         }
-
-        // ⛔ 速率**不走** `AnalyticsListener.onBandwidthEstimate`：那个回调
-        //    一次传输结束才发一次（`DefaultBandwidthMeter` 在 `onTransferEnd`
-        //    里通知），缓冲中好几秒才有一个样本 ⇒ 窗口里没有新字节 ⇒ 界面
-        //    上只剩「缓冲中」、看不到速率（实测就是这个现象）。
-        //    改成在数据源上数 `read()` 的返回值：字节是连续进来的。
         val mediaSourceFactory = DefaultMediaSourceFactory(upstream)
 
         Log.i(
@@ -792,7 +868,20 @@ class PlayerActivity : Activity() {
                 bufferBytes / 1048576 / 4,
             ),
         )
+        // ── 分配器：自己建一个，只为了**能读数** ────────────────────
+        //
+        // ⛔ 这是 `DefaultLoadControl` 默认就在用的那一个，参数逐字相同
+        //    （`trimOnReset = true`、分段 = `C.DEFAULT_BUFFER_SEGMENT_SIZE`），
+        //    所以**行为零变化** —— 唯一的区别是我们拿到了引用，于是可以读
+        //    `getTotalBytesAllocated()`：它正是 `setTargetBufferBytes` 管的那个数
+        //    （「当前真正在用多少字节」），调试浮层那行「占用 43/48 MiB」就是它。
+        //
+        // ⛔ 不自己建的话就只能拿「已缓冲秒数 × 估算码率」去反推，而码率是估的、
+        //    后缓冲还占着同一份额度 —— 算出来的数会跟预算对不上账，
+        //    那比不显示更坏（这个项目已经被「两套账本」坑过一次）。
+        val allocator = DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE)
         val loadControl = DefaultLoadControl.Builder()
+            .setAllocator(allocator)
             .setBufferDurationsMs(
                 30_000,   // minBufferMs：低于它一定继续下载
                 120_000,  // maxBufferMs：暂停时能一直缓冲到这里（低码率档可达）
@@ -841,6 +930,40 @@ class PlayerActivity : Activity() {
                 if (exo.playWhenReady) return
                 Log.i(TAG, "已暂停 ⇒ 控制栏常驻（看缓冲进度）")
                 showControls(autoHide = false)
+            }
+
+            /**
+             * 位置**不连续**的那一刻 —— 跳转（拖进度条、方向键 ±10s）都走到这里。
+             *
+             * ⛔ 这是**唯一**通知预取器「播放头跳了」的地方。不通知的话，
+             *    它会继续下用户刚刚跳过的那一段（现在落在播放头**后面**），
+             *    而播放头前方一个字节都不下 —— 这就是
+             *    「拖了进度条以后磁盘缓存会不会从当前位置重来」的答案：
+             *    **原来不会，现在会**（见 [DiskPrefetcher.reanchor]）。
+             *
+             * ⛔ 只认 `DISCONTINUITY_REASON_SEEK`：
+             *    `SEEK_ADJUSTMENT` 是 ExoPlayer 自己在就近同步帧上做的微调
+             *    （几百毫秒量级）、`AUTO_TRANSITION` 是自动切下一个 mediaItem ——
+             *    那些都不该让预取器丢下已经下好的数据。
+             */
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int,
+            ) {
+                if (reason != Player.DISCONTINUITY_REASON_SEEK) return
+                if (bytesPerSecCache <= 0.0) return
+                // ⛔ 必须**立刻**刷新快照。定时器是每秒一次，跳转后它会拿
+                //    **旧位置**算领先量，预取器就以为「播放头还在老地方」
+                //    而多下一整块（最多 12 秒）。
+                val bytes = estimatedBytes(newPosition.positionMs).coerceAtLeast(0L)
+                playheadBytesCache = bytes
+                prefetcher?.reanchor(bytes)
+                Log.i(
+                    TAG,
+                    "跳转 → ${newPosition.positionMs / 1000}s（约 ${bytes / 1048576} MiB）" +
+                        " ⇒ 已通知预取器重新锚定",
+                )
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -937,6 +1060,16 @@ class PlayerActivity : Activity() {
 
         player = exo
         stats.bind(exo)
+        // ── 调试浮层要的三样（2026-10-06 加）─────────────────────────
+        // ⛔ 分配器与预算**必须一起给**：分子分母同源，否则会显示
+        //    「43/48」这种看着合理、其实不是一对的读数 —— 见 StatsOverlay.allocator。
+        stats.bindBufferBudget(allocator, bufferBytes.toInt())
+        // ⛔ 网速读**缓存值**，不再自己采一次样 —— 见 [rateSupplier]。
+        stats.networkRateSupplier = { lastRatePerSec }
+        stats.backBufferMsSupplier = { backBufferMsCache }
+        stats.diskCacheSupplier = { diskCacheSnapshot() }
+        stats.diskStatSupplier = { PrefetchCache.shortStat(this) }
+        stats.prefetcherSupplier = { prefetcher }
         stats.start()
         controls.bind(exo)
 
@@ -945,7 +1078,13 @@ class PlayerActivity : Activity() {
         exo.prepare()
         exo.playWhenReady = true
 
-        startDiskPrefetch(url, cache, parallel, bitrateMibps)
+        // ⛔ 传给预取器的是 `countingParallel`（**同一把计数器**），不是 `parallel`：
+        //    播放器现在几乎总是从磁盘缓存命中、不碰网络，速率会恒为 0 ——
+        //    而真正在下的正是预取器。分开计数就会出现
+        //    「速率 0 KB/s · 磁盘 3.3 GiB」这种自相矛盾的读数（2026-10-06 实测），
+        //    用户看到 0 就以为「不缓冲了」，而这正是本需求要消灭的误判。
+        //    [ByteCounter] 内部是 `AtomicLong`，两条线程同时加不会丢字节。
+        startDiskPrefetch(url, cache, countingParallel, bitrateMibps)
 
         showNotice("正在打开…")
         // 播放器一建好就把控制栏亮出来（4 秒后自动收），让用户立刻看到
@@ -955,14 +1094,22 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         ui.removeCallbacks(hideControls)
+        // ⛔ 防抖里的跳转也要取消：player 释放后再跑会崩，而且此时跳转
+        //    已经没有意义（用户都离开播放页了）。
+        ui.removeCallbacks(seekCommit)
+        pendingSeekMs = -1L
         // ⛔ 快照定时器也要停：它读 `player.currentPosition`，
         //    player 释放后再跑会崩。
         ui.removeCallbacks(playheadTick)
         controls.unbind()
         prefetcher?.cancel()
         prefetcher = null
+        cacheRef = null
         Log.i(TAG, "退出播放页 · ${PrefetchCache.describe(this)}")
         stats.stop()
+        // ⛔ 分配器跟着播放器一起释放，浮层别再拿着它读 —— 虽然 `stats.stop()`
+        //    之后不会再 tick，但把引用留着是纯粹的隐患。
+        stats.bindBufferBudget(null, 0)
         player?.release()
         player = null
         super.onDestroy()
@@ -1520,15 +1667,70 @@ class PlayerActivity : Activity() {
     private var resumeAfterExitConfirm = false
 
     /**
-     * 相对跳转。
+     * 待提交的跳转目标（毫秒）；**`< 0` = 没有**。
      *
-     * 用 `seekTo(currentPosition ± delta)` 而不是 `Player.seekBy()`：后者在
-     * media3 1.3 才加进来，这里刻意钉在 1.5.1。负数要夹到 0 ——
-     * `seekTo(-10000)` 会被 ExoPlayer 当成「seek 到末尾」，是个不报错的坑。
+     * ⛔ 存在的理由是遥控器方向键的**自动重复**：按住 `→` 时系统约 20 次/秒
+     *    地送 `KEYCODE_DPAD_RIGHT`。若每次按键都真发一次 `seekTo`，有两个后果，
+     *    都是 2026-10-06 真机实测到的：
+     *
+     *    1. **卡顿、不跟手** —— 每次 `seekTo` 都要让 ExoPlayer 拆掉当前 load、
+     *       重开数据源、重建解码管线。20 次/秒地拆建，画面根本来不及出，
+     *       用户看到的就是「拖起来非常卡」。
+     *    2. **OOM 崩溃** —— 每次重开数据源都会新建一个 `ParallelRangeReader`，
+     *       它**一次性**分配 `8 × 2 MiB = 16 MiB` 的槽位数组。实测一次拖拽
+     *       2 秒内发起 28 次 seek，堆被打到 `192MB/192MB`，且 GC
+     *       `freed 0(0B)`（那些数组全部强可达），进程被杀：
+     *       `FATAL EXCEPTION: cc-range-1 / java.lang.OutOfMemoryError`。
+     *
+     * 所以：按键只累加这个目标（UI 立刻跟手），真跳转由 [seekCommit]
+     * **防抖后只发一次**。实测口径：同一次拖拽从 28 次 `seekTo` 降到 1 次。
+     */
+    private var pendingSeekMs = -1L
+
+    /**
+     * 把 [pendingSeekMs] 落成真正的 `seekTo`。
+     *
+     * ⛔ 必须能被后续按键**取消并重排**（`removeCallbacks` + `postDelayed`）——
+     *    那正是防抖本身。
+     */
+    private val seekCommit = Runnable { commitPendingSeek() }
+
+    /**
+     * 相对跳转（遥控器 `←→` ±10s / 快进快退键 ±30s）。
+     *
+     * ⛔ **不再直接 `seekTo`** —— 只挪待提交目标，见 [pendingSeekMs]。
+     *    用 `seekTo(currentPosition ± delta)` 而不是 `Player.seekBy()`：后者在
+     *    media3 1.3 才加进来，这里刻意钉在 1.5.1。负数要夹到 0 ——
+     *    `seekTo(-10000)` 会被 ExoPlayer 当成「seek 到末尾」，是个不报错的坑。
+     *
+     * ⛔ 基准必须是**待提交目标**而不是 `currentPosition`：连续按右键时
+     *    `currentPosition` 还停在老位置（上一次的 seek 还没提交），拿它累加
+     *    会让「按 10 次右键只走 10 秒」。
      */
     private fun seekBy(deltaMs: Long) {
         val p = player ?: return
-        p.seekTo((p.currentPosition + deltaMs).coerceAtLeast(0L))
+        // 累加与夹取的算术在 [SeekPlan.step] 里，**有单测**（含溢出与
+        // 「时长未知时不许拿 -1 去夹」两个坑）。
+        val target = SeekPlan.step(pendingSeekMs, p.currentPosition, deltaMs, p.duration)
+        pendingSeekMs = target
+        // 立刻把进度条与时间文字挪过去 —— 「跟手」就来自这一步。
+        controls.showPendingSeek(target)
+        ui.removeCallbacks(seekCommit)
+        ui.postDelayed(seekCommit, SEEK_DEBOUNCE_MS)
+    }
+
+    /**
+     * 防抖窗口结束后，把攒下的目标落成**一次**跳转。
+     *
+     * 走的是与触摸拖拽**同一条** [seekToPosition]：同一份日志、同一份
+     * 「内存/磁盘是否命中」判断。两处各写一套必然漂移，而漂移的读数会被
+     * 当成 bug 追（这条在磁盘缓存层已经吃过一次亏）。
+     */
+    private fun commitPendingSeek() {
+        val target = pendingSeekMs
+        if (target < 0L) return
+        pendingSeekMs = -1L
+        seekToPosition(target)
     }
 
     private fun showOsd() {
@@ -1586,20 +1788,71 @@ class PlayerActivity : Activity() {
      * 这就是需求里「拖到已缓冲进度就直接播、不用重新缓冲」的实现方式：
      * 不需要任何特殊处理，只要不误调 `prepare()`、并让用户能看见缓冲区间
      * （进度条那层浅色）就够了。
+     *
+     * ⛔ 日志里必须把「内存缓冲」与「磁盘缓存」分开说：命中磁盘缓存同样
+     *    **不用重新缓冲**（`CacheDataSource` 直接从盘上读）。只写「区间外，
+     *    需缓冲」会在用户拖进磁盘缓存时给出相反的结论，验证时会被带偏。
      */
     private fun seekToRatio(ratio: Float) {
         val p = player ?: return
         val d = p.duration
         if (d == C.TIME_UNSET || d <= 0) return
         val target = (d * ratio.toDouble()).toLong().coerceIn(0L, d)
+        // 触摸拖拽本来就是「松手才提交」（见 `SeekBarView.onTouchEvent`），
+        // 理论上不会与防抖定时器并存；这里清一下纯属保险 —— 万一上一轮
+        // 遥控器快进的提交还没落地，用户又去拖了进度条，两个跳转会打架。
+        ui.removeCallbacks(seekCommit)
+        pendingSeekMs = -1L
+        seekToPosition(target)
+    }
+
+    /**
+     * **唯一**真正的跳转落点 —— 触摸拖拽与遥控器快进都必须走这里。
+     *
+     * ⛔ 两处各写一遍 `seekTo` 会让日志口径与「内存/磁盘是否命中」的判断
+     *    漂移，而漂移的读数会被当成 bug 追。
+     */
+    private fun seekToPosition(targetMs: Long) {
+        val p = player ?: return
+        val d = p.duration
+        val max = if (d == C.TIME_UNSET || d <= 0L) Long.MAX_VALUE else d
+        val target = targetMs.coerceIn(0L, max)
+        // ⛔ `bufferedPosition` 必须在 `seekTo` **之前**读。
+        //    拖到未缓冲处时 ExoPlayer 会把 `bufferedPosition` 夹到新位置
+        //    （≥ target），于是 `target <= bufferedPosition` **恒为真** ——
+        //    日志会永远说「内存区间内，不需重新缓冲」，而下面「磁盘缓存命中」
+        //    那一路变成**死代码**。（2026-10-06 真机拖拽实测抓出来的：
+        //    拖到 88:56、内存缓冲明明只有 +58s，却报了「内存区间内」。）
+        val bufferedBefore = p.bufferedPosition
         p.seekTo(target)
-        val inBuffer = target <= p.bufferedPosition
+        val inBuffer = target <= bufferedBefore
+        // 估算位置是否落在磁盘已提交的区间里 —— 见 [DiskCacheSnapshot.covers]。
+        val inDisk = !inBuffer && diskCacheSnapshot().covers(estimatedBytes(target))
         Log.i(
             TAG,
-            "拖拽跳转 → ${target / 1000}s（已缓冲到 ${p.bufferedPosition / 1000}s，" +
-                if (inBuffer) "区间内，不需重新缓冲）" else "区间外，需缓冲）",
+            "跳转提交 → ${target / 1000}s（跳前内存缓冲到 ${bufferedBefore / 1000}s，" +
+                when {
+                    inBuffer -> "内存区间内，不需重新缓冲）"
+                    inDisk -> "内存区间外、磁盘缓存命中，不需重新缓冲）"
+                    else -> "两处都没命中，需缓冲）"
+                },
         )
+        // 跳转已落地 ⇒ 松开进度条，让 ticker 恢复正常回写。
+        controls.endExternalScrub()
         showControls()
+    }
+
+    /**
+     * 把媒体时间换算成文件里的**字节**位置。
+     *
+     * ⛔ 用的是**平均码率**（`Quality.requiredMbPerSec`），VBR 片源必然有偏差 ——
+     *    只用于「大概在不在缓存区间里」这类判断，不能当精确偏移使。
+     *    返回 -1 表示换算不了（拿不到码率）。
+     */
+    private fun estimatedBytes(positionMs: Long): Long {
+        val r = bytesPerSecCache
+        if (r <= 0.0 || positionMs <= 0L) return -1L
+        return (positionMs / 1000.0 * r).toLong()
     }
 
     // ------------------------------------------------------------------
@@ -1663,10 +1916,23 @@ class PlayerActivity : Activity() {
 
         /**
          * 方向键步进。10 秒是电视端的通行值：够快（一部长片按 50 下到底），
-         * 又不会一按就跳过头。遥控器长按连发是一串独立 ACTION_DOWN，
-         * 所以「按住左/右」天然就是连续拖拽。
+         * 又不会一按就跳过头。
+         *
+         * ⛔ 遥控器长按连发是**一串独立按键事件**（约 20 次/秒）。这些事件
+         *    **不能**每个都真发一次 `seekTo` —— 那会 20 次/秒地拆建解码管线，
+         *    既卡顿又爆堆（见 [pendingSeekMs]）。它们只累加待提交目标。
          */
         private const val SEEK_STEP_MS = 10_000L
+
+        /**
+         * 连续快进的**合并窗口**（毫秒）：最后一次按键之后静默这么久，
+         * 才把攒下的目标落成一次真跳转。
+         *
+         * ⛔ 别调到 100ms 以下：遥控器自动重复的间隔本身约 50ms，窗口太短
+         *    就退化成「每次按键都提交」，防抖白做。
+         * ⛔ 也别调大过 600ms：松手后用户会明显感到「等一下才动」。
+         */
+        private const val SEEK_DEBOUNCE_MS = 400L
 
         /**
          * 「播放头字节位置」快照的刷新周期。

@@ -150,5 +150,25 @@ object PrefetchCache {
         }
     }
 
+    /**
+     * 紧凑一行，给调试浮层用：`目录 3470/5081 MiB · 盘剩 8920 MiB`。
+     *
+     * ⛔ 与 [describe] 分开只是为了**行宽**：浮层那一行还要塞「本片多少、
+     *    几段、最远到哪」，`describe` 的措辞会把整行挤出屏幕（电视上
+     *    浮层是左上角一块，不换行更好读）。
+     *
+     * ⛔ 这里**故意不调 [get]**：它会把缓存建起来（有副作用），而浮层每秒
+     *    调一次 —— 读读数不该顺手改状态。没建起来就老实说「未启用」。
+     */
+    fun shortStat(context: Context): String {
+        val available = availableBytes(File(context.applicationContext.cacheDir, DIR_NAME))
+        val limit = limitBytes()
+        return if (limit <= 0L) {
+            "缓存未启用（盘剩 ${mib(available)} MiB）"
+        } else {
+            "目录 ${mib(usedBytes())}/${mib(limit)} MiB · 盘剩 ${mib(available)} MiB"
+        }
+    }
+
     private fun mib(bytes: Long): Long = if (bytes < 0) -1 else bytes / 1048576
 }

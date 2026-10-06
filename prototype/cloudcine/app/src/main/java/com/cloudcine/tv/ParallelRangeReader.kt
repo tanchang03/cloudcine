@@ -79,6 +79,8 @@ class ParallelRangeReader(
     init {
         require(connections >= 1) { "连接数至少 1" }
         require(chunkBytes > 0) { "块大小必须为正：$chunkBytes" }
+        created.incrementAndGet()
+        live.incrementAndGet()
     }
 
     // ------------------------------------------------------------------
@@ -189,7 +191,8 @@ class ParallelRangeReader(
             TAG,
             "并行读取器启动：$effectiveConnections 条连接 · 每块 ${chunkBytes / 1024} KiB" +
                 " · 窗口 ${effectiveConnections.toLong() * chunkBytes / 1048576} MiB" +
-                " · 起点 $base · 终点 ${if (limit < 0) "未知" else limit.toString()}",
+                " · 起点 $base · 终点 ${if (limit < 0) "未知" else limit.toString()}" +
+                " · ${liveLine()}",
         )
     }
 
@@ -198,6 +201,7 @@ class ParallelRangeReader(
         try {
             if (closed) return
             closed = true
+            live.decrementAndGet()
             cond.signalAll()
         } finally {
             lock.unlock()
@@ -211,8 +215,24 @@ class ParallelRangeReader(
             val t = workers[i] ?: continue
             runCatching { t.join(JOIN_TIMEOUT_MS) }
         }
-        Log.i(TAG, "并行读取器关闭：${statsLine()}")
+        Log.i(TAG, "并行读取器关闭：${statsLine()} · ${liveLine()}")
     }
+
+    /**
+     * 存活读数，一行：`累计建 12 · 存活 2`。
+     *
+     * ⛔ 存在的理由是一次真机事故（2026-10-06）：拖拽进度条时 2 秒内
+     *    发起 28 次 seek，每次重开数据源都新建一个读取器、**一次性**分配
+     *    `8 × 2 MiB = 16 MiB` 槽位数组，堆被打到 `192MB/192MB` 且 GC
+     *    `freed 0(0B)`（全部强可达）⇒ `FATAL EXCEPTION: cc-range-1 /
+     *    OutOfMemoryError`。
+     *
+     *    当时只能靠「启动 33 次 / 关闭 25 次」这种**事后配平**去猜有没有
+     *    泄漏 —— 分不清「真的漏了」与「还在途、稍后才关」。有这一行，
+     *    「存活」是否随播放时间**单调上涨**就是判据：
+     *    稳态播放应当只有 1~2 个（播放器一个 + 预取器一个）。
+     */
+    private fun liveLine(): String = "累计建 ${created.get()} · 存活 ${live.get()}"
 
     /** 一行统计，供日志核对「连接真的都吃上活了」。 */
     fun statsLine(): String {
@@ -620,6 +640,15 @@ class ParallelRangeReader(
 
     companion object {
         private const val TAG = "CloudCine"
+
+        /**
+         * 读取器存活统计 —— **只为排查「创建了却没被关」这类泄漏**，见 [liveLine]。
+         *
+         * ⛔ 用 `AtomicInteger`：构造与 `close()` 分别发生在 loader 线程、
+         *    预取线程、主线程上。
+         */
+        private val created = java.util.concurrent.atomic.AtomicInteger()
+        private val live = java.util.concurrent.atomic.AtomicInteger()
 
         /** 等待切片。够小，所以 `close()` / 失败最多半个周期就被发现。 */
         private const val WAIT_SLICE_MS = 200L * 1_000_000

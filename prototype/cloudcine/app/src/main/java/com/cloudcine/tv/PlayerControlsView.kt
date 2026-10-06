@@ -17,18 +17,18 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.media3.common.C
 import androidx.media3.common.Player
-import java.util.Locale
 
 /**
- * 播放页贴底控制栏：`12:34 / 58:20` + 双层进度条 + 状态/网速。
+ * 播放页贴底控制栏：`12:34 / 58:20` + 多层进度条 + 状态/网速。
  *
- * ## 三层进度（这是需求里最关键的一条）
+ * ## 进度条的四层（这是需求里最关键的一条）
  *
  * | 层 | 含义 | 来源 |
  * |---|---|---|
  * | 底色 | 整条时长（未缓冲） | — |
- * | 浅色 | **已缓冲**区间 | `player.bufferedPosition` |
- * | 亮色 | 已播放 | `player.currentPosition` |
+ * | 淡蓝 | **磁盘缓存**已覆盖的区间（可多段） | `SimpleCache.getCachedSpans` |
+ * | 浅色 | **内存缓冲**区间（前向 + 后缓冲） | `player.bufferedPosition` ± 后缓冲 |
+ * | 亮蓝 | 已播放 | `player.currentPosition` |
  *
  * 用户要的「拖到已缓冲进度就立刻播、不用重新缓冲」之所以成立，是因为
  * ExoPlayer 的 `seekTo` 落在已缓冲区间内时**不需要任何网络**，直接从
@@ -36,12 +36,19 @@ import java.util.Locale
  * 范围**的可视化。反过来，拖到浅色之外就一定得重新缓冲，界面必须先让
  * 用户看见这件事。
  *
+ * ## 为什么磁盘缓存是**多段**的
+ *
+ * ⛔ 用户把进度条拖到预取前沿之外时，预取器会跟到新位置（见
+ * `DiskPrefetcher.reanchor`），于是盘上就是
+ * `[片头, 旧前沿] ∪ [新锚点, 新前沿]` —— 中间那个空洞是**真的没有数据**。
+ * 画成「从片头连到新前沿」等于骗用户：他会以为回拖那一段不用重新缓冲。
+ *
  * ## 为什么自己画进度条，不用 `android.widget.ProgressBar`
  *
  * `ProgressBar` 的 determinate 外观由主题里的 9-patch 决定，颜色只能靠
  * tint 去染，高度也受 drawable 最小尺寸限制；而且它的 `secondaryProgress`
- * 语义是「第二进度」，绘制顺序固定。这里要的是**三色 + 圆角 + 圆形游标 +
- * 可拖拽**，自己画 40 行反而更短、更可控。
+ * 语义是「第二进度」，绘制顺序固定。这里要的是**多色 + 多段 + 圆角 +
+ * 圆形游标 + 可拖拽**，自己画几十行反而更短、更可控。
  *
  * ⛔ 控制栏**不是焦点节点**（`isFocusable = false`）：遥控器按键统一由
  * `PlayerActivity.dispatchKeyEvent` 收，跟 OSD 一样的道理 —— 一旦让它自己
@@ -71,11 +78,13 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
     var backBufferMsSupplier: (() -> Long)? = null
 
     /**
-     * 磁盘缓存已经下到的**媒体时间**（毫秒）；没启用缓存时返回 0。
+     * 磁盘缓存快照（进度条那层淡蓝 + 右侧「磁盘 512 MiB」**同源**）。
      *
-     * 这是进度条上那层**淡蓝**（见 [SeekBarView.diskCacheRatio]）。
+     * ⛔ 是**取值器**而不是当时的数值：换档、跳转、淘汰都会让它变。
+     * ⛔ 里面读的是 `SimpleCache`（要拿锁、遍历 span）与 `player.duration`，
+     *    **必须**在主线程调 —— 它就是从 `refresh()` 里调的。
      */
-    var diskCacheEndMsSupplier: (() -> Long)? = null
+    var diskCacheSupplier: (() -> DiskCacheSnapshot)? = null
 
     /** 用户拖完进度条后回调（比例 0..1）。 */
     var onSeek: ((Float) -> Unit)? = null
@@ -153,8 +162,29 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
     private fun onScrubbed(ratio: Float) {
         val p = player ?: return
         val dur = durationOf(p) ?: return
-        timeText.text = "${fmtTime((dur * ratio).toLong())} / ${fmtTime(dur)}"
+        timeText.text = "${Fmt.time((dur * ratio).toLong())} / ${Fmt.time(dur)}"
     }
+
+    /**
+     * 遥控器快进/快退时的「跟手」显示：把进度条与时间文字直接挪到 [targetMs]。
+     *
+     * ⛔ **只动显示，不动播放器** —— 真正的 `seekTo` 由 Activity 防抖后发一次。
+     *    与 [onScrubbed] 是一对：一个来自触摸、一个来自按键，对用户是同一件事。
+     *
+     * ⛔ 顺带 `beginExternalScrub()`：让 ticker 在这期间别把进度条刷回真实
+     *    播放位置（那会让「按一下挪一格」变成「按一下闪回去」）。
+     */
+    fun showPendingSeek(targetMs: Long) {
+        val p = player ?: return
+        val dur = durationOf(p) ?: return
+        if (dur <= 0L) return
+        seekBar.beginExternalScrub()
+        seekBar.progressRatio = (targetMs.toFloat() / dur).coerceIn(0f, 1f)
+        timeText.text = "${Fmt.time(targetMs)} / ${Fmt.time(dur)}"
+    }
+
+    /** 外部接管结束（跳转已提交）。 */
+    fun endExternalScrub() = seekBar.endExternalScrub()
 
     private fun refresh() {
         val p = player ?: return
@@ -162,12 +192,17 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
         val dur = durationOf(p)
         val buf = p.bufferedPosition.coerceAtLeast(pos)
 
+        // ⛔ 磁盘缓存快照**一拍只取一次**：算它要拿 `SimpleCache` 的锁并遍历
+        //    全部 span（可达几十个），进度条与右侧文字各取一遍就是白翻一倍，
+        //    而且是每 500ms 一次。
+        val disk = diskCacheSupplier?.invoke() ?: DiskCacheSnapshot.EMPTY
+
         // 拖拽中不要被 ticker 抢回去 —— 否则手指还按着、时间文字自己跳。
         if (!seekBar.scrubbing) {
             timeText.text = if (dur == null) {
-                "${fmtTime(pos)} / --:--"
+                "${Fmt.time(pos)} / --:--"
             } else {
-                "${fmtTime(pos)} / ${fmtTime(dur)}"
+                "${Fmt.time(pos)} / ${Fmt.time(dur)}"
             }
             if (dur != null && dur > 0) {
                 val d = dur.toFloat()
@@ -178,23 +213,22 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
                 //    「已经播过、要重下」，回拖时用户会被骗。
                 val backMs = backBufferMsSupplier?.invoke() ?: 0L
                 seekBar.bufferStartRatio = (pos - backMs).coerceAtLeast(0L).toFloat() / d
-                // 磁盘缓存：从片头画到「预取器已经下到哪」。它和内存缓冲是两套
-                // 账本（一个受 48 MiB 约束、一个在盘上），所以单独一层颜色。
-                seekBar.diskCacheRatio = (diskCacheEndMsSupplier?.invoke() ?: 0L).toFloat() / d
+                // 磁盘缓存：**多段**。跳转留下的空洞必须留着 —— 见类注释。
+                seekBar.diskRanges = disk.ranges
             } else {
                 seekBar.progressRatio = 0f
                 seekBar.bufferedRatio = 0f
                 seekBar.bufferStartRatio = 0f
-                seekBar.diskCacheRatio = 0f
+                seekBar.diskRanges = FloatArray(0)
             }
         }
 
         // ⛔ 速率每拍**只拉一次**。拉两次 = 同一拍塞两个采样点，窗口被压短、
         //    读数开始抖，而且「窗口内无新字节就衰减到 0」这条判据也会失真。
         val rate = networkRateSupplier?.invoke() ?: 0L
-        val disk = diskCacheText()
+        val diskText = diskText(disk)
 
-        statusText.text = statusLine(p, buf - pos, rate, disk)
+        statusText.text = statusLine(p, buf - pos, rate, diskText)
         statusText.setTextColor(
             if (p.playbackState == Player.STATE_BUFFERING) {
                 0xFF8FB6FF.toInt()
@@ -211,10 +245,10 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
             lastLogAt = now
             Log.i(
                 TAG,
-                "[控制栏] ${fmtTime(pos)} / ${if (dur == null) "--:--" else fmtTime(dur)}" +
+                "[控制栏] ${Fmt.time(pos)} / ${if (dur == null) "--:--" else Fmt.time(dur)}" +
                     " · 已缓冲+${(buf - pos) / 1000}s" +
-                    " · 速率 ${fmtSpeed(rate)}" +
-                    (if (disk != null) " · $disk" else "") +
+                    " · 速率 ${Fmt.speed(rate)}" +
+                    (if (diskText != null) " · $diskText" else "") +
                     " · ${statusText.text}",
             )
         }
@@ -231,7 +265,7 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
      * @param disk 磁盘缓存那一小段（[diskCacheText]）；没启用时是 null
      */
     private fun statusLine(p: Player, aheadMs: Long, rate: Long, disk: String?): String {
-        val speed = fmtSpeed(rate)
+        val speed = Fmt.speed(rate)
         val buffering = p.playbackState == Player.STATE_BUFFERING
         val paused = !p.playWhenReady
         val ahead = (aheadMs / 1000).coerceAtLeast(0)
@@ -257,17 +291,20 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
     }
 
     /**
-     * 磁盘缓存那一小段文字，例如 `磁盘 16:10`；**没启用或还没下到东西时返回 null**。
+     * 磁盘缓存那一小段文字，例如 `磁盘 512 MiB`；**没下到东西时返回 null**。
      *
-     * ⛔ 用**本片**已下到的时间（[diskCacheEndMsSupplier]），**不要**用
-     *    `PrefetchCache.usedBytes()` —— 那是整个缓存目录的占用，含别的片源的
-     *    残留。用它会出现「控制栏写着 2.2 GiB、进度条却画 0」这种自相矛盾的
-     *    画面（实测就是这么撞出来的），用户完全没法判断缓存到底生效没有。
+     * ⛔ 用**本片**已提交的字节数（[DiskCacheSnapshot.usedBytes]），它和进度条
+     *    画出来的淡蓝层是**同一份数据**算出来的，所以结构上不可能自相矛盾。
+     *    曾经用的是 `PrefetchCache.usedBytes()` —— 那是整个缓存目录的占用，
+     *    含别的片源的残留，于是出现「控制栏写着 2.2 GiB、进度条却画 0」
+     *    （实测就是这么撞出来的），用户完全没法判断缓存到底生效没有。
+     *
+     * ⛔ 也不再用「已下到的时间」：跳转会在磁盘上留下空洞，而一个时间点
+     *    表达不了「两段」。**位置由进度条说，规模由这行字说**，各司其职。
      */
-    private fun diskCacheText(): String? {
-        val endMs = diskCacheEndMsSupplier?.invoke() ?: 0L
-        if (endMs <= 0L) return null
-        return "磁盘 ${fmtTime(endMs)}"
+    private fun diskText(snap: DiskCacheSnapshot): String? {
+        if (snap.usedBytes <= 0L) return null
+        return "磁盘 ${Fmt.bytes(snap.usedBytes)}"
     }
 
     /** `C.TIME_UNSET` 与负数都要当成「还不知道时长」。 */
@@ -285,25 +322,6 @@ class PlayerControlsView(context: Context) : LinearLayout(context) {
         /** 500ms。再快没有意义（人眼读不出），再慢时间文字会一跳一跳。 */
         private const val TICK_MS = 500L
         private const val SEEK_TOUCH_DP = 34
-
-        fun fmtTime(ms: Long): String {
-            if (ms < 0) return "--:--"
-            val t = ms / 1000
-            val h = t / 3600
-            val m = (t % 3600) / 60
-            val s = t % 60
-            return if (h > 0) {
-                String.format(Locale.US, "%d:%02d:%02d", h, m, s)
-            } else {
-                String.format(Locale.US, "%02d:%02d", m, s)
-            }
-        }
-
-        fun fmtSpeed(bytesPerSec: Long): String = when {
-            bytesPerSec <= 0 -> "0 KB/s"
-            bytesPerSec >= 1L shl 20 -> "%.2f MB/s".format(bytesPerSec / 1048576.0)
-            else -> "%.0f KB/s".format(bytesPerSec / 1024.0)
-        }
     }
 }
 
@@ -343,21 +361,53 @@ class SeekBarView(context: Context) : View(context) {
         }
 
     /**
-     * **磁盘缓存**已经下到哪的比例（0..1）。
+     * **磁盘缓存**已覆盖的区间，扁平比例数组 `[起0, 止0, 起1, 止1, …]`（0..1）。
      *
      * 这一层与内存缓冲是两回事：内存缓冲受 `SampleQueue` 的 48 MiB 约束
      * （原画只够 9 秒），而磁盘缓存由 [DiskPrefetcher] 绕开播放器预算
      * 顺序灌入，能到 GB 级。**两者必须画成不同颜色**，否则用户没法判断
      * 「暂停时到底有没有在继续下」—— 那正是这个需求要解决的困惑。
+     *
+     * ⛔ 为什么是**数组**而不是一个「画到哪」的比例：跳转后预取器跟到新位置
+     *    （见 [DiskPrefetcher.reanchor]），盘上就变成两段、中间是真空洞。
+     *    画成「从片头连到新前沿」等于告诉用户回拖那一段不用重新缓冲 —— 骗人。
      */
-    var diskCacheRatio = 0f
+    var diskRanges: FloatArray = FloatArray(0)
         set(v) {
-            field = v.coerceIn(0f, 1f)
+            field = v
             invalidate()
         }
 
+    /**
+     * 「进度条正被人攥着」—— 手指按住（触摸拖拽）**或**遥控器连续快进中。
+     *
+     * ⛔ 控制栏的 ticker 每 500ms 会把 [progressRatio] 刷成播放器的真实位置，
+     *    必须靠这个标志屏蔽掉，否则会出现「手还按着、进度条自己跳回去」。
+     */
     var scrubbing = false
         private set
+
+    /**
+     * 由**外部**接管进度条（遥控器连续快进/快退）。
+     *
+     * ⛔ 存在的理由是「跟手」：遥控器方向键是**自动重复**的（按住时约
+     *    20 次/秒）。若每次按键都真发一次 `seekTo`，播放器会反复拆掉当前
+     *    load、重开数据源、重建解码管线 —— 表现就是「拖起来很卡、不跟手」，
+     *    而且每次重开数据源都会新建一个 16 MiB 的并行读取器，直接撑爆堆
+     *    （2026-10-06 真机 OOM）。
+     *
+     * 改成：按键只挪**待提交目标**（本方法负责把进度条与时间文字挪过去），
+     * 真正的 `seekTo` 由 `PlayerActivity` 防抖后**只发一次**。
+     */
+    fun beginExternalScrub() {
+        scrubbing = true
+    }
+
+    /** 外部接管结束（跳转已提交）。下一拍 ticker 恢复正常回写。 */
+    fun endExternalScrub() {
+        scrubbing = false
+        invalidate()
+    }
 
     var onScrub: ((Float) -> Unit)? = null
     var onCommit: ((Float) -> Unit)? = null
@@ -403,13 +453,21 @@ class SeekBarView(context: Context) : View(context) {
         val half = trackH / 2f
 
         // 从下往上四层，顺序不能反：
-        //   轨道 → 磁盘缓存 → 内存缓冲（前向+后向）→ 已播放
+        //   轨道 → 磁盘缓存（可多段）→ 内存缓冲（前向+后向）→ 已播放
         rect.set(left, cy - half, right, cy + half)
         canvas.drawRoundRect(rect, half, half, trackPaint)
 
-        if (diskCacheRatio > 0f) {
-            rect.set(left, cy - half, left + w * diskCacheRatio, cy + half)
-            canvas.drawRoundRect(rect, half, half, diskPaint)
+        // 磁盘缓存：逐段画。相邻两段（`SimpleCache` 没合并的连续 span）
+        // 画出来是同一个矩形，视觉上无差别，不必先去合并。
+        var i = 0
+        while (i + 1 < diskRanges.size) {
+            val a = diskRanges[i]
+            val b = diskRanges[i + 1]
+            if (b > a) {
+                rect.set(left + w * a, cy - half, left + w * b, cy + half)
+                canvas.drawRoundRect(rect, half, half, diskPaint)
+            }
+            i += 2
         }
         // ⛔ 宽度判据是 `> bufferStartRatio`（不是 `> 0`）：后缓冲让起点右移，
         //    若还按 0 判，会画出一个「左端点到 bufferedRatio」的假区间。

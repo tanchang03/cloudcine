@@ -49,6 +49,21 @@ import androidx.media3.datasource.cache.CacheWriter
  *
  * 128 MiB 在 11 MiB/s 下约 12 秒一块，开销可忽略；
  * 同时它也是 LRU 的淘汰粒度 —— 太大则一次扔太多，太小则文件碎片多。
+ *
+ * ## 用户跳转后必须**重新锚定**（2026-10-06 补）
+ *
+ * ⛔ [nextPositionBytes] **只往前走**，而「领先太多就等播放头」那段逻辑
+ *    只会**等**、不会**回看**。所以只要用户把进度条拖到预取前沿之外，
+ *    预取器就会继续下**用户刚刚跳过的那一段**（现在落在播放头**后面**）——
+ *    白占带宽、白占磁盘，而且播放头前方一个字节都不下。
+ *
+ * 修法是 [reanchor]：跳转时由播放器（主线程）告诉它新的字节位置，
+ * 它**只往前锚**（往回跳时已经下好的那段仍然有用，靠「领先太多就等」
+ * 自然处理），并**打断正在写的那一块**，让新位置立刻开始下。
+ *
+ * ⚠️ 打断的代价：被打断的 span **不会** `commitFile`，那部分数据被丢弃
+ *    （最多一整块 = [CHUNK_BYTES] ≈ 11 MiB/s 下 12 秒）。这是有意的取舍 ——
+ *    让播放头前方**立刻**开始下，比省下这 12 秒更值。
  */
 class DiskPrefetcher(
     private val cache: Cache,
@@ -59,7 +74,7 @@ class DiskPrefetcher(
     /** 文件总长（字节）；**负数 = 未知**。 */
     private val totalBytes: Long,
     /** 允许领先播放头多少字节 —— 超过就停下等播放头追上来。 */
-    private val maxLeadBytes: Long,
+    val maxLeadBytes: Long,
     /** 播放头当前在文件里的字节位置（由播放器位置 × 码率换算）。 */
     private val playheadBytes: () -> Long,
 ) {
@@ -83,7 +98,40 @@ class DiskPrefetcher(
 
     private var thread: Thread? = null
 
-    /** 已经下到哪（字节，绝对偏移）。 */
+    /**
+     * 串起「启停预取线程」的那把锁。
+     *
+     * ⛔ 必需：[reanchor] 与线程收工的 `finally` **都可能**发现「有锚点、
+     *    但线程已经收工」，各判各的就会**同时**拉起两条预取线程 ——
+     *    两条线程往同一个 span 里写，`SimpleCache.startFile` 会拒绝第二个
+     *    写者，于是两边反复重试、白跑。同理 [cancel] 与「重启」也必须互斥，
+     *    否则会在 `onDestroy` 之后漏下一条活着的线程。
+     */
+    private val startLock = Any()
+
+    /**
+     * 预取线程是否已经收工（正常下到末尾、或异常退出）。
+     *
+     * 存在它是为了让 [restartIfIdle] 能**把死掉的预取器叫起来**：预取是增强
+     * 功能，万一它因为某个没预料到的异常停了，用户下一次跳转就该把它重新拉
+     * 起来 —— 否则「暂停后不缓冲」会**悄无声息**地回来，而那正是这个需求要
+     * 消灭的现象。
+     */
+    @Volatile
+    private var finished = false
+
+    /**
+     * 待处理的「重新锚定」请求（字节）；**`<= 0` 表示没有**。
+     *
+     * ⛔ 不能直接改 [nextPositionBytes]：正在写的那一块结束后会执行
+     *    `nextPositionBytes = from + actual`，把外面写进去的值**覆盖回旧位置**。
+     *    所以这里只登记「想去哪」，由循环自己在**块与块之间**消费 ——
+     *    那是唯一不会跟 in-flight 块打架的时刻。
+     */
+    @Volatile
+    private var pendingAnchorBytes: Long = -1L
+
+    /** 已经下到哪（字节，绝对偏移）。跳转后会直接挪到新锚点。 */
     @Volatile
     var nextPositionBytes: Long = startPositionBytes
         private set
@@ -99,40 +147,105 @@ class DiskPrefetcher(
         private set
 
     /**
+     * 当前**领先播放头**多少字节（`nextPositionBytes - 播放头`）。
+     *
+     * 调试面板要看的就是它：它贴着 [maxLeadBytes] 就是「已经下满、在等播放头」，
+     * 远小于它就是「还在追」。跳转之后这个值会瞬间从正变负再爬回来 ——
+     * 那一眼就能确认「预取器有没有跟过去」。
+     */
+    val leadBytes: Long get() = nextPositionBytes - playheadBytes()
+
+    /**
      * 缓存键。**必须与播放器 `CacheDataSource` 用的一致**，
      * 否则预取下的东西播放器一个字节都命中不了 —— 两边都用默认的
      * [CacheKeyFactory.DEFAULT]（按 uri 生成），所以这里也用它。
+     *
+     * 对外可见是为了让播放器能按同一个键去 `Cache.getCachedSpans(key)`
+     * 查「本片在盘上覆盖了哪些区间」（进度条那层淡蓝要用）。
      */
-    private val cacheKey: String by lazy {
+    val cacheKey: String by lazy {
         CacheKeyFactory.DEFAULT.buildCacheKey(DataSpec(uri))
     }
 
     fun start() {
-        if (thread != null) return
-        val t = Thread({
-            // ⛔ 整个循环包一层兜底：预取是**增强功能**，任何异常都只该让预取
-            //    停下，绝不该把播放器进程带走。
-            //    踩过（2026-10-06）：在预取线程里读 `player.currentPosition`
-            //    ⇒ `IllegalStateException: Player is accessed on the wrong thread`
-            //    ⇒ 进程闪退，用户看到的是「无法打开影片」。
-            try {
-                loop()
-            } catch (t: Throwable) {
-                Log.e(TAG, "预取线程异常退出（播放不受影响）：${t.message}", t)
-            }
-        }, "cc-prefetch")
-        t.isDaemon = true
-        thread = t
-        t.start()
+        synchronized(startLock) {
+            if (thread != null) return
+            val t = Thread({
+                // ⛔ 整个循环包一层兜底：预取是**增强功能**，任何异常都只该让预取
+                //    停下，绝不该把播放器进程带走。
+                //    踩过（2026-10-06）：在预取线程里读 `player.currentPosition`
+                //    ⇒ `IllegalStateException: Player is accessed on the wrong thread`
+                //    ⇒ 进程闪退，用户看到的是「无法打开影片」。
+                try {
+                    loop()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "预取线程异常退出（播放不受影响）：${t.message}", t)
+                } finally {
+                    finished = true
+                    // ⛔ 收工的**同一刻**可能正好有人登记了新锚点：那时
+                    //    [reanchor] 读到的 `finished` 还是 false，不会帮我们重启，
+                    //    锚点就**没人消费**了 —— 表现就是「拖完进度条，缓冲再也不涨」。
+                    //    在这里补一次检查把这个窗口堵上。
+                    restartIfIdle()
+                }
+            }, "cc-prefetch")
+            t.isDaemon = true
+            thread = t
+            t.start()
+        }
     }
 
     fun cancel() {
-        cancelled = true
+        val t: Thread?
+        synchronized(startLock) {
+            cancelled = true
+            t = thread
+        }
         runCatching { currentWriter?.cancel() }
         // ⛔ 关数据源才能把卡在 socket 读上的线程踢出来（见 currentSource 的注释）。
         runCatching { currentSource?.close() }
-        thread?.let { runCatching { it.join(JOIN_TIMEOUT_MS) } }
-        thread = null
+        t?.let { runCatching { it.join(JOIN_TIMEOUT_MS) } }
+        synchronized(startLock) { thread = null }
+    }
+
+    /**
+     * 告诉预取器「播放头跳到这儿了」，让它跟着走。
+     *
+     * **只往前锚**：往回跳时已经下好的那段（在播放头前方）仍然有用，
+     * 靠循环里「领先太多就等播放头追上来」自然处理；往前跳到预取前沿之外
+     * 则必须跟过去，否则会继续下用户刚跳过的那一段。
+     *
+     * 由**主线程**调用（跳转回调里）。可以随便多调 —— 位置没越过前沿
+     * 就是空操作。
+     */
+    fun reanchor(positionBytes: Long) {
+        if (cancelled) return
+        if (positionBytes <= 0L) return
+        if (positionBytes <= nextPositionBytes) return
+        pendingAnchorBytes = positionBytes
+        // 打断正在写的那一块：不打断的话，得等它写完（最多 12 秒）才会看新锚点，
+        // 而这段时间播放头前方一个字节都下不动。
+        runCatching { currentWriter?.cancel() }
+        runCatching { currentSource?.close() }
+        restartIfIdle()
+    }
+
+    /**
+     * 「有待处理锚点、但线程已经收工」⇒ 把预取重新拉起来。
+     *
+     * ⛔ 必须**串在 [startLock] 里判**：[reanchor] 与线程收工的 `finally`
+     *    都可能看到这个状态，各判各的就会同时拉起两条线程（见 [startLock]）。
+     */
+    private fun restartIfIdle() {
+        synchronized(startLock) {
+            if (cancelled) return
+            if (pendingAnchorBytes <= 0L) return
+            if (!finished) return
+            finished = false
+            thread = null
+            Log.i(TAG, "预取线程已收工且有待处理跳转 ⇒ 重新拉起")
+            start()
+        }
     }
 
     private fun loop() {
@@ -142,6 +255,23 @@ class DiskPrefetcher(
                 "分块 ${CHUNK_BYTES / 1048576} MiB · 领先上限 ${maxLeadBytes / 1048576} MiB",
         )
         while (!cancelled) {
+            // ── 用户跳转 ⇒ 重新锚定 ────────────────────────────────
+            // ⛔ 必须放在「到文件末尾」与「领先太多」两道判断**之前**：
+            //    跳转后的新位置可能正好越过 EOF 判断用的旧 frontier，
+            //    也可能让 `lead` 变成负数（播放头跑到前沿前面去了）。
+            //    先把锚点落实，后面两道的读数才是新的。
+            val anchor = pendingAnchorBytes
+            if (anchor > 0L) {
+                pendingAnchorBytes = -1L
+                if (anchor > nextPositionBytes) {
+                    Log.i(
+                        TAG,
+                        "预取重新锚定：${nextPositionBytes / 1048576} → " +
+                            "${anchor / 1048576} MiB（用户跳转，丢弃被打断的那一块）",
+                    )
+                    nextPositionBytes = anchor
+                }
+            }
             // ── 到文件末尾就收工 ────────────────────────────────
             if (totalBytes > 0 && nextPositionBytes >= totalBytes) {
                 Log.i(TAG, "预取完成：已到文件末尾（${nextPositionBytes / 1048576} MiB）")
@@ -215,15 +345,23 @@ class DiskPrefetcher(
                 }
             } catch (e: Exception) {
                 if (cancelled) return
-                // ⛔ 单块失败**不退出**：夸克偶发 4xx/断流很常见，
-                //    重试同一块即可（CacheWriter 内部走的是 ParallelRangeReader，
-                //    它自己已经做了断点续传与重试）。这里只做退避。
-                Log.w(
-                    TAG,
-                    "预取第 ${chunks + 1} 块失败（${from / 1048576} MiB 起，" +
-                        "${length / 1048576} MiB）：${e.message} —— 2 秒后重试",
-                )
-                if (!sleep(RETRY_BACKOFF_MS)) return
+                // ⛔ 分清「我们主动打断」和「真失败」：
+                //    主动打断（[reanchor] 关掉了数据源）不该退避 2 秒 ——
+                //    那等于让用户跳转后白白多等 2 秒才开始下新位置。
+                //    这里什么都不做，循环回到顶部就会消费新锚点。
+                if (pendingAnchorBytes > 0L) {
+                    Log.i(TAG, "预取第 ${chunks + 1} 块被跳转打断，改从新位置继续")
+                } else {
+                    // ⛔ 单块失败**不退出**：夸克偶发 4xx/断流很常见，
+                    //    重试同一块即可（CacheWriter 内部走的是 ParallelRangeReader，
+                    //    它自己已经做了断点续传与重试）。这里只做退避。
+                    Log.w(
+                        TAG,
+                        "预取第 ${chunks + 1} 块失败（${from / 1048576} MiB 起，" +
+                            "${length / 1048576} MiB）：${e.message} —— 2 秒后重试",
+                    )
+                    if (!sleep(RETRY_BACKOFF_MS)) return
+                }
             } finally {
                 currentWriter = null
                 runCatching { source.close() }
@@ -235,7 +373,9 @@ class DiskPrefetcher(
     /** @return false 表示已被取消，调用方应立即退出 */
     private fun sleep(ms: Long): Boolean {
         var left = ms
-        while (left > 0 && !cancelled) {
+        // ⛔ 等待也要能被**跳转**提前打断：否则用户拖完进度条最多要等
+        //    1 秒（WAIT_SLICE）／2 秒（退避）才轮到新位置开始下。
+        while (left > 0 && !cancelled && pendingAnchorBytes <= 0L) {
             val step = minOf(left, 100L)
             runCatching { Thread.sleep(step) }
             left -= step

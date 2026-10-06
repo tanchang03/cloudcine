@@ -12,8 +12,19 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <!-- ⛔ 必须开：本地中继是明文 http://127.0.0.1:xxxxx，Android 9 起默认禁止。 -->
+    <!-- ⛔ `largeHeap="true"` 是**必需**的，不是优化。
+         本机 `getprop` 实测：`dalvik.vm.heapgrowthlimit=192m`、
+         `dalvik.vm.heapsize=512m`、`ro.config.low_ram=true`。
+         不开这个开关，App 的 Java 堆上限就是 **192 MiB**；而
+         `ParallelRangeReader` 每实例一次性分配 `8 × 2 MiB = 16 MiB`
+         槽位数组，一次拖拽的 seek 风暴足以把它打满（2026-10-06 真机：
+         `FATAL EXCEPTION: cc-range-1 / OutOfMemoryError`，GC `freed 0(0B)`）。
+         开了之后上限到 512 MiB，突发有了余量。
+         ⚠️ 副作用（可控）：`PlayerActivity` 的缓冲预算按 `堆上限 / 4` 算，
+         会从 48 MiB 升到 64 MiB —— 但那里有 `min(..., 64 MiB)` 封顶。 -->
     <application
         android:label="@string/app_name"
+        android:largeHeap="true"
         android:banner="@drawable/banner"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"

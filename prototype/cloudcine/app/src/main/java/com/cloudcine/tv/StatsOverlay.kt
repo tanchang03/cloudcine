@@ -14,6 +14,7 @@ import android.view.View
 import android.widget.TextView
 import androidx.media3.common.Format
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.upstream.DefaultAllocator
 import java.io.File
 import java.util.Locale
 
@@ -28,6 +29,19 @@ import java.util.Locale
  *    从按下到画面开始更新。云影那边这条没法直接测（按键要穿过 Flutter 的
  *    平台通道 + Dart 事件循环），只能靠帧耗时间接推；这里能直接读。
  * 2. **UI 帧间隔 最大 (ms)**：>16.7 说明掉帧，>50 说明肉眼可见的卡。
+ *
+ * ## 缓冲那三行（2026-10-06 加）
+ *
+ * | 行 | 回答什么 | 关键读法 |
+ * |---|---|---|
+ * | `缓冲 内存` | 播放头前方还有多少、后缓冲留了多少、**占用多少字节** | 占用贴着预算 = 已下满 |
+ * | `磁盘 本片` | 这片在盘上覆盖了多少、**几段**、最远到哪 | 段数 > 1 = 跳转留了空洞 |
+ * | `预取` | 预取器进度 + **实时网速** | 领先贴着上限 = 在等播放头 |
+ *
+ * ⛔ 三行里的数**全部来自注入的取值器**（见下面那些 `*Supplier`），浮层自己
+ *    只负责排版。理由和 `PlayerControlsView` 一样：控制栏与浮层会**同屏**
+ *    出现，两边各算一遍必然漂移，而漂移的读数会被当成 bug 追。
+ * ⛔ 唯独 `player` 是直接读的 —— 它本来就在这个类里，而且本方法就在主线程。
  *
  * 其余几项用于与云影的 `[资源]` 日志**逐行对齐**（同一个口径）：
  * 进程 CPU 用**单核口径**并写明折合 N 核（4 核盒子要 400% 才叫满载），
@@ -46,6 +60,35 @@ class StatsOverlay(context: Context) : TextView(context) {
 
     private var running = false
     private var player: ExoPlayer? = null
+
+    /**
+     * 内存缓冲的**分配器**与它的**字节上限**（`setTargetBufferBytes` 那个值）。
+     *
+     * ⛔ 两个必须**同源**一起给：`getTotalBytesAllocated()` 是分子、
+     *    预算是分母。换了播放器却只换一个，会显示「43/48」这种看着合理、
+     *    其实不是一对的读数 —— 那比不显示更坏。
+     * 由 [bindBufferBudget] 一起设。
+     */
+    private var allocator: DefaultAllocator? = null
+    private var bufferBudgetBytes = 0
+
+    /**
+     * 网速（字节/秒）。**必须与控制栏用同一个 `NetRateMeter` 采样点** ——
+     * 两处各建一个表，同一时刻会显示两个数，用户会来问哪个是真的。
+     */
+    var networkRateSupplier: (() -> Long)? = null
+
+    /** 后缓冲保留时长（毫秒），[BufferPlan] 算出来的那个值。 */
+    var backBufferMsSupplier: (() -> Long)? = null
+
+    /** 本片在磁盘上覆盖了哪些区间（段数 / 字节数 / 最远时间）。 */
+    var diskCacheSupplier: (() -> DiskCacheSnapshot)? = null
+
+    /** 缓存目录概况（占用 / 上限 / 磁盘剩余）—— 一行字，由 `PrefetchCache` 给。 */
+    var diskStatSupplier: (() -> String)? = null
+
+    /** 旁路预取器；未启用（空间不够 / 未起播）时返回 null。 */
+    var prefetcherSupplier: (() -> DiskPrefetcher?)? = null
 
     /** 解码器名由 `AnalyticsListener.onVideoDecoderInitialized` 喂进来。 */
     private var decoderName: String? = null
@@ -132,6 +175,17 @@ class StatsOverlay(context: Context) : TextView(context) {
         prevTicks = null
     }
 
+    /**
+     * 把「内存缓冲预算」与它的分配器一起交给浮层 —— 见 [allocator] 的注释。
+     *
+     * ⛔ 传 null 表示这一项不显示（比如没走 `startPlayer` 的对照路径），
+     *    **不要**退回成 0：那会写成「占用 0/0 MiB」，看起来像缓冲被关掉了。
+     */
+    fun bindBufferBudget(allocator: DefaultAllocator?, budgetBytes: Int) {
+        this.allocator = allocator
+        this.bufferBudgetBytes = if (allocator == null) 0 else budgetBytes
+    }
+
     fun setDecoder(name: String?) {
         decoderName = name
     }
@@ -204,6 +258,27 @@ class StatsOverlay(context: Context) : TextView(context) {
         uiFps = framesThisWindow.toDouble()
         framesThisWindow = 0
 
+        // ── 缓冲读数：内存 / 磁盘 / 网络（2026-10-06 加）────────────
+        // 这三样是当前阶段最该看的：内存缓冲受 `setTargetBufferBytes`（本机
+        // 48 MiB）封顶、磁盘缓存是「暂停也在下」的**唯一**证据、网速是判断
+        // 「到底卡在哪」的入口。
+        //
+        // ⛔ 全部在**主线程**取（本方法就是主线程 tick）：`bufferedPosition` /
+        //    `currentPosition` 都只能在主线程读 —— 预取线程读它闪退过一次。
+        val aheadMs = if (p != null) {
+            (p.bufferedPosition - p.currentPosition).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val backMs = backBufferMsSupplier?.invoke() ?: 0L
+        // ⛔ -1 = 没接分配器（对照路径），与「占用 0 字节」是两回事，
+        //    见 bindBufferBudget 的注释。
+        val memUsed = allocator?.totalBytesAllocated?.toLong() ?: -1L
+        val disk = diskCacheSupplier?.invoke() ?: DiskCacheSnapshot.EMPTY
+        val pf = prefetcherSupplier?.invoke()
+        val rate = networkRateSupplier?.invoke() ?: 0L
+        val cacheLine = diskStatSupplier?.invoke()
+
         text = buildString {
             append("Media3 ExoPlayer · SurfaceView（零拷贝）\n")
             val f = videoFormat
@@ -216,6 +291,45 @@ class StatsOverlay(context: Context) : TextView(context) {
             }
             append("解码器 ").append(decoderName ?: "未起").append('\n')
             append(String.format(Locale.US, "渲染 %.1f fps · 丢帧 %d · 已解码 %d\n", renderedFps, dropped, decoded))
+
+            // ── 缓冲：内存 ─────────────────────────────────────────
+            // 「后缓冲」是 `BufferPlan` 按字节预算反算出来的秒数 —— 它和
+            // 「占用 x/y MiB」是同一个预算的两面：后缓冲拿多了，前向就饿死。
+            append("缓冲 内存 +").append(aheadMs / 1000).append("s（后缓冲 ")
+                .append(String.format(Locale.US, "%.1fs", backMs / 1000.0))
+                .append("）· 占用 ")
+            if (memUsed >= 0) {
+                append(Fmt.mib(memUsed)).append('/')
+                    .append(Fmt.mib(bufferBudgetBytes.toLong())).append(" MiB")
+            } else {
+                append("--")
+            }
+            append('\n')
+
+            // ── 缓冲：磁盘 ─────────────────────────────────────────
+            // ⛔ 「本片」与「目录」必须分开写：目录占用含别的片源的残留，
+            //    只报目录就会出现「写着 3.4 GiB、进度条却一片空白」的
+            //    自相矛盾画面（实测撞过）。
+            append("磁盘 本片 ").append(Fmt.bytes(disk.usedBytes))
+            if (disk.segments > 0) {
+                append(" · ").append(disk.segments).append(" 段")
+                if (disk.endMs > 0) append(" · 到 ").append(Fmt.time(disk.endMs))
+            }
+            append(" · ").append(cacheLine ?: "未启用").append('\n')
+
+            // ── 缓冲：网络 ─────────────────────────────────────────
+            // 「领先」贴着上限 = 已经下满、在等播放头；远小于上限 = 还在追；
+            // **负数** = 播放头跑到预取前沿前面去了（跳转之后会看到，随后爬回）。
+            append("预取 ")
+            if (pf == null) {
+                append("未启用")
+            } else {
+                append("第 ").append(pf.chunks).append(" 块 · 领先 ")
+                    .append(Fmt.bytes(pf.leadBytes))
+                    .append("（上限 ").append(Fmt.bytes(pf.maxLeadBytes)).append("）")
+            }
+            append(" · 网络 ").append(Fmt.speed(rate)).append('\n')
+
             append(
                 String.format(
                     Locale.US, "进程CPU %.1f%%（折合 %d 核 %.1f%%） · 内存 %.0f MB\n",
