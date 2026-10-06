@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- 只用框架主题，不引 AppCompat / Material（理由见 app/build.gradle.kts）。 -->
-    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
-        <item name="android:windowBackground">@android:color/black</item>
-        <item name="android:colorBackground">@android:color/black</item>
-    </style>
-</resources>

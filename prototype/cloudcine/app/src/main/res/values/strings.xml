@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 品牌名单一来源：manifest 的 label、页面标题都引这里，
+         避免「改了一处、另一处还留着旧名字」。 -->
+    <string name="app_name">云影</string>
+</resources>

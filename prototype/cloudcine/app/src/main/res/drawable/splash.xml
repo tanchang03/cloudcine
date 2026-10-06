@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 启动页：系统在 Activity 起来之前就画这张图，所以它**不花启动时间**，
+     却能把「黑屏一闪 → 突然冒出二维码」换成「品牌图标 → 页面」。
+     ⛔ 只给 MainActivity 用（manifest 里的 android:theme）：
+        挂到全局主题上会让每次页面切换都闪一下图标。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/splash_bg" />
+    <item>
+        <bitmap
+            android:src="@mipmap/ic_launcher"
+            android:gravity="center" />
+    </item>
+</layer-list>
