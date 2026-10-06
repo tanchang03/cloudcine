@@ -1,14 +1,14 @@
-gradle-wrapper.jar
-/.gradle
-/captures/
-/gradlew
-/gradlew.bat
-/local.properties
-GeneratedPluginRegistrant.java
-.cxx/
+# Android 工程的本地产物 —— 不进版本库。
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
 
-# Remember to never publicly share your keystore.
-# See https://flutter.dev/to/reference-keystore
-key.properties
-**/*.keystore
-**/*.jks
+# ── 发布签名：**绝不能提交** ────────────────────────────────────────────────
+# `keystore.properties` 里有密钥库口令；`*.jks` / `*.keystore` 是私钥本体。
+# 模板见 `keystore.properties.example`（那个要提交）。
+keystore.properties
+*.jks
+*.keystore

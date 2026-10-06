@@ -150,6 +150,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 const SizedBox(height: 14),
                 _backupSection(current),
                 const SizedBox(height: 14),
+                _diagnosticsSection(current),
+                const SizedBox(height: 14),
                 _aboutSection(),
               ],
             ),
@@ -1497,6 +1499,52 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ref.invalidate(libraryStatsProvider);
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
+  }
+
+  // -------------------------------------------------------------------
+  // 诊断
+  // -------------------------------------------------------------------
+
+  /// 诊断这一节。
+  ///
+  /// ## 为什么单独一节，而不是塞进「关于」
+  ///
+  /// 这一节里是**会改变界面**的开关，而「关于」全是只读信息（版本、后端、
+  /// 网盘）加一个跳转按钮。混进去的话，一个真正有副作用的开关会被当成
+  /// 说明文字的一部分，用户根本不会往那儿找「怎么把那排数字关掉」。
+  ///
+  /// ## 为什么开关在这里，而不做成快捷键 / 命令行参数
+  ///
+  /// 真机上（电视、装在客厅的 Mac mini）没有键盘、也没有终端。排查「播放
+  /// 卡不卡」的人往往就是使用者本人，而他能用的只有遥控器 —— 必须是设置页
+  /// 里一个能点到、能关掉的开关。
+  Widget _diagnosticsSection(AppSettings s) {
+    return SectionCard(
+      title: '诊断',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _ToggleRow(
+            label: '显示调试指标',
+            hint: s.debugOverlay
+                ? '已在右上角常驻显示 CPU / 内存 / FPS / 解码内核，每秒刷新。'
+                    '排查完记得关掉 —— 它叠在画面上，也会持续采样。'
+                : '已关闭（默认）。打开后右上角会常驻一排实时指标，'
+                    '用来排查「按这一下键的瞬间到底发生了什么」。',
+            value: s.debugOverlay,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(debugOverlay: v),
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            '指标里的 CPU / 负载读的是 /proc，macOS 上没有，那几行会显示'
+            '「—」—— 这是预期，不是坏了。FPS 与解码内核在哪都有效。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+        ],
+      ),
+    );
   }
 
   // -------------------------------------------------------------------

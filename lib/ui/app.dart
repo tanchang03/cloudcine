@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'providers/app_providers.dart';
+import 'providers/settings_providers.dart';
 import 'router/app_router.dart';
 import 'theme/app_theme.dart';
 import 'widgets/app_logo.dart';
@@ -33,6 +34,13 @@ class CloudCineApp extends ConsumerWidget {
     // read 只跑一次，用户之后在设置页改开关就不会生效。
     ref.watch(relayConfigSyncProvider);
 
+    // 调试浮层的开关。**用 select 只听这一个字段**：整个 `AppSettings` 有
+    // 二十多项，直接 watch 会让「改个音量」也把整棵树重建一遍 —— 而这里
+    // 挂的是 `MaterialApp` 的根，重建代价最大。
+    final showDebugOverlay = ref.watch(
+      settingsProvider.select((s) => s.valueOrNull?.debugOverlay ?? false),
+    );
+
     return MaterialApp.router(
       title: AppLogo.appName,
       debugShowCheckedModeBanner: false,
@@ -55,8 +63,12 @@ class CloudCineApp extends ConsumerWidget {
               child: WindowChrome(child: child ?? const SizedBox.shrink()),
             ),
             // 调试浮层：浮在所有界面之上、不挡操作（IgnorePointer）。
-            // 只在 debug 模式启用（见 [kDebugOverlayEnabled]）。
-            if (kDebugOverlayEnabled)
+            //
+            // ⛔ 这里是 `if` 而不是 `Opacity(0)` / `Offstage`：关掉时浮层
+            // **根本不会被创建**，于是它内部的每秒定时器与逐帧回调都不存在。
+            // 藏起来的话，定时器照跑、每秒照样读一遍 `/proc` —— 一个「关掉的
+            // 调试开关」却在持续耗电，是最难发现的那类浪费。
+            if (showDebugOverlay)
               Positioned(
                 top: 10,
                 right: 10,

@@ -4,14 +4,20 @@ name: CI
 # 目标：main 分支永远是绿的，不会出现「本地过了、合进去就红」。
 #
 # 三个 job：
-#   - analyze-and-test：macOS。开发机就是 macOS，日常回归全在这里。
+#   - analyze-and-test：macOS。**Flutter / PC 端**（仓库根）的静态分析与单测。
+#     开发机就是 macOS，日常回归全在这里。
 #   - windows-build：Windows。**唯一能编译 windows/runner 原生代码的地方** ——
 #     Flutter 不支持交叉编译到 Windows，`flutter build windows` 的宿主必须是
 #     Windows，所以在 Mac 上永远验不到那几处 C++。顺带也是唯一能验 WiX
 #     打包链路（MSI）的地方。
-#   - android-build：Linux。验 **APK 打包链路**（SDK 组件、libmpv 的四个 ABI、
-#     release 清单里的 INTERNET 权限）。这些只在 release.yml 里跑的话，坏掉
-#     要等 tag 推出去才发现 —— 而那时 tag 已经收不回来了。
+#   - android-build：Linux。验 **`android/` 原生 Kotlin 工程**的单测与
+#     release APK 打包链路（SDK 组件、包名、release 清单里的 INTERNET 权限）。
+#     这些只在 release.yml 里跑的话，坏掉要等 tag 推出去才发现 ——
+#     而那时 tag 已经收不回来了。
+#
+# ⚠️ 仓库里现在是**两个互不相干的工程**：仓库根是 Flutter（PC 端），
+#    `android/` 是原生 Kotlin（Android 端）。这个 workflow 两者都要跑，
+#    但各自的 job 不会构建对方。
 on:
   push:
     branches: [main]
@@ -163,52 +169,47 @@ jobs:
           if-no-files-found: warn
 
   android-build:
-    name: Android 构建 + 打包链路校验
+    name: Android 构建（原生工程） + 单测 + 打包链路校验
     # 为什么是 ubuntu 而不是 macos：Android 构建链在两个系统上完全一致，
     # 而 ubuntu 镜像里预装的 Android SDK 更全、分钟数也更便宜。
+    #
+    # ⛔ 这个 job **不需要 Flutter**（2026-10-06 起）：Android 端是**独立的原生
+    #    Kotlin 工程**（`android/`），与仓库根的 Flutter（PC 端：macOS / Windows）
+    #    互不引用、互不构建。所以这里既不用装 Flutter，也不用装 cmake / NDK ——
+    #    本工程没有一行 C/C++（解码走 MediaCodec，播放器是 ExoPlayer）。
     runs-on: ubuntu-latest
     timeout-minutes: 40
+
+    defaults:
+      run:
+        working-directory: android
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.29.0'
-          channel: stable
-          cache: true
-
-      # 与 release.yml 的 build-android 钉同一个 JDK（AGP 8.x 要 17+）。
+      # 与 release.yml 的 build-android 钉同一个 JDK。
+      # ⛔ 必须是 21：AGP 8.x 要 17+，而本机实测 Android Studio 自带的 JBR（25）
+      #    编译 Kotlin 会失败（同样是 21 的那台机器一切正常）。
       - name: 安装 JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      # ⚠️ 这个列表必须与 release.yml 的 build-android 里那一份**保持一致**
-      # （要改就两处一起改）。理由：runner 镜像里**没有** 26.3.11579264 这个 NDK
-      # 也**没有** cmake 3.22.1；而应用侧 `ndkVersion = flutter.ndkVersion`（Flutter 3.29 就是 26.3.11579264）、
-      # AGP 在不指定版本时固定要 cmake 3.22.1。升 Flutter 时这些号要跟着改。
+      # 只要 platform：没有原生代码就没有 cmake / NDK 的事。
+      # ⚠️ 这个列表要与 release.yml 的 build-android 保持一致（要改就两处一起改）。
       - name: 预装 Android SDK 组件
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" \
-            "platforms;android-36" \
-            "cmake;3.22.1" \
-            "ndk;26.3.11579264"
+          "$SDKMANAGER" "platforms;android-36"
 
-      - name: 拉取依赖
-        run: flutter pub get
+      - name: 单元测试
+        run: ./gradlew :app:testDebugUnitTest
 
-      - name: 静态分析
-        run: flutter analyze
-
-      # 用与本机出包、以及 release.yml 完全相同的那一个脚本。
-      - name: 构建 APK
-        run: bash tool/build_android.sh
+      - name: 构建 Release APK
+        run: ./gradlew :app:assembleRelease
 
       # 断言「错了就白发布」、且**不会因为正常升级而变**的项。
       - name: 校验产物
@@ -216,10 +217,10 @@ jobs:
           # 产物名由 android/app/build.gradle.kts 末尾的 brandReleaseApk 决定
           # （`cloudcine-<versionName>-b<versionCode>-android.apk`）。这里用 glob
           # 而不是拼名字 —— 拼名字等于把命名规则抄成第二份实现，改一处就分叉。
-          APK="$(ls -1 build/app/outputs/flutter-apk/cloudcine-*-android.apk 2>/dev/null | head -1 || true)"
+          APK="$(ls -1 app/build/outputs/apk/branded/cloudcine-*-android.apk 2>/dev/null | head -1 || true)"
           test -n "$APK" || {
-            echo "::error::没找到品牌化产物（build/app/outputs/flutter-apk/cloudcine-*-android.apk）"
-            ls -lh build/app/outputs/flutter-apk/ || true
+            echo "::error::没找到品牌化产物（android/app/build/outputs/apk/branded/cloudcine-*-android.apk）"
+            ls -lh app/build/outputs/apk/branded/ || true
             exit 1
           }
           echo "APK=$APK" >> "$GITHUB_ENV"
@@ -228,20 +229,13 @@ jobs:
           "$AAPT2" dump badging "$APK" > badging.txt
           grep -E "^(package|sdkVersion|targetSdkVersion|uses-permission)" badging.txt
 
-          grep -q "package: name='com.cloudcine.cloudcine'" badging.txt \
-            || { echo "::error::包名不是 com.cloudcine.cloudcine"; exit 1; }
+          grep -q "package: name='com.cloudcine.tv'" badging.txt \
+            || { echo "::error::包名不是 com.cloudcine.tv"; exit 1; }
 
-          # Flutter 模板只在 debug/profile 清单里加 INTERNET —— release 缺了就是
-          # **联网必失败且没有任何弹窗**（踩过一次，现象看着像解码问题）
+          # ⛔ release 缺 INTERNET 就是**联网必失败且没有任何弹窗**
+          #    （踩过一次，现象看着像解码问题）。
           grep -q "uses-permission: name='android.permission.INTERNET'" badging.txt \
             || { echo "::error::release 清单里没有 INTERNET 权限，装上去连不上网盘"; exit 1; }
-
-          # 四个 ABI 都必须在包里：Android 上唯一能播 libmpv 软解的那条路，
-          # 缺哪个 ABI，对应架构的设备就退回系统播放器、部分格式放不出来。
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            unzip -l "$APK" | grep -q "lib/$abi/libmpv.so" \
-              || { echo "::error::$abi 里没有 libmpv.so"; exit 1; }
-          done
 
           ls -lh "$APK"
           sha256sum "$APK"
@@ -251,5 +245,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cloudcine-android
-          path: build/app/outputs/flutter-apk/cloudcine-*-android.apk
+          path: android/app/build/outputs/apk/branded/cloudcine-*-android.apk
           if-no-files-found: warn

@@ -115,4 +115,54 @@ void main() {
     expect(find.text('按名称**自然序**（`第2期` 排在 `第10期` 前面）。'),
         findsOneWidget);
   });
+
+  testWidgets('「诊断」一节在，调试指标默认关，点开关会写进设置', (tester) async {
+    // 这一组守的是「设置页这一侧真的接上了 `debugOverlay` 这个键」：
+    // `onChanged` 写错字段（或写到内存却不落库）都会让「打开开关却看不到
+    // 浮层」—— 而且不报错。provider 那一侧的默认值已在
+    // `settings_providers_test.dart` 里钉过了，这里只管「页面 ↔ 键」这条链。
+    final container = await pumpSettings(tester);
+
+    expect(find.text('诊断'), findsOneWidget);
+    expect(find.text('显示调试指标'), findsOneWidget);
+
+    // 默认是关：库里没这个键，页面读出来的就是 false。
+    expect(
+      container.read(settingsProvider).valueOrNull!.debugOverlay,
+      isFalse,
+      reason: '全新安装默认关 —— 见 settings_providers_test 那一组',
+    );
+
+    // 找到「显示调试指标」那一行的开关。`_ToggleRow` 是「文案 + Switch」
+    // 一行，Switch 是这个 Row 里唯一的 Switch，但页面上其它开关也不少，
+    // 所以按「行标签」定位最稳：先找到标签，再往回找到它所在的 Row，
+    // 在那个 Row 的作用域里按类型找 Switch。
+    final label = find.text('显示调试指标');
+    final row = find.ancestor(
+      of: label,
+      matching: find.byType(Row),
+    );
+    final toggle = find.descendant(
+      of: row,
+      matching: find.byType(Switch),
+    );
+    expect(toggle, findsOneWidget);
+
+    // 「诊断」一节在页面最底部，viewport 装不下 —— 先把那一行的开关滚进
+    // 可视区，否则 `tap` 算出来的坐标落在屏幕外、根本点不中（命中测试失败，
+    // 开关保持原样，下面的断言就会「默认关」永远成立）。
+    await tester.ensureVisible(toggle);
+    await tester.pumpAndSettle();
+
+    await tester.tap(toggle, warnIfMissed: false);
+    await tester.pumpAndSettle();
+
+    // 既改了内存状态，也落了库。只改其一的话，切走再切回设置页看到的会
+    // 是旧值，或者重启应用浮层又没了。
+    expect(container.read(settingsProvider).valueOrNull!.debugOverlay, isTrue);
+    expect(
+      await container.read(settingsStoreProvider).read(SettingKeys.debugOverlay),
+      'true',
+    );
+  });
 }

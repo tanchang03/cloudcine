@@ -22,12 +22,17 @@ name: Release
 # zip 是解压即用的兜底。两者由 build_package.ps1 一次生成，脚本同时被
 # ci.yml 复用 —— 每次推 main 就会验证一遍打包链路，而不是等发版才发现坏了。
 #
-# ── Android 交付物：一个通用 APK ──────────────────────────────────────────
-# 四种 ABI（arm64-v8a / armeabi-v7a / x86 / x86_64）都在同一个包里，手机与平板
-# 用同一个文件，用户不用挑。产物名 `cloudcine-<ver>-b<versionCode>-android.apk`
-# 与另外两个平台对齐，**由 `android/app/build.gradle.kts` 里的 brandReleaseApk 产出**
-# —— 不是脚本后处理改的名，所以直接跑 `flutter build apk` 同样拿得到品牌名。
-# `tool/build_android.sh` 只是「构建 + 校验 + 打印 sha256」的薄封装。
+# ── Android 交付物：一个通用 APK（原生工程）────────────────────────────────
+# ⛔ 从 2026-10-06 起，Android 端是 `android/` 下的**原生 Kotlin 工程**，
+#    不再走 `flutter build apk`。build-android 这个 job 也因此**不装 Flutter**。
+#
+# 产物是**跨架构通用**的：本工程没有一行 C/C++（解码走系统 MediaCodec），
+# 所以一个包就能覆盖 arm64-v8a / armeabi-v7a / x86 / x86_64，手机、平板、
+# Android TV 用同一个文件，用户不用挑。
+#
+# 产物名 `cloudcine-<ver>-b<versionCode>-android.apk` 与另外两个平台对齐，
+# **由 `android/app/build.gradle.kts` 末尾的 `brandReleaseApk` 产出** ——
+# 不是脚本后处理改的名，所以直接跑 `./gradlew :app:assembleRelease` 同样拿得到。
 #
 # ⚠️ 签名：配了 `ANDROID_KEYSTORE_BASE64` 那组 secret 就用它签，没配则退回 debug 签名。
 # debug 签名能侧载，但**每个 CI 产物的签名都不一样**，用户装新版会报「应用未安装」，
@@ -229,9 +234,15 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $lines
 
   build-android:
-    name: 构建 Android APK
+    name: 构建 Android APK（原生工程）
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
+    # ⛔ Android 端是 `android/` 下的**原生 Kotlin 工程**，所以本 job 全程在
+    #    那个目录里跑，**不装 Flutter**（仓库根的 Flutter 现在只服务 macOS / Windows）。
+    defaults:
+      run:
+        working-directory: android
 
     steps:
       - name: 检出代码
@@ -239,16 +250,9 @@ jobs:
 
       - name: 读取版本号
         run: |
-          VERSION="$(grep '^version:' pubspec.yaml | cut -d' ' -f2 | cut -d'+' -f1)"
-          [ -n "$VERSION" ] || { echo "::error::读不到 pubspec.yaml 的 version"; exit 1; }
+          VERSION="$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$VERSION" ] || { echo "::error::读不到 android/app/build.gradle.kts 的 versionName"; exit 1; }
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-
-      - name: 安装 Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.29.0'
-          channel: stable
-          cache: true
 
       - name: 安装 JDK
         uses: actions/setup-java@v4
@@ -256,23 +260,17 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # platforms;android-36：应用侧 `compileSdk = maxOf(flutter.compileSdkVersion, 36)`，
-      # 而 Flutter 3.29 给的是 35。cmake;3.22.1 / ndk;26.3.11579264：runner 镜像自带的
-      # 是更高版本，必须自己装。升 Flutter 时这些号要跟着改。
+      # 只要 platform：本工程没有一行 C/C++（解码走 MediaCodec，播放器是
+      # ExoPlayer），所以不需要 cmake / NDK —— 比原来那条 Flutter 链路少了两个大件。
       - name: 预装 Android SDK 组件
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" \
-            "platforms;android-36" \
-            "cmake;3.22.1" \
-            "ndk;26.3.11579264"
+          "$SDKMANAGER" "platforms;android-36"
 
-      - name: 拉取依赖
-        run: flutter pub get
-
-      # ── 配置发布签名 ───────────────────────────────────────────────────────
-      # 四个 secret 都在就用正式密钥签名，缺任意一个都退回 debug 签名。
+      # ── 配置发布签名 ─────────────────────────────────────────────────────
+      # 四个 secret 都在就用正式密钥签名，缺任意一个都退回 debug 签名
+      # （`app/build.gradle.kts` 读的就是这个 `keystore.properties`）。
       # 生成并上传密钥（在你自己机器上跑一次）：
       #   keytool -genkeypair -v -keystore cloudcine-release.jks \
       #     -keyalg RSA -keysize 2048 -validity 10000 -alias cloudcine
@@ -297,8 +295,9 @@ jobs:
             echo "SIGNING_KIND=debug" >> "$GITHUB_ENV"
             exit 0
           fi
-          echo "$KEYSTORE_BASE64" | base64 -d > android/app/cloudcine-release.jks
-          cat > android/key.properties <<EOF
+          # 路径是**相对 android/app/** 解析的（`app/build.gradle.kts` 里的 `file()`）。
+          echo "$KEYSTORE_BASE64" | base64 -d > app/cloudcine-release.jks
+          cat > keystore.properties <<EOF
           storeFile=cloudcine-release.jks
           storePassword=$STORE_PASSWORD
           keyAlias=$KEY_ALIAS
@@ -307,21 +306,22 @@ jobs:
           echo "SIGNING_KIND=release" >> "$GITHUB_ENV"
 
       - name: 构建 APK
-        run: bash tool/build_android.sh
+        run: ./gradlew :app:testDebugUnitTest :app:assembleRelease
 
       # 产物层面的断言必须在发布前跑。这几条都是「错了就白发布」的项：
       #   - 包名：装错包会变成另一个应用；
-      #   - INTERNET 权限：release 缺了就是**联网必失败且无弹窗**；
-      #   - libmpv 四个 ABI：Android 上唯一能播 libmpv 软解的那条路。
+      #   - INTERNET 权限：release 缺了就是**联网必失败且无弹窗**。
+      # ⛔ 不再校验 libmpv 的四个 ABI —— 那是 Flutter 侧 mpv 软解的事，
+      #    本工程解码走系统 MediaCodec，包里本来就没有 .so。
       - name: 校验产物
         run: |
           # 产物名由 android/app/build.gradle.kts 末尾的 brandReleaseApk 决定
           # （`cloudcine-<versionName>-b<versionCode>-android.apk`）。这里用 glob
           # 而不是拼名字 —— 拼名字等于把命名规则抄成第二份实现，改一处就分叉。
-          APK="$(ls -1 build/app/outputs/flutter-apk/cloudcine-*-android.apk 2>/dev/null | head -1 || true)"
+          APK="$(ls -1 app/build/outputs/apk/branded/cloudcine-*-android.apk 2>/dev/null | head -1 || true)"
           test -n "$APK" || {
-            echo "::error::没找到品牌化产物（build/app/outputs/flutter-apk/cloudcine-*-android.apk）"
-            ls -lh build/app/outputs/flutter-apk/ || true
+            echo "::error::没找到品牌化产物（android/app/build/outputs/apk/branded/cloudcine-*-android.apk）"
+            ls -lh app/build/outputs/apk/branded/ || true
             exit 1
           }
           echo "APK=$APK" >> "$GITHUB_ENV"
@@ -330,14 +330,10 @@ jobs:
           "$AAPT2" dump badging "$APK" > badging.txt
           grep -E "^(package|sdkVersion|targetSdkVersion|uses-permission)" badging.txt
 
-          grep -q "package: name='com.cloudcine.cloudcine'" badging.txt \
-            || { echo "::error::包名不是 com.cloudcine.cloudcine"; exit 1; }
+          grep -q "package: name='com.cloudcine.tv'" badging.txt \
+            || { echo "::error::包名不是 com.cloudcine.tv"; exit 1; }
           grep -q "uses-permission: name='android.permission.INTERNET'" badging.txt \
             || { echo "::error::release 清单里没有 INTERNET 权限，装上去连不上网盘"; exit 1; }
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            unzip -l "$APK" | grep -q "lib/$abi/libmpv.so" \
-              || { echo "::error::$abi 里没有 libmpv.so"; exit 1; }
-          done
 
           APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
           "$APKSIGNER" verify --print-certs "$APK" | head -5
@@ -349,7 +345,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cloudcine-android
-          path: build/app/outputs/flutter-apk/cloudcine-*-android.apk
+          path: android/app/build/outputs/apk/branded/cloudcine-*-android.apk
           if-no-files-found: error
 
       - name: 写发布摘要
@@ -364,13 +360,14 @@ jobs:
             echo '### Android 构建结果'
             echo ''
             echo "- 版本：\`${VERSION}\`"
-            echo "- 产物：\`$(basename "$APK")\`（通用包，四种 ABI 都在里面）"
+            echo "- 产物：\`$(basename "$APK")\`"
             echo "- 签名：${SIGN_LABEL}"
-            echo '- 运行要求：Android 5.0 (API 21) 或更高；手机 / 平板均可'
+            echo '- 运行要求：Android 5.0 (API 21) 或更高；手机 / 平板 / Android TV'
             echo ''
             echo '### 用户安装提示'
             echo ''
             echo '- 手机 / 平板：用文件管理器点开 APK，系统问「未知来源应用」时允许一次'
+            echo '- Android TV：用「小白文件管理」之类装，或用 adb install 从电脑推'
             if [ "${SIGNING_KIND:-}" != "release" ]; then
               echo ''
               echo '> ⚠️ **本次产物是 debug 签名、且每次构建的签名都不同** —— 用户装新版本时会报'
@@ -411,3 +408,4 @@ jobs:
             --notes "$NOTES" \
             --generate-notes \
             dist/*
+

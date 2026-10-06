@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 启动主题：深色 launch_background 消除白屏，但父类保持 Light——
-         Theme.Black 在这台 TV 上会导致 Flutter surface 不上屏（黑屏进不去）。 -->
-    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <item name="android:windowBackground">@drawable/launch_background</item>
+    <!-- 只用框架主题，不引 AppCompat / Material（理由见 app/build.gradle.kts）。 -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/surface</item>
+        <item name="android:colorBackground">@color/surface</item>
+        <item name="android:colorAccent">@color/brand</item>
     </style>
-    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <item name="android:windowBackground">@color/window_background</item>
+
+    <!-- 启动页专用：把 windowBackground 换成带品牌图标的那张。
+         ⛔ 只挂 MainActivity，别挂全局 —— 否则每次页面切换都会闪一下图标。 -->
+    <style name="SplashTheme" parent="@style/AppTheme">
+        <item name="android:windowBackground">@drawable/splash</item>
     </style>
 </resources>

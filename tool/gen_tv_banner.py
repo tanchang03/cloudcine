@@ -11,6 +11,10 @@
     /Users/tandy/.workbuddy-ai-5/binaries/python/envs/default/bin/python tool/gen_tv_banner.py
 
 输出：`android/app/src/main/res/drawable-xhdpi/banner.png`
+
+⛔ 注意：`android/` 现在是**原生 Kotlin 工程**（Android 端正式实现），这张 banner
+就是它给电视首页用的那张 —— 路径没变，但归属变了。改了 `android/` 的图标或
+品牌色，重跑一次这里。
 """
 from __future__ import annotations
 

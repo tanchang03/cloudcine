@@ -12,14 +12,14 @@ import '../../data/playback/video_player_exo_playback_engine.dart';
 import '../../domain/services/playback_controller.dart';
 import '../providers/app_providers.dart';
 
-/// 调试浮层开关。
-///
-/// 调试期默认开（debug APK 里是真机联调，指标要随时可见）；release 构建里
-/// 默认关 —— 用户不该看到一排数字叠在画面上。真机要看时把这里改回 `true`
-/// 重新构建即可。
-const bool kDebugOverlayEnabled = true;
-
 /// 实时资源指标浮层：CPU / 内存 / FPS / 线程 / 负载 / **解码内核与硬解状态**。
+///
+/// ## 开关在哪
+///
+/// 由设置项 `SettingKeys.debugOverlay` 控制（设置页「诊断」一节的「显示调试
+/// 指标」开关），**默认关**。这里**刻意没有编译期常量开关**：以前那个
+/// `kDebugOverlayEnabled` 只能靠改代码重新构建来切，而「我想看一眼现在的
+/// CPU」这件事不该要求用户会编译 —— 真机上要临时看，只能走设置。
 ///
 /// 挂在 `MaterialApp.builder` 上（Navigator 之上），浮在画面右上角。
 /// 用途是**真机调优时实时看资源** —— 之前「OSD 卡顿是不是 CPU 满」这种

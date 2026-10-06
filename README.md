@@ -7,7 +7,8 @@
 不下载 · 不搬家 · 不建后端
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Flutter](https://img.shields.io/badge/Flutter-3.29-02569B?logo=flutter&logoColor=white)](https://flutter.dev)
+[![桌面端](https://img.shields.io/badge/desktop-Flutter%203.29-02569B?logo=flutter&logoColor=white)](https://flutter.dev)
+[![Android](https://img.shields.io/badge/android-native%20Kotlin-7F52FF?logo=kotlin&logoColor=white)](android/README.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android-lightgrey)](#平台支持)
 
 </div>
@@ -50,10 +51,14 @@
 
 | 平台 | 状态 |
 |---|---|
-| **macOS** | ✅ 主要目标，已实测 |
-| Windows | ⚠️ 代码已适配，播放后端与 macOS 同一条路（`media_kit` / mpv）；尚未在真机实测 |
-| Android | ⚠️ 工程已就绪；未在真机实测 |
+| **macOS** | ✅ 主要目标，已实测（Flutter / 桌面端） |
+| Windows | ⚠️ 代码已适配，播放后端与 macOS 同一条路（`media_kit` / mpv）；尚未在真机实测（Flutter / 桌面端） |
+| **Android / Android TV** | ✅ **原生 Kotlin 实现**（`android/`），已在一台小米电视（Android 9）上真机实测：登录、浏览、4K 播放、拖拽、磁盘缓存全部跑通 |
 | iOS / Linux / Web | ❌ 暂未适配 |
+
+> ⚠️ **Android 端不是 Flutter 工程**，详见[仓库结构](#仓库结构)。桌面端与 Android 端
+> 是两套独立代码，功能对等程度不同：媒体库刮削、字幕搜索、季/部层级这些
+> 只在桌面端有。
 
 网盘支持情况：
 
@@ -64,6 +69,35 @@
 
 > 目前是**单网盘**实现。架构上已经把「网盘适配器」抽成接口（`lib/domain/adapters/`），接入新网盘不需要动上层。
 
+## 仓库结构
+
+这个仓库里有**两个互不相干的工程**，各自构建各自的平台，互不引用：
+
+```
+网盘媒体库播放器/
+├── android/          ← ★ Android 端正式实现：**原生 Kotlin**
+│   ├── app/            ExoPlayer + MediaCodec 直出 SurfaceView + 原生 View OSD
+│   ├── tool/           adb_tv.sh（装包 / 看日志 / 按遥控器键）
+│   └── README.md       构建、遥控器键位、踩坑清单
+│
+├── lib/ macos/ windows/ test/ packages/ pubspec.yaml …
+│                     ← Flutter 桌面端（macOS / Windows）
+│
+├── docs/             调研与实测记录（性能、遥控器、缓存…）
+├── tool/             仓库级开发脚本（夸克 API 探针等）
+└── .github/          CI（两个工程各跑各的）
+```
+
+**为什么 Android 不用 Flutter**：不是口味问题，是在一台小米电视（Android 9，
+4 核 / 2.5 GB）上量出来的 —— 瓶颈不在解码、不在渲染面，而在**数据通路**：
+
+- 夸克对**单条连接**限速约 1 MiB/s，而 4K 原画要 3.67 MiB/s，只能靠多连接去凑；
+- 桌面端那套多连接中继跑在 **Dart 主 isolate**（= Android 主线程）上，
+  实测「按 MENU → 菜单上屏」**524 ms**，原生同口径 **0.3 ~ 8.3 ms**。
+
+所以 Android 端走原生：8 连接并行取流 + 磁盘旁路预取 + 原生 OSD。
+证据在 `docs/AndroidTV-4K-丢帧-夸克对标.md` 与 `docs/解决4k片源不卡顿解析方案.md`。
+
 ## 安装
 
 ### 系统要求
@@ -72,6 +106,7 @@
 |---|---|
 | macOS | **10.15 (Catalina) 或更高** |
 | Windows | **10 (x64) 或更高** |
+| Android | **5.0 (API 21) 或更高**；手机、平板、Android TV 同一个包 |
 | 其它 | 无。不需要装任何运行时，也不依赖服务端 |
 
 ### 方式一：下载安装包（推荐）
@@ -82,12 +117,14 @@
 |---|---|
 | macOS | `cloudcine-x.y.z-macos.dmg` |
 | Windows | `cloudcine-x.y.z-windows-x64.msi` |
+| Android | `cloudcine-x.y.z-b<build>-android.apk` |
 
 > 安装包**未做代码签名 / 公证**（需要付费开发者账号）。首次打开可能被系统拦截（macOS Gatekeeper、Windows SmartScreen），提示「无法验证开发者」或「Windows 已保护你的电脑」—— **这不是文件损坏，也不是中毒**，按系统提示「仍要打开」即可。
 
 ### 方式二：从源码构建
 
-前置条件：Flutter 3.29+、对应平台的构建工具链（macOS 需 Xcode + CocoaPods；Windows 需 Visual Studio 2022「使用 C++ 的桌面开发」）。
+**桌面端**（macOS / Windows）前置条件：Flutter 3.29+、对应平台的构建工具链
+（macOS 需 Xcode + CocoaPods；Windows 需 Visual Studio 2022「使用 C++ 的桌面开发」）。
 
 ```bash
 git clone https://github.com/tanchang03/cloudcine.git
@@ -97,7 +134,21 @@ flutter pub get
 
 - **macOS**：`(cd macos && pod install) && flutter build macos --release`，产物在 `build/macos/Build/Products/Release/CloudCine.app`
 - **Windows**：`flutter build windows --release`，产物是 `build\windows\x64\runner\Release\`（exe + dll + data，整文件夹一起拷）
-- **Android**：`flutter build apk --release`，产物在 `build/app/outputs/flutter-apk/`
+
+**Android 端**前置条件：JDK **21**（用 Android Studio 自带的 JBR 25 会编译失败）、Android SDK Platform 36。**不需要 Flutter。**
+
+```bash
+cd android
+export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home
+export ANDROID_HOME=$HOME/Library/Android/sdk
+
+./gradlew :app:assembleDebug      # 自测
+./gradlew :app:assembleRelease    # 发版（会自动带上单测）
+```
+
+产物在 `android/app/build/outputs/apk/`（`branded/` 下的是品牌化副本）。
+装包与真机调试见 [`android/README.md`](android/README.md)，或用助手脚本
+`android/tool/adb_tv.sh`（装包 / 看日志 / 按遥控器键 / 截屏）。
 
 > 仓库默认 **ad-hoc 签名**（不含任何真实证书名 / Team ID），任何人 clone 下来都能直接构建，不需要付费开发者账号。需要分发包时再用自己的 Developer ID / 签名证书。
 
@@ -124,7 +175,12 @@ flutter pub get
 
 - macOS：`~/Library/Application Support/com.cloudcine.cloudcine/logs/cloudcine-YYYY-MM-DD.log`
 - Windows：`%APPDATA%\com.cloudcine.cloudcine\logs\`
-- Android：`adb logcat` 或应用内诊断页
+- Android：`adb logcat -s CloudCine`（或 `android/tool/adb_tv.sh log`）。
+
+  ⛔ Android 端**没有**日志文件：有硬件视频层时 `screencap` 拿不到画面、
+  播放中 `uiautomator dump` 也拿不到 UI，logcat 是唯一的出口 ——
+  所以业务日志走 `Log.i("CloudCine", …)`，不是调试残留。
+  调试浮层默认关闭，开法：播放页 → 菜单 → 调试 → 开启。
 
 常见问题：
 

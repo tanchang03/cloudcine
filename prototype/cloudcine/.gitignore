@@ -1,6 +1,0 @@
-# 原型工程的本地产物 —— 不进版本库（与 `android/` 同一套约定）。
-.gradle/
-build/
-local.properties
-*.iml
-.idea/

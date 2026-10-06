@@ -211,6 +211,74 @@ void main() {
       expect(s.scanIntervalMs, 350);
       expect(s.scanMaxDepth, 12);
       expect(s.lastScanAt, isNull);
+      expect(s.debugOverlay, isFalse,
+          reason: '调试浮层默认**关** —— 见下面那一组');
+    });
+  });
+
+  group('调试指标浮层：默认关，要显式打开', () {
+    // 这一组与上面几项**方向相反**（缺失即关），所以判据必须写成 `== 'true'`。
+    // 写反的后果不是报错，而是「每个用户一装上就顶着一排数字，而设置页的
+    // 开关是关着的」—— 用户会以为这开关坏了、关不掉。
+    test('全新安装（一个键都没有）→ 不显示', () {
+      expect(
+        AppSettings.fromValues(const <String, String?>{}).debugOverlay,
+        isFalse,
+        reason: '它是排查工具不是功能：一排每秒刷新的数字叠在画面上，'
+            '日常看片只会挡视线',
+      );
+    });
+
+    test('老库升级：别的键都有、唯独缺这一个 → 仍然不显示', () {
+      final s = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.logLevel: 'debug',
+        SettingKeys.streamRelay: 'true',
+        SettingKeys.autoPlayNext: 'true',
+      });
+      expect(s.logLevel, 'debug');
+      expect(s.streamRelay, isTrue);
+      expect(s.debugOverlay, isFalse,
+          reason: '缺键必须等价于关。缺键即开的话，所有老用户升级完都会'
+              '发现自己界面上多了一排数字');
+    });
+
+    test('只有显式写入 true 才打开', () {
+      expect(
+        AppSettings.fromValues(const <String, String?>{
+          SettingKeys.debugOverlay: 'true',
+        }).debugOverlay,
+        isTrue,
+      );
+      expect(
+        AppSettings.fromValues(const <String, String?>{
+          SettingKeys.debugOverlay: 'false',
+        }).debugOverlay,
+        isFalse,
+      );
+      // ⛔ 这一条是整组的**判据**：它区分 `== 'true'` 与 `!= 'false'` 两种写法。
+      // 换成 `!= 'false'` 的话，'1'、任何非空字符串、乃至于老版本写进去的
+      // 乱码**全都会打开浮层** —— 而这正是「默认值写反了」最难查的形态：
+      // 代码看着是「不等于 false 就开」，用户看到的是「关不掉」。
+      //
+      // 注意 `SettingsStore.readBool` 认 '1'，但那条路不参与 `AppSettings`
+      // （读设置走的是 `readAll` + `fromValues`），所以这里只认字面量 'true'
+      // 不会造成「设置页显示关、实际开着」的不一致。
+      expect(
+        AppSettings.fromValues(const <String, String?>{
+          SettingKeys.debugOverlay: '1',
+        }).debugOverlay,
+        isFalse,
+      );
+    });
+
+    test('默认构造与 copyWith 都保持这个默认值', () {
+      // `AppSettings()` 是设置还没从库里读出来时的兜底值（见
+      // `SettingsController.set` 里的 `valueOrNull ?? const AppSettings()`）。
+      // 它必须是「关」，否则第一次改任何设置都会顺手把浮层打开。
+      expect(const AppSettings().debugOverlay, isFalse);
+      expect(const AppSettings().copyWith().debugOverlay, isFalse);
+      expect(const AppSettings().copyWith(debugOverlay: true).debugOverlay,
+          isTrue);
     });
   });
 }

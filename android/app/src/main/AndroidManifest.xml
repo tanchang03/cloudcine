@@ -1,74 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ⛔ **别删这条**（2026-10-06 实测踩过）：全工程确实没有一处
+         `ConnectivityManager`，我一度以为它是死权限并删掉了 —— 但 `aapt2 dump
+         badging` 显示**产物里它还在**，因为它是 **`media3-exoplayer` 自己的
+         manifest 合并进来的**（ExoPlayer 的 `Util.getNetworkType` 要用）。
+         这里显式声明一份，是为了「依赖哪天不合并了也不会悄悄丢掉」，
+         不是我们自己的需求。删了它只会让注释变成假的。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 唤醒锁：ExoPlayer 的 setWakeMode 用它，播放中不让系统休眠。
+         云影那边是 media_kit 的 wakelock 插件在管，这里直接声明。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- ===== Android TV（2026-10-02）=====
-         下面两条 uses-feature 决定「应用会不会出现在 TV 的 Google Play 上」。
-         缺 android.hardware.touchscreen(required=false) 时系统认为本应用需要触摸屏，
-         会把无触摸屏的 TV 设备从可安装列表里滤掉。
-         ⚠️ required="false" 不能省成「不写」—— 不写等于 required="true"，效果一样是被 TV 排除。 -->
-    <uses-feature
-        android:name="android.software.leanback"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.touchscreen"
-        android:required="false" />
+    <!-- 电视上要能装：触摸屏与 leanback 都不作为硬性要求。 -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
 
+    <!-- ⛔ 必须开：本地中继是明文 http://127.0.0.1:xxxxx，Android 9 起默认禁止。 -->
+    <!-- ⛔ `largeHeap="true"` 是**必需**的，不是优化。
+         本机 `getprop` 实测：`dalvik.vm.heapgrowthlimit=192m`、
+         `dalvik.vm.heapsize=512m`、`ro.config.low_ram=true`。
+         不开这个开关，App 的 Java 堆上限就是 **192 MiB**；而
+         `ParallelRangeReader` 每实例一次性分配 `8 × 2 MiB = 16 MiB`
+         槽位数组，一次拖拽的 seek 风暴足以把它打满（2026-10-06 真机：
+         `FATAL EXCEPTION: cc-range-1 / OutOfMemoryError`，GC `freed 0(0B)`）。
+         开了之后上限到 512 MiB，突发有了余量。
+         ⚠️ 副作用（可控）：`PlayerActivity` 的缓冲预算按 `堆上限 / 4` 算，
+         会从 48 MiB 升到 64 MiB —— 但那里有 `min(..., 64 MiB)` 封顶。 -->
     <application
-        android:label="影视 CloudCine"
-        android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
         android:banner="@drawable/banner"
-        android:usesCleartextTraffic="true">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true"
+        android:allowBackup="false"
+        android:theme="@style/AppTheme">
+
+        <!-- 启动页：只看登录态，然后转去登录页或文件列表。
+             ⛔ theme 覆盖成 SplashTheme（windowBackground 带品牌图标）——
+                系统在 Activity 起来之前就画它，所以「黑屏一闪」变成品牌露出，
+                且**不花启动时间**。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
-            android:taskAffinity=""
-            android:theme="@style/LaunchTheme"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
-            android:hardwareAccelerated="true"
+            android:theme="@style/SplashTheme"
             android:screenOrientation="landscape"
-            android:windowSoftInputMode="adjustResize">
-            <!-- Specifies an Android theme to apply to this Activity as soon as
-                 the Android process has started. This theme is visible to the user
-                 while the Flutter UI initializes. After that, this theme continues
-                 to determine the Window background behind the Flutter UI. -->
-            <meta-data
-              android:name="io.flutter.embedding.android.NormalTheme"
-              android:resource="@style/NormalTheme"
-              />
-            <!-- 两个 category 必须同时在同一个 intent-filter 里：
-                 LAUNCHER        → 手机/平板的桌面图标
-                 LEANBACK_LAUNCHER → TV 首页的图标。
-                 ⚠️ 缺 LEANBACK_LAUNCHER 时，官方文档的原话是
-                 「用开发工具装到 TV 上，它不会出现在 TV 用户界面里」—— 侧载都找不到入口。 -->
+            android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
-                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- 电视首页入口（遥控器能直接点开，不用每次都 adb）。 -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- Don't delete the meta-data below.
-             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
-        <meta-data
-            android:name="flutterEmbedding"
-            android:value="2" />
-        <!-- 禁用 OnBackInvokedCallback：设备是 Android 9 (SDK 28)，
-             该 API 从 SDK 33 才引入。不写这条会导致 FlutterActivity
-             的 init 阶段找不到类而初始化失败 → 黑屏。 -->
-        <meta-data
-            android:name="io.flutter.embedding.android.EnableOnBackInvokedCallback"
-            android:value="false" />
-    </application>
-    <!-- Required to query activities that can process text, see:
-         https://developer.android.com/training/package-visibility and
-         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
 
-         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
-    <queries>
-        <intent>
-            <action android:name="android.intent.action.PROCESS_TEXT"/>
-            <data android:mimeType="text/plain"/>
-        </intent>
-    </queries>
+        <!-- 扫码登录页：二维码画在电视上，手机扫码。 -->
+        <activity
+            android:name=".LoginActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 文件列表页：遥控器上下选择，OK 进目录 / 起播。 -->
+        <activity
+            android:name=".BrowseActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 播放页：ExoPlayer + SurfaceView + 原生 OSD。这是要验证的那一页。
+             exported=true 是为了保留「am start 时用 -e url 传地址」这条对照路径。 -->
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+    </application>
 </manifest>

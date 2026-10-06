@@ -32,6 +32,7 @@ class AppSettings {
     this.scanMaxDepth = 12,
     this.lastScanAt,
     this.logLevel = 'info',
+    this.debugOverlay = false,
     this.streamRelay = true,
     this.relayConnections = 8,
     this.folderSortMode = FolderSortMode.modifiedTime,
@@ -130,6 +131,13 @@ class AppSettings {
   final DateTime? lastScanAt;
   final String logLevel;
 
+  /// 是否在右上角常驻显示实时调试指标浮层。**默认关**。
+  ///
+  /// 理由见 `SettingKeys.debugOverlay`：它是排查工具而不是功能，默认占着画面
+  /// 只会挡视线。关掉时那个浮层**根本不会被创建**（不是隐藏），所以定时器
+  /// 与逐帧回调都不存在 —— 不打开就没有开销。
+  final bool debugOverlay;
+
   /// 播网盘原画时是否走本地中继（多连接并发预取）。**默认开**，理由见
   /// `SettingKeys.streamRelay`。
   ///
@@ -209,6 +217,7 @@ class AppSettings {
     int? scanMaxDepth,
     DateTime? lastScanAt,
     String? logLevel,
+    bool? debugOverlay,
     bool? streamRelay,
     int? relayConnections,
     FolderSortMode? folderSortMode,
@@ -236,6 +245,7 @@ class AppSettings {
       scanMaxDepth: scanMaxDepth ?? this.scanMaxDepth,
       lastScanAt: lastScanAt ?? this.lastScanAt,
       logLevel: logLevel ?? this.logLevel,
+      debugOverlay: debugOverlay ?? this.debugOverlay,
       streamRelay: streamRelay ?? this.streamRelay,
       relayConnections: relayConnections ?? this.relayConnections,
       folderSortMode: folderSortMode ?? this.folderSortMode,
@@ -295,6 +305,10 @@ class AppSettings {
       scanMaxDepth: int.tryParse(v[SettingKeys.scanMaxDepth] ?? '') ?? 12,
       lastScanAt: DateTime.tryParse(v[SettingKeys.lastScanAt] ?? ''),
       logLevel: v[SettingKeys.logLevel] ?? 'info',
+      // ⚠️ 与紧邻的 `streamRelay` **刻意相反**：这一项缺失即**关**，判据必须
+      // 写成「等于 true」。写反的后果是每个用户一装上就顶着一排数字，
+      // 而设置页的开关是关着的（理由见 `SettingKeys.debugOverlay`）。
+      debugOverlay: v[SettingKeys.debugOverlay] == 'true',
       // 中继两项都是「缺失即用默认」，判据与 autoPlayNext 同族。
       streamRelay: v[SettingKeys.streamRelay] != 'false',
       // 卡在 1..16：0 条会让流根本下不来（open 直接返回 null，等于静默关掉
@@ -351,6 +365,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       SettingKeys.scanMaxDepth,
       SettingKeys.lastScanAt,
       SettingKeys.logLevel,
+      SettingKeys.debugOverlay,
       SettingKeys.streamRelay,
       SettingKeys.relayConnections,
       SettingKeys.folderSortMode,
@@ -382,6 +397,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     int? scanIntervalMs,
     int? scanMaxDepth,
     String? logLevel,
+    bool? debugOverlay,
     bool? streamRelay,
     int? relayConnections,
     FolderSortMode? folderSortMode,
@@ -454,6 +470,9 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     if (logLevel != null) {
       await store.write(SettingKeys.logLevel, logLevel);
     }
+    if (debugOverlay != null) {
+      await store.writeBool(SettingKeys.debugOverlay, debugOverlay);
+    }
     if (streamRelay != null) {
       await store.writeBool(SettingKeys.streamRelay, streamRelay);
     }
@@ -497,6 +516,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
         scanIntervalMs: scanIntervalMs,
         scanMaxDepth: scanMaxDepth,
         logLevel: logLevel,
+        debugOverlay: debugOverlay,
         streamRelay: streamRelay,
         relayConnections: relayConnections?.clamp(1, 16).toInt(),
         folderSortMode: folderSortMode,

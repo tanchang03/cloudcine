@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 应用启动背景色：与 Flutter 侧 AppTheme.bg 一致，消除白屏 -->
-    <color name="window_background">#FF0B0D12</color>
+    <!-- 品牌主色（与 `ic_launcher` 的紫、OSD 选中态的 `#7F77DD` 同一支）。
+         ⛔ 深色底上不要用 `brand` 直接当文字色（偏暗），OSD / 控制栏各自
+            有一套带透明度的画法，改这里之前先看那两处。 -->
+    <color name="brand">#FF7F77DD</color>
+
+    <!-- 页面底色。全 App 统一这一个值，别在代码里再写第二份 #101216。 -->
+    <color name="surface">#FF101216</color>
+
+    <!-- 启动页底色：比 surface 再深一档，让居中的图标更亮一点。 -->
+    <color name="splash_bg">#FF0B0E15</color>
 </resources>
