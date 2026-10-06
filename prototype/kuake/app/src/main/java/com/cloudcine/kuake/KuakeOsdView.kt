@@ -40,7 +40,19 @@ import android.widget.TextView
  */
 class KuakeOsdView(context: Context) : FrameLayout(context) {
 
-    /** 一行。字段与云影 `PlayerTvRowValue` 一一对应。 */
+    /**
+     * 一行。前六个字段与云影 `PlayerTvRowValue` 一一对应。
+     *
+     * [id] 与 [active] 是原生版**额外**加的两个字段，都源于同一个原因：
+     * 原生只回传**行下标**（[onActivate]），而下标会漂移。
+     *
+     *   * [id] —— 行数不是固定的：「直接给 URL」的对照路径就没有画质行，
+     *     片源没有内嵌字幕时字幕行会退化成一句提示。用下标去 `when`，
+     *     迟早把「字幕」接到「倍速」上；用稳定 id 还原语义就不会。
+     *   * [active] —— 当前**生效**的选项下标。打开菜单时光标直接停在这上面，
+     *     否则光标永远落在第一项、和用户此刻的状态对不上（比如现在放的是
+     *     中文硬字幕，光标却停在「关闭」上，一按 OK 就把它关了）。
+     */
     class Row(
         val label: String,
         val value: String,
@@ -50,6 +62,10 @@ class KuakeOsdView(context: Context) : FrameLayout(context) {
         val vertical: Boolean = false,
         /** options 为空时显示的那句说明。 */
         val hint: String? = null,
+        /** 稳定标识，见类注释。 */
+        val id: String = "",
+        /** 当前生效项的下标；`-1` 表示「这行没有生效态」（如调试开关）。 */
+        val active: Int = -1,
     ) {
         fun isEnabled(i: Int): Boolean = enabled.getOrElse(i) { true }
     }
@@ -149,10 +165,19 @@ class KuakeOsdView(context: Context) : FrameLayout(context) {
         rebuildRight()
     }
 
+    /**
+     * 光标该停在哪一项。
+     *
+     * ⛔ 优先停在**当前生效**的那一项（`Row.active`）—— 这样打开菜单、或用
+     *    ↑↓ 换到某一行时，光标就在用户此刻用的那个档位/字幕/倍速上，按 OK
+     *    不会莫名其妙改掉一个他没想动的设置。
+     *    只有行没给 `active`（`-1`）时才退化成「夹住上一次的光标位置」。
+     */
     private fun currentOptionIndex(): Int {
-        val opts = rows.getOrNull(selRow)?.options ?: return 0
-        if (opts.isEmpty()) return 0
-        return selChip.coerceIn(0, opts.size - 1)
+        val row = rows.getOrNull(selRow) ?: return 0
+        if (row.options.isEmpty()) return 0
+        if (row.active in row.options.indices) return row.active
+        return selChip.coerceIn(0, row.options.size - 1)
     }
 
     // ------------------------------------------------------------------

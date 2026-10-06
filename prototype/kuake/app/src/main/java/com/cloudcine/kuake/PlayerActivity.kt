@@ -20,6 +20,9 @@ import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackGroup
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -113,6 +116,24 @@ class PlayerActivity : Activity() {
 
     private var firstFrameRendered = false
     private var openedAtMs = 0L
+
+    /**
+     * 最近一次 `onTracksChanged` 拿到的轨道表。
+     *
+     * ⛔ **必须每帧现读、不能把 `TrackGroup` 存下来复用**：换档（[playQuality]）
+     *    会换掉整个 `MediaItem`，`Tracks` 随之重建 —— 旧 `TrackGroup` 拿去
+     *    `setOverrideForType` 不报错，但永远选不中（组对不上）。
+     *    所以这里只留「最新那份」，选项列表每次由 [trackChoices] 现枚举。
+     */
+    private var tracks: Tracks? = null
+
+    /**
+     * 当前绑给 OSD 的行。
+     *
+     * ⛔ 按键回调只回传**行下标**，靠 [KuakeOsdView.Row.id] 还原语义 ——
+     *    所以这张表必须与 `osd.bind()` 的那张是同一份，别各建各的。
+     */
+    private var osdRows: List<KuakeOsdView.Row> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -234,7 +255,9 @@ class PlayerActivity : Activity() {
             spec != null -> {
                 Log.i(TAG, "直接用给定 URL 播放（对照路径）：${spec!!.url}")
                 startPlayer(spec!!.url, spec!!.headers)
-                osd.bind(listOf(rateRow(1.0)))
+                // 这条路径没有 PlayInfo ⇒ 没有「画质」行，行下标与常规路径不同。
+                // 正因如此回调才按 id 分派（见 [onOsdActivate]）。
+                rebindOsd()
             }
             else -> {
                 Log.w(TAG, "既没有 fid 也没有 url，回列表页")
@@ -355,7 +378,7 @@ class PlayerActivity : Activity() {
     /** 切到某一档。同一档重复点不重建播放器。 */
     private fun playQuality(q: Quality) {
         if (current?.id == q.id && player != null) {
-            hideOsd()
+            Log.i(TAG, "档位未变（${q.id}），不重建播放器")
             return
         }
         Log.i(
@@ -375,6 +398,11 @@ class PlayerActivity : Activity() {
             val wasPlaying = player?.playWhenReady ?: true
             netBytes.reset()
             netMeter.reset()
+            // ⛔ 换档 = 换 media source ⇒ 字幕/音轨全都换了一套。旧的
+            //    `tracks` 与用户选过的 override 都不能带过去：新 source 上
+            //    没有那对 TrackGroup，override 会变成一条**指向不存在组的
+            //    死规则**，之后字幕再也选不上。清掉重来。
+            resetTrackOverrides()
             player?.setMediaItem(MediaItem.fromUri(q.url))
             openedAtMs = System.currentTimeMillis()
             firstFrameRendered = false
@@ -383,7 +411,23 @@ class PlayerActivity : Activity() {
             player?.playWhenReady = wasPlaying
             showNotice("正在切换：${q.label}…")
         }
-        osd.bind(buildRows())
+        rebindOsd()
+    }
+
+    /**
+     * 丢掉上一套 media source 的轨道选择。
+     *
+     * ⛔ 只清 override，**不动用户选的字幕语言偏好**（`preferredTextLanguages`）——
+     *    那是跨片的观看习惯，换个档就重置掉很讨厌。这里要清的只是「这个文件里
+     *    选的是第几条」这种**逐文件**的东西。
+     */
+    private fun resetTrackOverrides() {
+        val p = player ?: return
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+            .build()
+        tracks = null
     }
 
     /**
@@ -500,6 +544,22 @@ class PlayerActivity : Activity() {
             }
 
             /**
+             * 轨道表变了 —— **这是字幕/音轨菜单的唯一数据来源**。
+             *
+             * ⛔ 不要自己去 `player.currentTracks` 轮询，也不要缓存：换档、切
+             *    字幕、甚至自适应码率换 rendition 都会走到这里。切换生效后
+             *    **一定会**再回调一次（选中态跟着变），所以「点了没反应」这种
+             *    事在这里能一眼看出来 —— 日志里没有新的 `轨道变化`，就是没生效。
+             */
+            override fun onTracksChanged(tracks: Tracks) {
+                this@PlayerActivity.tracks = tracks
+                Log.i(TAG, describeTracks(tracks))
+                // 菜单开着就立刻刷新：用户按完 OK 要马上看到光标跳到新选项上。
+                // （菜单没开时不用重建 View —— 那纯属白干活，`showOsd` 会补上。）
+                if (osd.visibility == View.VISIBLE) rebindOsd()
+            }
+
+            /**
              * 片源尺寸一变就重算显示矩形。
              *
              * ⛔ **必须用 `onVideoSizeChanged`，不能用 `onVideoInputFormatChanged`**：
@@ -595,23 +655,86 @@ class PlayerActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // OSD —— 只有「画质」和「倍速」两行，其余功能原型不做
+    // OSD —— 画质 / 音效（音轨）/ 字幕 / 倍速 / 调试
     // ------------------------------------------------------------------
 
+    /**
+     * 重绑 OSD 行。
+     *
+     * ⛔ **所有 `osd.bind()` 都必须走这里**：按键回调只回传行下标，靠 [osdRows]
+     *    还原语义 —— 那张表必须与真正绑上去的是同一份，各建各的就会分派到别的功能。
+     */
+    private fun rebindOsd() {
+        val rows = buildRows()
+        osdRows = rows
+        osd.bind(rows)
+        // ⛔ 每次重绑都记一行「菜单此刻长什么样」。硬件视频层下截不到图、播放中
+        //    也 dump 不到 UI，这是**唯一**能确认「用户看到的是不是我以为的那份」
+        //    的通道。判据：选项里有没有「（1）（2）」这种重名序号、光标该停哪。
+        Log.i(
+            TAG,
+            "菜单内容：" + rows.joinToString(" | ") { r ->
+                val opts = if (r.options.isEmpty()) {
+                    "(无选项)"
+                } else {
+                    r.options.mapIndexed { i, o -> if (i == r.active) "[$o]" else o }
+                        .joinToString(",")
+                }
+                "${r.label}=${r.value} → $opts"
+            },
+        )
+    }
+
     private fun buildRows(): List<KuakeOsdView.Row> {
-        val pi = info ?: return listOf(rateRow(currentSpeed), debugRow())
-        val cur = current
-        return listOf(
-            KuakeOsdView.Row(
+        val out = ArrayList<KuakeOsdView.Row>(5)
+        // 「画质」只在有 PlayInfo（正常取链路径）时才有。直接给 URL 的对照路径
+        // 没有档位概念 ⇒ 少一行 —— 这正是回调要按 id 而不是按下标分派的原因。
+        info?.let { pi ->
+            out += KuakeOsdView.Row(
+                id = ROW_QUALITY,
                 label = "画质",
-                value = cur?.label ?: "—",
+                value = current?.label ?: "—",
                 // 选项带真实分辨率与「需要多少带宽」—— 这是本原型要看的核心数字，
                 // 藏进日志就没人看了。
                 options = pi.qualities.map { "${it.label}  ${it.detail}" },
-                enabled = pi.qualities.map { true },
-            ),
-            rateRow(currentSpeed),
-            debugRow(),
+                active = pi.qualities.indexOfFirst { it.id == current?.id },
+            )
+        }
+        out += trackRow(ROW_AUDIO, "音效", C.TRACK_TYPE_AUDIO, withOff = false)
+        out += trackRow(ROW_SUBTITLE, "字幕", C.TRACK_TYPE_TEXT, withOff = true)
+        out += rateRow(currentSpeed)
+        out += debugRow()
+        return out
+    }
+
+    /**
+     * 造一行轨道选择（音轨 / 字幕）。
+     *
+     * ⛔ 片源里**没有**这类轨道时返回一行只有 `hint` 的行（`options` 空）。
+     *    OSD 对空 options 的行，←/→ 会原样返回 false、落到 Activity 那层被吞掉
+     *    —— 正好是「这行没得选」该有的表现，不用另加一套禁用逻辑。
+     */
+    private fun trackRow(
+        id: String,
+        label: String,
+        type: Int,
+        withOff: Boolean,
+    ): KuakeOsdView.Row {
+        val choices = trackChoices(type, withOff)
+        if (choices.isEmpty()) {
+            return KuakeOsdView.Row(
+                id = id,
+                label = label,
+                value = "—",
+                hint = if (type == C.TRACK_TYPE_TEXT) "该片源没有内嵌字幕" else "该片源没有音轨",
+            )
+        }
+        return KuakeOsdView.Row(
+            id = id,
+            label = label,
+            value = choices.firstOrNull { it.selected }?.label ?: "—",
+            options = choices.map { it.label },
+            active = choices.indexOfFirst { it.selected },
         )
     }
 
@@ -619,34 +742,280 @@ class PlayerActivity : Activity() {
      * 「调试」那一行 —— 开关左上角那块浮层。
      *
      * ⛔ 这是**全局参数**（存 `ProtoPrefs`，跨影片跨重启都记得），不是逐影片的
-     *    播放偏好。⛔ 顺序不能随便动：原生 OSD 只回传**行下标**
-     *    （见 [onOsdActivate]），加行/换行必须同时改这里与那边的 `when`。
+     *    播放偏好。
      */
     private fun debugRow() = KuakeOsdView.Row(
+        id = ROW_DEBUG,
         label = "调试",
         value = if (prefs.debugOverlay) "开启" else "关闭",
         options = listOf("关闭", "开启"),
+        active = if (prefs.debugOverlay) 1 else 0,
     )
 
     private fun rateRow(speed: Double) = KuakeOsdView.Row(
+        id = ROW_SPEED,
         label = "倍速",
         value = rateLabel(speed),
         options = SPEEDS.map { rateLabel(it) },
+        active = SPEEDS.indexOfFirst { it == speed },
     )
 
+    /**
+     * OSD 激活回调。
+     *
+     * ⛔ 回调**只带行下标**，所以第一件事是按 [osdRows] 把下标还原成稳定 id
+     *    再分派 —— 行数不是固定的（没有画质行、没有字幕行都会少一行），
+     *    用下标 `when` 迟早把「字幕」接到「倍速」上。
+     *
+     * 菜单开合的取舍（照夸克）：
+     *   * **画质** —— 换档要重建 media source、画面会黑一下，菜单收掉；
+     *   * **音效 / 字幕 / 倍速 / 调试** —— 留在菜单里。挑字幕往往要连试几条，
+     *     每点一下就关菜单等于逼用户重开五遍。
+     */
     private fun onOsdActivate(row: Int, chip: Int) {
-        when (row) {
-            0 -> info?.qualities?.getOrNull(chip)?.let { playQuality(it) }
-            1 -> {
+        when (osdRows.getOrNull(row)?.id) {
+            ROW_QUALITY -> {
+                info?.qualities?.getOrNull(chip)?.let { playQuality(it) }
+                hideOsd()
+            }
+            ROW_AUDIO -> {
+                applyTrackChoice(C.TRACK_TYPE_AUDIO, withOff = false, chip = chip)
+                rebindOsd()
+            }
+            ROW_SUBTITLE -> {
+                applyTrackChoice(C.TRACK_TYPE_TEXT, withOff = true, chip = chip)
+                rebindOsd()
+            }
+            ROW_SPEED -> {
                 val rate = SPEEDS.getOrNull(chip) ?: 1.0
                 currentSpeed = rate
                 player?.setPlaybackSpeed(rate.toFloat())
                 Log.i(TAG, "OSD 倍速 → ${rateLabel(rate)}")
-                osd.bind(buildRows())
+                rebindOsd()
             }
-            2 -> setDebugOverlay(chip == 1)
+            ROW_DEBUG -> setDebugOverlay(chip == 1)
+            else -> {
+                Log.w(TAG, "OSD 回调了未知行下标 $row（osdRows.size=${osdRows.size}）")
+                hideOsd()
+            }
         }
-        hideOsd()
+    }
+
+    // ------------------------------------------------------------------
+    // 轨道（字幕 / 音轨）
+    // ------------------------------------------------------------------
+
+    /** 一条可选轨道。`group == null` 表示「关闭」—— 只有字幕会用到。 */
+    private class TrackChoice(
+        val label: String,
+        val group: TrackGroup?,
+        val index: Int,
+        val selected: Boolean,
+    )
+
+    /**
+     * 枚举某一类轨道。
+     *
+     * ⛔ **每次现枚举，不缓存**：见 [tracks] 的注释 —— 换档后旧的 `TrackGroup`
+     *    就是一张废纸，拿它去 `setOverrideForType` 不报错、但永远选不中。
+     *
+     * @param withOff 是否在最前面插一项「关闭」。字幕要（关字幕是常规操作）；
+     *   音轨**不要** —— 关掉音轨等于把片子变默片，不是个有用的选项。
+     */
+    private fun trackChoices(type: Int, withOff: Boolean): List<TrackChoice> {
+        val t = tracks ?: return emptyList()
+        val out = ArrayList<TrackChoice>()
+        if (withOff) out.add(TrackChoice(OFF_LABEL, null, -1, selected = false))
+        var ordinal = 0
+        var anySelected = false
+        for (g in t.groups) {
+            if (g.type != type) continue
+            for (i in 0 until g.length) {
+                ordinal++
+                val sel = g.isTrackSelected(i)
+                if (sel) anySelected = true
+                out.add(TrackChoice(trackLabel(g, i, ordinal), g.mediaTrackGroup, i, sel))
+            }
+        }
+        // 有轨道但一条都没选中 ⇒ 现在就是「关闭」状态，把光标指到那一项
+        if (withOff && !anySelected && out.size > 1) {
+            out[0] = TrackChoice(OFF_LABEL, null, -1, selected = true)
+        }
+        disambiguate(out)
+        return out
+    }
+
+    /**
+     * 给重名的轨道加序号。
+     *
+     * ⛔ 实测这个片源的转码档有 **2 条「韩语 · 立体声」和 2 条「中文（简体）」**
+     *    （容器里就是多条独立轨道）。菜单里并排摆两个一模一样的 chip，用户
+     *    根本不知道自己在切哪一条 —— 日志里也只能靠「第几组」去数。
+     * ⛔ 只给**同名**的加（`（1）`/`（2）`），不无差别编号：片源只有一条音轨时
+     *    显示「韩语 · 立体声（1）」是纯噪音。
+     */
+    private fun disambiguate(choices: MutableList<TrackChoice>) {
+        val dup = choices.groupBy { it.label }.filterValues { it.size > 1 }.keys
+        if (dup.isEmpty()) return
+        val seen = HashMap<String, Int>()
+        for (i in choices.indices) {
+            val c = choices[i]
+            if (c.label !in dup) continue
+            val n = (seen[c.label] ?: 0) + 1
+            seen[c.label] = n
+            choices[i] = TrackChoice("${c.label}（$n）", c.group, c.index, c.selected)
+        }
+    }
+
+    /**
+     * 应用一条轨道选择。
+     *
+     * `setOverrideForType` 是**替换式**的：它把该 type 的 override 换成本次这条、
+     * 不会叠加，所以不必先 `clearOverridesOfType` —— 那反而多出一次「无 override」
+     * 的中间态，字幕会闪一下。
+     *
+     * 关字幕走的是另一条路：`clearOverridesOfType` + `setTrackTypeDisabled(true)`。
+     * ⛔ 光清 override 不够 —— 没有 override 时 ExoPlayer 会按
+     *    `preferredTextLanguages` 自己再挑一条，字幕照样出来。
+     */
+    private fun applyTrackChoice(type: Int, withOff: Boolean, chip: Int) {
+        val p = player ?: return
+        val choice = trackChoices(type, withOff).getOrNull(chip)
+        if (choice == null) {
+            Log.w(TAG, "轨道下标越界：type=$type chip=$chip")
+            return
+        }
+        val b = p.trackSelectionParameters.buildUpon()
+        if (choice.group == null) {
+            b.clearOverridesOfType(type)
+            b.setTrackTypeDisabled(type, true)
+            Log.i(TAG, "切${trackTypeName(type)} → 关闭")
+        } else {
+            b.setTrackTypeDisabled(type, false)
+            b.setOverrideForType(TrackSelectionOverride(choice.group, choice.index))
+            Log.i(
+                TAG,
+                "切${trackTypeName(type)} → ${choice.label}" +
+                    "（组内第 ${choice.index} 条，共 ${choice.group.length} 条）",
+            )
+        }
+        p.trackSelectionParameters = b.build()
+    }
+
+    private fun trackLabel(g: Tracks.Group, i: Int, ordinal: Int): String {
+        val f = g.getTrackFormat(i)
+        val type = g.type
+        val name = f.label?.trim()?.takeIf { it.isNotEmpty() }
+        val fallback = when (type) {
+            C.TRACK_TYPE_TEXT -> "字幕 $ordinal"
+            C.TRACK_TYPE_AUDIO -> "音轨 $ordinal"
+            C.TRACK_TYPE_VIDEO -> "视频 $ordinal"
+            else -> "轨道 $ordinal"
+        }
+        val sb = StringBuilder(name ?: languageName(f.language) ?: fallback)
+        when (type) {
+            C.TRACK_TYPE_TEXT -> {
+                if ((f.selectionFlags and C.SELECTION_FLAG_FORCED) != 0) sb.append("（强制）")
+            }
+            C.TRACK_TYPE_AUDIO -> {
+                channelLabel(f.channelCount)?.let { sb.append(" · ").append(it) }
+                surroundCodec(f.sampleMimeType)?.let { sb.append(" · ").append(it) }
+            }
+            // 视频轨只进日志（菜单里没有「视频轨」这一行，画面档位由「画质」管），
+            // 所以这里带上分辨率，方便对着 `片源 1440x810` 那条日志核对。
+            C.TRACK_TYPE_VIDEO -> {
+                if (f.width > 0 && f.height > 0) sb.append(" · ${f.width}x${f.height}")
+            }
+        }
+        return sb.toString()
+    }
+
+    /**
+     * ISO 639 语言码 → 中文名。
+     *
+     * ⛔ 不用 `Locale.forLanguageTag(...).displayLanguage`：那个跟着**系统语言**
+     *    走，电视设成英文时菜单会变成 "Chinese"，而这块菜单是照夸克做的中文界面。
+     */
+    private fun languageName(lang: String?): String? {
+        val l = lang?.trim()?.lowercase()
+        if (l.isNullOrEmpty() || l == "und" || l == "unknown") return null
+        return when {
+            l.contains("yue") -> "粤语"
+            l.startsWith("zh") -> if (
+                l.contains("hant") || l.contains("tw") || l.contains("hk") || l.contains("mo")
+            ) {
+                "中文（繁体）"
+            } else {
+                "中文（简体）"
+            }
+            l.startsWith("en") -> "英语"
+            l.startsWith("ja") -> "日语"
+            l.startsWith("ko") -> "韩语"
+            l.startsWith("fr") -> "法语"
+            l.startsWith("de") -> "德语"
+            l.startsWith("es") -> "西班牙语"
+            l.startsWith("pt") -> "葡萄牙语"
+            l.startsWith("ru") -> "俄语"
+            l.startsWith("it") -> "意大利语"
+            l.startsWith("th") -> "泰语"
+            l.startsWith("vi") -> "越南语"
+            else -> l
+        }
+    }
+
+    private fun channelLabel(n: Int): String? = when (n) {
+        1 -> "单声道"
+        2 -> "立体声"
+        6 -> "5.1"
+        8 -> "7.1"
+        else -> if (n > 0) "${n} 声道" else null
+    }
+
+    /**
+     * 只标出电视用户真正在意的两种：杜比 / DTS。其余不标，省得菜单太长。
+     * ⛔ `eac3` 必须先判 —— 它字符串里含 `ac3`，顺序反了会把杜比+标成杜比。
+     */
+    private fun surroundCodec(mime: String?): String? = when {
+        mime == null -> null
+        mime.contains("eac3") -> "杜比+"
+        mime.contains("ac3") -> "杜比"
+        mime.contains("ac4") -> "杜比 AC-4"
+        mime.contains("dts") -> "DTS"
+        else -> null
+    }
+
+    private fun trackTypeName(type: Int): String = when (type) {
+        C.TRACK_TYPE_AUDIO -> "音轨"
+        C.TRACK_TYPE_TEXT -> "字幕"
+        C.TRACK_TYPE_VIDEO -> "视频"
+        else -> "轨道($type)"
+    }
+
+    /**
+     * 把轨道表打成人能读的日志。
+     *
+     * ⛔ 硬件视频层下 `screencap` 全黑、播放中 `uiautomator dump` 拿不到 UI，
+     *    所以**字幕/音轨到底有没有切成功，只能靠这条日志判**。判据：
+     *    切换后应立刻出现一条新的「轨道变化」，且对应条目带 `← 选中`。
+     *
+     * ⚠️ 这里的标签是**原始**标签（不带重名序号），而菜单里重名的会显示成
+     *    `中文（简体）（1）`。两边对照请看紧随其后的「菜单内容」那条。
+     */
+    private fun describeTracks(t: Tracks): String {
+        val sb = StringBuilder("轨道变化：")
+        if (t.groups.isEmpty()) return sb.append("（无）").toString()
+        for (g in t.groups) {
+            sb.append("\n  ").append(trackTypeName(g.type))
+                .append(" ×").append(g.length)
+            for (i in 0 until g.length) {
+                val f = g.getTrackFormat(i)
+                sb.append("\n    #").append(i).append(' ')
+                    .append(trackLabel(g, i, i + 1))
+                    .append("  ").append(f.sampleMimeType ?: f.containerMimeType ?: "")
+                    .append(if (g.isTrackSelected(i)) "  ← 选中" else "")
+            }
+        }
+        return sb.toString()
     }
 
     /**
@@ -659,7 +1028,7 @@ class PlayerActivity : Activity() {
     private fun setDebugOverlay(on: Boolean) {
         prefs.debugOverlay = on
         applyDebugOverlay()
-        osd.bind(buildRows())
+        rebindOsd()
     }
 
     private fun applyDebugOverlay() {
@@ -800,10 +1169,14 @@ class PlayerActivity : Activity() {
     }
 
     private fun showOsd() {
+        // ⛔ 先重绑再定位光标：行是现造的（字幕/音轨的行数随片源变），
+        //    `resetSelectionForTest()` 里的 `currentOptionIndex()` 读的是
+        //    **已经绑上去的那份 rows**，顺序反了光标就会落在上一份表上。
+        rebindOsd()
         osd.resetSelectionForTest()
         osd.visibility = View.VISIBLE
         stats.markKey()
-        Log.i(TAG, "OSD 打开")
+        Log.i(TAG, "OSD 打开（${osdRows.size} 行：${osdRows.joinToString("/") { it.id }}）")
     }
 
     private fun hideOsd() {
@@ -888,6 +1261,19 @@ class PlayerActivity : Activity() {
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
         private val SPEEDS = listOf(0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+
+        // ── OSD 行的稳定标识 ────────────────────────────────────────
+        // ⛔ 原生 OSD 只回传**行下标**，而「画质」行在对照路径上不存在、
+        //    「字幕/音效」行在片源没有对应轨道时会退化成一句提示 —— 行数
+        //    不是固定的。所以分派一律走这些 id，不要 `when (row) { 0 -> ... }`。
+        private const val ROW_QUALITY = "quality"
+        private const val ROW_AUDIO = "audio"
+        private const val ROW_SUBTITLE = "subtitle"
+        private const val ROW_SPEED = "speed"
+        private const val ROW_DEBUG = "debug"
+
+        /** 字幕那一行最前面的「关闭」项。 */
+        private const val OFF_LABEL = "关闭"
 
         /** 没人按键就把控制栏收起来。4 秒够看清缓冲进度在长，又不挡画面。 */
         private const val CONTROLS_HIDE_MS = 4_000L
