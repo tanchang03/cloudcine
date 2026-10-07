@@ -2,9 +2,21 @@ package com.cloudcine.tv
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.Bitmap
+import android.graphics.Path
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.BitmapShader
+import android.graphics.Shader
 import android.os.Bundle
 import android.text.SpannableString
 import android.text.Spanned
@@ -16,6 +28,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.widget.AdapterView
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
@@ -950,7 +963,11 @@ class LibraryActivity : Activity() {
             //    还是旧值，不重读的话追剧胶囊会一直写着「已追剧 · 2 新」，
             //    而墙上那枚角标已经没了 —— 同一个数字在两个地方说法不一致。
             db.clearFollowBadge(w.key)
-            db.workByKey(w.key) to db.itemsForWork(w.key)
+            // ⛔ 用 `workForDetail` 而**不是** `workByKey`：头部那行元数据
+            //    （`N 集 / M 季`）读的是 `w.itemCount` / `w.seasonCount`，而库里
+            //    存的是**自己名下**的数。归一并集后（如「遮天」存值 1 / 并集 13），
+            //    用存值会让头部写「1 集」而下面列着 13 行 —— 同页自相矛盾。
+            db.workForDetail(w.key) to db.itemsForWork(w.key)
         }) { pair, err ->
             if (err != null) {
                 status.text = "读取失败：${err.message}"
@@ -1002,6 +1019,55 @@ class LibraryActivity : Activity() {
             itemsList.setSelection(0)
             itemsList.requestFocus()
             focusDetailActions()
+        }
+    }
+
+    /**
+     * 站在简介页上时，把**当前这一部**的条目重读一遍（原地刷新）。
+     *
+     * ## 为什么需要它
+     *
+     * 2026-10-07 现场：用户在这部剧的简介页上点了「⟳ 检查追剧更新」，
+     * 提示「有 1 部剧更新了（共 2 集）」，**而眼前这个列表一个都没多**。
+     * 库确实写对了 —— 错的是这一页没人通知它重读。
+     *
+     * ⛔ 不能拿 [loadWorks] 顶替：它会 `level = Level.WORKS`，把正看着简介页的
+     *    用户**踢回作品墙**（用户点的是「检查更新」，不是「返回」）。
+     *    回作品墙那条路（[backToWorks]）本来就会重跑 `loadWorks`，所以墙上
+     *    的角标不会因此变旧。
+     *
+     * ⛔ 两处「期间状态变了」都要挡：
+     *    * 用户已经按返回回了作品墙（`level != Level.ITEMS`）；
+     *    * 用户已经换到另一部作品（`currentWork?.key` 变了）。
+     *    不挡的话，异步读库回来会把**上一部**的条目画进**下一部**的列表里 ——
+     *    而它看起来完全正常（都是这部剧的文件），只是内容不对。
+     *
+     * ⛔ 保留光标位置：用户很可能正停在第 12 集上，刷新一下把他弹回第 1 集
+     *    是另一种「莫名其妙」。
+     */
+    private fun reloadCurrentItems() {
+        val cur = currentWork ?: return
+        if (level != Level.ITEMS) return
+        Bg.run({ db.itemsForWork(cur.key) to db.workForDetail(cur.key) }) { pair, err ->
+            if (err != null) {
+                Log.w(TAG, "原地刷新简介页失败：${cur.key}", err)
+                return@run
+            }
+            if (level != Level.ITEMS) return@run
+            if (currentWork?.key != cur.key) return@run
+            val w = pair?.second ?: cur
+            val keep = itemsList.selectedItemPosition
+            items.clear()
+            items.addAll(sortItems(pair?.first ?: emptyList(), itemsSortMode))
+            currentWork = w
+            itemsAdapter.notifyDataSetChanged()
+            paintDetailHead()
+            buildDetailActions()
+            title.text = "媒体库 / ${w.title}"
+            status.text =
+                "${w.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
+            if (keep in items.indices) itemsList.setSelection(keep)
+            Log.i(TAG, "原地刷新简介页：${w.key} → ${items.size} 条（光标停在 $keep）")
         }
     }
 
@@ -1221,6 +1287,11 @@ class LibraryActivity : Activity() {
                 category = null
                 playedOnly = true
                 followedOnly = false
+                // ⛔ 进了「最近播放」必须把排序切到「按播放时间」—— 它只是一个
+                //    **视图**（`playedOnly`），默认排序是 `recentModified`（按文件
+                //    修改时间），不切的话刚看过的片子会按修改时间散落在列表里，
+                //    根本不在最前（用户实机反馈）。
+                sort = LibraryDb.Sort.recentPlayed
                 loadWorks()
             },
         )
@@ -1320,6 +1391,60 @@ class LibraryActivity : Activity() {
      * ⛔ 不要改回描边：深色主题 + 沙发距离下，1~2px 的描边只剩一条细线，
      *    既看不清也不高级（用户明确反馈过）。
      */
+    /**
+     * 胶囊 / 行的三态配色。**焦点 > 生效 > 常态**，层级必须靠明度拉开。
+     *
+     * ⛔ 之前 `isCurrent`(已生效) 用最亮品牌色、`isCursor`(真焦点) 用更暗品牌色，
+     *    层级反了：焦点移走后已生效那颗仍最亮 ⇒ 看着像「焦点还在那」；焦点在
+     *    导航上时光标位置反而比已生效项更暗 ⇒ 根本分不清焦点在哪。这里把
+     *    `focused` 放最前、用最亮品牌实心，已生效只用淡品牌底（绝不抢焦点），
+     *    常态再压一档。四类胶囊（导航 / 状态行 / 排序 / 动作）共用同一套语言。
+     *
+     * @param dimNormal 常态下是否再压暗文字（导航带里数量为 0 的分类）。
+     */
+    private fun chipColors(focused: Boolean, active: Boolean, dimNormal: Boolean = false): Pair<Int, Int> =
+        when {
+            focused -> BRAND_TINT to 0xFF1A1533.toInt()       // 亮品牌实心 + 深字（最强，唯一「真焦点」）
+            active  -> 0x33A9A3F5.toInt() to BRAND_TINT       // 淡品牌底 + 品牌字（已生效，不抢焦点）
+            else    -> 0x14FFFFFF.toInt() to if (dimNormal) 0xFF4B5563.toInt() else 0xFFB9C0CC.toInt()
+        }
+
+    /**
+     * 剧集列表选中行的背景。
+     *
+     * ⛔ 之前只给选中行一层中等亮度的品牌实底（`BRAND_SELECT`），在深色列表里
+     *    太弱、又和排序胶囊「已生效」的亮品牌色撞脸 ⇒ 三处焦点都分不清。这里在
+     *    圆角品牌底之上再加一条 4dp 左侧强调条（与 [MenuRow] 同一语言），选中行
+     *    一眼可辨，且不靠描边（深色 UI 里描边只剩一条细线，用户明确嫌过）。
+     */
+    private fun listRowFocusDrawable(selected: Boolean): Drawable {
+        if (!selected) return ColorDrawable(Color.TRANSPARENT)
+        val fill = BRAND_SELECT
+        val bar = BRAND_TINT
+        val barW = dp(4)
+        val r = dp(10)
+        return object : Drawable() {
+            private val fillPaint = Paint().apply { color = fill; isAntiAlias = true }
+            private val barPaint = Paint().apply { color = bar; isAntiAlias = true }
+            override fun draw(c: Canvas) {
+                c.drawRoundRect(
+                    0f, 0f, bounds.width().toFloat(), bounds.height().toFloat(),
+                    r.toFloat(), r.toFloat(), fillPaint,
+                )
+                c.drawRect(0f, 0f, barW.toFloat(), bounds.height().toFloat(), barPaint)
+            }
+            override fun setAlpha(a: Int) {}
+            override fun setColorFilter(cf: ColorFilter?) {}
+            override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+        }
+    }
+
+    /** 卡片的圆角 tile 底：选中=品牌色、常态=略亮深色，外圈这圈就是「卡」的边。 */
+    private fun cardTile(fill: Int): Drawable = GradientDrawable().apply {
+        cornerRadius = dp(14).toFloat()
+        setColor(fill)
+    }
+
     private fun navChip(item: NavItem, isCursor: Boolean): TextView {
         val text = buildString {
             if (item.icon != null) append(item.icon).append(' ')
@@ -1337,24 +1462,12 @@ class LibraryActivity : Activity() {
             isFocusable = false
             isFocusableInTouchMode = false
             gravity = Gravity.CENTER
+            val (navBg, navFg) = chipColors(focused = isCursor, active = item.isCurrent, dimNormal = item.count == 0)
             background = GradientDrawable().apply {
                 cornerRadius = dp(20).toFloat()
-                setColor(
-                    when {
-                        item.isCurrent -> BRAND_TINT
-                        isCursor -> 0xFF4A4278.toInt()
-                        else -> 0x14FFFFFF
-                    },
-                )
+                setColor(navBg)
             }
-            setTextColor(
-                when {
-                    item.isCurrent -> 0xFF1A1533.toInt()
-                    isCursor -> Color.WHITE
-                    item.count == 0 -> 0xFF4B5563.toInt()
-                    else -> 0xFFB9C0CC.toInt()
-                },
-            )
+            setTextColor(navFg)
             val lp = LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) }
             layoutParams = lp
         }
@@ -1475,23 +1588,12 @@ class LibraryActivity : Activity() {
         isFocusable = false
         isFocusableInTouchMode = false
         gravity = Gravity.CENTER
+        val (barBg, barFg) = chipColors(focused = isCursor, active = item.active)
         background = GradientDrawable().apply {
             cornerRadius = dp(18).toFloat()
-            setColor(
-                when {
-                    isCursor -> 0xFF4A4278.toInt()
-                    item.active -> 0x33A9A3F5
-                    else -> 0x14FFFFFF
-                },
-            )
+            setColor(barBg)
         }
-        setTextColor(
-            when {
-                isCursor -> Color.WHITE
-                item.active -> BRAND_TINT
-                else -> 0xFFB9C0CC.toInt()
-            },
-        )
+        setTextColor(barFg)
         layoutParams = LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) }
     }
 
@@ -1543,23 +1645,12 @@ class LibraryActivity : Activity() {
             isFocusable = false
             isFocusableInTouchMode = false
             gravity = Gravity.CENTER
+            val (sBg, sFg) = chipColors(focused = isCursor, active = isCurrent)
             background = GradientDrawable().apply {
                 cornerRadius = dp(18).toFloat()
-                setColor(
-                    when {
-                        isCurrent -> BRAND_TINT
-                        isCursor -> 0xFF4A4278.toInt()
-                        else -> 0x14FFFFFF
-                    },
-                )
+                setColor(sBg)
             }
-            setTextColor(
-                when {
-                    isCurrent -> 0xFF1A1533.toInt()
-                    isCursor -> Color.WHITE
-                    else -> 0xFFB9C0CC.toInt()
-                },
-            )
+            setTextColor(sFg)
             layoutParams = LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) }
         }
 
@@ -1660,23 +1751,13 @@ class LibraryActivity : Activity() {
             isFocusable = false
             isFocusableInTouchMode = false
             gravity = Gravity.CENTER
+            val (aBg, aFg) = if (!a.enabled) 0x0AFFFFFF.toInt() to 0xFF4B5563.toInt()
+                              else chipColors(focused = isCursor, active = false)
             background = GradientDrawable().apply {
                 cornerRadius = dp(18).toFloat()
-                setColor(
-                    when {
-                        !a.enabled -> 0x0AFFFFFF
-                        isCursor -> BRAND_TINT
-                        else -> 0x14FFFFFF
-                    },
-                )
+                setColor(aBg)
             }
-            setTextColor(
-                when {
-                    !a.enabled -> 0xFF4B5563.toInt()
-                    isCursor -> 0xFF1A1533.toInt()
-                    else -> 0xFFB9C0CC.toInt()
-                },
-            )
+            setTextColor(aFg)
             layoutParams = LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) }
         }
 
@@ -1877,9 +1958,33 @@ class LibraryActivity : Activity() {
      * ⛔ `EXTRA_PDIR` 必须给：播放页靠它扫**同目录**的外挂字幕。库里的
      *    `dir_id` 就是电脑扫描时记下的父目录 fid —— 单个文件的 fid
      *    **推不出**父目录，网盘也没有「查父目录」的接口。
+     *
+     * ## ⛔ 点击这一刻就写「已读回执」（2026-10-07 现场）
+     *
+     * 现象：TV 端点了带 `■ NEW` 的一集、打开播放，返回后标记还在。
+     * 两个原因叠在一起：
+     *
+     *   1. 已读回执**只由播放页**在退出时补写（`PlayerActivity.reportProgress`），
+     *      而它开头就是 `if (positionMs <= 0L) return` —— 起播瞬间位置是 0，
+     *      短看几秒就退出的那一次**一个字都没写**；
+     *   2. 本页从播放页返回后**不重读**（见 [onActivityResult]），列表里那份
+     *      `LibraryItem` 还是播放前的快照，`isNewSinceFollow` 自然照旧为真。
+     *
+     * 在**点击这一刻**写掉，第 1 条就不成立了 —— 与 PC 端 `_markOpened` 同一
+     * 取舍：用户要的是「**点过就不再是 NEW**」，与看多久无关。
+     *
+     * ⛔ 只写 `markPlayed`（已读回执），**不写** `max_position_ms`：那一列是
+     *    「看到哪儿了」，写个假极小值会让每一条点过的都画出一条 0% 的进度槽。
+     * ⛔ 写库是磁盘 I/O，必须 `Bg.run` 丢到后台；失败只记日志，**不能**挡起播。
      */
     private fun play(item: LibraryItem) {
-        startActivity(
+        Bg.run({ db.markPlayed(item.id) }) { _, err ->
+            if (err != null) Log.w(TAG, "已读回执写入失败（不影响播放）：${item.id}", err)
+        }
+        // ⛔ 用 `startActivityForResult` 而**不是** `startActivity`：回来时要把
+        //    这一页重读一遍，NEW 标签才会当场消失（见 [onActivityResult]）。
+        @Suppress("DEPRECATION")
+        startActivityForResult(
             Intent(this, PlayerActivity::class.java)
                 .putExtra(PlayerActivity.EXTRA_FID, item.fileId)
                 .putExtra(PlayerActivity.EXTRA_NAME, item.name)
@@ -1893,6 +1998,7 @@ class LibraryActivity : Activity() {
                 //    `PlayTarget.resolve` 早已挑好，它的续播点就是这条 extra；
                 //    播放页只管照着跳，不再自己查一次库。
                 .putExtra(PlayerActivity.EXTRA_RESUME_MS, item.resumePositionMs ?: 0L),
+            REQ_PLAYER,
         )
     }
 
@@ -2115,6 +2221,8 @@ class LibraryActivity : Activity() {
                 category = null
                 playedOnly = true
                 followedOnly = false
+                // ⛔ 与导航带同一条规矩：进「最近播放」按播放时间排。
+                sort = LibraryDb.Sort.recentPlayed
             },
         )
         // ⛔ 角标 = 有更新的作品数（与导航带上那颗同口径）。
@@ -2443,6 +2551,14 @@ class LibraryActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_SCRAPE && resultCode == RESULT_OK) refreshAfterScrape()
+        // 从播放页回来：把当前这一部重读一遍，`■ NEW` 标签才会当场消失。
+        //
+        // ⛔ **不判 `resultCode`**：播放页没有 `setResult`，退出时 `resultCode`
+        //    恒为 `RESULT_CANCELED`；而且用户可能按 Home 键离开、或播放页被
+        //    系统低内存杀掉，那时连 `onDestroy` 都不一定跑完。已读回执在
+        //    [play] 里**点击那一刻**就写好了，所以这里只需无条件重读。
+        // ⛔ 也**不能**只判 `RESULT_OK`：那样这条分支永远不会进。
+        if (requestCode == REQ_PLAYER) reloadCurrentItems()
     }
 
     /**
@@ -2463,7 +2579,9 @@ class LibraryActivity : Activity() {
         status.text = "刷新「${cur.title}」…"
         Bg.run({
             posters.buildIndex()
-            db.workByKey(cur.key)
+            // ⛔ `workForDetail` 而不是 `workByKey`：头部元数据行读 `itemCount` /
+            //    `seasonCount`，用存值会把并集口径的「13 集」打回「1 集」。
+            db.workForDetail(cur.key)
         }) { fresh, err ->
             if (err != null) {
                 status.text = "刷新失败：${err.message}（刮削可能已经生效，退回作品墙看看）"
@@ -3045,7 +3163,14 @@ class LibraryActivity : Activity() {
             // ⛔ 只有**真查出新集**才重读整页：`loadWorks` 会重建导航带 + 重排
             //    海报墙 + 抢焦点（用户可能已经走到简介页了，被踢回墙上很烦）。
             //    没更新时角标一个都没变，重读纯属浪费一次全量查询。
-            if (o.hasNews) loadWorks()
+            //
+            // ⛔ 站在简介页上时走 [reloadCurrentItems] 而**不是** `loadWorks`：
+            //    2026-10-07 现场 —— 用户在这部剧的简介页上点「检查追剧更新」，
+            //    提示「有 1 部剧更新了（共 2 集）」，而眼前这个列表一个都没多。
+            //    库写对了，只是这一页没人通知它重读。
+            if (o.hasNews) {
+                if (level == Level.ITEMS) reloadCurrentItems() else loadWorks()
+            }
         }
     }
 
@@ -3089,7 +3214,7 @@ class LibraryActivity : Activity() {
     private fun toggleFollow(w: Work) {
         val next = !w.followed
         status.text = if (next) "开启追剧…" else "取消追剧…"
-        Bg.run({ db.setFollowed(w.key, next); db.workByKey(w.key) }) { fresh, err ->
+        Bg.run({ db.setFollowed(w.key, next); db.workForDetail(w.key) }) { fresh, err ->
             if (err != null) {
                 Log.e(TAG, "追剧开关失败：${w.key}", err)
                 status.text = "追剧设置失败：${err.message}"
@@ -3362,12 +3487,13 @@ class LibraryActivity : Activity() {
     // ------------------------------------------------------------------
 
     /**
-     * 卡片：海报 + 续播进度条 + 片名 + 副标题。
+     * 卡片：海报 + 片名 + 副标题（类型 · 年份）。
      *
      * ## ⛔ 为什么复用 `convertView` 时要按**下标**取子控件
      *
      * `GridView` 的回收视图就是同一个 `LinearLayout`，子控件顺序在
-     * [buildCard] 里定死。用 `getChildAt(0..n)` 取比自己找 `tag` 快，
+     * [buildCard] 里定死（`posterBox` 在下标 0，片名在下标 1，副标题在下标 2）。
+     * 用 `getChildAt(0..n)` 取比自己找 `tag` 快，
      * 也避免了「忘了设 tag」这种只在滚动到第 N 屏才暴露的 bug。
      */
     private inner class WorksAdapter : BaseAdapter() {
@@ -3388,9 +3514,8 @@ class LibraryActivity : Activity() {
             //    中间会让上面那行 `getChildAt(2)` 拿到更新角标，评分就画到它上面
             //    —— 而且不报错（红线 9）。
             val updateBadge = posterBox.getChildAt(3) as TextView
-            val strip = card.getChildAt(1) as LinearLayout
-            val titleView = card.getChildAt(2) as TextView
-            val metaView = card.getChildAt(3) as TextView
+            val titleView = card.getChildAt(1) as TextView
+            val metaView = card.getChildAt(2) as TextView
 
             // 海报高度按卡片宽度的 2:3 算 —— 每张卡片都重新设一次，
             // 因为 `cardW` 可能在旋转/换屏后变过。
@@ -3400,7 +3525,8 @@ class LibraryActivity : Activity() {
             val file = posters.fileFor(w)
             val bmp = file?.let { posters.cached(it) }
             if (bmp != null) {
-                image.setImageBitmap(bmp)
+                // ⛔ 圆角在 drawable 层做：包裹成 `RoundedPosterDrawable`，缩放也不丢角。
+                image.setImageDrawable(RoundedPosterDrawable(bmp, dp(8).toFloat()))
                 image.visibility = View.VISIBLE
                 placeholder.visibility = View.GONE
             } else {
@@ -3446,53 +3572,106 @@ class LibraryActivity : Activity() {
                 updateBadge.visibility = View.GONE
             }
 
-            // 续播进度条：看了一半的片子才画。
-            paintProgress(strip, w.resumeFraction)
+            // ⛔ 不画续播进度条：用户明确说卡片上画进度条不好看，信息要精简
+            //    （只留 名称 / 类型 / 年份）。进度只在剧集列表行里表达。
 
             titleView.text = w.title
-            metaView.text = w.subtitle
+            metaView.text = w.cardMeta
 
-            // ── 焦点效果：**只用明度与大小，不画边框** ──────────────────
+            // ── 焦点效果：**只突出选中的那张，绝不在海报上画任何框** ─────
             //
-            // ⛔ 之前选中态是「2dp 亮紫描边 + 紫色底」，用户看到的第一反应是
-            //    「海报焦点时还是有边框样式，太丑了」。原因是**海报本身已经是
-            //    一张完整的图**：再套一圈亮线，看起来像「图片被塞进了一个表格
-            //    单元格」，而不是「这一张被选中了」。
+            // ⛔ 之前两版都犯了同一个错：给海报加「边框/光晕/底色」—— 用户明
+            //    确反馈过两次「丑」。这一次彻底不动背景：
+            //    选中 = 放大 1.1 + 抬升阴影 + 标题/副标题变品牌色；
+            //    非选中 = 海报原样（圆角由海报自己的 `clipToOutline` 提供）；
+            //    整面墙始终是干净的海报，焦点靠**大小跳变**一眼可辨。
             //
-            // ⛔ 现在的做法（Apple TV / VidHub 同款，也是 PC 端海报墙的口径）：
-            //    **没被选中的整片压暗**，选中的那张保持原亮度 + 放大 7%。
-            //    对比度来自「谁更亮」，而不是「谁有框」—— 沙发距离下反而更醒目，
-            //    而且不会在任何一张海报上加东西。
-            //
-            // ⛔ `card.background = null` **不能省**：`convertView` 是复用的，
-            //    不显式清掉的话，上一轮那圈的背景会留在这张卡上（表现为
-            //    「滚一下屏幕，选中框跑到别的海报上去了」）。
+            // ⛔ 海报 alpha 始终满亮度：之前会压暗其余几张做对比度，用户嫌「所
+            //    有卡片都变暗」，这次所有卡都是亮的。
             val gridFocused = worksGrid.isFocused
             val selected = gridFocused && worksGrid.selectedItemPosition == position
-            image.alpha = if (gridFocused && !selected) 0.58f else 1f
-            placeholder.alpha = image.alpha
-            // 评分角标跟着一起暗 —— 否则一排暗海报上浮着一堆亮角标，反而更乱。
-            badge.alpha = image.alpha
-            // ⛔ 更新角标也**必须**跟着暗。漏了它的表现是「一片压暗的海报上
-            //    浮着一堆亮紫色的 +2」，比原来的问题更显眼 —— 而且它比评分角标
-            //    亮（品牌色实心 vs 深灰底），漏掉时一眼就能看出来。
-            updateBadge.alpha = image.alpha
-            card.scaleX = if (selected) 1.07f else 1f
-            card.scaleY = if (selected) 1.07f else 1f
-            card.background = null
+            image.alpha = 1f
+            placeholder.alpha = 1f
+            badge.alpha = 1f
+            updateBadge.alpha = 1f
+            val s = if (selected) 1.1f else 1f
+            // ⛔ 卡片整体放大（`scaleX/Y`）；圆角靠 `RoundedPosterDrawable`（drawable
+            //    层），不靠 `clipToOutline` —— 后者在缩放态下裁切会失效。
+            card.scaleX = s
+            card.scaleY = s
+            // ⛔ 抬升阴影。`convertView` 复用时旧卡片的 elevation 不会自己回 0，
+            //    所以选中=8dp、其它=0 必须**每帧重设**（不能只在选中那次设）。
+            card.elevation = if (selected) dp(8).toFloat() else 0f
             titleView.setTextColor(if (selected) BRAND_TINT else Color.WHITE)
             metaView.setTextColor(if (selected) 0xFFB9B2FF.toInt() else MUTED)
             return card
         }
     }
 
+    /**
+     * 自带圆角的海报 drawable。
+     *
+     * ⛔ 圆角在 **drawable 层**做（不是 `View.clipToOutline`）：drawable 自己按
+     *    `bounds` 裁成圆角矩形来画 bitmap。ImageView 无论怎么 `scaleX/Y` 缩放，
+     *    圆角都跟着 drawable 的 `bounds` 一起缩放 —— 聚焦放大时四角照样是圆的。
+     *    这是修「放大后圆角没了」最稳的办法：实测 `clipToOutline` 在缩放态下
+     *    裁切会失效，烘焙进 bitmap 的圆角也不稳定（实机像素采样验证过）。
+     *
+     * ⛔ 用 `BitmapShader` 画而不是 `canvas.drawBitmap`：drawable 的 `bounds`
+     *    由 ImageView 的 `CENTER_CROP` 决定，尺寸未必等于 bitmap 像素尺寸，
+     *    shader 会把 bitmap 自动映射铺满 `bounds`，不会出现画偏/画不满。
+     */
+    private class RoundedPosterDrawable(
+        private val bitmap: Bitmap,
+        private val radiusPx: Float,
+    ) : Drawable() {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        }
+        private val path = Path()
+
+        override fun onBoundsChange(bounds: Rect) {
+            path.reset()
+            path.addRoundRect(RectF(bounds), radiusPx, radiusPx, Path.Direction.CW)
+        }
+
+        override fun draw(canvas: Canvas) {
+            canvas.save()
+            canvas.clipPath(path)
+            canvas.drawPaint(paint)
+            canvas.restore()
+        }
+
+        override fun setAlpha(alpha: Int) {
+            paint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: ColorFilter?) {
+            paint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+
+        override fun getIntrinsicWidth(): Int = bitmap.width
+        override fun getIntrinsicHeight(): Int = bitmap.height
+    }
+
     private fun buildCard(): LinearLayout {
-        val card = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        // ⛔ 圆角在 **drawable 层**做（见 `RoundedPosterDrawable`）：海报 bitmap 被
+        //    包成一个自带圆角的 drawable，ImageView 怎么缩放、角落都圆。不靠
+        //    `clipToOutline`（缩放态下裁切会失效，表现为「放大后圆角没了」），
+        //    也不烘焙进 bitmap（实测烘焙出的圆角不稳定）。
+        val radius = dp(8)
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            // ⛔ 底部留一点：卡片圆角会把最底下的文字下角切掉。
+            setPadding(0, 0, 0, dp(6))
+        }
 
         val posterBox = FrameLayout(this)
         val image = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(0xFF232833.toInt())
         }
         posterBox.addView(image, FrameLayout.LayoutParams(MATCH, MATCH))
         posterBox.addView(
@@ -3500,7 +3679,11 @@ class LibraryActivity : Activity() {
                 setTextColor(0xFF4B5563.toInt())
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 34f)
                 gravity = Gravity.CENTER
-                setBackgroundColor(0xFF232833.toInt())
+                // ⛔ 占位块也用圆角 drawable（drawable 形状本身是圆的，缩放不丢角）。
+                background = GradientDrawable().apply {
+                    cornerRadius = radius.toFloat()
+                    setColor(0xFF232833.toInt())
+                }
             },
             FrameLayout.LayoutParams(MATCH, MATCH),
         )
@@ -3565,21 +3748,14 @@ class LibraryActivity : Activity() {
         )
         card.addView(posterBox)
 
-        // 进度条：外框是轨道，里面两个加权块（已看 / 剩余）。
-        val strip = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF2A303C.toInt())
-        }
-        strip.addView(View(this), LinearLayout.LayoutParams(0, MATCH, 0f))
-        strip.addView(View(this), LinearLayout.LayoutParams(0, MATCH, 1f))
-        card.addView(strip, LinearLayout.LayoutParams(MATCH, dp(3)))
-
+        // ⛔ 不要播放进度条：用户明确说「卡片上画进度条不好看」，且信息要
+        //    精简（只留 名称 / 类型 / 年份）。进度在剧集列表行里仍有表达。
         card.addView(TextView(this).apply {
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(0, dp(6), 0, 0)
+            setPadding(0, dp(8), 0, 0)
         })
         card.addView(TextView(this).apply {
             setTextColor(MUTED)
@@ -3588,23 +3764,6 @@ class LibraryActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.END
         })
         return card
-    }
-
-    /** 进度条：`fraction` ∈ [0,1]，0 或未知时整条藏起来。 */
-    private fun paintProgress(strip: LinearLayout, fraction: Double?) {
-        if (fraction == null || fraction <= 0.0) {
-            strip.visibility = View.GONE
-            return
-        }
-        strip.visibility = View.VISIBLE
-        val f = fraction.coerceIn(0.0, 1.0)
-        val done = strip.getChildAt(0)
-        val rest = strip.getChildAt(1)
-        (done.layoutParams as LinearLayout.LayoutParams).weight = f.toFloat()
-        (rest.layoutParams as LinearLayout.LayoutParams).weight = (1.0 - f).toFloat()
-        done.setBackgroundColor(BRAND_TINT)
-        done.requestLayout()
-        rest.requestLayout()
     }
 
     // ⛔ 这里曾经有个 `cardBackground(selected)`：选中 = 紫底 + 2dp 亮紫描边。
@@ -3750,8 +3909,14 @@ class LibraryActivity : Activity() {
             //
             // 行首的「■ NEW」是**追剧以来才入库、且从没播过**的那几集
             // （判据 `Work.isNewSinceFollow`，由 [WorkDetailFormat.newEpisodePrefix]
-            // 给文案）。⛔ 播过就自动消失，**不需要任何额外写入** —— 这也是为什么
-            // 这里没有一张「已读」表。
+            // 给文案）。
+            // ⛔ 「没播过」= `max_position_ms` **与** `last_played_at` **两条都空**，
+            //    后者是已读回执。它由 [play] 在**点击那一刻**写入（不再等播放页
+            //    退出时补写 —— 那边 `positionMs <= 0` 就提前 return，短看几秒
+            //    一集一个字都不写，于是标记赖着不走）。
+            // ⛔ 但**写完还得重读**：标签是照着**内存里**这份 `LibraryItem` 现算的，
+            //    库里改了它不会自己变 —— 所以从播放页回来时 [onActivityResult]
+            //    要走 [reloadCurrentItems]。两件事缺一，标记就还在。
             val isNew = currentWork?.isNewSinceFollow(entry) == true
             line1.text = newEpisodeTitle(EpisodeLabels.fileLabel(entry), isNew)
             // 副标题只报「这一条文件本身是什么」（清晰度 · 体积）。
@@ -3775,12 +3940,8 @@ class LibraryActivity : Activity() {
             time.text = Fmt.relativeTime(m, System.currentTimeMillis())
             time.setTextColor(if (m > 0) 0xFF9AA3B2.toInt() else 0xFF4B5563.toInt())
 
-            row.setBackgroundColor(
-                if (itemsList.isFocused && itemsList.selectedItemPosition == position) {
-                    BRAND_SELECT
-                } else {
-                    Color.TRANSPARENT
-                },
+            row.background = listRowFocusDrawable(
+                itemsList.isFocused && itemsList.selectedItemPosition == position,
             )
             return row
         }
@@ -3802,12 +3963,20 @@ class LibraryActivity : Activity() {
         /**
          * `startActivityForResult` 的请求码。
          *
-         * ⛔ 这个 Activity 目前**只有这一个**请求码 —— 再加的时候要么用别的值、
-         *    要么在 [onActivityResult] 里判 `requestCode`（现在就判着），
-         *    不能只判 `resultCode == RESULT_OK`：那样任何一个子页面回 OK
+         * ⛔ 判 `requestCode` 而不是只判 `resultCode`：子页面回 OK 都会走到
+         *    [onActivityResult]，只判 `resultCode` 的话任何一个子页面退出
          *    都会触发一次「刷新作品」。
          */
         const val REQ_SCRAPE = 1001
+
+        /**
+         * 从播放页回来。
+         *
+         * ⛔ 与 [REQ_SCRAPE] 分开：这两条回来要干的事不同（一个是重读
+         *    `media_works` 一整行，一个是重读这一部的文件列表），而**都不能**
+         *    只靠 `resultCode` 判 —— 播放页压根没有 `setResult`。
+         */
+        const val REQ_PLAYER = 1002
 
         /**
          * 进媒体库后多久开始静默追更检查（毫秒）。

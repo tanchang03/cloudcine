@@ -6341,3 +6341,107 @@ be emitted.` —— 本次计算产出的那个 future **永远不完成**，而
 2. `saveMaxPosition` 收的是**完整 item id**（`quark:f3`），不是 `fileId`。
    传错时它静默匹配 0 行 —— 正是「看过没有」这类判据最难查的失败形态。
 
+### 9.9 「点了 NEW 不消失」：已读判据只认位置，而位置只在整十秒边界上报（2026-10-07 macOS 现场）
+
+用户原话：
+> 「看到了简介页面的 new 标记的列表，但是点击后，new 标记不消失，并且媒体库
+>   列表中的『更新 2』标记也没有相应的调整」
+> 「**调整逻辑，无论播放了多长时间，只要点击了，就去掉 new 标记**」
+
+第二句是**口径**（推翻了隐含假设「播放进度上报一定会写 `max_position_ms`」），
+不是猜测。**先按它改，再去对齐取证。**
+
+#### ① 三方对齐的取证（这个手法值得复用）
+| 证据源 | 看到的东西 |
+|---|---|
+| 日志 `logs/cloudcine-2026-10-07.log` | `12:32:30.697 播放请求已被播放窗口取走：Z 遮 天 E184` → `12:32:33.674 收到窗口关闭通知`（**3 秒**）；`E183` 同理 **2 秒**。期间**一次进度回报都没有**。 |
+| 用户库直查 | `183 4K.mp4` / `EP184.mkv` 的 `max_position_ms` / `last_played_at` / `resume_position_ms` **三列全 NULL**；`shroudingtheheavens.new_item_count = 2` |
+| 源码 | `player_protocol.dart` 的 `ProgressThrottle.accept`：`second <= 0 \|\| second % 10 != 0` 直接返回 null |
+
+⇒ **播放 < 10 秒 = 库里一个字都没写。** 而关窗时 `_releasePlayer()` 先
+`sub.cancel()` 再 stop、且 `_currentRequest = null`，**不补最后一笔**
+（⚠️ Android 端 `onDestroy` 是补的 —— 这就是两端差异的来源）。
+
+★ 钥匙：`max_position_ms` 是「**看到哪儿了**」；「**有没有点过**」是另一件事。
+拿前者当后者的判据，等于要求「至少看满 10 秒」。
+
+#### ② 判据 = 两条记录**取或**（`lib/domain/services/follow_read.dart`）
+```dart
+bool isItemWatched(MediaItem item, Map<String, Duration> maxPositions) =>
+    maxPositions[item.id] != null || item.lastPlayedAt != null;
+```
+- `max_position_ms` —— 看到哪儿了（看满 10 秒以上必有值）；
+- `last_played_at` —— **已读回执**，起播那一刻由 `MediaRepository.markPlayed` 写。
+
+⛔ **起播时不要往 `max_position_ms` 写个 1 毫秒充数**，两个后果：
+1. 每一行**点过**的条目都会画出一条 **0% 的进度槽** —— `_WatchedBar` 的槽是
+   **不透明**的（`panel2`），看得见；
+2. 与项目已定的「播了但不足 1 秒 = 从没播过」自相矛盾。
+**已读归 `last_played_at`，位置归 `max_position_ms`，两列各司其职。**
+
+⛔ 也不能用 `resume_position_ms`：看完会被清成 NULL ⇒ 看完的一集重新变 NEW。
+
+#### ③ 落点：`ui/widgets/play_action.dart` 的 `_markOpened`
+`playItem` 是**全应用唯一起播入口**（`media_item_row` / `library_page` /
+`folder_browser` / `work_detail_page` 四处调用点全走它）。在它的**两条**返回路径
+上 `unawaited(_markOpened(ref, item))`：独立窗口成功开窗后、以及退回内置页
+`context.push` 之前。
+
+`_markOpened` 三件事：`repo.markPlayed(item.id, now)` →
+`syncFollowReadCount(repo, item.groupKey)` → 推 `playbackProgressSignal` +
+`libraryListSignal`。
+
+- ⛔ **三个 `ref.read` 必须在第一个 `await` 之前**：内置页那条路紧接着
+  `context.push` 换页，之后再碰 `ref` 会抛
+  「Cannot use ref after the widget was disposed」。
+- ⛔ **刻意不推 `libraryWriteSignalProvider`**：它下游挂着 `folderTreeProvider`
+  （每次读全表两万行），而播放只写播放记录。与 `onPositionTick` 同一套口径。
+
+#### ④ ⛔⛔ 只下调、绝不上调（`syncFollowReadCount` / `workDetailProvider`）
+从「未读集合」重算的口径**比 `applyFollowCheck` 的累加更宽**（包含「追剧之后、
+但被**全盘扫描**而不是追更检查发现的集」）。上调会让**打开一次详情页就凭空冒出
+角标**。上调的唯一入口是 `applyFollowCheck`；**下调永远安全**。
+条件写成 `remainingNew < owner.newItemCount`（不是 `== 0`）。
+
+接口也顺势改名：`clearFollowBadge(key)` → **`setFollowNewItemCount(key, count)`**
+（现在要写的不只是 0）。
+
+#### ⑤ ⛔⛔ 归一之后 `item.groupKey` **不是**作品 key
+调用方手里只有一个 `MediaItem`，能给的只有 `groupKey`。但：
+```
+media_items.group_key = 'z遮天'                  ← 文件名解析出来的归组键
+media_works.key       = 'shroudingtheheavens'    ← 归一目标（追剧状态挂这行）
+media_works['z遮天'].merged_into = 'shroudingtheheavens'   ← 别名行
+```
+直接拿 `groupKey` 去 `workByKey` 会落在**别名行**上，而那行 `followed == false`
+⇒ 提前 return ⇒ **角标永远降不下来，且不报错**（`mergeWorksInto` 只写作品行，
+**不重写 `media_items.group_key`**）。
+
+**修**：`syncFollowReadCount` 自己顺着 `mergedInto` 走到目标 —— 与
+`workDetailProvider` 里那段**同一口径**（连「只走一跳」都一样，因为折叠不允许
+成链，`mergeWorksInto` 会拒绝把别名当目标）。
+★ 一般化：**凡是「从一个 item 反推它的作品」的地方，都必须跟着 `mergedInto` 走。**
+
+#### ⑥ Android 端同步（两端必须同源）
+`android/.../library/LibraryModels.kt`：
+```kotlin
+return item.maxPositionMs == null && item.lastPlayedAt == null   // 原：只看 maxPositionMs
+```
+那边也有**真实的**缺口：`PlayerActivity.reportProgress` 里
+`if (totalMs > 0L) db.saveMaxPosition(...)` —— **时长探测不出来**时（转码流 /
+探测失败）`max_position_ms` 一个字都不写，而 `markPlayed` 每次都写。
+新增 `FollowReadTest.kt`（10 例）钉住。
+
+⚠️ **两端口径仍有一处不同**：Android `openWork` 是「进简介页 =
+`clearFollowBadge` 清零」（它的红线 8），PC 是「只下调」。**刻意未改**。
+
+#### ⑦ 测试与验证
+- 新建 `test/domain/follow_read_test.dart`（9 例，**真 drift 库**）。
+  离线验证两条守卫：
+  - 去掉 `|| item.lastPlayedAt != null` ⇒ `+8 -3`（三条用例红）；
+  - `if (false)` 掉 `mergedInto` 跟随 ⇒ `Expected: <1> / Actual: <0>`。
+- ⛔ 空 Map 字面量写 `const <String, Duration>{}`（`const {}` 推断成
+  `Map<dynamic, dynamic>`）。
+- PC 回归 `test/domain test/data test/ui/providers test/ui/pages test/core`
+  = **1938 例全绿**；Android `:app:testDebugUnitTest` BUILD SUCCESSFUL。
+

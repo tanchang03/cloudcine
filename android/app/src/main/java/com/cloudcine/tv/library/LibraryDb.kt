@@ -852,12 +852,138 @@ class LibraryDb(val file: File) {
             append(" ORDER BY ").append(effectiveOrder)
             append(" LIMIT ").append(limit).append(" OFFSET ").append(offset)
         }
-        return queryWorks(sql, args)
+        return withUnionStats(queryWorks(sql, args))
+    }
+
+    /**
+     * 把「真有源作品折进来」的那几部的三个计数换成**并集**值。
+     *
+     * ## 为什么必须换
+     *
+     * 库里 `item_count` / `total_bytes` / `season_count` 存的是**自己名下**的
+     * 文件。归一之后源行的 `group_key` 从不改写，于是卡片会写「1 集」而点进
+     * 详情页有 13 个文件 —— 用户看到的两个数字自相矛盾，且都是「合法」的。
+     * 真库上 `01尚硅谷嵌入式技术之c语言` 存值 211 / 并集 1292，差 1081。
+     *
+     * ## 三条别改错（与 PC 端 `_withUnionStats` 同一条）
+     *
+     * 1. ⛔ **不写回库**。`mergeWorkForUpsert` 对 `item_count` 是「永远取新值」，
+     *    一旦写回，下次重扫就把并集冲成自己名下的数。
+     * 2. **只碰「真有源折进来」的行**（SQL 里的 `AND EXISTS(...)`）。老库里
+     *    `item_count` 与真实行数本就可能不一致，全表重算会把老数据也一起改掉。
+     * 3. ⚠️ **`seasons` 是 `COUNT(DISTINCT season)` 且只数 `> 0`** —— 绝对值，
+     *    **不能相加**（两季 + 两季 ≠ 四季）。`items` / `bytes` 才是求和。
+     *
+     * ⛔ `workByKey` / `allWorks` **仍是存值**（不做列表展示，别顺手也改成并集）
+     *    —— 详情页的「N 集」用的是 `itemsForWork(...).size`，不走这两个。
+     */
+    private fun withUnionStats(works: List<Work>): List<Work> {
+        if (works.isEmpty()) return works
+        val stats = unionStats(works.map { it.key })
+        if (stats.isEmpty()) return works
+        return works.map { w ->
+            val s = stats[w.key] ?: return@map w
+            w.copy(
+                itemCount = s.items,
+                totalBytes = s.bytes,
+                seasonCount = s.seasons,
+                // ⛔ 进度也一起换成并集值（`null` 就是 `null`）：只查自己名下的话
+                //    「合并过的剧」在卡片上永远画不出进度条，而点进去是有进度的。
+                //    并集里一条可续的都没有时必须是 `null`（不画），不能退成 0.0
+                //    —— 0.0 会画出一条 0% 的槽，看起来像「点过但没看」。
+                resumeFraction = s.resume,
+            )
+        }
+    }
+
+    /** 一部作品并集口径的计数与进度。`resume` 为 `null` = 并集里没有可续的。 */
+    private class UnionStats(
+        val items: Int,
+        val bytes: Long,
+        val seasons: Int,
+        val resume: Double?,
+    )
+
+    /**
+     * 这些作品里「有源折进来」的那几部，其**并集**的文件数 / 体积 / 季数。
+     *
+     * ⛔ SQL 与 PC 端 `DriftMediaRepository._unionStats` **逐字同形**：
+     *    `src` 那个 CTE 的两段 `UNION ALL` 保证「自己名下的」与「折进来的」
+     *    都数上（只数后一半会让「合并后集数反而变少」）。
+     * ⛔ 第一段带 `AND EXISTS(...)`：没有源折进来的作品**不进结果**，
+     *    调用方据此保留它原来的存值。
+     * ⚠️ 第二段**不按 key 过滤**（与 PC 端一致）：它返回库里全部折叠目标的
+     *    统计，调用方按 key 取。多出来的那些行只多几十字节，换来的是两端
+     *    SQL 一模一样 —— 别为了「省一点」改成局部，那样两边迟早漂移。
+     */
+    private fun unionStats(keys: List<String>): Map<String, UnionStats> {
+        val out = HashMap<String, UnionStats>(keys.size)
+        val d = require()
+        for (chunk in keys.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "WITH src AS (" +
+                    "  SELECT t.key AS tgt, t.key AS src FROM media_works t " +
+                    "   WHERE t.key IN ($marks) " +
+                    "     AND EXISTS (SELECT 1 FROM media_works s WHERE s.merged_into = t.key) " +
+                    "  UNION ALL " +
+                    "  SELECT s.merged_into AS tgt, s.key AS src FROM media_works s " +
+                    "   WHERE s.merged_into IS NOT NULL) " +
+                    "SELECT s.tgt AS tgt, " +
+                    "       COUNT(i.id) AS items, " +
+                    "       COALESCE(SUM(i.size_bytes), 0) AS bytes, " +
+                    "       COUNT(DISTINCT CASE WHEN i.season > 0 THEN i.season END) AS seasons, " +
+                    "       MAX(CASE WHEN i.duration_ms > 0 AND i.resume_position_ms > 0 " +
+                    "           THEN CAST(i.resume_position_ms AS REAL) / i.duration_ms END) " +
+                    "           AS resume " +
+                    "FROM src s JOIN media_items i ON i.group_key = s.src " +
+                    "GROUP BY s.tgt",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val resume = c.getDouble(4)
+                    out[c.getString(0)] = UnionStats(
+                        items = c.getInt(1),
+                        bytes = c.getLong(2),
+                        seasons = c.getInt(3),
+                        resume = if (c.isNull(4)) null else resume,
+                    )
+                }
+            }
+        }
+        return out
     }
 
     fun workByKey(key: String): Work? =
         queryWorks("SELECT $WORK_COLUMNS FROM media_works WHERE key = ? LIMIT 1", arrayOf(key))
             .firstOrNull()
+
+    /**
+     * **简介页**用的作品行：`itemCount` / `seasonCount` / `totalBytes` / `resumeFraction`
+     * 都换成**并集**口径。
+     *
+     * ## 为什么简介页也要并集，而 `workByKey` 保持存值
+     *
+     * 简介页头部那一行元数据（`2024 · 2 季 · 13 集 · 剧集 · …`）来自
+     * [WorkDetailFormat.metaLine]，它读的就是 `w.itemCount` / `w.seasonCount`。
+     * 只把**列表**改成并集的话，用户会看到头部写「1 集」、下面列着 13 行
+     * —— 同一个数字在同一个页面上自相矛盾（2026-10-07 现场「遮天」：
+     * 存值 1 / 并集 13）。
+     *
+     * PC 端没有这个问题：`_InfoColumn` 的「N 个文件」取自**列表长度**
+     * （`visibleCount`），压根不读存值。这里把并集补到行上，是与 PC 对齐。
+     *
+     * ⛔ 别顺手把 [workByKey] 也改成并集：它被 `syncFollowReadCount` 之类的
+     *    **写路径**用（要拿真实存值），改了会牵动别的口径。详情页走这个方法。
+     * ⛔ 传进来的可能是**别名 key**（`PlayerActivity` 的选集传的是
+     *    `item.group_key`，归一后那是源 key）—— 先向上解析到 owner 再取行。
+     */
+    fun workForDetail(key: String): Work? {
+        val owner = ownerKeyOf(key)
+        val row = workByKey(owner) ?: return null
+        // `withUnionStats` 只动「真有源折进来」的行，其余原样返回 —— 与作品墙同一条。
+        return withUnionStats(listOf(row)).firstOrNull()
+    }
 
     /**
      * 「**还没刮削过**」的作品，按**最近修改倒序**（与作品墙默认排序同一口径）。
@@ -1112,10 +1238,28 @@ class LibraryDb(val file: File) {
         return out
     }
 
-    /** 「看过但没看完」的作品数 —— 给筛选行上的角标用。 */
+    /**
+     * 「看过但没看完」的作品数 —— 给筛选行上的角标用。
+     *
+     * ⛔ **按并集数**（2026-10-07 修）：归一之后源行的 `group_key` 从不改写，
+     *    只 `JOIN … ON i.group_key = w.key` 会把「进度全在被折走的那一半里」
+     *    的作品漏掉 —— 角标少一个，而列表里那部作品明明有进度条。
+     *    与 [itemsForWork] / [unionStats] 同口径。
+     *
+     * ⛔ 别写成 `JOIN … ON i.group_key = w.key OR i.group_key IN (SELECT …)`：
+     *    那个 `OR` 让 SQLite 用不上自动索引（同一张表上实测 4.9 秒 vs 1 毫秒）。
+     *    这里用 `src` 那个 CTE 的两段 `UNION ALL`（每条腿都是等值连接）。
+     */
     fun unfinishedCount(): Int = require().rawQuery(
-        "SELECT COUNT(DISTINCT w.key) FROM media_works w JOIN media_items i ON i.group_key = w.key " +
-            "WHERE w.merged_into IS NULL AND i.resume_position_ms > 0",
+        "WITH src AS (" +
+            "  SELECT t.key AS tgt, t.key AS src FROM media_works t " +
+            "   WHERE t.merged_into IS NULL " +
+            "  UNION ALL " +
+            "  SELECT s.merged_into AS tgt, s.key AS src FROM media_works s " +
+            "   WHERE s.merged_into IS NOT NULL) " +
+            "SELECT COUNT(DISTINCT s.tgt) FROM src s " +
+            "JOIN media_items i ON i.group_key = s.src " +
+            "WHERE i.resume_position_ms > 0",
         null,
     ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
 
@@ -1124,14 +1268,65 @@ class LibraryDb(val file: File) {
      *
      * 排序：**季 → 部 → 集**，都没标号的排最后。这个顺序就是详情页文件列表的
      * 顺序，也是「自动连播下一集」的依据。
+     *
+     * ## ⛔ 必须按**并集**取，而且别名 key 要先向上解析（2026-10-07 修）
+     *
+     * 跨目录归一之后**源行的 `group_key` 从不改写**（`mergeWorksInto` 只给源
+     * 作品打一个 `merged_into` 标记），所以「这部作品有哪些文件」的正确答案是
+     *
+     * ```
+     * 自己名下的  ∪  所有已折叠进来的源作品名下的
+     * ```
+     *
+     * 只查 `group_key = ?` 的后果（用户现场原话）：
+     * > 「恢复相同的媒体库备份，『遮天』这个剧集在 TV 端简介页中文件列表
+     * >   只有 1 个文件，但是 PC 端有 2 个季以及好多文件，两边完全不一致」
+     *
+     * 真库形状（`cloudcine.sqlite` 直查）：
+     * ```
+     * media_works['shroudingtheheavens']   item_count = 1      ← 它自己那一条
+     * media_works['z遮天'].merged_into   = 'shroudingtheheavens'  ← 12 条
+     * ```
+     * ⇒ 旧 SQL 返回 **1**，新 SQL 返回 **13**。
+     *
+     * ⚠️ 这个缺口**不只影响这一部**：`01尚硅谷嵌入式技术之c语言` 存值 211、
+     *    并集 **1292** —— 它此前在电视上少了 1081 个文件。
+     *
+     * ## ⛔ 为什么还要「向上解析」
+     *
+     * 调用方给的 key 可能是**别名**：`PlayerActivity.loadSiblings` 拿到的是
+     * 当前条目的 `group_key`，而归一之后那正是**源**的 key（`z遮天`）。
+     * 拿它去查并集只会查到源自己那 12 条 —— 选集行里永远少一条。
+     * 所以先 `merged_into` 往上走一跳（链式合并不允许，一跳就够）。
+     *
+     * ⛔ [dirsForWorks] / [pendingNewItemCounts] 早就按并集口径写了，只有这里
+     *    漏了 —— 而它们两处的注释还把本方法当成并集口径的基准。
      */
-    fun itemsForWork(key: String): List<LibraryItem> =
-        queryItems(
-            "SELECT $ITEM_COLUMNS FROM media_items WHERE group_key = ? " +
+    fun itemsForWork(key: String): List<LibraryItem> {
+        val owner = ownerKeyOf(key)
+        return queryItems(
+            "SELECT $ITEM_COLUMNS FROM media_items WHERE group_key IN (" +
+                "SELECT key FROM media_works WHERE key = ? OR merged_into = ?) " +
                 "ORDER BY (season IS NULL), season, (part IS NULL), part, " +
                 "(episode IS NULL), episode, name",
+            arrayOf(owner, owner),
+        )
+    }
+
+    /**
+     * 把可能是**别名**的作品 key 解析成真正的作品 key（`merged_into` 指向的那个）。
+     *
+     * 不是别名、或那一行不存在时原样返回。只走一跳 —— 折叠不允许成链
+     * （`mergeWorksInto` 会拒绝把别名当目标），这一点由写侧保证。
+     */
+    private fun ownerKeyOf(key: String): String {
+        val merged = queryString(
+            require(),
+            "SELECT merged_into FROM media_works WHERE key = ? LIMIT 1",
             arrayOf(key),
         )
+        return merged?.takeIf { it.isNotEmpty() } ?: key
+    }
 
     fun itemById(id: String): LibraryItem? =
         queryItems("SELECT $ITEM_COLUMNS FROM media_items WHERE id = ? LIMIT 1", arrayOf(id))
@@ -1837,6 +2032,13 @@ class LibraryDb(val file: File) {
                 // 它是检查期的水位线，只出现在 `applyFollowCheck` 的写语句里，
                 // 界面从来不看它 —— 与「不要为了完整把 31 列全搬进来」同一条。
                 "followed, follow_started_at, new_item_count, " +
+                // ⛔ **这里只查自己名下的**，不许把并集塞进来 —— 实测（真库
+                //    201 部 / 2866 条）：这个相关子查询写等值时 SQLite 会给
+                //    `media_items.group_key` 建**自动索引**，500 行 21ms；一旦
+                //    改成 `IN (SELECT …)` 或 `… OR … IN (SELECT …)`，自动索引
+                //    就用不上了，同样的查询变成 **7.5 秒 / 4.9 秒**（逐行全表扫）。
+                //    并集口径的进度由 [withUnionStats] 那条**页级**查询补
+                //    （和三个计数一起算，实测 4ms）。
                 "(SELECT MAX(CASE WHEN i.duration_ms > 0 AND i.resume_position_ms > 0 " +
                 "THEN CAST(i.resume_position_ms AS REAL) / i.duration_ms END) " +
                 "FROM media_items i WHERE i.group_key = media_works.key) AS resume_fraction"

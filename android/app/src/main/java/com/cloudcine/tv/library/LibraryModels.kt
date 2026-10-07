@@ -136,7 +136,26 @@ data class Work(
             }
             return parts.joinToString(" · ")
         }
-}
+
+    /**
+     * 卡片**副标题（精简版）**：只保留「类型 · 年份」。
+     *
+     * ⛔ 2026-10-07 用户要求卡片少呈现信息、只显示「影片名称 / 类型 / 年份」，
+     *    于是把原来的 [subtitle]（分类·年份·季数·集数）砍掉季数和集数，类型也
+     *    从「分类枚举标签」换成更贴近语义的 **genres**（如「动作 · 科幻」）。
+     * ⛔ [genres] 为空（未刮削）时回退到 [MediaCategoryNames.label]，否则未
+     *    刮削的片子副标题会是空的、卡片看着缺一块。
+     */
+    val cardMeta: String
+        get() {
+            val g = genres.filter { it.isNotBlank() }
+            val type = if (g.isNotEmpty()) g.joinToString(" · ") else MediaCategoryNames.label(category)
+            val parts = ArrayList<String>(2)
+            parts.add(type)
+            if (year != null && year > 0) parts.add("$year")
+            return parts.joinToString(" · ")
+        }
+    }
 
 /**
  * 媒体项（文件级）。

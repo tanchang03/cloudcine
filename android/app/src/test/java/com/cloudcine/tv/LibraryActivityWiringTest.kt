@@ -84,6 +84,43 @@ class LibraryActivityWiringTest {
     }
 
     /**
+     * 点一集去播放 ⇒ **当场**写已读回执，回来还要重读这一页。
+     *
+     * ## 为什么这两件事必须一起在
+     *
+     * 2026-10-07 现场：TV 端点了带 `■ NEW` 的一集、打开播放，返回后标记还在。
+     *
+     *   · 已读回执原先**只由播放页**在退出时补写，而它开头是
+     *     `if (positionMs <= 0L) return` —— 短看几秒就退出的那次一个字都没写；
+     *   · 而且这一页从播放页返回后**不重读**，列表里那份 `LibraryItem` 还是
+     *     播放前的快照，`isNewSinceFollow` 自然照旧为真。
+     *
+     * 缺任何一条，标记都会赖着不走：
+     *   · 只在返回时重读、不在点击时写 ⇒ 短看的那一集永远不消；
+     *   · 只在点击时写、返回时不重读 ⇒ 库里对了，屏幕上还是旧的。
+     */
+    @Test
+    fun `点播放会写已读回执并在返回时重读简介页`() {
+        val code = codeOnly(readSource())
+        assertTrue(
+            "`play(...)` 里没有 `db.markPlayed(` —— 已读回执只由播放页在退出时补写的话，" +
+                "短看几秒就退出的那一集一个字都不会写（播放页开头 `positionMs <= 0` 就 return），" +
+                "NEW 标记会一直挂着。",
+            code.contains("db.markPlayed("),
+        )
+        assertTrue(
+            "`onActivityResult` 没有处理 `REQ_PLAYER`（`requestCode == REQ_PLAYER`）—— " +
+                "从播放页回来时没人重读这一页，库里的已读回执改了也看不出来。",
+            code.contains("requestCode == REQ_PLAYER"),
+        )
+        assertTrue(
+            "找不到 `REQ_PLAYER = 1002` —— 播放页必须用 `startActivityForResult` 启动，" +
+                "否则 [onActivityResult] 根本不会被回调。",
+            code.contains("REQ_PLAYER = 1002"),
+        )
+    }
+
+    /**
      * 剔除注释后的源码。
      *
      * 用**行级**过滤而不是正则剥块注释：`LibraryActivity.kt` 里有网盘 URL 之类的
