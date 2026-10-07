@@ -403,6 +403,67 @@ object PanHttp {
     }
 
     /**
+     * 只读一个文件的**开头若干字节**（带 `Range`）。
+     *
+     * ## ⛔ 与 [getBytes] 的唯一差别：超长**不抛**
+     *
+     * [getBytes] 读满 `maxBytes` 之后会抛「响应超过 N MiB」—— 它的用途是
+     * 字幕 / 图片，超长说明拿到的根本不是想要的东西。而这里要的是
+     * **备份包最前面的那段清单**：包本身就有几十 MB，读完头部就该断开，
+     * 所以「读到 maxBytes 就停」是**预期行为**，不是异常。
+     *
+     * ## 为什么值得单开一条路
+     *
+     * 备份包的布局是 `[magic][清单长度][清单][库][海报]` —— 清单在最前面，
+     * 几百字节。启动时只想比一个时间戳，为此把几十 MB 的海报段整个拉下来
+     * 是白流量（夸克单连接限速 ≈1 MiB/s，那就是几十秒）。
+     * 服务端**认** `Range`（同一批地址上 [probeThroughput] 一直在用）；
+     * 就算它不认、直接回整份，这里也只读到 `maxBytes` 就断开，结果一样。
+     *
+     * 线程模型同 [getBytes]：阻塞，调用方负责放到后台线程。
+     */
+    fun getBytesHead(
+        url: String,
+        cookie: String = "",
+        headers: Map<String, String> = emptyMap(),
+        maxBytes: Int = 64 * 1024,
+        timeoutMs: Int = 20_000,
+    ): BytesResponse {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = timeoutMs
+            readTimeout = timeoutMs
+            useCaches = false
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", UA)
+            setRequestProperty("Referer", REFERER)
+            setRequestProperty("Range", "bytes=0-${maxBytes - 1}")
+            if (cookie.isNotEmpty()) setRequestProperty("Cookie", cookie)
+            for ((k, v) in headers) if (v.isNotEmpty()) setRequestProperty(k, v)
+        }
+        try {
+            val status = conn.responseCode
+            if (status !in 200..299) {
+                throw IOException("HTTP $status ${conn.responseMessage.orEmpty()}".trim())
+            }
+            val setCookies = collectSetCookies(conn)
+            val out = ByteArrayOutputStream()
+            conn.inputStream.use { input ->
+                val buf = ByteArray(16 * 1024)
+                while (out.size() < maxBytes) {
+                    val room = maxBytes - out.size()
+                    val n = input.read(buf, 0, minOf(buf.size, room))
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                }
+            }
+            return BytesResponse(out.toByteArray(), setCookies)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /**
      * 抄下响应里全部 `Set-Cookie` 行。
      *
      * ⛔ 不能用 `conn.getHeaderField("Set-Cookie")` —— 它**只回第一条**，

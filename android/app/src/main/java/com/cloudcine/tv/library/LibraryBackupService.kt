@@ -64,6 +64,23 @@ class LibraryBackupService(
         val uploads: Boolean get() = action.uploads
     }
 
+    /**
+     * 启动时那次**只读探测**的结果：网盘上最新的备份是什么、按 [SyncDecision]
+     * 该往哪边走。
+     *
+     * ⛔ 探测**不动任何一边**（不传、不覆盖），拿到的只是一个方向。
+     *    真正动手要用户点「立即同步」，那才会走 [sync]。
+     */
+    data class Probe(
+        val action: SyncDecision.Action,
+        /** 网盘备份目录里最新的那一份；目录不存在 / 是空的时为 `null`。 */
+        val latest: RemoteBackup? = null,
+        /** 上面那一份的清单（只读了包头的几十 KB）。 */
+        val remoteManifest: BackupManifest? = null,
+        /** 本机库的内容变更时间（Unix 秒，`null` = 空库）。给提示文案用。 */
+        val localModifiedAtSec: Long? = null,
+    )
+
     // ------------------------------------------------------------------
     // 导出 / 导入（本地，不碰网盘）
     // ------------------------------------------------------------------
@@ -167,13 +184,15 @@ class LibraryBackupService(
      * 目录不存在时会**创建**它 —— 这是本类唯一的写副作用，且只在
      * 「列一份还没有的备份」时发生。
      */
-    fun listRemoteBackups(dirName: String = BackupPackage.BACKUP_DIR_NAME): List<RemoteBackup> {
-        val dirFid = api.ensureFolder(PanApi.ROOT, dirName)
-        return api.listDirectory(dirFid, page = 1, size = 200)
+    fun listRemoteBackups(dirName: String = BackupPackage.BACKUP_DIR_NAME): List<RemoteBackup> =
+        listIn(api.ensureFolder(PanApi.ROOT, dirName))
+
+    /** 列一个已确定的目录 fid 里的备份包，按修改时间倒序。 */
+    private fun listIn(dirFid: String): List<RemoteBackup> =
+        api.listDirectory(dirFid, page = 1, size = 200)
             .filter { !it.isDir && it.name.endsWith(BackupPackage.EXTENSION) }
             .map { RemoteBackup(it.fid, it.name, it.sizeBytes, it.updatedAtMs) }
             .sortedByDescending { it.modifiedAtMs }
-    }
 
     /**
      * 把备份推上网盘，返回新文件的 fid。
@@ -212,6 +231,95 @@ class LibraryBackupService(
         Log.i(tag, "[备份] 从网盘恢复最新备份「${latest.name}」（${latest.sizeBytes} 字节）")
         importBackup(downloadBackup(latest.fileId))
         return latest
+    }
+
+    // ------------------------------------------------------------------
+    // 启动探测（只读）
+    // ------------------------------------------------------------------
+
+    /**
+     * 问一句「网盘上有没有比本机更新的备份」—— **只读，两边都不动**。
+     *
+     * 与 [sync] 的区别只在最后一步：`sync` 拿到方向之后会真的传 / 真的覆盖，
+     * 这里只把方向交回去。启动时**必须**是这一条 —— 在用户点头之前动他的库，
+     * 不管往哪边动都是错的。
+     *
+     * ## ⛔ 三处刻意的「不」
+     *
+     * 1. **不创建备份目录**（走 [PanApi.findFolder] 而不是 `ensureFolder`）：
+     *    从没备份过的用户，每开一次电视就被塞一个空目录。
+     * 2. **不整包下载**：清单在包的最前面，只读头部 [MANIFEST_HEAD_BYTES] 字节
+     *    （见 [readRemoteManifest]）。
+     * 3. **不读库文件字节**（走 [lightLocalManifest]）：[exportBackup] 会调
+     *    `LibraryDb.rawBytes()`，而那个方法为了拿到自洽的库文件会**先 close()**
+     *    连接 —— 启动路径上主线程刚 `loadWorks()` 完，撞上就是
+     *    「already-closed object」。
+     *
+     * 阻塞（网络）。调用方负责放到 [com.cloudcine.tv.pan.Bg]。
+     */
+    fun probeRemote(dirName: String = BackupPackage.BACKUP_DIR_NAME): Probe {
+        val localSec = db.libraryModifiedAt()
+        val local = lightLocalManifest(localSec)
+
+        val latest = api.findFolder(PanApi.ROOT, dirName)?.let { listIn(it).firstOrNull() }
+        val remote = latest?.let { readRemoteManifest(it) }
+
+        val action = SyncDecision.decide(local, remote)
+        Log.i(
+            tag,
+            "[备份] 启动探测：${action.name}（本地=" +
+                (localSec?.let { "${it}s" } ?: "无（空库）") +
+                "，远程=${remote?.effectiveModifiedAt ?: "无"}）" +
+                "，最新备份=「${latest?.name ?: "无"}」",
+        )
+        return Probe(action, latest, remote, localSec)
+    }
+
+    /**
+     * 本地清单的**轻量**版本 —— 只够 [SyncDecision] 做判断，**不读库文件字节**。
+     *
+     * ⛔ 判据必须与 [exportBackup] 产出的那份清单**逐项等价**：
+     *    [SyncDecision.decide] 只用到 `hasLibraryContent`（= `libraryModifiedAt != null`）、
+     *    `effectiveModifiedAt`、`deviceId` 三项，而它们分别来自
+     *    [LibraryDb.libraryModifiedAt] 与构造参数里的 `deviceId` ——
+     *    这里一个都没换口径。
+     *
+     * `createdAt` 取「现在」只是为了「万一 `libraryModifiedAt` 为 null 时有个
+     * 合理的退化值」；那条路已经被 `decide` 的「本地空库」分支挡在前面了
+     * （它排在「比时间」之前，见 [SyncDecision.decide] 的注释）。
+     */
+    private fun lightLocalManifest(modifiedAtSec: Long?): BackupManifest = BackupManifest(
+        deviceId = deviceId,
+        deviceName = deviceName,
+        createdAt = now(),
+        // ⛔ 秒 → 毫秒：库里的时间列是 Unix **秒**，manifest 走 ISO 毫秒。
+        libraryModifiedAt = modifiedAtSec?.let { it * 1000L },
+        schemaVersion = LibrarySchema.VERSION,
+        fileNames = listOf(BackupManifest.DB_ENTRY),
+    )
+
+    /**
+     * 读一份远程备份的清单 —— **先只读头部**，读不出来才整包下载。
+     *
+     * ⛔ 兜底那条路必须留着：`Range` 是服务端的自愿行为（它也可能直接回整份
+     *    200，那就只能拿到前 [MANIFEST_HEAD_BYTES] 字节），而**清单长度是
+     *    未知的**（理论上有人可以手工塞一个超长 `note`）。头部里读不出清单时，
+     *    整包下载一次总比「探测不到、永远不提示」好。
+     */
+    private fun readRemoteManifest(backup: RemoteBackup): BackupManifest {
+        val head = runCatching { api.fileHeadBytes(backup.fileId, MANIFEST_HEAD_BYTES) }
+            .getOrNull()
+        if (head != null) {
+            val m = runCatching { BackupPackage.extractManifest(head) }.getOrNull()
+            if (m != null) return m
+            Log.i(
+                tag,
+                "[备份] 「${backup.name}」头部 ${head.size} 字节里读不到清单，改为整包下载",
+            )
+        } else {
+            Log.i(tag, "[备份] 「${backup.name}」头部读取失败，改为整包下载")
+        }
+        return BackupPackage.extractManifest(downloadBackup(backup.fileId))
     }
 
     // ------------------------------------------------------------------
@@ -282,6 +390,15 @@ class LibraryBackupService(
     }
 
     companion object {
+
+        /**
+         * 启动探测时，从备份包头部读多少字节去找清单。
+         *
+         * 清单是几百字节的 JSON（`deviceId` / 时间 / `fileNames` / 可选 `note`），
+         * 64 KiB 留了两个数量级的余量；就算读到的是整包（服务端不认 `Range`），
+         * 也只是一次 64 KiB 的读取。
+         */
+        const val MANIFEST_HEAD_BYTES = 64 * 1024
 
         /**
          * 默认备份文件名：`cloudcine_backup_2026-10-06T19-16-13.ccbak`。

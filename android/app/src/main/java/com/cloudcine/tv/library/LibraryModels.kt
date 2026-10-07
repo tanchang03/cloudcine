@@ -102,6 +102,18 @@ data class LibraryItem(
     val resumePositionMs: Long?,
     val maxPositionMs: Long?,
     val lastPlayedAt: Long?,
+    /**
+     * 网盘上的**修改时间**（毫秒）；网盘没给时 `null`。
+     *
+     * ⛔ 库里 `media_items.modified_at` 存的是 **Unix 秒**（全库时间列统一口径），
+     *    读出来时已乘 1000 —— 目的只有一个：与网盘那边的 `updatedAtMs`
+     *    **同单位**。两个来源单位不同的话，`sortItems` / `compareEntries`
+     *    排出来的顺序会差一百万倍，而且不报错。
+     *
+     * ⛔ `null` 必须能在界面上表达成「—」，不能当 0：0 会被读成
+     *    「1970 年传的」，那是撒谎。
+     */
+    val modifiedAt: Long? = null,
     val thumbUrl: String?,
     val faceAnchorX: Double?,
     val videoWidth: Int?,

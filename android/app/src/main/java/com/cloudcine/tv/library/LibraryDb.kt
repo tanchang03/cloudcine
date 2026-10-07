@@ -196,6 +196,247 @@ class LibraryDb(val file: File) {
     }
 
     // ------------------------------------------------------------------
+    // 设置（`settings` 表）
+    //
+    // ⛔ 刮削凭证（TMDB Key / 两个反代地址 / 豆瓣 Cookie）走**这里**，而不是
+    //    `AppPrefs`（SharedPreferences）。理由只有一个但很硬：**备份包里装的
+    //    是整个 sqlite 文件的原始字节**，`settings` 表随之一路走；而
+    //    SharedPreferences 在备份包里根本不存在。放进 `AppPrefs` 的话，
+    //    「在电脑上配好、同步到电视」这件事就不成立了。
+    // ------------------------------------------------------------------
+
+    /**
+     * 读出**整张** `settings` 表。
+     *
+     * ⛔ 一次读全表而不是按需四次 `getSetting`：刮削要用四个键，而这个方法在
+     *    **每次开始刮削**时调一次。表很小（几十行），一次读完更省。
+     *
+     * ⚠️ 读出来的包括 PC 端同步过来的值 —— 这正是「反代地址跨端可用」的实现方式。
+     */
+    fun settingsMap(): Map<String, String> {
+        val out = HashMap<String, String>(32)
+        require().rawQuery("SELECT key, value FROM settings", null).use { c ->
+            while (c.moveToNext()) {
+                val k = c.getString(0) ?: continue
+                out[k] = c.getString(1).orEmpty()
+            }
+        }
+        return out
+    }
+
+    /** 读一个设置项。**缺失返回 `null`**（不是空串 —— 两者语义不同）。 */
+    fun getSetting(key: String): String? {
+        require().rawQuery(
+            "SELECT value FROM settings WHERE key = ? LIMIT 1",
+            arrayOf(key),
+        ).use { c -> if (c.moveToFirst()) return c.getString(0).orEmpty() }
+        return null
+    }
+
+    /**
+     * 写一个设置项（存在即更新，不存在则插入）。
+     *
+     * ⛔ 不用 `INSERT OR REPLACE`：那是「先删后插」，在只有 `key`/`value` 两列的
+     *    表上行为一样，但语义上是「删一行再插一行」—— 将来这张表多一列
+     *    （比如 `updated_at`）时会把新列的值抹掉。显式分两支，与
+     *    [applyScanItems] 同一条规矩。
+     */
+    fun setSetting(key: String, value: String) {
+        val d = require()
+        val n = d.update(
+            "settings",
+            ContentValues().apply { put("value", value) },
+            "key = ?",
+            arrayOf(key),
+        )
+        if (n == 0) {
+            d.insert(
+                "settings",
+                null,
+                ContentValues().apply {
+                    put("key", key)
+                    put("value", value)
+                },
+            )
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 刮削写回
+    // ------------------------------------------------------------------
+
+    /**
+     * 把刮削结果**合并回**作品行并落库，返回更新后的行（找不到该作品时 `null`）。
+     *
+     * ## 为什么不能复用 [insertMissingWorks]
+     *
+     * 那个用 `INSERT OR IGNORE`，**绝不更新已存在的行** —— 它的职责是「补建」，
+     * 而刮削要的恰恰是更新那一行（且只更新元数据列）。
+     *
+     * ## 哪些列会被改
+     *
+     * 标题 / 原名 / 年份 / 简介 / 海报 / 背景图 / 评分 / 类型 / `online_id` /
+     * `source` / `scraped_at` / `updated_at`。
+     *
+     * ⛔ **`item_count` / `total_bytes` / `season_count` / `last_modified_at`
+     * 一个字都不碰** —— 它们是**扫描的产物**，与刮削无关。抄一遍或写 0 都会
+     * 让卡片上的「24 集」变成一个错的数字。
+     *
+     * ## 海报换了就必须清 `poster_file` / `poster_face_x`
+     *
+     * 缓存文件名是按 URL 散列出来的，地址换了就该重新下载；不清的话详情页会
+     * 继续显示上一版海报。`poster_face_x` 同理：刮削海报是 2:3 竖版、铺满格子
+     * 不裁切，压根不需要人脸锚点，写 NULL 是**结论**而不是缺失。
+     *
+     * ## 分类
+     *
+     * [categoryOverride] 非空 = 用户在刮削页**亲手选的结论** → 直接落库并锁
+     * （`category_manual = 1`），之后的刮削不再改写它。为空时按
+     * [categoryAfterScrape] 的规则判。
+     *
+     * ## `genres_manual`
+     *
+     * 用户手敲过的类型标签**不被刮削覆盖** —— 他可能就是为了修「刮削返回的类型
+     * 是错的」才动手的，再刮一次又冲掉等于白改。所以先查这一列。
+     */
+    fun updateWorkScrape(
+        workKey: String,
+        meta: ScrapedMetadata,
+        categoryOverride: String? = null,
+        nowSec: Long = nowSec(),
+    ): Work? {
+        val cur = workByKey(workKey) ?: return null
+
+        val posterUrl = meta.posterUrl?.takeIf { it.isNotBlank() } ?: cur.posterUrl
+        val posterChanged = posterUrl != cur.posterUrl
+
+        // 类型标签锁要**单独查**：`Work` 是只读视图模型，刻意没有这一列
+        //（它只在写的时候有意义，多读一列就多一处与 PC 端 schema 脱钩的风险）。
+        var genresManual = false
+        require().rawQuery(
+            "SELECT genres_manual FROM media_works WHERE key = ? LIMIT 1",
+            arrayOf(workKey),
+        ).use { c -> if (c.moveToFirst()) genresManual = c.getInt(0) != 0 }
+
+        val category = categoryAfterScrape(cur, meta, categoryOverride)
+        val genres = when {
+            genresManual -> cur.genres
+            meta.genres.isNotEmpty() -> meta.genres
+            else -> cur.genres
+        }
+
+        val values = ContentValues().apply {
+            put("title", meta.title)
+            put("category", category)
+            // ⛔ 用户这次**亲手选了**类型 → 锁住它（与 PC 端同一条规则：用户明确
+            //    要求的状态变更不该被后续自动流程改写）。没选就保持原值不动。
+            if (categoryOverride != null) put("category_manual", 1)
+
+            val ot = meta.originalTitle?.takeIf { it.isNotBlank() } ?: cur.originalTitle
+            if (ot != null) put("original_title", ot) else putNull("original_title")
+
+            val year = meta.year ?: cur.year
+            if (year != null) put("year", year) else putNull("year")
+
+            val overview = meta.overview?.takeIf { it.isNotBlank() } ?: cur.overview
+            if (overview != null) put("overview", overview) else putNull("overview")
+
+            if (posterUrl != null) put("poster_url", posterUrl) else putNull("poster_url")
+            if (posterChanged) {
+                putNull("poster_file")
+                putNull("poster_face_x")
+            }
+
+            val rating = meta.rating ?: cur.rating
+            if (rating != null) put("rating", rating) else putNull("rating")
+
+            put("genres", jsonArray(genres))
+            // `online_id` / `backdrop_url` 只在刮到值时才写：`Work` 没读这两列，
+            // 拿不到旧值可回退，写 NULL 会把 PC 端刮来的背景图抹掉。
+            meta.onlineId?.takeIf { it.isNotBlank() }?.let { put("online_id", it) }
+            meta.backdropUrl?.takeIf { it.isNotBlank() }?.let { put("backdrop_url", it) }
+
+            // ⛔ `source = 'online'` 是「已刮削」的唯一判据（筛选项按它算）。
+            put("source", ScrapeSource.online.id)
+            put("scraped_at", nowSec)
+            put("updated_at", nowSec)
+        }
+        require().update("media_works", values, "key = ?", arrayOf(workKey))
+        Log.i(
+            TAG,
+            "刮削落库 $workKey → 「${meta.title}」" +
+                "${meta.year?.let { "（$it）" } ?: ""} · 分类=$category" +
+                "${if (categoryOverride != null) "（手选）" else ""}" +
+                " · 类型=${genres.joinToString("/")}" +
+                "${if (posterChanged) " · 海报已换（待下载）" else ""}",
+        )
+        return workByKey(workKey)
+    }
+
+    /**
+     * 记下某部作品的海报缓存文件名（[PosterFetcher] 下载完成后回写）。
+     *
+     * ⛔ 回写它**有实际收益**：PC 端 `PosterCache.pathFor` 拿到 `knownFile` 时
+     *    直接返回（省一次「按 key + url 现算」），Android 端 [PosterStore.fileFor]
+     *    也把它排在第一优先。不回写的话两边都得走现算或扫目录，多一次磁盘判断。
+     *
+     * ⚠️ 只写文件名、**不写绝对路径** —— 库要能整个搬走（换机器、改缓存目录）
+     *    而不用改数据（与 PC 端 `PosterCache.relativeNameOf` 的注释同一条）。
+     */
+    fun setWorkPosterFile(workKey: String, fileName: String) {
+        require().update(
+            "media_works",
+            ContentValues().apply { put("poster_file", fileName) },
+            "key = ?",
+            arrayOf(workKey),
+        )
+    }
+
+    /**
+     * 刮削之后这部作品该归到哪一栏。
+     *
+     * ## 为什么不能直接调 `MediaCategoryGuesser.guess`
+     *
+     * `guess` 的最后一步是「按 `kind` 落到电影 / 剧集」—— 那是**兜底**，
+     * 而这里要的是「刮削**新增**了什么证据」，不是「从头再判一次」。
+     *
+     * 用 `guess` 会有一个很难查的后果：用户把综艺放在 `/综艺/奔跑吧/`（扫描期
+     * 靠目录路径正确地判成「综艺」），而 TMDB 对国产综艺常常给不出「真人秀」
+     * 这个类型 —— 于是 `guess` 走到 kind 兜底，把「综艺」**冲成「剧集」**。
+     * 用户看到的是「我的综艺栏目空了」。
+     *
+     * ## 所以规则是：genres 说话才算，不说就闭嘴
+     *
+     *   1. 用户在刮削页手选的类型 → 结论，直接用；
+     *   2. `fromGenres` 有结论（动画 / 纪录片 / 真人秀）→ 用它（TMDB 的真实类型，
+     *      比目录名和关键词都准，与 `MediaCategoryGuesser` 把 genres 排第一优先
+     *      的口径一致）；
+     *   3. `fromGenres` 没结论 → 看**条目结构**（`douban/tv/…` / `tmdb/movie/…`）。
+     *      这一条只在**手动通道**用（Android 端只有手动），因为用户在候选列表里
+     *      亲手确认过这一条 —— 那是比文件名结构强得多的证据。它能救这一类：
+     *      文件名只剩 `2026.2160p.WEB-DL.mkv`，扫描期结构上认不出（落到「其他」），
+     *      而用户在候选里亲手确认了这是一部剧；
+     *   4. 都没有 → **原样保留扫描期的判定**。
+     *
+     * ⚠️ 第 3 步的代价（已知并接受）：放在 `/综艺/` 而数据源又没给「真人秀」
+     *    类型的片子，会被判成「剧集」—— 此时在刮削页的「媒体类型」里点一下
+     *    「综艺」即可（PC 端同一条取舍）。
+     */
+    private fun categoryAfterScrape(
+        current: Work,
+        meta: ScrapedMetadata,
+        override: String?,
+    ): String {
+        if (override != null) return override
+        MediaCategoryGuesser.fromGenres(meta.genres)?.let { return it }
+        when (structureOf(meta.onlineId)) {
+            "tv" -> return MediaCategoryNames.SERIES
+            "movie" -> return MediaCategoryNames.MOVIE
+        }
+        return current.category
+    }
+
+    // ------------------------------------------------------------------
     // 读：列表 / 详情
     // ------------------------------------------------------------------
 
@@ -1145,6 +1386,9 @@ class LibraryDb(val file: File) {
                         resumePositionMs = c.longOrNull("resume_position_ms"),
                         maxPositionMs = c.longOrNull("max_position_ms"),
                         lastPlayedAt = c.longOrNull("last_played_at"),
+                        // ⛔ **秒** —— 全库时间列都是秒（`LibraryDb` 类注释）。
+                        //    这里换算成毫秒，好与网盘那边的 `updatedAtMs` 同单位。
+                        modifiedAt = c.longOrNull("modified_at")?.let { it * 1000L },
                         thumbUrl = c.strOrNull("thumb_url"),
                         faceAnchorX = c.doubleOrNull("face_anchor_x"),
                         videoWidth = c.intOrNull("video_width"),
@@ -1195,6 +1439,10 @@ class LibraryDb(val file: File) {
             "id, provider, file_id, dir_id, name, dir_path, group_key, kind, title, year, season, " +
                 "episode, episode_end, part, part_label, container, resolution, size_bytes, " +
                 "duration_ms, resume_position_ms, max_position_ms, last_played_at, " +
+                // ⛔ `modified_at` 之前**没有读出来**：它是「哪几个是刚传的」的
+                //    唯一依据（文件列表默认就按它倒序），而这一列从扫描那一刻
+                //    起就写在库里 —— 只是没人把它读进 `LibraryItem`。
+                "modified_at, " +
                 "thumb_url, face_anchor_x, video_width, video_height, is_sample_or_extra"
 
         /** 当前 Unix 秒。⛔ 全库时间列都是秒，不是毫秒。 */

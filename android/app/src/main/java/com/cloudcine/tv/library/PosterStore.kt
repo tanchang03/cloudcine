@@ -68,13 +68,26 @@ class PosterStore(
     /** 找到某个作品的海报文件；没有则 null。 */
     fun fileFor(work: Work): File? {
         // ① 库里记着的文件名优先 —— 有就直接用，连索引都不用查。
-        //    （PC 端现在不写这一列，但它是 schema 的一部分，将来可能写。）
+        //    （PC 端以前不写这一列，Android 端刮削下载完会**回写**它。）
         val named = work.posterFile?.takeIf { it.isNotBlank() }
         if (named != null) {
             val f = File(dir, named)
             if (f.isFile) return f
         }
-        // ② 退回索引 —— 这才是**常态路径**。
+        // ② 用**当前** `posterUrl` 精确算文件名 —— 与 PC 端 `PosterCache.pathFor`
+        //    同一口径（它也是拿 `key` + `url` 现算）。
+        //
+        //    ⛔ 这一步是**刮削换海报之后能立刻看到新图**的关键。文件名的第二段
+        //    是 URL 的散列，所以新旧海报是**两个不同的文件**；只靠 ③ 的目录索引
+        //    会在两个文件里随便挑一个（索引按「目录返回顺序里的第一个」建），
+        //    用户就会看到「刮了但海报没变」。
+        val url = work.posterUrl?.takeIf { it.isNotBlank() }
+        if (url != null) {
+            val f = File(dir, PosterNaming.fileNameFor(work.key, url))
+            if (f.isFile) return f
+        }
+        // ③ 退回索引 —— 兼容「PC 端刮的、随备份搬过来的」那些作品
+        //    （它们的 `posterUrl` 可能是空的，只有文件在盘上）。
         return index?.get(PosterNaming.sanitize(work.key))
     }
 

@@ -1493,12 +1493,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   ///
   /// 四个 provider 一个都不能少：列表、统计、两个角标计数。
   /// 只作废列表的话，筛选面板上的「年份 / 类型」角标会停留在旧库的数字上。
+  ///
+  /// ⛔ 还要把 `settingsProvider` 一起作废 —— 它**不是**「媒体库视图」，
+  ///    但恢复备份换掉的是整个数据库文件，`settings` 表跟着一起变了。
+  ///    而 [SettingsController] 手上那份 `AppSettings` 是恢复**之前**读的：
+  ///    不作废的话，「在电脑上填好的 TMDB Key / 豆瓣 Cookie」恢复过来
+  ///    在设置页上依然显示为空，刮削也依然走匿名额度 —— 要重启应用才对。
+  ///    （进程内的 `SettingsStore._cache` 由 `LibraryBackupService` 的
+  ///    `onLibraryReplaced` 钩子清掉，两条缺一不可：一条管缓存、一条管状态。）
   void _refreshLibraryViews() {
     ref.read(libraryWriteSignalProvider.notifier).bump();
     ref.invalidate(workListProvider);
     ref.invalidate(libraryStatsProvider);
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
+    ref.invalidate(settingsProvider);
   }
 
   // -------------------------------------------------------------------

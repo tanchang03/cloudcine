@@ -290,6 +290,299 @@ class LibraryScanner(
     }
 
     // ------------------------------------------------------------------
+    // 作用域发现（只增不减）
+    // ------------------------------------------------------------------
+
+    /**
+     * 一次**作用域发现**的结果。
+     *
+     * 与 [Outcome] 的差别不只是字段多少 —— 那边带着 `itemsPruned`，
+     * 因为全盘扫描会清理陈旧记录；这里**没有这个字段**，因为发现根本不清理
+     * （理由见 [discover]）。字段的缺席本身就是一条约定。
+     */
+    data class Discovery(
+        val dirs: Int,
+        val files: Int,
+        /** 这次看到的可入库视频文件数（**含早已在库的**）。 */
+        val found: Int,
+        /**
+         * 其中**之前不在库里**的条数。
+         *
+         * 与 [existing] 相加等于 [found]。分开报的理由与 PC 端
+         * `DiscoveryOutcome` 一致：用户点「发现」时最想知道的是「有没有新东西」，
+         * 只报「发现 12 个媒体文件」而 12 个都是旧的，会让人以为这次什么都没做
+         * （其实它把元数据刷新了一遍）。
+         */
+        val added: Int,
+        /** 其中已经在库里的条数。 */
+        val existing: Int,
+        /** 本次涉及的分组数（会写成作品行）。 */
+        val works: Int,
+        /** 因超时 / 限流被跳过的目录数。**不为 0 时结果是不完整的**。 */
+        val failedDirs: Int,
+        val cancelled: Boolean,
+        val error: String?,
+    ) {
+        /** 给状态行用的一句话。 */
+        val message: String
+            get() {
+                if (error != null) return "发现失败：$error"
+                // ⛔ 「一个都没发现」必须说清楚是「这里没有视频」而不是「失败」——
+                //    合成一句「发现 0 个媒体文件」用户会以为网盘上真没有。
+                if (found == 0) return "这个目录里没有可入库的视频"
+                val head = if (cancelled) "发现已取消" else "发现完成"
+                return buildString {
+                    append(head)
+                    append("：媒体 ").append(found)
+                    append("（新增 ").append(added)
+                    append(" / 已有 ").append(existing).append("）")
+                    if (works > 0) append(" · 作品 ").append(works)
+                    if (failedDirs > 0) append(" · 跳过 ").append(failedDirs).append(" 个目录")
+                }
+            }
+    }
+
+    /**
+     * **作用域发现**：只走用户指定的那一片（某个目录，可选含子目录）。
+     *
+     * ## 它解决什么问题
+     *
+     * 网盘是个持续变化的目录：用户今天往 `/电影/` 里丢了一部新片。这时让他为了
+     * 这一部片子跑一次 [scan]（全盘），代价是遍历几千个目录、好几分钟，
+     * 以及一次被限流的风险。发现只走那一小片，几秒完成。
+     *
+     * ## 与全盘扫描的三条硬区别（缺一条都会静默损坏媒体库）
+     *
+     * 1. **绝不清理陈旧记录**。全盘扫描扫完会拿「本次见到的 id」当白名单，
+     *    删掉网盘侧已删除的行；发现只看到一棵子树，拿它当白名单等于把子树
+     *    之外的**全部**媒体项删光。所以这里根本不调 [LibraryDb.pruneMissingItems]。
+     * 2. **绝不写续扫游标**。`scan_cursors` 描述的是全盘扫描的 BFS 队列与分页
+     *    位置；发现往里写一笔，用户下次「从上次中断处继续」就会从一个错的队列
+     *    开始 —— 表现是「续扫之后少了一大半片子」，而这两件事在用户眼里毫无关联。
+     * 3. **不递归时只看这一层**。`recursive = false` 只处理 `rootFid` 本身，
+     *    子目录一个都不入队（PC 端目录行那个「只发现这一个目录」就是它）。
+     *
+     * ## 共用的部分
+     *
+     * 条目解析（[toItem]）、归组（[accumulate] / [toWork]）、分页列目录（[listAll]）
+     * 与全盘扫描**是同一份实现** —— 两处各写一遍会让同一个文件走两条路得到不同的
+     * `groupKey` 或分类，而那是静默的。
+     *
+     * ## 线程
+     *
+     * ⛔ 与 [scan] 一样**必须在后台线程调**（[com.cloudcine.tv.pan.Bg]）。
+     *
+     * @param rootFid 发现目标的 fid（目录）。
+     * @param rootPath 发现目标的完整路径。**会归一成带尾斜杠**（`/电影/`），
+     *   因为 `dirPath` 要参与 `groupKey` 的计算，两个调用点传进来的形态
+     *   （带 / 不带尾斜杠）必须收敛到同一份。
+     */
+    fun discover(
+        rootFid: String,
+        rootPath: String,
+        recursive: Boolean = true,
+        cancel: Cancellation = Cancellation(),
+        onProgress: (Progress) -> Unit = {},
+    ): Discovery {
+        val root = normalizeDirPath(rootPath)
+        val seeds = LinkedHashMap<String, Seed>(64)
+        val buf = ArrayList<ScanItem>(FLUSH_AT)
+        val queue = ArrayDeque<Dir>()
+        queue.add(Dir(rootFid, root))
+
+        var dirs = 0
+        var files = 0
+        var found = 0
+        var failedDirs = 0
+        var added = 0
+        var existing = 0
+        var error: String? = null
+        var cancelled = false
+        var lastReport = 0L
+
+        fun report(phase: String, current: String, force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            if (!force && now - lastReport < REPORT_EVERY_MS) return
+            lastReport = now
+            runCatching {
+                onProgress(Progress(phase, dirs, files, found, failedDirs, queue.size, current))
+            }
+        }
+
+        fun flush() {
+            if (buf.isEmpty()) return
+            // ⛔ 先查已有分组键再写（同 [scan]）：库里那些行可能是 PC 端按**它自己的**
+            //    解析器分好的组，不复用会把整库拆成两份。
+            // ⛔ 这一次查询顺手当「新增 / 已有」的判据 —— 同一个 id 在遍历里不会出现
+            //    两次，所以不会重复计数。
+            val known = db.groupKeysOf(buf.map { it.id })
+            for (raw in buf) {
+                val old = known[raw.id]
+                if (old == null) added++ else existing++
+                val item = if (old != null && old != raw.groupKey) {
+                    raw.copy(groupKey = old)
+                } else {
+                    raw
+                }
+                accumulate(seeds, item)
+            }
+            db.applyScanItems(buf)
+            buf.clear()
+        }
+
+        try {
+            while (queue.isNotEmpty()) {
+                if (cancel.isCancelled) {
+                    cancelled = true
+                    break
+                }
+                val dir = queue.removeFirst()
+                val entries = try {
+                    listAll(dir.fid)
+                } catch (e: Throwable) {
+                    failedDirs++
+                    Log.w(TAG, "发现：列目录失败，跳过：${dir.path}（${e.message}）")
+                    sleepQuietly(FAIL_BACKOFF_MS)
+                    report("发现", dir.path)
+                    continue
+                }
+                dirs++
+                for (e in entries) {
+                    if (e.isDir) {
+                        // ⛔ 不递归时**不入队**子目录 —— 这正是「只发现这一层」。
+                        //    放在这里而不是循环外：根目录自己还是要处理的。
+                        if (!recursive) continue
+                        queue.add(Dir(e.fid, joinPath(dir.path, e.name)))
+                        continue
+                    }
+                    files++
+                    if (!VideoFormats.isVideoFile(e.name)) continue
+                    if (VideoFormats.isDiscImage(e.name)) continue
+                    found++
+                    buf.add(toItem(e, dir))
+                }
+                if (buf.size >= FLUSH_AT) flush()
+                report("发现", dir.path)
+                if (dirs >= MAX_DIRS) {
+                    Log.w(TAG, "发现：目录数达到上限 $MAX_DIRS，停止遍历")
+                    break
+                }
+            }
+        } catch (t: Throwable) {
+            error = t.message ?: t.toString()
+            Log.e(TAG, "发现中断", t)
+        } finally {
+            runCatching { flush() }.onFailure { Log.e(TAG, "发现：尾批入库失败", it) }
+        }
+
+        // ---- 入库收尾：补建作品行 + 重算冗余计数（与 [scan] 同一套）----
+        report("入库", "", force = true)
+        var works = 0
+        try {
+            val known = db.workKeys()
+            val fresh = seeds.keys.filter { it !in known }
+            db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
+            db.refreshWorkStats(seeds.keys)
+            works = seeds.size
+        } catch (t: Throwable) {
+            error = error ?: (t.message ?: t.toString())
+            Log.e(TAG, "发现：作品入库失败", t)
+        }
+
+        report(if (cancelled) "已取消" else "完成", "", force = true)
+        Log.i(
+            TAG,
+            "发现 $root${if (recursive) "（含子目录）" else "（仅本层）"}：" +
+                "媒体 $found（新增 $added / 已有 $existing）· 作品 $works · 目录 $dirs",
+        )
+        return Discovery(
+            dirs = dirs,
+            files = files,
+            found = found,
+            added = added,
+            existing = existing,
+            works = works,
+            failedDirs = failedDirs,
+            cancelled = cancelled,
+            error = error,
+        )
+    }
+
+    /**
+     * 目录路径归一化：**一律带尾斜杠**。
+     *
+     * ⛔ 与 PC 端 `drivePathWithTrailingSlash` 同口径。根目录是 `/`（不是空串）——
+     *    空串拼出来的 `groupKey` 与 `/` 拼出来的不同，那会让根目录下的片子
+     *    在墙上多出一格。
+     */
+    private fun normalizeDirPath(path: String): String {
+        val p = path.trim()
+        if (p.isEmpty() || p == ROOT_PATH) return ROOT_PATH
+        return if (p.endsWith("/")) p else "$p/"
+    }
+
+    /**
+     * 发现**单个文件** —— 文件列表里视频行那个「加入媒体库」。
+     *
+     * 与 [discover] 的差别只有作用域：这里只入库这一个文件，不列它的兄弟。
+     * 不这么做的话，「把这一集加进媒体库」会把整个目录的几百个文件一起拖进来，
+     * 而用户在目录视图里点的是**某一行**，他期待的就是那一行。
+     *
+     * 顺带把同目录的字幕配进来是**额外一次列目录**，这里没做：Android 端的外挂
+     * 字幕由播放页在起播时现扫（`PlayerActivity` 拿 `dirId` 干的就是这件事），
+     * 库里的 `subtitle_refs` 只用来做「有没有字幕」的提示。少这一次往返，
+     * 换来的代价只是提示可能晚一步 —— 而它下次全盘扫描会补上。
+     *
+     * ⛔ 非视频 / 镜像文件**直接返回零结果**，不写库（`a.jpg` 不该变成「一个视频」）。
+     */
+    fun discoverFile(entry: DriveEntry, dirPath: String, dirId: String): Discovery {
+        val empty = Discovery(0, 1, 0, 0, 0, 0, 0, false, null)
+        if (!VideoFormats.isVideoFile(entry.name) || VideoFormats.isDiscImage(entry.name)) {
+            Log.i(TAG, "发现文件：跳过非视频 ${entry.name}")
+            return empty
+        }
+        val root = normalizeDirPath(dirPath)
+        val item = toItem(entry, Dir(dirId, root))
+        val known = db.groupKeysOf(listOf(item.id))
+        val oldKey = known[item.id]
+        val isNew = oldKey == null
+        // 归组用**库里已有的** group_key（与 [discover] 的 flush 同一口径）。
+        val grouped = if (oldKey != null && oldKey != item.groupKey) {
+            item.copy(groupKey = oldKey)
+        } else {
+            item
+        }
+
+        val seeds = LinkedHashMap<String, Seed>(1)
+        accumulate(seeds, grouped)
+        db.applyScanItems(listOf(item))
+
+        var works = 0
+        try {
+            val knownWorks = db.workKeys()
+            val fresh = seeds.keys.filter { it !in knownWorks }
+            db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
+            db.refreshWorkStats(seeds.keys)
+            works = seeds.size
+        } catch (t: Throwable) {
+            Log.e(TAG, "发现文件：作品入库失败", t)
+            return Discovery(0, 1, 1, 0, 0, 0, 0, false, t.message ?: t.toString())
+        }
+        Log.i(TAG, "发现文件「${entry.name}」：${if (isNew) "新增" else "已在库（元数据已刷新）"}")
+        return Discovery(
+            dirs = 0,
+            files = 1,
+            found = 1,
+            added = if (isNew) 1 else 0,
+            existing = if (isNew) 0 else 1,
+            works = works,
+            failedDirs = 0,
+            cancelled = false,
+            error = null,
+        )
+    }
+
+    // ------------------------------------------------------------------
     // 遍历
     // ------------------------------------------------------------------
 

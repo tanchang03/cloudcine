@@ -292,3 +292,38 @@ object LibrarySchema {
      */
     const val KEY_REMEMBER_PROGRESS = "remember_position"
 }
+
+/**
+ * 刮削凭证的键名 —— **与 PC 端 `lib/data/db/settings_store.dart` 的 `SettingKeys`
+ * 逐字一致**。
+ *
+ * ## 为什么键名是跨端契约的一部分
+ *
+ * 备份包（`.ccbak`）里装的是**整个 `cloudcine.sqlite` 文件的原始字节**，
+ * `settings` 表随之一起走。所以：
+ *
+ *   * 在电脑上填好的 TMDB 反代地址，同步到电视上**直接可用**；
+ *   * 键名差一个字母，电视上就是「没配」—— 而**两边都不会报错**，
+ *     用户看到的现象是「明明电脑上能刮，电视上刮不到」。
+ *
+ * 这就是为什么这几个常量集中在这里，而不是散在设置页与刮削器里各写一份字面量。
+ */
+object LibrarySettings {
+    /** TMDB API Key。空串 = 不启用 TMDB 源。 */
+    const val TMDB_API_KEY = "tmdb_api_key"
+
+    /** TMDB API 的 Base URL（境内需自建反代）。空 = 用官方地址。 */
+    const val TMDB_API_BASE = "tmdb_api_base"
+
+    /**
+     * TMDB 图片 CDN 的 Base URL。**与 [TMDB_API_BASE] 是两个域名**，必须分开配
+     * —— 反代经常只覆盖其中一个，合成一个的话「API 通了但图片下不来」没法修。
+     */
+    const val TMDB_IMAGE_BASE = "tmdb_image_base"
+
+    /** 豆瓣登录后的 Cookie。空 = 走匿名额度（实测约 10 个搜索词）。 */
+    const val DOUBAN_COOKIE = "douban_cookie"
+
+    /** 「刮削设置」那一屏里能填的全部键。 */
+    val SCRAPE_KEYS = listOf(TMDB_API_KEY, TMDB_API_BASE, TMDB_IMAGE_BASE, DOUBAN_COOKIE)
+}

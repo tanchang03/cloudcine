@@ -5643,6 +5643,214 @@ MEMORY.md 只留**标识符索引**，下列为**理由与完整判据**。
 - **信息不丢**：分辨率 / 码率 / `需 X MB/s` 改由 `rebindOsd()` 追加一行 `Log.i("CloudCine", "画质档位：…")` 输出 —— 「4K 卡顿」排查第一步就是对照这几档的需带宽（原画 3.00 vs 4k 0.63 MB/s）。菜单里那点数字本来也没人算，选档已由 `chooseQuality` 按实测带宽自动做掉。
 - **防御**：`TvOsdView` 里每个 chip 设 `maxWidth = MAX_CHIP_W`（160dp）+ `maxLines = 1` + `ellipsize = END`，防服务端给出超长档位 id 时一个 chip 撑满整行。面板右侧可用宽 ≈ 屏宽 − `SAFE_H`(48dp) − `SIDEBAR_W`(180dp)，1080p 上约 560dp。
 
+### 4. 启动时问一句「网盘上有更新的备份，要不要同步」（2026-10-07）
+
+**需求**：每次启动 Android TV App 时提示是否有更新的媒体库备份、是否需要同步。
+
+**为什么需要**：「同步」原本只藏在 MENU 菜单里 ⇒ 用户在电脑上扫完库 / 刮好海报，回到电视上看到的还是上周那份索引，而**他不会想到去菜单里点一下** ⇒ 跨端同步这个能力等于不存在。
+
+**实现（Android 端新增，PC 端没有这个功能）**
+- `library/StartupSync.kt`：策略对象。`shouldPrompt(action)` 决定弹不弹；`probedThisLaunch` + `beginLaunch()`/`markProbed()` 管「本次启动」的零点。
+- `LibraryBackupService.probeRemote()`：**只读**探测，返回 `Probe(action, latest, remoteManifest, localModifiedAtSec)`；`decide()` 复用 `SyncDecision`，方向判断与 `sync()` 完全同源。
+- `LibraryActivity.probeRemoteBackupAtStartup()` / `askStartupSync()`：`onCreate` 里 `root.post{}` 发起（别挡首帧），回来后弹 `showOverlay`，两个选项 `暂不同步` / `立即同步`（**默认落在「暂不同步」**，恢复是破坏性的）；点「立即同步」走 `doSync()` 而**不是** `doRestore()`（`sync` 会重新判一次方向）。
+- `MainActivity.onCreate` 调 `StartupSync.beginLaunch()`。
+
+**判据（⛔ 别改）**
+1. **只在 `restores` 那两个动作弹**（`restoreRemoteNewer` / `restoreLocalEmpty`）。`uploadLocalNewer` 是**常态**（看一集就变了），也问就变成每次启动烦一次；`uploadFirst`/`uploadRemoteEmpty` 要动的是**网盘**；`conflict` 要看得见两边的库才选得出来，两行弹窗承担不了。`StartupSyncTest` 里有一条「弹的条件恰好等于 `Action.restores`」，穷举 `when` ⇒ 以后加第八个动作会**编译不过**，逼着做决定（漏判是静默的：不弹 = 用户根本不知道有这回事）。
+2. **零点在 `MainActivity.onCreate`，不在 `LibraryActivity`**。每个页面是独立 Activity，从「文件列表」返回会**重建** LibraryActivity ⇒ 状态放那儿就变成「来回切一次弹一次」。`MainActivity` 是 LAUNCHER 入口且自己 `finish()` ⇒ 从桌面点一次图标必然新建一次它。
+3. `markProbed()` 在探测**发起时**置位，不等跑完（探测慢时用户可能已经点进文件列表又退回来 ⇒ 会重复发起）；失败也不重试。
+4. **失败静默**：没网 / 未登录 / 网盘抽风一律只写日志。启动路径上弹错误框比「这次没同步」更烦，而且用户没法处理。
+5. **界面正忙就不弹**（`busy || overlayVisible || filterVisible || scanCancel != null` 时只记日志）：`showOverlay` 会直接盖掉当前那层菜单。
+
+**三处「不」——都为了不在启动路径上产生副作用 / 白流量**
+- **不创建备份目录**：`PanApi.findFolder()`（新加的，只查不建）而不是 `ensureFolder()`。否则从没备份过的用户每开一次电视就被塞一个空的「云影备份」。
+- **不整包下载**：清单在包最前面（`[magic][清单长度][清单][库][海报]`），走新加的 `PanApi.fileHeadBytes()` → `PanHttp.getBytesHead()`，带 `Range: bytes=0-65535` 只读 64 KiB。⛔ `getBytesHead` 与 `getBytes` 的**唯一差别是超长不抛**（`getBytes` 读满 `maxBytes` 会抛，因为它的用途是字幕/图片）。服务端不认 `Range` 时也只读到 64 KiB 就断开，结果一样。读不出清单才退回整包（`readRemoteManifest` 的兜底）。
+- **不读库文件字节**：`lightLocalManifest()` 只用 `db.libraryModifiedAt()`，**不调 `exportBackup()`** —— 后者会走 `LibraryDb.rawBytes()`，而那个方法为了拿到自洽的库文件**先 `close()`** 连接；启动时主线程刚 `loadWorks()` 完，撞上就是「already-closed object」。⛔ 口径必须与 `exportBackup` 的清单等价：`decide` 只用 `hasLibraryContent` / `effectiveModifiedAt` / `deviceId` 三项。
+
+**文案**：`MM-dd HH:mm · 12.3 MB · 来自「小米电视」`（时间用**本机时区**显示 —— manifest 存的是 UTC 毫秒）+ 「本机媒体库比它旧。」/「本机还没有媒体库。」+ 「同步会用网盘上那份覆盖本机（本机还没上传的改动会丢失）」。
+
+**测试**：`StartupSyncTest`（4 例）；`BackupPackageTest` 加了一例「只拿到包头的若干字节也读得出清单」—— 它是「探测只读头部」这个假设的唯一防线（有人把清单挪到包尾时会红）。
+
+**⛔ 顺带发现的坑（2026-10-07 07:22）**：`android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java` **未跟踪**、会突然出现（在根目录跑 Flutter 工具会往 `android/` 里重新生成 Flutter 宿主），让 `:app:compileDebugJavaWithJavac` 直接 **35 个错误**（`找不到符号 Log` / `程序包 io.flutter.plugins.* 不存在`）。它**不属于本工程**，清掉即 `rm -rf android/app/src/main/java/io`。排查手法：`compileDebugJavaWithJavac` 平时是 `NO-SOURCE`，它一旦「执行并失败」就说明源码树里混进了 Java 文件。
+
+### 5. 文件夹「发现」+ 手动刮削 + 凭证随备份（2026-10-07）
+
+**三个需求一次做完**：① 文件列表里能「扫这个目录、把里面的片子收进媒体库」；② 详情页能「手动刮削」；③ 刮削的 token / cookie 随备份恢复。
+
+#### 5.1 「发现」= 局部扫描，与全盘扫描有**三条硬区别**（`LibraryScanner.discover`）
+
+| | 全盘 `scan` | 发现 `discover` |
+|---|---|---|
+| 清理陈旧记录 | 调 `pruneMissingItems` | ⛔ **绝不调** |
+| 写续扫游标 `scan_cursors` | 写 | ⛔ **绝不写** |
+| 深度 | 按设置 | `recursive=false` 只扫一层 |
+
+「只增不减」是这一整个功能的**定义**：用户在文件列表里点的是「把这几个收进来」，不是「用这个目录重建我的库」。任何一处泄漏（顺手 prune 一次）都会让用户丢掉别的目录里的条目，而且**不报错**。
+- `Discovery` 数据类**刻意没有 `itemsPruned` 字段** —— 字段缺席本身就是约定。
+- 复用全盘那条链的 `toItem` / `accumulate` / `toWork` / `listAll` / `insertMissingWorks` / `refreshWorkStats`，只换遍历入口。
+- ⛔ 归组用**库里已有的 `group_key`**（`db.groupKeysOf`），不用本次解析出来的：Android 的 `MediaNameParser` 是 PC 端的移植版，两边对同一文件给出不同 `group_key` 完全可能 ⇒ 不复用会把一部剧拆成两部（原来那部还在，旁边多出一部同名的、只含新扫到的那几集）。`applyScanItems` 更新已有行时**不碰 `group_key`**，所以「拿旧 key 覆盖解析 key」只影响归组、不会写坏数据。
+- `discoverFile`（单文件入仓）的判据是 **`!isVideoFile(name) || isDiscImage(name)`**，两个条件缺一不可：`.iso` **在**视频白名单里（映射到 `other` 容器）⇒ 只能靠 `isDiscImage` 拦下来；`.img` 不在白名单，被拦两次。⛔ 只留前者的后果：用户点一个 40 GB 的 `.iso`「加入媒体库」，库里多一个永远播不动的条目。
+- `normalizeDirPath` 一律补尾斜杠，**根目录是 `/` 不是空串** —— 空串与 `/` 拼出来的 `groupKey` 不同，会让根目录下的片子多出一格。
+- UI 入口（`BrowseActivity.openMenu`）：`发现本目录「X」（含子目录）` / `只发现「X」这一层` / `发现「X」（含子目录）`（光标在某一行目录上时）/ `把「X」加入媒体库`（光标在视频文件上时）。菜单行塞进 `ScrollView`（`overlayScroll` + `revealOverlayRow()`），否则项一多就被屏幕切掉。
+- `Discovery.message` 特判 `found == 0` → 「这个目录里没有可入库的视频」：不能只说「发现完成 0 个」，那与「功能没做」长得一样。
+
+#### 5.2 手动刮削（`ScrapeActivity` + `library/Scrape*.kt`）
+
+- **分层**：`ScrapeModels`（网络层模型）· `ScrapeHttp`（`HttpURLConnection`，**不引 OkHttp**，与 `PanHttp` **刻意不合并**）· `DoubanScraper` / `TmdbScraper` · `ScraperPipeline`（**拼接**各源候选，不是「取第一个成功的」——手动刮削是用户自己挑）· `PosterFetcher`。
+- ★★ **豆瓣 rexxar 的六个坑**（`https://m.douban.com/rexxar/api/v2`，必带 `Referer: https://movie.douban.com/`）：
+  1. **搜索结果分两处**：`subjects.items`（`{items:[…]}`）**和** `smart_box`（直接是数组）。实测搜「繁花」正主只在 `smart_box` 里 ⇒ 只读一处会**静默刮错片子**。
+  2. **`type=movie` 不是过滤器**，返回里混着 `book`/`music` ⇒ 必须自己按 `target_type` 剔。
+  3. **搜索的 `cover_url` 不能当海报**（服务端套了 `h/120` ⇒ 120px 横条）。海报只能取**详情**的 `cover_url`（`m_ratio_poster`，540×803）。
+  4. **详情对剧集会 301 到 `/tv/{id}`** ⇒ 类型必须读**响应体**的 `type`，不能按请求路径判。
+  5. **限流是显式的但状态码不稳**：`{"code":103,"msg":"need_login"}` 实测**既见过 200 也见过 403** ⇒ **业务码判在状态码之前**（判反了 ⇒ 403 那次被读成「网络抖了一下」，继续烧额度）。
+  6. 海报 CDN `img*.doubanio.com` **带对 Referer 也回 403/418** ⇒ 落库前改写域名到 `qnmob3-sign.doubanio.com`（**只换域名、路径不变**；已幂等；非豆瓣域**原样返回**，别误伤 TMDB）。改写用 `indexOf` + 拼接做**字面量**替换，不用 `replaceFirst`（后者第一个参数是**正则**）。
+- **匿名额度实测约 10 个不同的搜索词**；同一个词连打命中服务端缓存（不扣额度）⇒「多打几次看看」这种排查会得出完全错误的结论。见到 `103` 立刻熔断，**但熔断必须会过期**（30s 起、翻倍、封顶 10 min）：写死「本次进程内不再试」的话，用户按提示去贴了 Cookie 回来仍然刮不到，只有重启才恢复。
+- ⛔ **Android 端 `DoubanScraper.enabled` 恒为 `true`**（PC 端要求 Cookie 非空）。两条现实：电视上遥控器敲 Cookie 是**真的难**；手动刮削是低频主动动作（一次点一部），而 PC 端担心的是「扫描期自动刮 145 部」——那个场景 Android 端不存在。`TmdbScraper.enabled = apiKey.isNotBlank()`（没 Key 根本发不出去，服务端必回 401，与豆瓣那条放宽是两回事）。
+- ★★ **TMDB**：`api.themoviedb.org` 与 `image.tmdb.org` 境内不可达（DNS 污染）⇒ **两个域名分开配**（`tmdb_api_base` / `tmdb_image_base`），反代常只覆盖一个；合成一个的话「API 通了但海报全是灰块」没法修。`year` 是**硬过滤**（错的年份把正主直接筛掉）⇒ 只在有值时带。电影/剧集是**两套接口两套字段名**（`title`/`name`、`release_date`/`first_air_date`）。类型未知（综艺/纪录片常见 `unknown`）时**两个接口都搜**——硬猜一个方向会把它们搜到完全无关的条目上。`poster_path` 以 `/` 开头、`imageBase` 不带尾斜杠 ⇒ 直接相加；用户填的反代地址**结尾带斜杠是常态** ⇒ `trimEnd('/')`。
+- ⛔ **标题拿不到 ⇒ 返回 `null`，绝不拿查询词兜底**（豆瓣、TMDB 同一规矩）。兜底会把「详情没拿到」伪装成「刮削成功」：标题有、海报简介一个都没有，且 `source` 记成 online ⇒ 界面显示「已刮削」。
+- **落库**：`LibraryDb.updateWorkScrape` 合并元数据列，⛔ **不碰** `item_count`/`total_bytes`/`season_count`/`last_modified_at`；海报换了清 `poster_file`/`poster_face_x`；`source='online'`。分类走四级：`categoryOverride`（用户手选）→ `fromGenres` → `structureOf(onlineId)` → 保持原值。
+- ★ `structureOf(onlineId)`：`douban/tv/34874646` / `tmdb/movie/843527`，**按段**匹配（`startsWith("movie/")` 会漏掉豆瓣那条多一层前缀的）；认不出返回 **`null`**（= 「这条证据没意见」），**不是**「归到其它」。
+- ★ **海报换 URL 后能立刻看到新图**：`PosterStore.fileFor` 三级 —— ① `work.posterFile` → ② **用当前 `posterUrl` 现算** `PosterNaming.fileNameFor(key, url)` → ③ 目录索引。第 ② 步是关键：文件名的第二段是 URL 散列 ⇒ 新旧海报是**两个文件**，只靠 ③ 会在两个里随便挑一个（索引取「目录返回顺序里的第一个」），表现是「刮了但海报没变」。`PosterFetcher` 写 `.part` 再改名（进程被杀会留半张图，而它下次会被当有效缓存）。
+- **详情页入口**（`LibraryActivity.openMenu` 的 `Level.ITEMS` 分支）：`手动刮削「X」` → `startActivityForResult`（⛔ 不是 `startActivity`：刮完 `currentWork` 就是过期快照，不刷新会「刮成功了但详情页还是旧的」）；回来后 `refreshAfterScrape()` 重读 `db.workByKey` + `posters.buildIndex()`。`刮削设置` 两个分支都放（用户看到「刮不出来」的瞬间想找的就是它）。
+- **按键**：候选列表 OK **DOWN 与 UP 都要吞**（只吞 DOWN ⇒ 一次按键刮两遍）；⛔ **单行 `EditText` 会自己吃掉 ↑↓** ⇒ 必须在 `dispatchKeyEvent` 里接管（搜索框 ↓ 去胶囊行、设置页 ↑↓ 换输入框）。
+
+#### 5.3 凭证随备份恢复 —— **不需要任何新的备份代码**
+
+- 备份包（`.ccbak`）里装的是**整个 `cloudcine.sqlite` 文件的原始字节**，`settings` 表随之一起走。所以把凭证写进 `settings` 表（**不是** `AppPrefs`/SharedPreferences —— 那个在备份包里根本不存在）就自动跨端走。
+- 键名（`LibrarySettings` / PC `SettingKeys`）必须**逐字一致**：`tmdb_api_key` · `tmdb_api_base` · `tmdb_image_base` · `douban_cookie`。差一个字母 ⇒ 电视上就是「没配」，走匿名额度，**两边都不报错**。`ScrapeSettingsKeysTest` 把这四个字面量钉死（改名就会红）。
+- ⛔ **PC 端原有的一个真 bug（本次修掉）**：`SettingsStore` 有一层进程内 `_cache`，而 `importBackup` 是**换掉整个数据库文件** ⇒ 缓存对「文件被换了」一无所知。触发路径很容易撞：在新机器上先打开设置页（缓存记下「TMDB Key 为空」）→ 从网盘恢复电脑上的备份 → **设置页还是空的**、刮削继续走匿名额度，**要重启应用才对**。修法两条缺一不可：
+  1. `SettingsStore.invalidate()`（清 `_cache`），由 `LibraryBackupService` 新加的 `onLibraryReplaced` 钩子在 `importBackup` **末尾**（且无条件）同步调用；组合根把它接到 `ref.read(settingsStoreProvider).invalidate()`（⛔ 用 `ref.read` 不用 `ref.watch`，否则设置一变这个服务就跟着重建）。
+  2. `settings_page._refreshLibraryViews()` 里加 `ref.invalidate(settingsProvider)` —— `SettingsController` 手上那份 `AppSettings` 也是恢复**之前**读的。一条管缓存、一条管状态。
+- Android 端**天然满足**：`ScraperPipeline.fromSettings(db)` **每次刮削都重新构造**（不缓存实例），所以恢复后下次刮削读到的就是新值。
+
+#### 5.4 本次新增的单测（80 例，`./gradlew :app:testDebugUnitTest --tests 'com.cloudcine.tv.library.*Scrape*'` 等）
+
+`ScrapeModelsTest`（`structureOf` 段匹配/`wantsTv`/`subtitle`/`uid`）· `DoubanScraperTest`（两处搜索来源、`target_type` 剔除、占位项跳过、id 数字/字符串、去重保序、类型读响应体、标题不兜底、`103` 两写法、403+103 也熔断 vs 普通 403 不熔断、熔断过期、Referer/Cookie/编码、海报改写幂等与不误伤 TMDB）· `TmdbScraperTest`（`title`/`name` 两套字段、`release_date`/`first_air_date`、图片拼接与反代尾斜杠、`year` 硬过滤、类型未知搜两个接口、流水线拼接/跳过未启用/指定来源/来源不在流水线）· `ScrapeSettingsKeysTest`（四个键字面量 + 蛇形小写无空白 + `SCRAPE_KEYS` 恰好四个 + API/图片是两个键）· `DiscoveryIngestRulesTest`（视频白名单、字幕图片音频压缩包不收、畸形文件名、**`.iso` 只能靠 `isDiscImage` 拦**、容器枚举名归一、分辨率三条判据的顺序、营销词不咬到字母数字中间、实测尺寸长短边取较高档）。
+
+**两个「测试写错了」的实例（都是测试起了作用）**：① `candidates` 按 `uid` 去重 ⇒ 用同一个 id 测「数字/字符串两种形态」会被合并成一条，两个 id 必须不同；② `isVideoFile("x.img")` 是 **false**（`.img` 不在白名单），我原先写成「前提：在白名单里」⇒ 断言反了。
+
+### 6. 作品简介页：点卡片先去这里，不再直接播（2026-10-07）
+
+**起因（用户原话）**：「媒体文件无法进入简介页面，点击媒体文件应该先进入简介页面，
+在简介页面支持手动刮削和播放和选集播放的相关功能，对标pc端简介页面」。
+
+**为什么原来的「点卡片直接播」是错的**：直接播等于替用户做了三个决定 —— 播哪一条
+（`PlayTarget.resolve`）、播哪一版、要不要先刮削。而用户点卡片时想做的经常是
+「看看这部是什么」「换一集」「刮一下海报」。旧的 `onWorkRow` 是
+`works.getOrNull(position)?.let { playWork(it) }`，现在改成 `openWork(it)`；
+「直接续播」降级成简介页里的一颗胶囊 + 菜单项（两条路都还在）。
+
+#### 6.1 页面结构与上下层的物理顺序
+
+```
+简介页头部 detailHead       海报 96×144 + 标题 / 原名 / 元数据行 / 简介（最多 3 行）
+动作胶囊   actionsScroll     ▶ 播放(续播) · 手动刮削 · 刮削设置 · 选集（N）
+排序胶囊   itemsSortScroll   修改时间倒序 · 剧集顺序 · 标题
+剧集列表   itemsList
+```
+
+`detailHead` / `actionsScroll` 在 `Level.WORKS` 下 `GONE`，`openWork` 里转
+`VISIBLE`，`backToWorks` / `applyWorks` 里转回 `GONE`（⛔ 转的是**滚动容器**
+`actionsScroll`，不是里面的 `LinearLayout` —— 与 `itemsSortScroll` 同一条理由，
+只 GONE 子视图会留下一条高度 0 却仍参与焦点搜索的空壳）。
+
+#### 6.2 焦点模型：焦点留在列表上，两行胶囊只吃「光标态」
+
+- 两行胶囊都是 `isFocusable = false`；真正的焦点**始终在 `itemsList`** 上。
+  理由与一级导航带 / 状态行一致：焦点一挪到胶囊上，底下列表那行的高亮就没了，
+  用户会以为列表被清空了。
+- 方向键靠 `actionsFocused` / `itemsSortFocused` 两个标志在 `dispatchKeyEvent`
+  里分流，`actionsFocused` 那一支必须排在 `itemsSortFocused` **之前**。
+- ⛔ 各 `focus*` 函数**必须互相清掉对方的标志位**（与 `focusTabs`/`focusBar`/
+  `focusGrid` 那一组同一条规矩），漏清一个 = 「两行同时发光」。
+- 上下层的物理顺序 ⇒ 键语义：动作行 ↑↓ → 排序行；排序行 ↑↓ → 列表；
+  列表首行 ↑ → 排序行。**只有动作行上再按 ↑（或返回）才回作品墙** ——
+  排序行上的 ↑ 从「回作品墙」改成了「到动作行」。
+- 进作品时（`openWork`）先 `itemsList.setSelection(0)` + `requestFocus()`，
+  再 `focusDetailActions()`：**焦点给列表、光标给动作行**。这样默认落在
+  「▶ 播放 / ▶ 续播」上，按一下 OK 就是播（保留了旧行为的顺手），
+  而 ←→ 能看到刮削、选集。
+
+#### 6.3 两行胶囊**刻意不合并**
+
+动作行回答「对这一部作品做什么」，排序行回答「这一页的列表怎么排」。合成一行的话
+「▶ 播放」会和「修改时间倒序」并排，用户按 ←→ 路过时分不清哪颗是动作。
+两行都是同一套样式语言：实心面明度区分「光标（`BRAND_TINT` + 深字）/ 常态
+（`0x14FFFFFF` + 次级字）」，⛔ **不描边**（用户两次点名「线框不高级」）。
+
+动作行多一个状态：`enabled = false` 时压到 `0x0AFFFFFF` + 灰字。
+⛔ **不可用时置灰而不是从列表里消失** —— 库里一条可播文件都没有时，用户最需要
+看到的恰恰是一个灰着的按钮加上一句解释；按钮凭空消失他只会以为页面坏了。
+`applyAction` 在 `!enabled` 时把原因写进 `infoLine`（「▶ 播放：现在没有可播的文件」）。
+
+#### 6.4 海报尺寸 **96×144**，不照抄 PC 的 138×207
+
+PC 那个尺寸是给桌面窗口高度用的。电视横屏逻辑高只有 **540dp**（1080p / density
+2.0），207dp 的海报加上两行胶囊、剧集列表、`infoLine`、`hintBar` 会把这页撑爆 ——
+列表只剩一行，而「选集」恰恰是这一页的主要用途。96×144（2:3）之后刚好放下三行
+简介 + 四行列表。
+
+#### 6.5 底部提示行 `hintBar` 随层级换文案
+
+原来是写死的一句话（「OK 直接播放」），现在改成字段 `hintBar`：
+作品墙上写「OK 进简介页」，简介页里写「←→ 换胶囊 · OK 播放 / 执行 · ↑↓ 换层」。
+⛔ 写死的话两层里总有一层在骗人，而遥控器上用户唯一的线索就是这行字。
+`infoLine` 在 `Level.ITEMS` 下不再显示作品简介（简介正文已经画在头部里了），
+改成按键提示 —— 否则同一段简介会在屏幕上印两遍。
+
+#### 6.6 ⛔ 顺手修掉一个**不报错**的真 bug：`openWork` 把 `items` 清了两遍
+
+原代码：
+
+```kotlin
+items.clear()
+items.addAll(list ?: emptyList())
+…
+items.clear()                                    // ← 又清了一次
+items.addAll(sortItems(items, itemsSortMode))     // ← 排的是空列表
+```
+
+`sortItems` 拿到的是空列表 ⇒ **剧集列表永远是空的**，而且不报任何错
+（只是「点进去什么都没有」）。正确写法：保留容器、只清空重填，一次排序 ——
+`items.clear(); items.addAll(sortItems(list ?: emptyList(), itemsSortMode))`。
+
+#### 6.7 简介页文案口径下沉成纯函数 + 单测
+
+`library/WorkDetailFormat.kt`（`object`，纯函数）+ `WorkDetailFormatTest`（13 例）。
+搬出来的理由：每一条都是**跨端口径**，而写错它们**全都不会报错** ——
+放在 `LibraryActivity` 里 JVM 单测根本跑不起来（与 `PlayTarget` / `PosterNaming`
+同一套做法）。钉住的四条：
+
+| 口径 | 写错的后果 |
+|---|---|
+| 「已刮削」判据 = `source == "online"`，**不是**「有海报」 | 刮了但没下到图的作品写着「未刮削」，用户再刮一遍还是这样 |
+| 季数门槛 `>= 2` | 每部电影、每部单季剧都多一个「1 季」，像分类判错了 |
+| 类型最多 `MAX_GENRES = 4` 个 | 类型多的片子把这一行折成两排，把简介正文挤出屏幕 |
+| 原名 `!= title` 才画 | 中文片名没刮到时标题连着印两遍 |
+
+另外两条：`metaLine` **恒非空**（分类兜底「其他」+ 来源恒在），所以调用方不判空；
+`actionLabels(resumable, itemCount)` 的顺序**必须**与 `buildDetailActions` 逐项一致
+（光标位置就是按这个下标存的，顺序错了 = 「点了 A 执行 B」）。
+
+**又一个「测试写错了」的实例（测试起了作用）**：我最初断言「什么都没刮到时
+`metaLine` 返回空串」，实际是 `"其他 · 未刮削"` —— 分类与来源两项恒在，
+所以这一行永不为空。断言改对之后，顺带把 `paintDetailHead` 里那句多余的
+`if (text.isEmpty()) GONE` 也删了。
+
+#### 6.8 海报解码的两个约束（与海报墙不同）
+
+- 解码**不能在主线程**（`PosterStore.decode`），走 `Bg.run`，与 `WorksAdapter`
+  同一套「先查缓存 → 未命中丢后台解 → 解完再画」。
+- ⛔ 解完**只重画这一块**，**不能** `notifyDataSetChanged()` 海报墙：那会连带重绑
+  整个 `GridView`，而用户此刻正在看详情页。
+- ⛔ 解码回来时**必须核对 `currentWork?.key == 解码时那个 key`**：这段时间里用户
+  可能已经退出这一页 / 进了别的作品，无条件画上去就是**别人的海报**。
+
+#### 6.9 本次验证
+
+`:app:compileDebugKotlin` ✅ · `:app:testDebugUnitTest --tests 'com.cloudcine.tv.library.*'`
+**214 例全绿**（原 201 + `WorkDetailFormatTest` 13）· `:app:assembleDebug` ✅。
+
 ## 7. PC TV 布局 / OSD 卡顿
 - `isTvLayout` = android + 逻辑宽≥960（⛔ 判据读 **view 宽**）。⛔ 页头 `actions` 必须 `Wrap`；⛔ **过扫描内边距只有 `app_shell` 一处**；⛔ 遥控器 **↓ 绝不接管**；⛔ **`SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。
 - ⛔ **播放页 OSD 卡顿**：整页 rebuild ≈10 次/秒（`bufferEnd` 没节流）+ `SubtitleViewConfiguration` 无 `operator ==` + `DebugOverlay` 的 `kDebugOverlayEnabled = true` **硬编码**。

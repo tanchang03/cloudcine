@@ -1,5 +1,6 @@
 package com.cloudcine.tv
 
+import java.util.Calendar
 import java.util.Locale
 
 /**
@@ -62,4 +63,78 @@ object Fmt {
      *    一旦有人改了 [bytes] 的精度，分子分母就不同源了。
      */
     fun mib(b: Long): Long = b / 1048576
+
+    // ------------------------------------------------------------------
+    // 时间（两份「文件列表」共用 —— 与 PC 端 `format.dart` 同口径）
+    // ------------------------------------------------------------------
+
+    /**
+     * 相对时间：`刚刚` / `3 分钟前` / `2 天前` / `2026-09-01`。
+     *
+     * ## 为什么列表里显示相对时间
+     *
+     * 这份列表要回答的是「新不新」，不是「精确到分是哪一刻」。完整时刻
+     * （[dateTimeMinute]）比很多文件名还长，印进那一列会喧宾夺主。
+     * 与 PC 端 `formatRelativeTime` 逐条一致 —— 一处写 `3 天前`、另一处写
+     * `2026-10-03 16:41`，用户会以为是两个不同的字段。
+     *
+     * ⛔ 超过 30 天退回**日期**而不是继续说「N 个月前」：月份长度不定，
+     *    「2 个月前」在 1 月 31 日与 3 月 1 日差一天却差两个字。
+     * ⛔ [nowMs] 由调用方给，是为了让这个纯函数能被单测。
+     */
+    fun relativeTime(ms: Long, nowMs: Long): String {
+        if (ms <= 0L) return "—"
+        val diffSec = (nowMs - ms) / 1000
+        if (diffSec < 0) return "刚刚"
+        if (diffSec < 60) return "刚刚"
+        val min = diffSec / 60
+        if (min < 60) return "$min 分钟前"
+        val hour = min / 60
+        if (hour < 24) return "$hour 小时前"
+        val day = hour / 24
+        if (day < 30) return "$day 天前"
+        return dateOnly(ms)
+    }
+
+    /** 精确到分钟的时刻：`2026-10-03 16:41`。 */
+    fun dateTimeMinute(ms: Long): String {
+        if (ms <= 0L) return "—"
+        val c = cal
+        c.timeInMillis = ms
+        return String.format(
+            Locale.US,
+            "%04d-%02d-%02d %02d:%02d",
+            c.get(Calendar.YEAR),
+            c.get(Calendar.MONTH) + 1,
+            c.get(Calendar.DAY_OF_MONTH),
+            c.get(Calendar.HOUR_OF_DAY),
+            c.get(Calendar.MINUTE),
+        )
+    }
+
+    /** `2026-09-01`。只在 [relativeTime] 超过 30 天时给。 */
+    private fun dateOnly(ms: Long): String {
+        val c = cal
+        c.timeInMillis = ms
+        return String.format(
+            Locale.US, "%04d-%02d-%02d",
+            c.get(Calendar.YEAR),
+            c.get(Calendar.MONTH) + 1,
+            c.get(Calendar.DAY_OF_MONTH),
+        )
+    }
+
+    /**
+     * 复用的日历实例 —— **单线程用**（这两个函数只在主线程上被调用）。
+     *
+     * ⛔ 不每次 new：`Calendar.getInstance()` 要读时区数据库，在 `getView`
+     *    里每行调一次就是几十次，而这份列表一屏有十几行、滚动时每行都要重画。
+     * ⛔ **每次使用前先 `timeInMillis = ms`**：这个 getter 故意在每次取用时
+     *    把实例重置回 epoch，所以绝不能直接 `cal.get(...)`，一定要先设值再读。
+     */
+    private val cal: Calendar = Calendar.getInstance()
+        get() {
+            field.timeInMillis = 0 // 占位，真正的值由调用方 setTimeInMillis
+            return field
+        }
 }

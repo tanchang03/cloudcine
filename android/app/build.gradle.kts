@@ -1,3 +1,4 @@
+import java.time.Duration
 import java.util.Properties
 
 plugins {
@@ -17,6 +18,12 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        // 本工程的源文件（含单测里那份 `android.text.TextUtils` 替身）注释全是
+        // 中文，这里显式钉住 UTF-8，别依赖构建机的平台默认编码。
+        // ⛔ 用的是 AGP 的 `compileOptions.encoding`（会下发到所有 Java 编译任务，
+        //    含 `compileDebugUnitTestJavaWithJavac`），不是
+        //    `tasks.withType<JavaCompile>` —— 后者会被 AGP 覆盖掉。
+        encoding = "UTF-8"
     }
 
     kotlinOptions {
@@ -144,6 +151,33 @@ val brandReleaseApk = tasks.register<Copy>("brandReleaseApk") {
     doLast { logger.lifecycle("品牌化产物：${dst.get().asFile}/$brandedApkName") }
 }
 tasks.matching { it.name == "assembleRelease" }.configureEach { finalizedBy(brandReleaseApk) }
+
+// ── 单测兜底超时：把「永远挂着」变成「明确失败」 ──────────────────────────
+//
+// ⛔ 起因（2026-10-07 实测）：JVM 单测跑的是 AGP 生成的 `mockable-android-*.jar`
+//    （全是空壳），而工程开了 `unitTests.isReturnDefaultValues = true`，
+//    于是框架方法**静默返回默认值**。Media3 的
+//    `WebvttParser.parse` 里有一句
+//
+//        while (!TextUtils.isEmpty(parsableWebvttData.readLine())) { ... }
+//
+//    `isEmpty` 恒返回 `false` ⇒ `while (true)`，`readLine()` 读到头后一直返回
+//    `null` ⇒ **死循环**。实测 `ExternalSubtitleTest.VTT 能解析` 单条用例
+//    371 秒里烧了 367 秒 CPU，整条 `testDebugUnitTest` 永远不返回，
+//    `assembleRelease`（依赖单测）跟着挂死，最后是被系统 SIGKILL 掉的。
+//
+//    真正的修法是给 `TextUtils` 补真实现（见
+//    `src/test/java/android/text/TextUtils.java`）；这个上限是**第二道保险** ——
+//    下一个「空壳返回默认值」引发死循环时，构建会红着退出并指向测试报告，
+//    而不是安静地挂在那儿让人以为「是不是卡死了」。
+//
+//    正常全套单测 < 1 分钟，5 分钟是宽松上限。
+tasks.withType<Test>().configureEach {
+    // ⛔ 必须写 `Duration.ofMinutes` 而**不是** `java.time.Duration.ofMinutes`：
+    //    Kotlin DSL 的脚本作用域里 `java` 是 Gradle 的 Java 插件扩展，
+    //    `java.time` 会被解析成它的 `time` 属性 ⇒ `Unresolved reference: time`。
+    timeout.set(Duration.ofMinutes(5))
+}
 
 dependencies {
     // ⛔ 版本必须与仓库根 Flutter 侧 `packages/video_player_android/android/build.gradle`

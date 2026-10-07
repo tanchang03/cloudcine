@@ -46,13 +46,15 @@ class LibraryBackupService {
     required String deviceName,
     int schemaVersion = 6,
     Future<DateTime?> Function()? localModifiedAt,
+    void Function()? onLibraryReplaced,
   })  : _adapter = adapter,
         _databasePath = databasePath,
         _posterCachePath = posterCachePath,
         _deviceId = deviceId,
         _deviceName = deviceName,
         _schemaVersion = schemaVersion,
-        _localModifiedAt = localModifiedAt;
+        _localModifiedAt = localModifiedAt,
+        _onLibraryReplaced = onLibraryReplaced;
 
   final CloudDriveAdapter _adapter;
   final String _databasePath;
@@ -68,6 +70,22 @@ class LibraryBackupService {
   /// 同步会退化成拿 `createdAt` 比较 —— 那等于「永远本机新」，
   /// 只适合单机场景。**生产环境必须注入**。
   final Future<DateTime?> Function()? _localModifiedAt;
+
+  /// 数据库文件被**整体替换**之后的钩子（[importBackup] 末尾调一次）。
+  ///
+  /// ## 为什么必须有这个钩子
+  ///
+  /// 恢复备份换掉的是**整个 `cloudcine.sqlite` 文件的字节**，`settings` 表
+  /// 跟着一起变。而进程内凡是「读过设置」的地方都还拿着旧值：
+  /// `SettingsStore._cache`、以及它上游的 `SettingsController` 状态。
+  ///
+  /// 后果静默且容易撞：在新机器上打开设置页（缓存里记下「TMDB Key 为空」）
+  /// → 恢复电脑上的备份 → **设置页还是空的**，刮削继续走匿名额度。
+  /// 这正是「token / cookie 随备份恢复」这条需求能不能成立的关键一步。
+  ///
+  /// ⛔ 由组合根注入，领域层不 import Riverpod：这里只知道「库换了，
+  ///    你该把你那边的缓存扔掉」。
+  final void Function()? _onLibraryReplaced;
 
   /// 备份包的 magic bytes。
   static const List<int> _magic = [0x43, 0x43, 0x42, 0x4B]; // 'CCBK'
@@ -281,6 +299,16 @@ class LibraryBackupService {
       diag.info('备份', '调用方要求保留本地设置，但当前实现无法做到'
           '（settings 表随数据库文件一起覆盖）');
     }
+
+    // 8. 通知组合根「库已经换人了」。
+    //
+    // ⛔ 放在**最后**、而且**无条件**调：前面任何一步抛异常都不会走到这里，
+    //    而那时候库文件可能已经写了一半 —— 让调用方去读一份半成品设置
+    //    不如让它在下次成功恢复时再清。
+    // ⛔ 这里必须**同步**调（不是 `await` 一个 Future）：调用方要做的事就是
+    //    「清一个内存 Map + invalidate 一个 provider」，都是同步的；
+    //    做成异步的话，紧接着读设置的那段代码有概率抢在清缓存之前跑。
+    _onLibraryReplaced?.call();
 
     return manifest;
   }

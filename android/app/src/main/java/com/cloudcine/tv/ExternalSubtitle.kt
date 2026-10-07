@@ -115,6 +115,15 @@ class ExternalSubtitle private constructor(
         /** 往回找重叠 cue 的最大条数。 */
         private const val MAX_BACK_SCAN = 64
 
+        /**
+         * [isTagComposite] 只看这么长的词。
+         *
+         * 标签串现实里就 2~6 个字（`中英双语` / `简繁英`）。不设上限的话，
+         * 一个长片名每个词都要跑一遍 O(n²) 完全切分 —— 结果是「更慢，且答案
+         * 还是 false」（片名不可能整词由标签拼成）。
+         */
+        private const val MAX_TAG_COMPOSITE_LEN = 8
+
         /** 拿不到时长、又是最后一条时，给它撑多久（微秒）。 */
         private const val TAIL_CUE_US = 8L * 1_000_000L
 
@@ -145,15 +154,39 @@ class ExternalSubtitle private constructor(
         /**
          * 解析一份字幕字节。
          *
+         * @param factory 解析器工厂。**生产调用一律不传**（用 Media3 的默认工厂）；
+         *   它存在的唯一理由是单测要注入一个假工厂 —— 见下面的「⛔ 为什么单测
+         *   必须能换掉解析器」。
+         *
          * @throws IllegalArgumentException 格式不认识
          * @throws IllegalStateException 认得出格式但一条都没解出来
+         *
+         * ## ⛔ 为什么单测必须能换掉解析器
+         *
+         * Media3 1.5.1 的 `SubripParser` / `SsaParser` / `WebvttParser` 造出来的
+         * 是 **`Spanned` 富文本**（`SubripParser.buildCue` 的入参类型就是
+         * `android.text.Spanned`），一路依赖 `SpannableStringBuilder` /
+         * `SpannableString` / `StyleSpan` / `ForegroundColorSpan` / `SparseArray`
+         * 一整套 Android 框架类。而 JVM 单测跑的是 AGP 生成的
+         * `mockable-android-*.jar`（空壳，方法一律返回默认值）——
+         * 在它上面跑真解析器**只有两种结局**：死循环（`TextUtils.isEmpty` 恒
+         * `false`，见 `src/test/java/android/text/TextUtils.java`）或者
+         * `Cue` 构造器里的 `checkNotNull(bitmap)` 抛 NPE（`text` 是空壳造出来的
+         * `null`）。要真跑得上 Robolectric（工程明确不引）或真机仪器化测试。
+         *
+         * 所以单测**只验我们自己写的那一段**：编码判定（BOM / GBK）、按
+         * `startTimeUs` 排序、结束时间兜底（[endOf]）、[cuesAt] 的二分。
+         * Media3 解析器本身的行为交给真机回归 —— 那也是唯一能真验的地方。
          */
-        fun parse(name: String, raw: ByteArray): ExternalSubtitle {
+        fun parse(
+            name: String,
+            raw: ByteArray,
+            factory: SubtitleParser.Factory = DefaultSubtitleParserFactory(),
+        ): ExternalSubtitle {
             val mime = mimeFor(name)
                 ?: throw IllegalArgumentException("不支持的字幕格式：$name")
 
             val bytes = toUtf8(raw)
-            val factory = DefaultSubtitleParserFactory()
             val format = Format.Builder().setSampleMimeType(mime).build()
             if (!factory.supportsFormat(format)) {
                 throw IllegalArgumentException("media3 里没有 $mime 的解析器")
@@ -270,8 +303,9 @@ class ExternalSubtitle private constructor(
         /**
          * 归一化文件名主干，用于「视频 ↔ 字幕」配对。
          *
-         * 步骤：去扩展名 → 小写 → 按非字母数字切词 → 丢掉 [TAGS] 与纯数字短词
-         * （`DDP5.1` 会被切成 `ddp5` 和 `1`，后者是噪音）→ 拼起来。
+         * 步骤：去扩展名 → 小写 → 按非字母数字切词 → 丢掉 [TAGS]、[isTagComposite]
+         * 认出的标签串、以及纯数字短词（`DDP5.1` 会被切成 `ddp5` 和 `1`，
+         * 后者是噪音）→ 拼起来。
          *
          * 例：`Furiosa.2024.2160p.WEB-DL.DDP5.1.Atmos.HDR.mkv` → `furiosa2024`
          */
@@ -281,10 +315,43 @@ class ExternalSubtitle private constructor(
             for (t in base.lowercase().split(SEPARATORS)) {
                 if (t.isEmpty()) continue
                 if (t in TAGS) continue
+                if (isTagComposite(t)) continue
                 if (t.length <= 2 && t.all { it.isDigit() }) continue
                 sb.append(t)
             }
             return sb.toString()
+        }
+
+        /**
+         * 这个词能不能**整词**由 [TAGS] 里的词拼出来。
+         *
+         * ⛔ 必须有这一条：中文压制组的标签经常**连写**，而 [TAGS] 里只有拆开的
+         *    形态 —— `Furiosa.2024.中英双语.srt` 切出来的词是 `中英双语`，
+         *    它既不在 [TAGS]（那里只有 `中英` 和 `双语`），也不含数字，于是整段
+         *    被拼进主干，得到 `furiosa2024中英双语` ≠ 视频的 `furiosa2024`
+         *    ⇒ **同一部片的字幕配不上，而且不报错**（表现是「自动挑不到字幕」）。
+         *
+         * ⛔ 判据是**整词可切分**，不是「包含某个标签」：`中` 单字是标签词的一部分
+         *    吗？`中国机长` 里含 `中`，用「包含」判会直接把片名丢掉 —— 那是比漏配
+         *    更糟的错（两部不同的片子会被归一化成同一个主干）。
+         *
+         * 用最朴素的 O(n²) 完全切分，n 是词长（现实里 ≤ 8）：一次 `normalize`
+         * 要跑几百个词，但每个词的 n² 都在常数级，实测无感。
+         */
+        private fun isTagComposite(token: String): Boolean {
+            val n = token.length
+            if (n < 2 || n > MAX_TAG_COMPOSITE_LEN) return false
+            // `ok[i]` = 前 i 个字符能被 TAGS 完整切分。
+            val ok = BooleanArray(n + 1)
+            ok[0] = true
+            for (i in 0 until n) {
+                if (!ok[i]) continue
+                for (j in i + 1..n) {
+                    if (ok[j]) continue
+                    if (token.substring(i, j) in TAGS) ok[j] = true
+                }
+            }
+            return ok[n]
         }
 
         /**

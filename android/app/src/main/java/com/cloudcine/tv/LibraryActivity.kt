@@ -3,6 +3,7 @@ package com.cloudcine.tv
 import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.util.Log
@@ -22,20 +23,29 @@ import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
 import com.cloudcine.tv.library.DeviceIdentity
+import com.cloudcine.tv.library.EpisodeLabels
 import com.cloudcine.tv.library.LibraryBackupService
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.ItemSortMode
 import com.cloudcine.tv.library.LibraryScanner
 import com.cloudcine.tv.library.MediaCategoryNames
 import com.cloudcine.tv.library.PlayTarget
+import com.cloudcine.tv.library.sortItems
 import com.cloudcine.tv.library.PosterStore
+import com.cloudcine.tv.library.StartupSync
+import com.cloudcine.tv.library.SyncDecision
 import com.cloudcine.tv.library.Work
+import com.cloudcine.tv.library.WorkDetailFormat
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.CredStore
 import com.cloudcine.tv.pan.PanApi
 import com.cloudcine.tv.pan.formatSize
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * 媒体库 —— **海报墙**（不是文件列表）。
@@ -51,8 +61,19 @@ import java.io.File
  *
  * ## 三层导航
  *
- * `作品墙` → `某部作品的剧集列表` → [PlayerActivity]。返回键退一层。
- * MENU 键开覆盖层菜单（排序 / 筛选 / 同步 / 备份）。
+ * `作品墙` → `作品简介页（海报 + 简介 + 动作胶囊 + 剧集列表）` → [PlayerActivity]。
+ * 返回键退一层。MENU 键开覆盖层菜单（排序 / 筛选 / 同步 / 备份）。
+ *
+ * ⛔ 2026-10-07 起 **OK 点卡片是「进简介页」，不是「直接播放」**（用户需求）。
+ *    直接播等于替用户做了三个决定 —— 播哪一条（`PlayTarget`）、播哪一版、
+ *    要不要先刮削；而用户点卡片时想做的经常是「看看这部是什么」「换一集」
+ *    「刮一下海报」。简介页把这三件事都摆成胶囊，播放只是其中最显眼的一颗。
+ *
+ * ## 启动时会问一句「网盘上有更新的备份，要不要同步」
+ *
+ * 见 [probeRemoteBackupAtStartup]。**只读探测 + 只在「远程赢」时弹**，
+ * 一个进程一次 —— 同步这个能力如果只藏在菜单里，等于不存在：用户不会想到
+ * 去点它，于是电视上永远显示上周那份索引。
  *
  * ## 界面结构（自上而下）
  *
@@ -66,7 +87,22 @@ import java.io.File
  *  片名  片名  片名  片名  片名  片名  片名  片名
  *  2024·8.7 …
  * 选中作品的简介 / 类型                        ← infoLine
- * ↑↓←→ 选择 · OK 播放 · 返回 · 菜单 排序/筛选/备份
+ * ↑↓←→ 选择 · OK 进简介页 · ↑ 到状态行 · 菜单 更多   ← hintBar
+ * ```
+ *
+ * 进作品之后（`Level.ITEMS`）上半部分换成简介页：
+ *
+ * ```
+ * [logo] 媒体库 / 片名                       剧集 · 12 个文件
+ * ┌────┐  片名                                  ← 简介页头部（detailHead）
+ * │海报│  原名 / Original Title
+ * │96× │  2024 · 2 季 · 12 集 · 剧集 · ★ 8.7 · 已刮削 · 剧情/犯罪
+ * └────┘  简介正文（最多三行，超出省略）
+ * [▶ 续播] [手动刮削] [刮削设置] [选集（12）]      ← 动作胶囊（actionsScroll）
+ * [修改时间倒序] [剧集顺序] [标题]                ← 排序胶囊（itemsSortScroll）
+ * 第 1 集 …                                    ← 剧集列表（ListView）
+ * 第 2 集 …
+ * ←→ 换胶囊 · OK 播放 / 执行 · ↑↓ 换层 · 菜单 更多  ← hintBar
  * ```
  *
  * ## 按键：分类标签**自己管**，海报墙交给框架
@@ -76,6 +112,11 @@ import java.io.File
  * 去给它们排焦点是不可靠的（`requestFocus()` 会静默失败）——
  * 所以标签行只做两件事：**自己接管 ←→**（见 [dispatchKeyEvent]），
  * 以及用 `requestFocus()` 让海报墙的选中框消失。
+ *
+ * ⛔ 简介页上的两行胶囊（动作 / 排序）是同一套做法，而且**焦点一直留在
+ *    [itemsList] 上**：胶囊只吃「光标态」，靠 `actionsFocused` /
+ *    `itemsSortFocused` 两个标志把方向键分流。焦点一挪到胶囊上，底下列表那行
+ *    的高亮就没了，用户会以为列表被清空了。
  */
 class LibraryActivity : Activity() {
 
@@ -110,6 +151,51 @@ class LibraryActivity : Activity() {
     private lateinit var overlayRowsBox: LinearLayout
     private lateinit var overlayScroll: ScrollView
     private lateinit var overlayScrim: FrameLayout
+
+    // ── 作品简介页（`Level.ITEMS` 的头部）────────────────────────────
+    //
+    // ⛔ **点卡片先到这一页，不再直接播**（2026-10-07 用户需求：「点击媒体文件
+    //    应该先进入简介页面」）。理由：直接播等于替用户做了三个决定 ——
+    //    播哪一条（`PlayTarget`）、播哪一版、要不要先刮削。而用户点卡片时想做的
+    //    经常是「看看这部是什么」「换一集」「刮一下海报」。
+    //
+    // 版式**对标 PC 端 `work_detail_page.dart` 的 `_InfoColumn`**：左海报、
+    // 右侧「标题 / 原名 / 元数据行 / 简介」，下面一行动作胶囊。
+    private lateinit var detailHead: LinearLayout
+    private lateinit var detailPoster: ImageView
+    private lateinit var detailPosterPlaceholder: TextView
+    private lateinit var detailTitle: TextView
+    private lateinit var detailOriginal: TextView
+    private lateinit var detailMeta: TextView
+    private lateinit var detailOverview: TextView
+
+    // 简介页的**动作胶囊行**（播放 / 手动刮削 / 刮削设置 / 选集）。
+    //
+    // ⛔ 与「剧集排序胶囊」是**两行、两套光标态**（`actionsFocused` /
+    //    `itemsSortFocused`），刻意不合并：动作行回答「对这一部作品做什么」，
+    //    排序行回答「这一页的列表怎么排」。合成一行的话「播放」会和
+    //    「修改时间倒序」并排，用户按 ←→ 路过时完全分不清哪颗是动作。
+    private var actionsFocused = false
+    private var actionsCursor = 0
+    private lateinit var actionsBox: LinearLayout
+    private lateinit var actionsScroll: HorizontalScrollView
+    private var detailActions: List<DetailAction> = emptyList()
+
+    /** 底部按键提示行。**随层级换文案**（作品墙 / 简介页管的键不一样）。 */
+    private lateinit var hintBar: TextView
+
+    /**
+     * 简介页上的一颗动作胶囊。
+     *
+     * ⛔ 带 `enabled` 而不是「不可用时干脆不加进列表」：库里一条可播文件都没有
+     *    时，用户最需要看到的恰恰是**一个灰着的「播放」**加上一句解释 ——
+     *    按钮凭空消失的话，他只会以为这个页面坏了。
+     */
+    private class DetailAction(
+        val label: String,
+        val enabled: Boolean,
+        val onPick: () -> Unit,
+    )
 
     // ── 状态 ────────────────────────────────────────────────────────
     private enum class Level { WORKS, ITEMS }
@@ -163,6 +249,18 @@ class LibraryActivity : Activity() {
     private lateinit var worksAdapter: WorksAdapter
     private lateinit var itemsAdapter: ItemsAdapter
 
+    // ── 剧集列表（作品详情页）的排序胶囊 ──
+    // ⛔ **默认「修改时间倒序」**：用户要的默认就是它（见需求）。三档里
+    //    [ItemSortMode.EPISODE_ORDER] 是「沿用仓储层排好的季→部→集→名称」，
+    //    不是「没排序」，所以它是个**真正的选项**而不是默认值。
+    private var itemsSortMode: ItemSortMode = ItemSortMode.MODIFIED_DESC
+    private var itemsSortCursor: Int = ItemSortMode.entries.indexOf(ItemSortMode.MODIFIED_DESC)
+    // ⛔ 光标态与生效态分离（与一级导航同一套语言）：←→ 只移光标，OK 才生效，
+    //    避免跟着光标一路重排整个列表（电视上就是一路闪屏）。
+    private var itemsSortFocused = false
+    private lateinit var itemsSortBox: LinearLayout
+    private lateinit var itemsSortScroll: HorizontalScrollView
+
     /** 单张卡片的宽度（像素），由 [computeGrid] 算一次，`getView` 反复用。 */
     private var cardW = 0
 
@@ -205,6 +303,11 @@ class LibraryActivity : Activity() {
         setContentView(root)
 
         loadWorks()
+
+        // ⛔ 用 `post` 而不是直接调：探测要走网络（列目录 + 读 64 KiB 头），
+        //    放在 `onCreate` 里会让首帧等它。海报墙先画出来，探测随后就到 ——
+        //    它本来就是「顺带问一句」，不该挡住用户看东西。
+        root.post { probeRemoteBackupAtStartup() }
     }
 
     override fun onDestroy() {
@@ -345,6 +448,120 @@ class LibraryActivity : Activity() {
         }
         column.addView(worksGrid, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
+        // ── 作品简介页头部（`Level.ITEMS` 才有；作品墙那一层整块 GONE）──
+        //
+        // 版式**对标 PC 端 `work_detail_page.dart` 的 `_InfoColumn`**：左海报
+        // （2:3）、右侧「标题 / 原名 / 元数据 / 简介」，下面一行动作胶囊。
+        //
+        // ⛔ 海报尺寸**不照抄 PC 的 138×207**：电视横屏的逻辑高只有 540dp
+        //    （1080p / density 2.0），207dp 的海报加上动作行、排序行、列表、
+        //    底部两行提示会把这页撑爆 —— 列表只剩一行，而「选集」恰恰是这页的
+        //    主要用途。收到 96×144 之后刚好放下三行简介 + 四行列表。
+        detailHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), dp(4))
+            visibility = View.GONE
+        }
+        val posterBox = FrameLayout(this)
+        detailPoster = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(0xFF232833.toInt())
+        }
+        posterBox.addView(detailPoster, FrameLayout.LayoutParams(MATCH, MATCH))
+        detailPosterPlaceholder = TextView(this).apply {
+            setTextColor(0xFF4B5563.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
+            gravity = Gravity.CENTER
+            setBackgroundColor(0xFF232833.toInt())
+        }
+        posterBox.addView(detailPosterPlaceholder, FrameLayout.LayoutParams(MATCH, MATCH))
+        detailHead.addView(posterBox, LinearLayout.LayoutParams(dp(96), dp(144)))
+
+        val infoCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), 0, 0, 0)
+        }
+        detailTitle = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTypeface(typeface, Typeface.BOLD)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        infoCol.addView(detailTitle)
+        detailOriginal = TextView(this).apply {
+            setTextColor(MUTED)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dp(3), 0, 0)
+        }
+        infoCol.addView(detailOriginal)
+        detailMeta = TextView(this).apply {
+            setTextColor(0xFFB9B2FF.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dp(7), 0, 0)
+        }
+        infoCol.addView(detailMeta)
+        detailOverview = TextView(this).apply {
+            setTextColor(MUTED)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            maxLines = 3
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(0, dp(8), 0, 0)
+        }
+        infoCol.addView(detailOverview)
+        detailHead.addView(infoCol, LinearLayout.LayoutParams(0, WRAP, 1f))
+        column.addView(detailHead, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        // ── 简介页动作胶囊（播放 / 手动刮削 / 刮削设置 / 选集）──
+        // 与排序胶囊同一套样式语言（实心面明度区分「光标 / 常态」，不描边）。
+        // ⛔ 自己不吃焦点：光标态由 `actionsFocused` + `actionsCursor` 驱动，
+        //    焦点始终留在 `itemsList` 上（见 [focusDetailActions]）。
+        actionsBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), dp(4))
+            isFocusable = false
+            isFocusableInTouchMode = false
+        }
+        actionsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            isFocusable = false
+            isFocusableInTouchMode = false
+            clipToPadding = false
+            clipChildren = false
+            visibility = View.GONE
+        }
+        actionsScroll.addView(actionsBox, FrameLayout.LayoutParams(WRAP, WRAP))
+        column.addView(actionsScroll, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        // ── 剧集列表排序胶囊（进作品后才显示）──
+        // 与一级导航的胶囊同一套样式语言（实心面明度区分「生效 / 光标 / 常态」，
+        // 不描边）。放在列表上方，↑ 从首行进、↓ 回列表。
+        itemsSortBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), dp(4))
+            // ⛔ 胶囊自己不吃焦点：光标态由 `itemsSortFocused` + `itemsSortCursor`
+            //    驱动，焦点全在 `itemsList` 上（见 [dispatchKeyEvent]）。
+            isFocusable = false
+            isFocusableInTouchMode = false
+        }
+        itemsSortScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            isFocusable = false
+            isFocusableInTouchMode = false
+            clipToPadding = false
+            clipChildren = false
+            visibility = View.GONE
+        }
+        itemsSortScroll.addView(itemsSortBox, FrameLayout.LayoutParams(WRAP, WRAP))
+        column.addView(itemsSortScroll, LinearLayout.LayoutParams(MATCH, WRAP))
+
         // ── 剧集列表（进作品后才显示）──
         itemsAdapter = ItemsAdapter()
         itemsList = ListView(this).apply {
@@ -369,12 +586,15 @@ class LibraryActivity : Activity() {
         }
         column.addView(infoLine)
 
-        column.addView(TextView(this).apply {
-            text = "↑↓←→ 选择 · OK 直接播放 · ↑ 到状态行（排序 / 筛选）· 菜单 更多"
+        // ⛔ 提示文案**随层级换**（[hintBar]）：作品墙上的 OK 是「进简介页」，
+        //    简介页上的 OK 是「播放 / 应用」。写死一句话的话，两层里总有一层
+        //    在骗人 —— 而遥控器上用户唯一的线索就是这行字。
+        hintBar = TextView(this).apply {
             setTextColor(0xFF6B7280.toInt())
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), dp(16))
-        })
+        }
+        column.addView(hintBar)
 
         // 卡片宽度要按屏幕算，`onCreate` 里控件还没量过宽 —— 直接用屏幕宽度，
         // 本页是全屏横屏，两者一致。
@@ -531,6 +751,10 @@ class LibraryActivity : Activity() {
         currentWork = null
         worksGrid.visibility = View.VISIBLE
         itemsList.visibility = View.GONE
+        // 简介页那一整块（海报 / 信息 / 动作胶囊）在作品墙上是 GONE。
+        detailHead.visibility = View.GONE
+        actionsScroll.visibility = View.GONE
+        actionsFocused = false
         // ⛔ 收起/展开的是**滚动容器**，不是里面的 `LinearLayout`：
         //    只把子视图设成 GONE 的话，外面那层 `HorizontalScrollView` 还在，
         //    它会留一条高度为 0 却仍然参与焦点搜索的空壳。
@@ -538,6 +762,7 @@ class LibraryActivity : Activity() {
         barScroll.visibility = View.VISIBLE
         title.text = "媒体库"
         status.text = statusText
+        hintBar.text = "↑↓←→ 选择 · OK 进简介页 · ↑ 到状态行（排序 / 筛选）· 菜单 更多"
         paintTabs()
         paintBar()
         worksAdapter.notifyDataSetChanged()
@@ -554,6 +779,16 @@ class LibraryActivity : Activity() {
         }
     }
 
+    /**
+     * 进「作品简介页」。
+     *
+     * ⛔ 2026-10-07 起**点卡片走这里，不再直接播**（用户需求）。理由：直接播
+     *    等于替用户做了三个决定 —— 播哪一条（[PlayTarget]）、播哪一版、
+     *    要不要先刮削；而用户点卡片时想做的经常是「看看这部是什么」
+     *    「换一集」「刮一下海报」。
+     *
+     * ⛔ 取条目要在**后台**读（`itemsForWork` 是查库，剧集一部能有两百条）。
+     */
     private fun openWork(w: Work) {
         status.text = "读取「${w.title}」…"
         Bg.run({ db.itemsForWork(w.key) }) { list, err ->
@@ -561,13 +796,29 @@ class LibraryActivity : Activity() {
                 status.text = "读取失败：${err.message}"
                 return@run
             }
+            // ⛔ 进作品**默认按修改时间倒序**：这是用户要的默认排序（见需求）。
+            //    [sortItems] 对 [ItemSortMode.EPISODE_ORDER] 原样返回、对两种时间档
+            //    重排；这里先按默认档排好，胶囊再画「当前档 = 修改时间倒序」。
+            itemsSortMode = ItemSortMode.MODIFIED_DESC
+            itemsSortCursor = ItemSortMode.entries.indexOf(itemsSortMode)
+            itemsSortFocused = false
+            // ⛔ 保留 `items` 这个 `ArrayList` 本身（别重新赋值），只清空重填：
+            //    适配器持有的是它。**也别先填一遍再清一遍** —— 那样
+            //    `sortItems` 拿到的是空列表，剧集列表会永远是空的（不报错）。
             items.clear()
-            items.addAll(list ?: emptyList())
+            items.addAll(sortItems(list ?: emptyList(), itemsSortMode))
             level = Level.ITEMS
             currentWork = w
             itemsAdapter.notifyDataSetChanged()
             worksGrid.visibility = View.GONE
             itemsList.visibility = View.VISIBLE
+            // 简介页头部 + 动作胶囊 + 排序胶囊：三块都只在作品详情页出现。
+            paintDetailHead()
+            actionsCursor = 0
+            buildDetailActions()
+            actionsScroll.visibility = View.VISIBLE
+            itemsSortScroll.visibility = View.VISIBLE
+            buildItemsSortBar()
             // ⛔ 进作品后分类/筛选行**必须收起来**：它们的作用域是「作品墙」，
             //    留在屏幕上会让人以为还能按分类过滤剧集（实际不会）。
             tabsScroll.visibility = View.GONE
@@ -579,9 +830,12 @@ class LibraryActivity : Activity() {
             barFocused = false
             title.text = "媒体库 / ${w.title}"
             status.text = "${w.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
+            hintBar.text = "←→ 换胶囊 · OK 播放 / 执行 · ↑↓ 换层 · 菜单 更多 · 返回 回作品墙"
+            // ⛔ 焦点给列表、**光标**给动作行：列表拿到焦点它的选中高亮才画得出来，
+            //    而 ←→ 这时归动作行管（见 [focusDetailActions] 的理由）。
             itemsList.setSelection(0)
             itemsList.requestFocus()
-            infoLine.text = w.overview?.takeIf { it.isNotBlank() }?.let { brief(it) } ?: ""
+            focusDetailActions()
         }
     }
 
@@ -590,6 +844,13 @@ class LibraryActivity : Activity() {
         level = Level.WORKS
         currentWork = null
         items.clear()
+        // 离开详情页：简介页头部、动作胶囊、排序胶囊与它们的光标态都要复位，
+        // 回作品墙时这三块都是不可见的。
+        detailHead.visibility = View.GONE
+        actionsScroll.visibility = View.GONE
+        itemsSortScroll.visibility = View.GONE
+        actionsFocused = false
+        itemsSortFocused = false
         loadWorks()
     }
 
@@ -611,6 +872,74 @@ class LibraryActivity : Activity() {
 
     private fun brief(text: String): String =
         text.replace(Regex("\\s+"), " ").trim().let { if (it.length > 90) it.take(90) + "…" else it }
+
+    // ------------------------------------------------------------------
+    // 简介页头部（海报 + 标题 / 原名 / 元数据 / 简介）
+    // ------------------------------------------------------------------
+
+    /**
+     * 把 [currentWork] 画进简介页头部。
+     *
+     * ⛔ 每次刮削回来必须重画（[refreshAfterScrape]）：标题 / 年份 / 类型 / 简介
+     *    / 海报都会被改。不重画的表现是「刮成功了，页面上还是旧的」。
+     * ⛔ 海报解码**绝不能在主线程做**（见 [PosterStore.decode]）：与海报墙
+     *    同一套「先查缓存、未命中就丢后台解、解完再画」的流程。
+     */
+    private fun paintDetailHead() {
+        val w = currentWork
+        if (w == null) {
+            detailHead.visibility = View.GONE
+            return
+        }
+        detailHead.visibility = View.VISIBLE
+
+        detailTitle.text = w.title
+        // ⛔ 「原名」与「元数据行」的口径都封在 [WorkDetailFormat] 里（可单测），
+        //    这里只负责把它们画上去 —— 别在这边再写一遍判据。
+        val original = WorkDetailFormat.originalLine(w)
+        detailOriginal.text = original ?: ""
+        detailOriginal.visibility = if (original == null) View.GONE else View.VISIBLE
+
+        // ⛔ 这一行**恒非空**（分类与来源恒在，见 [WorkDetailFormat.metaLine]），
+        //    所以不判空、不设 GONE —— 元数据是这一页最该一眼看到的东西。
+        detailMeta.text = WorkDetailFormat.metaLine(w)
+        detailMeta.visibility = View.VISIBLE
+
+        val overview = WorkDetailFormat.overviewText(w)
+        detailOverview.text = overview ?: ""
+        detailOverview.visibility = if (overview == null) View.GONE else View.VISIBLE
+
+        paintDetailPoster(w)
+    }
+
+    /** 简介页海报。三级查找封在 [PosterStore.fileFor] 里，这里只管画。 */
+    private fun paintDetailPoster(w: Work) {
+        val file = posters.fileFor(w)
+        val bmp = file?.let { posters.cached(it) }
+        if (bmp != null) {
+            detailPoster.setImageBitmap(bmp)
+            detailPoster.visibility = View.VISIBLE
+            detailPosterPlaceholder.visibility = View.GONE
+            return
+        }
+        detailPoster.setImageDrawable(null)
+        detailPoster.visibility = View.INVISIBLE
+        // 没海报时给一个「首字」占位块 —— 一片灰比一个字更让人以为坏了。
+        detailPosterPlaceholder.text = w.title.take(1)
+        detailPosterPlaceholder.visibility = View.VISIBLE
+        if (file == null) return
+        // ⛔ 解码绝不能在主线程做（见 [PosterStore.decode]）。
+        //    解完**只重画这一块**，不能 `notifyDataSetChanged()` 海报墙 ——
+        //    那会连带重绑整个 `GridView`，而用户此刻正在看详情页。
+        Bg.run({ posters.decode(file, dp(DETAIL_POSTER_DP * 2)) }) { bitmap, err ->
+            if (bitmap == null || err != null) return@run
+            posters.put(file, bitmap)
+            // ⛔ 解码回来时用户可能已经退出这一页了 —— 那时 `currentWork`
+            //    换人（或被清空），直接画上去就是**别人的海报**。
+            if (currentWork?.key != w.key) return@run
+            paintDetailPoster(w)
+        }
+    }
 
     // ------------------------------------------------------------------
     // 分类标签 / 筛选行
@@ -908,6 +1237,231 @@ class LibraryActivity : Activity() {
         barItems.getOrNull(barIndex)?.onPick()
     }
 
+    // ------------------------------------------------------------------
+    // 剧集列表（作品详情页）的排序胶囊
+    //
+    // 与一级导航的胶囊**同一套样式语言**（实心面明度区分「生效 / 光标 / 常态」，
+    // 不描边），但**作用域不同**：它只在 `Level.ITEMS` 出现，且光标态和生效态
+    // 分离（←→ 只移光标，OK 才重排），理由与一级导航一致（见 [moveTab]）。
+    // ------------------------------------------------------------------
+
+    /** 重画排序胶囊。当前档 = 生效（亮品牌色实心 + 深字）；光标所在 = 暗品牌色。 */
+    private fun buildItemsSortBar() {
+        val modes = ItemSortMode.entries
+        itemsSortBox.removeAllViews()
+        for ((i, mode) in modes.withIndex()) {
+            itemsSortBox.addView(
+                itemsSortChip(
+                    mode,
+                    isCurrent = mode == itemsSortMode,
+                    isCursor = itemsSortFocused && i == itemsSortCursor,
+                ),
+            )
+        }
+        revealChip(itemsSortScroll, itemsSortBox, itemsSortCursor)
+    }
+
+    /** 一颗排序胶囊。尺寸/圆角/配色与 [barChip] 同款，只是多了「生效态」高亮。 */
+    private fun itemsSortChip(mode: ItemSortMode, isCurrent: Boolean, isCursor: Boolean): TextView =
+        TextView(this).apply {
+            text = mode.label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            maxLines = 1
+            isSingleLine = true
+            isFocusable = false
+            isFocusableInTouchMode = false
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = dp(18).toFloat()
+                setColor(
+                    when {
+                        isCurrent -> BRAND_TINT
+                        isCursor -> 0xFF4A4278.toInt()
+                        else -> 0x14FFFFFF
+                    },
+                )
+            }
+            setTextColor(
+                when {
+                    isCurrent -> 0xFF1A1533.toInt()
+                    isCursor -> Color.WHITE
+                    else -> 0xFFB9C0CC.toInt()
+                },
+            )
+            layoutParams = LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) }
+        }
+
+    /** ←→ 在排序胶囊里移光标。**不重排**：重排只发生在 OK 生效时。 */
+    private fun moveItemsSort(delta: Int) {
+        val modes = ItemSortMode.entries
+        itemsSortCursor = (itemsSortCursor + delta + modes.size) % modes.size
+        buildItemsSortBar()
+    }
+
+    /** OK：把光标所在档设为当前排序，重排列表、回到第一行、把焦点还给列表。 */
+    private fun applyItemsSort() {
+        val mode = ItemSortMode.entries.getOrNull(itemsSortCursor) ?: return
+        if (mode == itemsSortMode) {
+            focusItemsList()
+            return
+        }
+        Log.i(TAG, "剧集排序：${itemsSortMode.label} → ${mode.label}")
+        itemsSortMode = mode
+        // ⛔ 保留 `items` 这个 `ArrayList` 本身（别重新赋值），只清空重填：
+        //    列表适配器持有的是它，重新赋值会丢掉引用。
+        val sorted = sortItems(items, mode)
+        items.clear()
+        items.addAll(sorted)
+        itemsAdapter.notifyDataSetChanged()
+        // ⛔ 回到第一行：重排后旧选中项的 position 已经失效，而「切排序 = 想看
+        //    另一种顺序」通常就该从头扫，与海报墙切分类回第一行一致。
+        itemsList.setSelection(0)
+        buildItemsSortBar()
+        focusItemsList()
+    }
+
+    // ------------------------------------------------------------------
+    // 简介页动作胶囊（播放 / 手动刮削 / 刮削设置 / 选集）
+    //
+    // 与排序胶囊同一套语言（实心面明度区分「光标 / 常态」，不描边），但**不是
+    // 同一个东西**：动作行回答「对这一部作品做什么」，排序行回答「这一页的
+    // 列表怎么排」。两行、两套光标态，理由见字段区。
+    // ------------------------------------------------------------------
+
+    /**
+     * 重建动作胶囊的**内容**。
+     *
+     * ⛔ 每次进作品 / 刮削回来都要重建：文案与 `enabled` 都依赖当前这份
+     *    [currentWork] 与 [items]（「续播」只在真有进度时出现、播放按钮在
+     *    一条可播文件都没有时置灰）。缓存一份的话，刮削换了标题之后按钮
+     *    还是旧的。
+     */
+    private fun buildDetailActions() {
+        val w = currentWork
+        val actions = ArrayList<DetailAction>(5)
+        if (w != null) {
+            val resumable = (w.resumeFraction ?: 0.0) > 0.0
+            // ⛔ 文案与可用性来自 [WorkDetailFormat]（可单测），这里只负责把
+            //    「第几颗胶囊做什么」接上 —— 顺序必须与那边逐项一致，
+            //    因为光标位置就是按这个下标存的。
+            val labels = WorkDetailFormat.actionLabels(resumable, items.size)
+            actions.add(
+                DetailAction(labels[0].first, labels[0].second) { playWork(w) },
+            )
+            actions.add(DetailAction(labels[1].first, labels[1].second) { openScrape(w) })
+            actions.add(DetailAction(labels[2].first, labels[2].second) { openScrapeSettings() })
+            // 「选集」不是一个动作，而是**把光标交给下面的列表** —— 它在电视上
+            // 是「这一页怎么换集」的唯一说明；没有它，用户会以为这里只能播一条。
+            actions.add(
+                DetailAction(labels[3].first, labels[3].second) { focusItemsList() },
+            )
+        }
+        detailActions = actions
+        actionsCursor = actionsCursor.coerceIn(0, (actions.size - 1).coerceAtLeast(0))
+        paintDetailActions()
+    }
+
+    /** 重画动作胶囊。光标所在 = 亮品牌色实心 + 深字；不可用 = 压到几乎看不见。 */
+    private fun paintDetailActions() {
+        actionsBox.removeAllViews()
+        for ((i, a) in detailActions.withIndex()) {
+            actionsBox.addView(actionChip(a, isCursor = actionsFocused && i == actionsCursor))
+        }
+        revealChip(actionsScroll, actionsBox, actionsCursor)
+    }
+
+    /** 一颗动作胶囊。尺寸 / 圆角 / 配色与 [itemsSortChip] 同款（不描边）。 */
+    private fun actionChip(a: DetailAction, isCursor: Boolean): TextView =
+        TextView(this).apply {
+            text = a.label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            maxLines = 1
+            isSingleLine = true
+            isFocusable = false
+            isFocusableInTouchMode = false
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = dp(18).toFloat()
+                setColor(
+                    when {
+                        !a.enabled -> 0x0AFFFFFF
+                        isCursor -> BRAND_TINT
+                        else -> 0x14FFFFFF
+                    },
+                )
+            }
+            setTextColor(
+                when {
+                    !a.enabled -> 0xFF4B5563.toInt()
+                    isCursor -> 0xFF1A1533.toInt()
+                    else -> 0xFFB9C0CC.toInt()
+                },
+            )
+            layoutParams = LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) }
+        }
+
+    /** ←→ 在动作胶囊里移光标。**不执行**：动作只在 OK 时发生。 */
+    private fun moveActions(delta: Int) {
+        if (detailActions.isEmpty()) return
+        actionsCursor = (actionsCursor + delta + detailActions.size) % detailActions.size
+        paintDetailActions()
+        val a = detailActions[actionsCursor]
+        infoLine.text = if (a.enabled) "OK ${a.label}" else "${a.label}：现在没有可播的文件"
+    }
+
+    /** OK：执行光标所在的动作。 */
+    private fun applyAction() {
+        val a = detailActions.getOrNull(actionsCursor) ?: return
+        if (!a.enabled) {
+            infoLine.text = "${a.label}：现在没有可播的文件"
+            return
+        }
+        Log.i(TAG, "简介页动作：${a.label}")
+        a.onPick()
+    }
+
+    /**
+     * ↑ 从排序胶囊进动作行（进作品时也走这里）。
+     *
+     * ⛔ **不抢焦点**（不 `requestFocus()`）：焦点留在 [itemsList] 上，列表的
+     *    选中高亮才画得出来，动作行只吃「光标态」。与 [focusItemsSort] 同一套
+     *    理由 —— 焦点一挪走，底下那行的高亮就没了，用户会以为列表被清空了。
+     * ⛔ 这几个 `focus*` 函数**必须互相清掉对方的标志位**（与 [focusTabs] 那一组
+     *    同一条规矩）：漏清一个就会出现「两行胶囊同时发光」，用户完全不知道
+     *    按键现在管的是哪一行。
+     */
+    private fun focusDetailActions() {
+        itemsSortFocused = false
+        actionsFocused = true
+        paintDetailActions()
+        buildItemsSortBar()
+        infoLine.text = "←→ 选动作 · OK 执行 · ↓ 到列表 · ↑ 回作品墙"
+    }
+
+    /** ↑ 从列表首行进排序胶囊：胶囊吃光标态，列表的选中高亮仍在（不抢焦点）。 */
+    private fun focusItemsSort() {
+        actionsFocused = false
+        itemsSortFocused = true
+        paintDetailActions()
+        buildItemsSortBar()
+        infoLine.text = "OK 应用排序 · ↑ 到动作 · ↓ 返回列表"
+    }
+
+    /** 把光标交回列表（两行胶囊都失去光标态），并恢复底部提示。 */
+    private fun focusItemsList() {
+        actionsFocused = false
+        itemsSortFocused = false
+        paintDetailActions()
+        buildItemsSortBar()
+        // ⛔ 光标在胶囊上时底部那行被改成了「OK 应用排序…」，交回列表要还原。
+        //    简介正文现在画在**上面的头部**里（见 [paintDetailHead]），所以这行
+        //    改成按键提示，不再是同一段简介在屏幕上印两遍。
+        infoLine.text = "OK 播放这一集 · ↑ 到排序 / 动作 · 返回 回作品墙"
+        itemsList.requestFocus()
+    }
+
     /**
      * 排序子菜单。
      *
@@ -1000,15 +1554,16 @@ class LibraryActivity : Activity() {
     // ------------------------------------------------------------------
 
     /**
-     * 点作品卡片 —— **直接播放**（VidHub / Infuse 的标准行为）。
+     * 点作品卡片 —— **进简介页**（2026-10-07 起，不再是「直接播放」）。
      *
-     * ⛔ 播哪一条由 [PlayTarget] 决定：**先续播点、再看过的最后一条、最后才
-     *    第一条**。用户点海报的意图是看片，不是先看一页列表 —— 剧集列表
-     *    改由 MENU →「剧集列表」进入。
-     * ⛔ 取条目要在**后台**读（`itemsForWork` 是查库，剧集一部能有两百条）。
+     * ⛔ 直接播等于替用户做了三个决定 —— 播哪一条（[PlayTarget]）、播哪一版、
+     *    要不要先刮削；而用户点卡片时想做的经常是「看看这部是什么」「换一集」
+     *    「刮一下海报」。简介页把这三件事都摆出来，播放只是其中最显眼的一颗胶囊。
+     * ⛔ 因此 `onWorkRow` 与 `onItemRow` 现在是**两种语义**：前者进详情页
+     *    （异步读库），后者直接起播（已经在详情页里，选的就是那一条）。
      */
     private fun onWorkRow(position: Int) {
-        works.getOrNull(position)?.let { playWork(it) }
+        works.getOrNull(position)?.let { openWork(it) }
     }
 
     private fun playWork(w: Work) {
@@ -1494,16 +2049,26 @@ class LibraryActivity : Activity() {
 
         if (level == Level.ITEMS) {
             val cur = currentWork
-            if (cur != null) actions.add("播放「${cur.title}」（续播）" to { playWork(cur) })
+            if (cur != null) {
+                actions.add("播放「${cur.title}」（续播）" to { playWork(cur) })
+                // ⛔ 刮削入口紧跟在播放后面：它是**对这一部作品**的动作，
+                //    和「同步 / 备份」那种全局动作不是一类。
+                actions.add("手动刮削「${cur.title}」" to { openScrape(cur) })
+            }
             actions.add("同步（本地 ↔ 网盘）" to { doSync() })
             actions.add("上传备份到网盘" to { doUpload() })
             actions.add("从网盘恢复（覆盖本地）" to { confirmRestore() })
+            // ⛔ 设置项放在这里（而不是只在作品墙上）：用户看到「刮不出东西」
+            //    的瞬间，想找的就是这一项，让他先退回作品墙是白走一步。
+            actions.add("刮削设置（TMDB Key / 反代 / 豆瓣 Cookie）" to { openScrapeSettings() })
             actions.add("返回作品墙" to { backToWorks() })
         } else {
             val cur = works.getOrNull(worksGrid.selectedItemPosition)
             if (cur != null) {
-                actions.add("播放「${cur.title}」" to { playWork(cur) })
-                actions.add("「${cur.title}」的剧集列表" to { openWork(cur) })
+                // ⛔ 「简介页」排在「播放」前面：它是**默认**的卡片行为（OK），
+                //    菜单里的顺序与按键习惯保持一致，用户才不会觉得菜单是另一套。
+                actions.add("「${cur.title}」简介页 / 选集" to { openWork(cur) })
+                actions.add("播放「${cur.title}」（续播）" to { playWork(cur) })
             }
             // ⛔ 排序**不在菜单里循环切**：六档要按五次才能到头，而每按一次都会
             //    重查库 + 重排整个海报墙。走子菜单，一次选完（状态行上的
@@ -1530,6 +2095,8 @@ class LibraryActivity : Activity() {
             actions.add("同步（本地 ↔ 网盘）" to { doSync() })
             actions.add("上传备份到网盘" to { doUpload() })
             actions.add("从网盘恢复（覆盖本地）" to { confirmRestore() })
+            // ⛔ 也放在作品墙上：想先配好 TMDB 再刮的人，不该被迫先进一部作品。
+            actions.add("刮削设置（TMDB Key / 反代 / 豆瓣 Cookie）" to { openScrapeSettings() })
             actions.add("文件列表（网盘实时目录）" to {
                 startActivity(Intent(this, BrowseActivity::class.java))
                 finish()
@@ -1540,6 +2107,95 @@ class LibraryActivity : Activity() {
             val act = actions.getOrNull(index) ?: return@showOverlay
             hideOverlay()
             act.second()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 手动刮削
+    // ------------------------------------------------------------------
+
+    /**
+     * 打开手动刮削页（豆瓣 / TMDB 双源，与 PC 端同一套）。
+     *
+     * ⛔ 用 `startActivityForResult` 而不是 `startActivity`：刮完这一页手上那个
+     *    [currentWork] 就成了**过期快照** —— 标题 / 年份 / 海报 / 分类 / 简介 /
+     *    类型全都被改过。不刷新的表现是「明明刮成功了，详情页还是旧的」，
+     *    用户会以为刮削没生效，然后再刮一次。
+     */
+    private fun openScrape(w: Work) {
+        val intent = Intent(this, ScrapeActivity::class.java)
+            .putExtra(ScrapeActivity.EXTRA_WORK_KEY, w.key)
+            .putExtra(ScrapeActivity.EXTRA_WORK_TITLE, w.title)
+        @Suppress("DEPRECATION")
+        startActivityForResult(intent, REQ_SCRAPE)
+    }
+
+    /** 刮削设置（TMDB Key / 两个反代地址 / 豆瓣 Cookie）。只读回显，不需要结果。 */
+    private fun openScrapeSettings() {
+        startActivity(Intent(this, ScrapeSettingsActivity::class.java))
+    }
+
+    @Deprecated("与 minSdk 21 对齐的旧式回调；androidx 的 registerForActivityResult 本工程没引。")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SCRAPE && resultCode == RESULT_OK) refreshAfterScrape()
+    }
+
+    /**
+     * 刮削回来后**把这一页重新读一遍**。
+     *
+     * ⛔ 必须重读库，不能在客户端改手上的 `Work`：刮削动的是 `media_works`
+     *    一整行，而且分类那一列走的是「override → genres → onlineId 结构证据
+     *    → 保持原值」四级判定（见 [LibraryDb.updateWorkScrape]）。在 UI 层
+     *    拼一个「差不多的新 Work」= 把同一套合并规则写第二遍，两边迟早不一致。
+     *
+     * ⛔ `posters.buildIndex()` 也必须重跑：刮削换海报产生的是**新文件名**
+     *    （第二段是 URL 散列，新旧两张图是两个文件）。[PosterStore.fileFor]
+     *    的 ① 靠 `poster_file` 回写能命中，但那是**本机刮的**才有；索引不重建
+     *    的话，③ 那条给「PC 端刮的、随备份搬过来」的兜底路径会看不到新图。
+     */
+    private fun refreshAfterScrape() {
+        val cur = currentWork ?: return
+        status.text = "刷新「${cur.title}」…"
+        Bg.run({
+            posters.buildIndex()
+            db.workByKey(cur.key)
+        }) { fresh, err ->
+            if (err != null) {
+                status.text = "刷新失败：${err.message}（刮削可能已经生效，退回作品墙看看）"
+                Log.w(TAG, "刮削后刷新失败：${cur.key}", err)
+                return@run
+            }
+            // ⛔ 别写成 `fresh ?: run { … return@run }`：内层 `run { }` 会把
+            //    `@run` 这个标签**遮住**，`return@run` 于是从内层 run 返回
+            //    （返回 Unit），整句的类型退化成 `Any` —— 报错信息是
+            //    「actual type is kotlin.Any, but Work? was expected」，
+            //    和真正的毛病（标签被遮）看起来毫无关系。
+            val w = fresh
+            if (w == null) {
+                status.text = "「${cur.title}」在库里找不到了"
+                return@run
+            }
+            currentWork = w
+            // 剧集列表本身没变（刮削不碰 `media_items`），只重画标题、简介页头部
+            // 与动作胶囊 —— 后者要重画是因为「▶ 播放 / ▶ 续播」的文案与
+            // `enabled` 都跟着 `currentWork` 走。
+            title.text = "媒体库 / ${w.title}"
+            itemsAdapter.notifyDataSetChanged()
+            paintDetailHead()
+            buildDetailActions()
+            status.text = buildString {
+                append("已更新：").append(w.title)
+                w.year?.takeIf { it > 0 }?.let { append("（").append(it).append("）") }
+                append(" · ").append(MediaCategoryNames.label(w.category))
+                if (w.genres.isNotEmpty()) append(" · ").append(w.genres.take(3).joinToString("/"))
+                if (posters.fileFor(w) == null) append(" · ⚠ 没有海报文件")
+            }
+            Log.i(
+                TAG,
+                "刮削后刷新：${w.key} → ${w.title}（分类=${w.category}，" +
+                    "source=${w.source}，海报=${posters.fileFor(w)?.name ?: "无"}）",
+            )
         }
     }
 
@@ -1736,6 +2392,113 @@ class LibraryActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
+    // 启动时问一句「网盘上有更新的备份，要不要同步」
+    // ------------------------------------------------------------------
+
+    /**
+     * 每次启动 App 问一次：**网盘上有没有比本机更新的媒体库备份**。
+     *
+     * ## 它解决的是哪件事
+     *
+     * 「同步」原本只藏在 MENU 菜单里。用户在家里电脑上扫完库、刮好海报、
+     * 标好进度，回到电视上打开 App —— 屏幕上还是上周那份索引，而他不会想到
+     * 要去菜单里点一下「同步」。于是「跨端同步」这个能力等于不存在。
+     *
+     * ## ⛔ 四条约束（缺一条这个功能就会变成骚扰）
+     *
+     * 1. **只在「远程赢」时问** —— 判据是 [StartupSync.shouldPrompt]。
+     *    本地更新是常态（看一集就变了），每次启动都问「要不要上传」＝每次启动烦一次。
+     * 2. **只读**：探测走 [LibraryBackupService.probeRemote]，不传不覆盖；
+     *    真正动手要用户点「立即同步」。
+     * 3. **失败静默**：没网、网盘抽风、凭证过期 —— 一律只写日志。
+     *    启动路径上弹一个错误框，比「这次没同步」更让人烦，而且他也没法处理。
+     * 4. **不抢已经开着的界面**：探测在后台跑，回来时用户可能已经打开了菜单 /
+     *    筛选面板 / 正在扫描。那时只记日志 —— 抢着弹会打断他，还会把 overlay
+     *    那层状态搅乱（`showOverlay` 会直接盖掉当前那层）。
+     */
+    private fun probeRemoteBackupAtStartup() {
+        // ⛔ 「一个进程一次」由 [StartupSync] 记着，零点在 MainActivity（每次从
+        //    桌面点图标启动都会新建它）。放这里的话，从「文件列表」返回会**重建**
+        //    本页（每个页面是独立 Activity），变成来回切一次弹一次。
+        if (StartupSync.probedThisLaunch) return
+        StartupSync.markProbed()
+
+        if (!store.loggedIn) {
+            Log.i(TAG, "启动探测：未登录，跳过")
+            return
+        }
+        Bg.run({ service.probeRemote() }) { probe, err ->
+            if (err != null) {
+                Log.w(TAG, "启动探测失败（不打扰用户）：${err.message}")
+                return@run
+            }
+            if (probe == null || !StartupSync.shouldPrompt(probe.action)) {
+                Log.i(TAG, "启动探测：${probe?.action?.name}，无需打扰用户")
+                return@run
+            }
+            if (busy || overlayVisible || filterVisible || scanCancel != null) {
+                Log.i(TAG, "启动探测：界面正忙（${busyWhat.ifEmpty { "面板开着" }}），这次不打扰")
+                return@run
+            }
+            askStartupSync(probe)
+        }
+    }
+
+    /** 把探测结果摊成两行能看懂的说明，让用户决定要不要同步。 */
+    private fun askStartupSync(probe: LibraryBackupService.Probe) {
+        val latest = probe.latest
+        val remote = probe.remoteManifest
+
+        val title = buildString {
+            append("网盘上有更新的媒体库备份\n\n")
+            append(backupTime(remote?.createdAt ?: latest?.modifiedAtMs ?: 0L))
+            append(" · ")
+            append(latest?.let { formatSize(it.sizeBytes) } ?: "大小未知")
+            append(" · 来自「")
+            append(remote?.deviceName?.takeIf { it.isNotBlank() } ?: "未知设备")
+            append("」\n")
+            append(
+                if (probe.action == SyncDecision.Action.restoreLocalEmpty) {
+                    // 新机器 / 刚清空过：说清楚「本机是空的」，不然用户会以为
+                    // 自己点错了什么。
+                    "本机还没有媒体库。\n"
+                } else {
+                    "本机媒体库比它旧。\n"
+                },
+            )
+            append("同步会用网盘上那份覆盖本机（本机还没上传的改动会丢失）")
+        }
+        Log.i(
+            TAG,
+            "启动探测：提示用户（${probe.action.name}，备份「${latest?.name}」，" +
+                "本机库内容变更时间=${probe.localModifiedAtSec?.let { "${it}s" } ?: "无（空库）"}）",
+        )
+        showOverlay(
+            titleText = title,
+            // ⛔ 默认项是「暂不同步」：恢复是**破坏性**的（本地未上传的改动会没），
+            //    光标默认落在危险项上时，一次误触就把库换掉了。
+            labels = listOf("暂不同步", "立即同步"),
+        ) { index ->
+            hideOverlay()
+            // ⛔ 走 `doSync()` 而不是 `doRestore()`：菜单里那个「同步」是同一个
+            //    入口，它会在真正动手前**重新判一次方向**（探测到现在可能过了
+            //    几秒，用户也可能刚在别的设备上又备份了一次）。
+            if (index == 1) doSync()
+        }
+    }
+
+    /**
+     * 备份时间上屏：`10-07 13:20`。
+     *
+     * ⛔ 用**本机时区**显示。manifest 里存的是 UTC 毫秒，直接显示会让
+     *    「今天下午刚备份的」看起来像「今早八点」—— 用户对不上自己的钟。
+     */
+    private fun backupTime(epochMillis: Long): String {
+        if (epochMillis <= 0L) return "时间未知"
+        return SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(epochMillis))
+    }
+
+    // ------------------------------------------------------------------
     // 按键
     // ------------------------------------------------------------------
 
@@ -1868,6 +2631,54 @@ class LibraryActivity : Activity() {
             return true
         }
 
+        // ── 简介页动作行拿到光标：←→ 移、OK 执行、↓ 到排序胶囊、↑/返回 回作品墙 ──
+        // ⛔ 必须排在 `itemsSortFocused` **之前**：动作行在屏幕上就在排序胶囊上面，
+        //    两层不会同时为真，但顺序写反的话（万一标志位漏清）↑↓ 会互相打架。
+        // ⛔ 只在 `Level.ITEMS` 下有意义：作品墙那一层这一行是 GONE。
+        if (actionsFocused) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> if (down) moveActions(-1)
+                KeyEvent.KEYCODE_DPAD_RIGHT -> if (down) moveActions(1)
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                -> if (down) applyAction()
+                KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusItemsSort()
+                // ⛔ 动作行是最上面那一层，再往上没有东西了 ⇒ 与返回键同义（回作品墙）。
+                KeyEvent.KEYCODE_DPAD_UP,
+                KeyEvent.KEYCODE_BACK,
+                -> if (down) backToWorks()
+                KeyEvent.KEYCODE_MENU -> if (down) openMenu()
+                // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
+                else -> return super.dispatchKeyEvent(event)
+            }
+            return true
+        }
+
+        // ── 剧集列表的排序胶囊拿到光标：←→ 移光标、OK 生效、↓/返回 回列表、↑ 到动作行 ──
+        // ⛔ 只在 `Level.ITEMS` 下有意义：作品墙那一层没有这个胶囊。放在「海报墙 /
+        //    剧集列表」通用分支**之前**，优先吃掉这些键，避免它们泄漏到底下的列表。
+        if (itemsSortFocused) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> if (down) moveItemsSort(-1)
+                KeyEvent.KEYCODE_DPAD_RIGHT -> if (down) moveItemsSort(1)
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                -> if (down) applyItemsSort()
+                KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_BACK,
+                -> if (down) focusItemsList()
+                // ⛔ 排序胶囊上面**还有动作行**，所以 ↑ 是「再上一层」而不是
+                //    「回作品墙」。只有动作行上再按 ↑ 才退出这一页。
+                KeyEvent.KEYCODE_DPAD_UP -> if (down) focusDetailActions()
+                KeyEvent.KEYCODE_MENU -> if (down) openMenu()
+                // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
+                else -> return super.dispatchKeyEvent(event)
+            }
+            return true
+        }
+
         // ── 海报墙 / 剧集列表 ──
         when (event.keyCode) {
             KeyEvent.KEYCODE_DPAD_CENTER,
@@ -1888,6 +2699,11 @@ class LibraryActivity : Activity() {
                     focusBar()
                     return true
                 }
+                // 剧集列表首行 ↑ 进排序胶囊（胶囊在列表上方，且只在 ITEMS 层存在）。
+                if (down && level == Level.ITEMS && itemsList.selectedItemPosition == 0) {
+                    focusItemsSort()
+                    return true
+                }
             }
             KeyEvent.KEYCODE_MENU -> {
                 if (down) openMenu()
@@ -1901,7 +2717,12 @@ class LibraryActivity : Activity() {
         return super.dispatchKeyEvent(event)
     }
 
-    /** OK：作品墙 → **直接播**；剧集列表 → 播选中的那一集。 */
+    /**
+     * OK：作品墙 → **进简介页**；剧集列表 → 播选中的那一集。
+     *
+     * ⛔ 简介页上的 OK 不走这里 —— 那两行胶囊（动作 / 排序）在
+     *    [dispatchKeyEvent] 里就被吃掉了，根本到不了这个分支。
+     */
     private fun onConfirm() {
         when (level) {
             // `selectedItemPosition` 可能是 `INVALID_POSITION`(-1)，
@@ -2031,20 +2852,37 @@ class LibraryActivity : Activity() {
             },
             FrameLayout.LayoutParams(MATCH, MATCH),
         )
+        // 评分角标。样式**逐项对标 PC 端海报墙**（`library_page.dart` 的
+        // `TagChip(label: rating, icon: Icons.star_rounded, color: AppTheme.warn,
+        // filled: true)`），五项一一对应：
+        //
+        // | | PC 端 | 这里 |
+        // |---|---|---|
+        // | 位置 | `left: 6, bottom: 6` | `BOTTOM or START` + 6dp |
+        // | 底 / 字 | `warn` @92% / `bg` | [RATING_BG] / [RATING_FG] |
+        // | 圆角 | `5`（卡片宽 172） | `dp(5)` |
+        // | 内边距 | `h6 v2.5` | `h7 v3` |
+        // | 字重 | `w600` | `BOLD` |
+        //
+        // ⛔ **落在左下角**，不是右上角。右上角是「未刮削」标签的位置
+        //    （PC 端那里放的是 `文件名` 那枚灰标），两枚都挤在右上会互相打架。
+        // ⛔ 圆角从 `dp(10)`（药丸）收到 `dp(5)` 是这次「好看」的主要来源：
+        //    药丸形状在小尺寸下像**按钮**，会让人以为点得动；小圆角才像标签。
         posterBox.addView(
             TextView(this).apply {
-                setTextColor(Color.WHITE)
+                setTextColor(RATING_FG)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setPadding(dp(6), dp(3), dp(6), dp(3))
+                setTypeface(typeface, Typeface.BOLD)
+                setPadding(dp(7), dp(3), dp(7), dp(3))
                 background = GradientDrawable().apply {
-                    cornerRadius = dp(10).toFloat()
-                    setColor(0xCC000000.toInt())
+                    cornerRadius = dp(5).toFloat()
+                    setColor(RATING_BG)
                 }
             },
             FrameLayout.LayoutParams(WRAP, WRAP).apply {
-                gravity = Gravity.TOP or Gravity.END
-                topMargin = dp(6)
-                rightMargin = dp(6)
+                gravity = Gravity.BOTTOM or Gravity.START
+                bottomMargin = dp(6)
+                leftMargin = dp(6)
             },
         )
         card.addView(posterBox)
@@ -2100,34 +2938,103 @@ class LibraryActivity : Activity() {
     // 剧集列表渲染
     // ------------------------------------------------------------------
 
+    /**
+     * 作品简介页的「文件」列表 —— 一行 = 库里的一条文件。
+     *
+     * ## 一行四样东西（从左到右）
+     *
+     * | 位置 | 内容 | 为什么 |
+     * |---|---|---|
+     * | 主标题 18sp 白 | **文件名**（去扩展名，[EpisodeLabels.fileLabel]） | ⛔ 不能用 `displayTitle`：它优先返回**作品标题**，整列会印成同一句话（「黑亚当」× 12），剧集之间、同一部电影的多个版本之间都分不出来 |
+     * | 副标题 13sp 灰 | 分辨率 · 大小 · `看到 12:34 / 45:00` | 进度读**历史最大位置**，看完的那一集也看得出来 |
+     * | 标签 13sp 品牌色 | `S01E03`（集号解析得出时才画） | 一眼扫集号，不用在文件名里找 |
+     * | 右侧 13sp 右对齐 | 网盘修改时间（相对时间） | 与 PC 端 `ModifiedTimeColumn` 同口径 |
+     *
+     * ⛔ 2026-10-07 用户原话：「文件列表应该重点凸显的是文件名，而不是全部都是
+     *    媒体名，否则剧集列表都是媒体名，看起来体验非常不好」—— 当时这一行写的是
+     *    `entry.displayTitle`，于是 12 集全叫「黑亚当」。
+     */
     private inner class ItemsAdapter : BaseAdapter() {
         override fun getCount() = items.size
         override fun getItem(position: Int) = position.toLong()
         override fun getItemId(position: Int) = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            // ⛔ **懒加子 View**：首屏 convertView 是 null，这一行一个子 View 都
+            //    没有，直接 `row.getChildAt(0) as LinearLayout` 必崩（旧写法的坑）。
+            //    改成「没有就现建并 addView」，与 `BrowseActivity.EntryAdapter` 同一路。
             val row = (convertView as? LinearLayout) ?: LinearLayout(this@LibraryActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(GRID_PAD_DP), dp(12), dp(GRID_PAD_DP), dp(12))
             }
-            val column = row.getChildAt(0) as LinearLayout
-            val line1 = column.getChildAt(0) as TextView
-            val line2 = column.getChildAt(1) as TextView
-            val tag = row.getChildAt(1) as TextView
+            val column = row.getChildAt(0) as? LinearLayout ?: LinearLayout(this@LibraryActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                // ⛔ 占满除「标签 / 时间」之外的剩余宽度：文件名那一列才能随屏伸缩。
+                layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f)
+                row.addView(this)
+            }
+            val line1 = column.getChildAt(0) as? TextView ?: TextView(this@LibraryActivity).apply {
+                setTextColor(Color.WHITE)
+                // ⛔ 17 → 18sp：这一行现在是**文件名**（唯一能把 12 集区分开的信息），
+                //    比副标题大 5sp 才撑得起「重点」。再多就挤掉列表行数了。
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                column.addView(this)
+            }
+            val line2 = column.getChildAt(1) as? TextView ?: TextView(this@LibraryActivity).apply {
+                setTextColor(MUTED)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                column.addView(this)
+            }
+            val tag = row.getChildAt(1) as? TextView ?: TextView(this@LibraryActivity).apply {
+                setTextColor(BRAND_TINT)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                gravity = Gravity.CENTER
+                setPadding(dp(10), 0, dp(10), 0)
+                layoutParams = LinearLayout.LayoutParams(WRAP, WRAP)
+                row.addView(this)
+            }
+            // 修改时间列：与 PC 端 `ModifiedTimeColumn` 同一口径 —— 固定宽度、
+            // 右对齐、显示相对时间（`3 天前`），`null`/`0` 显示 `—`。
+            val time = row.getChildAt(2) as? TextView ?: TextView(this@LibraryActivity).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                gravity = Gravity.END
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                layoutParams = LinearLayout.LayoutParams(dp(96), WRAP)
+                row.addView(this)
+            }
 
             // ⛔ 别把这个局部变量叫 `it`：下面 `?.let { … }` 的隐式参数也叫 `it`，
             //    两层同名会让「这行用的是哪个」纯靠规则推断，读代码时极易看错。
             val entry = items[position]
             tag.text = entry.episodeTag ?: ""
             tag.visibility = if (entry.episodeTag == null) View.GONE else View.VISIBLE
-            line1.text = entry.displayTitle
+            // ⛔ 主标题是**文件名**（去扩展名），不是 `entry.displayTitle` ——
+            //    后者优先返回**作品标题**，于是整列印的是同一句话（「黑亚当」× 12），
+            //    剧集之间、同一部电影的多个版本之间**完全分不出来**。
+            //    口径与播放页 OSD 的「选集」同一支（[EpisodeLabels.fileLabel]），
+            //    也是 PC 端详情页 `rowLabel(RowLabelStyle.fileName)` 的口径。
+            // ⛔ 但**不**照抄 PC 的「剧名-文件名」前缀：那一行在电视上只有一行、
+            //    尾部省略，长剧名会把真正要看的文件名挤出屏幕外。
+            line1.text = EpisodeLabels.fileLabel(entry)
             line2.text = buildString {
                 entry.resolution?.takeIf { it.isNotEmpty() }?.let { append("$it · ") }
                 append(formatSize(entry.sizeBytes ?: 0L))
-                val resume = entry.resumePositionMs
-                if (resume != null && resume > 0) append(" · 看到 ${clock(resume)}")
+                // ⛔ 进度读 `max_position_ms`（[EpisodeLabels.progressLabel]），**不是**
+                //    `resume_position_ms`：看完的那一集续播点会被清成 NULL，用它的话
+                //    「这集看过没有」永远显示不出来。与播放页选集同一口径。
+                EpisodeLabels.progressLabel(entry)?.let { append(" · 看到 $it") }
             }
+            // ⛔ `modified_at` 存的是 **Unix 秒**，[Fmt.relativeTime] 要毫秒 ⇒ ×1000。
+            //    0 / null 当「网盘没给」，显示 `—`（而不是 1970 年）。
+            val m = entry.modifiedAt ?: 0L
+            time.text = Fmt.relativeTime(if (m > 0) m * 1000L else 0L, System.currentTimeMillis())
+            time.setTextColor(if (m > 0) 0xFF9AA3B2.toInt() else 0xFF4B5563.toInt())
 
             row.setBackgroundColor(
                 if (itemsList.isFocused && itemsList.selectedItemPosition == position) {
@@ -2142,14 +3049,9 @@ class LibraryActivity : Activity() {
 
     // ------------------------------------------------------------------
 
-    /** `1:23:45` / `12:34` —— 续播位置用，比「1234567 毫秒」有用。 */
-    private fun clock(ms: Long): String {
-        val total = ms / 1000
-        val h = total / 3600
-        val m = (total % 3600) / 60
-        val s = total % 60
-        return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
-    }
+    // ⛔ 这里曾经有个 `private fun clock(ms)`：列表副标题的「看到 12:34」用它格式化
+    //    续播点。已删除 —— 那个位置现在走 [EpisodeLabels.progressLabel]（读历史最大
+    //    位置、并带上总时长），本页不再需要自己格式化时钟。
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -2158,11 +3060,35 @@ class LibraryActivity : Activity() {
     private companion object {
         const val TAG = "CloudCine"
 
+        /**
+         * `startActivityForResult` 的请求码。
+         *
+         * ⛔ 这个 Activity 目前**只有这一个**请求码 —— 再加的时候要么用别的值、
+         *    要么在 [onActivityResult] 里判 `requestCode`（现在就判着），
+         *    不能只判 `resultCode == RESULT_OK`：那样任何一个子页面回 OK
+         *    都会触发一次「刷新作品」。
+         */
+        const val REQ_SCRAPE = 1001
+
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
         const val BG = 0xFF101216.toInt()
         const val MUTED = 0xFF9AA3B2.toInt()
+
+        /**
+         * 评分角标的实心底色 —— 与 PC 端 `TagChip(filled: true, color: AppTheme.warn)`
+         * 同一支色：`#FFB454` 压到 92% 不透明（`0xEB`）。
+         *
+         * ⛔ 别改回「半透明黑 + 白字」。那是角标最初的写法，问题不在对比度而在
+         *    **语义**：一排海报上飘着好几个一模一样的黑药丸，看的人分不清哪个是
+         *    评分、哪个是别的什么；暖橙实底一眼就是「这片子多少分」。
+         *    这也是 PC 端海报墙的口径（那里 `warn` 只用在评分上）。
+         */
+        const val RATING_BG = 0xEBFFB454.toInt()
+
+        /** 评分角标的字色 —— PC 端 `AppTheme.bg`（`#0B0D12`），与实底形成高对比。 */
+        const val RATING_FG = 0xFF0B0D12.toInt()
 
         /** 品牌主色 `#7F77DD` 在深底上的可读版本。 */
         const val BRAND_TINT = 0xFFA9A3F5.toInt()
@@ -2172,6 +3098,16 @@ class LibraryActivity : Activity() {
 
         /** 海报墙左右留白。 */
         const val GRID_PAD_DP = 32
+
+        /**
+         * 简介页海报的宽度（dp），高度按 2:3 算。
+         *
+         * ⛔ **不要照抄 PC 端 `work_detail_page.dart` 的 138×207**：那是给
+         *    桌面窗口高度用的。电视横屏的逻辑高只有 540dp（1080p / density 2.0），
+         *    207dp 的海报加上动作行、排序行、剧集列表、底部两行提示会把这一页
+         *    撑爆 —— 列表只剩一行，而「选集」恰恰是这一页的主要用途。
+         */
+        const val DETAIL_POSTER_DP = 96
 
         /** 卡片间距。 */
         const val GRID_GAP_DP = 12

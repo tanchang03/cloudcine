@@ -85,6 +85,19 @@ class BackupPackageTest {
     }
 
     @Test
+    fun `只拿到包头的若干字节也读得出清单`() {
+        // 启动时探测「网盘上那份备份比本机新还是旧」只读头部 64 KiB ——
+        // 依据就是这条：清单在包的最前面，且长度自描述，不需要包尾。
+        // 万一哪天有人把清单挪到包尾（或者给它加个「总长度」字段），
+        // 探测会**静默**退化成「整包下载」（有兜底，不报错），
+        // 这条断言是唯一能提前发现的地方。
+        val bigDb = ByteArray(2 * 1024 * 1024) { (it % 251).toByte() }
+        val pkg = BackupPackage.build(manifest, bigDb, null)
+        val head = pkg.copyOfRange(0, 1024)
+        assertEquals(manifest, BackupPackage.extractManifest(head))
+    }
+
+    @Test
     fun `fileNames 声明了海报但包尾没有字节时 posterBytes 为 null`() {
         // 只看 fileNames 的实现会拿一段空字节去解包 —— 解出 0 个文件、
         // 不报错，海报全丢。

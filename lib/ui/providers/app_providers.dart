@@ -337,6 +337,19 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
       // 那等于本机永远比远程新 → 只会上传，新机器会把好备份冲成空库。
       localModifiedAt: () =>
           ref.read(mediaRepositoryProvider).latestLibraryChangeAt(),
+      // 恢复备份是拿备份里的字节覆盖**整个** `cloudcine.sqlite` 文件，
+      // `settings` 表随之被换掉 —— 而 `SettingsStore` 有一层进程内缓存，
+      // 它不知道文件被换了。
+      //
+      // 不接这一条的表现（**静默**）：在新机器上先打开设置页（缓存记下
+      // 「TMDB Key 为空」）→ 从网盘恢复电脑上的备份 → 设置页还是空的、
+      // 刮削继续走匿名额度，重启应用才正常。这正是「token / cookie 随备份
+      // 恢复」需求的关键一步。
+      //
+      // ⛔ 用 `ref.read`（回调求值时才取）而不是 `ref.watch`：watch 会让
+      //    `libraryBackupServiceProvider` 跟着设置的变化重建，而这个服务
+      //    持有设备标识与路径，没有重建的理由。
+      onLibraryReplaced: () => ref.read(settingsStoreProvider).invalidate(),
     );
   },
 );

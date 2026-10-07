@@ -89,5 +89,27 @@
             android:screenOrientation="landscape"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 手动刮削页：搜索豆瓣 / TMDB，挑一个候选落库。
+             exported=true 与 LibraryActivity 同理 —— 保留
+             `adb shell am start -n com.cloudcine.tv/.ScrapeActivity \
+                  -e scrape_work_key <key> -e scrape_work_title <title>`
+             这条直连路径，否则每测一次刮削都得先用遥控器翻到那个作品。
+             ⛔ 不设 launchMode=singleTask：从详情页连着刮两部片是正常操作，
+                单例会让第二次进入复用到上一次的 workKey。 -->
+        <activity
+            android:name=".ScrapeActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 刮削设置页：TMDB Key / 两个反代地址 / 豆瓣 Cookie。
+             这些值存在媒体库的 `settings` 表里，随备份包同步。
+             exported=false：它没有任何启动参数，走详情页菜单进来即可。 -->
+        <activity
+            android:name=".ScrapeSettingsActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
     </application>
 </manifest>

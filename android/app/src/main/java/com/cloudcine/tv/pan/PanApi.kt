@@ -301,17 +301,25 @@ class PanApi(private val store: CredStore) {
     }
 
     /**
+     * 找一个**已存在**的子目录；不存在返回 `null`，**绝不创建**。
+     *
+     * ⛔ [ensureFolder] 会创建 —— 那个副作用对「上传 / 恢复」是对的，但
+     *    **启动时的探测不能有**：用户还没备份过的时候，每开一次电视就往他
+     *    网盘根目录里塞一个空的「云影备份」。探测是只读动作，只读就该无副作用。
+     */
+    fun findFolder(parentId: String, name: String): String? =
+        listDirectory(parentId.ifEmpty { ROOT }, page = 1, size = 200)
+            .firstOrNull { it.isDir && it.name == name }
+            ?.fid
+
+    /**
      * 确保 `parentId` 下存在名为 `name` 的目录，返回它的 fid。
      *
      * ⛔ 先列目录再建，而不是直接建：直接建也能work（幂等），但会在每次
      *    同步时都往网盘写一次 —— 而「只读的同步」不该有副作用。
      */
-    fun ensureFolder(parentId: String, name: String): String {
-        listDirectory(parentId.ifEmpty { ROOT }, page = 1, size = 200)
-            .firstOrNull { it.isDir && it.name == name }
-            ?.let { return it.fid }
-        return createFolder(parentId, name)
-    }
+    fun ensureFolder(parentId: String, name: String): String =
+        findFolder(parentId, name) ?: createFolder(parentId, name)
 
     /**
      * **永久**删除一批文件/目录（`action_type=2`）。
@@ -360,6 +368,27 @@ class PanApi(private val store: CredStore) {
             maxBytes = maxBytes,
             timeoutMs = 60_000,
         )
+
+    /**
+     * 只取一个文件**开头**的若干字节。
+     *
+     * 备份包把清单放在最前面（`[magic][清单长度][清单][库][海报]`），
+     * 所以「这份备份比本机新还是旧」这个问题，几十 KB 就能回答 ——
+     * 不必把后面的海报段整个拉下来。见 [PanHttp.getBytesHead]。
+     *
+     * ⛔ 与 [fileBytes] 一样走 `file/audioplay` 现签的地址，并且**同样要把
+     *    `Set-Cookie` 收回去**：夸克在每个响应里轮换 `__puus`，丢掉它下一次
+     *    取链就可能 412（理由见 [absorbSetCookies]）。
+     */
+    fun fileHeadBytes(fid: String, maxBytes: Int = 64 * 1024): ByteArray {
+        val res = PanHttp.getBytesHead(
+            url = fileBytesUrl(fid),
+            cookie = store.requestCookie(),
+            maxBytes = maxBytes,
+        )
+        absorbSetCookies(res.setCookies)
+        return res.bytes
+    }
 
     /**
      * 上传一个文件到 `parentId`，返回新文件的 fid。

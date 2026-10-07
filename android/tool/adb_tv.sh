@@ -196,18 +196,22 @@ cmd_build() {
   esac
 }
 
-# 找最新的产物：优先品牌化 release，其次 app-release，最后 debug。
+# 找要装的产物：三个候选里挑 **mtime 最新** 的那个。
+#
+# ⛔ 别改回「按优先级取第一个」。`brandReleaseApk` 是 build.gradle.kts 里的
+#    一个 `Copy` 任务，Gradle 的增量检查会让它在某些情况下**不刷新**品牌化产物
+#    —— 那时 `apk/branded/` 里躺着的还是上一轮的包。按优先级取就会把**旧包**
+#    装进电视：代码明明改了、装机也「成功」了，现象却一模一样，白查一整轮
+#    （2026-10-07 实际踩过：装的是前一天 23:01 的包）。
+#    按 mtime 取最新的，最坏情况只是退到 `app-release.apk` —— 那也是刚构建的。
 find_apk() {
   local f
-  for pattern in \
-    "$ROOT/app/build/outputs/apk/branded/cloudcine-*-android.apk" \
-    "$ROOT/app/build/outputs/apk/release/app-release.apk" \
-    "$ROOT/app/build/outputs/apk/debug/app-debug.apk"
-  do
-    # shellcheck disable=SC2086
-    f="$(ls -1t $pattern 2>/dev/null | head -1 || true)"
-    if [ -n "$f" ]; then echo "$f"; return 0; fi
-  done
+  # shellcheck disable=SC2086
+  f="$(ls -1t \
+    "$ROOT"/app/build/outputs/apk/branded/cloudcine-*-android.apk \
+    "$ROOT"/app/build/outputs/apk/release/app-release.apk \
+    "$ROOT"/app/build/outputs/apk/debug/app-debug.apk 2>/dev/null | head -1 || true)"
+  if [ -n "$f" ]; then echo "$f"; return 0; fi
   return 1
 }
 
@@ -218,7 +222,8 @@ cmd_install() {
     echo "没找到 APK。先跑：android/tool/adb_tv.sh build" >&2
     exit 1
   fi
-  echo "安装：$apk"
+  # 打印产物时间 —— 「装的是不是刚构建的那个包」是这个脚本最容易搞错的一件事。
+  echo "安装：$apk（产物时间 $(date -r "$apk" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '未知')）"
   # -r 覆盖安装并保留数据（含磁盘缓存）。想测「首次启动」先跑 uninstall。
   adb -s "$SERIAL" install -r "$apk"
   echo "✓ 已安装。启动：android/tool/adb_tv.sh launch"
