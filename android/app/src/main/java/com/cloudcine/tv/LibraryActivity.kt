@@ -4102,9 +4102,14 @@ class LibraryActivity : Activity() {
         // |---|---|---|
         // | 位置 | `left: 6, bottom: 6` | `BOTTOM or START` + 6dp |
         // | 底 / 字 | `warn` @92% / `bg` | [RATING_BG] / [RATING_FG] |
-        // | 圆角 | `5`（卡片宽 172） | `dp(5)` |
-        // | 内边距 | `h6 v2.5` | `h7 v3` |
+        // | 圆角 | `5`（卡片宽 172） | `[BADGE_CORNER_DP]` |
+        // | 内边距 | `h6 v2.5` | `h[BADGE_PAD_H_DP] v[BADGE_PAD_V_DP]` |
+        // | 字号 | `11` | `[BADGE_TEXT_SP]` |
         // | 字重 | `w600` | `BOLD` |
+        //
+        // ⚠️ 尺寸**不再逐字对齐 PC 端**：PC 的卡宽 172，这里的卡宽 203，
+        //    同一套 dp 在两边占的**比例**不同。以「别挡住海报」为准，
+        //    尺寸统一收在 [BADGE_TEXT_SP] / [BADGE_PAD_H_DP] 那组常量里。
         //
         // ⛔ **落在左下角**，不是右上角。右上角是「未刮削」标签的位置
         //    （PC 端那里放的是 `文件名` 那枚灰标），两枚都挤在右上会互相打架。
@@ -4113,11 +4118,14 @@ class LibraryActivity : Activity() {
         posterBox.addView(
             TextView(this).apply {
                 setTextColor(RATING_FG)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, BADGE_TEXT_SP)
                 setTypeface(typeface, Typeface.BOLD)
-                setPadding(dp(7), dp(3), dp(7), dp(3))
+                setPadding(
+                    dp(BADGE_PAD_H_DP), dp(BADGE_PAD_V_DP),
+                    dp(BADGE_PAD_H_DP), dp(BADGE_PAD_V_DP),
+                )
                 background = GradientDrawable().apply {
-                    cornerRadius = dp(5).toFloat()
+                    cornerRadius = dp(BADGE_CORNER_DP).toFloat()
                     setColor(RATING_BG)
                 }
             },
@@ -4136,14 +4144,19 @@ class LibraryActivity : Activity() {
         //    而且左上离左下最远，两枚角标不会在同一只眼睛里打架。
         // ⛔ 样式与评分角标**同尺寸不同色**（品牌色实心 / 深色字）：同色的话
         //    两枚小方块在沙发距离下分不出哪个是「★ 8.7」哪个是「+2」。
+        // ⛔ 尺寸**两处都读 [BADGE_TEXT_SP] / [BADGE_PAD_H_DP] 那组常量**，
+        //    别在这儿再写一份字面量 —— 改一处漏一处就会让两枚角标不等大。
         posterBox.addView(
             TextView(this).apply {
                 setTextColor(0xFF1A1533.toInt())
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, BADGE_TEXT_SP)
                 setTypeface(typeface, Typeface.BOLD)
-                setPadding(dp(7), dp(3), dp(7), dp(3))
+                setPadding(
+                    dp(BADGE_PAD_H_DP), dp(BADGE_PAD_V_DP),
+                    dp(BADGE_PAD_H_DP), dp(BADGE_PAD_V_DP),
+                )
                 background = GradientDrawable().apply {
-                    cornerRadius = dp(5).toFloat()
+                    cornerRadius = dp(BADGE_CORNER_DP).toFloat()
                     setColor(BRAND_TINT)
                 }
             },
@@ -4679,6 +4692,34 @@ class LibraryActivity : Activity() {
          * ⛔ 深色底上**不能**用黑色阴影代替它（那是第一版，实机上完全看不见）。
          */
         const val FOCUS_GLOW_DP = 8
+
+        /**
+         * 海报角标（评分 `★` / 追剧 `+N`）的字号（sp）与内边距（dp）。
+         *
+         * ⛔ 两枚角标**必须同尺寸**（只允许颜色不同）：尺寸不一样的话，沙发距离下
+         *    分不出哪个是「★ 8.7」哪个是「+2」—— 这正是 [buildCard] 里
+         *    「同尺寸不同色」那条注释在守的东西，所以两处都读这里，别各写一份。
+         *
+         * 尺寸来历：原来是 11sp / `h7·v3`，在 203px 宽的卡上实测约占掉海报宽度的
+         * 四分之一，用户反馈「太大了，挡住了海报很多信息」⇒ 收到 9sp / `h5·v2`，
+         * 角标面积约降四成。
+         *
+         * ⛔ 别再往下压到 8sp 以下：8 列版式下卡宽只有 203px，再小在 3 米外读不出
+         *    数字，而角标存在的意义就是「扫一眼知道评分」。
+         */
+        const val BADGE_TEXT_SP = 9f
+        const val BADGE_PAD_H_DP = 5
+        const val BADGE_PAD_V_DP = 2
+
+        /**
+         * 角标圆角（dp）。
+         *
+         * ⛔ 别改回药丸（曾经是 `dp(10)`）：小尺寸下药丸像**按钮**，会让人以为
+         *    点得动；小圆角才像标签。
+         * ⛔ 也不必与海报圆角 [POSTER_CORNER_DP] 相等：角标是贴在海报之上的
+         *    独立标签，圆角完全一致反而会被看成海报自己的一部分。
+         */
+        const val BADGE_CORNER_DP = 4
 
         /**
          * 海报缩略图缓存上限。

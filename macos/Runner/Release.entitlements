@@ -2,6 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- ⛔ 本文件里**没有** com.apple.security.get-task-allow，这是对的 —— 别加。
+	     但「文件里没有」≠「签名里没有」：Xcode 的 target 设置
+	     CODE_SIGN_INJECT_BASE_ENTITLEMENTS 默认是 YES，构建时会**自动注入**
+	     这条调试授权（依据 Apple《Resolving Common Notarization Issues》→
+	     "Avoid the Get-Task-Allow Entitlement"）。
+	     2026-10-07 release.yml 的产物校验就是被它拦下的：把本文件与 Debug 那份
+	     逐字对比都看不出问题，只有 `codesign -d --entitlements - <app>` 才现形。
+	     ⇒ 已在 Runner target 的 **Release** 配置里设成 NO（project.pbxproj）。
+	     ⚠️ 只关 Release：Debug / Profile 必须保留，否则 `flutter run` 连不上
+	     Dart VM Service，表现是「构建成功但一直卡住、没有窗口」。 -->
 	<!-- 关闭沙箱。
 	     理由（2026-10-01 实测定位）：
 	     1) 本应用走的是网盘网页版的 Cookie 接口，不可能上 Mac App Store，

@@ -1,7 +1,7 @@
 name: cloudcine
 description: "CloudCine 云影 —— 网盘媒体库播放器（夸克网盘优先）"
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.1.1+2
 
 environment:
   sdk: ^3.7.0

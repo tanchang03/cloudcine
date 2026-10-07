@@ -389,6 +389,55 @@ open build/macos/Build/Products/Release/cloudcine.app   # 立刻就能起来
 | `com.apple.security.network.server` | `true` | 播放器给直链挂请求头时要在 127.0.0.1 起代理 |
 | `com.apple.security.files.user-selected.read-only` | `true` | 「加载本地字幕文件」（沙箱已关，保留以记录意图） |
 | `DebugProfile` 额外 `get-task-allow` | `true` | 否则 `flutter run` 连不上 Dart VM Service |
+| `get-task-allow` 出现在 **Release 签名**里 | **不许** | 文件里没写也可能有 —— 构建期注入，见下一节 |
+
+### ★★ `Release.entitlements` 里没有 get-task-allow，签名里却有（2026-10-07）
+
+**现象**：`release.yml` 的「校验产物授权」失败 ——
+`Error: 产物带了 get-task-allow 调试授权，不该出现在发布包里`，job 挂掉、不上架。
+把 `Release.entitlements` 与 `DebugProfile.entitlements` 逐字对比**看不出任何问题**：
+前者根本没有这一项。
+
+**根因**：不是文件，是**构建期注入**。Xcode 新建 macOS 工程时会把 target 的
+`CODE_SIGN_INJECT_BASE_ENTITLEMENTS` 默认为 `YES`，构建时**自动**把
+`com.apple.security.get-task-allow` 塞进签名（Apple《Resolving Common Notarization
+Issues》→ "Avoid the Get-Task-Allow Entitlement" 原文：
+「Xcode automatically sets the target's CODE_SIGN_INJECT_BASE_ENTITLEMENTS build
+setting to YES … tells Xcode to add the com.apple.security.get-task-allow
+entitlement to your app at build time」）。本机 `flutter build macos --release`
+同样中招 —— **不是 CI 环境问题**，本机 `build/macos/.../Release/CloudCine.app`
+当时也带这条。
+
+**判据（唯一能看到它的地方）**：`codesign -d --entitlements - <app>`，
+或看 Xcode 真正签进去的那份
+`build/macos/Build/Intermediates.noindex/Runner.build/Release/Runner.build/CloudCine.app.xcent`。
+⛔ 读 `*.entitlements` 文件、读 `git diff`、对比两份 entitlements —— **全都看不出来**。
+
+**修法**：Runner target 的 **Release** 配置加 `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;`
+（`macos/Runner.xcodeproj/project.pbxproj`，紧挨 `CODE_SIGN_ENTITLEMENTS = Runner/Release.entitlements;`）。
+- ⛔ **只关 Release**：Debug / Profile 必须保留注入，否则 `flutter run` 连不上 Dart VM Service
+  （表现是「构建成功但一直卡住、没有窗口」）。Debug 产物实测仍带 `get-task-allow` ✔。
+- ⛔ 别顺手把这个变量也写到 CI 的 xcodebuild 命令行上 —— 工程文件是**单一真源**，
+  这样本机 `flutter build macos --release` 与 CI 才走同一份设置。
+- `release.yml` 里那条 get-task-allow 断言**不要删**：它守的正是这个「文件看不出、签名里才有」的坑。
+- ★ `ci.yml` 的 `analyze-and-test` 里有一步**静态**断言（不构建、零耗时）守同一件事：
+  `CODE_SIGN_ENTITLEMENTS = Runner/Release.entitlements;` 后 3 行内必须有
+  `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;`，且 `DebugProfile.entitlements` 后 3 行内**不许**有它。
+  ⇒ **推 main 就拦住**，不必等发版。⚠️ 那个 job 原有的「输出 macOS 授权摘要」只打印
+  `.entitlements` **文件**，恰好落在盲区里，别把它当成这道断言（摘要里另加了一行
+  「Release 注入开关」让状态可见）。反向验证过：把那行 sed 删掉，断言确实拦下。
+
+**验证（本机实测，2026-10-07）**：
+
+```bash
+xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Release \
+  -derivedDataPath build/macos CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual \
+  CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES build
+codesign -d --entitlements - build/macos/Build/Products/Release/CloudCine.app
+# 改前：app-sandbox / files.read-only / files.read-write / get-task-allow / network.client / network.server  ← 6 项
+# 改后：app-sandbox / files.read-only / files.read-write / network.client / network.server                  ← 5 项
+#       与 Release.entitlements 逐项一致；CI 那段校验 + codesign --verify --deep --strict 本机复跑全绿
+```
 
 **排查时踩过的两个假线索**（别再走一遍）：
 - 用 `Developer ID Application` 证书重签能解，但**本机签不动**。本机确实有可用证书
@@ -5251,7 +5300,7 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 - **筛选/封面刮削**：⛔ 筛选「已刮削」判据 = **`source==online`**（不是 `isScraped`），且**进 `_facetScope`**。⛔ `==`/`hashCode` 按**集合内容**比（`setEquals`+`Object.hashAllUnordered`）。⛔ `posterFaceX` 与 `posterUrl` **必须成对**；熔断只计**网络层**失败。**TMDB `/search/*` 必须过 `ScrapeMatch` 闸门**。⛔ 手动刮削通道三条交互不许改；**「自定义」** `customizeWork` **整行写、不过 merge**。**候选链** `ScrapeQuery.fallbacks` = 文件名 → 目录名逐级向上、串行命中即停；⛔ 本地兜底只用主查询、⛔ 两个调用点都要传 `dirPath`。⚠️ 待办 `DirectoryTitle._clean` 清年份/画质标记（⛔ 别用 `_parseDotted`）。
 - **Android 产物名（10-03）**：⛔ 产物名由 Flutter 工具链**定死**，改 AGP `outputFileName` 无效；做法是给 `assemble<Mode>` 挂 **finalizer**（⛔ 别 doLast）**复制**成 `cloudcine-<versionName>-b<versionCode>-android.apk`。⛔ **别信产物文件名**：**只有通用的 `app-debug.apk` 会被重新构建**，per-ABI 那份停在旧 mtime ⇒ `-b1006-` 与 `-b1007-` **内容完全一样**；装前 `aapt2 dump badging <apk> | grep -E "^package|native-code"`。⛔ **`adb install` 被中途打断会留下装了一半的包**；装完复核 `dumpsys package … | grep versionCode`。
 - **Windows MSI（10-05）**：`windows/packaging/cloudcine.wxs` + `build_package.ps1`（per-user 装到 `%LOCALAPPDATA%\Programs\CloudCine`，`InstallerVersion=500`）。⛔ **启动条件绝不能写 `VersionNT >= 1000`**：Windows Installer 把 VersionNT **钳在 603** ⇒ 该条件**在任何真实 Windows 上都失败**；判据用 **`WindowsBuild >= 10240`** + `Installed OR`（微软 KB3202260）。⚠️ **MSI 条件语法不支持括号**。⛔ `-sice` 只压 ICE38/ICE64/ICE91，**别换成 `-sval`**。
-- **macOS 签名与凭证**：⛔ 不许写 `keychain-access-groups`（→ **启动即 SIGKILL**）；`app-sandbox` 必须 **`false`**；两份都要 `network.client/server`·`files.user-selected.read-write`；`DebugProfile` 另加 `get-task-allow`。凭证 macOS 走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串，其余平台 `flutter_secure_storage`），密钥由 `IOPlatformUUID` 派生（**别掺易变环境值**）。
+- **macOS 签名与凭证**：⛔ 不许写 `keychain-access-groups`（→ **启动即 SIGKILL**）；`app-sandbox` 必须 **`false`**；两份都要 `network.client/server`·`files.user-selected.read-write`；`DebugProfile` 另加 `get-task-allow`。⛔⛔ **Release 签名里不许出现 `get-task-allow`**：文件里没写 Xcode 也会注入 ⇒ Runner target 的 **Release** 配置必须 `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO`（只关 Release，Debug/Profile 保留否则 `flutter run` 连不上 Dart VM Service；判据只有 `codesign -d --entitlements -`）。凭证 macOS 走 `EncryptedFileSecretBackend`（⛔ 别再试钥匙串，其余平台 `flutter_secure_storage`），密钥由 `IOPlatformUUID` 派生（**别掺易变环境值**）。
 - **测试取向**：纯函数优先；断言写「为什么重要」。⛔ **每个需求只跑相关单测，不回归全量**（用户 10-04 定的）。修并发/竞态 bug **先加测试确认红**再加修复。⚠️ 用户常**边改边跑**，判据=红的在不在我改的文件里。
 
 ---
@@ -6127,6 +6176,35 @@ interface AutoScrapeStore {                 // 只留 4 个方法
 （键名与 PC 逐字一致）。⚠️ **PC 默认关**（豆瓣匿名额度约 10 次搜索），
 **Android 默认开**；默认值**不写在这个常量里**，写在 `LibraryActivity.autoScrapeEnabled()`。
 
+### 8. 海报墙卡片：角标尺寸 / 圆角（2026-10-07 真机复核）
+
+**角标尺寸**（`BADGE_TEXT_SP` / `BADGE_PAD_H_DP` / `BADGE_PAD_V_DP` /
+`BADGE_CORNER_DP` —— 评分 `★ x.x` 与追剧 `+N` **两处共用同一组常量**）：
+- 原 **11sp / `h7·v3` / `r5`** 在 203px 宽的卡上实测占海报宽 **44%**，用户反馈
+  「星标标签太大，挡住了海报很多信息」⇒ 收到 **9sp / `h5·v2` / `r4`**，
+  实测 **71×29px**（改前 ≈90×38px）⇒ **面积 −40%**，占海报宽 **35%**。
+- ⛔ **别按 PC 端的比例去对齐**：PC 卡宽 172dp、这里只有 101.5dp（8 列），
+  同一套 dp 在两边占的**比例**不同；以「别挡住海报」为准。
+- ⛔ 别再压到 8sp 以下：卡宽只有 203px，3 米外读不出数字，角标就失去意义。
+- ⛔ 尺寸**只写在常量里**，两处角标别再各写一份字面量（改一处漏一处会不等大）。
+
+**圆角（真机复核通过，2026-10-07）**：`RoundedPosterDrawable` + `FIT_XY` 方案
+四角**全部是圆的**，放大 1.1× 后也**不丢角**。实测轮廓（焦点卡 224×335）：
+
+| 角 | 顶行内缩 → 到达边缘 |
+|---|---|
+| 左上 | +12 → +6 → +3 → +1 → 0 |
+| 右上 | −13 → −7 → −4 → −2 |
+| 左下 | +14 → +7 → +4 → +2 → 0 |
+| 右下 | −15 → −8 → −5 → −3 → −1 |
+
+实测半径 ≈13–15px，理论值 8dp×2×1.1=17.6px（差值来自描边内缩 + 抗锯齿阈值）。
+★ **量法**（比肉眼看图可靠）：`uiautomator dump` 取 `posterBox` 的**真实 bounds**
+（原生 Kotlin 工程 dump 得到，不是 Flutter），再沿四条边扫「背景 → 非背景」过渡。
+⛔ 扫的时候注意**邻卡会串进窗口**（相邻 poster 间距 14px），要把邻卡的边当干扰排除。
+★ 另：`pivotY = 0` 已验证生效 —— 焦点卡与非焦点卡**顶边同为 y=184**，
+放大只向下长，第一行不丢顶部像素。
+
 ## 7. PC TV 布局 / OSD 卡顿
 - `isTvLayout` = android + 逻辑宽≥960（⛔ 判据读 **view 宽**）。⛔ 页头 `actions` 必须 `Wrap`；⛔ **过扫描内边距只有 `app_shell` 一处**；⛔ 遥控器 **↓ 绝不接管**；⛔ **`SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。
 - ⛔ **播放页 OSD 卡顿**：整页 rebuild ≈10 次/秒（`bufferEnd` 没节流）+ `SubtitleViewConfiguration` 无 `operator ==` + `DebugOverlay` 的 `kDebugOverlayEnabled = true` **硬编码**。
@@ -6244,8 +6322,14 @@ interface AutoScrapeStore {                 // 只留 4 个方法
 NO_PROXY="127.0.0.1,localhost" HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
   flutter analyze lib
 NO_PROXY=... flutter test test/domain test/ui
-# ⚠️ `test/ui/widgets/tv_text_field_test.dart`「TV 下点一下进编辑态」在本机
-#    Flutter 3.29 下**恒红**（enterText 行为差异），与追剧无关，别去查它。
+# ⚠️ `test/ui/widgets/tv_text_field_test.dart`「TV 下点一下进编辑态」**已修好**
+#    （2026-10-07）。当时不是 Flutter 版本差异，是 widget 自己的 bug：
+#    `_enterEditing()` 里的 `_focusNode.unfocus()` 会触发 `_onFocusChange()`，
+#    后者见「失焦 ∧ _editing」就把 `_editing` 重置回 false ⇒ `readOnly` 一直是
+#    true ⇒ `enterText` 一个字都进不去（Expected 'abc' / Actual ''）。
+#    ⛔ 修法是在 `_onFocusChange` 上加 `!_entering` 守卫（`_entering` 只在
+#    「unfocus → 下一帧 requestFocus」这段窗口里为 true），**别去改测试**。
+#    全量 `flutter test` 现已 2448 条全绿。
 # Android（JDK 21）
 JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home \
   ./gradlew :app:testDebugUnitTest --tests 'com.cloudcine.tv.library.*'
@@ -6445,3 +6529,70 @@ return item.maxPositionMs == null && item.lastPlayedAt == null   // 原：只看
 - PC 回归 `test/domain test/data test/ui/providers test/ui/pages test/core`
   = **1938 例全绿**；Android `:app:testDebugUnitTest` BUILD SUCCESSFUL。
 
+
+## 10. 发版 / Release（2026-10-07 首个版本 v0.1.0）
+
+### 10.1 触发方式
+`.github/workflows/release.yml` 只认 **`v*` tag**：
+```bash
+git tag -a v0.1.0 -m "…" && git push origin v0.1.0
+```
+推 tag ⇒ 跑测试 → 三端构建 → **全部成功才** `gh release create`。
+⛔ 上架是**独立 job**（`needs: [build-macos, build-windows, build-android]`），
+任一平台失败 ⇒ **Release 根本不出现**（只留下 tag 和一次红的 run）。
+所以「tag 推出去就收不回来」在本仓库只对 **tag** 成立，Release 是有闸门的。
+⛔ `workflow_dispatch` 手动触发时 `github.ref` 是**分支名** ⇒ release job 的
+`if: startsWith(github.ref, 'refs/tags/v')` 不成立 ⇒ 只构建、不上架，产物留在
+本次 run 的 Artifacts 里。想先试就跑它。
+
+### 10.2 ⛔⛔ 版本号有**两个源头，必须同时改**
+| 平台 | 真源 | 产物名 |
+|---|---|---|
+| macOS / Windows | `pubspec.yaml` 的 `version: x.y.z+N` | `cloudcine-x.y.z-macos.dmg` / `-windows-x64.msi` |
+| Android | `android/app/build.gradle.kts` 的 `versionName` | `cloudcine-<versionName>-b<versionCode>-android.apk` |
+
+两边不一致 ⇒ **同一个 Release 挂着两个版本号**（2026-10-07 修：Android 侧是
+从没改过的占位 `1.0.0`，PC 侧是 `0.1.0`）。README 与 `.github/release-notes.md`
+承诺的是统一的 `cloudcine-x.y.z-*`。
+- ⛔ `versionCode` 必须**单调递增**（不递增 ⇒ 已装设备报「应用未安装」）；
+  `pubspec` 的 `+N` 与它同义，也应同步。
+- ⛔ `applicationId` 不许动（换包名 = 丢磁盘缓存）。
+- ⛔ **tag 名**（`v0.1.0`）也要跟这两个对上 —— Release 标题用的是 `GITHUB_REF_NAME`。
+
+### 10.3 本地预检（推 tag 之前跑；等价于 release job 的两道门）
+```bash
+# Android（JDK 21 + SDK 36）—— 与 build-android 同命令
+cd android
+JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home \
+ANDROID_HOME=$HOME/Library/Android/sdk \
+  ./gradlew :app:testDebugUnitTest :app:assembleRelease
+ls app/build/outputs/apk/branded/          # 期望 cloudcine-<新版本>-b<N>-android.apk
+
+# PC
+NO_PROXY="localhost,127.0.0.1,::1" flutter analyze && flutter test
+```
+
+**2026-10-07（v0.1.1 发版）实测结果**：`flutter analyze` → `No issues found!`；
+`flutter test` → `00:42 +2448: All tests passed!`；Android → `BUILD SUCCESSFUL`，
+品牌化产物 `cloudcine-0.1.1-b2-android.apk`。⇒ 全绿，约 3 分钟。
+
+⚠️⚠️ **在本机（Agent 沙箱）跑这套预检必须 `HOME=/Users/tandy` 且关掉沙箱**，
+否则两个假故障：
+- `$HOME` 被重定向成 `/Users/tandy/.workbuddy-ai-6-home` ⇒ `ANDROID_HOME=$HOME/Library/Android/sdk`
+  指向不存在的路径（SDK 真实位置是 `/Users/tandy/Library/Android/sdk`）。
+- `flutter test` 会写 `~/.pub-cache/...` 与 `~/.dartServer/...`，被拒后**进程被打断** ⇒
+  现象是 `tail` 停在 `+2430` 之类的进度行、**没有 `All tests passed!` 汇总行**，
+  看起来像测试失败 —— 其实一条断言都没红。判据：看退出码 + `grep -c '\[E\]'`，
+  别只看 tail。（`flutter analyze` 不受影响，它照样能出 `No issues found!`。）
+
+⚠️ `brandReleaseApk` **不清理** branded 目录 ⇒ 本地会同时躺着新旧两个版本名的
+apk（`cloudcine-0.1.0-*` 与 `cloudcine-1.0.0-*`）。CI 是干净检出，不会。
+⛔ 别「按优先级取第一个」挑包 —— `android/tool/adb_tv.sh` 的 `find_apk` 按 **mtime** 取最新。
+
+### 10.4 已知未配项（发版前要知道）
+- **Android 发布签名未配**（`ANDROID_KEYSTORE_BASE64` 那组 secret 没设）⇒
+  release 包退回 **debug 签名**。侧载正常，但⛔ 签名不同的包**不能互相覆盖安装**
+  （用户装新版会报「应用未安装」，得先卸载再装）。
+- `gh release create --generate-notes` 从**提交信息**生成 changelog，而本仓库提交
+  信息大量是 `nil` ⇒ 自动更新日志基本是空的。要体面的 changelog 就得自己写进
+  `.github/release-notes.md`（它排在自动日志**之前**）。

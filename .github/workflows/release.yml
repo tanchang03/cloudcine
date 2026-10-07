@@ -91,6 +91,14 @@ jobs:
         run: flutter build macos --release --config-only
 
       # 显式钉死 ad-hoc 签名，不受任何 xcconfig 里可能的 Developer ID 影响。
+      #
+      # ⛔ 这里**故意不传** CODE_SIGN_INJECT_BASE_ENTITLEMENTS —— 它由工程文件里
+      #    Runner target 的 Release 配置设成 NO（见 macos/Runner.xcodeproj/project.pbxproj），
+      #    保持「单一真源」：本机 `flutter build macos --release` 与 CI 走同一份设置。
+      #    漏掉它的表现见下一步「校验产物授权」：签名里会多出一条
+      #    com.apple.security.get-task-allow（Xcode 默认注入的调试授权，
+      #    依据 Apple《Resolving Common Notarization Issues》→ Avoid the Get-Task-Allow Entitlement）。
+      #    ⚠️ 只在 Release 关掉，Debug / Profile 保留 —— 否则 `flutter run` 连不上 Dart VM Service。
       - name: 构建（ad-hoc 签名）
         run: |
           xcodebuild \
@@ -105,6 +113,12 @@ jobs:
             build
 
       # 授权文件一旦分叉，会出现「debug 能播、release 不能播」这种只在打包后才暴露的问题。
+      #
+      # ⛔ 最后那条 get-task-allow 断言**不要删**。它守的不是 entitlements 文件
+      #    （`Release.entitlements` 里根本没有这一项），而是 Xcode 构建期的注入：
+      #    target 的 CODE_SIGN_INJECT_BASE_ENTITLEMENTS 默认 YES 时，Xcode 会把
+      #    `com.apple.security.get-task-allow` 加进签名 —— 文件里看不出任何异常，
+      #    只有 `codesign -d --entitlements -` 才看得见。2026-10-07 就是这么挂过一次。
       - name: 校验产物授权
         run: |
           APP="build/macos/Build/Products/Release/CloudCine.app"

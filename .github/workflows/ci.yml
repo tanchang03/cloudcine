@@ -68,9 +68,15 @@ jobs:
 
       # 授权文件一旦分叉，就会出现「debug 能播、release 不能播」这类
       # 只在打包后才暴露的问题。这一步单独把结论打成摘要，方便一眼看到。
+      #
+      # ⚠️ 摘要里的「Release 注入开关」那一行**必须留着**：上面那张表打印的是
+      #    `.entitlements` **文件**，而下面这个坑恰恰不在文件里 —— 见下一步。
       - name: 输出 macOS 授权摘要
         if: always()
         run: |
+          INJECT="$(grep -A 3 'CODE_SIGN_ENTITLEMENTS = Runner/Release.entitlements;' macos/Runner.xcodeproj/project.pbxproj \
+            | grep -o 'CODE_SIGN_INJECT_BASE_ENTITLEMENTS = [A-Z]*' || true)"
+          [ -n "$INJECT" ] || INJECT='未设置 —— 等于默认 YES，构建时会注入 get-task-allow'
           {
             echo '### macOS 授权文件'
             echo ''
@@ -82,7 +88,34 @@ jobs:
                 | sed 's/[{}"]//g; s/,/ · /g'
               echo ' |'
             done
+            echo ''
+            echo "| Release 注入开关 | $INJECT |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ⛔ 这条断言是**静态**的（不构建），但它守的坑只有构建产物才看得见：
+      #    target 的 CODE_SIGN_INJECT_BASE_ENTITLEMENTS 默认 YES 时，Xcode 会把
+      #    `com.apple.security.get-task-allow` 注入 Release 签名 —— entitlements
+      #    文件里根本没有这一项，`git diff` 也看不出来，只有
+      #    `codesign -d --entitlements - <app>` 才现形。2026-10-07 就这么挂过一次，
+      #    当时拖到 release.yml 才发现。放到这里是为了让**每次推 main** 就拦住它，
+      #    而不是等发版那一刻。
+      #    反向也查：Debug / Profile **不许**被关掉，否则 `flutter run` 连不上
+      #    Dart VM Service（表现是「构建成功但一直卡住、没有窗口」）。
+      - name: 校验 macOS 授权配置
+        run: |
+          PBX="macos/Runner.xcodeproj/project.pbxproj"
+
+          grep -A 3 'CODE_SIGN_ENTITLEMENTS = Runner/Release.entitlements;' "$PBX" \
+            | grep -q 'CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;' \
+            || { echo "::error::Runner 的 Release 配置缺少 CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO —— 产物会带 get-task-allow"; exit 1; }
+
+          if grep -A 3 'CODE_SIGN_ENTITLEMENTS = Runner/DebugProfile.entitlements;' "$PBX" \
+               | grep -q 'CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;'; then
+            echo "::error::Debug / Profile 也被关掉了 base entitlement 注入 —— flutter run 会连不上 Dart VM Service"
+            exit 1
+          fi
+
+          echo "macOS 授权配置 OK"
 
   windows-build:
     name: Windows 构建 + 单元测试

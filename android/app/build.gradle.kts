@@ -43,8 +43,8 @@ android {
         //    两边不一致时同一个 Release 会挂出 `cloudcine-0.1.0-macos.dmg` 和
         //    `cloudcine-1.0.0-b1-android.apk` 两个版本号（README 承诺的是统一的
         //    `cloudcine-x.y.z-*`）。
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     // ── 发布签名 ────────────────────────────────────────────────────────────
