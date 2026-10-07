@@ -13,10 +13,7 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.Bitmap
 import android.graphics.Path
-import android.graphics.Rect
 import android.graphics.RectF
-import android.graphics.BitmapShader
-import android.graphics.Shader
 import android.os.Bundle
 import android.text.SpannableString
 import android.text.Spanned
@@ -28,7 +25,6 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.ViewOutlineProvider
 import android.widget.AdapterView
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
@@ -3693,6 +3689,23 @@ class LibraryActivity : Activity() {
     // ------------------------------------------------------------------
 
     /**
+     * 选中卡片的**海报**描边 + 阴影（见 [PosterFocusDrawable]）。
+     *
+     * ⛔ 挂在 `posterBox.foreground` 上，**不是** `card` 上 —— 这是「只圈海报、
+     *    不圈片名」的实现方式，也是用户明确要求的那一条。
+     * ⛔ 一个实例在多张卡之间共享是安全的：同一时刻只有 `selectedItemPosition`
+     *    那一张会拿到它，其它卡在 `getView` 里被置回 `null`。
+     */
+    private val focusRing: Drawable by lazy {
+        PosterFocusDrawable(
+            radiusPx = dp(POSTER_CORNER_DP).toFloat(),
+            ringPx = dp(FOCUS_RING_DP).toFloat(),
+            ringColor = BRAND_TINT,
+            glowPx = dp(FOCUS_GLOW_DP).toFloat(),
+        )
+    }
+
+    /**
      * 卡片：海报 + 片名 + 副标题（类型 · 年份）。
      *
      * ## ⛔ 为什么复用 `convertView` 时要按**下标**取子控件
@@ -3732,7 +3745,9 @@ class LibraryActivity : Activity() {
             val bmp = file?.let { posters.cached(it) }
             if (bmp != null) {
                 // ⛔ 圆角在 drawable 层做：包裹成 `RoundedPosterDrawable`，缩放也不丢角。
-                image.setImageDrawable(RoundedPosterDrawable(bmp, dp(8).toFloat()))
+                image.setImageDrawable(
+                    RoundedPosterDrawable(bmp, dp(POSTER_CORNER_DP).toFloat()),
+                )
                 image.visibility = View.VISIBLE
                 placeholder.visibility = View.GONE
             } else {
@@ -3784,14 +3799,14 @@ class LibraryActivity : Activity() {
             titleView.text = w.title
             metaView.text = w.cardMeta
 
-            // ── 焦点效果：**只突出选中的那张，绝不在海报上画任何框** ─────
+            // ── 焦点效果：放大 + **海报描边和阴影** + 片名变品牌色 ─────────
             //
-            // ⛔ 之前两版都犯了同一个错：给海报加「边框/光晕/底色」—— 用户明
-            //    确反馈过两次「丑」。这一次彻底不动背景：
-            //    选中 = 放大 1.1 + 抬升阴影 + 标题/副标题变品牌色；
-            //    非选中 = 海报原样（圆角由海报自己的 `clipToOutline` 提供）；
-            //    整面墙始终是干净的海报，焦点靠**大小跳变**一眼可辨。
-            //
+            // ⛔ 描边和阴影**只加在海报上**（`posterBox.foreground`），**不圈片名**。
+            //    这是用户 2026-10-07 明确要求的：「给影片封面加上边框和阴影，
+            //    注意只在图片，不要包括标题部分」。之前两版被否掉的写法都是把
+            //    整张卡（含片名）圈起来，或者干脆什么焦点线索都没有。
+            // ⛔ 阴影不再用 `card.elevation`：那是**整张卡**的阴影，会把片名一起
+            //    罩住。现在归零，阴影由 [PosterFocusDrawable] 自己画在海报周围。
             // ⛔ 海报 alpha 始终满亮度：之前会压暗其余几张做对比度，用户嫌「所
             //    有卡片都变暗」，这次所有卡都是亮的。
             val gridFocused = worksGrid.isFocused
@@ -3805,9 +3820,12 @@ class LibraryActivity : Activity() {
             //    层），不靠 `clipToOutline` —— 后者在缩放态下裁切会失效。
             card.scaleX = s
             card.scaleY = s
-            // ⛔ 抬升阴影。`convertView` 复用时旧卡片的 elevation 不会自己回 0，
-            //    所以选中=8dp、其它=0 必须**每帧重设**（不能只在选中那次设）。
-            card.elevation = if (selected) dp(8).toFloat() else 0f
+            // ⛔ `convertView` 复用时旧卡片的描边不会自己消失（`foreground` 是
+            //    视图状态），所以选中 / 非选中**每帧都要重设**。
+            posterBox.foreground = if (selected) focusRing else null
+            // ⛔ 整卡阴影归零（见上）。这里也必须每帧重设：`convertView` 复用时
+            //    旧值会留在视图上。
+            card.elevation = 0f
             titleView.setTextColor(if (selected) BRAND_TINT else Color.WHITE)
             metaView.setTextColor(if (selected) 0xFFB9B2FF.toInt() else MUTED)
             return card
@@ -3831,20 +3849,29 @@ class LibraryActivity : Activity() {
         private val bitmap: Bitmap,
         private val radiusPx: Float,
     ) : Drawable() {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-        }
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         private val path = Path()
-
-        override fun onBoundsChange(bounds: Rect) {
-            path.reset()
-            path.addRoundRect(RectF(bounds), radiusPx, radiusPx, Path.Direction.CW)
-        }
+        private val dst = RectF()
 
         override fun draw(canvas: Canvas) {
+            val b = bounds
+            if (b.isEmpty) return
+            // ⛔ 圆角按 **drawable 的 bounds（= ImageView 的可见矩形，配 FIT_XY）
+            //    来裁**，不是按 bitmap 尺寸 —— 否则海报不是精确 2:3 时，
+            //    `CENTER_CROP` 会把图放大溢出视图，圆角被挤到可见区之外，
+            //    看起来就是「某些卡有圆角、某些没有」。
+            path.reset()
+            path.addRoundRect(RectF(b), radiusPx, radiusPx, Path.Direction.CW)
             canvas.save()
             canvas.clipPath(path)
-            canvas.drawPaint(paint)
+            // 自己实现 CENTER_CROP：把 bitmap 按「覆盖」缩放到 bounds 并居中。
+            val scale = maxOf(b.width().toFloat() / bitmap.width, b.height().toFloat() / bitmap.height)
+            val dw = bitmap.width * scale
+            val dh = bitmap.height * scale
+            val left = b.left + (b.width() - dw) / 2f
+            val top = b.top + (b.height() - dh) / 2f
+            dst.set(left, top, left + dw, top + dh)
+            canvas.drawBitmap(bitmap, null, dst, paint)
             canvas.restore()
         }
 
@@ -3863,21 +3890,163 @@ class LibraryActivity : Activity() {
         override fun getIntrinsicHeight(): Int = bitmap.height
     }
 
+    /**
+     * 选中卡片的**海报**描边 + 光晕。
+     *
+     * ⛔ 只画在海报上（挂在 `posterBox.foreground`），**不圈标题** —— 用户明确
+     *    否掉过两次「整张卡套一圈亮紫」，那种画法把片名也框了进去。
+     *
+     * ## ⛔ 为什么是「光晕」而不是「黑色阴影」
+     *
+     * 用户的原话是「加上边框和阴影」，但**黑色阴影在深色底上等于没画**：页面
+     * 底色是 `#0B0D12`，阴影再黑也黑不过背景，实机截图上完全看不出来（第一版
+     * 就是照字面画的黑色阴影，放大截图后才发现那一圈根本没显影）。
+     * 深色 UI 里「抬起一层」的等效画法是**往外发一层同色系的光**，所以这里用
+     * 品牌色（[BRAND_TINT]）做柔光晕，越往外越淡。
+     *
+     * ⛔ 光晕**自己画**，不用 `View.elevation`。两个理由：
+     *    1. elevation 的阴影属于**整张卡**，会把片名一起罩住；
+     *    2. 抬 `posterBox` 的 Z 会把它的绘制顺序提到片名之上，光晕直接盖到
+     *       片名文字上（比第 1 条更难看）。
+     *
+     * ⛔ 柔光**既不用 `BlurMaskFilter`，也不用同心描边**，两个都是踩过的坑：
+     *    1. `BlurMaskFilter` 在硬件加速的画布上不保证生效（真机上表现为「一行
+     *       代码下去、什么都没发生」，而且不报错）；
+     *    2. 同心**描边**（`Style.STROKE`）在**圆角处**会叠出一道道可见的阶梯 ——
+     *       每一圈的半径差在直边处互相抵消（看不出），到圆角处被弧长放大成
+     *       块状同心弧。实机放大截图能直接看到条带，观感「粗糙、廉价」。
+     *
+     * 现在的做法：**由外向内叠 `GLOW_STEPS` 层实心圆角矩形**。
+     *   - 每层 `alpha` 相同且极低（[GLOW_LAYER_ALPHA]）；
+     *   - 越靠里被越多层覆盖 ⇒ alpha 沿**法线方向连续累积**，
+     *     形成一条平滑的向外衰减曲线，没有任何硬边；
+     *   - 每层的圆角半径都按「外扩量」**同步增大**（`radiusPx + grow`），
+     *     这样每层都是上一层的**精确外扩**（等距曲线），直边与圆角的衰减
+     *     速度完全一致 —— 这正是消除圆角条带的关键。
+     *
+     * ⛔ 光晕只画在**环带**里（海报本体之外）：`foreground` 是画在 `ImageView`
+     *    **之上**的，不裁的话里面那些层会把海报本身也蒙上一层色。用一次
+     *    `clipPath`（外圆角矩形 **减去** 海报圆角矩形）裁出环带即可。
+     *
+     * ⛔ 圆角必须与海报一致（[POSTER_CORNER_DP]）：不一致时描边会切进海报的四角，
+     *    或在海报外留出一圈背景色。
+     *
+     * ⛔ 这个 drawable 的绘制**不受 `bounds` 限制**（`Drawable.draw` 里往外画就行），
+     *    所以能画出海报之外的光晕 —— 前提是 `card.clipChildren = false`
+     *    （见 [buildCard]），否则会被父容器的子视图裁剪切掉。
+     */
+    private class PosterFocusDrawable(
+        private val radiusPx: Float,
+        private val ringPx: Float,
+        private val ringColor: Int,
+        private val glowPx: Float,
+    ) : Drawable() {
+
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = ringPx
+            color = ringColor
+        }
+
+        /** 光晕层：**实心**填充，各层同色同 alpha，靠「覆盖层数」累积出衰减。 */
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = ringColor
+            alpha = GLOW_LAYER_ALPHA
+        }
+
+        private val rect = RectF()
+
+        /** 光晕环带（外圆角矩形 − 海报圆角矩形），用来把光晕挡在海报之外。 */
+        private val bandPath = Path()
+
+        /** 临时路径，只用于 `Path.op` 求差集。 */
+        private val innerPath = Path()
+
+        override fun draw(canvas: Canvas) {
+            val l = bounds.left.toFloat()
+            val t = bounds.top.toFloat()
+            val r = bounds.right.toFloat()
+            val b = bounds.bottom.toFloat()
+            if (r <= l || b <= t) return
+
+            // ── 光晕：由外向内叠实心圆角矩形，alpha 连续累积 ──
+            if (glowPx > 0f) {
+                bandPath.reset()
+                rect.set(l - glowPx, t - glowPx, r + glowPx, b + glowPx)
+                bandPath.addRoundRect(
+                    rect, radiusPx + glowPx, radiusPx + glowPx, Path.Direction.CW,
+                )
+                innerPath.reset()
+                rect.set(l, t, r, b)
+                innerPath.addRoundRect(rect, radiusPx, radiusPx, Path.Direction.CW)
+                // 外圈 − 内圈 = 环带；海报本体被挖空，光晕不会蒙到画面上。
+                bandPath.op(innerPath, Path.Op.DIFFERENCE)
+
+                val step = glowPx / GLOW_STEPS
+                canvas.save()
+                canvas.clipPath(bandPath)
+                for (i in GLOW_STEPS downTo 1) {
+                    val grow = step * i
+                    rect.set(l - grow, t - grow, r + grow, b + grow)
+                    canvas.drawRoundRect(rect, radiusPx + grow, radiusPx + grow, glowPaint)
+                }
+                canvas.restore()
+            }
+
+            // ── 描边：压在光晕内侧，边缘最亮 ──
+            rect.set(l, t, r, b)
+            canvas.drawRoundRect(rect, radiusPx, radiusPx, ringPaint)
+        }
+
+        override fun setAlpha(alpha: Int) {
+            ringPaint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: ColorFilter?) {
+            ringPaint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+
+        private companion object {
+            /**
+             * 光晕叠几层。层数越多，相邻两层的透明度落差越小 ⇒ 越平滑。
+             * 24 层配 [GLOW_LAYER_ALPHA]=7，合成峰值 alpha ≈ 124（不透明度的
+             * 48%），既明显又不糊。层数再往上加收益很小，只会多几次绘制。
+             */
+            const val GLOW_STEPS = 24
+
+            /** 单层 alpha（0–255）。极低，靠层数堆出总强度。 */
+            const val GLOW_LAYER_ALPHA = 7
+        }
+    }
+
     private fun buildCard(): LinearLayout {
         // ⛔ 圆角在 **drawable 层**做（见 `RoundedPosterDrawable`）：海报 bitmap 被
         //    包成一个自带圆角的 drawable，ImageView 怎么缩放、角落都圆。不靠
         //    `clipToOutline`（缩放态下裁切会失效，表现为「放大后圆角没了」），
         //    也不烘焙进 bitmap（实测烘焙出的圆角不稳定）。
-        val radius = dp(8)
+        val radius = dp(POSTER_CORNER_DP)
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // ⛔ 底部留一点：卡片圆角会把最底下的文字下角切掉。
             setPadding(0, 0, 0, dp(6))
+            // ⛔ **必须关掉**：选中卡片的阴影是画在 `posterBox` 的 foreground 上的
+            //    （见 [PosterFocusDrawable]），海报左右两侧与卡片同宽 ⇒ 阴影有一半
+            //    在卡片之外。`clipChildren` 默认 true 会把它整圈切掉，表现就是
+            //    「加了阴影但什么都看不见」。
+            clipChildren = false
         }
 
         val posterBox = FrameLayout(this)
+        // ⛔ 用 `FIT_XY`（不是 `CENTER_CROP`）：让 drawable 的 `bounds` **等于**
+        //    视图可见矩形，`RoundedPosterDrawable` 才能按可见矩形裁圆角。
+        //    `CENTER_CROP` 会把 drawable 放大溢出视图，圆角被挤到可见区之外 ——
+        //    表现就是「某些卡有圆角、某些没有」。
         val image = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            scaleType = ImageView.ScaleType.FIT_XY
         }
         posterBox.addView(image, FrameLayout.LayoutParams(MATCH, MATCH))
         posterBox.addView(
@@ -4270,6 +4439,33 @@ class LibraryActivity : Activity() {
          *    那是另一套版式，不在这次范围内）。
          */
         const val TARGET_CARD_DP = 100
+
+        /**
+         * 海报圆角（dp）。
+         *
+         * ⛔ **三处必须同值**：海报的 `RoundedPosterDrawable`、占位块的
+         *    `GradientDrawable`、以及选中描边 [focusRing]。任何一处不一致，
+         *    描边都会切进海报的四角（或在海报外留出一圈背景色）。
+         */
+        const val POSTER_CORNER_DP = 8
+
+        /**
+         * 选中卡片的**海报**描边宽度（dp）。
+         *
+         * 3dp ≈ 6px。沙发上 3 米看 1080p，再细就成了一条看不清的灰线
+         * （用户明确嫌过「线框」），再粗会把海报的边吃进去。
+         */
+        const val FOCUS_RING_DP = 3
+
+        /**
+         * 选中卡片的**海报**光晕外扩（dp）。
+         *
+         * ⛔ 必须小于 [GRID_GAP_DP]（12dp）：光晕会画到相邻卡片的地界里，
+         *    超过间距就会糊在隔壁那张海报上。
+         * ⛔ 深色底上**不能**用黑色阴影代替它（那是第一版，实机上完全看不见）——
+         *    理由见 [PosterFocusDrawable] 的类文档。
+         */
+        const val FOCUS_GLOW_DP = 8
 
         /**
          * 海报缩略图缓存上限。

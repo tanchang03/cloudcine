@@ -69,6 +69,14 @@ class _TvTextFieldState extends State<TvTextField> {
   late final FocusNode _focusNode;
   bool _editing = false;
 
+  /// 正在执行「只读 → 编辑」的中转（先失焦、再复焦，见 [_enterEditing]）。
+  ///
+  /// ⛔ 这段中转里的失焦是**我们自己制造的**，不代表「焦点离开了这一格」，
+  ///    所以 [_onFocusChange] 必须跳过复位 —— 否则刚 `setState(_editing = true)`
+  ///    就被那次 `unfocus()` 触发的监听复位回 `false`，`readOnly` 一直是 `true`，
+  ///    表现就是「点一下进不去编辑态、打不进字」。
+  bool _entering = false;
+
   @override
   void initState() {
     super.initState();
@@ -87,7 +95,8 @@ class _TvTextFieldState extends State<TvTextField> {
   void _onFocusChange() {
     // 焦点离开这一格 = 本次路过/编辑结束，退回只读并收键盘。
     // 不在这里调 onChanged（输入过程中已经调过），只做状态复位。
-    if (!_focusNode.hasFocus && _editing) {
+    // ⛔ `_entering` 期间的失焦是 [_enterEditing] 自己制造的中转，必须跳过。
+    if (!_focusNode.hasFocus && _editing && !_entering) {
       SystemChannels.textInput.invokeMethod('TextInput.hide');
       setState(() => _editing = false);
       widget.onSaved?.call();
@@ -96,6 +105,7 @@ class _TvTextFieldState extends State<TvTextField> {
 
   void _enterEditing() {
     if (_editing) return;
+    _entering = true;
     setState(() => _editing = true);
     // readOnly 从 true 翻成 false 时，已在焦点上的节点不会自动重建
     // 输入连接 —— 先失焦再拿回，让框架重新走一遍「可编辑 + 有焦点 →
@@ -105,6 +115,7 @@ class _TvTextFieldState extends State<TvTextField> {
       _focusNode.unfocus();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
+        _entering = false;
         _focusNode.requestFocus();
       });
     });
