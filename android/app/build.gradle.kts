@@ -38,8 +38,13 @@ android {
         targetSdk = 34
         // ⚠️ 发版前**手动**改这两个值。`versionCode` 必须单调递增，
         //    否则已装设备会报「应用未安装」。
+        // ⛔ `versionName` 必须与 `pubspec.yaml` 的 `version` 保持一致：
+        //    `release.yml` 里 macOS/Windows 的产物名读 pubspec，Android 读这里，
+        //    两边不一致时同一个 Release 会挂出 `cloudcine-0.1.0-macos.dmg` 和
+        //    `cloudcine-1.0.0-b1-android.apk` 两个版本号（README 承诺的是统一的
+        //    `cloudcine-x.y.z-*`）。
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = "0.1.0"
     }
 
     // ── 发布签名 ────────────────────────────────────────────────────────────
