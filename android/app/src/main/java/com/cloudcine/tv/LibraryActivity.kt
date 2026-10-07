@@ -1,6 +1,7 @@
 package com.cloudcine.tv
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
@@ -39,6 +40,7 @@ import com.cloudcine.tv.library.AutoScraper
 import com.cloudcine.tv.library.CloudCoverFetcher
 import com.cloudcine.tv.library.DeviceIdentity
 import com.cloudcine.tv.library.EpisodeLabels
+import com.cloudcine.tv.library.EpisodeThumbs
 import com.cloudcine.tv.library.FollowAutoCheck
 import com.cloudcine.tv.library.FollowUpdater
 import com.cloudcine.tv.library.LibraryBackupService
@@ -204,6 +206,16 @@ class LibraryActivity : Activity() {
      *    可能有几百部，逐个重绑整墙等于把海报墙按住不让动。攒成一次。
      */
     private var cloudRefreshQueued = false
+
+    /**
+     * 简介页剧集列表里每张**网盘封面**的取用（内存 + 落盘 + 失败标记）。
+     *
+     * ⛔ 与播放页的选集列表**共用同一个类**（[EpisodeThumbs]）、**同一个磁盘目录**
+     *    （`filesDir/thumbs`）：同一集在两处看到的是同一张图，下过一次就都有了。
+     * ⛔ 只记 URL、**首次真的要显示时才下**：一个库上千条，扫描期全下就是上千次
+     *    请求，而用户可能一次都不翻到那些片子。
+     */
+    private var episodeThumbs: EpisodeThumbs? = null
 
     // ── 视图 ────────────────────────────────────────────────────────
     private lateinit var root: FrameLayout
@@ -442,6 +454,11 @@ class LibraryActivity : Activity() {
         cloudCovers = CloudCoverFetcher(
             dir = LibraryPaths.posterDir(this),
             thumbBytes = { api.thumbBytes(it) },
+        )
+        // 简介页剧集列表的封面。与播放页选集列表同一个目录 ⇒ 两边共享磁盘缓存。
+        episodeThumbs = EpisodeThumbs(
+            dir = LibraryPaths.thumbDir(this),
+            cacheBytes = THUMB_CACHE_BYTES,
         )
 
         root = FrameLayout(this).apply { setBackgroundColor(BG) }
@@ -4203,21 +4220,29 @@ class LibraryActivity : Activity() {
     }
 
     /**
-     * 作品简介页的「文件」列表 —— 一行 = 库里的一条文件。
+     * 作品简介页的「剧集」列表 —— 一行 = 库里的一条文件。
      *
-     * ## 一行五样东西（从左到右）
+     * ## 一行四样东西（从左到右）
      *
      * | 位置 | 内容 | 为什么 |
      * |---|---|---|
-     * | 主标题 18sp 白 | **文件名**（去扩展名，[EpisodeLabels.fileLabel]），新集时行首带品牌色「■ NEW」 | ⛔ 不能用 `displayTitle`：它优先返回**作品标题**，整列会印成同一句话（「黑亚当」× 12），剧集之间、同一部电影的多个版本之间都分不出来 |
-     * | 副标题 13sp 灰 | 分辨率 · 大小 | ⛔ 进度不在这里 —— 它单独占一列 |
+     * | **封面** 96×54dp、16:9、圆角 | 网盘缩略图（[EpisodeThumbs]），拿不到时画**集号**占位；**封面底部压着一条历史进度条** | 用户 2026-10-07：「增加剧集列表封面（网盘封面图），历史播放进度在封面图底部通过进度条体现，秀气一点，漂亮点」 |
+     * | 主标题 17sp 白 | **文件名**（去扩展名，[EpisodeLabels.fileLabel]），新集时行首带品牌色「■ NEW」 | ⛔ 不能用 `displayTitle`：它优先返回**作品标题**，整列会印成同一句话（「黑亚当」× 12），剧集之间、同一部电影的多个版本之间都分不出来 |
+     * | 副标题 12sp 灰 | 分辨率 · 大小 | 一行两条信息，再挤就看不见了 |
      * | 标签 13sp 品牌色 | `S01E03`（集号解析得出时才画） | 一眼扫集号，不用在文件名里找 |
-     * | 进度 13sp 固定列 | `62%` / `—`（历史**最大**位置占比） | 竖着扫一眼看出哪几集看过；⛔ 不是续播点（看完被清成 NULL） |
      * | 时间 13sp 右对齐 | **网盘文件的修改时间**（相对时间） | 与 PC 端 `ModifiedTimeColumn` 同口径；⛔ 单位已是毫秒，别再 ×1000 |
      *
-     * ⛔ 2026-10-07 用户原话：「文件列表应该重点凸显的是文件名，而不是全部都是
-     *    媒体名，否则剧集列表都是媒体名，看起来体验非常不好」—— 当时这一行写的是
-     *    `entry.displayTitle`，于是 12 集全叫「黑亚当」。
+     * ## ⛔ 原来那一列「62%」去哪了
+     *
+     * 用户 2026-10-07 要求把进度改成**封面底部的一条进度条**，于是固定宽度的
+     * `62%` / `—` 文本列整列删掉。两个理由：
+     *   1. 同一件事画两遍，只会把**文件名**那一列挤窄（而文件名是这一行的重点）；
+     *   2. **进度条比数字更好扫** —— 一眼看得出哪几集看了一大半，数字得逐个读。
+     * 没看过的集数**整条不画**（连底槽也不画）：留白本身就是「没看过」。
+     *
+     * ⛔ 2026-10-07 更早的一条用户原话：「文件列表应该重点凸显的是文件名，
+     *    而不是全部都是媒体名，否则剧集列表都是媒体名，看起来体验非常不好」
+     *    —— 当时这一行写的是 `entry.displayTitle`，于是 12 集全叫「黑亚当」。
      */
     private inner class ItemsAdapter : BaseAdapter() {
         override fun getCount() = items.size
@@ -4225,79 +4250,73 @@ class LibraryActivity : Activity() {
         override fun getItemId(position: Int) = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            // ⛔ **懒加子 View**：首屏 convertView 是 null，这一行一个子 View 都
-            //    没有，直接 `row.getChildAt(0) as LinearLayout` 必崩（旧写法的坑）。
-            //    改成「没有就现建并 addView」，与 `BrowseActivity.EntryAdapter` 同一路。
-            val row = (convertView as? LinearLayout) ?: LinearLayout(this@LibraryActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(GRID_PAD_DP), dp(12), dp(GRID_PAD_DP), dp(12))
-            }
-            val column = row.getChildAt(0) as? LinearLayout ?: LinearLayout(this@LibraryActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                // ⛔ 占满除「标签 / 时间」之外的剩余宽度：文件名那一列才能随屏伸缩。
-                layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f)
-                row.addView(this)
-            }
-            val line1 = column.getChildAt(0) as? TextView ?: TextView(this@LibraryActivity).apply {
-                setTextColor(Color.WHITE)
-                // ⛔ 17 → 18sp：这一行现在是**文件名**（唯一能把 12 集区分开的信息），
-                //    比副标题大 5sp 才撑得起「重点」。再多就挤掉列表行数了。
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                column.addView(this)
-            }
-            val line2 = column.getChildAt(1) as? TextView ?: TextView(this@LibraryActivity).apply {
-                setTextColor(MUTED)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                column.addView(this)
-            }
-            val tag = row.getChildAt(1) as? TextView ?: TextView(this@LibraryActivity).apply {
-                setTextColor(BRAND_TINT)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                gravity = Gravity.CENTER
-                setPadding(dp(10), 0, dp(10), 0)
-                layoutParams = LinearLayout.LayoutParams(WRAP, WRAP)
-                row.addView(this)
-            }
-            // 播放进度列：**单独一列**、固定宽度、右对齐，只写百分比（`62%`）。
-            // ⛔ 读的是历史最大位置（[EpisodeLabels.progressPercent]），不是续播点 ——
-            //    看完的那一集续播点会被清成 NULL，用它的话「看过没有」永远显示不出来。
-            // ⛔ 没有进度时写 `—` 而不是藏起来：这一列的价值就在于**竖着扫一眼**
-            //    看出哪几集看过，列时有时无的话就没法扫了（与时间列同一规矩）。
-            val progress = row.getChildAt(2) as? TextView ?: TextView(this@LibraryActivity).apply {
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                gravity = Gravity.END
-                maxLines = 1
-                layoutParams = LinearLayout.LayoutParams(dp(PROGRESS_COL_DP), WRAP)
-                row.addView(this)
-            }
-            // 修改时间列：与 PC 端 `ModifiedTimeColumn` 同一口径 —— 固定宽度、
-            // 右对齐、显示相对时间（`3 天前`），`null`/`0` 显示 `—`。
-            val time = row.getChildAt(3) as? TextView ?: TextView(this@LibraryActivity).apply {
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                gravity = Gravity.END
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                layoutParams = LinearLayout.LayoutParams(dp(TIME_COL_DP), WRAP)
-                row.addView(this)
-            }
+            val row = (convertView as? LinearLayout) ?: buildItemRow()
+            // ⛔ 子控件**全部按下标取**，顺序在 [buildItemRow] 里定死（红线 9）：
+            //    `[0] 封面框{图, 占位字, 进度条} · [1] 文字列{文件名, 分辨率·体积}
+            //     · [2] 集号 · [3] 时间`。改结构必须同步改这里。
+            val thumbBox = row.getChildAt(0) as FrameLayout
+            val image = thumbBox.getChildAt(0) as ImageView
+            val placeholder = thumbBox.getChildAt(1) as TextView
+            val bar = thumbBox.getChildAt(2) as ThumbProgressBar
+            val column = row.getChildAt(1) as LinearLayout
+            val line1 = column.getChildAt(0) as TextView
+            val line2 = column.getChildAt(1) as TextView
+            val tag = row.getChildAt(2) as TextView
+            val time = row.getChildAt(3) as TextView
 
             // ⛔ 别把这个局部变量叫 `it`：下面 `?.let { … }` 的隐式参数也叫 `it`，
             //    两层同名会让「这行用的是哪个」纯靠规则推断，读代码时极易看错。
             val entry = items[position]
-            tag.text = entry.episodeTag ?: ""
-            tag.visibility = if (entry.episodeTag == null) View.GONE else View.VISIBLE
-            // ⛔ 主标题是**文件名**（去扩展名），不是 `entry.displayTitle` ——
-            //    后者优先返回**作品标题**，于是整列印的是同一句话（「黑亚当」× 12），
-            //    剧集之间、同一部电影的多个版本之间**完全分不出来**。
-            //    口径与播放页 OSD 的「选集」同一支（[EpisodeLabels.fileLabel]），
-            //    也是 PC 端详情页 `rowLabel(RowLabelStyle.fileName)` 的口径。
-            // ⛔ 但**不**照抄 PC 的「剧名-文件名」前缀：那一行在电视上只有一行、
-            //    尾部省略，长剧名会把真正要看的文件名挤出屏幕外。
+
+            // ── 封面 ──────────────────────────────────────────────────
+            //
+            // ⛔ 只读**内存**缓存（[EpisodeThumbs.cached]，主线程可调）；磁盘和网络
+            //    一律丢给 [Bg]。在这台电视上 `getView` 里做一次 `File.exists()`
+            //    或解码都会变成可见的卡顿。
+            val url = entry.thumbUrl.orEmpty()
+            val bmp = if (url.isEmpty()) null else episodeThumbs?.cached(url)
+            if (bmp != null) {
+                // ⛔ 圆角在 **drawable 层**做（复用海报墙那支 [RoundedPosterDrawable]）：
+                //    直接 `setImageBitmap` 出来的是**直角**，一排封面全是方块，
+                //    与旁边 2:3 圆角海报不是一套语言。
+                image.setImageDrawable(RoundedPosterDrawable(bmp, dp(EP_CORNER_DP).toFloat()))
+                image.visibility = View.VISIBLE
+                placeholder.visibility = View.GONE
+            } else {
+                image.setImageDrawable(null)
+                image.visibility = View.INVISIBLE
+                // 占位块写**集号**而不是「无封面」：服务端对约三成视频根本没生成过
+                // 预览图，那个位置长期是空的，写「无封面」等于三成条目挂着一句废话。
+                placeholder.text = entry.episodeTag ?: (position + 1).toString()
+                placeholder.visibility = View.VISIBLE
+                // 没下过、也没确认拿不到 → 排一次后台下载。
+                if (url.isNotEmpty() && episodeThumbs?.isKnownBad(url) != true) {
+                    val store = episodeThumbs
+                    if (store != null) {
+                        val self = this
+                        Bg.run({ store.load(url, api, dp(EP_COVER_W_DP)) }) { _, _ ->
+                            // ⛔ **失败也要重画**：`load` 已经把地址记进「拿不到」，
+                            //    不重画的话每次 `getView` 都会再排一次下载
+                            //    （表现是「滚一格卡一下」）。
+                            // ⛔ `post` 不能省：`getView` 有可能就在这一拍里被调用，
+                            //    而**在布局过程中 `notifyDataSetChanged` 会抛**
+                            //    「The content of the adapter has changed but
+                            //    ListView did not receive a notification」。
+                            // ⛔ 还要确认这期间列表没被换成别的作品。
+                            itemsList.post { if (itemsAdapter === self) self.notifyDataSetChanged() }
+                        }
+                    }
+                }
+            }
+
+            // ── 封面底部那条历史进度条 ────────────────────────────────
+            //
+            // ⛔ 读的是历史**最大**位置（[EpisodeLabels.progressFraction]），不是续播点
+            //    —— 看完的那一集续播点会被清成 NULL，用它的话「看过没有」永远
+            //    显示不出来。`null` ⇒ 0 ⇒ 整条不画。
+            bar.fraction = (EpisodeLabels.progressFraction(entry) ?: 0.0).toFloat()
+
+            // ── 文字 ──────────────────────────────────────────────────
             //
             // 行首的「■ NEW」是**追剧以来才入库、且从没播过**的那几集
             // （判据 `Work.isNewSinceFollow`，由 [WorkDetailFormat.newEpisodePrefix]
@@ -4312,16 +4331,12 @@ class LibraryActivity : Activity() {
             val isNew = currentWork?.isNewSinceFollow(entry) == true
             line1.text = newEpisodeTitle(EpisodeLabels.fileLabel(entry), isNew)
             // 副标题只报「这一条文件本身是什么」（清晰度 · 体积）。
-            // ⛔ 进度**不在这里**：它已经单独占一列了，两处都写就是同一件事印两遍
-            //    —— 这一行的宽度还要留给文件名。
             line2.text = buildString {
                 entry.resolution?.takeIf { it.isNotEmpty() }?.let { append("$it · ") }
                 append(formatSize(entry.sizeBytes ?: 0L))
             }
-            val percent = EpisodeLabels.progressPercent(entry)
-            progress.text = percent ?: "—"
-            // 看过 ⇒ 亮一档，没看过 ⇒ 与时间列的「不知道」同档灰。
-            progress.setTextColor(if (percent != null) 0xFFE5E7EB.toInt() else 0xFF4B5563.toInt())
+            tag.text = entry.episodeTag ?: ""
+            tag.visibility = if (entry.episodeTag == null) View.GONE else View.VISIBLE
             // ⛔ [LibraryItem.modifiedAt] 已经是**毫秒**了（`LibraryDb.queryItems` 从库里
             //    的秒乘过一次，好与网盘的 `updatedAtMs` 同单位）。这里**再乘一次 1000**
             //    会得到一个公元 5 万多年的时间戳 ⇒ `Fmt.relativeTime` 的 `diffSec < 0`
@@ -4336,6 +4351,156 @@ class LibraryActivity : Activity() {
                 itemsList.isFocused && itemsList.selectedItemPosition == position,
             )
             return row
+        }
+
+        /**
+         * 造一行的骨架。子节点**顺序即契约**（[getView] 按下标取）：
+         * `[0] 封面框{图, 占位字, 进度条} · [1] 文字列{文件名, 分辨率·体积}
+         *  · [2] 集号 · [3] 时间`。
+         *
+         * ⛔ 一次性建全（不再是「没有就现加」的懒写法）：子控件从 3 个变成 4 类、
+         *    每类还有自己的子节点，按下标逐个补建会变得无法阅读，而 `ListView`
+         *    本来就只对首屏那几行调一次建造成本。
+         */
+        private fun buildItemRow(): LinearLayout {
+            val row = LinearLayout(this@LibraryActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(GRID_PAD_DP), dp(7), dp(GRID_PAD_DP), dp(7))
+            }
+
+            val thumbBox = FrameLayout(this@LibraryActivity)
+            thumbBox.addView(
+                ImageView(this@LibraryActivity).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setBackgroundColor(0xFF232833.toInt())
+                },
+                FrameLayout.LayoutParams(MATCH, MATCH),
+            )
+            thumbBox.addView(
+                TextView(this@LibraryActivity).apply {
+                    setTextColor(0xFF4B5563.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    background = GradientDrawable().apply {
+                        cornerRadius = dp(EP_CORNER_DP).toFloat()
+                        setColor(0xFF232833.toInt())
+                    }
+                },
+                FrameLayout.LayoutParams(MATCH, MATCH),
+            )
+            thumbBox.addView(
+                ThumbProgressBar(this@LibraryActivity),
+                FrameLayout.LayoutParams(MATCH, dp(EP_PROGRESS_H_DP)).apply {
+                    gravity = Gravity.BOTTOM
+                    // ⛔ 左右各留 8dp、底部留 5dp：封面是圆角的，进度条顶到边会被
+                    //    圆角切掉，看起来像一条被裁断的横杠 —— 用户要的「秀气」
+                    //    正是这里，别为了「更长」把它拉满。
+                    leftMargin = dp(8)
+                    rightMargin = dp(8)
+                    bottomMargin = dp(5)
+                },
+            )
+            row.addView(
+                thumbBox,
+                LinearLayout.LayoutParams(dp(EP_COVER_W_DP), dp(EP_COVER_H_DP)),
+            )
+
+            val column = LinearLayout(this@LibraryActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                // ⛔ 占满除「集号 / 时间」之外的剩余宽度：文件名那一列才能随屏伸缩。
+                layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f)
+                    .apply { marginStart = dp(14) }
+            }
+            column.addView(
+                TextView(this@LibraryActivity).apply {
+                    setTextColor(Color.WHITE)
+                    // ⛔ 18 → 17sp：左边多了 96dp 的封面，同一行的可用宽度少了
+                    //    约 110dp，18sp 下长文件名几乎整条都会被省略号吃掉。
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                },
+            )
+            column.addView(
+                TextView(this@LibraryActivity).apply {
+                    setTextColor(MUTED)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setPadding(0, dp(3), 0, 0)
+                },
+            )
+            row.addView(column)
+
+            row.addView(
+                TextView(this@LibraryActivity).apply {
+                    setTextColor(BRAND_TINT)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    gravity = Gravity.CENTER
+                    setPadding(dp(10), 0, dp(10), 0)
+                },
+            )
+            // 修改时间列：与 PC 端 `ModifiedTimeColumn` 同一口径 —— 固定宽度、
+            // 右对齐、显示相对时间（`3 天前`），`null`/`0` 显示 `—`。
+            row.addView(
+                TextView(this@LibraryActivity).apply {
+                    setTextColor(0xFF9AA3B2.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    gravity = Gravity.END
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    layoutParams = LinearLayout.LayoutParams(dp(TIME_COL_DP), WRAP)
+                },
+            )
+            return row
+        }
+    }
+
+    /**
+     * 剧集封面上那条**历史进度**条（压在封面底部）。
+     *
+     * ⛔ 为什么不复用播放页 OSD 那套「`LinearLayout` + 两个权重子 View」：那条画在
+     *    **纯色行底**上，两端直角无所谓；这一条压在**封面画面上**，直角端会像一条
+     *    被裁断的横杠。自己 `onDraw` 才能把两端收成圆头 —— 也就是用户要的「秀气」。
+     *
+     * ⛔ `fraction <= 0` 时**整条不画**（连底槽也不画）：没看过的集数上飘着一条
+     *    灰槽，等于每张封面都糊了一道灰线；「没看过」本身就是信息，留白就够了。
+     */
+    private class ThumbProgressBar(context: Context) : View(context) {
+
+        /** 底槽：半透明黑，在亮封面上也看得见「还剩多少」。 */
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x66000000 }
+
+        /** 已看：品牌色，与海报墙 / OSD 那条同一支色。 */
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = BRAND_TINT }
+
+        private val rect = RectF()
+
+        /** 已看比例 `0..1`；`<= 0` = 没看过 ⇒ 整条不画。 */
+        var fraction: Float = 0f
+            set(value) {
+                val v = value.coerceIn(0f, 1f)
+                if (field == v) return
+                field = v
+                invalidate()
+            }
+
+        override fun onDraw(canvas: Canvas) {
+            if (fraction <= 0f) return
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+            val r = h / 2f
+            rect.set(0f, 0f, w, h)
+            canvas.drawRoundRect(rect, r, r, trackPaint)
+            // ⛔ 至少画一个「圆头」的宽度（`h`）：比例极小时若按 `w × fraction` 画，
+            //    会缩成不到一个像素，看起来像进度条坏了。
+            val fw = (w * fraction).coerceAtLeast(h)
+            rect.set(0f, 0f, fw, h)
+            canvas.drawRoundRect(rect, r, r, fillPaint)
         }
     }
 
@@ -4409,12 +4574,41 @@ class LibraryActivity : Activity() {
         const val GRID_PAD_DP = 32
 
         /**
-         * 「播放进度」列宽（dp）。
+         * 简介页剧集列表里**封面**的尺寸（dp），16:9 —— 与夸克 `preview_url`
+         * （640×360）同比例，也与播放页 OSD 选集行的 `LIST_THUMB_W/H` **逐字一致**
+         * ⇒ 同一集在两处看到的封面一样大、裁得一样。
          *
-         * ⛔ 宽度要装得下最长的那个值（`100%` / `<1%`）**并且固定** —— 这一列是
-         *    给人竖着扫的，宽度随内容变会让整张表左右跳。
+         * ⛔ 封面尺寸直接决定「一屏能看几集」：这一页的列表区实测只有约 427px
+         *    （1080p / density 2.0），54dp 封面 + 上下 7dp 内边距 ⇒ 一行 68dp = 136px
+         *    ⇒ 一屏 3 集出头。再高就掉到 3 集以下，而「选集」恰恰是这一页的主要用途。
          */
-        const val PROGRESS_COL_DP = 64
+        const val EP_COVER_W_DP = 96
+        const val EP_COVER_H_DP = 54
+
+        /**
+         * 剧集封面的圆角（dp）。
+         *
+         * ⛔ 比海报墙的 [POSTER_CORNER_DP]（8）小：封面只有 54dp 高，8dp 圆角在
+         *    这个小尺寸上「吃掉」的角太多，缩略图会看着像药丸。
+         */
+        const val EP_CORNER_DP = 6
+
+        /**
+         * 剧集封面底部那条**历史进度**条的高度（dp）。
+         *
+         * ⛔ 「秀气」是用户的原话（2026-10-07）。3dp 在 1080p 上约 6px，与播放页
+         *    OSD 的 `PROGRESS_H`、海报墙那条同厚 —— 它压在**封面画面上**，
+         *    再粗一点就变成一条横杠、把封面从中间切断了。
+         */
+        const val EP_PROGRESS_H_DP = 3
+
+        /**
+         * 剧集封面缩略图的内存缓存上限。
+         *
+         * ⛔ 一屏 3~4 张、每张 16:9 缩到 96dp 宽，RGB_565 下约 20 KB ⇒ 4 MiB
+         *    够翻十几屏。与播放页 `THUMB_CACHE_BYTES` 同量级（那边同时可见更多）。
+         */
+        const val THUMB_CACHE_BYTES = 4 * 1024 * 1024
 
         /**
          * 「修改时间」列宽（dp）。
