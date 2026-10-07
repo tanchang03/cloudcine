@@ -9,6 +9,7 @@ import '../../core/error/drive_error.dart';
 import '../../domain/entities/drive_entry.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/media_item.dart';
+import '../../domain/services/directory_anchor_loader.dart';
 import '../../domain/services/follow_read.dart';
 import '../../domain/services/media_discovery.dart';
 import '../../domain/services/media_entry_classifier.dart';
@@ -172,10 +173,16 @@ Future<void> playDriveEntry(
     return;
   }
 
+  // 目录锚点：与「加入媒体库」那条路**同一份判据**。不传的话，这个文件
+  // 在内存里的 `groupKey` 会与它入库后的那一条不同 —— 表现是「直接播完
+  // 再去媒体库里找它，下一集/续播对不上」，而它不报任何错。
+  final anchors = await loadDirectoryAnchors(ref.read(mediaRepositoryProvider));
+
   final item = parseTransientMedia(
     entry: entry,
     provider: provider,
     dirPath: dirPath,
+    anchors: anchors,
   ).item;
 
   // 记一份给「直链过期自动续播」用：那条路发生在**另一个引擎**里，只能回
@@ -183,5 +190,7 @@ Future<void> playDriveEntry(
   // 里 `_transientItems` 的文档。
   rememberTransientItem(item);
 
+  // 上面读锚点跨了一次 async gap —— 页面可能已经被关掉了。
+  if (!context.mounted) return;
   await playItem(context, ref, item);
 }

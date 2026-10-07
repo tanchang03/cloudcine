@@ -1,3 +1,4 @@
+import 'package:cloudcine/core/utils/directory_anchor.dart';
 import 'package:cloudcine/core/utils/filename_parser.dart';
 import 'package:cloudcine/core/utils/video_formats.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -603,6 +604,134 @@ void main() {
       final b = parser.parse('Dune.2021.2160p.mkv');
 
       expect(a.groupKey, isNot(b.groupKey));
+    });
+  });
+
+  group('目录锚点：归到哪部剧由**目录**说了算（2026-10-07）', () {
+    const liveDir = '/来自：分享/兰丨香R-故/';
+    const liveSubDir =
+        '/来自：分享/兰丨香R-故/兰z.香z.如z.故  去头去尾版 (2026) 4K/';
+
+    /// 老作品《兰香如故》：20 个 `01.mp4…`，文件都在 [liveDir]。
+    final anchors = DirectoryAnchorIndex.of([
+      const AnchorWork(
+        key: '兰丨香r故',
+        title: '兰香如故',
+        kind: MediaKind.episode,
+        isAlias: false,
+        dirs: {liveDir},
+      ),
+    ]);
+
+    test('没有锚点时行为完全不变（老调用点与老测试不受影响）', () {
+      const name = 'S01E01.第1集.2160p.WEB-DL.H.265.Pure.mkv';
+
+      final without = parser.parse(name, dirPath: liveSubDir);
+      final withNull = parser.parse(name, dirPath: liveSubDir, anchors: null);
+
+      expect(without.groupKey, withNull.groupKey);
+      // 没有锚点时，片名取自子目录名 —— 正是分叉的成因。
+      expect(without.groupKey, '兰z香z如z故去头去尾版');
+    });
+
+    test('子目录里的新集 → 归到已有那部剧（片名/类型/归组键一起覆盖）', () {
+      final parsed = parser.parse(
+        'S01E01.第1集.2160p.WEB-DL.H.265.Pure.mkv',
+        dirPath: liveSubDir,
+        anchors: anchors,
+      );
+
+      expect(parsed.groupKey, '兰丨香r故', reason: '不覆盖的话这 47 集会另起一部作品');
+      expect(parsed.title, '兰香如故');
+      expect(parsed.kind, MediaKind.episode);
+    });
+
+    test('季集号**保留** —— 归到哪部剧与「是第几集」互不影响', () {
+      // 现场的文件名：自带季集结构 → 目录级归组本来就会让路（`_isStandaloneRelease`），
+      // 所以 S01E01 留得住。锚点**不许**把这一步的结果再抹掉。
+      const name = 'S01E01.第1集.2160p.WEB-DL.H.265.Pure.mkv';
+      final anchored = parser.parse(name, dirPath: liveSubDir, anchors: anchors);
+      final plain = parser.parse(name, dirPath: liveSubDir);
+
+      expect(anchored.groupKey, '兰丨香r故');
+      expect(anchored.season, plain.season);
+      expect(anchored.episode, plain.episode);
+      expect(anchored.episodeLabel, 'S01E01');
+      expect(anchored.season, 1);
+      expect(anchored.episode, 1);
+    });
+
+    test('末级是容器段（`第二季`）时锚点照样生效', () {
+      // 这条钉的是「锚点不依赖目录名像不像名字」。季号被清掉是**既有**行为
+      // （目录级归组在片名提不出来时会清季集号，见 `_isStandaloneRelease`
+      // 那一段的注释），锚点不改它。
+      final parsed = parser.parse(
+        'S02E07.第7集.mkv',
+        dirPath: '$liveSubDir第二季/',
+        anchors: anchors,
+      );
+
+      expect(parsed.groupKey, '兰丨香r故');
+      expect(parsed.title, '兰香如故');
+    });
+
+    test('⛔ 归组键走**强制覆盖**，不是「改标题再算一遍」', () {
+      // 作品刮削后标题会变成在线源给的正式名，而 `media_works.key` 是首次
+      // 入库时算出来的、永不改写。两者不同时，靠 title 反推的键会对不上。
+      final scraped = DirectoryAnchorIndex.of([
+        const AnchorWork(
+          key: '兰丨香r故',
+          title: '兰香如故（2026）', // 刮削后的正式名 ≠ key
+          kind: MediaKind.episode,
+          isAlias: false,
+          dirs: {liveDir},
+        ),
+      ]);
+
+      final parsed = parser.parse(
+        'S01E01.第1集.mkv',
+        dirPath: liveSubDir,
+        anchors: scraped,
+      );
+
+      expect(parsed.title, '兰香如故（2026）');
+      expect(
+        parsed.groupKey,
+        '兰丨香r故',
+        reason: '键必须是那部作品的 key，不能由标题重算',
+      );
+    });
+
+    test('文件直接躺在剧集目录里 → 不锚（闸 3），老 20 集归属不变', () {
+      final parsed = parser.parse(
+        '01.mp4',
+        dirPath: liveDir,
+        anchors: anchors,
+      );
+
+      expect(parsed.groupKey, '兰丨香r故', reason: '目录名兜底本来就算对了');
+      expect(parsed.kind, MediaKind.episode);
+    });
+
+    test('平铺目录里的新片不会被吸进那部剧', () {
+      final flat = DirectoryAnchorIndex.of([
+        const AnchorWork(
+          key: '兰丨香r故',
+          title: '兰香如故',
+          kind: MediaKind.episode,
+          isAlias: false,
+          dirs: {'/来自：分享/我的资源/'},
+        ),
+      ]);
+
+      final parsed = parser.parse(
+        '奥德赛.2026.2160p.mkv',
+        dirPath: '/来自：分享/我的资源/',
+        anchors: flat,
+      );
+
+      expect(parsed.groupKey, isNot('兰丨香r故'));
+      expect(parsed.kind, MediaKind.movie);
     });
   });
 }

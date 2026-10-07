@@ -37,11 +37,35 @@ library;
 
 /// 归一化：只留小写字母数字与汉字。
 ///
-/// 与 `scrape_match.dart` / `MediaCategoryGuesser` 的口径一致 ——
-/// 三处对「什么算同一个名字」的理解一旦不同，就会出现
+/// 与 `scrape_match.dart` / `MediaCategoryGuesser` / `ParsedMediaName.groupKey`
+/// 的口径一致 —— 几处对「什么算同一个名字」的理解一旦不同，就会出现
 /// 「目录名判成了系列、刮削又当成另一部片」这种极难排查的不一致。
-String _norm(String s) =>
-    s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
+///
+/// 公开出来是因为 `WorkMergeSuggester` 的「两个标题沾不沾边」也要用它：
+/// 那里是**唯一**另一处需要「名字比对」的地方，复制一份迟早漂移。
+String normalizeWorkName(String? s) =>
+    (s ?? '').toLowerCase().replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
+
+/// 「两个名字算沾边」的门槛：归一化后公共字符数 ≥ 2。
+///
+/// 取 2 是权衡出来的：
+///
+///   - 取 1 会让「《兰香如故》× 《兰亭》」这类只剩一个字的组合通过；
+///   - 取 3 会漏掉 `兰丨香r故` × `兰z香z如z故去头去尾版` —— 公共字符恰好是
+///     `兰`、`香`、`故` 三个，但「丨」与「r」是发布者塞的噪声，稍长一点的
+///     名字就会被噪声稀释到 3 以下。
+///
+/// 短名（两三个字的国产剧）是这个门槛最难受的地方，而它们恰恰最需要被认
+/// 出来 —— 所以宁可宽一点：多问一句的成本是点一下「暂不」，漏掉一句的
+/// 成本是用户永远找不到那几十集。
+const int kMinSharedNameChars = 2;
+
+/// 两个名字归一化后共有的字符数（按**字符集**，不看顺序）。
+int sharedNameChars(String a, String b) {
+  final sa = normalizeWorkName(a).split('').toSet();
+  final sb = normalizeWorkName(b).split('').toSet();
+  return sa.intersection(sb).length;
+}
 
 /// 目录名 → 作品名。
 abstract final class DirectoryTitle {
@@ -109,7 +133,7 @@ abstract final class DirectoryTitle {
     if (raw.isEmpty) return true;
 
     final lower = raw.toLowerCase();
-    final n = _norm(lower);
+    final n = normalizeWorkName(lower);
 
     // 单个字符（`1`、`a`、`·`）不是名字。
     if (n.length < 2) return true;

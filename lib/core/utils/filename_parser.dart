@@ -23,6 +23,7 @@
 /// 什么符号都可能有（`Spider-Man`、`Se7en`、`流浪地球2`）。
 library;
 
+import 'directory_anchor.dart';
 import 'directory_title.dart';
 import 'file_names.dart';
 import 'video_formats.dart';
@@ -67,6 +68,7 @@ class ParsedMediaName {
     this.releaseGroup,
     this.isSampleOrExtra = false,
     this.isDiscImage = false,
+    this.groupKeyOverride,
   });
 
   /// 原始文件名（含扩展名）
@@ -136,6 +138,15 @@ class ParsedMediaName {
   final bool isSampleOrExtra;
   final bool isDiscImage;
 
+  /// 归组键的**强制覆盖** —— 由「目录锚点」给出（见 [DirectoryAnchorIndex]）。
+  ///
+  /// ⛔ 为什么不能靠「把 title 改成锚点作品的标题、再让 [groupKey] 算一遍」：
+  ///    作品刮削之后 `title` 会变成在线源给的正式名（`兰香如故（2026）`），
+  ///    而 `media_works.key` 是**首次入库时**算出来的、**永不改写**。
+  ///    两者一旦不同，算出来的键就对不上那部作品 —— 结果是
+  ///    「锚点说归到 A，实际又建了一部新作品」，而且不报错。
+  final String? groupKeyOverride;
+
   /// 集号展示文本：`S01E02` / `E02` / `E02-E05` / 无则 `null`。
   String? get episodeLabel {
     final e = episode;
@@ -169,6 +180,10 @@ class ParsedMediaName {
   ///
   /// 剧集**不含季号**：`S01` 与 `S02` 应该落在同一部剧下，由 UI 再分层。
   String get groupKey {
+    // 目录锚点优先：它回答的是「这是哪部剧」，而文件名只回答「这是第几集」。
+    final override = groupKeyOverride;
+    if (override != null && override.isNotEmpty) return override;
+
     final t = (title ?? baseNameOf(rawName)).toLowerCase();
     final cleaned = t.replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]'), '');
     final y = year;
@@ -266,7 +281,21 @@ class MediaFilenameParser {
   /// 「自己说得清楚」的判据见 [_isStandaloneRelease]：片名是真名字，
   /// 而且自带年份或季集结构（`天龙八部…S01E01.1997…`、`流浪地球2.2023…`）。
   /// 这类文件名自己就够准，用目录名去顶它只会把 `S01E01` 那样的信息抹掉。
-  ParsedMediaName parse(String fileName, {String? dirName, String? dirPath}) {
+  ///
+  /// ## 目录**锚点**（[anchors]）：比上面两条都高的权威
+  ///
+  /// 上面两条只能看「这个文件自己的名字 + 它所在目录的名字」。可当这个目录
+  /// **落在一部已有剧集的目录之下**时，还有一条更强的证据：*库里已经有那部剧
+  /// 了*。此时「这是哪部剧」不该再由文件名猜 —— 见 [DirectoryAnchorIndex]。
+  ///
+  /// ⚠️ 它排在**最后**：只有前面几条都定不下来（或定得与锚点不同）时才覆盖。
+  ///    换句话说锚点永远赢，因为它是唯一「知道库里有什么」的那一条。
+  ParsedMediaName parse(
+    String fileName, {
+    String? dirName,
+    String? dirPath,
+    DirectoryAnchorIndex? anchors,
+  }) {
     final base = baseNameOf(fileName);
     final isSample = VideoFormats.isSampleOrExtra(base);
     final isDisc = VideoFormats.isDiscImage(fileName);
@@ -284,6 +313,9 @@ class MediaFilenameParser {
     var episode = parsed.episode;
     var episodeEnd = parsed.episodeEnd;
     var resolution = parsed.resolution;
+
+    /// 归组键的强制覆盖（由下面的「目录锚点」填）。
+    String? groupKeyOverride;
 
     // ⚠️ `dirPath` 优先于 `dirName`，且**只用它推 dirName**：两个来源各自
     // 生效时，同一个文件在扫描期与详情页会解析出不同的片名（静默分叉）。
@@ -337,6 +369,27 @@ class MediaFilenameParser {
       }
     }
 
+    // 目录**锚点**（最高权威，见方法头）：这个目录落在一部已有剧集的目录
+    // 之下 → 这个文件就是那部剧的一集。
+    //
+    // ⛔ 放在**最后**、且不受 `_isStandaloneRelease` 约束 —— 那一条判的是
+    //    「文件名自己说不说得清」，而锚点用的是**库里已经有什么**，两者不是
+    //    一个层面的证据。2026-10-07 现场正是被 `_isStandaloneRelease` 挡住，
+    //    才把 `S01E01…mkv` 归成了一部叫「…去头去尾版」的新剧。
+    //
+    // 季集号**保留**：归到哪部剧与「是第几集」互不影响，UI 分层要用它。
+    // 年份也保留（展示用），但进不了 key（剧集的 key 不含年份）。
+    if (anchors != null && dirPath != null && dirPath.isNotEmpty) {
+      final anchor = anchors.anchorFor(dirPath);
+      if (anchor != null) {
+        title = anchor.title;
+        cjk = anchor.title;
+        latin = null;
+        kind = MediaKind.episode;
+        groupKeyOverride = anchor.groupKey;
+      }
+    }
+
     return ParsedMediaName(
       rawName: fileName,
       kind: kind,
@@ -357,6 +410,7 @@ class MediaFilenameParser {
       releaseGroup: parsed.releaseGroup,
       isSampleOrExtra: isSample,
       isDiscImage: isDisc,
+      groupKeyOverride: groupKeyOverride,
     );
   }
 

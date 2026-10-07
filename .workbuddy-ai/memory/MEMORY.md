@@ -20,6 +20,8 @@
 - ★★ **「点过就不再是 NEW」两端同口径（→ §9.10/9.11）**：`last_played_at` 在**点击那一刻**写（`markPlayed`），⛔ **不等**进度落库、写完**必须重读该页**；⛔ 起播**不写** `max_position_ms`。PC `play_action._markOpened`+`syncFollowReadCount`（**只下调**、跟 `mergedInto`）；Android `LibraryActivity.play()`+`onActivityResult(REQ_PLAYER)`→`reloadCurrentItems()`。
 - ⛔⛔ 自动检查**绝不写 `media_works.updated_at`**（污染同步 LWW）；节流零点 `settings.follow_last_check_at`（Unix **秒字符串**）。⛔ 目录失败不推进水位线（水位线取「发现跑完之后」、按**目录**回写）。⛔⛔ `FollowAutoCheck.off` 的 `throttleWindow == null` = 不节流 ⇒ 必须 `_run` 里**显式**挡掉。⛔ 手动入口 `force: true`；⛔ 扫描/刮削在跑时禁用。
 - PC：`AppShell._FollowLaunchCheck`（延迟 20s + `every_6h`），⛔ 两个 `Timer` 必须 `dispose` cancel；「检查更新」在**分类栏右端**（⛔ 桌面页头 8 控件已满）；角标 = `new_item_count > 0` 的作品数；⛔ 不加侧栏一级入口。⛔ 恢复备份后 `_refreshLibraryViews` invalidate 六个。
+- ⚠️⚠️ **已知缺口（2026-10-07 现场，未修）**：检查更新的**增量统计与它自己触发的发现是两套口径**。`FollowService._run` 只从 `DiscoveryOutcome` 取 `isComplete`/`failedDirs`，**丢掉 `added`/`touchedWorkKeys`**；增量另走 `pendingNewItemCounts(checked)`，而 `checked` 由 `dirsForWorks(在追 keys)` 反推（`if (!target.contains(owner)) continue;`）。⇒ **发现把新集归到一部新作品上时（归组分叉：文件名自带季集号 → 片名取自子目录名），新作品 `followed=0` 且没被折叠 → 增量恒为 0 → `hasNews=false` → 报「没有更新」，一句提示都不弹。** 日志上是同一秒并列 `[发现] 新增 47` 与 `[追剧] 新增 0`。正常场景（网盘新存一个多一级目录 + 里面是最新剧集）必然命中，**不依赖导入备份**。
+- ⚠️ 附带证据：`导入 .ccbak` 会**整库替换**（含 `merged_into`），17:52 的手动归一被 13:14 的备份冲掉；17:53 那次检查本来报对了「有 1 部剧更新了（共 47 集）」，17:54 导入后同一次检查就变成「没有更新」。
 
 ## ★★ Android 端红线（→ HOWTO §AND-1）
 - ⛔⛔ 电视上 **`AbsListView.OnItemClickListener` 按 OK 不触发** ⇒ `dispatchKeyEvent` 自管 OK，**DOWN 与 UP 都要吞**（只吞 DOWN = 一按播两遍）。

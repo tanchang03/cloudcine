@@ -1,5 +1,6 @@
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/directory_anchor.dart';
 import '../../core/utils/drive_paths.dart';
 import '../../core/utils/filename_parser.dart';
 import '../adapters/cloud_drive_adapter.dart';
@@ -8,6 +9,7 @@ import '../entities/drive_entry.dart';
 import '../entities/drive_provider.dart';
 import '../entities/media_item.dart';
 import '../entities/scan_policy.dart';
+import 'directory_anchor_loader.dart';
 import 'media_entry_classifier.dart';
 import 'request_throttle.dart';
 import 'scan_service.dart';
@@ -73,6 +75,7 @@ class DiscoveryOutcome {
     this.failedDirs = 0,
     this.wasCancelled = false,
     this.error,
+    this.touchedWorkKeys = const {},
   });
 
   final DiscoveryScope scope;
@@ -108,6 +111,18 @@ class DiscoveryOutcome {
   /// 中断原因（面向用户）。为 `null` 表示正常跑完。
   final String? error;
 
+  /// 本次发现里**有文件是新入库的**那些作品键（分组键）。
+  ///
+  /// ## 它和 [added] 是两个维度
+  ///
+  /// [added] 数的是**文件条数**，这里数的是**作品**。用户看到「新增 47」
+  /// 之后真正要问的是「这 47 个跑到哪部剧下面去了」—— 而答案可能就是
+  /// 「它们自成了一部新作品」（见 `WorkMergeSuggester`）。
+  ///
+  /// 判据是「这一组里**至少有一个**文件之前不在库里」：给一部已有的剧
+  /// 补了一集，那一组也算被碰过 —— 它同样值得看一眼归组对不对。
+  final Set<String> touchedWorkKeys;
+
   bool get isComplete => !wasCancelled && error == null;
 
   /// 什么都没发现（目录里没有视频）。UI 据此给「这里没有可入库的视频」。
@@ -117,6 +132,7 @@ class DiscoveryOutcome {
   String toString() => 'DiscoveryOutcome(${scope.name}, $rootPath, '
       '媒体 $mediaFound（新增 $added / 已有 $existing）, 作品 $works, '
       '字幕 $subtitlesIndexed, 目录 $scannedDirs'
+      '${touchedWorkKeys.isEmpty ? "" : ", 有新内容的作品 ${touchedWorkKeys.length} 部"}'
       '${failedDirs == 0 ? "" : ", 跳过 $failedDirs"}'
       '${wasCancelled ? ", 已取消" : (error == null ? "" : ", 出错：$error")})';
 }
@@ -151,15 +167,22 @@ class DiscoveryOutcome {
 ///
 /// [now] 只在造对象时用（`firstSeenAt` / `updatedAt`）；不写库，所以它没有
 /// 持久化含义，调用方不必为了它去取时钟。
+///
+/// [anchors] 是**目录锚点**（见 [DirectoryAnchorIndex]）：这个目录若落在一部
+/// 已有剧集的目录之下，就归到那部剧上，不再由文件名另起一部。默认 `null`
+/// = 不锚定（与老行为一致）。两条入口（入库 / 直接播）都要传**同一份**，
+/// 否则同一个文件在两处会算出不同的 `groupKey` —— 那正是这个函数存在的
+/// 理由（见上文）。
 ({MediaItem item, ParsedMediaName parsed}) parseTransientMedia({
   required DriveEntry entry,
   required DriveProvider provider,
   required String dirPath,
   MediaFilenameParser parser = const MediaFilenameParser(),
+  DirectoryAnchorIndex? anchors,
   DateTime? now,
 }) {
   final rootPath = drivePathWithTrailingSlash(dirPath);
-  final parsed = parser.parse(entry.name, dirPath: rootPath);
+  final parsed = parser.parse(entry.name, dirPath: rootPath, anchors: anchors);
   return (
     item: MediaItem.fromEntry(
       entry: entry,
@@ -298,6 +321,18 @@ class MediaDiscoveryService {
     // 会偏小（把已有的算成新增），这个偏差只会让文案偏乐观，不会损坏数据。
     final known = await _knownIds(rootPath);
 
+    // 目录锚点：**开始前**取一次库快照 —— 「这些目录各自属于哪部已有剧集」。
+    //
+    // ⛔ 本次发现新建出来的作品**不登记**进来。局部发现是「把这一小片补进
+    //    库」，同一批里新出现的作品是**本次的产物**；拿它当锚点会把后面
+    //    扫到的文件也吸进去，那是循环论证（而全盘扫描里必须登记，因为
+    //    BFS 保证父目录先出队，见 `ScanService`）。
+    final anchors = await loadDirectoryAnchors(_library);
+    diag.info(
+      '归组',
+      '目录锚点：${anchors == null ? "无（库里还没有剧集）" : "${anchors.length} 个目录"}',
+    );
+
     final book = WorkSeedBook();
     final throttle = RequestThrottle(
       minInterval: policy.minRequestInterval,
@@ -319,6 +354,13 @@ class MediaDiscoveryService {
     var subtitlesIndexed = 0;
     var cancelled = false;
     String? error;
+
+    /// 有文件是新入库的那些作品键。见 [DiscoveryOutcome.touchedWorkKeys]。
+    ///
+    /// ⚠️ 在**解析出 `groupKey` 的那一处**就地记，而不是事后从 `book` 里推：
+    /// `WorkSeedBook` 只知道「这一组收到了几条」，分不出哪条是新的
+    /// （`known` 是本次发现的局部快照，书拿不到）。
+    final touched = <String>{};
 
     void emit({bool finished = false, String? currentDir}) {
       onProgress?.call(
@@ -411,9 +453,11 @@ class MediaDiscoveryService {
               case EntryRole.video:
                 {
                   // 传整个目录路径（不是末级目录名）—— 目录级归组要用它，见 [DirectoryTitle]。
+                  // `anchors` 比目录名更权威：库里已经有这部剧时，由它说了算。
                   final parsed = parser.parse(
                     entry.name,
                     dirPath: dir.path,
+                    anchors: anchors,
                   );
                   final item = MediaItem.fromEntry(
                     entry: entry,
@@ -429,6 +473,7 @@ class MediaDiscoveryService {
                     existing++;
                   } else {
                     added++;
+                    touched.add(parsed.groupKey);
                   }
                   book.add(parsed: parsed, item: item, dirPath: dir.path);
                 }
@@ -506,6 +551,7 @@ class MediaDiscoveryService {
       failedDirs: failedDirs,
       wasCancelled: cancelled,
       error: error,
+      touchedWorkKeys: touched,
     );
 
     diag.info('发现', '结束：$outcome');
@@ -571,6 +617,7 @@ class MediaDiscoveryService {
       provider: provider,
       dirPath: rootPath,
       parser: parser,
+      anchors: await loadDirectoryAnchors(_library),
       now: _clock(),
     );
     final parsed = parsedMedia.parsed;
@@ -614,6 +661,9 @@ class MediaDiscoveryService {
       subtitlesIndexed: subtitlesIndexed,
       scannedDirs: 0,
       scannedFiles: 1,
+      // 只有这一条是新的时才算「碰过」—— 重复点「加入媒体库」不该被
+      // 当成一次新入库，否则同一个建议会被反复问。
+      touchedWorkKeys: isNew ? {parsed.groupKey} : const {},
     );
     diag.info('发现', '结束：$outcome');
     diag.section('发现结束');

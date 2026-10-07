@@ -731,4 +731,303 @@ void main() {
       expect(media.item.dirPath, '/剧乙/');
     });
   });
+
+  /// [DiscoveryOutcome.touchedWorkKeys] —— 「这次发现碰了哪几部作品」。
+  ///
+  /// 它是「要不要问一句『把这批新文件并进某部已有作品吗』」的唯一触发条件
+  /// （见 `WorkMergeSuggester`）。判据错的方向有两个，代价完全不同：
+  ///
+  ///   - **偏大**（把没碰过的作品也算进来）→ 用户每点一次「发现」都被追问
+  ///     同一件事，最后他会把这个功能当噪音；
+  ///   - **偏小**（该记的没记）→ 建议永远不出，用户又回到
+  ///     「提示说发现了新文件，可我哪儿都没看到」那个现场。
+  group('touchedWorkKeys：这次发现碰了哪几部作品', () {
+    test('目录发现：新入库的分组全在，且与作品数对得上', () async {
+      final repo = InMemoryMediaRepository();
+      final outcome = await buildService(repo).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/电影',
+      );
+
+      expect(outcome.added, 3);
+      expect(
+        outcome.touchedWorkKeys,
+        hasLength(3),
+        reason: '电影 / 新片 / 深层 三个分组，各有 1 个新文件',
+      );
+      expect(
+        outcome.touchedWorkKeys,
+        repo.works.keys.toSet(),
+        reason: '「碰过」的分组必须正好是这次新建出来的那几部',
+      );
+    });
+
+    test('重跑一次、一个文件都没新增 → 空集（不许追问同一件事）', () async {
+      final repo = InMemoryMediaRepository();
+      final service = buildService(repo);
+      await service.discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/电影',
+      );
+
+      final again = await buildService(repo).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/电影',
+      );
+
+      expect(again.added, 0);
+      expect(again.existing, 3);
+      expect(
+        again.touchedWorkKeys,
+        isEmpty,
+        reason: '第二次一个文件都不是新的 —— 建议器据此直接返回空，'
+            '否则用户每点一次「发现」都会被问一遍',
+      );
+    });
+
+    test('给已有作品补一集 → 那一组也算「碰过」', () async {
+      final repo = InMemoryMediaRepository();
+      await buildService(repo).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/电影',
+        recursive: false,
+      );
+      final firstKeys = repo.works.keys.toSet();
+
+      // 再发现一次，这次连子目录一起（新片 / 深层 是新的）。
+      final outcome = await buildService(repo).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/电影',
+      );
+
+      expect(outcome.added, 2);
+      expect(outcome.touchedWorkKeys, hasLength(2));
+      expect(
+        outcome.touchedWorkKeys.intersection(firstKeys),
+        isEmpty,
+        reason: '「电影」那一部这次一条新文件都没有，不该被算进来',
+      );
+    });
+
+    test('单文件发现：新文件记它的分组，已在库的则不记', () async {
+      final repo = InMemoryMediaRepository();
+      const entry = DriveEntry(
+        id: 'f1',
+        name: 'Movie.2024.1080p.mkv',
+        isDirectory: false,
+        sizeBytes: 1000,
+      );
+
+      final first = await buildService(repo).discoverFile(
+        DriveProvider.quark,
+        entry: entry,
+        dirPath: '/电影',
+        dirId: 'd1',
+      );
+      expect(first.touchedWorkKeys, hasLength(1));
+
+      final second = await buildService(repo).discoverFile(
+        DriveProvider.quark,
+        entry: entry,
+        dirPath: '/电影',
+        dirId: 'd1',
+      );
+      expect(
+        second.touchedWorkKeys,
+        isEmpty,
+        reason: '重复点「加入媒体库」不该被当成一次新入库',
+      );
+    });
+  });
+
+  group('目录锚点：同一剧集目录下新开一层（2026-10-07 现场）', () {
+    /// 现场那棵树：
+    ///   `/来自：分享/兰丨香R-故/`          → `01.mp4`、`02.mp4`（片名靠目录名兜底）
+    ///   `/来自：分享/兰丨香R-故/去头去尾版 4K/` → `S01E01.第1集.mkv`（自带季集结构）
+    ///
+    /// 第二层是**后来新开的**，于是走「先发现父目录、再发现子目录」这条真实路径。
+    Map<String, List<DriveEntry>> liveTree() => {
+          'root': const [
+            DriveEntry(id: 'd1', name: '兰丨香R-故', isDirectory: true),
+          ],
+          'd1': const [
+            DriveEntry(
+              id: 'f1',
+              name: '01.mp4',
+              isDirectory: false,
+              parentId: 'd1',
+              sizeBytes: 100,
+            ),
+            DriveEntry(
+              id: 'f2',
+              name: '02.mp4',
+              isDirectory: false,
+              parentId: 'd1',
+              sizeBytes: 100,
+            ),
+            DriveEntry(
+              id: 'd1s',
+              name: '去头去尾版 4K',
+              isDirectory: true,
+              parentId: 'd1',
+            ),
+          ],
+          'd1s': const [
+            DriveEntry(
+              id: 'f3',
+              name: 'S01E01.第1集.2160p.WEB-DL.H.265.Pure.mkv',
+              isDirectory: false,
+              parentId: 'd1s',
+              sizeBytes: 300,
+            ),
+            DriveEntry(
+              id: 'f4',
+              name: 'S01E02.第2集.2160p.WEB-DL.H.265.Pure.mkv',
+              isDirectory: false,
+              parentId: 'd1s',
+              sizeBytes: 300,
+            ),
+          ],
+        };
+
+    test('第二趟发现子目录 → 新集归到已有那部剧，不再分叉', () async {
+      final repo = InMemoryMediaRepository();
+      final drive = FakeDriveAdapter(liveTree());
+
+      // 第一趟：用户点父目录（**仅本层**，与现场一致）→ 建出《兰香如故》。
+      await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/来自：分享/兰丨香R-故',
+        recursive: false,
+      );
+      expect(repo.works, hasLength(1));
+      final key = repo.works.keys.single;
+
+      // 第二趟：用户点新开的那一层。
+      await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1s',
+        dirPath: '/来自：分享/兰丨香R-故/去头去尾版 4K',
+        recursive: false,
+      );
+
+      expect(
+        repo.works, hasLength(1),
+        reason: '不锚的话这里会变成 2 部 —— 剧集页里看不见那 2 集，'
+            '追更检查还会报「没有更新」',
+      );
+      expect(repo.works.keys.single, key);
+      expect(
+        repo.items['quark:f3']!.groupKey,
+        key,
+        reason: '新集的归组键必须等于那部已有剧集',
+      );
+      expect(repo.items['quark:f4']!.groupKey, key);
+    });
+
+    test('父目录（递归）一趟扫完也一样 —— 追更检查走的就是这条路', () async {
+      final repo = InMemoryMediaRepository();
+      final drive = FakeDriveAdapter(liveTree());
+
+      // 先建出老作品，再把子目录里的两条也一起发现（`recursive: true`
+      // 正是 `followDiscoveryAdapter` 的接线方式）。
+      await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/来自：分享/兰丨香R-故',
+        recursive: false,
+      );
+      final key = repo.works.keys.single;
+
+      final outcome = await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/来自：分享/兰丨香R-故',
+        recursive: true,
+      );
+
+      expect(repo.works, hasLength(1));
+      expect(repo.works.keys.single, key);
+      expect(
+        outcome.touchedWorkKeys,
+        {key},
+        reason: '「有新内容的作品」只该有那部剧 —— 追更检查靠它算增量',
+      );
+    });
+
+    test('库里一部剧都没有时（首次发现）不受影响', () async {
+      final repo = InMemoryMediaRepository();
+      final drive = FakeDriveAdapter(liveTree());
+
+      await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/来自：分享/兰丨香R-故',
+        recursive: true,
+      );
+
+      // 没有任何锚点可用 → 退回按文件名归组的老行为：父目录那两条
+      // 靠目录名兜底成一部，子目录那两条自带季集结构、片名取自子目录名，
+      // 于是仍然是两部。这是**已知且可接受**的：用户手上有那部剧之后，
+      // 下一次发现就会归到一起（见下一条用例）。
+      expect(repo.works.length, greaterThanOrEqualTo(1));
+    });
+
+    test('平铺目录里的新文件不会被吸进那部剧（闸 3）', () async {
+      final repo = InMemoryMediaRepository();
+      final drive = FakeDriveAdapter({
+        'root': const [
+          DriveEntry(id: 'd1', name: '兰香如故', isDirectory: true),
+        ],
+        'd1': const [
+          DriveEntry(
+            id: 'f1',
+            name: '01.mp4',
+            isDirectory: false,
+            parentId: 'd1',
+            sizeBytes: 100,
+          ),
+        ],
+      });
+
+      await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/来自：分享/兰香如故',
+        recursive: false,
+      );
+      final showKey = repo.works.keys.single;
+
+      // 用户往**同一个目录**里又丢了一部电影。
+      drive.tree['d1']!.add(
+        const DriveEntry(
+          id: 'f2',
+          name: '奥德赛.2026.2160p.mkv',
+          isDirectory: false,
+          parentId: 'd1',
+          sizeBytes: 900,
+        ),
+      );
+
+      await buildService(repo, drive: drive).discoverDirectory(
+        DriveProvider.quark,
+        dirId: 'd1',
+        dirPath: '/来自：分享/兰香如故',
+        recursive: false,
+      );
+
+      expect(
+        repo.items['quark:f2']!.groupKey,
+        isNot(showKey),
+        reason: '文件直接躺在剧集目录里时不算归属证据 —— 否则平铺目录里'
+            '的新片会被吸进那部剧',
+      );
+    });
+  });
 }

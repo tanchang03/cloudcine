@@ -28,6 +28,7 @@ import 'copy_button.dart';
 import 'download_action.dart';
 import 'drive_delete_dialog.dart';
 import 'drive_move_dialog.dart';
+import 'merge_suggestion_dialog.dart';
 import 'modified_time_column.dart';
 import 'play_action.dart';
 import 'tv_affordance.dart';
@@ -229,6 +230,14 @@ class FolderBrowser extends ConsumerWidget {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(behavior: SnackBarBehavior.floating, content: Text(text)),
       );
+      // 结果提示之后紧接着问「那批新文件要不要并进某一部已有作品」。
+      // 顺序不能反：先让用户看到「新增 47」，再问「这 47 个要不要合」，
+      // 否则他会以为对话框说的是别的东西。
+      //
+      // ⚠️ 这个监听**只读不写**。往正在通知的那个 provider 上写状态要么被
+      // 吞掉、要么触发一轮意外的重入；「这条问过没有」的记账放在
+      // `DiscoveryController._asked` 那个普通字段上，由下面那个函数去改。
+      unawaited(_askMergeSuggestions(context, ref));
     });
 
     if (!loggedIn) {
@@ -317,6 +326,67 @@ class FolderBrowser extends ConsumerWidget {
     // 「就这么多」——用户会以为新片没被发现。
     if (o.failedDirs > 0) buf.write('（有 ${o.failedDirs} 个目录没读到，结果不完整）');
     return buf.toString();
+  }
+
+  /// 逐条问「这批新入库的文件要不要并进某部已有作品」。
+  ///
+  /// ## 为什么是循环而不是只问第一条
+  ///
+  /// 一次递归发现可能同时造出好几部新作品（一部剧的正片、特别篇、另一个版本
+  /// 各是一个子目录）。只处理第一条的话，剩下的建议**静默消失** ——
+  /// 而用户完全无从知道「刚才还有两条没问」。
+  ///
+  /// ## 队列在开头同步快照，之后不再读 provider
+  ///
+  /// 这个函数是在 `discoveryControllerProvider` 的变更监听里被同步调起的，
+  /// 所以开头那一次 `ref.read` 拿到的正是刚跑完那次发现的结果。快照下来之后
+  /// 每一轮循环都只看本地列表 —— 中途任何一次 provider 变动都不会把队列改掉。
+  ///
+  /// ⚠️ `await` 之后**必须重新确认 `context.mounted`**：对话框可能开很久，
+  /// 期间用户完全可能切走页面，那时再碰 `ScaffoldMessenger` 会抛异常。
+  static Future<void> _askMergeSuggestions(
+    BuildContext context,
+    WidgetRef ref,
+  ) async {
+    final controller = ref.read(discoveryControllerProvider.notifier);
+    final queue = ref.read(discoveryControllerProvider).suggestions;
+
+    for (var i = 0; i < queue.length; i++) {
+      final suggestion = queue[i];
+      if (!context.mounted) return;
+
+      // 先记账再问：中途退出应用时这几条不会再被追问，而详情页那个
+      // 「合并到…」按钮永远在，用户随时能自己合。
+      controller.markAsked(suggestion);
+
+      final accepted = await MergeSuggestionDialog.show(
+        context,
+        suggestion,
+        remaining: queue.length - i - 1,
+      );
+      if (!context.mounted) return;
+      if (!accepted) continue;
+
+      final result = await controller.acceptSuggestion(suggestion);
+      if (!context.mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text(
+            result?.message ??
+                '这次没合上 —— 库里的作品刚刚变过，'
+                    '可以在那部作品的详情页点「合并到…」再试。',
+          ),
+          action: result == null
+              ? null
+              : SnackBarAction(
+                  label: '撤销',
+                  onPressed: () => controller.undoMergeSuggestion(suggestion),
+                ),
+        ),
+      );
+    }
   }
 }
 

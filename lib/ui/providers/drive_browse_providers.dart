@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
 import '../../core/utils/drive_paths.dart';
 import '../../core/utils/file_names.dart';
@@ -10,6 +11,8 @@ import '../../domain/services/folder_sort.dart';
 import '../../domain/services/media_discovery.dart';
 import '../../domain/services/media_entry_classifier.dart';
 import '../../domain/services/scan_service.dart';
+import '../../domain/services/work_merge_service.dart';
+import '../../domain/services/work_merge_suggester.dart';
 import 'app_providers.dart';
 import 'folder_providers.dart';
 import 'library_providers.dart';
@@ -331,6 +334,7 @@ class DiscoveryState {
     this.progress,
     this.outcome,
     this.error,
+    this.suggestions = const [],
   });
 
   final bool running;
@@ -346,6 +350,20 @@ class DiscoveryState {
   /// 上一次发现的失败原因（面向用户）。
   final String? error;
 
+  /// 上一次发现产生的**待用户确认**的合并建议（见 `WorkMergeSuggester`）。
+  ///
+  /// ## 为什么挂在状态上，而不是让界面自己去算
+  ///
+  /// 「哪几部该合」需要读全库作品 + 全部媒体项，是一次跨表读。放进界面的话
+  /// 每个 `build` 都可能触发一次，而且判据会散在 UI 里没法单测。
+  /// 放在这里，判据全在 `WorkMergeSuggester`（纯函数、有单测），
+  /// 界面只负责问一句。
+  ///
+  /// ⚠️ 它只在一次发现跑完之后出现，而且**已经问过的不会再出现**
+  /// （去重在 `DiscoveryController._asked`，不在这个字段上）。
+  /// 界面**只读它**：往这里写东西等于在被监听的那个 provider 上再写一次状态。
+  final List<WorkMergeSuggestion> suggestions;
+
   bool get hasRun => outcome != null || error != null;
 
   @override
@@ -359,6 +377,9 @@ class DiscoveryState {
 class DiscoveryController extends Notifier<DiscoveryState> {
   ScanCancellation? _cancel;
   bool _disposed = false;
+
+  /// 本会话里**已经问过**的合并建议 id（见 [markAsked]）。
+  final Set<String> _asked = {};
 
   @override
   DiscoveryState build() {
@@ -407,7 +428,13 @@ class DiscoveryController extends Notifier<DiscoveryState> {
           DiscoveryState(running: true, target: crumb.path, progress: p),
         ),
       );
-      _emit(DiscoveryState(outcome: outcome, target: crumb.path));
+      _emit(
+        DiscoveryState(
+          outcome: outcome,
+          target: crumb.path,
+          suggestions: await _suggestMerges(outcome),
+        ),
+      );
     } on DriveException catch (e) {
       _emit(DiscoveryState(error: _explain(e), target: crumb.path));
     } catch (e) {
@@ -438,7 +465,13 @@ class DiscoveryController extends Notifier<DiscoveryState> {
         // 而 `crumb` 正是列出这一行的那个目录，一定是对的。
         dirId: crumb.id,
       );
-      _emit(DiscoveryState(outcome: outcome, target: entry.name));
+      _emit(
+        DiscoveryState(
+          outcome: outcome,
+          target: entry.name,
+          suggestions: await _suggestMerges(outcome),
+        ),
+      );
     } on DriveException catch (e) {
       _emit(DiscoveryState(error: _explain(e), target: entry.name));
     } catch (e) {
@@ -446,6 +479,98 @@ class DiscoveryController extends Notifier<DiscoveryState> {
     } finally {
       _cancel = null;
       if (!_disposed) _refreshAfterWrite();
+    }
+  }
+
+  /// 接受一条建议：把《源》并进《目标》。
+  ///
+  /// 放在控制器上而不是对话框里，是为了**复用 [DiscoveryController] 的刷新
+  /// 口径**：合并改的是「哪些行算作品」，列表 / 角标 / 统计全都要重取，
+  /// 少推一个就会出现「列表少了一格、角标还是旧数」。
+  /// 对话框自己拼一遍失效列表，迟早会漏。
+  ///
+  /// 返回 `null` = 没合上（期间库变过、或撞上
+  /// `WorkMergePlanner.manualBlocker` 的任一条）。
+  Future<WorkMergeResult?> acceptSuggestion(WorkMergeSuggestion s) async {
+    final result = await WorkMergeService(
+      library: ref.read(mediaRepositoryProvider),
+    ).mergeInto(targetKey: s.targetKey, sourceKey: s.sourceKey);
+    _refreshAfterWrite();
+    return result;
+  }
+
+  /// 撤销刚才那次合并（SnackBar 上那个「撤销」）。
+  ///
+  /// 与 [acceptSuggestion] 一样把刷新留在控制器里：撤销改的同样是
+  /// 「哪些行算作品」。撤销**不需要**计划 —— 它就是把 `merged_into` 清掉
+  /// （见 `WorkMergeService.undo`），所以即使后来规则变了也照样点得动。
+  Future<void> undoMergeSuggestion(WorkMergeSuggestion s) async {
+    await WorkMergeService(
+      library: ref.read(mediaRepositoryProvider),
+    ).undo([s.sourceKey]);
+    _refreshAfterWrite();
+  }
+
+  /// 标记一条建议**已经问过用户了**，同一个会话里不再问第二遍。
+  ///
+  /// ## 为什么是普通字段而不是状态
+  ///
+  /// 「问过没有」是**记账**，不是界面要画的东西 —— 它进状态只会多一轮通知。
+  /// 更要紧的是：界面是在 `discoveryControllerProvider` 的**变更监听里**
+  /// 同步调用它的，而往自己正在通知的那个 provider 上写状态，要么被吞掉、
+  /// 要么触发一轮意外的重入。写一个普通字段没有这两个问题。
+  ///
+  /// 不落库、不跨进程：下次启动应用会重新问一遍。这是刻意的 —— 用户上次
+  /// 点了「暂不」可能是因为当时在忙，而不是「以后永远别问」。
+  void markAsked(WorkMergeSuggestion s) => _asked.add(s.id);
+
+  /// 一次发现跑完之后，算一下「有没有哪部新作品其实是某部已有作品的一部分」。
+  ///
+  /// ## 只在真的有新内容时才算
+  ///
+  /// [DiscoveryOutcome.touchedWorkKeys] 为空 = 这次一个文件都没新入库，
+  /// 直接返回 —— 否则用户每点一次「发现」都会被问同一件事，而那正是
+  /// 让人关掉这个功能的最快方式。
+  ///
+  /// ## 为什么要把全量媒体项读出来
+  ///
+  /// 判据是「源的目录落在目标的目录之下」，而目录只写在媒体项上
+  /// （作品行不带路径）。按作品逐个 `itemsForWork` 是 N+1；一次
+  /// `listItems()` 拿全（个人网盘量级，实测 ~2900 行 / 60ms）再在内存里
+  /// 搭表更划算，也更简单。
+  ///
+  /// 任何异常都降级成「没有建议」：它是发现之后的锦上添花，
+  /// 失败了不该让用户看到「发现失败」。
+  Future<List<WorkMergeSuggestion>> _suggestMerges(
+    DiscoveryOutcome outcome,
+  ) async {
+    if (outcome.touchedWorkKeys.isEmpty) return const [];
+    try {
+      final library = ref.read(mediaRepositoryProvider);
+      final works = await library.allWorks();
+      final items = await library.listItems();
+
+      final dirsByWork = <String, List<String>>{};
+      for (final item in items) {
+        (dirsByWork[item.groupKey] ??= <String>[]).add(item.dirPath);
+      }
+
+      final found = WorkMergeSuggester.suggest(
+        works: works,
+        dirsByWork: dirsByWork,
+        touchedKeys: outcome.touchedWorkKeys,
+      );
+      // 本会话里问过的不再问：用户点过一次「暂不」就是答案，
+      // 每次发现都追问同一件事只会让人把这个功能当噪音。
+      final fresh =
+          found.where((s) => !_asked.contains(s.id)).toList(growable: false);
+      if (fresh.isNotEmpty) {
+        diag.info('发现', '合并建议 ${fresh.length} 条：${fresh.join("；")}');
+      }
+      return fresh;
+    } catch (e) {
+      diag.warn('发现', '合并建议计算失败，本次跳过', error: e);
+      return const [];
     }
   }
 

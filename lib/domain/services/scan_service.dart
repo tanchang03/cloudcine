@@ -1,5 +1,6 @@
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
+import '../../core/utils/directory_anchor.dart';
 import '../../core/utils/drive_paths.dart';
 import '../../core/utils/filename_parser.dart';
 import '../adapters/cloud_drive_adapter.dart';
@@ -10,6 +11,7 @@ import '../entities/media_item.dart';
 import '../entities/media_work.dart';
 import '../entities/scan_cursor.dart';
 import '../entities/scan_policy.dart';
+import 'directory_anchor_loader.dart';
 import 'media_entry_classifier.dart';
 import 'request_throttle.dart';
 import 'scraper.dart';
@@ -266,6 +268,23 @@ class ScanService {
     /// 分组键 / 分类 / 封面，而这是静默的。
     final book = WorkSeedBook();
 
+    /// **目录锚点**：新文件若落在某部已有剧集的目录之下，就归到那部剧上，
+    /// 不再由文件名另起一部（见 [DirectoryAnchorIndex]）。
+    ///
+    /// ⛔ 库里一部剧集都没有时也要建一个**空**索引（而不是 `null`）：
+    ///    首次全盘扫描正是这种情况，而 BFS 保证父目录先于子目录出队 ——
+    ///    父目录那一批建出的作品要能立刻当后面子目录的锚点，否则
+    ///    「第一次扫就分叉，得再扫一次才对」。
+    final anchors =
+        await loadDirectoryAnchors(_library) ?? DirectoryAnchorIndex.of(const []);
+    diag.info('归组', '目录锚点：${anchors.length} 个目录（扫描期还会登记新建的剧集）');
+
+    /// 归组键 → 它的文件出现在哪些目录（本批还没登记进 [anchors] 的那些）。
+    ///
+    /// 由 [flushWorks] 消费 —— 登记必须发生在**作品行落库之后**：解析器看到
+    /// 的锚点是「库里已有的作品」，还没落库的东西不该当锚点。
+    final pendingAnchorDirs = <String, Set<String>>{};
+
     /// 已发现、但还没写成作品行的归组键由 [WorkSeedBook] 自己维护。
     ///
     /// 存在的理由是「边扫边看」：作品行原先只在遍历**全部结束之后**才建，
@@ -279,6 +298,23 @@ class ScanService {
         now: _clock(),
       );
       book.markClean();
+
+      // 落库完成 → 这一批的作品可以当锚点了。
+      for (final e in pendingAnchorDirs.entries) {
+        final seed = book.seedOf(e.key);
+        if (seed == null) continue;
+        anchors.register(
+          AnchorWork(
+            key: e.key,
+            title: seed.title,
+            kind: seed.kind,
+            // 扫描期新建的行不可能是别名行（别名只由归一产生）。
+            isAlias: false,
+            dirs: e.value,
+          ),
+        );
+      }
+      pendingAnchorDirs.clear();
     }
 
     var indexed = 0;
@@ -426,9 +462,14 @@ class ScanService {
                   // ⚠️ 传**整个目录路径**而不是末级目录名：目录名什么时候
                   // 才是作品名（`姜松《家电维修视频教程》` 是，
                   // `day01`/`04_视频` 不是）要靠它判，见 [DirectoryTitle]。
+                  //
+                  // `anchors` 比目录名更权威：库里已经有这部剧时由它说了算，
+                  // 于是「剧集目录下新开一层、里面是 S01E01…」不会再被拆成
+                  // 两部作品（见 [DirectoryAnchorIndex]）。
                   final parsed = parser.parse(
                     entry.name,
                     dirPath: dir.path,
+                    anchors: anchors,
                   );
                   final item = MediaItem.fromEntry(
                     entry: entry,
@@ -444,7 +485,16 @@ class ScanService {
                   newBytes += entry.sizeBytes ?? 0;
 
                   // 归组 + 取种（刮削查询、分类、封面与锚点）走共用实现。
-                  book.add(parsed: parsed, item: item, dirPath: dir.path);
+                  final grouped = book.add(
+                    parsed: parsed,
+                    item: item,
+                    dirPath: dir.path,
+                  );
+                  // 本批新出现的分组：落库后要登记成锚点（见 [pendingAnchorDirs]）。
+                  if (grouped) {
+                    (pendingAnchorDirs[parsed.groupKey] ??= <String>{})
+                        .add(dir.path);
+                  }
                 }
             }
           }
