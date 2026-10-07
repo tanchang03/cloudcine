@@ -276,6 +276,20 @@ class LibraryActivity : Activity() {
 
     private var level = Level.WORKS
     private var currentWork: Work? = null
+
+    /**
+     * 从简介页返回作品墙时，**要把光标放回进来时那一张卡**。
+     *
+     * ⛔ `applyWorks` 末尾的 `setSelection(0)` 会把选中项打回第一张 —— 在 129 部的
+     *    库里，用户从第 30 部的简介页按返回会被扔回开头，等于「我迷路了」。
+     *    返回键的语义是「退一步」，光标必须还在原来那张卡上。
+     * ⛔ 存的是**作品的 `key`**，不是下标：返回时列表可能已经被重查过
+     *    （角标 / 计数 / 排序都会变），下标会错位，而 `key` 不会。
+     * ⛔ 只在 [backToWorks] 里被填上；换分类 / 清筛选 / 返回首页这些路径都是
+     *    `null` ⇒ 照旧回到第一张。
+     */
+    private var restoreSelectKey: String? = null
+
     private var sort = LibraryDb.Sort.recentModified
     private var playedOnly = false
 
@@ -389,6 +403,15 @@ class LibraryActivity : Activity() {
     private var overlayLabels: List<String> = emptyList()
     private var overlayOnPick: ((Int) -> Unit)? = null
 
+    /**
+     * 「要退出云影吗？」确认框（见 [handleBack] 的第 ③ 步）。
+     *
+     * ⛔ 媒体库是 App 的首页（`MainActivity` 启动完自己 `finish()` 了），所以
+     *    这一页上的 `finish()` 就是**退出 App**。返回键一路退到最底下时不能
+     *    直接退 —— 遥控器上没有「误触撤销」，而电视上的返回键是最高频的键。
+     */
+    private lateinit var exitDialog: ConfirmDialogView
+
     // ------------------------------------------------------------------
     // 生命周期
     // ------------------------------------------------------------------
@@ -429,6 +452,14 @@ class LibraryActivity : Activity() {
         root.addView(buildContent(), matchParent())
         root.addView(buildOverlay(), matchParent())
         root.addView(buildFilter(), matchParent())
+        // ⛔ 退出确认框**最后加** —— 它是最上面那一层，黑幕要盖住海报墙、菜单、
+        //    筛选面板的全部。加在 `setContentView` 之前，首帧不会闪一下黑幕。
+        exitDialog = ConfirmDialogView(this)
+        exitDialog.onCancel = { exitDialog.dismiss() }
+        // ⛔ 这里就是「退出 App」：本页是 App 的首页（`MainActivity` 已经
+        //    `finish()` 了），所以 Activity 一结束进程里就没有界面了。
+        exitDialog.onConfirm = { finish() }
+        root.addView(exitDialog, matchParent())
         setContentView(root)
 
         loadWorks()
@@ -473,14 +504,17 @@ class LibraryActivity : Activity() {
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         // ── 页头：品牌图标 + 标题 + 右侧计数 ──
+        // ⛔ 高度压到 32dp（原 50dp）：`18dp` 的上留白 + `30dp` 图标是「品牌页头」
+        //    的排场，但在电视上这 18dp 是**纯损耗** —— 它换不来任何信息，却等于
+        //    海报墙少一条边。图标降到 22dp（与 20sp 标题同高），上留白降到 8dp。
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(GRID_PAD_DP), dp(18), dp(GRID_PAD_DP), dp(2))
+            setPadding(dp(GRID_PAD_DP), dp(8), dp(GRID_PAD_DP), dp(2))
         }
         head.addView(
             ImageView(this).apply { setImageResource(R.mipmap.ic_launcher) },
-            LinearLayout.LayoutParams(dp(30), dp(30)),
+            LinearLayout.LayoutParams(dp(22), dp(22)),
         )
         title = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -565,7 +599,9 @@ class LibraryActivity : Activity() {
             setSelector(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
             isFocusable = true
             isFocusableInTouchMode = true
-            setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), dp(4))
+            // ⛔ 上下留白 4dp → 2dp：海报墙上沿紧贴分类栏，这 4px 的「呼吸」不值
+            //    一条边。左右仍是 GRID_PAD_DP，与 `computeGrid` 的可用宽度对齐。
+            setPadding(dp(GRID_PAD_DP), dp(2), dp(GRID_PAD_DP), dp(2))
             clipToPadding = false
             // ⛔ 选中卡片会放大 1.05，**必须关掉子视图裁剪**，否则多出来的那圈
             //    会被格子切掉，看起来像海报被裁了一块。
@@ -721,10 +757,13 @@ class LibraryActivity : Activity() {
         column.addView(itemsList, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
         // ── 底部：选中作品的信息 + 按键提示 ──
+        // ⛔ 13sp/上留白 6dp → 12sp/4dp：这一块从 75px 压到 66px。
+        //    **保留两行**（第二行是简介）——它是「不进简介页就能知道这部片讲什么」
+        //    的唯一入口，砍掉它省下的 30px 换不回用户那一趟跳转。
         infoLine = TextView(this).apply {
             setTextColor(MUTED)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setPadding(dp(GRID_PAD_DP), dp(6), dp(GRID_PAD_DP), 0)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), 0)
             maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
@@ -733,10 +772,13 @@ class LibraryActivity : Activity() {
         // ⛔ 提示文案**随层级换**（[hintBar]）：作品墙上的 OK 是「进简介页」，
         //    简介页上的 OK 是「播放 / 应用」。写死一句话的话，两层里总有一层
         //    在骗人 —— 而遥控器上用户唯一的线索就是这行字。
+        // ⛔ 12sp/上下 4+16dp → 11sp/2+10dp：67px → 49px。
+        //    下留白**只收到 10dp**，不再往下压：电视有 overscan，最外一圈在部分
+        //    机器上看不见，这行字是遥控器上唯一的操作线索，不能贴着边。
         hintBar = TextView(this).apply {
             setTextColor(0xFF6B7280.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(dp(GRID_PAD_DP), dp(4), dp(GRID_PAD_DP), dp(16))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(dp(GRID_PAD_DP), dp(2), dp(GRID_PAD_DP), dp(10))
         }
         column.addView(hintBar)
 
@@ -933,9 +975,17 @@ class LibraryActivity : Activity() {
         //    焦点归谁只由 [focusTabs] / [focusBar] / [focusGrid] 决定。
         // ⛔ 筛选面板开着时也不能抢：面板是覆盖层，底下的墙拿焦点会让面板失焦。
         if (!tabsFocused && !barFocused && !filterVisible && !overlayVisible) {
-            worksGrid.setSelection(0)
+            // ⛔ 还原「从简介页返回时那一张卡」（见 [restoreSelectKey]）：只有
+            //    [backToWorks] 会填它，其它路径是 null ⇒ 回到第一张。
+            // ⛔ 用完**立刻清掉**，否则它会在下一次无关的刷新里再命中一次，
+            //    把用户刚翻到的地方又拽回去。
+            val restore = restoreSelectKey
+            restoreSelectKey = null
+            val pos = restore?.let { k -> works.indexOfFirst { it.key == k } } ?: -1
+            val target = if (pos >= 0) pos else 0
+            worksGrid.setSelection(target)
             worksGrid.requestFocus()
-            showInfo(works.firstOrNull())
+            showInfo(works.getOrNull(target))
         }
     }
 
@@ -1073,6 +1123,9 @@ class LibraryActivity : Activity() {
 
     /** 回到作品墙。返回键在 [Level.ITEMS] 上会调它。 */
     private fun backToWorks() {
+        // ⛔ 先记下「从哪一部进来的」：`applyWorks` 会把选中项打回第 0 张，
+        //    不还原的话用户从第 30 部返回会被扔回开头。见 [restoreSelectKey]。
+        restoreSelectKey = currentWork?.key
         level = Level.WORKS
         currentWork = null
         items.clear()
@@ -1453,8 +1506,11 @@ class LibraryActivity : Activity() {
         }
         return TextView(this).apply {
             this.text = text
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            setPadding(dp(18), dp(10), dp(18), dp(10))
+            // ⛔ 15sp/上下 10dp → 13sp/上下 5dp：胶囊从 37dp 压到 25dp。
+            //    形状不变（`cornerRadius = dp(20)` 本来就超过半高，一直是药丸），
+            //    省下的 12dp 全给海报墙。
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(14), dp(5), dp(14), dp(5))
             // ⛔ **必须单行**。装不下时宁可被滚动条截掉、也不能折行：
             //    折行会把整条导航带顶高一行，海报墙跟着少一行（实测过）。
             maxLines = 1
@@ -1581,8 +1637,9 @@ class LibraryActivity : Activity() {
 
     private fun barChip(item: BarItem, isCursor: Boolean): TextView = TextView(this).apply {
         text = item.label
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-        setPadding(dp(14), dp(8), dp(14), dp(8))
+        // ⛔ 与 [navChip] 同一理由：13sp/上下 8dp → 12sp/上下 4dp，胶囊 30dp → 22dp。
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setPadding(dp(12), dp(4), dp(12), dp(4))
         maxLines = 1
         isSingleLine = true
         isFocusable = false
@@ -2509,9 +2566,11 @@ class LibraryActivity : Activity() {
             actions.add("从网盘恢复（覆盖本地）" to { confirmRestore() })
             // ⛔ 也放在作品墙上：想先配好 TMDB 再刮的人，不该被迫先进一部作品。
             actions.add("刮削设置（TMDB Key / 反代 / 豆瓣 Cookie）" to { openScrapeSettings() })
+            // ⛔ **不 `finish()`**（与一级导航上那颗「文件列表」同一条红线）：
+            //    媒体库是 App 的首页，`finish()` 掉之后从文件列表按返回就是
+            //    **退出 App**，而用户以为只是「退回上一层」。
             actions.add("文件列表（网盘实时目录）" to {
                 startActivity(Intent(this, BrowseActivity::class.java))
-                finish()
             })
         }
 
@@ -3259,6 +3318,30 @@ class LibraryActivity : Activity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val down = event.action == KeyEvent.ACTION_DOWN
 
+        // ── 退出确认框：**最优先**，连扫描 / 刮削的「停下」都要让位 ──────────
+        //
+        // ⛔ `if (!down) return true` 这一行不能省：框是在返回键的 **DOWN** 上
+        //    弹出来的，紧接着的那个 UP 如果不吞掉，会第二次进这里、被框当成
+        //    「取消」⇒ 框刚画出来就自己没了（屏幕上只闪一下）。OK 上踩过同一个坑。
+        if (exitDialog.isShowing) {
+            if (!down) return true
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP,
+                KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_DPAD_LEFT,
+                KeyEvent.KEYCODE_DPAD_RIGHT,
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_MENU,
+                KeyEvent.KEYCODE_ESCAPE,
+                -> return exitDialog.onKey(event.keyCode)
+                // ⛔ 音量 / 电源 / HDMI 这类键放行：框开着的时候用户照样要能调音量。
+                else -> return super.dispatchKeyEvent(event)
+            }
+        }
+
         // ⛔ 扫描进行中，返回键 = **停下扫描**，不是退出页面。
         //    扫描要跑几分钟，而 `guard` 已经把其它动作全挡住了 —— 没有这个
         //    出口，用户唯一的办法是杀应用（下次进来库还是半截的）。
@@ -3342,6 +3425,20 @@ class LibraryActivity : Activity() {
             return true // 菜单开着时吞掉其它按键，别让底下的墙跟着动
         }
 
+        // ── 返回键：统一「逐层往上退」（见 [handleBack]）─────────────────
+        //
+        // ⛔ **必须排在这里、排在下面所有焦点分支之前**。下面每一支的 `when`
+        //    末尾都是 `else -> return super.dispatchKeyEvent(event)`，返回键一旦
+        //    落进去就会被系统当成「退出 Activity」直接关掉这一页 —— 而媒体库
+        //    这一页就是 App 的首页，等于一按返回就退出 App。
+        // ⛔ 又必须排在 `filterVisible` / `overlayVisible` **之后**：那两个是覆盖层，
+        //    返回键在它们上面的语义是「关掉这一层」，不是「往上退一层页面」。
+        // ⛔ DOWN 与 UP 都吞：只吞 DOWN 的话 UP 会继续走系统默认路径。
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            if (down) handleBack()
+            return true
+        }
+
         // ── 状态行拿到焦点：←→ 移光标、OK 执行、↑ 回分类栏、↓ 回海报墙 ──
         if (barFocused) {
             when (event.keyCode) {
@@ -3352,9 +3449,10 @@ class LibraryActivity : Activity() {
                 KeyEvent.KEYCODE_NUMPAD_ENTER,
                 -> if (down) applyBar()
                 KeyEvent.KEYCODE_DPAD_UP -> if (down) focusTabs()
-                KeyEvent.KEYCODE_DPAD_DOWN,
-                KeyEvent.KEYCODE_BACK,
-                -> if (down) focusGrid()
+                // ⛔ 返回键**不在这里**：它由上面统一的 [handleBack] 处理。
+                //    这一支是「方向键往下走一层」，返回键是「往上退一层页面」，
+                //    两件事的语义不同，混在一起写就会出现「按返回往下走」。
+                KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusGrid()
                 KeyEvent.KEYCODE_MENU -> if (down) openMenu()
                 // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
                 else -> return super.dispatchKeyEvent(event)
@@ -3371,9 +3469,8 @@ class LibraryActivity : Activity() {
                 KeyEvent.KEYCODE_ENTER,
                 KeyEvent.KEYCODE_NUMPAD_ENTER,
                 -> if (down) applyTab()
-                KeyEvent.KEYCODE_DPAD_DOWN,
-                KeyEvent.KEYCODE_BACK,
-                -> if (down) focusBar()
+                // ⛔ 返回键同上，由 [handleBack] 统一处理。
+                KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusBar()
                 KeyEvent.KEYCODE_MENU -> if (down) openMenu()
                 // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
                 else -> return super.dispatchKeyEvent(event)
@@ -3395,9 +3492,8 @@ class LibraryActivity : Activity() {
                 -> if (down) applyAction()
                 KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusItemsSort()
                 // ⛔ 动作行是最上面那一层，再往上没有东西了 ⇒ 与返回键同义（回作品墙）。
-                KeyEvent.KEYCODE_DPAD_UP,
-                KeyEvent.KEYCODE_BACK,
-                -> if (down) backToWorks()
+                //    返回键本身由 [handleBack] 统一处理，走到那儿同样是回作品墙。
+                KeyEvent.KEYCODE_DPAD_UP -> if (down) backToWorks()
                 KeyEvent.KEYCODE_MENU -> if (down) openMenu()
                 // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
                 else -> return super.dispatchKeyEvent(event)
@@ -3416,9 +3512,9 @@ class LibraryActivity : Activity() {
                 KeyEvent.KEYCODE_ENTER,
                 KeyEvent.KEYCODE_NUMPAD_ENTER,
                 -> if (down) applyItemsSort()
-                KeyEvent.KEYCODE_DPAD_DOWN,
-                KeyEvent.KEYCODE_BACK,
-                -> if (down) focusItemsList()
+                // ⛔ 返回键同上，由 [handleBack] 统一处理 —— 那里是「回作品墙」，
+                //    不是「往下走一层」：排序胶囊上按返回该退出这一页。
+                KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusItemsList()
                 // ⛔ 排序胶囊上面**还有动作行**，所以 ↑ 是「再上一层」而不是
                 //    「回作品墙」。只有动作行上再按 ↑ 才退出这一页。
                 KeyEvent.KEYCODE_DPAD_UP -> if (down) focusDetailActions()
@@ -3459,12 +3555,122 @@ class LibraryActivity : Activity() {
                 if (down) openMenu()
                 return true
             }
-            KeyEvent.KEYCODE_BACK -> if (down && level == Level.ITEMS) {
-                backToWorks()
-                return true
-            }
+            // ⛔ 返回键不在这里 —— 它由上面统一的 [handleBack] 处理。原先这里
+            //    只挡 `Level.ITEMS`，作品墙上的返回会掉到 `super` 去 ⇒
+            //    系统直接关掉本页（= 退出 App）。
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * 返回键：**逐层往上退**，退到最底下再问一句「要退出云影吗」。
+     *
+     * ## 层级（从高到低）
+     *
+     * ```
+     *   ① 作品简介页（Level.ITEMS）    → 作品墙，光标**回到进来时那一张卡**
+     *   ② 作品墙 + 状态行拿焦点         → 导航栏
+     *   ③ 作品墙 + 海报墙拿焦点         → 导航栏，光标对准**当前生效的那一颗**
+     *   ④ 导航栏 + 非「全部」           → 切到「全部」，光标停在「全部」上
+     *   ⑤ 导航栏 + 已经是「全部」       → 退出确认框 → 退出 App
+     * ```
+     *
+     * 例：焦点在「动漫」下的某张卡 → 返回 → 停在「动漫」胶囊上 → 返回 →
+     * 停在「全部」胶囊上 → 返回 → 弹退出确认。
+     *
+     * ⛔ 扫描中 / 刮削中、筛选面板、菜单**不在这里** —— 它们是长任务或覆盖层，
+     *    在 [dispatchKeyEvent] 里各自更靠前就被吃掉了（返回键在那儿的语义是
+     *    「停下」/「关掉这一层」）。
+     *
+     * ⛔ ③ 是「一步跳到导航栏」，**不经过状态行**：状态行是工具条（排序 / 筛选），
+     *    不是一层页面。用户要动排序才按 ↑ 上去，而返回键的语义是「离开这个列表」。
+     * ⛔ ④ 是**一次退干净**：分类 / 最近播放 / 追剧 / 筛选 / 只看有海报一起退掉。
+     *    逐条退会让用户按四五次才回到首页，而每个中间态都是他自己都没印象的列表。
+     */
+    private fun handleBack() {
+        // ⛔ 这一行是**排障的唯一线索**：电视上没有可用的 UI 快照（`uiautomator`
+        //    拿不到焦点态），遥控器行为出问题时只能靠它反推「当时在哪一层」。
+        Log.i(
+            TAG,
+            "返回键：level=$level tabs=$tabsFocused bar=$barFocused " +
+                "分类=${category ?: "全部"} 最近播放=$playedOnly 追剧=$followedOnly " +
+                "只看有海报=$posterOnly 筛选=$selectedFilterCount",
+        )
+        // ① 作品简介页 → 作品墙（光标还原到进来时那张卡）
+        if (level == Level.ITEMS) {
+            backToWorks()
+            return
+        }
+        // ② 状态行 → 导航栏
+        if (barFocused) {
+            backToNav()
+            return
+        }
+        // ③ 海报墙 → 导航栏
+        if (!tabsFocused) {
+            backToNav()
+            return
+        }
+        // ④ 已经在导航栏上，但还没回到「全部媒体」→ 一次退干净
+        if (!isAtHome()) {
+            backToAll()
+            return
+        }
+        // ⑤ 已经是首页 —— 问一句再退
+        exitDialog.show(title = "要退出云影吗？", confirmLabel = "退出")
+    }
+
+    /**
+     * 焦点上移到导航栏，光标对准**当前生效的那一颗**。
+     *
+     * ⛔ `buildNav()` 必须在 `focusTabs()` **之前**调：它只在 `tabsFocused == false`
+     *    时才把光标同步到「当前生效项」（见它的文档）。顺序反了的话，`focusTabs()`
+     *    里那次 `paintTabs()` → `buildNav()` 会因为 `tabsFocused` 已经是 `true`
+     *    而跳过同步，光标停在上一次的位置 —— 现象是「返回之后高亮跳到别的分类上」。
+     */
+    private fun backToNav() {
+        buildNav()
+        focusTabs()
+    }
+
+    /**
+     * 是不是「首页（全部媒体）」—— 没分类、没视图、没筛选。
+     *
+     * ⛔ **排序不算**：它是用户对「同一个列表怎么排」的偏好，不是「在看哪个列表」。
+     *    把排序也算进来的话，用户改一次排序就再也退不到首页了（而首页又正是
+     *    唯一能弹退出确认的地方 ⇒ 返回键直接失效）。
+     * ⛔ **「只看有海报」算**：它和筛选一样会把列表截短，用户看到的就是另一个列表。
+     */
+    private fun isAtHome(): Boolean =
+        category == null &&
+            !playedOnly &&
+            !followedOnly &&
+            !posterOnly &&
+            selectedFilterCount == 0
+
+    /**
+     * 退回「全部媒体」：清掉分类 / 视图 / 筛选 / 只看有海报，**光标停在「全部」上**。
+     *
+     * ⛔ 与「把焦点收回海报墙」**刻意不同**：用户此刻就在导航栏上，返回键要的是
+     *    「换一个分类」。焦点一旦被抢到海报墙，用户再按一次返回的落点就不是
+     *    他以为的那一层（会先去海报墙、再回导航栏，凭空多两次）。
+     */
+    private fun backToAll() {
+        category = null
+        playedOnly = false
+        followedOnly = false
+        posterOnly = false
+        scrapedOnly = false
+        years.clear()
+        genres.clear()
+        // ⛔ 「全部」永远是第一颗胶囊（见 `buildNav` 的添加顺序），光标直接落那儿。
+        // ⛔ 必须在 `loadWorks()` **之前**设：`applyWorks` 里会 `paintTabs()`，
+        //    而 `buildNav()` 在 `tabsFocused == true` 时**不会**重算光标位置。
+        navIndex = 0
+        // ⛔ 状态行的控件数会随筛选一起变少（「清空筛选」会消失），光标跟着归零，
+        //    否则它会停在一个已经不存在的下标上（那一行会「没有光标」）。
+        barIndex = 0
+        loadWorks()
     }
 
     /**
@@ -3750,12 +3956,14 @@ class LibraryActivity : Activity() {
 
         // ⛔ 不要播放进度条：用户明确说「卡片上画进度条不好看」，且信息要
         //    精简（只留 名称 / 类型 / 年份）。进度在剧集列表行里仍有表达。
+        // ⛔ 片名上留白 8dp → 4dp：每张卡省 8px，一行 8 张就是 8px × 2 行 ——
+        //    这 16px 正好是「第二行能不能完整露出来」的胜负手（实测只差几个像素）。
         card.addView(TextView(this).apply {
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(4), 0, 0)
         })
         card.addView(TextView(this).apply {
             setTextColor(MUTED)
@@ -4045,8 +4253,23 @@ class LibraryActivity : Activity() {
         /** 卡片间距。 */
         const val GRID_GAP_DP = 12
 
-        /** 目标卡宽（dp）—— 实际列数由屏幕像素宽度反算，见 `computeGrid`。 */
-        const val TARGET_CARD_DP = 132
+        /**
+         * 目标卡宽（dp）—— 实际列数由屏幕像素宽度反算，见 `computeGrid`。
+         *
+         * ⛔ 这个值**同时**决定列数和卡片高度（海报 2:3 ⇒ 高 = 宽 × 1.5），
+         *    所以它是「一屏能看几部」的主开关，不只是横向密度。
+         *
+         * 132 → 100 的来历（1920×1080 / density 2.0，实测）：132dp 反算出 **6 列**，
+         * 卡宽 278px、卡高 499px —— 一行就吃掉屏高的 46%，可视区只放得下
+         * **1.3 行**（6 张完整 + 6 张残）。100dp 反算出 **8 列**，卡宽 203px、
+         * 卡高 378px，配合下面各处压缩的上下固定栏，可视区正好放下**完整 2 行**
+         * ⇒ 一屏从 6 部变成 16 部。
+         *
+         * ⛔ 别为了「更密」把它压到 88 以下：那会跳到 9 列，卡宽只剩 177px，
+         *    在沙发距离上海报上的字就看不清了（9 列要配合把卡片文字改到海报上，
+         *    那是另一套版式，不在这次范围内）。
+         */
+        const val TARGET_CARD_DP = 100
 
         /**
          * 海报缩略图缓存上限。

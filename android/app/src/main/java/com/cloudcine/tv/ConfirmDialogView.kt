@@ -13,8 +13,12 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
- * 「要退出播放吗？」确认框 —— 原生自绘，画法照 [TvOsdView]（同一套配色与圆角，
+ * 确认框 —— 原生自绘，画法照 [TvOsdView]（同一套配色与圆角，
  * 不做裁剪/阴影/动画）。
+ *
+ * 两处用它：播放页问「要退出播放吗？」（[PlayerActivity]），媒体库首页问
+ * 「要退出云影吗？」（[LibraryActivity]，返回键退到最底那一层时弹）。
+ * 文案由 [show] 的两个参数决定，组件本身不认识任何一个业务。
  *
  * ## 交互约定
  *
@@ -90,8 +94,16 @@ class ConfirmDialogView(context: Context) : FrameLayout(context) {
 
     // ------------------------------------------------------------------
 
-    fun show(title: String = "要退出播放吗？") {
+    /**
+     * 弹框。
+     *
+     * ⛔ `confirmLabel` 默认「退出播放」（播放页），**媒体库要传「退出」** ——
+     *    同一个组件在两处问的不是同一件事：那边退的是播放页，这边退的是整个 App。
+     *    写死「退出播放」的话，媒体库上会问出一句读不通的话。
+     */
+    fun show(title: String = "要退出播放吗？", confirmLabel: String = "退出播放") {
         titleView.text = title
+        buttons.getOrNull(1)?.text = confirmLabel
         // ⛔ 每次打开都回到「取消」。上一次选了「退出」再按返回取消掉，下次打开
         //    如果还停在「退出」上，一次误触就真的退出了。
         selected = 0

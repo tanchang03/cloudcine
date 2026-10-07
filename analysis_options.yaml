@@ -9,6 +9,21 @@
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  exclude:
+    # ⛔ 排除 vendored 的 `video_player_android`（通过 `dependency_overrides`
+    # 的 path 依赖引入，只为了改它 Android 侧的 ExoPlayer 缓冲配置）。
+    #
+    # 为什么必须排除：**path 依赖的 dev_dependencies 不会被安装**。该包自己的
+    # `pigeons/messages.dart` 与 `test/*.dart` 依赖 `pigeon` / `mockito` /
+    # `build_runner`（都在它的 dev_dependencies 里），在根工程 `flutter pub get`
+    # 之后一律解析不到，于是 `flutter analyze` 直接报 128 个
+    # `uri_does_not_exist` —— 全是它的锅，不是本仓库的代码。
+    #
+    # 该包的 Dart 层是上游原样代码，我们不改、也不维护；真正的编译校验由
+    # `flutter build` 承担（windows-build job 会整包编译），静态分析这里不需要重复。
+    - packages/video_player_android/**
+
 linter:
   # The lint rules applied to this project can be customized in the
   # section below to disable rules from the `package:flutter_lints/flutter.yaml`

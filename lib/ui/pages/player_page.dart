@@ -994,6 +994,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       // `WillPopScope` 是旧 API 但行为更可预测。
       endDrawer: const SizedBox.shrink(),
       key: const Key('player-page'),
+      // 刻意保留 `WillPopScope`（理由见上方注释），此处显式忽略弃用告警。
+      // ignore: deprecated_member_use
       body: WillPopScope(
         onWillPop: () async {
           // 面板开着时，返回键**先关面板**，而不是退出播放。
