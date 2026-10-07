@@ -118,7 +118,13 @@ Future<void> main(List<String> args) async {
   runApp(
     ProviderScope(
       overrides: [
-        databaseProvider.overrideWithValue(db),
+        // ⛔ 注入的是**持有者**而不是 `databaseProvider` 本身：恢复备份要换掉
+        //    整个 `AppDatabase`（Drift 的连接关掉就不能再开，见
+        //    `DatabaseHandle` 的文档），而 `databaseProvider` 是
+        //    `ref.watch(databaseHandleProvider)` 转发出来的 ——
+        //    直接 `databaseProvider.overrideWithValue(db)` 会把那层转发
+        //    整个盖掉，换了实例也没人跟着动。
+        databaseHandleProvider.overrideWith(() => DatabaseHandle(db)),
         posterCacheDirProvider.overrideWithValue(posterDir.path),
         appSupportDirProvider.overrideWithValue(support.path),
       ],

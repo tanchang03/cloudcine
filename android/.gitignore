@@ -12,3 +12,15 @@ local.properties
 keystore.properties
 *.jks
 *.keystore
+
+# ── Flutter 工具**误生成**的插件注册表 ─────────────────────────────────────
+# 仓库根还有一份 `pubspec.yaml`（PC 端），而 `android/` 目录名正好是 Flutter
+# 约定的 Android 宿主位置 ⇒ 任何 `flutter pub get` / `flutter test` 都会在这里
+# 写一份 `io/flutter/plugins/GeneratedPluginRegistrant.java`，内容是 PC 端那套
+# 插件（`video_player_android` / `wakelock_plus` / …）。
+#
+# ⛔ 本工程是**原生 Kotlin 独立工程**，`settings.gradle.kts` 不加载 Flutter
+#    插件 ⇒ 那些类不存在 ⇒ `compileDebugJavaWithJavac` 直接 35 个错误、
+#    整个 Android 构建挂掉（2026-10-07 踩过）。所以既不提交、也不参与编译
+#    （后者由 `app/build.gradle.kts` 的 `sourceSets` 排除兜住）。
+app/src/main/java/io/flutter/

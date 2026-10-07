@@ -72,6 +72,18 @@ class LibraryScanner(
         val failedDirs: Int,
         val pendingDirs: Int,
         val currentDir: String,
+        /**
+         * **当前库里有多少部作品**（含本次扫描新补建的）。
+         *
+         * ⛔ 存在的唯一理由是让作品墙**边扫边刷新**：这个数一变大，就说明有
+         *    新的作品行落库了，UI 才值得重查一次库。没有它的话 UI 只能靠
+         *    「每次进度都刷新」——那是每 400ms 一次全量读库，而绝大多数进度
+         *    回调其实什么都没变（一个目录里几百个文件全属于同一部作品）。
+         *
+         * ⛔ 它是**库里的总数**，不是「本次扫描发现的作品数」：作品行是
+         *    跨扫描累积的，报「本次发现」会让状态行上的数字在续扫时从 0 开始。
+         */
+        val works: Int,
     ) {
         val text: String
             get() = buildString {
@@ -79,6 +91,7 @@ class LibraryScanner(
                 append("：目录 ").append(dirs)
                 append(" · 文件 ").append(files)
                 append(" · 媒体 ").append(found)
+                if (works > 0) append(" · 作品 ").append(works)
                 if (failedDirs > 0) append(" · 跳过 ").append(failedDirs)
             }
     }
@@ -160,12 +173,71 @@ class LibraryScanner(
         var cancelled = false
         var lastReport = 0L
 
+        // ---- 作品行的**增量**补建（见 [publishWorks]）----
+        //
+        // ⛔ 一开始就把「库里已有哪些作品」读进来，之后只在内存里维护：每次
+        //    flush 都重查一次 `workKeys()` 是「每 200 个文件一次全表扫描」。
+        val known: MutableSet<String> = db.workKeys().toMutableSet()
+        var worksCreated = 0
+        var refreshed = 0
+        /** 自上次发布以来**被触碰过**的分组键（只有它需要重算冗余计数）。 */
+        val dirty = LinkedHashSet<String>(256)
+        var lastPublish = 0L
+
         fun report(phase: String, current: String, force: Boolean = false) {
             val now = System.currentTimeMillis()
             if (!force && now - lastReport < REPORT_EVERY_MS) return
             lastReport = now
             runCatching {
-                onProgress(Progress(phase, dirs, files, found, failedDirs, queue.size, current))
+                onProgress(
+                    Progress(phase, dirs, files, found, failedDirs, queue.size, current, known.size),
+                )
+            }
+        }
+
+        /**
+         * 把**到目前为止**扫到的作品行补建进库，并重算被触碰过的那几个的冗余计数。
+         *
+         * ## 为什么不能等遍历结束再一次性补建
+         *
+         * 作品墙读的是 `media_works`，而文件是**分批**写进 `media_items` 的
+         * （见 [flush]）。只在结尾补建作品行的话，扫描期间 `media_items` 里
+         * 有几千行、`media_works` 里一行都没有 —— 用户看到的是「扫了半天，
+         * 媒体库还是空的」，直到最后一刻整墙作品一起蹦出来。
+         *
+         * ## 为什么按时间节流而不是每批都发布
+         *
+         * `insertMissingWorks` 要遍历当前所有种子、`refreshWorkStats` 要跑一次
+         * `GROUP BY` 全表扫描（`media_items.group_key` 上没有索引）。一次扫描
+         * 会有几十次 flush，每批都发就是几十次全表扫描 —— 而扫描线程和 UI
+         * 读库共用同一个连接，卡住的是用户看得见的那一屏。
+         *
+         * ⛔ `force = true` 时**无视节流**：收尾那一次必须把最后一批发出去，
+         *    否则最后 200 个文件对应的作品要等到下次扫描才出现。
+         */
+        fun publishWorks(force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            if (!force && now - lastPublish < PUBLISH_EVERY_MS) return
+            lastPublish = now
+
+            val fresh = seeds.keys.filter { it !in known }
+            if (fresh.isNotEmpty()) {
+                worksCreated += db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
+                known.addAll(fresh)
+            }
+            if (dirty.isNotEmpty()) {
+                db.refreshWorkStats(dirty)
+                // ⛔ 补「地址还是空的」那些（见 [LibraryDb.backfillWorkPosterUrls]）：
+                //    作品行是 `CONFLICT_IGNORE` 建的，某次扫描恰好没拿到缩略图时
+                //    那一列就空着了，之后每次重扫都补不上 —— 那部作品永远是一块灰。
+                val posters = HashMap<String, String>(dirty.size * 2)
+                for (k in dirty) {
+                    val u = seeds[k]?.let { it.posterUrl ?: it.extraPosterUrl }
+                    if (!u.isNullOrBlank()) posters[k] = u
+                }
+                if (posters.isNotEmpty()) db.backfillWorkPosterUrls(posters)
+                refreshed += dirty.size
+                dirty.clear()
             }
         }
 
@@ -184,11 +256,17 @@ class LibraryScanner(
                     raw
                 }
                 accumulate(seeds, item)
+                // 只有**真的建了种子**的键才需要重算计数：片名不可信的项不归组，
+                // 它的键在 `media_works` 里没有对应行（重算是空转）。
+                if (seeds.containsKey(item.groupKey)) dirty.add(item.groupKey)
             }
             val (ins, upd) = db.applyScanItems(buf)
             inserted += ins
             updated += upd
             buf.clear()
+            // ⛔ 顺序不能反：作品行必须**等这批媒体项落库之后**才补建，否则
+            //    `refreshWorkStats` 算出来的 `item_count` 会少掉这一批。
+            runCatching { publishWorks() }.onFailure { Log.e(TAG, "增量补建作品行失败", it) }
         }
 
         try {
@@ -240,15 +318,16 @@ class LibraryScanner(
             runCatching { flush() }.onFailure { Log.e(TAG, "尾批入库失败", it) }
         }
 
-        // ---- 入库收尾：补建作品行 + 重算冗余计数 ----
+        // ---- 入库收尾：把最后一批作品行补齐 ----
+        //
+        // ⛔ 这里只补「还没发出去的」那一点（`force` 无视节流）。遍历期间的
+        //    每一批都已经发过了 —— 这正是「边扫边显示」的实现方式，不是
+        //    「等扫完再显示」。
         report("入库", "", force = true)
-        var worksCreated = 0
-        var refreshed = 0
         try {
-            val known = db.workKeys()
-            val fresh = seeds.keys.filter { it !in known }
-            worksCreated = db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
-            db.refreshWorkStats(seeds.keys)
+            publishWorks(force = true)
+            // 遍历期间只重算了「被触碰过的」那几个键，这里报本次扫描涉及的作品
+            // 总数。`refreshed` 只是给日志看的统计量，不参与任何判据。
             refreshed = seeds.size
         } catch (t: Throwable) {
             error = error ?: (t.message ?: t.toString())
@@ -400,12 +479,48 @@ class LibraryScanner(
         var cancelled = false
         var lastReport = 0L
 
+        // ---- 作品行的增量补建（与 [scan] 同一套，理由见那边的 [publishWorks]）----
+        //
+        // ⛔ 变量名与 flush 里那个 `oldKeys`（按文件 id 查出来的分组键）**刻意不同名**：
+        //    一个是「库里已有的作品键」，一个是「这批文件各自的组」。同名的话
+        //    读代码的人会把「作品不存在」与「文件是新的」当成同一个判据。
+        val knownWorks: MutableSet<String> = db.workKeys().toMutableSet()
+        val dirty = LinkedHashSet<String>(64)
+        var lastPublish = 0L
+
         fun report(phase: String, current: String, force: Boolean = false) {
             val now = System.currentTimeMillis()
             if (!force && now - lastReport < REPORT_EVERY_MS) return
             lastReport = now
             runCatching {
-                onProgress(Progress(phase, dirs, files, found, failedDirs, queue.size, current))
+                onProgress(
+                    Progress(
+                        phase, dirs, files, found, failedDirs, queue.size, current,
+                        knownWorks.size,
+                    ),
+                )
+            }
+        }
+
+        fun publishWorks(force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            if (!force && now - lastPublish < PUBLISH_EVERY_MS) return
+            lastPublish = now
+            val fresh = seeds.keys.filter { it !in knownWorks }
+            if (fresh.isNotEmpty()) {
+                db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
+                knownWorks.addAll(fresh)
+            }
+            if (dirty.isNotEmpty()) {
+                db.refreshWorkStats(dirty)
+                // 同 [scan]：给「海报地址还是空的」作品补上网盘缩略图地址。
+                val posters = HashMap<String, String>(dirty.size * 2)
+                for (k in dirty) {
+                    val u = seeds[k]?.let { it.posterUrl ?: it.extraPosterUrl }
+                    if (!u.isNullOrBlank()) posters[k] = u
+                }
+                if (posters.isNotEmpty()) db.backfillWorkPosterUrls(posters)
+                dirty.clear()
             }
         }
 
@@ -415,9 +530,9 @@ class LibraryScanner(
             //    解析器分好的组，不复用会把整库拆成两份。
             // ⛔ 这一次查询顺手当「新增 / 已有」的判据 —— 同一个 id 在遍历里不会出现
             //    两次，所以不会重复计数。
-            val known = db.groupKeysOf(buf.map { it.id })
+            val oldKeys = db.groupKeysOf(buf.map { it.id })
             for (raw in buf) {
-                val old = known[raw.id]
+                val old = oldKeys[raw.id]
                 if (old == null) added++ else existing++
                 val item = if (old != null && old != raw.groupKey) {
                     raw.copy(groupKey = old)
@@ -425,9 +540,11 @@ class LibraryScanner(
                     raw
                 }
                 accumulate(seeds, item)
+                if (seeds.containsKey(item.groupKey)) dirty.add(item.groupKey)
             }
             db.applyScanItems(buf)
             buf.clear()
+            runCatching { publishWorks() }.onFailure { Log.e(TAG, "发现：增量补建作品行失败", it) }
         }
 
         try {
@@ -475,14 +592,11 @@ class LibraryScanner(
             runCatching { flush() }.onFailure { Log.e(TAG, "发现：尾批入库失败", it) }
         }
 
-        // ---- 入库收尾：补建作品行 + 重算冗余计数（与 [scan] 同一套）----
+        // ---- 入库收尾：把最后一批作品行补齐（与 [scan] 同一套）----
         report("入库", "", force = true)
         var works = 0
         try {
-            val known = db.workKeys()
-            val fresh = seeds.keys.filter { it !in known }
-            db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
-            db.refreshWorkStats(seeds.keys)
+            publishWorks(force = true)
             works = seeds.size
         } catch (t: Throwable) {
             error = error ?: (t.message ?: t.toString())
@@ -508,18 +622,9 @@ class LibraryScanner(
         )
     }
 
-    /**
-     * 目录路径归一化：**一律带尾斜杠**。
-     *
-     * ⛔ 与 PC 端 `drivePathWithTrailingSlash` 同口径。根目录是 `/`（不是空串）——
-     *    空串拼出来的 `groupKey` 与 `/` 拼出来的不同，那会让根目录下的片子
-     *    在墙上多出一格。
-     */
-    private fun normalizeDirPath(path: String): String {
-        val p = path.trim()
-        if (p.isEmpty() || p == ROOT_PATH) return ROOT_PATH
-        return if (p.endsWith("/")) p else "$p/"
-    }
+    // 目录路径归一化已下沉到包级的 `normalizeDirPath`（`DirPaths.kt`）——
+    // 追更检查（`LibraryDb.dirsForWorks`）也要用同一份。两处各写一遍的话，
+    // 同一个文件走两条路会算出不同的 `groupKey`，而那是**静默的**。
 
     /**
      * 发现**单个文件** —— 文件列表里视频行那个「加入媒体库」。
@@ -646,7 +751,7 @@ class LibraryScanner(
                 ?: VideoFormats.resolutionFromName(e.name),
             sizeBytes = e.sizeBytes.takeIf { it > 0 },
             // ⛔ 库里存的是 **Unix 秒**，而 `updatedAtMs` 是毫秒。
-            modifiedAt = e.updatedAtMs.takeIf { it > 0 }?.let { it / 1000L },
+            modifiedAtSec = e.updatedAtMs.takeIf { it > 0 }?.let { it / 1000L },
             durationMs = e.durationMs,
             videoWidth = e.videoWidth,
             videoHeight = e.videoHeight,
@@ -689,6 +794,16 @@ class LibraryScanner(
         val seasons = HashSet<Int>(4)
         var lastModifiedAt: Long? = null
         var posterUrl: String? = null
+
+        /**
+         * **花絮 / 样片**的缩略图地址 —— 只有在一条正片的图都没有时才用它。
+         *
+         * ⛔ 与 [posterUrl] 分成两个字段而不是「第一个有图的」：花絮也是这一部
+         *    的画面，但它们是幕后、预告、彩蛋，拿它们当封面会让整墙看起来像挂错
+         *    了图。判据与 PC 端 `WorkPoster.fromItems` **逐条一致**（那边也是
+         *    「正片优先，一条正片都没有图时才退而求其次」）。
+         */
+        var extraPosterUrl: String? = null
     }
 
     /**
@@ -700,7 +815,7 @@ class LibraryScanner(
      */
     private fun accumulate(seeds: MutableMap<String, Seed>, item: ScanItem) {
         val title = item.title
-        if (title.isNullOrBlank() || !hasUsableTitle(title)) return
+        if (title.isNullOrBlank() || !ScrapeQueryBuilder.hasUsableTitle(title)) return
 
         val seed = seeds.getOrPut(item.groupKey) {
             Seed(
@@ -720,23 +835,27 @@ class LibraryScanner(
         }
         // ⛔ 缩略图只取分组里**第一条有图的**。一部剧几十集，每集都存一份地址
         //    没有意义；而且用户认的是「这部剧」，不是「第 7 集的那一帧」。
-        if (seed.posterUrl == null && item.thumbUrl != null) {
-            seed.posterUrl = item.thumbUrl
+        // ⛔ **正片优先于花絮**：花絮 / 样片也是这一部的画面，但它们是幕后、
+        //    预告、彩蛋，拿它们当封面会让整墙看起来像挂错了图。所以正片那条
+        //    单独记，只有一条正片的图都没有时才退回花絮的（与 PC 端
+        //    `WorkPoster.fromItems` 同一条判据）。
+        if (item.thumbUrl != null) {
+            if (item.isSampleOrExtra) {
+                if (seed.extraPosterUrl == null) seed.extraPosterUrl = item.thumbUrl
+            } else if (seed.posterUrl == null) {
+                seed.posterUrl = item.thumbUrl
+            }
         }
         seed.itemCount++
         seed.totalBytes += item.sizeBytes ?: 0L
         // ⛔ 季号攒 `Set` 而不是计数器：一季里几十集，计数器会把「12 集」
         //    当成「12 季」。`0` 代表「未标季」，[ScanWork.seasonCount] 不算它。
         seed.seasons.add(item.season ?: 0)
-        val m = item.modifiedAt
+        val m = item.modifiedAtSec
         if (m != null && (seed.lastModifiedAt == null || m > seed.lastModifiedAt!!)) {
             seed.lastModifiedAt = m
         }
     }
-
-    /** 片名能不能当作品名用：**含至少一个字母或汉字**。纯数字 / 纯符号不算。 */
-    private fun hasUsableTitle(title: String): Boolean =
-        Regex("[a-z\\u4e00-\\u9fff]", RegexOption.IGNORE_CASE).containsMatchIn(title)
 
     private fun toWork(key: String, seed: Seed): ScanWork = ScanWork(
         key = key,
@@ -745,7 +864,8 @@ class LibraryScanner(
         category = seed.category,
         title = seed.title,
         year = seed.year,
-        posterUrl = seed.posterUrl,
+        // 正片优先，一条正片都没有图时才用花絮那张（见 [Seed.extraPosterUrl]）。
+        posterUrl = seed.posterUrl ?: seed.extraPosterUrl,
         itemCount = seed.itemCount,
         totalBytes = seed.totalBytes,
         // 只数 > 0 的季（`0` 是「未标季」那一桶）。
@@ -783,6 +903,19 @@ class LibraryScanner(
 
         /** 进度回调的最小间隔。**不能每条目录都回调** —— 那会把主线程刷爆。 */
         private const val REPORT_EVERY_MS = 400L
+
+        /**
+         * 增量补建作品行的最小间隔。
+         *
+         * ⛔ 比 [REPORT_EVERY_MS] 长得多，也**必须**长得多：进度回调只是刷一个
+         *    `TextView`，而发布作品行要跑一次 `GROUP BY` 全表扫描
+         *    （`media_items.group_key` 上没有索引）。按 400ms 发就是「每 400ms
+         *    一次全表扫描」，扫描线程和 UI 读库共用同一个连接，卡住的是用户
+         *    看得见的那一屏。
+         *
+         * 1 秒的粒度对用户来说已经足够「边扫边出现」了。
+         */
+        private const val PUBLISH_EVERY_MS = 1_000L
 
         /** 列目录失败后的退避（限流 / 超时的常见应对）。 */
         private const val FAIL_BACKOFF_MS = 500L

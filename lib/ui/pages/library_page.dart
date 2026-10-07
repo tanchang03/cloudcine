@@ -8,9 +8,11 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/media_category.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/follow_service.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
+import '../providers/follow_providers.dart';
 import '../providers/library_providers.dart';
 import '../providers/library_selection_providers.dart';
 import '../providers/scan_providers.dart';
@@ -101,39 +103,47 @@ Future<void> playWork({
   /// 按钮的用途是**让用户重新看到内容**。同时设了搜索词与年份时只清一个，
   /// 列表很可能还是空的 —— 用户会认为这个按钮坏了。所以：
   ///
-  ///   1. 两组都在用 → 两个都清，保留分类；
-  ///   2. 只有年份 / 类型 → 清那两组，保留分类；
-  ///   3. 只有搜索词 → 清搜索词，保留分类；
-  ///   4. 都没有（只切了分类）→ 提示语本来就在说「换个分类看看」，
-  ///      按钮也就该是「回到全部」。
-  ///
-  /// 抽成纯函数是为了能单测：这一段的分支写错不报错，只表现为「用户点完
-  /// 丢了本来不想丢的东西」，事后才被发现。
-  @visibleForTesting
-  ({String body, String actionLabel, LibraryEmptyAction action}) libraryEmptyHint(
-    LibraryFilter filter,
-  ) {
-    final query = filter.query.trim();
-    final hasQuery = query.isNotEmpty;
+///   1. 两组都在用 → 两个都清，保留分类；
+///   2. 只有年份 / 类型 → 清那两组，保留分类；
+///   3. 只有搜索词 → 清搜索词，保留分类；
+///   4. 都没有（只切了分类）→ 提示语本来就在说「换个分类看看」，
+///      按钮也就该是「回到全部」。
+///
+/// ## 「追剧」与「最近播放」各自单独一支
+///
+/// 这两个是**视图**（见 `LibraryFilter.followedOnly`），不是「条件太紧」。
+/// 走上面那支通用文案的话，用户看到的是「这个分类下暂时没有作品」——
+/// 而「追剧」根本不是分类，他会去分类栏里找一个不存在的入口。
+/// 所以它们在**没有搜索词、也没有面板条件**时各说各的（带条件时仍然走
+/// 通用分支：那时候确实是条件太紧，清掉就好）。
+///
+/// 抽成纯函数是为了能单测：这一段的分支写错不报错，只表现为「用户点完
+/// 丢了本来不想丢的东西」，事后才被发现。
+@visibleForTesting
+({String body, String actionLabel, LibraryEmptyAction action}) libraryEmptyHint(
+  LibraryFilter filter,
+) {
+  final query = filter.query.trim();
+  final hasQuery = query.isNotEmpty;
 
-    // 面板里**实际**在筛的那几组。这句话必须点名它们：用户会照着提示去清
-    // 「年份 / 类型」，而如果他只开了「已刮削」，那句话就是在让他去清一组
-    // 根本没选过的条件 —— 而他点完按钮列表变空的原因也解释不了。
-    final facets = [
-      if (filter.scrapedOnly) '「已刮削」',
-      if (filter.years.isNotEmpty || filter.genres.isNotEmpty) '年份 / 类型',
-    ];
+  // 面板里**实际**在筛的那几组。这句话必须点名它们：用户会照着提示去清
+  // 「年份 / 类型」，而如果他只开了「已刮削」，那句话就是在让他去清一组
+  // 根本没选过的条件 —— 而他点完按钮列表变空的原因也解释不了。
+  final facets = [
+    if (filter.scrapedOnly) '「已刮削」',
+    if (filter.years.isNotEmpty || filter.genres.isNotEmpty) '年份 / 类型',
+  ];
 
-    if (filter.hasExtra && hasQuery) {
-      return (
-        body: '没有同时匹配「$query」与所选${facets.join("、")}的作品。',
-        actionLabel: '清空筛选条件',
-        action: LibraryEmptyAction.clearExtraAndQuery,
-      );
-    }
-    if (filter.hasExtra) {
-      return (
-        body: '当前筛选条件下一条都没筛到。清掉${facets.join("、")}再看看。',
+  if (filter.hasExtra && hasQuery) {
+    return (
+      body: '没有同时匹配「$query」与所选${facets.join("、")}的作品。',
+      actionLabel: '清空筛选条件',
+      action: LibraryEmptyAction.clearExtraAndQuery,
+    );
+  }
+  if (filter.hasExtra) {
+    return (
+      body: '当前筛选条件下一条都没筛到。清掉${facets.join("、")}再看看。',
       actionLabel: '清空筛选',
       action: LibraryEmptyAction.clearExtra,
     );
@@ -143,6 +153,14 @@ Future<void> playWork({
       body: '没有匹配「$query」的作品。',
       actionLabel: '清空搜索',
       action: LibraryEmptyAction.clearQuery,
+    );
+  }
+  if (filter.followedOnly) {
+    return (
+      body: '还没有在追的剧集。打开任意一部作品的详情页点「追剧」，'
+          '之后这部剧在网盘里出现新文件时会自动同步进来，并在这里提醒你。',
+      actionLabel: '去看看全部',
+      action: LibraryEmptyAction.clearAll,
     );
   }
   return (
@@ -224,8 +242,59 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     ref.invalidate(unscrapedCountProvider);
   }
 
+  /// 追更检查查出新集之后的那条 SnackBar。
+  ///
+  /// ## 「查看」按钮为什么要把筛选一起清掉
+  ///
+  /// 这条提示说的是「有 N 部剧更新了」—— 用户点「查看」就是要**看到那几部**。
+  /// 只切 `followedOnly` 的话，他之前选着的年份 / 类型 / 搜索词会一起生效：
+  /// 更新的那几部恰好不在这些条件里时，点完「查看」看到的是一片空。
+  /// 那种情况下用户不会想到「是筛选把结果挡住了」，只会认为提示在撒谎。
+  ///
+  /// 清掉的顺序无所谓，但**三处都要清**（面板两组 / 搜索词 / 分类由
+  /// `setFollowedOnly` 自己带掉），漏一处就是同一个问题换了个来源。
+  void _showFollowResult(FollowOutcome outcome) {
+    if (!mounted) return;
+    final notifier = ref.read(libraryFilterProvider.notifier);
+    final messenger = ScaffoldMessenger.of(context);
+    // 连点两次检查时不要排队：后一条把前一条顶掉，用户看到的永远是最新结果。
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(outcome.message),
+        action: SnackBarAction(
+          label: '查看',
+          onPressed: () {
+            notifier.clearExtra();
+            notifier.setFollowedOnly();
+            _clearSearch();
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    // 追更检查跑完的**回执**。放在 `build` 最前面、且**无条件**调用 ——
+    // `ref.listen` 是「挂一次监听」，放在任何 `if` 里面都会随条件变化
+    // 反复挂 / 拆，而它挂在哪里由「这一帧的筛选状态」决定的话，
+    // 用户恰好没在某个视图上时就永远收不到这条提示。
+    //
+    // ⛔ **只在 `hasNews` 时弹**：手动点一次检查、什么都没变时弹一个
+    //    「没有更新」，是最典型的噪音（见 `FollowOutcome.hasNews`）。
+    //    按钮上那圈转停本身就是「跑完了」的回执。
+    ref.listen(followControllerProvider, (prev, next) {
+      final outcome = next.outcome;
+      if (outcome == null || !outcome.hasNews) return;
+      // `outcome` 是**状态字段**：后面任何一次 `_emit`（用户又点了取消、
+      // 或第二次检查开始）都会让监听器再进来一次。用 `identical` 挡住
+      // 同一份结果 —— 否则用户会连吃两个一模一样的 SnackBar。
+      if (identical(prev?.outcome, outcome)) return;
+      _showFollowResult(outcome);
+    });
+
     final view = ref.watch(libraryViewProvider);
     final works = ref.watch(workListProvider);
     final stats = ref.watch(libraryStatsProvider).valueOrNull;
@@ -454,7 +523,11 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
                 // 位置一起丢掉），理由见那个函数的文档。
                 final hint = libraryEmptyHint(filter);
                 return EmptyState(
-                  icon: Icons.search_off_rounded,
+                  // 追剧栏空着不是「搜不到」，用作品详情页那颗「追剧」按钮
+                  // 同一个图标 —— 用户照着它就能找到该去点哪里。
+                  icon: filter.followedOnly
+                      ? Icons.notifications_none_rounded
+                      : Icons.search_off_rounded,
                   title: '这里还没有内容',
                   body: hint.body,
                   actionLabel: hint.actionLabel,
@@ -949,6 +1022,10 @@ class _CategoryBar extends ConsumerWidget {
     final filter = ref.watch(libraryFilterProvider);
     final counts = ref.watch(categoryCountsProvider).valueOrNull;
     final played = ref.watch(playedCountProvider).valueOrNull;
+    // ⛔ 角标是「**有更新**的在追作品数」，不是「在追的作品数」——
+    //    与 Android 端 `LibraryDb.followedUpdateCount` 逐字同口径。
+    //    数错的话，这个数字会永远亮着（追了就不掉），几天之后用户就不看它了。
+    final updated = ref.watch(followedUpdateCountProvider).valueOrNull;
     final total =
         counts?.values.fold<int>(0, (sum, n) => sum + n);
 
@@ -973,7 +1050,9 @@ class _CategoryBar extends ConsumerWidget {
               _CategoryChip(
                 label: '全部',
                 count: total,
-                selected: filter.category == null && !filter.playedOnly,
+                selected: filter.category == null &&
+                    !filter.playedOnly &&
+                    !filter.followedOnly,
                 onTap: () =>
                     ref.read(libraryFilterProvider.notifier).setCategory(null),
               ),
@@ -985,6 +1064,19 @@ class _CategoryBar extends ConsumerWidget {
                 selected: filter.playedOnly,
                 onTap: () =>
                     ref.read(libraryFilterProvider.notifier).setPlayedOnly(),
+              ),
+              // 「追剧」与「最近播放」同属**视图**（不是分类），所以紧挨着它。
+              // ⛔ 角标口径见上面 `updated` 那段：它回答「有几部动了」。
+              //    `count` 传 `null` 而不是 `updated ?? 0` 是有区别的 ——
+              //    见 [_CategoryChip.count] 的说明（0 不画角标）。
+              SizedBox(width: gap),
+              _CategoryChip(
+                label: '追剧',
+                icon: Icons.notifications_active_rounded,
+                count: updated,
+                selected: filter.followedOnly,
+                onTap: () =>
+                    ref.read(libraryFilterProvider.notifier).setFollowedOnly(),
               ),
               for (final category in MediaCategory.displayOrder) ...[
                 SizedBox(width: gap),
@@ -1027,16 +1119,110 @@ class _CategoryBar extends ConsumerWidget {
 
     return Padding(
       padding: EdgeInsets.fromLTRB(22, 0, 22, tv ? 6 : 12),
-      child: leading.isEmpty
-          ? chips
-          : Row(
-              children: [
-                for (final w in leading) ...[w, const SizedBox(width: 12)],
-                // ⛔ 胶囊必须拿 `Expanded`：它们是一条**横向滚动**的列表，
-                // 不夹宽度的话 `ListView` 会向 Row 要无限宽，直接抛异常。
-                Expanded(child: chips),
-              ],
+      child: Row(
+        children: [
+          for (final w in leading) ...[w, const SizedBox(width: 12)],
+          // ⛔ 胶囊必须拿 `Expanded`：它们是一条**横向滚动**的列表，
+          // 不夹宽度的话 `ListView` 会向 Row 要无限宽，直接抛异常。
+          Expanded(child: chips),
+          // 「检查更新」压在这一带**右端**，与「追剧」胶囊同一排。
+          //
+          // ## 为什么不是页头
+          //
+          // 页头那一行在 800px 宽的窗口下**已经满了**：桌面版现在有八个
+          // 控件，再加一个实测溢出 26px（`PageHeader` 的桌面分支是 `Row`，
+          // Release 下溢出部分被静默裁掉 —— 看起来就是「这个按钮本来就没有」）。
+          //
+          // 而这一带的右端是空的：胶囊是 `Expanded` 里一条横向滚动列表，
+          // 右边从来没有东西。放在这儿还有个好处 —— 它紧挨着「追剧」那颗
+          // 胶囊，而它正是**为追剧服务的**动作（只查在追的剧）。
+          const SizedBox(width: 12),
+          const _FollowCheckButton(),
+        ],
+      ),
+    );
+  }
+}
+
+/// 分类栏右端的「检查更新」。
+///
+/// ## 它和「重扫」不是一件事
+///
+/// 重扫遍历整个网盘、重建作品、推进 `scan_cursors`；这一个只列**已追剧作品
+/// 名下那几个目录**（去重后通常 1~5 个），秒级完成、只增不减、不写游标。
+/// 合成一个按钮的话，用户点「检查更新」会意外触发一次全盘遍历 ——
+/// 所以 tooltip 里把「不遍历整个网盘」写出来了。
+///
+/// ## 为什么转圈时把进度写进文案
+///
+/// 检查要列几个目录、每个目录一次网络往返。只转圈不给数字的话，用户没法
+/// 判断「是卡住了还是本来就要这么久」，而这一页上恰好有个会跑几分钟的
+/// 「重扫」—— 他很容易把两者混起来，以为按钮卡死了。
+class _FollowCheckButton extends ConsumerWidget {
+  const _FollowCheckButton();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final tv = AppTheme.isTvLayout(context);
+    final follow = ref.watch(followControllerProvider);
+    final scanning = ref.watch(scanControllerProvider).running;
+    final progress = follow.progress;
+
+    // ⛔ 扫描在跑时禁用：两边的节流器是各自实例，并发跑等于把实际 QPS
+    //    翻倍（见 `FollowController.canStart`）。
+    final enabled = !follow.running && !scanning;
+    final label = !follow.running
+        ? '检查更新'
+        : (progress == null || progress.total == 0
+            ? '检查中…'
+            : '检查中 ${progress.done}/${progress.total}');
+
+    return Tooltip(
+      message: follow.running
+          ? label
+          : (scanning
+              ? '正在扫描，稍后再检查'
+              : '只查在追的剧有没有新集（不遍历整个网盘）'),
+      child: SizedBox(
+        // 与同排的胶囊等高（TV 44 / 桌面 28），否则这一带看着像没对齐。
+        height: tv ? 44 : 28,
+        child: OutlinedButton.icon(
+          // ⛔ `force: true`：这是**手动**入口，无视节流窗口、也无视
+          //    `follow_auto_check = off` —— 用户明确按了这个按钮。
+          //    把 `off` 也挡住的话，这个按钮会变成「按下去什么都不发生」。
+          onPressed: enabled
+              ? () =>
+                  ref.read(followControllerProvider.notifier).start(force: true)
+              : null,
+          style: OutlinedButton.styleFrom(
+            // 高度由外面那个 `SizedBox` 定（这里给 0 免得被主题的最小高度
+            // 顶破 —— 两处各定一次的话，改一处就会出现「按钮比胶囊高 8px」）。
+            minimumSize: Size.zero,
+            padding: EdgeInsets.symmetric(horizontal: tv ? 14 : 10),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(tv ? 10 : 8),
             ),
+          ),
+          icon: follow.running
+              ? const SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(strokeWidth: 1.8),
+                )
+              : Icon(
+                  Icons.notifications_active_rounded,
+                  size: tv ? 17 : 14,
+                ),
+          label: Text(
+            label,
+            style: TextStyle(
+              fontSize: tv ? AppTheme.tvActionLabel : 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -1327,6 +1513,29 @@ class _WorkCardState extends ConsumerState<_WorkCard> {
                       left: 6,
                       top: 6,
                       child: _SelectionTick(selected: selected),
+                    ),
+                  // 追剧更新角标。海报四个角的占用：左下 = 评分、右下 =
+                  // 「详情」按钮、右上 = 「文件名」（未刮削时），**左上**是唯一
+                  // 空位 —— 而多选时它被 [_SelectionTick] 占着，所以判据里
+                  // 必须带上 `!selecting`（两个都画会叠在一起，还都带圆角，
+                  // 看起来像一个画坏了的双色块）。
+                  //
+                  // ⛔ 判据是 `newItemCount > 0`，**不是** `followed`：追了但
+                  //    没有更新时海报上不该有任何东西（那只是「我在追」，
+                  //    不是「有东西可看」）。进过详情页（= 我看到了）之后
+                  //    角标也会自己消失。
+                  // ⛔ PC 上写全称「更新 N」（电视那边写 `+N`）：桌面海报卡
+                  //    有 172 宽，装得下；而电视上格子更窄，多两个字会把
+                  //    数字挤没。这是两端**有意**的文案差异，不是漏改。
+                  if (work.newItemCount > 0 && !selecting)
+                    Positioned(
+                      left: 6,
+                      top: 6,
+                      child: TagChip(
+                        label: '更新 ${work.newItemCount}',
+                        color: AppTheme.accent,
+                        filled: true,
+                      ),
                     ),
                   if (selecting && selected)
                     // 选中的整张压一层淡蓝：小方框在深色海报上不够显眼，

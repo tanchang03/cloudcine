@@ -72,12 +72,75 @@ object WorkDetailFormat {
      * ⛔ 「选集（N）」里的 N 是**这一部作品下的文件数**（= 列表行数），
      *    不是季数、也不是集数 —— 列表里花絮/样片也在，用户按 ↓ 能看到的
      *    就是 N 行。
+     *
+     * ## 五颗的排布，以及「追剧」为什么在**第 2 位**
+     *
+     * ```
+     * [▶ 播放] [☆ 追剧] [手动刮削] [刮削设置] [选集（N）]
+     * ```
+     *
+     * ⚠️ 设计文档 §5.2(d) 写的是「新增第 5 颗」，字面读是**追加到末尾**。
+     *    这里**有意偏离**，理由是「选集」必须留在最后：
+     *
+     *   * 「选集」不是一个动作，而是**把光标交给下面那张列表**（`focusItemsList`）
+     *     —— 它是这一行的**出口**。后面再挂一颗开关，用户按 → 走过出口又回到
+     *     一个动作上，方向感就断了。
+     *   * 电视上这一行只有一屏宽，末尾那颗要按四次 → 才够得着。而「追剧」是
+     *     这个功能的**主入口**，把它埋在刮削那两颗后面是本末倒置。
+     *
+     * 两处（这里 + `buildDetailActions`）仍然必须同序 —— 偏离的只是位置，
+     * 不是「两处要一起改」这条规矩。
      */
-    fun actionLabels(resumable: Boolean, itemCount: Int): List<Pair<String, Boolean>> =
+    fun actionLabels(
+        resumable: Boolean,
+        itemCount: Int,
+        followed: Boolean = false,
+        newCount: Int = 0,
+    ): List<Pair<String, Boolean>> =
         listOf(
             playLabel(resumable) to (itemCount > 0),
+            followLabel(followed, newCount) to true,
             "手动刮削" to true,
             "刮削设置" to true,
             "选集（$itemCount）" to (itemCount > 0),
         )
+
+    // ------------------------------------------------------------------
+    // 追剧（schema v17）
+    // ------------------------------------------------------------------
+
+    /**
+     * 「追剧」那颗动作胶囊的文案。
+     *
+     * ⛔ **已追剧时也返回文案**（而不是空串）：胶囊要**置灰不消失**（红线）。
+     *    与「▶ 播放」在没文件时置灰是同一条规矩 —— 一个凭空消失的按钮，
+     *    用户只会以为这个页面坏了。
+     *
+     * ⛔ `newCount > 0` 时缀上「· N 新」：用户点开简介页最常见的目的就是
+     *    「看看更新了什么」，把数字印在按钮上省掉一次点进去再退出来的往返。
+     *    但**只在已追剧时缀** —— 没追的剧 `new_item_count` 恒为 0，
+     *    那时写「· 0 新」是噪音。
+     */
+    fun followLabel(followed: Boolean, newCount: Int): String = when {
+        !followed -> "☆ 追剧"
+        newCount > 0 -> "★ 已追剧 · $newCount 新"
+        else -> "★ 已追剧"
+    }
+
+    /**
+     * 剧集行行首的「新集」前缀；不是新集时是**空串**。
+     *
+     * ⛔ 空串而不是 `null`：调用方要拿它去拼 `SpannableString`，
+     *    `null` 会让「拼前缀」和「不拼」分成两个分支，而这两个分支的
+     *    区别只有一处 —— 拆开写迟早只改一边。
+     *
+     * ⛔ 「■」是**实心方块**（U+25A0），不是「▍」那种半高块：电视上
+     *    18sp 的半高块只剩一条细线，与「不描边、靠实心面明度」的整套
+     *    视觉语言也不一致。
+     *
+     * ⛔ 判据**不在这里** —— 它由 `Work.isNewSinceFollow(item)` 给
+     *    （`first_seen_at > follow_started_at` ∧ 从没播过）。这里只负责
+     *    「怎么说」，与 [metaLine] 同一分工。
+     */
+    fun newEpisodePrefix(isNew: Boolean): String = if (isNew) "■ NEW  " else ""
 }

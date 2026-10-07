@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/db/settings_store.dart';
 import '../../domain/entities/download_task.dart';
+import '../../domain/services/follow_auto_check.dart';
 import '../../domain/services/folder_sort.dart';
 import '../../domain/services/item_sort.dart';
 import 'app_providers.dart';
@@ -14,6 +15,7 @@ class AppSettings {
   const AppSettings({
     this.onlineScrape = false,
     this.autoScrapeOnScan = false,
+    this.followAutoCheck = FollowAutoCheck.onLaunch,
     this.autoMergeByOnlineId = true,
     this.tmdbApiKey = '',
     this.tmdbApiBase = '',
@@ -49,6 +51,23 @@ class AppSettings {
   /// 扫描结束后是否自动刮一遍。**默认关**，理由见
   /// `SettingKeys.autoScrapeOnScan`（豆瓣额度小、耗尽后整批失败）。
   final bool autoScrapeOnScan;
+
+  /// **追剧自动检查**的策略：`off` / `on_launch`（默认）/ `every_6h`。
+  ///
+  /// 与 `autoScrapeOnScan` 不同，这一项默认**开**（`on_launch`）—— 追更检查
+  /// 只列已追剧作品名下那几个目录（去重后通常 1~5 个），秒级完成，而它的
+  /// 全部意义就是「不用自己想起来去查」。默认关的话这个功能等于不存在。
+  ///
+  /// ## ⛔ 它是三态，不是布尔
+  ///
+  /// 「每 6 小时查一次」这个档位没法用 `bool` 表达。硬塞成布尔的话，
+  /// 用户要么每次启动都查、要么永远不查 —— 而「挂着不动也想查」是个
+  /// 真实诉求（书房里常开机的 Mac mini）。
+  ///
+  /// ⛔ 判据（含默认值）只在 `FollowAutoCheck.parse` 一处，这里**不要**再写
+  ///    一遍 `== 'on_launch'`：两处会漂开，症状是「设置页选了关闭，重启
+  ///    之后又开始检查了」。
+  final FollowAutoCheck followAutoCheck;
 
   /// 刮到同一条目的几部作品是否自动折成一部（跨目录归一）。**默认开**。
   ///
@@ -199,6 +218,7 @@ class AppSettings {
   AppSettings copyWith({
     bool? onlineScrape,
     bool? autoScrapeOnScan,
+    FollowAutoCheck? followAutoCheck,
     bool? autoMergeByOnlineId,
     String? tmdbApiKey,
     String? tmdbApiBase,
@@ -227,6 +247,7 @@ class AppSettings {
     return AppSettings(
       onlineScrape: onlineScrape ?? this.onlineScrape,
       autoScrapeOnScan: autoScrapeOnScan ?? this.autoScrapeOnScan,
+      followAutoCheck: followAutoCheck ?? this.followAutoCheck,
       autoMergeByOnlineId: autoMergeByOnlineId ?? this.autoMergeByOnlineId,
       tmdbApiKey: tmdbApiKey ?? this.tmdbApiKey,
       tmdbApiBase: tmdbApiBase ?? this.tmdbApiBase,
@@ -273,6 +294,11 @@ class AppSettings {
       // 缺失即 `false`：自动刮削**默认关**，这是产品决定而不是实现细节，
       // 所以判据写成「等于 true」而不是「不等于 false」。
       autoScrapeOnScan: v[SettingKeys.autoScrapeOnScan] == 'true',
+      // 追剧自动检查：三态，判据（含默认 `on_launch`）只在
+      // `FollowAutoCheck.parse` 一处。这里写 `==` 是**错的** ——
+      // 它是一个枚举名而不是布尔串，写成布尔判断会让 `every_6h` 静默退化成
+      // 默认值（表现是「选了每 6 小时，实际只在启动时查一次」）。
+      followAutoCheck: FollowAutoCheck.parse(v[SettingKeys.followAutoCheck]),
       // ⚠️ 与上一行**刻意相反**：这一项缺失即 `true`，所以判据必须写成
       // 「不等于 false」。写反的后果不是报错，而是「新装用户永远不合库」
       // —— 一个没人会想到去查的默认值问题。理由见
@@ -347,6 +373,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     final v = await store.readAll(const [
       SettingKeys.onlineScrape,
       SettingKeys.autoScrapeOnScan,
+      SettingKeys.followAutoCheck,
       SettingKeys.autoMergeByOnlineId,
       SettingKeys.tmdbApiKey,
       SettingKeys.tmdbApiBase,
@@ -380,6 +407,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
   Future<void> set({
     bool? onlineScrape,
     bool? autoScrapeOnScan,
+    FollowAutoCheck? followAutoCheck,
     bool? autoMergeByOnlineId,
     String? tmdbApiKey,
     String? tmdbApiBase,
@@ -412,6 +440,12 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     }
     if (autoScrapeOnScan != null) {
       await store.writeBool(SettingKeys.autoScrapeOnScan, autoScrapeOnScan);
+    }
+    if (followAutoCheck != null) {
+      // ⛔ 写 `id`（`off` / `on_launch` / `every_6h`）而不是 `toString()` ——
+      //    枚举名与落库值刻意不同（`onLaunch` vs `on_launch`），写错了
+      //    另一端解析不出来、只能退回默认值，而且不报错。
+      await store.write(SettingKeys.followAutoCheck, followAutoCheck.id);
     }
     if (autoMergeByOnlineId != null) {
       await store.writeBool(
@@ -499,6 +533,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       current.copyWith(
         onlineScrape: onlineScrape,
         autoScrapeOnScan: autoScrapeOnScan,
+        followAutoCheck: followAutoCheck,
         autoMergeByOnlineId: autoMergeByOnlineId,
         tmdbApiKey: tmdbApiKey?.trim(),
         tmdbApiBase: tmdbApiBase?.trim(),

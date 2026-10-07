@@ -33,7 +33,7 @@ object LibrarySchema {
      * 后会跑一遍迁移（多数是 `ADD COLUMN`，会直接报 duplicate column）；
      * 写大了 → PC 端直接判定「来自更高版本的数据库」并只打一条 warn。
      */
-    const val VERSION = 16
+    const val VERSION = 17
 
     /** 一列的定义。 */
     data class Column(
@@ -179,6 +179,13 @@ object LibrarySchema {
             text("merged_into"),
             int("intro_start_ms"),
             int("intro_end_ms"),
+            // v17：追剧 / 更新提醒。四列一组，缺一列这个功能就不成立。
+            // ⛔ 默认值 `0` / `NULL` / `NULL` / `0` 恰好表达「这部作品没在追剧」，
+            //    所以升级不需要回填，行为与升级前完全一致。
+            bool("followed"),
+            int("follow_started_at"),
+            int("follow_checked_at"),
+            int("new_item_count", notNull = true, default = 0),
         ),
         primaryKey = listOf("key"),
     )
@@ -324,6 +331,78 @@ object LibrarySettings {
     /** 豆瓣登录后的 Cookie。空 = 走匿名额度（实测约 10 个搜索词）。 */
     const val DOUBAN_COOKIE = "douban_cookie"
 
-    /** 「刮削设置」那一屏里能填的全部键。 */
+    /**
+     * 「扫描后自动刮削」开关。
+     *
+     * ⛔ 键名与 PC 端 `SettingKeys.autoScrapeOnScan` **逐字一致**
+     *    （`auto_scrape_on_scan`）—— 它在 `settings` 表里、随备份包跨端走。
+     *
+     * ⚠️ **两端的默认值刻意不同，连判据的方向都相反**：
+     *
+     * | | 判据 | 缺失时 |
+     * |---|---|---|
+     * | PC | `== "true"` | 关 |
+     * | Android | `!= "false"` | **开** |
+     *
+     * PC 端默认**关**：那边是整盘扫描几千个文件，豆瓣匿名额度约 10 个搜索词，
+     * 走一遍必然中途耗尽。Android 端默认**开** —— 电视上用户看不到进度细节，
+     * 「扫完还得手动去点每一部」的体验比配额更糟，而且 [AutoScraper] 有源级预算
+     * 会自己收工。
+     *
+     * ⛔ Android 侧的判据**刻意是「不等于 `"false"`」**：这一列在 PC 的旧库里
+     *    根本不存在（那边默认关），而缺失在电视上应当读成「开」。写成
+     *    `== "true"` 的话，从电脑同步过来的库会在电视上默认关掉 ——
+     *    用户根本不知道有这么个功能。判据写在 `LibraryActivity.autoScrapeEnabled()`
+     *    里，**不在**这里：这里只放键名。
+     */
+    const val AUTO_SCRAPE_ON_SCAN = "auto_scrape_on_scan"
+
+    /**
+     * **追更检查的全局节流零点**（Unix **秒**的十进制字符串）。
+     *
+     * ⛔ 键名与 PC 端 `SettingKeys.followLastCheckAt` **逐字一致**
+     *    （`follow_last_check_at`）—— 它在 `settings` 表里、随备份包跨端走。
+     *
+     * ⛔ 值是 **Unix 秒**，不是 ISO8601。两端各用各的解析器时（Dart
+     *    `toIso8601String` 是本地时间、不带时区后缀、微秒位数还随值变化），
+     *    只要有一边按 UTC 解析就会差出整整一个时区，而**两边都不报错**，
+     *    表现是「节流窗口时灵时不灵」。Unix 秒没有任何解释空间。
+     *    PC 端读它是 `readInt`，这边是 `String.toLongOrNull()`。
+     *
+     * ## 为什么需要它，而不是只看作品级的 `follow_checked_at`
+     *
+     * `media_works.follow_checked_at` 是**逐部作品**的（每部剧各自的水位线），
+     * 而「要不要现在就发起一次检查」是个**全局**问题 —— 没有这一列的话，
+     * 每次进媒体库都要把每一部在追的剧重新查一遍。
+     *
+     * ## ⛔ 为什么放在 `settings` 表，而不是 `media_works`
+     *
+     * 同步判据 `libraryModifiedAt()` = `MAX(media_works.updated_at)` ∪
+     * `MAX(media_items.first_seen_at)` ∪ `MAX(media_items.last_played_at)`。
+     * **`settings` 表不在其中** —— 所以写这个键**不会**让本机「看起来更新」，
+     * 也就不会在下一次同步时无条件上传、把另一台设备的进度盖掉。
+     *
+     * 反过来，如果把它塞进 `media_works`，那么**每次自动检查都会改同步判据**
+     * —— 一台常开机的设备会永远赢下 LWW 比较，另一台设备看的进度就永远
+     * 同步不上去。这是这个功能里最隐蔽的一条红线。
+     */
+    const val FOLLOW_LAST_CHECK_AT = "follow_last_check_at"
+
+    /**
+     * 自动追更检查的策略。取值见 `FollowAutoCheck`：
+     * `off` / `on_launch`（默认）/ `every_6h`。
+     *
+     * ⛔ 键名与 PC 端 `SettingKeys.followAutoCheck` 逐字一致。
+     * ⚠️ 默认值写在 `FollowAutoCheck.parse` 里（只认三个枚举名，其余一律
+     *    退回默认），**不在**这里 —— 这里只放键名。
+     */
+    const val FOLLOW_AUTO_CHECK = "follow_auto_check"
+
+    /**
+     * 「刮削设置」那一屏里能填的全部**凭证**键。
+     *
+     * ⛔ [AUTO_SCRAPE_ON_SCAN] **不在**这个表里：它是个开关、不是凭证，
+     *    放进来会让设置页的「当前已填 N 项」把开关也算成一项。
+     */
     val SCRAPE_KEYS = listOf(TMDB_API_KEY, TMDB_API_BASE, TMDB_IMAGE_BASE, DOUBAN_COOKIE)
 }

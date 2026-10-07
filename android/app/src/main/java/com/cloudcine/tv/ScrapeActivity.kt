@@ -26,10 +26,10 @@ import com.cloudcine.tv.library.DoubanScraper
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
 import com.cloudcine.tv.library.MediaCategoryNames
-import com.cloudcine.tv.library.MediaNameParser
 import com.cloudcine.tv.library.PosterFetcher
 import com.cloudcine.tv.library.ScrapeCandidate
 import com.cloudcine.tv.library.ScrapeQuery
+import com.cloudcine.tv.library.ScrapeQueryBuilder
 import com.cloudcine.tv.library.ScraperPipeline
 import com.cloudcine.tv.library.TmdbScraper
 import com.cloudcine.tv.pan.Bg
@@ -540,10 +540,11 @@ class ScrapeActivity : Activity() {
     /**
      * 预填搜索词。
      *
-     * ⛔ 挑法与 PC 端 `WorkScraper._queryFor` 一致：**跳过花絮 / 样片**
-     *    （`-trailer.mkv` 解析出来的片名常常带着 `trailer`，拿它去搜只会搜到
-     *    一堆不相关的东西），并且传 `dirPath` 而不是末级目录名 —— 与扫描期
-     *    **完全同一条解析路径**，否则「扫描期刮出来是 A、点按钮刮出来是 B」。
+     * ⛔ 挑文件的口径**下沉到了** [ScrapeQueryBuilder.forItems] —— 它同时被
+     *    扫描后的自动刮削（`AutoScraper`）使用。两处各写一份的话，同一个作品
+     *    会出现「手动刮出来是 A、自动刮出来是 B」，而这是**静默的**。
+     *    那段逻辑做三件事：跳过花絮 / 样片、逐条按 `dirPath` 解析、取第一个
+     *    可信片名。
      *
      * ⛔ 解析不出可信片名时**退回库里已存的标题**（用户至少有个起点可改），
      *    而不是留一个空框。
@@ -551,24 +552,14 @@ class ScrapeActivity : Activity() {
     private fun prefill() {
         status.text = "正在准备搜索词…"
         Bg.run({
-            val items = db.itemsForWork(workKey)
-            val features = items.filter { !it.isSampleOrExtra }
-            val pool = if (features.isNotEmpty()) features else items
-            for (it in pool) {
-                val parsed = MediaNameParser.parse(it.name, it.dirPath)
-                val title = parsed.title
-                if (!title.isNullOrBlank() && hasUsableTitle(title)) {
-                    return@run Triple(title, parsed.year, parsed.kind)
-                }
-            }
-            null
-        }) { triple, err ->
+            ScrapeQueryBuilder.forItems(db.itemsForWork(workKey))
+        }) { q, err ->
             if (err != null) Log.w(TAG, "预填搜索词失败", err)
-            if (triple != null) {
-                searchBox.setText(triple.first)
-                parsedYear = triple.second
-                parsedKind = triple.third
-                status.text = "搜索词来自文件名（年份 ${triple.second ?: "无"}）。改好后按 ↓ 点「搜索」"
+            if (q != null) {
+                searchBox.setText(q.title)
+                parsedYear = q.year
+                parsedKind = q.kind
+                status.text = "搜索词来自文件名（年份 ${q.year ?: "无"}）。改好后按 ↓ 点「搜索」"
             } else {
                 searchBox.setText(workTitle)
                 status.text = "文件名解析不出可信片名，已用库里标题预填。改好后按 ↓ 点「搜索」"
@@ -834,10 +825,6 @@ class ScrapeActivity : Activity() {
         TmdbScraper.ID -> "TMDB"
         else -> id
     }
-
-    /** 片名能不能当查询词用：**含至少一个字母或汉字**（纯数字 / 纯符号不算）。 */
-    private fun hasUsableTitle(title: String): Boolean =
-        Regex("[a-z\\u4e00-\\u9fff]", RegexOption.IGNORE_CASE).containsMatchIn(title)
 
     private fun hideKeyboard() {
         keyboardUp = false

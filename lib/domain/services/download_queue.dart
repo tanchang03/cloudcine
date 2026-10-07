@@ -103,18 +103,39 @@ class DownloadQueue {
   ///
   /// ⚠️ 刻意**不**自动续传。理由见 `DownloadStatus.paused` 的文档：
   /// 一开应用就闷头下几十 GB 不是用户这次打开应用想干的事。
+  /// ## ⛔ 为什么每一步之间都要查一次 `_disposed`
+  ///
+  /// 恢复备份会**在队列初始化途中**把数据库整个换掉（`DatabaseHandle.swap`
+  /// 之后旧连接 `close()`），而 [init] 是 `build()` 里 `unawaited` 出去的 ——
+  /// 它跑到一半时 `dispose()` 可能已经发生了。Drift 的 `close()` 是**终局**
+  /// 的，所以那次还没落地的 `loadAll` 会以
+  /// `StateError: Can't re-open a database after closing it` 失败。
+  ///
+  /// 那个失败**是预期内的**：这份列表属于一个已经被换掉的库，本来就该丢掉
+  /// （新队列会自己再 `init()` 一次，从新库里重新读）。不吞掉的话它是一条
+  /// unhandled async error —— 控制台里多一段红字，测试里还会把用例判红。
+  ///
+  /// 只在 `_disposed` 为真时才吞：队列还活着却查不动库，那是真出事了，
+  /// 必须原样抛出去。
   Future<void> init() async {
-    final paused = await _store.pauseRunning(_clock());
-    final loaded = await _store.loadAll();
     if (_disposed) return;
-    _tasks
-      ..clear()
-      ..addAll(loaded);
-    _notify(force: true);
-    if (paused > 0) {
-      diag.info('下载', '$paused 个下载任务在上次退出时未完成，已置为「已暂停」');
+    try {
+      final paused = await _store.pauseRunning(_clock());
+      if (_disposed) return;
+      final loaded = await _store.loadAll();
+      if (_disposed) return;
+      _tasks
+        ..clear()
+        ..addAll(loaded);
+      _notify(force: true);
+      if (paused > 0) {
+        diag.info('下载', '$paused 个下载任务在上次退出时未完成，已置为「已暂停」');
+      }
+      _pump();
+    } on StateError catch (e) {
+      if (!_disposed) rethrow;
+      diag.debug('下载', '队列初始化途中数据库已被换掉，本次加载作废：$e');
     }
-    _pump();
   }
 
   void dispose() {

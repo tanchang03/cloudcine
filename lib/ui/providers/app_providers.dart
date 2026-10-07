@@ -37,14 +37,85 @@ import 'settings_providers.dart';
 /// 新增一家网盘 = 在 [adapterRegistryProvider] 里多传一个适配器实例，
 /// 其余 provider、页面、播放引擎都不用动。
 
+/// 当前数据库实例的**持有者**。
+///
+/// ## 为什么需要一个可替换的持有者
+///
+/// 恢复备份是把备份包里的 **SQLite 文件字节整体覆盖**到 `cloudcine.sqlite`，
+/// 所以覆盖前后必须换掉**整个** [AppDatabase]。
+///
+/// ⛔ 而 Drift 的连接**关掉就不能再开**：`_BaseExecutor.ensureOpen` 里
+///    `_closed` 一旦置位，之后任何查询都直接抛
+///    `StateError: Can't re-open a database after closing it. Please create a
+///    new database connection and open that instead.`
+///    —— 2026-10-07 的「恢复备份报错」正是照着「关掉再打开同一个实例」写的：
+///    日志停在「数据库 1884160 字节」之后（`writeAsBytes` 之后那一句
+///    `_openDatabase()` 抛了），用户看到
+///    「恢复失败：Bad state: Can't re-open a database…」。
+///
+/// 所以让实例本身可替换：恢复流程调 [DatabaseHandle.swap]，[databaseProvider]
+/// 以及所有 watch 它的仓储 / 设置缓存随之拿到新实例；新实例的第一次查询会
+/// 重新读 `PRAGMA user_version`，于是 `onUpgrade` 照跑，迁移一步不少。
+class DatabaseHandle extends Notifier<AppDatabase> {
+  DatabaseHandle([this._initial]);
+
+  /// 启动时注入的那一个。为 `null` 说明组合根忘了注入。
+  final AppDatabase? _initial;
+
+  /// [swap] 换上的那一个。`null` 表示还没换过。
+  ///
+  /// ⛔ 必须单独记着，**不能**让 [build] 直接返回 `_initial`：Riverpod 会
+  ///    复用 Notifier 实例再调一次 `build()`（`ref.invalidate`、依赖变化、
+  ///    热重载都会）。如果那时返回的是 `_initial`，就等于**把刚换上的新库
+  ///    又退回给那个已经被 `close()` 的旧实例** —— 之后每一次查询都抛
+  ///    `Can't re-open a database after closing it`，而且是在「恢复成功」
+  ///    之后才炸，比恢复本身失败更难查。
+  AppDatabase? _current;
+
+  @override
+  AppDatabase build() {
+    // 重建时优先给「当前那一个」：换过库之后，`_current` 才是真的。
+    final existing = _current;
+    if (existing != null) return existing;
+    final initial = _initial;
+    if (initial == null) {
+      throw UnimplementedError(
+        'databaseHandleProvider 必须在 main() 里用 ProviderScope.overrides 注入',
+      );
+    }
+    return initial;
+  }
+
+  /// 换上一个**新**实例。
+  ///
+  /// ⛔ 传进来的必须是一个全新的 [AppDatabase]。把一个已经 `close()` 过的实例
+  ///    传回来等于什么都没做 —— 下一次查询照样抛那个 `StateError`。
+  void swap(AppDatabase next) {
+    _current = next;
+    state = next;
+  }
+}
+
+/// 数据库实例的持有者。在 `main()` 里注入，恢复备份时被 [DatabaseHandle.swap] 替换。
+final databaseHandleProvider =
+    NotifierProvider<DatabaseHandle, AppDatabase>(DatabaseHandle.new);
+
 /// 本地索引数据库。
 ///
-/// 在 `main()` 里打开后通过 `ProviderScope.overrides` 注入 —— 打开数据库是
-/// 异步的（要先拿应用支持目录），塞不进同步的 Provider 里。
+/// 在 `main()` 里打开后通过 `ProviderScope.overrides` 注入（见
+/// [databaseHandleProvider]）—— 打开数据库是异步的（要先拿应用支持目录），
+/// 塞不进同步的 Provider 里。
+///
+/// 值转发给 [databaseHandleProvider]：恢复备份换了实例之后，
+/// `mediaRepositoryProvider` / `settingsStoreProvider`（以及 watch 它们的
+/// `settingsProvider` 等）会一起重建，于是**不需要重启应用**。
+///
+/// ⚠️ 这里仍然保持 `Provider` 而不是把持有者直接暴露出去：单测里有 24 处
+///    `databaseProvider.overrideWithValue(db)`，而 Riverpod 2.6 里
+///    **只有 `Provider` 有 `overrideWithValue`**（`StateProvider` /
+///    `NotifierProvider` 都没有）。把类型换掉会一次性打爆那 24 处。
 final databaseProvider = Provider<AppDatabase>(
-  (ref) => throw UnimplementedError(
-    'databaseProvider 必须在 main() 里用 ProviderScope.overrides 注入',
-  ),
+  (ref) => ref.watch(databaseHandleProvider),
 );
 
 /// 海报/背景图的磁盘缓存目录。与 [databaseProvider] 同理在 `main()` 里注入。
@@ -326,13 +397,21 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
     final adapter = registry.requireAdapter(DriveProvider.quark);
     final supportDir = ref.watch(appSupportDirProvider);
     final posterPath = ref.watch(posterCacheDirProvider);
+    // 库文件路径要在两个地方用：告诉服务「备份里那份字节该落到哪」，
+    // 以及恢复完之后用它建一个**新**的 AppDatabase（见 openDatabase）。
+    final dbPath = '$supportDir${Platform.pathSeparator}cloudcine.sqlite';
 
     return LibraryBackupService(
       adapter: adapter,
-      databasePath: '$supportDir${Platform.pathSeparator}cloudcine.sqlite',
+      databasePath: dbPath,
       posterCachePath: posterPath,
       deviceId: _getDeviceId(),
       deviceName: _getDeviceName(),
+      // ⛔ 必须传真实版本号。这个参数曾经有个 `= 6` 的默认值，而这里没传 ——
+      //    于是**每一份备份的清单里都写着 `schema=6`**，「备份来自更高版本」
+      //    的校验（`manifest.schemaVersion > _schemaVersion`）永远为假。
+      //    改成 `required` 之后，漏传就是编译错误而不是静默错误。
+      schemaVersion: AppDatabase.currentSchemaVersion,
       // ⚠️ 必须注入：漏了的话同步会拿「备份文件生成时间」比较，
       // 那等于本机永远比远程新 → 只会上传，新机器会把好备份冲成空库。
       localModifiedAt: () =>
@@ -350,6 +429,36 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
       //    `libraryBackupServiceProvider` 跟着设置的变化重建，而这个服务
       //    持有设备标识与路径，没有重建的理由。
       onLibraryReplaced: () => ref.read(settingsStoreProvider).invalidate(),
+      // ⛔⛔ 这两个钩子是**恢复备份能不能用**的关键。缺了就是
+      //      「库看着恢复了，碰追剧的查询却抛 `no such column: followed`」。
+      //      两件事必须成对做，顺序不能换：
+      //
+      //       ① 覆盖文件**之前**关掉旧连接 —— SQLite 还开着的时候文件被换掉，
+      //          它手里的页缓存与文件句柄指向的仍是旧库；
+      //       ② 覆盖文件**之后**换一个**新实例**并主动叫醒它 —— Drift 只在
+      //          打开连接时读一次 `PRAGMA user_version`，据此决定跑不跑
+      //          `onUpgrade`。不重开 ⇒ 迁移一步都不跑，磁盘上是旧结构、
+      //          连接以为还是新版本。
+      //
+      //      ⛔ 第 ② 步**不能**写成「把刚才那个实例重新打开」。Drift 的
+      //         `close()` 是**终局**的：`_BaseExecutor._closed` 置位之后
+      //         `ensureOpen` 直接抛 `StateError: Can't re-open a database
+      //         after closing it`。2026-10-07 就是栽在这里 —— 日志停在
+      //         「数据库 1884160 字节」之后，用户看到
+      //         「恢复失败：Bad state: Can't re-open a database…」。
+      //      （Android 端一直是对的：`LibraryDb.replaceWithRawBytes` 也是
+      //        `close() → writeBytes() → open()`，但它的 `open()` 是**重建**
+      //        连接并补表补列，不是重开旧连接。）
+      closeDatabase: () => ref.read(databaseProvider).close(),
+      openDatabase: () async {
+        final next = AppDatabase.openFile(File(dbPath));
+        // 换实例 → `databaseProvider` 及其下游（仓储 / 设置缓存）全部重建。
+        ref.read(databaseHandleProvider.notifier).swap(next);
+        // 主动叫醒：Drift 是**懒**打开的，`onUpgrade` 要等第一次查询才跑。
+        // 少了这一句，迁移会拖到用户下一次点进媒体库，中间那段时间库里
+        // 还是旧结构（就是那个 `no such column: followed`）。
+        await next.customSelect('SELECT 1').get();
+      },
     );
   },
 );

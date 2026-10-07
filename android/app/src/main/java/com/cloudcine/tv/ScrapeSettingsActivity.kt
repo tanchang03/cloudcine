@@ -50,9 +50,10 @@ import com.cloudcine.tv.pan.Bg
  *
  * ## 按键
  *
- * ↑↓ 在 [navOrder] 那条链上移动 —— 四个输入框 + 两个「测试」按钮 + 「保存」
- * （⛔ 单行 EditText 会自己吃掉 ↑↓，所以这里显式在 [dispatchKeyEvent] 里接管）；
- * OK 在输入框上弹软键盘、在按钮上执行（见 [actionFor]）。
+ * ↑↓ 在 [navOrder] 那条链上移动 —— 四个输入框 + 两个「测试」按钮 +
+ * 「扫描后自动刮削」开关 + 「保存」（⛔ 单行 EditText 会自己吃掉 ↑↓，所以这里
+ * 显式在 [dispatchKeyEvent] 里接管）；OK 在输入框上弹软键盘、在按钮 / 开关上
+ * 执行（见 [actionFor]）。
  *
  * ## 为什么有「测试」按钮
  *
@@ -77,6 +78,19 @@ class ScrapeSettingsActivity : Activity() {
 
     private lateinit var saveButton: TextView
     private lateinit var status: TextView
+
+    /** 「扫描后自动刮削」的开关胶囊。 */
+    private lateinit var autoScrapeButton: TextView
+
+    /**
+     * 开关的**当前值**（真源是它，不是按钮上的字）。
+     *
+     * ⛔ 默认 `true` —— 与 PC 端相反，理由见 [LibrarySettings.AUTO_SCRAPE_ON_SCAN]：
+     *    电视上「扫完还得手动去点每一部」比配额更糟。判据是「不等于 `"false"`」，
+     *    所以从电脑同步过来、`settings` 表里**根本没有这一行**的库，在电视上
+     *    读出来也是「开」。
+     */
+    private var autoScrapeOn = true
 
     /**
      * ↑↓ 的焦点顺序。
@@ -182,6 +196,47 @@ class ScrapeSettingsActivity : Activity() {
         doubanTestButton = probeButton(column, "测试豆瓣 Cookie") { probeDouban() }
         doubanProbeLine = probeLine(column)
 
+        // ── 扫描后自动刮削 ──
+        //
+        // ⛔ 它排在**凭证之后、保存之前**：这个开关只有在真的配了凭证时才有意义，
+        //    而它自己也要靠「保存」落库（与四个输入框同一趟写）。
+        // ⛔ 它是**开关**不是输入框，所以 OK 直接在 [actionFor] 里切值，
+        //    不弹软键盘。
+        column.addView(
+            TextView(this).apply {
+                text = "扫描网盘之后自动刮削"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setPadding(0, dp(18), 0, 0)
+            },
+        )
+        autoScrapeButton = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+            setPadding(dp(22), dp(9), dp(22), dp(9))
+            isFocusable = true
+            isFocusableInTouchMode = true
+            setOnClickListener { toggleAutoScrape() }
+            setOnFocusChangeListener { v, hasFocus ->
+                paintAutoScrapeButton(v as TextView, hasFocus)
+            }
+        }
+        paintAutoScrapeButton(autoScrapeButton, false)
+        column.addView(
+            autoScrapeButton,
+            LinearLayout.LayoutParams(dp(220), WRAP).apply { topMargin = dp(10) },
+        )
+        column.addView(
+            TextView(this).apply {
+                text = "开（默认）：扫完自动把没刮削过的作品补齐海报与简介，进度显示在" +
+                    "媒体库顶栏，按返回可以中途停下。\n" +
+                    "关：只在你想刮的时候手动进作品的简介页刮。"
+                setTextColor(FAINT)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, dp(8), 0, 0)
+            },
+        )
+
         status = TextView(this).apply {
             setTextColor(DIM)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -219,9 +274,45 @@ class ScrapeSettingsActivity : Activity() {
         navOrder = listOf(
             keyBox, apiBox, imageBox, tmdbTestButton,
             cookieBox, doubanTestButton,
+            autoScrapeButton,
             saveButton,
         )
         return column
+    }
+
+    /**
+     * 画开关胶囊。
+     *
+     * ⛔ 文案里带上**当前状态**（「开」/「关」），而不是只靠颜色 —— 颜色还要
+     *    表达焦点态，两者混在一起用户分不清「这个按钮被选中了」和
+     *    「这个开关是开着的」。
+     */
+    private fun paintAutoScrapeButton(button: TextView, focused: Boolean) {
+        button.text = if (autoScrapeOn) "自动刮削：开" else "自动刮削：关"
+        button.background = GradientDrawable().apply {
+            cornerRadius = dp(18).toFloat()
+            setColor(if (focused) BRAND_SOLID else 0x14FFFFFF)
+        }
+        // ⛔ 失焦时**回到状态色**，不能像「测试」按钮那样统一刷成灰 ——
+        //    那样开关的「开 / 关」就看不出来了。
+        button.setTextColor(
+            when {
+                focused -> 0xFF1A1533.toInt()
+                autoScrapeOn -> OK_GREEN
+                else -> 0xFF9AA3B2.toInt()
+            },
+        )
+    }
+
+    /** 切一下开关。⛔ 只改内存，落库交给「保存」—— 与四个输入框同一趟写。 */
+    private fun toggleAutoScrape() {
+        autoScrapeOn = !autoScrapeOn
+        paintAutoScrapeButton(autoScrapeButton, autoScrapeButton.hasFocus())
+        status.text = if (autoScrapeOn) {
+            "扫描后会自动刮削（默认）。记得点「保存」。"
+        } else {
+            "扫描后不再自动刮削。记得点「保存」。"
+        }
     }
 
     private fun paintSaveButton(focused: Boolean) {
@@ -424,6 +515,12 @@ class ScrapeSettingsActivity : Activity() {
             apiBox.setText(m[LibrarySettings.TMDB_API_BASE].orEmpty())
             imageBox.setText(m[LibrarySettings.TMDB_IMAGE_BASE].orEmpty())
             cookieBox.setText(m[LibrarySettings.DOUBAN_COOKIE].orEmpty())
+            // ⛔ 判据是「不等于 `"false"`」而不是「等于 `"true"`」：这一列在
+            //    PC 端的旧库里**根本不存在**（那边默认关），而缺失在电视上应当
+            //    读成「开」。判据必须与 `LibraryActivity.autoScrapeEnabled()` 一致，
+            //    否则会出现「设置页显示关、实际却在刮」。
+            autoScrapeOn = m[LibrarySettings.AUTO_SCRAPE_ON_SCAN] != "false"
+            paintAutoScrapeButton(autoScrapeButton, autoScrapeButton.hasFocus())
             val configured = LibrarySettings.SCRAPE_KEYS.count { !m[it].isNullOrBlank() }
             status.text = "当前已填 $configured 项 · ↑↓ 切换输入框 · OK 编辑"
             keyBox.requestFocus()
@@ -441,11 +538,16 @@ class ScrapeSettingsActivity : Activity() {
         val a = apiBox.text.toString().trim()
         val i = imageBox.text.toString().trim()
         val c = cookieBox.text.toString().trim()
+        // ⛔ 开关写成 `"true"` / `"false"` **两个都显式写**（不是「关就删行」）：
+        //    删行的话，从 PC 端同步过来的 `"false"` 会在下次同步时又冒出来，
+        //    用户明明在电视上关掉了它。
+        val auto = if (autoScrapeOn) "true" else "false"
         Bg.run({
             db.setSetting(LibrarySettings.TMDB_API_KEY, k)
             db.setSetting(LibrarySettings.TMDB_API_BASE, a)
             db.setSetting(LibrarySettings.TMDB_IMAGE_BASE, i)
             db.setSetting(LibrarySettings.DOUBAN_COOKIE, c)
+            db.setSetting(LibrarySettings.AUTO_SCRAPE_ON_SCAN, auto)
         }) { _, err ->
             saving = false
             if (err != null) {
@@ -459,8 +561,12 @@ class ScrapeSettingsActivity : Activity() {
                 if (k.isEmpty() && c.isEmpty()) add("豆瓣（匿名额度）")
             }
             status.text = "已保存：${enabled.joinToString(" + ")} 可用。" +
+                (if (autoScrapeOn) "扫描后自动刮削。" else "扫描后不自动刮削。") +
                 "同步一次备份，这些值就会带到其它设备。"
-            Log.i(TAG, "刮削设置已保存（TMDB=${k.isNotEmpty()}, 豆瓣=${c.isNotEmpty()}）")
+            Log.i(
+                TAG,
+                "刮削设置已保存（TMDB=${k.isNotEmpty()}, 豆瓣=${c.isNotEmpty()}, 自动刮削=$autoScrapeOn）",
+            )
         }
     }
 
@@ -517,6 +623,7 @@ class ScrapeSettingsActivity : Activity() {
     private fun actionFor(view: View): (() -> Unit)? = when (view) {
         tmdbTestButton -> ({ probeTmdb() })
         doubanTestButton -> ({ probeDouban() })
+        autoScrapeButton -> ({ toggleAutoScrape() })
         saveButton -> ({ save() })
         else -> null
     }

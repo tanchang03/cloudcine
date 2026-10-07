@@ -14,7 +14,7 @@ import org.junit.Test
  * 它们不是「另一个手写的期望值」—— 是 PC 端真的会建出来的那张表。
  *
  * 备份包装的是 **SQLite 文件的原始字节**，PC 端 restore 之后看
- * `user_version == 16` 就**不再跑迁移**，直接拿它当自己的库用。所以：
+ * `user_version == 17` 就**不再跑迁移**，直接拿它当自己的库用。所以：
  *
  *   * 列名少一个 / 多一个 → PC 端 `no such column`，**没有迁移兜底**；
  *   * `DEFAULT` 值不同 → 新插入的行在两端语义不同（最典型的是
@@ -27,9 +27,9 @@ import org.junit.Test
 class LibrarySchemaTest {
 
     @Test
-    fun `user_version 必须是 16`() {
+    fun `user_version 必须是 17`() {
         // 与 PC 端 AppDatabase.schemaVersion 相等。
-        assertEquals(16, LibrarySchema.VERSION)
+        assertEquals(17, LibrarySchema.VERSION)
     }
 
     @Test
@@ -186,7 +186,10 @@ class LibrarySchemaTest {
                 "DEFAULT 0, \"season_count\" INTEGER NOT NULL DEFAULT 0, \"last_modified_at\" " +
                 "INTEGER NULL, \"first_seen_at\" INTEGER NULL, \"last_played_at\" INTEGER NULL, " +
                 "\"updated_at\" INTEGER NOT NULL, \"merged_into\" TEXT NULL, \"intro_start_ms\" " +
-                "INTEGER NULL, \"intro_end_ms\" INTEGER NULL, PRIMARY KEY (\"key\"))"
+                "INTEGER NULL, \"intro_end_ms\" INTEGER NULL, \"followed\" INTEGER NOT NULL " +
+                "DEFAULT 0 CHECK (\"followed\" IN (0, 1)), \"follow_started_at\" INTEGER NULL, " +
+                "\"follow_checked_at\" INTEGER NULL, \"new_item_count\" INTEGER NOT NULL " +
+                "DEFAULT 0, PRIMARY KEY (\"key\"))"
 
         const val EXPECTED_SUBTITLE_REFS =
             "CREATE TABLE \"subtitle_refs\" (\"id\" TEXT NOT NULL, \"item_id\" TEXT NOT NULL, " +

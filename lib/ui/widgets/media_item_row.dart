@@ -55,6 +55,7 @@ class MediaItemRow extends ConsumerWidget {
     this.locateTooltip = '在目录中显示',
     this.workTitle,
     this.watched,
+    this.isNew = false,
   });
 
   final MediaItem item;
@@ -64,6 +65,18 @@ class MediaItemRow extends ConsumerWidget {
   /// 由调用方从 `WorkDetail.maxPositions` 取好传进来 —— 这一行不自己去查库：
   /// 列表一屏几十行，每行各查一次会把「一次批量查询」变成 N 次。
   final Duration? watched;
+
+  /// 这一条算不算「追剧之后才出现、而且还没看过」的新集。
+  ///
+  /// 判据由调用方用 `MediaWork.isNewSinceFollow(firstSeenAt:, played:)`
+  /// 算好传进来 —— 与 [watched] 同一条理由（这一行不持有作品、也不查库），
+  /// 而且「播过没有」这件事**恰好就是** [watched] 非空。
+  ///
+  /// ⛔ 别在这一行里自己算：`followStartedAt` 在作品上，不在这里。传进来
+  ///    一个 `bool` 而不是 `DateTime? followStartedAt`，是为了让「哪几行是
+  ///    新的」这个判断**只在一处**（详情页 `_DetailBody.build`）——
+  ///    两个地方各判一遍，迟早会分叉成「列表标了 NEW、进度条却显示看过」。
+  final bool isNew;
 
   /// 所属**作品行**的标题（刮削后的剧名），只用于主标题的组装。
   ///
@@ -125,27 +138,41 @@ class MediaItemRow extends ConsumerWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            // ⚠️ **不能**用 `item.displayTitle` 一把梭：提不出集号时
-                            // 它就是片名，而这一整屏都是同一部剧。真实样本
-                            // `/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4`…
-                            // 全被顶成同一个目录名，12 行主标题一模一样，只有下面
-                            // 那条暗色的网盘路径能看出区别。
-                            //
-                            // 取 `withTitle` 而不是 `compact`：有集号时**要**保留
-                            // 片名 —— 同一集常有多个版本（翡翠台 / MyTVSuper），
-                            // 版本之间只有片名不同（见 `RowLabelStyle`）。
-                            item.rowLabel(
-                              RowLabelStyle.withTitle,
-                              workTitle: workTitle,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w500,
-                              color: dim ? AppTheme.muted : AppTheme.text,
-                            ),
+                          // NEW 标签与主标题**同一条基线**，所以放在同一个
+                          // `Row` 里而不是上面另起一行：另起一行会让这一条
+                          // 比没标 NEW 的行高出一截，一屏几十行参差不齐
+                          // （与 `_WatchedBar` 压底边是同一条理由）。
+                          Row(
+                            children: [
+                              if (isNew) ...[
+                                const _NewTag(),
+                                const SizedBox(width: 6),
+                              ],
+                              Expanded(
+                                child: Text(
+                                  // ⚠️ **不能**用 `item.displayTitle` 一把梭：提不出集号时
+                                  // 它就是片名，而这一整屏都是同一部剧。真实样本
+                                  // `/来自：分享/F飞CC日  志2/` 下 12 个 `01.国语.mp4`…
+                                  // 全被顶成同一个目录名，12 行主标题一模一样，只有下面
+                                  // 那条暗色的网盘路径能看出区别。
+                                  //
+                                  // 取 `withTitle` 而不是 `compact`：有集号时**要**保留
+                                  // 片名 —— 同一集常有多个版本（翡翠台 / MyTVSuper），
+                                  // 版本之间只有片名不同（见 `RowLabelStyle`）。
+                                  item.rowLabel(
+                                    RowLabelStyle.withTitle,
+                                    workTitle: workTitle,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w500,
+                                    color: dim ? AppTheme.muted : AppTheme.text,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                           const SizedBox(height: 3),
                           Text(
@@ -252,6 +279,59 @@ class MediaItemRow extends ConsumerWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 剧集行行首那个「■ NEW」。
+///
+/// ## 为什么是一个小方块 + 品牌色字，而不是一个实心胶囊
+///
+/// 与 Android 电视端的口径**逐字一致**（那边是 `SpannableString` 加一个
+/// `■` 前缀 + `BRAND_TINT` 粗体，见 `LibraryActivity.newEpisodeTitle`）。
+/// 两端同一件事长得不一样的话，用户换设备之后得重新学一遍「哪个标记是新的」。
+///
+/// 而它之所以不做成 `TagChip` 那样的实心块：这一行的右侧已经挤了分辨率
+/// 胶囊、时间列、复制、播放四个东西，行首再来一块实心色，整行会变得
+/// 「到处都在喊」。一个小方块 + 三个字母，是「一眼扫得到、又不抢主标题」的
+/// 那个量级。
+///
+/// ## 为什么不带数字
+///
+/// 数字在**作品**这一层（海报角标「更新 2」、详情页按钮「已追剧 · 2 集新」）。
+/// 行级只要回答「这一条是不是新的」—— 在每一行上重复一个同一个数字，
+/// 既没有信息量，又会让 24 集里 24 行都写着「2」。
+class _NewTag extends StatelessWidget {
+  const _NewTag();
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // 方块与文字同色，缩到 5px —— 再大就会把 12.5sp 的主标题压下去。
+        Container(
+          width: 5,
+          height: 5,
+          decoration: BoxDecoration(
+            color: AppTheme.accent,
+            borderRadius: BorderRadius.circular(1.5),
+          ),
+        ),
+        const SizedBox(width: 4),
+        const Text(
+          'NEW',
+          style: TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.w700,
+            // 行高压到 1.2：这一行的高度由主标题（12.5sp）决定，
+            // 标签不能反过来把它撑高。
+            height: 1.2,
+            letterSpacing: 0.6,
+            color: AppTheme.accent,
+          ),
+        ),
+      ],
     );
   }
 }

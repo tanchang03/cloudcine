@@ -49,12 +49,18 @@ void main() {
     WidgetTester tester,
     MediaItem it, {
     Duration? watched,
+    bool isNew = false,
   }) async {
     await tester.pumpWidget(ProviderScope(
       child: MaterialApp(
         theme: AppTheme.dark(),
         home: Scaffold(
-          body: MediaItemRow(item: it, index: 0, watched: watched),
+          body: MediaItemRow(
+            item: it,
+            index: 0,
+            watched: watched,
+            isNew: isNew,
+          ),
         ),
       ),
     ));
@@ -150,6 +156,64 @@ void main() {
       reason: '进度条压在面板底边（不参与布局）。塞进文字列的话，一屏几十行里'
           '看过的那些会高几像素，右侧的时间列也跟着上下跳 —— 而这个列表最常见的'
           '用法正是竖着扫时间。',
+    );
+  });
+
+  // -------------------------------------------------------------------
+  // 追剧 NEW 标签
+  // -------------------------------------------------------------------
+
+  testWidgets('新集才画 NEW 标签', (tester) async {
+    await render(tester, item(), isNew: true);
+    expect(
+      find.text('NEW'),
+      findsOneWidget,
+      reason: '「追剧以来新增 ∧ 从没播过」这一条判据由调用方算好传进来，'
+          '这一行只负责画。不画的话用户看不出哪几集是新的 —— '
+          '而他要追的恰恰就是那几集。',
+    );
+
+    await render(tester, item());
+    expect(find.text('NEW'), findsNothing);
+  });
+
+  testWidgets('NEW 标签**不改变行高** —— 标了的行与没标的行一样高', (tester) async {
+    await render(tester, item(), isNew: true);
+    final withTag = tester.getSize(find.byType(MediaItemRow)).height;
+
+    await render(tester, item());
+    final withoutTag = tester.getSize(find.byType(MediaItemRow)).height;
+
+    expect(
+      withTag,
+      withoutTag,
+      reason: '标签塞进主标题那一行（同一个 `Row`），而不是上面另起一行。'
+          '另起一行的话，24 集里新的那几集会比别的行高出一截 —— '
+          '一屏几十行参差不齐，右侧时间列也跟着跳（与进度条那条同一条理由）。',
+    );
+  });
+
+  testWidgets('NEW 标签与主标题同时可见（不是把主标题挤没了）', (tester) async {
+    await render(tester, item(), isNew: true);
+
+    expect(find.text('NEW'), findsOneWidget);
+    // 主标题必须还在：标签与标题同在一个 `Row`，标题拿的是 `Expanded`，
+    // 漏了 `Expanded` 的话标题会被压成 0 宽 —— 屏幕上只剩一个 NEW，
+    // 用户完全不知道哪一集是新的。
+    final others = tester
+        .widgetList<Text>(
+          find.descendant(
+            of: find.byType(MediaItemRow),
+            matching: find.byType(Text),
+          ),
+        )
+        .map((t) => t.data ?? '')
+        .where((s) => s.isNotEmpty && s != 'NEW')
+        .toList();
+    expect(
+      others,
+      isNotEmpty,
+      reason: '标签与标题同排，标题必须仍然画得出来。',
     );
   });
 }

@@ -59,7 +59,7 @@ void main() {
       posterCachePath: posterPath,
       deviceId: 'test-device-001',
       deviceName: '测试机器',
-      schemaVersion: 6,
+      schemaVersion: 17,
     );
   });
 
@@ -95,7 +95,7 @@ void main() {
       // manifest 字段
       expect(manifest.deviceId, 'test-device-001');
       expect(manifest.deviceName, '测试机器');
-      expect(manifest.schemaVersion, 6);
+      expect(manifest.schemaVersion, 17);
       expect(manifest.fileNames, contains('cloudcine.sqlite'));
       expect(manifest.fileNames, contains('posters/'));
 
@@ -269,7 +269,7 @@ void main() {
         posterCachePath: remotePosters.path,
         deviceId: deviceId,
         deviceName: '远程机器',
-        schemaVersion: 6,
+        schemaVersion: 17,
         localModifiedAt: () async => remoteModifiedAt,
       );
       return remoteService.exportBackup();
@@ -287,7 +287,7 @@ void main() {
           posterCachePath: posterPath,
           deviceId: deviceId,
           deviceName: '本地机器',
-          schemaVersion: 6,
+          schemaVersion: 17,
           localModifiedAt: () async => localModifiedAt,
         );
 
@@ -416,6 +416,102 @@ void main() {
     });
   });
 
+  group('恢复备份：覆盖库文件前后必须关 / 开连接', () {
+    late List<Uint8List> seenAtClose;
+    late List<Uint8List> seenAtOpen;
+
+    /// 一个「被观测」的 service：两个回调各自记下**当时磁盘上**的库字节。
+    ///
+    /// 用文件内容当证据，而不是只记「谁先被调用」—— 因为真正的 bug 不是
+    /// 调用顺序，而是**关的时机晚了**：连接在文件已被换掉之后才关，它手里的
+    /// 页缓存 / 文件句柄仍然指向旧库（2026-10-07 真机踩到的那次）。
+    LibraryBackupService instrumented(String atPath) => LibraryBackupService(
+          adapter: _NoOpAdapter(),
+          databasePath: atPath,
+          posterCachePath: posterPath,
+          deviceId: 'instrumented',
+          deviceName: '被观测的机器',
+          schemaVersion: 17,
+          closeDatabase: () async =>
+              seenAtClose.add(await File(atPath).readAsBytes()),
+          openDatabase: () async =>
+              seenAtOpen.add(await File(atPath).readAsBytes()),
+        );
+
+    setUp(() {
+      seenAtClose = [];
+      seenAtOpen = [];
+    });
+
+    test('关的时候文件还是旧的，开的时候已经是备份里那份', () async {
+      // 「另一台机器」上的库：改一个特征字节，让它与本地那份可区分
+      // （`_fakeSqliteHeader()` 在偏移 20 处写的是 `(20*7)&0xFF = 0x8C`）。
+      final remoteDb = _fakeSqliteHeader()..[20] = 0xAB;
+      final remoteDbPath = '${File(dbPath).parent.path}/remote.sqlite';
+      await File(remoteDbPath).writeAsBytes(remoteDb);
+
+      final remoteBytes = await LibraryBackupService(
+        adapter: _NoOpAdapter(),
+        databasePath: remoteDbPath,
+        posterCachePath: posterPath,
+        deviceId: 'remote',
+        deviceName: '远程机器',
+        schemaVersion: 17,
+      ).exportBackup(includePosters: false);
+
+      final before = await File(dbPath).readAsBytes();
+      await instrumented(dbPath).importBackup(remoteBytes);
+
+      expect(
+        seenAtClose.single,
+        before,
+        reason: '关连接必须在覆盖文件**之前** —— 晚一步的话，连接手里的页缓存'
+            '仍然指向旧库，覆盖之后它读到的 schema 是错的',
+      );
+      expect(
+        seenAtOpen.single,
+        remoteDb,
+        reason: '重开必须在覆盖文件**之后**，且此刻磁盘上应当已经是备份里那份库'
+            '—— Drift 正是借这次重开读 `user_version` 并跑 `onUpgrade`',
+      );
+    });
+
+    test('较低版本的备份（v6 < v17）走正常路径，不抛异常', () async {
+      final oldBytes = await LibraryBackupService(
+        adapter: _NoOpAdapter(),
+        databasePath: dbPath,
+        posterCachePath: posterPath,
+        deviceId: 'old-machine',
+        deviceName: '老机器',
+        schemaVersion: 6,
+      ).exportBackup(includePosters: false);
+
+      final manifest = await instrumented(dbPath).importBackup(oldBytes);
+
+      expect(manifest.schemaVersion, 6);
+      // ⛔ 老备份**也要**关 / 开连接：它恰恰是「库结构与当前代码不一致」的那一份，
+      //    不重开就永远不会跑迁移（这正是 v6 / v16 备份恢复后报
+      //    `no such column: followed` 的原因）。
+      expect(seenAtClose, hasLength(1));
+      expect(seenAtOpen, hasLength(1));
+    });
+
+    test('没注入回调时仍能覆盖文件（单测场景），属于已知退化', () async {
+      final svc = LibraryBackupService(
+        adapter: _NoOpAdapter(),
+        databasePath: dbPath,
+        posterCachePath: posterPath,
+        deviceId: 'd',
+        deviceName: 'n',
+        schemaVersion: 17,
+      );
+      final bytes = await svc.exportBackup(includePosters: false);
+      await svc.importBackup(bytes);
+      // 文件照样被写；生产组合根必须注入回调（缺了会打一条 WARN）。
+      expect(await File(dbPath).readAsBytes(), _fakeSqliteHeader());
+    });
+  });
+
   group('uploadFileToBackupDir —— 任意文件上云（诊断日志走的就是它）', () {
     LibraryBackupService svcWith(_FakeRemoteDrive drive) => LibraryBackupService(
           adapter: drive,
@@ -423,6 +519,7 @@ void main() {
           posterCachePath: posterPath,
           deviceId: 'test-device-001',
           deviceName: '测试机器',
+          schemaVersion: 17,
         );
 
     test('目录不存在时先建目录再上传', () async {

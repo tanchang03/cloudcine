@@ -7,6 +7,8 @@ import 'package:go_router/go_router.dart';
 
 import '../providers/auth_providers.dart';
 import '../providers/download_providers.dart';
+import '../providers/follow_providers.dart';
+import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_logo.dart';
 import '../widgets/tv_affordance.dart';
@@ -143,10 +145,110 @@ class _AppShellState extends State<AppShell> {
                 ),
               ),
             ),
+          // 追更检查的**启动触发器**。没有任何视觉（见 `_FollowLaunchCheck`）——
+          // 它只是挂一个延迟定时器，所以放在 `Stack` 最上层也不会挡住任何东西。
+          const _FollowLaunchCheck(),
         ],
       ),
     );
   }
+}
+
+/// App 启动后的**静默追更检查**。
+///
+/// ## 为什么挂在壳上，而不是媒体库页
+///
+/// 「启动后检查一次」的语义是**一次会话一次**（见 `FollowAutoCheck.onLaunch`）。
+/// 挂在媒体库页上有两个问题：用户这次是从别的分支进来的（深链、或上次退出
+/// 时停在设置页）它压根不会跑；而每次切回媒体库页又会重新挂一次定时器 ——
+/// 「启动后 20 秒」变成了「每次进媒体库 20 秒后」。
+///
+/// 壳是这个进程里**唯一**一个「装好之后不再重建」的 widget，与
+/// `_AppShellState` 那套「返回键双层确认」共享同一个生命周期口径。
+///
+/// ## 为什么延迟 20 秒
+///
+/// 检查要发网盘请求、要写 SQLite。首帧还没出来就跟启动抢 IO 的话，用户看到
+/// 的是「开 App 卡一下」—— 而这个功能的价值是「不用自己想起来去查」，
+/// 晚 20 秒完全不影响，它抢掉的启动时间用户却立刻能感觉到。
+///
+/// ## ⛔ 两个定时器都必须在 `dispose` 里取消
+///
+/// 漏掉的话 widget 测试会在收尾时炸「A Timer is still pending even after the
+/// widget tree was disposed」—— 而它看起来像「加了段跟测试无关的代码，
+/// 一堆页面测试全红」，排查方向会完全跑偏。
+class _FollowLaunchCheck extends ConsumerStatefulWidget {
+  const _FollowLaunchCheck();
+
+  @override
+  ConsumerState<_FollowLaunchCheck> createState() => _FollowLaunchCheckState();
+}
+
+class _FollowLaunchCheckState extends ConsumerState<_FollowLaunchCheck> {
+  /// 启动延迟。见类文档「为什么延迟 20 秒」。
+  static const Duration _launchDelay = Duration(seconds: 20);
+
+  /// `every_6h` 那一档的周期。
+  ///
+  /// ⚠️ 与 `FollowAutoCheck.throttleWindow` 的 6 小时**是同一个数**，但
+  /// 刻意**不引用它**：定时器比窗口密的话，多出来的那些次会被节流闸挡掉、
+  /// 白转一圈（而且每次都要读一次设置 + 判一次 `off`）；比窗口疏则会漏掉
+  /// 窗口边界上的那一次。两个数一起改是必须的 —— 所以这里写死并留这条注释，
+  /// 而不是让「周期 = 窗口」变成一个隐式巧合。
+  static const Duration _timerPeriod = Duration(hours: 6);
+
+  Timer? _launch;
+  Timer? _periodic;
+
+  @override
+  void initState() {
+    super.initState();
+    _launch = Timer(_launchDelay, _checkOnce);
+  }
+
+  @override
+  void dispose() {
+    _launch?.cancel();
+    _periodic?.cancel();
+    super.dispose();
+  }
+
+  /// 启动那一次。
+  ///
+  /// ⛔ **不传 `force`**：走节流窗口、也走 `follow_auto_check = off` 的闸门。
+  ///    传 `true` 就变成「每次开 App 都真查一遍」，那是 `off` 想避免的事。
+  Future<void> _checkOnce() async {
+    if (!mounted) return;
+    await ref.read(followControllerProvider.notifier).start();
+    if (!mounted) return;
+    // 跑完再决定要不要挂周期定时器：这一项是用户可改的，而改设置**不会**
+    // 重建壳（设置页是壳里的一个分支），所以没有别的地方能挂上它。
+    _syncPeriodic();
+  }
+
+  void _syncPeriodic() {
+    final policy = ref.read(settingsProvider).valueOrNull?.followAutoCheck;
+    final want = policy?.runsOnTimer ?? false;
+
+    if (want && _periodic == null) {
+      _periodic = Timer.periodic(_timerPeriod, (_) {
+        // ⛔ 周期那几次同样走节流闸（不传 `force`）。用户在别处刚手动查过时，
+        //    这一次会被挡掉 —— 这是对的，不是漏跑。
+        //
+        // 会话中途把设置从「每 6 小时」改成别的档位时，这个定时器会继续存在，
+        // 但每一次 `start()` 都会被新的策略挡掉（`off` 直接跳过，
+        // `on_launch` 被 6 小时窗口挡住）—— 表现正确，只是白转一圈。
+        // 为此去 watch 设置、让整个壳跟着重建是不划算的。
+        ref.read(followControllerProvider.notifier).start();
+      });
+    } else if (!want && _periodic != null) {
+      _periodic!.cancel();
+      _periodic = null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.shrink();
 }
 
 /// 一级导航的根 widget —— 方向键兜底要在**它里面**找目标。

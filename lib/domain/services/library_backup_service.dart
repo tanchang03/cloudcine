@@ -44,9 +44,23 @@ class LibraryBackupService {
     required String posterCachePath,
     required String deviceId,
     required String deviceName,
-    int schemaVersion = 6,
+    // 写进备份清单的 schema 版本。
+    //
+    // ⛔ **必填**，且必须传 `AppDatabase.currentSchemaVersion`。
+    //    这里曾经有个 `= 6` 的默认值，而组合根没传 —— 于是**每一份备份的
+    //    清单里都写着 `schema=6`**，`importBackup` 的「备份来自更高版本」
+    //    校验（`manifest.schemaVersion > _schemaVersion`）永远为假、形同虚设。
+    //    去掉默认值就是为了让「忘了传」变成**编译错误**，而不是一个只在
+    //    排查兼容性问题时才暴露的静默错误（2026-10-07 实际踩到）。
+    required int schemaVersion,
     Future<DateTime?> Function()? localModifiedAt,
     void Function()? onLibraryReplaced,
+    // 覆盖库文件**之前**调用：组合根在这里关掉数据库连接。
+    Future<void> Function()? closeDatabase,
+    // 覆盖库文件**之后**调用：组合根在这里换一个**全新**的数据库实例
+    // （并借这次打开触发 schema 迁移）。⛔ 不是「重开旧连接」——
+    //    Drift 的 `close()` 是终局的，理由见 `_openDatabase` 的文档。
+    Future<void> Function()? openDatabase,
   })  : _adapter = adapter,
         _databasePath = databasePath,
         _posterCachePath = posterCachePath,
@@ -54,7 +68,9 @@ class LibraryBackupService {
         _deviceName = deviceName,
         _schemaVersion = schemaVersion,
         _localModifiedAt = localModifiedAt,
-        _onLibraryReplaced = onLibraryReplaced;
+        _onLibraryReplaced = onLibraryReplaced,
+        _closeDatabase = closeDatabase,
+        _openDatabase = openDatabase;
 
   final CloudDriveAdapter _adapter;
   final String _databasePath;
@@ -86,6 +102,31 @@ class LibraryBackupService {
   /// ⛔ 由组合根注入，领域层不 import Riverpod：这里只知道「库换了，
   ///    你该把你那边的缓存扔掉」。
   final void Function()? _onLibraryReplaced;
+
+  /// 覆盖库文件**之前**关连接。
+  ///
+  /// 只服务于「用备份包覆盖**整个**库文件」这一步：SQLite 连接还开着的时候
+  /// 文件被换掉，它手里的页缓存与文件句柄指向的仍是旧库。
+  ///
+  /// ⛔ 与 [openDatabase] 必须**成对**使用，中间夹着写文件那一步。
+  final Future<void> Function()? _closeDatabase;
+
+  /// 覆盖库文件**之后**把连接接回去（并借这次打开触发 schema 迁移）。
+  ///
+  /// ⛔⛔ 这里**不是**「把刚才那个连接重新打开」—— 实现方必须换一个**全新的**
+  ///    数据库实例。Drift 的 `close()` 是**终局**的：`_BaseExecutor._closed`
+  ///    一旦置位，之后任何查询都抛
+  ///    `StateError: Can't re-open a database after closing it. Please create a
+  ///    new database connection and open that instead.`
+  ///    （2026-10-07 的「恢复备份报错」正是这么写出来的：日志停在
+  ///    「数据库 N 字节」之后，因为 `writeAsBytes` 之后那句「重开」抛了，
+  ///    后面那行 `数据库已写入 …` 永远打不出来 —— 而库文件其实已经换掉了，
+  ///    于是应用进入「文件是新的、连接是死的」状态，重启才好。）
+  ///
+  /// 为什么非重开不可：Drift 只在**打开连接时**读一次 `PRAGMA user_version`，
+  /// 据此决定跑不跑 `onUpgrade`。不重开 ⇒ 迁移一步都不跑 ⇒ 磁盘上是旧结构、
+  /// 连接以为还是当前版本 ⇒ 碰新列的查询抛 `no such column: followed`。
+  final Future<void> Function()? _openDatabase;
 
   /// 备份包的 magic bytes。
   static const List<int> _magic = [0x43, 0x43, 0x42, 0x4B]; // 'CCBK'
@@ -220,7 +261,9 @@ class LibraryBackupService {
   /// 一行日志。UI 三条通道全部用默认的 `true`，所以这个分支当下够不到。
   /// 真要「保留本地设置」，做法是先写库、再打开数据库把本地设置回写一遍。
   ///
-  /// ⚠️ 恢复前应先关闭数据库连接，否则写入会被锁。
+  /// ⚠️ 恢复前必须先关掉数据库连接、写完再换一个**新实例**接回去 ——
+  /// 这两步由 [closeDatabase] / [openDatabase] 两个回调交给组合根做，
+  /// 缺了它们恢复一定坏（见 [openDatabase] 的文档）。
   Future<BackupManifest> importBackup(
     Uint8List bytes, {
     String? targetDbPath,
@@ -246,11 +289,24 @@ class LibraryBackupService {
     );
     diag.info('备份', '清单：$manifest');
 
-    // 3. 校验 schema 版本
+    // 3. 校验 schema 版本。
+    //
+    // ⛔ 两个方向都要说清楚，因为它们**都**会发生，而且**都**能正常工作
+    //    （第 5 步写完文件后会重开连接，Drift 按库文件里真实的 `user_version`
+    //    跑 `onUpgrade` 逐级补齐）：
+    //      · 更高版本（别人用新版 App 备份的）：本机代码不认识多出来的列，
+    //        迁移也补不回来，只能警告；
+    //      · 更低版本（v6 / v16 的老备份）：`onUpgrade` 会把缺的表 / 列逐级
+    //        补上 —— 这是**正常路径**，但必须留一行日志：一旦迁移失败，
+    //        排查的人得先知道「这份备份是旧的」。
     if (manifest.schemaVersion > _schemaVersion) {
       diag.warn('备份', '备份来自更高版本的数据库'
           '（${manifest.schemaVersion} > $_schemaVersion），'
-          '恢复后需要运行迁移');
+          '多出来的列会被忽略');
+    } else if (manifest.schemaVersion < _schemaVersion) {
+      diag.info('备份', '备份来自较低版本的数据库'
+          '（${manifest.schemaVersion} < $_schemaVersion），'
+          '恢复后会跑 schema 迁移补齐');
     }
 
     // 4. 提取数据库字节
@@ -274,12 +330,48 @@ class LibraryBackupService {
     final dbBytes = bytes.sublist(dbStart, dbEnd);
     diag.info('备份', '数据库 ${dbBytes.length} 字节');
 
-    // 5. 写入数据库文件
+    // 5. 写入数据库文件。
+    //
+    // ⛔⛔ **必须先关连接，写完再把连接接回来**。这是 2026-10-07 那次
+    //     「恢复备份后报 `no such column: followed`」的根因，两个后果都要说清楚：
+    //
+    //   ① **不关就写**：SQLite 连接还开着，文件被换掉之后它手里的页缓存与
+    //      文件句柄指向的仍是旧库。写入本身可能侥幸成功（`flush: true`），
+    //      于是日志里一切正常 —— 坏在下一步。
+    //
+    //   ② **不重开**：Drift 只在**打开连接时**读一次 `PRAGMA user_version`
+    //      并据此决定跑不跑 `onUpgrade`。连接没重开 ⇒ 它仍然认为库就是当前
+    //      版本 ⇒ **迁移一步都不跑**。而磁盘上的文件其实是旧版本的结构
+    //      （v16 没有 `followed` / `follow_started_at` / `follow_checked_at` /
+    //      `new_item_count` 四列）⇒ 恢复之后凡是碰追剧的查询都抛
+    //      `no such column`，**其它查询却正常** —— 表现就是「库看着恢复了，
+    //      但某个功能炸了」。
+    //
+    //   ⛔⛔ 而第 ② 步**不能**实现成「把刚才那个连接重新打开」：Drift 的
+    //      `close()` 是终局的，关掉之后任何查询都抛
+    //      `StateError: Can't re-open a database after closing it`。
+    //      实现方（组合根）必须换一个**全新实例**，详见 [_openDatabase] 的文档。
+    //      2026-10-07 第二轮就是栽在这里：库文件换掉了、连接却再也起不来，
+    //      用户看到「恢复失败：Bad state: Can't re-open a database…」，
+    //      而日志停在「数据库 1884160 字节」之后一行不多。
+    //
+    //    Android 端一直是对的（`LibraryDb.replaceWithRawBytes` 也是
+    //    `close() → writeBytes() → open()`）—— 它的 `open()` 会**重建**连接
+    //    并补表补列，不是重开旧连接。PC 端这次是照抄了前半句、漏了「重建」。
     final dbPath = targetDbPath ?? _databasePath;
     final dbFile = File(dbPath);
     await dbFile.parent.create(recursive: true);
+    if (_closeDatabase == null || _openDatabase == null) {
+      // ⛔ 缺这两个回调时**一定会坏**（见上），所以不能静默放过：
+      //    生产组合根必须注入；只做 export 的调用方（多为单测）可以不注入。
+      diag.warn('备份', '未注入 closeDatabase / openDatabase —— '
+          '覆盖库文件后不会重开连接，schema 迁移不会运行，'
+          '碰新列的查询会抛 no such column');
+    }
+    await _closeDatabase?.call();
     await dbFile.writeAsBytes(dbBytes, flush: true);
-    diag.info('备份', '数据库已写入 $dbPath');
+    await _openDatabase?.call();
+    diag.info('备份', '数据库已写入 $dbPath（已换新连接，迁移随之完成）');
 
     // 6. 恢复海报缓存（如果备份包含且指定了目标路径）
     final posterPath = targetPosterPath ?? _posterCachePath;

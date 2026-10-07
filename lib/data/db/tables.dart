@@ -309,6 +309,67 @@ class MediaWorks extends Table {
   IntColumn get introStartMs => integer().nullable()();
   IntColumn get introEndMs => integer().nullable()();
 
+  // -------------------------------------------------------------------
+  // 追剧 / 更新提醒（v17）
+  // -------------------------------------------------------------------
+  //
+  // 四列是一组，缺一列这个功能就不成立，所以放在一起读：
+  //
+  //   * [followed]            —— 用户开关（唯一由用户直接改的一列）
+  //   * [followStartedAt]     —— **追剧起点**（水位线 A，只在开启时写一次）
+  //   * [followCheckedAt]     —— **上次检查时刻**（水位线 B，每次检查成功后推进）
+  //   * [newItemCount]        —— 未读新增条数（海报墙角标上的数字）
+  //
+  // ## 判据全靠已有的 `media_items.firstSeenAt` 做差
+  //
+  //   * 本次新增   = `item.firstSeenAt > followCheckedAt`  → 累加进 [newItemCount]
+  //   * 追剧以来新增 = `item.firstSeenAt > followStartedAt` → 剧集行画 NEW 标签
+  //
+  // ⛔ **刻意不用 `media_items.modifiedAt`**：那是网盘给的文件修改时间，
+  //    **替换文件（换一版更高码率）也会变** —— 用它当判据会把「换了个版本」
+  //    误报成「更新了最新一集」。
+  //    `firstSeenAt` 只在行**首次插入**时写（`upsertItems` 的 `skipFirstSeen`
+  //    分支守着），是「我什么时候第一次见到这个文件」这个历史事实 ——
+  //    它才是「新集」的定义，而且对电影 / 综艺 / `kind=unknown` 一样成立。
+
+  /// 是否在追剧。
+  BoolColumn get followed => boolean().withDefault(const Constant(false))();
+
+  /// **追剧起点**（Unix 秒）。`null` = 没在追剧。
+  ///
+  /// ⛔ **只在用户开启追剧时写一次**，之后任何检查都**不推进它**。
+  ///
+  /// 它是剧集行 NEW 标签的基线：剧集行画 NEW 的判据是
+  /// `firstSeenAt > followStartedAt && maxPositionMs IS NULL` ——
+  /// 播过就自动消失，**不需要任何额外写入**。
+  ///
+  /// 反过来，如果每次检查都把它推到「现在」，NEW 标签会在检查的瞬间集体
+  /// 消失 —— 用户看到的是「刚提示有更新，点进去什么都没有」。
+  DateTimeColumn get followStartedAt => dateTime().nullable()();
+
+  /// **上次追更检查时刻**（Unix 秒）。`null` = 从没检查过（要建立基线）。
+  ///
+  /// ⛔ 这是**水位线**，只在检查**成功**后推进：目录列失败（超时 / 限流）时
+  ///    推进它，等于把这批新集永久划进「已经看过了」—— 用户再也不会被提醒。
+  ///    与全盘扫描那条「有目录列失败就不做陈旧清理」是同一条思路：
+  ///    白名单 / 水位线在自身不完整时是有害的，宁可这次不推进，下次重来。
+  DateTimeColumn get followCheckedAt => dateTime().nullable()();
+
+  /// 未读新增条数（角标数字）。
+  ///
+  /// ⛔ 是**增量累加 `+=`**，不是每次重算 `=`：重算会把用户已经清掉的角标
+  ///    又算回来（用户进过一次简介页，角标却在下一次检查时复活）。
+  ///    增量来源是「`firstSeenAt > followCheckedAt` 的条数」，而
+  ///    `followCheckedAt` 只前进不后退，所以同一条永远不会被数两次。
+  ///
+  /// ⛔ 清零只清这一列，**不动 [followStartedAt]** —— 动了的话剧集列表的
+  ///    NEW 标签会跟着一起消失，而用户还没看。
+  ///
+  /// 冗余存一列而不是每次查询现算（`listWorks` 对每个作品做一次子查询）：
+  /// 与 [itemCount] / [seasonCount] 同一条理由，海报墙上几百个格子，
+  /// 每个一次子查询就是几百次全表扫描。
+  IntColumn get newItemCount => integer().withDefault(const Constant(0))();
+
   @override
   Set<Column> get primaryKey => {key};
 }

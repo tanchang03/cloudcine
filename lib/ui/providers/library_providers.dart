@@ -7,6 +7,7 @@ import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/entities/subtitle_track.dart';
+import '../../domain/services/follow_read.dart';
 import '../../domain/services/item_sort.dart';
 import '../../domain/services/missing_media.dart';
 import '../../domain/services/play_target.dart';
@@ -61,6 +62,7 @@ class LibraryFilter {
   const LibraryFilter({
     this.category,
     this.playedOnly = false,
+    this.followedOnly = false,
     this.scrapedOnly = false,
     this.sort = WorkSort.recentModified,
     this.query = '',
@@ -89,6 +91,28 @@ class LibraryFilter {
   /// 这也让它和 [category] 天然互斥 —— 分类栏是单选组，两个同时高亮
   /// 只会让用户不知道列表到底在筛什么。
   final bool playedOnly;
+
+  /// 只看**在追**的剧 —— 分类栏上的「追剧」那一栏。
+  ///
+  /// ## 与 [playedOnly] 完全同类，与它**互斥**
+  ///
+  /// 它是**视图**不是分类：只影响查询，不落库、不参与 `MediaCategoryGuesser`
+  /// 的判定（那一位永远猜不出「追剧」）。分类栏是一个单选组，两栏同时高亮
+  /// 只会让用户不知道列表到底在筛什么，所以三者（分类 / 最近播放 / 追剧）
+  /// 两两互斥，见 [LibraryFilterController]。
+  ///
+  /// ## 为什么它不参与 [hasExtra]
+  ///
+  /// 与 [playedOnly] 同一条理由：它有自己的分类栏入口，不在筛选面板里，
+  /// 所以不该被「清空筛选」清掉、也不该进面板底部那个「已选 N 项」。
+  ///
+  /// ## 视图内「有更新的排最前」
+  ///
+  /// 排序仍然由 [sort] 决定，但仓储层在 `followedOnly` 时会把
+  /// `new_item_count > 0` 的排在最前（见 `MediaRepository.listWorks`）——
+  /// 「哪几部动了」正是用户点这一栏想看的，让它埋在「最近修改」里
+  /// 等于这一栏没做。
+  final bool followedOnly;
 
   /// 只看**刮削过**的作品 —— 筛选面板上的「已刮削」那一项。
   ///
@@ -149,6 +173,7 @@ class LibraryFilter {
   bool get isEmpty =>
       category == null &&
       !playedOnly &&
+      !followedOnly &&
       query.trim().isEmpty &&
       !hasExtra;
 
@@ -156,6 +181,7 @@ class LibraryFilter {
   bool get isDefault =>
       category == null &&
       !playedOnly &&
+      !followedOnly &&
       sort == WorkSort.recentModified &&
       query.trim().isEmpty &&
       !hasExtra;
@@ -163,6 +189,7 @@ class LibraryFilter {
   LibraryFilter copyWith({
     MediaCategory? category,
     bool? playedOnly,
+    bool? followedOnly,
     bool? scrapedOnly,
     WorkSort? sort,
     String? query,
@@ -173,6 +200,7 @@ class LibraryFilter {
     return LibraryFilter(
       category: clearCategory ? null : (category ?? this.category),
       playedOnly: playedOnly ?? this.playedOnly,
+      followedOnly: followedOnly ?? this.followedOnly,
       scrapedOnly: scrapedOnly ?? this.scrapedOnly,
       sort: sort ?? this.sort,
       query: query ?? this.query,
@@ -188,6 +216,7 @@ class LibraryFilter {
       other is LibraryFilter &&
       other.category == category &&
       other.playedOnly == playedOnly &&
+      other.followedOnly == followedOnly &&
       other.scrapedOnly == scrapedOnly &&
       other.sort == sort &&
       other.query == query &&
@@ -200,6 +229,7 @@ class LibraryFilter {
   int get hashCode => Object.hash(
         category,
         playedOnly,
+        followedOnly,
         scrapedOnly,
         sort,
         query,
@@ -216,7 +246,7 @@ class LibraryFilter {
       if (genres.isNotEmpty) genres.join("/"),
     ];
     return 'LibraryFilter('
-        '${playedOnly ? "最近播放" : (category?.label ?? "全部")}, '
+        '${followedOnly ? "追剧" : (playedOnly ? "最近播放" : (category?.label ?? "全部"))}, '
         '${sort.label}, "$query"'
         '${extra.isEmpty ? "" : ", ${extra.join(" · ")}"})';
   }
@@ -228,11 +258,20 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
 
   /// 传 `null` 表示「全部」。
   ///
-  /// 选分类会**退出**「最近播放」视图（见 [LibraryFilter.playedOnly]）。
+  /// 选分类会**退出**「最近播放」与「追剧」两个视图（见
+  /// [LibraryFilter.playedOnly] / [LibraryFilter.followedOnly]）。
   void setCategory(MediaCategory? category) {
     state = category == null
-        ? state.copyWith(clearCategory: true, playedOnly: false)
-        : state.copyWith(category: category, playedOnly: false);
+        ? state.copyWith(
+            clearCategory: true,
+            playedOnly: false,
+            followedOnly: false,
+          )
+        : state.copyWith(
+            category: category,
+            playedOnly: false,
+            followedOnly: false,
+          );
   }
 
   /// 切到「最近播放」视图。
@@ -249,8 +288,26 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
   void setPlayedOnly() {
     state = state.copyWith(
       playedOnly: true,
+      followedOnly: false,
       clearCategory: true,
       sort: WorkSort.recentPlayed,
+    );
+  }
+
+  /// 切到「追剧」视图。
+  ///
+  /// ## ⛔ 刻意**不动排序**
+  ///
+  /// [setPlayedOnly] 会顺带把排序切成「最近播放」，这里不这么做：追剧这一栏
+  /// 要看的不是「最近看了什么」，而是「哪几部动了」。而「哪几部动了」由
+  /// **仓储层**在 `followedOnly` 时把 `new_item_count > 0` 排到最前来表达
+  /// （见 `MediaRepository.listWorks`）—— 那是一个**稳定的**优先级，
+  /// 不是某一种排序档。改排序反而会把用户自己选的那一档悄悄换掉。
+  void setFollowedOnly() {
+    state = state.copyWith(
+      followedOnly: true,
+      playedOnly: false,
+      clearCategory: true,
     );
   }
 
@@ -563,6 +620,7 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
   final works = await ref.watch(mediaRepositoryProvider).listWorks(
         category: filter.category,
         playedOnly: filter.playedOnly,
+        followedOnly: filter.followedOnly,
         scrapedOnly: filter.scrapedOnly,
         query: query.isEmpty ? null : query,
         // 空集合与 `null` 在仓储里是同一件事（「这一维不限」），
@@ -628,6 +686,29 @@ final playedCountProvider = FutureProvider<int>((ref) {
   );
 });
 
+/// **有更新**的在追作品数（分类栏「追剧 N」上的那个数字）。
+///
+/// ## ⛔ 数的是 `new_item_count > 0`，不是「在追的作品数」
+///
+/// 与 Android 端 `LibraryDb.followedUpdateCount` 逐字同口径。这个数字是一个
+/// **提醒**（有 N 部动了），不是「你追了 N 部」的收藏计数 —— 后者在没更新时
+/// 也恒 > 0，那个角标就永远亮着，用户几天之后就不再看它了。
+///
+/// ## 刷新时机
+///
+///   * [libraryListSignalProvider]：追更检查查出新集后会推一次（写入方推信号）；
+///   * [playbackLibraryLinkProvider]：**进详情页会清角标**（那是「我看到了」），
+///     所以看完一集回来这个数字要跟着掉。它挂在播放链路上，不是最精确的
+///     时机，但清角标本来就发生在「用户主动去看了」的时刻，两者足够同步。
+final followedUpdateCountProvider = FutureProvider<int>((ref) {
+  ref.watch(libraryListSignalProvider);
+  ref.watch(playbackLibraryLinkProvider);
+  return _timedQuery(
+    '追剧角标',
+    () => ref.watch(mediaRepositoryProvider).countUpdatedWorks(),
+  );
+});
+
 /// 筛选面板两组选项的**共同作用域**：分类 / 「最近播放」/「已刮削」/ 搜索词。
 ///
 /// ## 为什么是这四个
@@ -646,16 +727,22 @@ final playedCountProvider = FutureProvider<int>((ref) {
 /// 用 `select` 而不是直接 `watch(libraryFilterProvider)` 是必须的：
 /// 后者会让「勾一个年份」也触发一次统计查询（白跑两遍全表扫描）。
 /// 记录（record）有结构相等，所以只有这四个值真的变了才会重算。
-({MediaCategory? category, bool playedOnly, bool scrapedOnly, String query})
+///
+/// ⛔ 「追剧」**在**这一组里：它的角标口径是「在追的作品里有哪些年份 /
+///    类型」，与「最近播放」完全对称。放出去的话，用户打开追剧栏会看到
+///    一堆只在**没在追**的作品里存在的年份，点下去是空列表 ——
+///    而面板的全部承诺就是「点下去至少有一条」。
+({MediaCategory? category, bool playedOnly, bool followedOnly, bool scrapedOnly, String query})
     _facetScope(Ref ref) {
-  final (category, playedOnly, scrapedOnly, query) = ref.watch(
+  final (category, playedOnly, followedOnly, scrapedOnly, query) = ref.watch(
     libraryFilterProvider.select(
-      (f) => (f.category, f.playedOnly, f.scrapedOnly, f.query),
+      (f) => (f.category, f.playedOnly, f.followedOnly, f.scrapedOnly, f.query),
     ),
   );
   return (
     category: category,
     playedOnly: playedOnly,
+    followedOnly: followedOnly,
     scrapedOnly: scrapedOnly,
     query: query.trim().isEmpty ? '' : query.trim(),
   );
@@ -679,6 +766,7 @@ final yearCountsProvider = FutureProvider<Map<int, int>>((ref) async {
     () => ref.watch(mediaRepositoryProvider).countWorksByYear(
           category: scope.category,
           playedOnly: scope.playedOnly,
+          followedOnly: scope.followedOnly,
           scrapedOnly: scope.scrapedOnly,
           query: scope.query.isEmpty ? null : scope.query,
         ),
@@ -699,6 +787,7 @@ final genreCountsProvider = FutureProvider<Map<String, int>>((ref) async {
     () => ref.watch(mediaRepositoryProvider).countWorksByGenre(
           category: scope.category,
           playedOnly: scope.playedOnly,
+          followedOnly: scope.followedOnly,
           scrapedOnly: scope.scrapedOnly,
           query: scope.query.isEmpty ? null : scope.query,
         ),
@@ -792,6 +881,28 @@ final workDetailProvider =
   // 为什么不能与 `PlaybackLibraryLink` 合并。
   ref.watch(playbackProgressSignalProvider);
 
+  // 库里被写过（扫描 / 发现 / 追更检查 / 批量刮削）也要重取。
+  //
+  // ⛔⛔ 少了这一句，**追更检查刚入库的新集在这一页里看不见** ——
+  //      2026-10-07 真实现场：用户点了「检查更新」，提示「有 1 部剧更新了
+  //      （共 2 集）」，打开详情页却还是那 11 行旧文件，点一下页头的「刷新」
+  //      才冒出 13 行。日志上一切正常（`[发现] 媒体 13（新增 2 / 已有 11）`、
+  //      `[追剧] 检查结束：… 新增 2`），因为库**确实**写对了 ——
+  //      错的是这一页没人通知它重读。
+  //
+  //      根因是「信号发给了谁」：写库的那几条路径推的是
+  //      `libraryWriteSignalProvider`（它的语义就是「库里数据变了，凡是读库
+  //      的视图都该重看」，见 `LibraryWriteSignal` 的文档），而这个 provider
+  //      当时只 watch 播放进度信号 —— 于是它不在那条链的下游里。
+  //      同一类「写完没刷新」在 `FollowController._refreshAfterWrite` 的
+  //      注释里被反复强调过（「漏掉它的表现是点了按钮毫无反应」），
+  //      这一次漏掉的是**文件列表本身**。
+  //
+  // 代价可接受：它的消费方只有「当前打开着的那**一个**详情页」，一次重取是
+  // 一部作品的四个查询；而扫描只在**整次结束**时推一次、批量刮削每部推一次。
+  // 与 `folderTreeProvider`（每次要读全表 20000 行）不是一个量级。
+  ref.watch(libraryWriteSignalProvider);
+
   final repo = ref.watch(mediaRepositoryProvider);
   var work = await repo.workByKey(key);
   if (work == null) return null;
@@ -817,6 +928,65 @@ final workDetailProvider =
   final maxPositions = await repo.maxPositions(
     items.map((i) => i.id).toList(growable: false),
   );
+
+  // ---- 「更新 N」角标跟着「看过没有」走 ----
+  //
+  // 判据：这一部作品下**还剩几条**「追剧之后新增、而且还没播过」的条目。
+  //
+  // ## 为什么在这里做
+  //
+  // 这个 provider 是**唯一**同时握着两样东西的地方：作品的 `followStartedAt`
+  // 与每一条的「播过没有」（`maxPositions`）。而它又恰好会在两种时机重跑 ——
+  // 打开详情页、以及每一条播放进度落库之后 —— 正是「角标该不该变」这件事
+  // 会发生变化的那两个时刻。
+  //
+  // ## ⛔ 判据必须与行级 NEW **同源**
+  //
+  // 行上的 `■ NEW` 与海报上的「更新 N」回答的是同一个问题的两个侧面
+  // （「哪几集是新的」/「还有几集没看」）。两处各判一遍的话，会出现
+  // 「列表里一条 NEW 都没有了、海报上还挂着 2」——而用户没有任何办法
+  // 清掉它。所以两边共用 [isNewSinceFollow] + [isItemWatched]。
+  //
+  // ## ⛔ 只下调，绝不上调
+  //
+  // 上调会让**打开一次详情页就可能凭空冒出角标**（这里的口径比
+  // `applyFollowCheck` 的累加更宽，理由见 `syncFollowReadCount` 的文档）。
+  // 上调的唯一入口是 `applyFollowCheck`。
+  //
+  // ## ⛔ 「看过没有」是两条记录取或，不是只看进度
+  //
+  // 2026-10-07 现场：用户点开一集只看了 2~3 秒就关窗 —— 进度上报的节流器
+  // 只在整十秒边界触发，`max_position_ms` 压根没被写过，于是 NEW 不消失、
+  // 角标也不动。用户的口径是「**只要点击了，就去掉 new 标记**」，所以
+  // 起播那一刻写的 `last_played_at`（已读回执）也算数。详见
+  // `domain/services/follow_read.dart`。
+  //
+  // 提成非空局部变量：`work` 是可变局部（上面「跟着走到目标」那一段会重新赋值），
+  // 而 Dart **不对被闭包捕获的可变局部变量做类型提升** —— 直接在闭包里用它
+  // 会报 `unchecked_use_of_nullable_value`。
+  final owner = work;
+  final remainingNew = items
+      .where((i) => owner.isNewSinceFollow(
+            firstSeenAt: i.firstSeenAt,
+            played: isItemWatched(i, maxPositions),
+          ))
+      .length;
+  if (remainingNew < owner.newItemCount) {
+    await repo.setFollowNewItemCount(owner.key, remainingNew);
+    // 海报墙上的角标与分类栏「追剧 N」读的是另外两份数据，得单独作废。
+    ref.invalidate(workListProvider);
+    ref.invalidate(followedUpdateCountProvider);
+    // 把**本次要返回的**那一份也改掉。
+    //
+    // ⛔ 这里刻意**不** `ref.invalidateSelf()`。试过，它会让「本次计算」产出的
+    //    那个 future **永远不完成** —— Riverpod 抛
+    //    `the provider was disposed during loading state, yet no value could be
+    //    emitted`，而详情页正是靠那个 future 拿数据的（单测直接超时）。
+    //    直接改手上这一份既省掉一次四查询，也不会把状态推回 loading ——
+    //    值本来就已知，没必要再回库问一遍。
+    work = owner.copyWith(newItemCount: remainingNew);
+  }
+
   return WorkDetail(
     work: work,
     items: items,

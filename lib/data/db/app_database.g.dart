@@ -2323,6 +2323,57 @@ class $MediaWorksTable extends MediaWorks
     type: DriftSqlType.int,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _followedMeta = const VerificationMeta(
+    'followed',
+  );
+  @override
+  late final GeneratedColumn<bool> followed = GeneratedColumn<bool>(
+    'followed',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("followed" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
+  static const VerificationMeta _followStartedAtMeta = const VerificationMeta(
+    'followStartedAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> followStartedAt =
+      GeneratedColumn<DateTime>(
+        'follow_started_at',
+        aliasedName,
+        true,
+        type: DriftSqlType.dateTime,
+        requiredDuringInsert: false,
+      );
+  static const VerificationMeta _followCheckedAtMeta = const VerificationMeta(
+    'followCheckedAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> followCheckedAt =
+      GeneratedColumn<DateTime>(
+        'follow_checked_at',
+        aliasedName,
+        true,
+        type: DriftSqlType.dateTime,
+        requiredDuringInsert: false,
+      );
+  static const VerificationMeta _newItemCountMeta = const VerificationMeta(
+    'newItemCount',
+  );
+  @override
+  late final GeneratedColumn<int> newItemCount = GeneratedColumn<int>(
+    'new_item_count',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(0),
+  );
   @override
   List<GeneratedColumn> get $columns => [
     key,
@@ -2355,6 +2406,10 @@ class $MediaWorksTable extends MediaWorks
     mergedInto,
     introStartMs,
     introEndMs,
+    followed,
+    followStartedAt,
+    followCheckedAt,
+    newItemCount,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -2596,6 +2651,39 @@ class $MediaWorksTable extends MediaWorks
         ),
       );
     }
+    if (data.containsKey('followed')) {
+      context.handle(
+        _followedMeta,
+        followed.isAcceptableOrUnknown(data['followed']!, _followedMeta),
+      );
+    }
+    if (data.containsKey('follow_started_at')) {
+      context.handle(
+        _followStartedAtMeta,
+        followStartedAt.isAcceptableOrUnknown(
+          data['follow_started_at']!,
+          _followStartedAtMeta,
+        ),
+      );
+    }
+    if (data.containsKey('follow_checked_at')) {
+      context.handle(
+        _followCheckedAtMeta,
+        followCheckedAt.isAcceptableOrUnknown(
+          data['follow_checked_at']!,
+          _followCheckedAtMeta,
+        ),
+      );
+    }
+    if (data.containsKey('new_item_count')) {
+      context.handle(
+        _newItemCountMeta,
+        newItemCount.isAcceptableOrUnknown(
+          data['new_item_count']!,
+          _newItemCountMeta,
+        ),
+      );
+    }
     return context;
   }
 
@@ -2738,6 +2826,24 @@ class $MediaWorksTable extends MediaWorks
         DriftSqlType.int,
         data['${effectivePrefix}intro_end_ms'],
       ),
+      followed:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.bool,
+            data['${effectivePrefix}followed'],
+          )!,
+      followStartedAt: attachedDatabase.typeMapping.read(
+        DriftSqlType.dateTime,
+        data['${effectivePrefix}follow_started_at'],
+      ),
+      followCheckedAt: attachedDatabase.typeMapping.read(
+        DriftSqlType.dateTime,
+        data['${effectivePrefix}follow_checked_at'],
+      ),
+      newItemCount:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.int,
+            data['${effectivePrefix}new_item_count'],
+          )!,
     );
   }
 
@@ -2884,6 +2990,44 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   /// **每次重扫都把用户标好的片头抹掉**，而用户只看到「跳片头时灵时不灵」。
   final int? introStartMs;
   final int? introEndMs;
+
+  /// 是否在追剧。
+  final bool followed;
+
+  /// **追剧起点**（Unix 秒）。`null` = 没在追剧。
+  ///
+  /// ⛔ **只在用户开启追剧时写一次**，之后任何检查都**不推进它**。
+  ///
+  /// 它是剧集行 NEW 标签的基线：剧集行画 NEW 的判据是
+  /// `firstSeenAt > followStartedAt && maxPositionMs IS NULL` ——
+  /// 播过就自动消失，**不需要任何额外写入**。
+  ///
+  /// 反过来，如果每次检查都把它推到「现在」，NEW 标签会在检查的瞬间集体
+  /// 消失 —— 用户看到的是「刚提示有更新，点进去什么都没有」。
+  final DateTime? followStartedAt;
+
+  /// **上次追更检查时刻**（Unix 秒）。`null` = 从没检查过（要建立基线）。
+  ///
+  /// ⛔ 这是**水位线**，只在检查**成功**后推进：目录列失败（超时 / 限流）时
+  ///    推进它，等于把这批新集永久划进「已经看过了」—— 用户再也不会被提醒。
+  ///    与全盘扫描那条「有目录列失败就不做陈旧清理」是同一条思路：
+  ///    白名单 / 水位线在自身不完整时是有害的，宁可这次不推进，下次重来。
+  final DateTime? followCheckedAt;
+
+  /// 未读新增条数（角标数字）。
+  ///
+  /// ⛔ 是**增量累加 `+=`**，不是每次重算 `=`：重算会把用户已经清掉的角标
+  ///    又算回来（用户进过一次简介页，角标却在下一次检查时复活）。
+  ///    增量来源是「`firstSeenAt > followCheckedAt` 的条数」，而
+  ///    `followCheckedAt` 只前进不后退，所以同一条永远不会被数两次。
+  ///
+  /// ⛔ 清零只清这一列，**不动 [followStartedAt]** —— 动了的话剧集列表的
+  ///    NEW 标签会跟着一起消失，而用户还没看。
+  ///
+  /// 冗余存一列而不是每次查询现算（`listWorks` 对每个作品做一次子查询）：
+  /// 与 [itemCount] / [seasonCount] 同一条理由，海报墙上几百个格子，
+  /// 每个一次子查询就是几百次全表扫描。
+  final int newItemCount;
   const MediaWorkRow({
     required this.key,
     required this.provider,
@@ -2915,6 +3059,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     this.mergedInto,
     this.introStartMs,
     this.introEndMs,
+    required this.followed,
+    this.followStartedAt,
+    this.followCheckedAt,
+    required this.newItemCount,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -2983,6 +3131,14 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     if (!nullToAbsent || introEndMs != null) {
       map['intro_end_ms'] = Variable<int>(introEndMs);
     }
+    map['followed'] = Variable<bool>(followed);
+    if (!nullToAbsent || followStartedAt != null) {
+      map['follow_started_at'] = Variable<DateTime>(followStartedAt);
+    }
+    if (!nullToAbsent || followCheckedAt != null) {
+      map['follow_checked_at'] = Variable<DateTime>(followCheckedAt);
+    }
+    map['new_item_count'] = Variable<int>(newItemCount);
     return map;
   }
 
@@ -3064,6 +3220,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           introEndMs == null && nullToAbsent
               ? const Value.absent()
               : Value(introEndMs),
+      followed: Value(followed),
+      followStartedAt:
+          followStartedAt == null && nullToAbsent
+              ? const Value.absent()
+              : Value(followStartedAt),
+      followCheckedAt:
+          followCheckedAt == null && nullToAbsent
+              ? const Value.absent()
+              : Value(followCheckedAt),
+      newItemCount: Value(newItemCount),
     );
   }
 
@@ -3103,6 +3269,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       mergedInto: serializer.fromJson<String?>(json['mergedInto']),
       introStartMs: serializer.fromJson<int?>(json['introStartMs']),
       introEndMs: serializer.fromJson<int?>(json['introEndMs']),
+      followed: serializer.fromJson<bool>(json['followed']),
+      followStartedAt: serializer.fromJson<DateTime?>(json['followStartedAt']),
+      followCheckedAt: serializer.fromJson<DateTime?>(json['followCheckedAt']),
+      newItemCount: serializer.fromJson<int>(json['newItemCount']),
     );
   }
   @override
@@ -3139,6 +3309,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'mergedInto': serializer.toJson<String?>(mergedInto),
       'introStartMs': serializer.toJson<int?>(introStartMs),
       'introEndMs': serializer.toJson<int?>(introEndMs),
+      'followed': serializer.toJson<bool>(followed),
+      'followStartedAt': serializer.toJson<DateTime?>(followStartedAt),
+      'followCheckedAt': serializer.toJson<DateTime?>(followCheckedAt),
+      'newItemCount': serializer.toJson<int>(newItemCount),
     };
   }
 
@@ -3173,6 +3347,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     Value<String?> mergedInto = const Value.absent(),
     Value<int?> introStartMs = const Value.absent(),
     Value<int?> introEndMs = const Value.absent(),
+    bool? followed,
+    Value<DateTime?> followStartedAt = const Value.absent(),
+    Value<DateTime?> followCheckedAt = const Value.absent(),
+    int? newItemCount,
   }) => MediaWorkRow(
     key: key ?? this.key,
     provider: provider ?? this.provider,
@@ -3206,6 +3384,12 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     mergedInto: mergedInto.present ? mergedInto.value : this.mergedInto,
     introStartMs: introStartMs.present ? introStartMs.value : this.introStartMs,
     introEndMs: introEndMs.present ? introEndMs.value : this.introEndMs,
+    followed: followed ?? this.followed,
+    followStartedAt:
+        followStartedAt.present ? followStartedAt.value : this.followStartedAt,
+    followCheckedAt:
+        followCheckedAt.present ? followCheckedAt.value : this.followCheckedAt,
+    newItemCount: newItemCount ?? this.newItemCount,
   );
   MediaWorkRow copyWithCompanion(MediaWorksCompanion data) {
     return MediaWorkRow(
@@ -3268,6 +3452,19 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               : this.introStartMs,
       introEndMs:
           data.introEndMs.present ? data.introEndMs.value : this.introEndMs,
+      followed: data.followed.present ? data.followed.value : this.followed,
+      followStartedAt:
+          data.followStartedAt.present
+              ? data.followStartedAt.value
+              : this.followStartedAt,
+      followCheckedAt:
+          data.followCheckedAt.present
+              ? data.followCheckedAt.value
+              : this.followCheckedAt,
+      newItemCount:
+          data.newItemCount.present
+              ? data.newItemCount.value
+              : this.newItemCount,
     );
   }
 
@@ -3303,7 +3500,11 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('updatedAt: $updatedAt, ')
           ..write('mergedInto: $mergedInto, ')
           ..write('introStartMs: $introStartMs, ')
-          ..write('introEndMs: $introEndMs')
+          ..write('introEndMs: $introEndMs, ')
+          ..write('followed: $followed, ')
+          ..write('followStartedAt: $followStartedAt, ')
+          ..write('followCheckedAt: $followCheckedAt, ')
+          ..write('newItemCount: $newItemCount')
           ..write(')'))
         .toString();
   }
@@ -3340,6 +3541,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     mergedInto,
     introStartMs,
     introEndMs,
+    followed,
+    followStartedAt,
+    followCheckedAt,
+    newItemCount,
   ]);
   @override
   bool operator ==(Object other) =>
@@ -3374,7 +3579,11 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.updatedAt == this.updatedAt &&
           other.mergedInto == this.mergedInto &&
           other.introStartMs == this.introStartMs &&
-          other.introEndMs == this.introEndMs);
+          other.introEndMs == this.introEndMs &&
+          other.followed == this.followed &&
+          other.followStartedAt == this.followStartedAt &&
+          other.followCheckedAt == this.followCheckedAt &&
+          other.newItemCount == this.newItemCount);
 }
 
 class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
@@ -3408,6 +3617,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<String?> mergedInto;
   final Value<int?> introStartMs;
   final Value<int?> introEndMs;
+  final Value<bool> followed;
+  final Value<DateTime?> followStartedAt;
+  final Value<DateTime?> followCheckedAt;
+  final Value<int> newItemCount;
   final Value<int> rowid;
   const MediaWorksCompanion({
     this.key = const Value.absent(),
@@ -3440,6 +3653,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.mergedInto = const Value.absent(),
     this.introStartMs = const Value.absent(),
     this.introEndMs = const Value.absent(),
+    this.followed = const Value.absent(),
+    this.followStartedAt = const Value.absent(),
+    this.followCheckedAt = const Value.absent(),
+    this.newItemCount = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   MediaWorksCompanion.insert({
@@ -3473,6 +3690,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.mergedInto = const Value.absent(),
     this.introStartMs = const Value.absent(),
     this.introEndMs = const Value.absent(),
+    this.followed = const Value.absent(),
+    this.followStartedAt = const Value.absent(),
+    this.followCheckedAt = const Value.absent(),
+    this.newItemCount = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : key = Value(key),
        provider = Value(provider),
@@ -3511,6 +3732,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<String>? mergedInto,
     Expression<int>? introStartMs,
     Expression<int>? introEndMs,
+    Expression<bool>? followed,
+    Expression<DateTime>? followStartedAt,
+    Expression<DateTime>? followCheckedAt,
+    Expression<int>? newItemCount,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -3544,6 +3769,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (mergedInto != null) 'merged_into': mergedInto,
       if (introStartMs != null) 'intro_start_ms': introStartMs,
       if (introEndMs != null) 'intro_end_ms': introEndMs,
+      if (followed != null) 'followed': followed,
+      if (followStartedAt != null) 'follow_started_at': followStartedAt,
+      if (followCheckedAt != null) 'follow_checked_at': followCheckedAt,
+      if (newItemCount != null) 'new_item_count': newItemCount,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -3579,6 +3808,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<String?>? mergedInto,
     Value<int?>? introStartMs,
     Value<int?>? introEndMs,
+    Value<bool>? followed,
+    Value<DateTime?>? followStartedAt,
+    Value<DateTime?>? followCheckedAt,
+    Value<int>? newItemCount,
     Value<int>? rowid,
   }) {
     return MediaWorksCompanion(
@@ -3612,6 +3845,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       mergedInto: mergedInto ?? this.mergedInto,
       introStartMs: introStartMs ?? this.introStartMs,
       introEndMs: introEndMs ?? this.introEndMs,
+      followed: followed ?? this.followed,
+      followStartedAt: followStartedAt ?? this.followStartedAt,
+      followCheckedAt: followCheckedAt ?? this.followCheckedAt,
+      newItemCount: newItemCount ?? this.newItemCount,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -3709,6 +3946,18 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     if (introEndMs.present) {
       map['intro_end_ms'] = Variable<int>(introEndMs.value);
     }
+    if (followed.present) {
+      map['followed'] = Variable<bool>(followed.value);
+    }
+    if (followStartedAt.present) {
+      map['follow_started_at'] = Variable<DateTime>(followStartedAt.value);
+    }
+    if (followCheckedAt.present) {
+      map['follow_checked_at'] = Variable<DateTime>(followCheckedAt.value);
+    }
+    if (newItemCount.present) {
+      map['new_item_count'] = Variable<int>(newItemCount.value);
+    }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
     }
@@ -3748,6 +3997,10 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('mergedInto: $mergedInto, ')
           ..write('introStartMs: $introStartMs, ')
           ..write('introEndMs: $introEndMs, ')
+          ..write('followed: $followed, ')
+          ..write('followStartedAt: $followStartedAt, ')
+          ..write('followCheckedAt: $followCheckedAt, ')
+          ..write('newItemCount: $newItemCount, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -7567,6 +7820,10 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       Value<String?> mergedInto,
       Value<int?> introStartMs,
       Value<int?> introEndMs,
+      Value<bool> followed,
+      Value<DateTime?> followStartedAt,
+      Value<DateTime?> followCheckedAt,
+      Value<int> newItemCount,
       Value<int> rowid,
     });
 typedef $$MediaWorksTableUpdateCompanionBuilder =
@@ -7601,6 +7858,10 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<String?> mergedInto,
       Value<int?> introStartMs,
       Value<int?> introEndMs,
+      Value<bool> followed,
+      Value<DateTime?> followStartedAt,
+      Value<DateTime?> followCheckedAt,
+      Value<int> newItemCount,
       Value<int> rowid,
     });
 
@@ -7760,6 +8021,26 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<int> get introEndMs => $composableBuilder(
     column: $table.introEndMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get followed => $composableBuilder(
+    column: $table.followed,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get followStartedAt => $composableBuilder(
+    column: $table.followStartedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get followCheckedAt => $composableBuilder(
+    column: $table.followCheckedAt,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get newItemCount => $composableBuilder(
+    column: $table.newItemCount,
     builder: (column) => ColumnFilters(column),
   );
 }
@@ -7922,6 +8203,26 @@ class $$MediaWorksTableOrderingComposer
     column: $table.introEndMs,
     builder: (column) => ColumnOrderings(column),
   );
+
+  ColumnOrderings<bool> get followed => $composableBuilder(
+    column: $table.followed,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get followStartedAt => $composableBuilder(
+    column: $table.followStartedAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get followCheckedAt => $composableBuilder(
+    column: $table.followCheckedAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get newItemCount => $composableBuilder(
+    column: $table.newItemCount,
+    builder: (column) => ColumnOrderings(column),
+  );
 }
 
 class $$MediaWorksTableAnnotationComposer
@@ -8052,6 +8353,24 @@ class $$MediaWorksTableAnnotationComposer
     column: $table.introEndMs,
     builder: (column) => column,
   );
+
+  GeneratedColumn<bool> get followed =>
+      $composableBuilder(column: $table.followed, builder: (column) => column);
+
+  GeneratedColumn<DateTime> get followStartedAt => $composableBuilder(
+    column: $table.followStartedAt,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<DateTime> get followCheckedAt => $composableBuilder(
+    column: $table.followCheckedAt,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get newItemCount => $composableBuilder(
+    column: $table.newItemCount,
+    builder: (column) => column,
+  );
 }
 
 class $$MediaWorksTableTableManager
@@ -8115,6 +8434,10 @@ class $$MediaWorksTableTableManager
                 Value<String?> mergedInto = const Value.absent(),
                 Value<int?> introStartMs = const Value.absent(),
                 Value<int?> introEndMs = const Value.absent(),
+                Value<bool> followed = const Value.absent(),
+                Value<DateTime?> followStartedAt = const Value.absent(),
+                Value<DateTime?> followCheckedAt = const Value.absent(),
+                Value<int> newItemCount = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaWorksCompanion(
                 key: key,
@@ -8147,6 +8470,10 @@ class $$MediaWorksTableTableManager
                 mergedInto: mergedInto,
                 introStartMs: introStartMs,
                 introEndMs: introEndMs,
+                followed: followed,
+                followStartedAt: followStartedAt,
+                followCheckedAt: followCheckedAt,
+                newItemCount: newItemCount,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -8181,6 +8508,10 @@ class $$MediaWorksTableTableManager
                 Value<String?> mergedInto = const Value.absent(),
                 Value<int?> introStartMs = const Value.absent(),
                 Value<int?> introEndMs = const Value.absent(),
+                Value<bool> followed = const Value.absent(),
+                Value<DateTime?> followStartedAt = const Value.absent(),
+                Value<DateTime?> followCheckedAt = const Value.absent(),
+                Value<int> newItemCount = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaWorksCompanion.insert(
                 key: key,
@@ -8213,6 +8544,10 @@ class $$MediaWorksTableTableManager
                 mergedInto: mergedInto,
                 introStartMs: introStartMs,
                 introEndMs: introEndMs,
+                followed: followed,
+                followStartedAt: followStartedAt,
+                followCheckedAt: followCheckedAt,
+                newItemCount: newItemCount,
                 rowid: rowid,
               ),
           withReferenceMapper:

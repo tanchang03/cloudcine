@@ -393,6 +393,48 @@ class LibraryDb(val file: File) {
     }
 
     /**
+     * 给**海报地址还是空的**作品补上网盘缩略图地址。
+     *
+     * ## 为什么必须有它（[insertMissingWorks] 是 `CONFLICT_IGNORE`）
+     *
+     * 作品行只在**新建**时写一次 `poster_url`，之后重扫一个字都不改 —— 那是对
+     * 的（已有地址可能是 PC 端刮削时挑好的那张图）。但代价是：某次扫描恰好
+     * 没拿到缩略图时（夸克对约 30% 的视频还没生成预览图，见
+     * `DriveEntry.previewUrl`），`poster_url` 就落成空值，**之后每次重扫都补
+     * 不上** —— 那部作品永远是一块「首字」灰块，而它名下明明有别的集带着图。
+     *
+     * 所以补这一条**只填空的**回填。
+     *
+     * ⛔ 判据里必须带空串：库里 `NULL` 与 `''` 两种都出现过（PC 端与 Android 端
+     *    写空的方式不同），只判 `IS NULL` 会让一半的空行漏掉。
+     * ⛔ 已有地址的行**一个字都不许改**：用户看到的可能是他亲手刮削过的那张海报。
+     *
+     * @param entries `作品键 → 网盘缩略图地址`。地址为空白的项会被跳过。
+     * @return 实际补上的行数。
+     */
+    fun backfillWorkPosterUrls(entries: Map<String, String>): Int {
+        if (entries.isEmpty()) return 0
+        val d = require()
+        var n = 0
+        d.beginTransaction()
+        try {
+            for ((key, url) in entries) {
+                if (url.isBlank()) continue
+                n += d.update(
+                    "media_works",
+                    ContentValues().apply { put("poster_url", url) },
+                    "key = ? AND (poster_url IS NULL OR poster_url = '')",
+                    arrayOf(key),
+                )
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+        return n
+    }
+
+    /**
      * 刮削之后这部作品该归到哪一栏。
      *
      * ## 为什么不能直接调 `MediaCategoryGuesser.guess`
@@ -437,6 +479,299 @@ class LibraryDb(val file: File) {
     }
 
     // ------------------------------------------------------------------
+    // 追剧 / 更新提醒（schema v17）
+    // ------------------------------------------------------------------
+    //
+    // 四列一组：`followed` / `follow_started_at` / `follow_checked_at` /
+    // `new_item_count`。完整口径见 `LibrarySchema` 与 `Work` 上的注释，
+    // 这里只重复三条最容易写错、且**错了不会报错**的：
+    //
+    //   1. ⛔ [setFollowed] **要**写 `updated_at`（用户显式动作 = 真实内容
+    //      变更，该跨端同步）；[applyFollowCheck] / [clearFollowBadge]
+    //      **绝不能**写它 —— 否则每次自动检查都会改同步判据
+    //      `libraryModifiedAt`，本机永远「看起来更新」，下一次同步无条件
+    //      上传，把另一台设备的播放进度盖掉。
+    //   2. ⛔ [applyFollowCheck] 里的计数是**增量累加**，不是重算 ——
+    //      重算会把用户刚清掉的角标又算回来。
+    //   3. ⛔ [clearFollowBadge] 只清计数，**不动 `follow_started_at`** ——
+    //      动了的话剧集列表的 NEW 标签会跟着消失，而用户还没看。
+
+    /**
+     * 打开 / 关闭一部作品的追剧。
+     *
+     * 开启时**同时建立两条水位线**：`follow_started_at = follow_checked_at = now`，
+     * 并把 `new_item_count` 清 0。三件事必须一起做：
+     *
+     *   - `follow_started_at = now` ⇒ 此刻之前入库的集**都不算新增**
+     *     （用户刚看完 12 集才开的追剧，不该把 12 集全标成 NEW）；
+     *   - `follow_checked_at = now` ⇒ 第一次检查只报「开启之后」的新增，
+     *     不会把开启那一刻之前扫到的东西重报一遍；
+     *   - `new_item_count = 0` ⇒ 角标从零开始。
+     *
+     * 关闭时四列一起清回默认。⛔ 清 `follow_started_at` 是**有意**的：
+     * 关掉再打开 = 「重新开始追」，之前的 NEW 标签全部作废。
+     *
+     * @param nowSec 由调用方注入是为了可测：水位线是「秒」级的，测试里
+     *   两次调用落在同一秒会让「开启前 / 开启后」的判据失效。
+     */
+    fun setFollowed(key: String, followed: Boolean, nowSec: Long = nowSec()) {
+        val values = ContentValues().apply {
+            put("followed", if (followed) 1 else 0)
+            if (followed) {
+                put("follow_started_at", nowSec)
+                put("follow_checked_at", nowSec)
+            } else {
+                putNull("follow_started_at")
+                putNull("follow_checked_at")
+            }
+            put("new_item_count", 0)
+            // ⛔ 这一列**要**写：开关追剧是用户的显式动作 = 真实内容变更，
+            //    该跨端同步 —— 否则「电脑上追了这部，电视上打开没有」。
+            //    （与 applyFollowCheck / clearFollowBadge 恰好相反。）
+            put("updated_at", nowSec)
+        }
+        require().update("media_works", values, "key = ?", arrayOf(key))
+    }
+
+    /**
+     * 清掉一部作品的未读更新角标（用户进了简介页 = 「我知道了」）。
+     *
+     * ⛔ **只清 `new_item_count`**：
+     *   * 不动 `follow_started_at` —— 剧集行的 NEW 标签靠它，那是「哪几集
+     *     是新的、我还没看」，与角标回答的不是同一个问题；
+     *   * 不动 `follow_checked_at` —— 那是水位线，动它会让下一次检查把
+     *     同一批新集重数一遍；
+     *   * 不动 `updated_at` —— 它参与同步判据 `libraryModifiedAt`，
+     *     写它会让本机永远「看起来更新」，下次同步无条件上传、
+     *     把另一台设备的播放进度盖掉。
+     */
+    fun clearFollowBadge(key: String) {
+        require().update(
+            "media_works",
+            ContentValues().apply { put("new_item_count", 0) },
+            "key = ?",
+            arrayOf(key),
+        )
+    }
+
+    /**
+     * 一次追更检查的写回（**一个事务**）。
+     *
+     * @param increments 作品 key → 本次新增条数。只放**有新增**的作品，
+     *   没新增的不必出现在里面（但仍要在 [checkedKeys] 里推进水位线）。
+     * @param checkedKeys 本次**成功检查过**的作品 key —— 水位线
+     *   `follow_checked_at` 只对这些作品推进。
+     *
+     * ⛔ **列目录失败的目录所覆盖的作品必须排除在 [checkedKeys] 之外**：
+     *    水位线是「已经看过这里了」的承诺，在没看成功时推进它，等于把这批
+     *    新集永久划进「已读」—— 用户再也不会被提醒，而且没有任何报错。
+     *    与全盘扫描那条「有目录列失败就不做陈旧清理」是同一条思路。
+     *
+     * ⛔ 不写 `updated_at`（本节顶部第 1 条）。
+     *
+     * ## 为什么先 SELECT 再逐条 UPDATE，而不是一条
+     * `SET new_item_count = new_item_count + ?`
+     *
+     * 与 `upsertItems` 里「在 Kotlin 侧合并」同一条理由：这个数只涉及
+     * **在追的那几部**（通常个位数到几十），多一次 SELECT 换来的是
+     * 「增量语义在代码里看得见」，而不是藏在一条 SQL 表达式里。
+     * 读回之后仍在**同一个事务**里写：中途失败时「水位线推进了、计数没加上」
+     * 这种半成品状态不会落库。
+     */
+    fun applyFollowCheck(
+        increments: Map<String, Int>,
+        checkedKeys: Collection<String>,
+        checkedAtSec: Long = nowSec(),
+    ) {
+        if (checkedKeys.isEmpty()) return
+        val d = require()
+        val keys = checkedKeys.toList()
+
+        val existing = HashMap<String, Int>(keys.size * 2)
+        for (chunk in keys.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT key, new_item_count FROM media_works WHERE key IN ($marks)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) existing[c.getString(0)] = c.getInt(1)
+            }
+        }
+
+        d.beginTransaction()
+        try {
+            for (key in keys) {
+                // 行在两次查询之间被删了（用户在详情页点了「移除整部」）：
+                // 跳过，不写一条 UPDATE 去影响 0 行。
+                val old = existing[key] ?: continue
+                val added = increments[key] ?: 0
+                d.execSQL(
+                    "UPDATE media_works SET follow_checked_at = ?, new_item_count = ? " +
+                        "WHERE key = ?",
+                    // ⛔ **增量累加**。重算（`= 本次新增数`）会把用户刚清掉的
+                    //    角标又算回来 —— 用户进过一次简介页，角标却在下一次
+                    //    检查时复活。
+                    arrayOf<Any?>(checkedAtSec, old + added, key),
+                )
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+    }
+
+    /** 全部**在追**的作品 key（只含 `merged_into IS NULL` 的行）。 */
+    fun followedWorkKeys(): List<String> {
+        val out = ArrayList<String>(32)
+        require().rawQuery(
+            "SELECT key FROM media_works WHERE followed = 1 AND merged_into IS NULL",
+            null,
+        ).use { c -> while (c.moveToNext()) out.add(c.getString(0)) }
+        return out
+    }
+
+    /**
+     * 这几部作品名下的**网盘目录**（已按 fid 去重），每个目录带上
+     * 「它覆盖到了哪些在追的作品」。
+     *
+     * ## 并集口径
+     *
+     * 与 [itemsForWork] 一致：跨目录归一时源行的 `group_key` **从不改写**，
+     * 所以「这部作品的文件在哪些目录」的正确答案是**并集** —— 只查目标
+     * 自己的 `group_key` 会漏掉被折叠进来的那些文件所在的目录，表现是
+     * 「合并过的剧永远收不到更新提醒」，而检查日志一切正常。
+     *
+     * ⛔ 顺带记下「源 → 目标」的反查表：文件行上只有**源**的 `group_key`，
+     *    而水位线只写在**目标**行上，所以回写时必须能把它翻译回目标。
+     *    少了这张表，被折叠过的剧会「列了目录、但水位线永远不推进」——
+     *    每检查一次就把同一批新集重报一次。
+     *
+     * ⛔ **必须去重**：一部剧的 12 集通常在同一个目录里，不去重就是
+     * 12 次列目录请求（而夸克有 QPS 限制）。
+     * ⛔ 空 `dir_id` 跳过：那是老库 / 手改过的行的兜底值，拿它去列目录
+     * 只会得到一次失败请求。
+     */
+    fun dirsForWorks(keys: Collection<String>): List<FollowDir> {
+        if (keys.isEmpty()) return emptyList()
+        val d = require()
+        val target = HashSet(keys)
+
+        val sourceToTarget = HashMap<String, String>(keys.size * 2)
+        for (chunk in keys.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT key, merged_into FROM media_works WHERE merged_into IN ($marks)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val src = c.getString(0) ?: continue
+                    // 链式合并是不允许的（见 `merged_into` 的注释），所以一层就够。
+                    // 目标不在在追集合里 = 折叠到一部**没在追**的作品上，
+                    // 它的文件不该算进任何在追作品的覆盖范围。
+                    val dst = c.getString(1) ?: continue
+                    if (!target.contains(dst)) continue
+                    sourceToTarget[src] = dst
+                }
+            }
+        }
+
+        val all = HashSet<String>(keys.size * 2)
+        all.addAll(keys)
+        all.addAll(sourceToTarget.keys)
+
+        val dirPathById = HashMap<String, String>()
+        val workKeysByDir = HashMap<String, MutableSet<String>>()
+        for (chunk in all.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT dir_id, dir_path, group_key FROM media_items WHERE group_key IN ($marks)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0)
+                    if (id.isNullOrEmpty()) continue
+                    val group = c.getString(2) ?: continue
+                    val owner = sourceToTarget[group] ?: group
+                    if (!target.contains(owner)) continue
+                    workKeysByDir.getOrPut(id) { HashSet() }.add(owner)
+                    if (!dirPathById.containsKey(id)) {
+                        // ⛔ 走包级的 `normalizeDirPath`（`DirPaths.kt`）：
+                        //    `dirPath` 参与 `groupKey` 的计算，少了尾斜杠会让
+                        //    同一个文件在追更检查里算出**另一个** groupKey ——
+                        //    表现是「检查完多出一部重复的作品」。
+                        dirPathById[id] = normalizeDirPath(c.getString(1).orEmpty())
+                    }
+                }
+            }
+        }
+
+        return dirPathById.map { (id, path) ->
+            FollowDir(id, path, workKeysByDir[id] ?: emptySet())
+        }
+    }
+
+    /**
+     * 这几部作品各自「**上次检查之后**新入库的条数」= `new_item_count` 的增量。
+     *
+     * 判据：`first_seen_at > COALESCE(follow_checked_at, follow_started_at)`。
+     *
+     * ## ⛔ 用 `COALESCE(checked, started)` 而不是裸 `checked`
+     *
+     * 只有 [setFollowed] 会把 `followed` 置 1，而它**同时**写两条水位线 ——
+     * 所以「`followed = 1` 但 `follow_checked_at IS NULL`」本该不存在。
+     * 但真出现了（手改的库、早期版本写的行）时，裸 `checked` 会让
+     * `first_seen_at > NULL` 恒为 NULL、计数恒为 0 —— 这部剧**永远不提醒**，
+     * 而且没有任何报错。退回 `follow_started_at` 是它的正确语义。
+     *
+     * ⛔ 两个都 `NULL` 时**必须**得到 0，不能退到 0（epoch）：那会把整部剧
+     *    算成新增（角标直接变成总集数）。SQLite 里 `x > NULL` 天然是 NULL、
+     *    COUNT 不计入，所以只要把 `COALESCE` 写进比较式就自动成立。
+     *
+     * ## ⛔ 按**并集**口径数（与 [itemsForWork] 一致）
+     *
+     * 被折叠进来的源作品名下的集**不在** `group_key = key` 里。只数存值的话，
+     * 合并过的剧角标会永远少报那几集 —— 而 [dirsForWorks] 已经按并集把目录
+     * 找齐了，两处口径不一致会让「检查到了新集但不报数」。
+     *
+     * 没在结果里的 key 视为 0（调用方不必先铺一遍零）。
+     */
+    fun pendingNewItemCounts(keys: Collection<String>): Map<String, Int> {
+        if (keys.isEmpty()) return emptyMap()
+        val out = HashMap<String, Int>(keys.size * 2)
+        val d = require()
+        for (chunk in keys.chunked(400)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT w.key, ("
+                    + "  SELECT COUNT(*) FROM media_items i "
+                    + "   WHERE i.group_key IN ("
+                    + "           SELECT w2.key FROM media_works w2 "
+                    + "            WHERE w2.key = w.key OR w2.merged_into = w.key) "
+                    + "     AND i.first_seen_at > "
+                    + "         COALESCE(w.follow_checked_at, w.follow_started_at)"
+                    + ") FROM media_works w WHERE w.key IN ($marks)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) out[c.getString(0)] = c.getInt(1)
+            }
+        }
+        return out
+    }
+
+    /**
+     * 有几部在追的作品带未读更新（分类栏「追剧 N」上的那个数字）。
+     *
+     * 与 [playedCount] 同类的角标计数：海报墙上不显示，只用于分类栏。
+     * ⛔ 数的是 `new_item_count > 0` 而不是 `followed = 1` —— 「追剧 N」
+     *    在电视上是一个**提醒**（有 N 部动了），不是「你追了 N 部」的
+     *    收藏计数。与 PC 端 `countUpdatedWorks` 逐字同口径。
+     */
+    fun followedUpdateCount(): Int = require().rawQuery(
+        "SELECT COUNT(*) FROM media_works WHERE merged_into IS NULL AND new_item_count > 0",
+        null,
+    ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+
+    // ------------------------------------------------------------------
     // 读：列表 / 详情
     // ------------------------------------------------------------------
 
@@ -467,10 +802,15 @@ class LibraryDb(val file: File) {
      *
      * 排序的收尾 tie-breaker（`year desc, title asc`）照抄 PC 端
      * `_orderingFor` —— 否则评分相同的一批作品每次刷新都换位置，像列表在乱跳。
+     *
+     * [followedOnly] 是「追剧」那一栏：只留在追的作品，并把**有未读更新的**
+     * 按 `new_item_count` 倒序顶到最前（其余仍按 [sort]）。它是一个与
+     * [playedOnly] 同类的**视图开关**，不是一个分类取值。
      */
     fun listWorks(
         sort: Sort = Sort.recentModified,
         playedOnly: Boolean = false,
+        followedOnly: Boolean = false,
         category: String? = null,
         years: Set<Int> = emptySet(),
         genres: Set<String> = emptySet(),
@@ -482,6 +822,7 @@ class LibraryDb(val file: File) {
         val (where, args) = workWhere(
             category = category,
             playedOnly = playedOnly,
+            followedOnly = followedOnly,
             scrapedOnly = scrapedOnly,
             years = years,
             genres = genres,
@@ -499,10 +840,16 @@ class LibraryDb(val file: File) {
             Sort.title -> "title ASC"
         }
 
+        // 追剧栏把「有更新的」顶到最前，其余仍按用户选的那套排序 —— 与 PC 端
+        // `listWorks` 里 `followedOnly ? [newItemCount desc, ...] : [...]` 逐字同形。
+        // ⛔ 这是**排序**而不是筛选：`followedOnly` 只决定「只看在追的」，
+        //    置顶是它附带的表达 —— 用户点进追剧栏，第一眼要看到哪几部动了。
+        val effectiveOrder = if (followedOnly) "new_item_count DESC, $order" else order
+
         val sql = buildString {
             append("SELECT $WORK_COLUMNS FROM media_works")
             append(" WHERE ").append(where)
-            append(" ORDER BY ").append(order)
+            append(" ORDER BY ").append(effectiveOrder)
             append(" LIMIT ").append(limit).append(" OFFSET ").append(offset)
         }
         return queryWorks(sql, args)
@@ -512,12 +859,42 @@ class LibraryDb(val file: File) {
         queryWorks("SELECT $WORK_COLUMNS FROM media_works WHERE key = ? LIMIT 1", arrayOf(key))
             .firstOrNull()
 
+    /**
+     * 「**还没刮削过**」的作品，按**最近修改倒序**（与作品墙默认排序同一口径）。
+     *
+     * ## 三条排除规则，每条都对应一种「刮了也是白刮」
+     *
+     *   * `merged_into IS NULL` —— 被跨目录归一折叠掉的行**不显示在墙上**
+     *     （全库的查询都带这一条）。刮它等于白花一个搜索词。
+     *   * `source = 'online'` —— 已经刮到了。**扫描后的自动刮削只补没刮过的**，
+     *     不重刮：重刮会把用户上次手动挑中的那条结果换成算法自己挑的
+     *     （与 PC 端 `ScanService` 那句「刮削在遍历之后单独跑，且只刮还没刮过
+     *     的作品」是同一条）。
+     *   * `source = 'manual'` —— 用户**亲手**改过片名 / 分类（PC 端
+     *     `customizeWork` 写的值）。这一类作品在线刮削**永远不许碰**：
+     *     用户清掉刮错的信息、自己敲了正确的片名，下一次扫描又给它刮回来，
+     *     那这个功能等于不存在。
+     *
+     * ⛔ 判据写 `source IS NULL` 一起兜住：老库（PC 端 v3 之前）没有这一列的值。
+     *
+     * @param limit 一次最多取多少部。批量刮削是串行的，几千部一次跑不完也没意义。
+     */
+    fun worksNeedingScrape(limit: Int = 500): List<Work> =
+        queryWorks(
+            "SELECT $WORK_COLUMNS FROM media_works " +
+                "WHERE merged_into IS NULL " +
+                "AND (source IS NULL OR (source <> 'online' AND source <> 'manual')) " +
+                "ORDER BY (last_modified_at IS NULL), last_modified_at DESC, " +
+                "year DESC, title ASC LIMIT $limit",
+            emptyArray(),
+        )
+
     // ------------------------------------------------------------------
     // 筛选：条件拼装
     // ------------------------------------------------------------------
 
     /**
-     * 把「分类 / 最近播放 / 已刮削 / 年份 / 类型 / 搜索词」拼成 WHERE 与参数。
+     * 把「分类 / 最近播放 / 追剧 / 已刮削 / 年份 / 类型 / 搜索词」拼成 WHERE 与参数。
      *
      * ⛔ **`listWorks` 与两个分面计数共用本函数**。分开写的话必然出现
      *    「列表 11 部、面板角标写 12」这种用户一眼看得见、却极难查的不一致
@@ -532,6 +909,7 @@ class LibraryDb(val file: File) {
     private fun workWhere(
         category: String? = null,
         playedOnly: Boolean = false,
+        followedOnly: Boolean = false,
         scrapedOnly: Boolean = false,
         years: Set<Int> = emptySet(),
         genres: Set<String> = emptySet(),
@@ -545,6 +923,14 @@ class LibraryDb(val file: File) {
         // 后者会把「上个月看过」也算成没看过，而这一栏的意思是「我看过的」，
         // 「最近」由排序负责。
         if (playedOnly) where.add("last_played_at IS NOT NULL")
+
+        // 「追剧」的判据就是那一列（`followed = 1`）。与 `playedOnly` 完全同类：
+        // 是一个**视图**（不落库、不参与分类判定），所以是一个独立的布尔开关，
+        // 而不是 `MediaCategory` 的一个取值 —— 照抄 PC 端
+        // `LibraryFilter.followedOnly` 的取舍。
+        // ⛔ 用 `= 1` 而不是 `IS TRUE`：SQLite 3.22 支持 `IS TRUE`，但本列是
+        //    `INTEGER NOT NULL DEFAULT 0`，`= 1` 走得到索引也更直白。
+        if (followedOnly) where.add("followed = 1")
 
         // 「已刮削」的判据是 `source = 'online'`，**不是**「有海报 / 有简介」——
         // PC 端特意避开了 `MediaWork.isScraped`，因为那一位还含 `manual`，
@@ -639,12 +1025,14 @@ class LibraryDb(val file: File) {
     fun yearCounts(
         category: String? = null,
         playedOnly: Boolean = false,
+        followedOnly: Boolean = false,
         scrapedOnly: Boolean = false,
         keyword: String? = null,
     ): Map<Int, Int> {
         val (where, args) = workWhere(
             category = category,
             playedOnly = playedOnly,
+            followedOnly = followedOnly,
             scrapedOnly = scrapedOnly,
             keyword = keyword,
         )
@@ -672,12 +1060,14 @@ class LibraryDb(val file: File) {
     fun genreCounts(
         category: String? = null,
         playedOnly: Boolean = false,
+        followedOnly: Boolean = false,
         scrapedOnly: Boolean = false,
         keyword: String? = null,
     ): Map<String, Int> {
         val (where, args) = workWhere(
             category = category,
             playedOnly = playedOnly,
+            followedOnly = followedOnly,
             scrapedOnly = scrapedOnly,
             keyword = keyword,
         )
@@ -1007,7 +1397,7 @@ class LibraryDb(val file: File) {
                             put("dir_id", it.dirId)
                             put("dir_path", it.dirPath)
                             it.sizeBytes?.let { v -> put("size_bytes", v) } ?: putNull("size_bytes")
-                            it.modifiedAt?.let { v -> put("modified_at", v) } ?: putNull("modified_at")
+                            it.modifiedAtSec?.let { v -> put("modified_at", v) } ?: putNull("modified_at")
                             // ⛔ 与新增分支同一条规矩：这三个**只在拿到值时才写**。
                             //    服务端这次没告诉我们时长，不等于这个文件没有时长 ——
                             //    写成 NULL 会把上一次的好值抹掉。
@@ -1058,7 +1448,7 @@ class LibraryDb(val file: File) {
                             put("container", it.container)
                             it.resolution?.let { v -> put("resolution", v) } ?: putNull("resolution")
                             it.sizeBytes?.let { v -> put("size_bytes", v) } ?: putNull("size_bytes")
-                            it.modifiedAt?.let { v -> put("modified_at", v) } ?: putNull("modified_at")
+                            it.modifiedAtSec?.let { v -> put("modified_at", v) } ?: putNull("modified_at")
                             // ⛔ 这三个**只在拿到值时才写**（不像邻居那样写 NULL）。
                             //    它们表达的是「服务端告诉我们多长 / 多大」，
                             //    拿不到 ≠ 文件没有时长。写成 NULL 会把上一次
@@ -1351,6 +1741,11 @@ class LibraryDb(val file: File) {
                         resumeFraction = c.doubleOrNull("resume_fraction")
                             ?.takeIf { it > 0.0 }
                             ?.coerceAtMost(1.0),
+                        // 追剧三列（schema v17）。读不到就当「没在追」——
+                        // 老库刚升级完那一次正是这个状态，与升级前表现一致。
+                        followed = c.boolOrFalse("followed"),
+                        followStartedAt = c.longOrNull("follow_started_at"),
+                        newItemCount = c.intOrNull("new_item_count") ?: 0,
                     ),
                 )
             }
@@ -1388,12 +1783,19 @@ class LibraryDb(val file: File) {
                         lastPlayedAt = c.longOrNull("last_played_at"),
                         // ⛔ **秒** —— 全库时间列都是秒（`LibraryDb` 类注释）。
                         //    这里换算成毫秒，好与网盘那边的 `updatedAtMs` 同单位。
-                        modifiedAt = c.longOrNull("modified_at")?.let { it * 1000L },
+                        //    ⛔ 字段名里的 `Ms` 就是这件事的**唯一**提醒：界面层
+                        //    再乘一次 1000 会得到公元 5 万年的时刻，而
+                        //    `Fmt.relativeTime` 只会把它显示成「刚刚」——
+                        //    2026-10-07 真的这么错过一次（简介页三行全「刚刚」）。
+                        modifiedAtMs = c.longOrNull("modified_at")?.let { it * 1000L },
                         thumbUrl = c.strOrNull("thumb_url"),
                         faceAnchorX = c.doubleOrNull("face_anchor_x"),
                         videoWidth = c.intOrNull("video_width"),
                         videoHeight = c.intOrNull("video_height"),
                         isSampleOrExtra = c.boolOrFalse("is_sample_or_extra"),
+                        // ⛔ **秒**，与其它时间列同单位（不是 `modifiedAtMs`）。
+                        //    剧集行 NEW 标签的基线就是它（`Work.isNewSinceFollow`）。
+                        firstSeenAt = c.longOrNull("first_seen_at"),
                     ),
                 )
             }
@@ -1431,6 +1833,10 @@ class LibraryDb(val file: File) {
             "key, kind, category, title, original_title, year, overview, poster_url, " +
                 "poster_file, poster_face_x, rating, genres, source, item_count, " +
                 "total_bytes, season_count, last_modified_at, first_seen_at, last_played_at, " +
+                // 追剧三列（schema v17）。⛔ `follow_checked_at` **刻意不在这里**：
+                // 它是检查期的水位线，只出现在 `applyFollowCheck` 的写语句里，
+                // 界面从来不看它 —— 与「不要为了完整把 31 列全搬进来」同一条。
+                "followed, follow_started_at, new_item_count, " +
                 "(SELECT MAX(CASE WHEN i.duration_ms > 0 AND i.resume_position_ms > 0 " +
                 "THEN CAST(i.resume_position_ms AS REAL) / i.duration_ms END) " +
                 "FROM media_items i WHERE i.group_key = media_works.key) AS resume_fraction"
@@ -1443,6 +1849,11 @@ class LibraryDb(val file: File) {
                 //    唯一依据（文件列表默认就按它倒序），而这一列从扫描那一刻
                 //    起就写在库里 —— 只是没人把它读进 `LibraryItem`。
                 "modified_at, " +
+                // ⛔ `first_seen_at` 同理：schema v1 就有，直到 v17 的追剧
+                //    「新集」标签才第一次被界面用到。它**只在行首次插入时写**，
+                //    所以是「这一集什么时候第一次出现在库里」的历史事实 ——
+                //    不能拿 `modified_at` 代替（换一版更高码率也会变）。
+                "first_seen_at, " +
                 "thumb_url, face_anchor_x, video_width, video_height, is_sample_or_extra"
 
         /** 当前 Unix 秒。⛔ 全库时间列都是秒，不是毫秒。 */

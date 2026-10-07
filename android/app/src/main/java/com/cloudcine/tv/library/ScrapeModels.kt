@@ -33,7 +33,19 @@ enum class ScrapeSource(val id: String) {
      *    [ScrapedMetadata.source] 与 PC 端同形，避免将来合并两端代码时
      *    出现「这边少一个取值」。
      */
-    local("local");
+    local("local"),
+
+    /**
+     * 用户**手工修改**（PC 端 `customizeWork` 写的值）。
+     *
+     * ⚠️ 与 [local] 同理，Android 端**不产出**它 —— 但库里**会有**：备份包把
+     *    PC 端的整张 `media_works` 原样搬过来，其中就有用户自定义过的行。
+     *
+     * ⛔ 它是**扫描后的自动刮削必须跳过**的那一类（见
+     *    [LibraryDb.worksNeedingScrape]）：用户清掉刮错的信息、自己敲了正确的
+     *    片名，下一次扫描又给他刮回来，那这个功能等于不存在。
+     */
+    manual("manual");
 
     companion object {
         /** 认不出来时退回 [online]（在线结果才是刮削的常态）。 */
@@ -128,6 +140,18 @@ data class ScrapeQuery(
      *    东西被硬塞进某一栏 —— 转换在 [wantsTv] 里做，且**只在明确时**才转。
      */
     val kind: String? = null,
+    /**
+     * 闸门要不要换成「**只认精确同名**」那一档（见 [ScrapeMatch.evaluate]）。
+     *
+     * ⛔ 取值由 [ScrapeQueryBuilder.requiresExactTitle] 算，**调用方不许自己拼**：
+     *    「电影且没有年份」这一类没有年份硬闸门兜底，只剩标题相似度，而
+     *    严格档的 0.6 阈值是为「有年份」定的 —— 它会放前缀误配通过
+     *    （`奥德赛` → `奥德赛：归来` 0.86）。少设这一个 `true`，用户看到的是
+     *    「这部片子刮到了另一部」而不是「没刮到」，代价完全不对称。
+     *
+     * 手动刮削（用户在候选里亲手挑）**不看这一档** —— 判断已经由人做过了。
+     */
+    val requireExactTitle: Boolean = false,
 ) {
     /**
      * 搜索时该偏重「剧集」还是「电影」。

@@ -118,6 +118,21 @@ void main() {
     await seed.customStatement(
       'ALTER TABLE media_items DROP COLUMN max_position_ms',
     );
+    // v17：`media_works` 的追剧 4 列。同一条规矩 —— 加列就要在这里配一行 DROP。
+    //
+    // ⛔ 2026-10-07 补：v17 落地时漏了这一组，于是这整份用例全红在
+    //    `duplicate column name: followed` 上 —— 而报错信息完全指不到这里
+    //    （加追剧列的人只跑了 `test/domain` 与 `test/ui`，没跑 `test/data`）。
+    await seed.customStatement('ALTER TABLE media_works DROP COLUMN followed');
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN follow_started_at',
+    );
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN follow_checked_at',
+    );
+    await seed.customStatement(
+      'ALTER TABLE media_works DROP COLUMN new_item_count',
+    );
     await seed.customStatement('PRAGMA user_version = 5');
     await seed.close();
 

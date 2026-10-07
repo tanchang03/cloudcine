@@ -272,6 +272,50 @@ class SettingKeys {
   /// 打不开，而用户丢掉的只是「最近记录」。判据只写在
   /// `MoveTargetsController._parse` 一处。
   static const String moveTargetRecents = 'move_target_recents';
+
+  /// **追更检查的全局节流零点**（Unix **秒**的十进制字符串，如 `"1780000000"`）。
+  ///
+  /// ## 为什么需要它，而不是只看作品级的 `follow_checked_at`
+  ///
+  /// `media_works.follow_checked_at` 是**逐部作品**的（每部剧各自的水位线），
+  /// 而「要不要现在就发起一次检查」是个**全局**问题 —— 没有这一列的话，
+  /// 每次进媒体库都要把每一部在追的剧重新查一遍。
+  ///
+  /// ## ⛔ 为什么是 Unix 秒，而不是 ISO8601
+  ///
+  /// 这个键**跨端**（Android 也要读写同一个字符串）。ISO8601 在这里有个
+  /// 隐蔽的坑：Dart 的 `DateTime.now().toIso8601String()` 是**本地时间且不带
+  /// 时区后缀**，微秒位数还随值变化（`.912` / `.912123`）—— 两端各用各的
+  /// 解析器（Dart `DateTime.tryParse` / Android `SimpleDateFormat`）时，
+  /// 只要有一边按 UTC 解析就会差出整整一个时区，而**两边都不报错**，
+  /// 表现是「节流窗口时灵时不灵」。
+  ///
+  /// Unix 秒是个纯整数，没有任何解释空间 —— 与全库时间列同一口径。
+  /// 读用 `readInt`（不是 `readDateTime`）。
+  ///
+  /// ## ⛔ 为什么放在 `settings` 表，而不是 `media_works`
+  ///
+  /// 同步判据 `libraryModifiedAt` = `MAX(media_works.updated_at)` ∪
+  /// `MAX(media_items.first_seen_at)` ∪ `MAX(media_items.last_played_at)`。
+  /// **`settings` 表不在其中** —— 所以写这个键**不会**让本机「看起来更新」，
+  /// 也就不会在下一次同步时无条件上传、把另一台设备的进度盖掉。
+  ///
+  /// 反过来，如果把它塞进 `media_works`（比如复用某个 `updated_at`），
+  /// 那么**每次自动检查都会改同步判据** —— 一台常开机的设备会永远赢下
+  /// LWW 比较，另一台设备看的进度就永远同步不上去。这是这个功能里最隐蔽的
+  /// 一条红线。
+  ///
+  /// ⚠️ 键名与 Android 端 `LibrarySettings.FOLLOW_LAST_CHECK_AT` **逐字一致**
+  /// （它在 `settings` 表里、随 `.ccbak` 备份包跨端走）。
+  static const String followLastCheckAt = 'follow_last_check_at';
+
+  /// 自动追更检查的策略。取值见 `FollowAutoCheck`：
+  /// `off` / `on_launch`（默认）/ `every_6h`。
+  ///
+  /// 与其它「缺失即用默认」的设置一样，判据只写在 `FollowAutoCheck.parse`
+  /// 一处 —— 它只认三个枚举名，其余（`null`、老版本写坏的值、手工改过的）
+  /// 一律退回默认。在这里再写一遍 `== '...'` 只会多出一处会漂移的默认值真源。
+  static const String followAutoCheck = 'follow_auto_check';
 }
 
 /// 通用键值设置存储。

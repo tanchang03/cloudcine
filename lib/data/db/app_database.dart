@@ -32,8 +32,17 @@ class AppDatabase extends _$AppDatabase {
   ///
   /// `createInBackground` 让建库/迁移跑在后台 isolate：媒体库首次扫描时
   /// 可能有几千次写入，放在主 isolate 会直接卡住 UI 线程。
+  ///
+  /// ⚠️ 顺手记下「申请打开」的时刻（见 [_openRequestedAt]）。**必须在这里
+  /// 记**，不能只在 [openAppDatabase] 里记：恢复备份是绕过 [openAppDatabase]
+  /// 直接 `AppDatabase.openFile(File(dbPath))` 的，只在那一个入口记的话，
+  /// 恢复时的 `beforeOpen` 会拿**启动那一刻**的旧时间戳去算，日志里于是出现
+  /// 「从申请打开起 19846ms」这种把启动后半小时都算进去的假数字
+  /// （2026-10-07 恢复备份时真的打出来过）。
   AppDatabase.openFile(File file)
-      : super(NativeDatabase.createInBackground(file));
+      : super(NativeDatabase.createInBackground(file)) {
+    _openRequestedAt = DateTime.now();
+  }
 
   /// 内存库（测试用）。
   AppDatabase.memory() : super(NativeDatabase.memory());
@@ -79,8 +88,28 @@ class AppDatabase extends _$AppDatabase {
   ///     已完成 / 失败 + 已下字节）。与 v14 的 `playback_prefs` 同一种改动：
   ///     **新表**，旧库升级后是空的，语义正好是「还没有任何下载任务」，
   ///     不需要回填。
+  /// v17：`media_works` 加 4 列 —— 追剧 / 更新提醒（`followed` /
+  ///     `followStartedAt` / `followCheckedAt` / `newItemCount`）。
+  ///     与 v11 / v12 同一种改动：**不需要回填**，因为 4 列的默认值
+  ///     （`false` / `NULL` / `NULL` / `0`）恰好表达「这部作品没在追剧」，
+  ///     升级后的行为与升级前完全一致（只是多了一次「没在追」的判定）。
+  ///
+  ///     ⛔ 这一版是**跨端契约**：Android 端 `LibrarySchema.VERSION` 必须同时
+  ///        改成 17，两边列名 / 类型 / 默认值逐字一致。只改一端的话，
+  ///        另一端 `restore` 之后 `user_version` 对不上，会直接
+  ///        `no such column: followed` —— 而且**没有任何迁移来兜底**。
+  /// 当前 schema 版本号（**静态常量**，供领域层引用）。
+  ///
+  /// ⛔ 必须是 `static const`：领域层 `LibraryBackupService` 要把它写进备份
+  ///    清单，而它拿不到 `AppDatabase` 实例。写不了常量就只能自己填一个字面量，
+  ///    而那个字面量会漂移 —— 曾经 `LibraryBackupService.schemaVersion`
+  ///    默认成 `6`，于是**所有备份清单里写的版本号都是 6**，
+  ///    `importBackup` 的「备份来自更高版本」校验（`> schemaVersion`）
+  ///    永远为假、形同虚设（2026-10-07 排查恢复报错时发现）。
+  static const int currentSchemaVersion = 17;
+
   @override
-  int get schemaVersion => 16;
+  int get schemaVersion => currentSchemaVersion;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -293,6 +322,28 @@ class AppDatabase extends _$AppDatabase {
             await m.createTable(downloadTasks);
             diag.info('数据库', '索引库已升级到 v16（下载任务表）');
           }
+          if (from < 17) {
+            // ⛔ 这一版**不需要回填**，且**不该回填**。
+            //
+            // 四列的默认值（`followed = false` / `follow_started_at = NULL` /
+            // `follow_checked_at = NULL` / `new_item_count = 0`）恰好表达
+            // 「这部作品没在追剧」，所以升级后所有作品都是「没在追」——
+            // 与升级前的行为完全一致（媒体库、排序、同步判据都不变）。
+            //
+            // ⚠️ 尤其**不要**「顺手把最近看过的作品标成追剧」：那会让用户
+            // 升级后莫名其妙多出一批追剧条目，而他从没开过这个开关 ——
+            // 而且这批条目会立刻开始发网盘请求。
+            //
+            // ⚠️ `follow_started_at` / `follow_checked_at` 留 NULL 是对的：
+            // 用户第一次点「追剧」时才写 `follow_started_at = now`，
+            // 那一刻之前入库的集**都不算新增**（`firstSeenAt < followStartedAt`）——
+            // 这正是「刚开启追剧时不该把已有的 12 集全标成 NEW」。
+            await m.addColumn(mediaWorks, mediaWorks.followed);
+            await m.addColumn(mediaWorks, mediaWorks.followStartedAt);
+            await m.addColumn(mediaWorks, mediaWorks.followCheckedAt);
+            await m.addColumn(mediaWorks, mediaWorks.newItemCount);
+            diag.info('数据库', '索引库已升级到 v17（追剧 / 更新提醒）');
+          }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，
             // 而空的 onUpgrade 会让「忘了写迁移」变成一个静默的数据损坏。
@@ -331,7 +382,10 @@ class AppDatabase extends _$AppDatabase {
   }
 }
 
-/// `openAppDatabase()` 被调用的时刻。
+/// 「申请打开索引库」的时刻。
+///
+/// 由 [AppDatabase.openFile] 写入 —— 启动与恢复备份两条路都经过它，所以
+/// 这个时间戳永远是**这一次**申请的，不会把两次混在一起。
 ///
 /// 用来在 `beforeOpen` 里算出「从申请到真正打开」的耗时 —— 库是**懒**打开的，
 /// 这个差值才是用户等的那一段（含迁移），而它发生在第一次查询时。
@@ -345,7 +399,6 @@ DateTime? _openRequestedAt;
 /// ⚠️ 这里**只申请、不真开**：`NativeDatabase.createInBackground` 是懒的，
 /// 真正的打开/迁移要等第一次查询（见 `beforeOpen` 里那条日志）。
 Future<AppDatabase> openAppDatabase() async {
-  _openRequestedAt = DateTime.now();
   final dir = await getApplicationSupportDirectory();
   if (!await dir.exists()) await dir.create(recursive: true);
   final file = File(p.join(dir.path, 'cloudcine.sqlite'));

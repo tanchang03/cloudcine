@@ -669,16 +669,55 @@ class MediaFilenameParser {
         ? (markerStart < 0 ? cleaned : '')
         : cleaned.substring(0, markerStart);
 
-    final title = _cleanTitle(rawTitle);
-    final scripts = _splitScripts(title ?? '');
+    var title = _cleanTitle(rawTitle);
 
     final lower = cleaned.toLowerCase();
     final tv = _matchEpisodePattern(lower);
     final resolution = VideoFormats.resolutionFromName(cleaned);
     final year = _pickYear(cleaned, markerStart);
 
+    // 2.6 「编号 + 空格 + 技术标记」= 没有片名，那个编号就是**集号**。
+    //
+    // 形如 `183 4K.mp4` / `178 4K.mp4` —— 压片组很常见的写法。
+    //
+    // 在此之前 `183` 被当成**片名**（`_isStandaloneRelease` 允许纯数字当名字，
+    // 那是为了《65》那部 2023 年的电影），后果是连着两步一起坏：
+    //
+    //   ① 集号是空的；
+    //   ② 紧接着的**目录级归组**把这条文件判成「自己说不清楚」，用目录名顶掉
+    //      `title` 的同时**连季集号一起清掉**（`season = null; episode = null;`
+    //      是防 `格力空调显示E6` 那条事故的守卫，见 `parse` 里那一段）。
+    //
+    // 净效果就是这些条目在库里没有集号：列表里以文件名示人、按「季→集」排的
+    // 顺序里全部垫底、`PlayTarget` 也选不准 —— 而它们其实清清楚楚写着第几集。
+    // 2026-10-07 现场：追剧检查把 `183 4K.mp4` 当「新集」报了，用户在详情页
+    // 却认不出它是第 183 集。
+    //
+    // ⛔ 三条守卫缺一不可：
+    //    ① 提出来的是一个**纯数字**（`^\d{1,4}$`）—— 有真片名的不进这条路，
+    //       `182.格力空调显示E6如何维修.mp4` 因此完全不受影响；
+    //    ② 编号与标记之间**只隔空格**（不是 `.`）—— 点分隔的
+    //       `65.2023.2160p…mkv`（片名就叫《65》的 2023 年电影）被挡住；
+    //    ③ 整串**没有年份**、且**确实存在技术标记**（`markerStart > 0`）——
+    //       `183.mp4` / `159.mkv` 这种「整串就是一个编号」的老行为不变
+    //       （它们仍然按「编号当片名」处理，由目录级归组决定去留）。
+    final bareEpisode = (tv == null &&
+            year == null &&
+            markerStart > 0 &&
+            title != null &&
+            _pureNumber.hasMatch(title))
+        ? int.tryParse(title)
+        : null;
+
+    // 编号既然当集号用掉了，就不能再占着「片名」的位置：留着的话上面那个
+    // 「提不出片名就用目录名兜底」不生效（`title` 非空），这一条会变成
+    // 一部叫「183」的独立作品 —— 正是它现在在库里的样子。
+    if (bareEpisode != null) title = null;
+
+    final scripts = _splitScripts(title ?? '');
+
     final flags = _flagsOf(lower);
-    final kind = (tv != null)
+    final kind = (tv != null || bareEpisode != null)
         ? MediaKind.episode
         : ((title ?? '').isNotEmpty
             ? MediaKind.movie
@@ -693,7 +732,7 @@ class MediaFilenameParser {
       latinTitle: scripts.latin,
       year: year,
       season: tv?.season,
-      episode: tv?.episode,
+      episode: tv?.episode ?? bareEpisode,
       episodeEnd: tv?.episodeEnd,
       part: partInfo.index,
       partLabel: partInfo.label,

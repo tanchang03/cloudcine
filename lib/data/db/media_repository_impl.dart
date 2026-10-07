@@ -10,6 +10,7 @@ import '../../core/utils/media_category.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/video_formats.dart';
 import '../../domain/adapters/media_repository.dart';
+import '../../domain/entities/follow_dir.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/entities/playback_preference.dart';
@@ -18,6 +19,26 @@ import '../../domain/entities/subtitle_track.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_cursor.dart';
 import 'app_database.dart';
+
+/// 把 [list] 按每段最多 [size] 个切成若干片（顺序不变）。
+///
+/// ⛔ 这里**刻意不用 `package:collection` 的 `chunked`**：本机 pub-cache 里的
+///    collection 1.19.1 没有这个方法（实测报 `undefined_method`），
+///    而这段逻辑只有四行，不值得为它引一个包、更不值得让「能不能编译」
+///    取决于一个第三方包里有没有某个扩展方法。
+///
+/// 用途只有一个：`IN (…)` 的占位符数量上限。SQLite 的
+/// `SQLITE_MAX_VARIABLE_NUMBER` 是 **999**，超了直接抛
+/// `too many SQL variables`。
+List<List<T>> _chunkedList<T>(List<T> list, int size) {
+  if (list.isEmpty) return const [];
+  final out = <List<T>>[];
+  for (var i = 0; i < list.length; i += size) {
+    final end = i + size;
+    out.add(list.sublist(i, end < list.length ? end : list.length));
+  }
+  return out;
+}
 
 /// 基于 drift 的媒体索引库实现。
 ///
@@ -32,6 +53,13 @@ class DriftMediaRepository implements MediaRepository {
   DriftMediaRepository(this._db);
 
   final AppDatabase _db;
+
+  /// `IN (…)` 里一次最多塞几个占位符。
+  ///
+  /// SQLite 的变量上限是 **999**（`SQLITE_MAX_VARIABLE_NUMBER`），超了直接抛
+  /// `too many SQL variables`。留出余量取 400，与 Android 端
+  /// `LibraryDb.refreshWorkStats` / `pruneMissingItems` 用的是同一个数字。
+  static const int _sqlChunk = 400;
 
   // -------------------------------------------------------------------
   // 写入
@@ -494,6 +522,18 @@ class DriftMediaRepository implements MediaRepository {
       // 与播放偏好无关。
       introStartMs: existing.introStartMs,
       introEndMs: existing.introEndMs,
+      // ⚠️ 追剧四列与 `mergedInto` / `introStartMs` **同一条规矩**：本次扫描
+      // 造出来的行这四列恒为默认值（`WorkSeed.build` 不填它们），照抄新值
+      // 等于**每次重扫都取消追剧、并把角标清零** —— 用户看到的是
+      // 「明明在追的剧，扫一次就不追了」，而他什么都没做。
+      //
+      // 也不能走 `protect`：那是「元数据要不要被刮削覆盖」的开关，
+      // 与追更状态无关，重刮削（`incoming.source == online`）时它是 `false`，
+      // 那时照样会把追剧状态抹掉。这一组与刮削无关，所以无条件取旧值。
+      followed: existing.followed,
+      followStartedAt: existing.followStartedAt,
+      followCheckedAt: existing.followCheckedAt,
+      newItemCount: existing.newItemCount,
       updatedAt: ts,
     );
   }
@@ -880,6 +920,250 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   // -------------------------------------------------------------------
+  // 追剧 / 更新提醒（schema v17）
+  // -------------------------------------------------------------------
+
+  @override
+  Future<void> setFollowed(String key, bool followed, {DateTime? now}) async {
+    final ts = now ?? DateTime.now();
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      followed
+          // 开启：**两条水位线一起建立**（理由见接口文档）。
+          //
+          // `followStartedAt = now` 这一条尤其重要：它让「此刻之前入库的集」
+          // 全部落在水位线**左边**，于是 `isNewSinceFollow` 对它们返回 false ——
+          // 用户刚看完 12 集才开的追剧，不会看到 12 个 NEW 标签。
+          ? MediaWorksCompanion(
+              followed: const Value(true),
+              followStartedAt: Value(ts),
+              followCheckedAt: Value(ts),
+              newItemCount: const Value(0),
+              // ⛔ 这一列**要**写。开关追剧是用户的显式动作 = 真实内容变更，
+              // 该跨端同步 —— 否则「电脑上追了这部，电视上打开没有」。
+              // （与 `applyFollowCheck` / `setFollowNewItemCount` 恰好相反。）
+              updatedAt: Value(ts),
+            )
+          // 关闭：四列一起清回默认。⛔ 清 `followStartedAt` 是**有意**的 ——
+          // 关掉再打开 = 「重新开始追」，之前的 NEW 标签全部作废。
+          : MediaWorksCompanion(
+              followed: const Value(false),
+              followStartedAt: const Value(null),
+              followCheckedAt: const Value(null),
+              newItemCount: const Value(0),
+              updatedAt: Value(ts),
+            ),
+    );
+  }
+
+  @override
+  Future<void> setFollowNewItemCount(String key, int count) async {
+    // ⛔ 三件事都不能做，每一件都有具体后果：
+    //
+    //   * 不动 `followStartedAt` —— 剧集行的 NEW 标签靠它，动了的话
+    //     「哪几集是新的、我还没看」会跟着角标一起消失；
+    //   * 不动 `followCheckedAt` —— 那是水位线，动它会让下一次检查把
+    //     同一批新集重数一遍；
+    //   * 不动 `updatedAt` —— 它参与同步判据 `libraryModifiedAt`，
+    //     写它会让本机永远「看起来更新」，下次同步无条件上传、
+    //     把另一台设备的播放进度盖掉。
+    //
+    // 用 `const MediaWorksCompanion` 而不是 `MediaWork.copyWith` 走
+    // `_workCompanion`：后者是**整行写**，会把上面三列一起带上。
+    //
+    // 只有一个 `UPDATE`、没有「先读后写」：`count` 由调用方算好
+    // （`syncFollowReadCount` / 详情页），这里不重算也不累加 —— 累加是
+    // `applyFollowCheck` 的事，两者口径不同（见接口文档）。
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key)))
+        .write(MediaWorksCompanion(newItemCount: Value(count)));
+  }
+
+  @override
+  Future<void> applyFollowCheck({
+    required Map<String, int> increments,
+    required Set<String> checkedKeys,
+    required DateTime checkedAt,
+  }) async {
+    if (checkedKeys.isEmpty) return;
+
+    // 先读回旧计数再写 —— 而不是 `SET new_item_count = new_item_count + ?`
+    // 那样一条 SQL。理由与 `upsertWorks` 里「在 Dart 侧合并」同一条：
+    // 这个数只涉及**在追的那几部**（通常个位数到几十），多一次 SELECT
+    // 换来的是「增量语义在代码里看得见」，而不是藏在一条 SQL 表达式里。
+    //
+    // 读回之后仍在**同一个 batch**（= 一个事务）里写：中途失败时
+    // 「水位线推进了、计数没加上」这种半成品状态不会落库。
+    final keys = checkedKeys.toList(growable: false);
+    final existing = <String, int>{};
+    for (final chunk in _chunkedList(keys, _sqlChunk)) {
+      final rows = await (_db.selectOnly(_db.mediaWorks)
+            ..addColumns([_db.mediaWorks.key, _db.mediaWorks.newItemCount])
+            ..where(_db.mediaWorks.key.isIn(chunk)))
+          .get();
+      for (final r in rows) {
+        existing[r.read(_db.mediaWorks.key)!] =
+            r.read(_db.mediaWorks.newItemCount) ?? 0;
+      }
+    }
+
+    await _db.batch((b) {
+      for (final key in keys) {
+        final old = existing[key];
+        // 行在两次查询之间被删了（用户在详情页点了「移除整部」）：
+        // 跳过，不写一条 UPDATE 去影响 0 行。
+        if (old == null) continue;
+        final added = increments[key] ?? 0;
+        b.update(
+          _db.mediaWorks,
+          MediaWorksCompanion(
+            followCheckedAt: Value(checkedAt),
+            // ⛔ **增量累加**。重算（`= 本次新增数`）会把用户刚清掉的角标
+            //    又算回来 —— 用户进过一次简介页，角标却在下一次检查时复活。
+            newItemCount: Value(old + added),
+            // ⛔ 这里**没有** `updatedAt`，而且不能加。见接口文档第 1 条。
+          ),
+          where: (t) => t.key.equals(key),
+        );
+      }
+    });
+  }
+
+  @override
+  Future<List<String>> followedWorkKeys() async {
+    final rows = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([_db.mediaWorks.key])
+          ..where(_db.mediaWorks.followed.equals(true) &
+              _db.mediaWorks.mergedInto.isNull()))
+        .get();
+    return rows
+        .map((r) => r.read(_db.mediaWorks.key)!)
+        .toList(growable: false);
+  }
+
+  @override
+  Future<List<FollowDir>> dirsForWorks(List<String> keys) async {
+    if (keys.isEmpty) return const [];
+
+    final target = keys.toSet();
+
+    // 并集口径：目标自己的 `group_key` ∪ 「被折叠进它们」的源行的 `group_key`。
+    // 跨目录归一从不改写 `media_items.group_key`，所以只查目标会漏掉被折叠
+    // 进来的那些文件所在的目录 —— 表现是「合并过的剧永远收不到更新提醒」，
+    // 而检查日志一切正常。
+    //
+    // ⛔ 顺带记下「源 → 目标」的反查表：文件行上只有**源**的 `group_key`，
+    //    而水位线只写在**目标**行上，所以回写时必须能把它翻译回目标。
+    //    少了这张表，被折叠过的剧会「列了目录、但水位线永远不推进」——
+    //    每检查一次就把同一批新集重报一次。
+    final sourceToTarget = <String, String>{};
+    for (final chunk in _chunkedList(keys, _sqlChunk)) {
+      final rows = await (_db.selectOnly(_db.mediaWorks)
+            ..addColumns([_db.mediaWorks.key, _db.mediaWorks.mergedInto])
+            ..where(_db.mediaWorks.mergedInto.isIn(chunk)))
+          .get();
+      for (final r in rows) {
+        final src = r.read(_db.mediaWorks.key);
+        final dst = r.read(_db.mediaWorks.mergedInto);
+        if (src == null || dst == null) continue;
+        // 链式合并是不允许的（见 `MediaWorks.mergedInto` 的注释），所以一层
+        // 就够。`dst` 不在目标集合里 = 折叠到一部**没在追**的作品上，
+        // 它的文件不该算进任何在追作品的覆盖范围。
+        if (!target.contains(dst)) continue;
+        sourceToTarget[src] = dst;
+      }
+    }
+
+    final all = <String>{...keys, ...sourceToTarget.keys};
+
+    // 按 fid 去重。一部剧的 12 集通常在同一个目录里，不去重就是 12 次
+    // 列目录请求，而夸克有 QPS 限制。
+    final dirPathById = <String, String>{};
+    final workKeysByDir = <String, Set<String>>{};
+    for (final chunk in _chunkedList(all.toList(growable: false), _sqlChunk)) {
+      final rows = await (_db.selectOnly(_db.mediaItems)
+            ..addColumns([
+              _db.mediaItems.dirId,
+              _db.mediaItems.dirPath,
+              _db.mediaItems.groupKey,
+            ])
+            ..where(_db.mediaItems.groupKey.isIn(chunk)))
+          .get();
+      for (final r in rows) {
+        final id = r.read(_db.mediaItems.dirId);
+        // 空 `dir_id` 是老库 / 手改过的行的兜底值：拿它去列目录只会得到
+        // 一次失败请求，跳过更干净。
+        if (id == null || id.isEmpty) continue;
+        final group = r.read(_db.mediaItems.groupKey);
+        if (group == null) continue;
+        final owner = sourceToTarget[group] ?? group;
+        if (!target.contains(owner)) continue;
+        (workKeysByDir[id] ??= <String>{}).add(owner);
+        dirPathById.putIfAbsent(
+          id,
+          // ⛔ 归一成带尾斜杠：`dirPath` 参与 `groupKey` 的计算，
+          //    少了尾斜杠会让同一个文件在追更检查里算出**另一个**
+          //    groupKey，表现是「检查完多出一部重复的作品」。
+          () => drivePathWithTrailingSlash(
+            r.read(_db.mediaItems.dirPath) ?? driveRootPath,
+          ),
+        );
+      }
+    }
+    return [
+      for (final e in dirPathById.entries)
+        FollowDir(
+          dirId: e.key,
+          dirPath: e.value,
+          workKeys: workKeysByDir[e.key] ?? const <String>{},
+        ),
+    ];
+  }
+
+  @override
+  Future<int> countUpdatedWorks() async {
+    final expr = _db.mediaWorks.key.count();
+    final row = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([expr])
+          ..where(_db.mediaWorks.newItemCount.isBiggerThanValue(0) &
+              _db.mediaWorks.mergedInto.isNull()))
+        .getSingle();
+    return row.read(expr) ?? 0;
+  }
+
+  @override
+  Future<Map<String, int>> pendingNewItemCounts(List<String> keys) async {
+    if (keys.isEmpty) return const {};
+
+    final out = <String, int>{};
+    for (final chunk in _chunkedList(keys, _sqlChunk)) {
+      final marks = List.filled(chunk.length, '?').join(', ');
+      // ⛔ 三段都不能省：
+      //   * `IN (SELECT … merged_into = w.key)` —— 并集口径（被折叠进来的
+      //     源作品名下的集不在 `group_key = w.key` 里）；
+      //   * `COALESCE(follow_checked_at, follow_started_at)` —— 水位线缺了
+      //     就退回追剧起点，**不要**退到 0（那会把整部剧算成新增）；
+      //   * `x > NULL` 天然是 NULL、COUNT 不计入 —— 所以两个水位线都为 NULL
+      //     时结果自动是 0，不需要额外分支。
+      final rows = await _db.customSelect(
+        'SELECT w.key AS k, ('
+        '  SELECT COUNT(*) FROM media_items i '
+        '   WHERE i.group_key IN ('
+        '           SELECT w2.key FROM media_works w2 '
+        '            WHERE w2.key = w.key OR w2.merged_into = w.key) '
+        '     AND i.first_seen_at > '
+        '         COALESCE(w.follow_checked_at, w.follow_started_at)'
+        ') AS n '
+        'FROM media_works w WHERE w.key IN ($marks)',
+        variables: [for (final k in chunk) Variable<String>(k)],
+        readsFrom: {_db.mediaWorks, _db.mediaItems},
+      ).get();
+      for (final r in rows) {
+        out[r.read<String>('k')] = r.read<int>('n');
+      }
+    }
+    return out;
+  }
+
+  // -------------------------------------------------------------------
   // 读取
   // -------------------------------------------------------------------
 
@@ -889,6 +1173,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -898,13 +1183,14 @@ class DriftMediaRepository implements MediaRepository {
   }) async {
     final q = _db.select(_db.mediaWorks);
 
-    // 分类 / 搜索 / 「播过没有」/ 「刮过没有」走共用表达式 —— 两个计数查询
-    // 要用同一份条件（理由见 `_workConditions`）。
+    // 分类 / 搜索 / 「播过没有」/ 「刮过没有」/ 「在追没有」走共用表达式 ——
+    // 两个计数查询要用同一份条件（理由见 `_workConditions`）。
     final base = _workConditions(
       kind: kind,
       category: category,
       playedOnly: playedOnly,
       scrapedOnly: scrapedOnly,
+      followedOnly: followedOnly,
       query: query,
     );
     if (base != null) q.where((_) => base);
@@ -940,7 +1226,24 @@ class DriftMediaRepository implements MediaRepository {
     }
 
     q
-      ..orderBy(_orderingFor(sort))
+      // 「追剧」视图里**有更新的排最前**（`new_item_count DESC`）。
+      //
+      // 计数永远非负，所以这一项等价于一个布尔位「有没有更新」，而且它在
+      // 相等时不影响后面的排序项 —— 有更新的按 [sort] 排，没更新的也按
+      // [sort] 排，两段各自有序。
+      //
+      // ⛔ 这是**视图内的隐式规则**，刻意不新增一个 `WorkSort` 取值：
+      //    那个枚举是两端共用的全局排序菜单口径，为一个视图加一档会让
+      //    菜单里出现一个在别的栏里毫无意义的选项。
+      //    与内存实现的 `hasUpdate` 优先必须同口径。
+      ..orderBy(
+        followedOnly
+            ? [
+                (t) => OrderingTerm.desc(t.newItemCount),
+                ..._orderingFor(sort),
+              ]
+            : _orderingFor(sort),
+      )
       ..limit(limit, offset: offset);
 
     final sw = Stopwatch()..start();
@@ -1091,6 +1394,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   }) {
     final t = _db.mediaWorks;
@@ -1118,6 +1422,12 @@ class DriftMediaRepository implements MediaRepository {
     // 与内存实现的 `w.source == ScrapeSource.online` 必须同口径：两边不一致
     // 会让「用替身跑过的用例在真库上失败」变成一个谜。
     if (scrapedOnly) add(t.source.equals(ScrapeSource.online.name));
+
+    // 「追剧」栏。判据是**用户开关** `followed`，不是「有更新」——
+    // 有更新的那几部只是排在前面（见 [listWorks] 里的排序），
+    // 仍然全都在这一栏里。写成 `new_item_count > 0` 的话，用户点进
+    // 「追剧」会看到「只有两部」，而他一共追了十部。
+    if (followedOnly) add(t.followed.equals(true));
 
     if (category != null) add(_categoryCondition(category));
 
@@ -1358,6 +1668,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   }) async {
     // 只读 `year` 一列：作品表有十几列，为了一组数字把整行物化是浪费。
@@ -1374,6 +1685,7 @@ class DriftMediaRepository implements MediaRepository {
       category: category,
       playedOnly: playedOnly,
       scrapedOnly: scrapedOnly,
+      followedOnly: followedOnly,
       query: query,
     );
     if (cond != null) q.where(cond);
@@ -1393,6 +1705,7 @@ class DriftMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   }) async {
     // 类型存在 `genres` 列（JSON 数组文本）里，SQL 数不出来 ——
@@ -1403,6 +1716,7 @@ class DriftMediaRepository implements MediaRepository {
       category: category,
       playedOnly: playedOnly,
       scrapedOnly: scrapedOnly,
+      followedOnly: followedOnly,
       query: query,
     );
     if (cond != null) q.where(cond);
@@ -1778,6 +2092,10 @@ class DriftMediaRepository implements MediaRepository {
         mergedInto: Value(w.mergedInto),
         introStartMs: Value(w.introStartMs),
         introEndMs: Value(w.introEndMs),
+        followed: Value(w.followed),
+        followStartedAt: Value(w.followStartedAt),
+        followCheckedAt: Value(w.followCheckedAt),
+        newItemCount: Value(w.newItemCount),
         lastModifiedAt: Value(w.lastModifiedAt),
         firstSeenAt: Value(w.firstSeenAt),
         lastPlayedAt: Value(w.lastPlayedAt),
@@ -1885,6 +2203,10 @@ class DriftMediaRepository implements MediaRepository {
         mergedInto: row.mergedInto,
         introStartMs: row.introStartMs,
         introEndMs: row.introEndMs,
+        followed: row.followed,
+        followStartedAt: row.followStartedAt,
+        followCheckedAt: row.followCheckedAt,
+        newItemCount: row.newItemCount,
         lastModifiedAt: row.lastModifiedAt,
         firstSeenAt: row.firstSeenAt,
         lastPlayedAt: row.lastPlayedAt,

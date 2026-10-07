@@ -13,7 +13,7 @@ import com.cloudcine.tv.pan.DriveEntry
  *
  * ⛔ 两处的**边界口径必须一致**，否则同一个网盘在同一台机器上会排出两种顺序：
  *
- *   * `modifiedAt` 为 `null` 的条目**垫底**（两个方向都垫底）；
+ *   * `modifiedAtMs` 为 `null` 的条目**垫底**（两个方向都垫底）；
  *   * 时间**完全相同**的两条按名称自然序定序（网盘对一次批量上传只给到秒）。
  *
  * 所以两条比较函数都委托给同一个 [compareByModifiedTime]，而不是各写一份。
@@ -177,7 +177,7 @@ fun sortItems(items: List<LibraryItem>, mode: ItemSortMode): List<LibraryItem> {
     if (mode == ItemSortMode.EPISODE_ORDER) return items.toList()
     val descending = mode == ItemSortMode.MODIFIED_DESC
     return items.sortedWith { a, b ->
-        ListSort.compareByModifiedTime(a.modifiedAt, b.modifiedAt, a.name, b.name, descending)
+        ListSort.compareByModifiedTime(a.modifiedAtMs, b.modifiedAtMs, a.name, b.name, descending)
     }
 }
 

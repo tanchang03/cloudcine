@@ -498,6 +498,7 @@ class _BrokenYearRepo extends InMemoryMediaRepository {
   Future<Map<int, int>> countWorksByYear({
     MediaCategory? category,
     bool playedOnly = false,
+    bool followedOnly = false,
     bool scrapedOnly = false,
     String? query,
   }) async =>
@@ -510,6 +511,7 @@ class _BrokenGenreRepo extends InMemoryMediaRepository {
   Future<Map<String, int>> countWorksByGenre({
     MediaCategory? category,
     bool playedOnly = false,
+    bool followedOnly = false,
     bool scrapedOnly = false,
     String? query,
   }) async =>

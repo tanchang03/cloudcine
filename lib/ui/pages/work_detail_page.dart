@@ -6,10 +6,12 @@ import 'package:go_router/go_router.dart';
 
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/services/follow_read.dart';
 import '../../domain/services/item_sort.dart';
 import '../../domain/services/work_levels.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
+import '../providers/follow_providers.dart';
 import '../providers/library_providers.dart';
 import '../providers/scrape_providers.dart';
 import '../providers/settings_providers.dart';
@@ -192,6 +194,72 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
     final shownFeatures = sortItems(features, sortMode);
     final shownExtras = sortItems(extras, sortMode);
 
+    // 「追剧之后才出现、而且还没看过」—— 剧集行的 NEW 标签。
+    //
+    // ⛔ 判据**只在这一处**算：`isNewSinceFollow` 需要作品（`followStartedAt`
+    //    水位线）与条目（`firstSeenAt`）两边，而这一层恰好两者都有。
+    //    让 `MediaItemRow` 各自算一遍的话，两处一旦分叉就会得到
+    //    「列表标了 NEW，行底进度条却显示看过」这种自相矛盾的样子。
+    //
+    // ⛔ 「播过没有」**不是**只看 `maxPositions`：那一列只在进度上报时写，
+    //    而进度上报只在整十秒边界触发 —— 用户点开一集看了 2~3 秒就关掉时，
+    //    库里一个字都没写，NEW 就不会消失（2026-10-07 现场）。
+    //    判据与取舍统一收在 [isItemWatched]：`max_position_ms`（看到哪儿了）
+    //    或 `last_played_at`（起播即写的已读回执）**任一有值**即算看过。
+    //
+    // ⛔ 续播点（`resumePositionMs`）仍然不能用：它看完会被清成 NULL，
+    //    拿它当判据的话，用户刚看完一集回来，那一集反而重新变成 NEW。
+    bool isNewItem(MediaItem i) => work.isNewSinceFollow(
+          firstSeenAt: i.firstSeenAt,
+          played: isItemWatched(i, detail.maxPositions),
+        );
+
+    // 每一格里有几条新的 —— 季 / 部选择器上的角标读它。
+    //
+    // ⛔ 与 [isNewItem] 必须用**同一个**判据。角标说「这一格里有 2 条新的」、
+    //    点进去却一条都没标 NEW，是最容易让人不再相信角标的那个不一致。
+    int newCountOf(WorkLevelGroup g) => g.items.where(isNewItem).length;
+
+    final visibleNew = visible.where(isNewItem).length;
+
+    // 「新集在**别的**格里」—— 必须主动指路。
+    //
+    // ## 为什么这一条不能省（2026-10-07 真实现场）
+    //
+    // 用户追的《遮天》新入库了 `183 4K.mp4` 和 `EP184.mkv`。这两个文件名里
+    // **没有季号**，于是 `WorkLevels` 把它们归进「未标季」那一格；而他上一轮
+    // 点过「第 1 季」（那一格才是 `S01E174~183` 这些看得懂的集），`_seasonKey`
+    // 就一直停在 `s:1`。列表确实从 11 行刷成了 13 行，可他眼前那 6 行里
+    // 一行新的都没有 —— **界面上也没有任何东西告诉他新集在另一格里**。
+    // 于是他合理地得出「说有 2 个更新，但文件列表里找不到」。
+    //
+    // 所以：当前格一条新的都没有、而作品里别处有时，就在选择器下面挂一条
+    // 可点击的指路条。只在**这种情况下**画 —— 正常情况下详情页版式不变。
+    ({String seasonKey, String? partKey, String label, int count})? newElsewhere;
+    if (visibleNew == 0) {
+      // 先看当前这一季的「部」：用户就站在这部剧上，横跳一格代价最小。
+      for (final g in parts) {
+        final n = newCountOf(g);
+        if (n > 0) {
+          newElsewhere =
+              (seasonKey: seasonKey!, partKey: g.key, label: g.label, count: n);
+          break;
+        }
+      }
+      // 再退到季这一层（含「当前这一季里没有任何部、但新集在别的季」）。
+      if (newElsewhere == null) {
+        for (final g in levels.seasons) {
+          if (g.key == seasonKey) continue;
+          final n = newCountOf(g);
+          if (n > 0) {
+            newElsewhere =
+                (seasonKey: g.key, partKey: null, label: g.label, count: n);
+            break;
+          }
+        }
+      }
+    }
+
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 4, 24, 32),
       child: Column(
@@ -233,6 +301,7 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
               label: '季',
               groups: levels.seasons,
               selectedKey: seasonKey,
+              newCountOf: newCountOf,
               onSelect: (k) => setState(() {
                 _seasonKey = k;
                 // 换了季就把部重置 —— 上一季的部键落在这一季里没有意义。
@@ -246,7 +315,21 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
               label: '部',
               groups: parts,
               selectedKey: partKey,
+              newCountOf: newCountOf,
               onSelect: (k) => setState(() => _partKey = k),
+            ),
+            const SizedBox(height: 10),
+          ],
+          // 「新集不在这里」的指路条。**只在真的会挡住用户时**画 ——
+          // 判据见上面 `newElsewhere` 那一段。
+          if (newElsewhere != null) ...[
+            _NewItemsHint(
+              label: newElsewhere.label,
+              count: newElsewhere.count,
+              onJump: () => setState(() {
+                _seasonKey = newElsewhere!.seasonKey;
+                _partKey = newElsewhere.partKey;
+              }),
             ),
             const SizedBox(height: 10),
           ],
@@ -281,6 +364,7 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
                 item: shownFeatures[i],
                 index: i,
                 workTitle: work.title,
+                isNew: isNewItem(shownFeatures[i]),
                 // 历史最大位置（不是续播点，见 `WorkDetail.maxPositions`）。
                 // 缺键 = 没播过，行底不画进度条。
                 watched: detail.maxPositions[shownFeatures[i].id],
@@ -304,6 +388,7 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
                 index: i,
                 dim: true,
                 workTitle: work.title,
+                isNew: isNewItem(shownExtras[i]),
                 watched: detail.maxPositions[shownExtras[i].id],
               ),
           ],
@@ -551,12 +636,20 @@ class _LevelRow extends StatelessWidget {
     required this.label,
     required this.groups,
     required this.selectedKey,
+    required this.newCountOf,
     required this.onSelect,
   });
 
   final String label;
   final List<WorkLevelGroup> groups;
   final String? selectedKey;
+
+  /// 某一格里有几条「追剧后新增、还没播过」的条目。0 表示不画角标。
+  ///
+  /// 传函数而不是 `Map<String, int>`：键是 group 的 `key`，而这一层只关心
+  /// 「这一格几条」，多一层映射就多一处可能与数据不同步的地方。
+  final int Function(WorkLevelGroup) newCountOf;
+
   final ValueChanged<String> onSelect;
 
   @override
@@ -588,6 +681,7 @@ class _LevelRow extends StatelessWidget {
                   _LevelChip(
                     group: g,
                     selected: g.key == selectedKey,
+                    newCount: newCountOf(g),
                     onTap: () => onSelect(g.key),
                   ),
                   const SizedBox(width: 8),
@@ -605,11 +699,22 @@ class _LevelChip extends StatelessWidget {
   const _LevelChip({
     required this.group,
     required this.selected,
+    required this.newCount,
     required this.onTap,
   });
 
   final WorkLevelGroup group;
   final bool selected;
+
+  /// 这一格里有几条新的。> 0 时在格子上挂一个「N 新」小胶囊。
+  ///
+  /// ## 为什么角标必须挂在**格子**上
+  ///
+  /// 新集落在哪一格，取决于文件名里有没有季号 —— 而同一个目录里的命名
+  /// 常常混着来（`S01E174.mkv` 有、`183 4K.mp4` 没有）。用户手上没有任何
+  /// 线索能猜到「新集在未标季那一格」，不挂角标他就只能一格一格点过去试。
+  final int newCount;
+
   final VoidCallback onTap;
 
   @override
@@ -645,6 +750,13 @@ class _LevelChip extends StatelessWidget {
                     color: selected ? color : AppTheme.text,
                   ),
                 ),
+                if (newCount > 0) ...[
+                  const SizedBox(width: 6),
+                  // 用**品牌色**而不是跟着选中态走：它的意思是「这里有新东西」，
+                  // 与「你正站在这一格」是两件事 —— 跟着选中态变色的话，用户
+                  // 切走之后角标就变暗，反而更容易被漏掉。
+                  _NewCountBadge(count: newCount),
+                ],
                 const SizedBox(width: 6),
                 // 集数角标：一眼看出哪一季还没看。
                 Text(
@@ -654,6 +766,122 @@ class _LevelChip extends StatelessWidget {
                     color:
                         selected ? color.withValues(alpha: 0.8) : AppTheme.dim,
                   ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 季 / 部格子上的「N 新」小胶囊。
+class _NewCountBadge extends StatelessWidget {
+  const _NewCountBadge({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: AppTheme.accent.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        '$count 新',
+        style: const TextStyle(
+          fontSize: 9.5,
+          fontWeight: FontWeight.w700,
+          height: 1.3,
+          color: AppTheme.accent,
+        ),
+      ),
+    );
+  }
+}
+
+/// 「新集在别的格里」的指路条。
+///
+/// ## 它解决什么问题
+///
+/// 用户被告知「有 2 集更新」之后，打开这一页看到的却是一屏没有 NEW 的旧集
+/// （新集在「未标季」那一格，而他停在「第 1 季」）。**光在格子上挂角标不够** ——
+/// 角标说的是「那一格里有新的」，而用户此刻的疑问是「我被告知的新集到底在哪」。
+/// 这条把两件事连起来：直接说出格子的名字，并且点一下就过去。
+///
+/// ## 为什么是整条可点，而不是只点「查看」两个字
+///
+/// 与详情页其它可点区域同一条口径：TV 上没有 hover，一个小文字热区既难瞄准、
+/// 也看不出可点。整条做成 `InkWell`，文字里再给一个明确的动词。
+class _NewItemsHint extends StatelessWidget {
+  const _NewItemsHint({
+    required this.label,
+    required this.count,
+    required this.onJump,
+  });
+
+  /// 目标格的展示名（`未标季` / `第 2 季` / `第 3 部`…）。
+  final String label;
+
+  final int count;
+  final VoidCallback onJump;
+
+  @override
+  Widget build(BuildContext context) {
+    return TvFocusable(
+      borderRadius: BorderRadius.circular(8),
+      child: Material(
+        color: AppTheme.accent.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          onTap: onJump,
+          borderRadius: BorderRadius.circular(8),
+          hoverColor: AppTheme.accent.withValues(alpha: 0.16),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: AppTheme.accent.withValues(alpha: 0.35),
+                width: 0.5,
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.fiber_new_rounded,
+                  size: 16,
+                  color: AppTheme.accent,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '有 $count 集更新在「$label」里',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: AppTheme.text,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Text(
+                  '去看看',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.accent,
+                  ),
+                ),
+                const Icon(
+                  Icons.chevron_right_rounded,
+                  size: 16,
+                  color: AppTheme.accent,
                 ),
               ],
             ),
@@ -759,8 +987,8 @@ class _InfoColumn extends ConsumerWidget {
           ),
         ],
         const SizedBox(height: 18),
-        // 用 `Wrap` 而不是 `Row`：这一行现在有五个按钮（播放 / 刮削 / 手动 /
-        // 自定义 / 合并到…），主窗口没有最小宽度限制，用户把窗口拖窄时
+        // 用 `Wrap` 而不是 `Row`：这一行现在有六个按钮（播放 / 追剧 / 刮削 /
+        // 手动 / 自定义 / 合并到…），主窗口没有最小宽度限制，用户把窗口拖窄时
         // `Row` 会直接溢出报黄条。`Wrap` 在空间不够时把「N 个文件」挤到
         // 下一行，按钮一个都不会变形。
         Wrap(
@@ -791,6 +1019,7 @@ class _InfoColumn extends ConsumerWidget {
                 ),
               ),
             ),
+            _FollowButton(work: work),
             _ScrapeButton(work: work),
             _ManualScrapeButton(work: work),
             _CustomizeButton(work: work),
@@ -882,6 +1111,85 @@ class _EditGenresChip extends ConsumerWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 「追剧 / 已追剧」。
+///
+/// ## 它解决什么问题
+///
+/// 在播的剧每周多一集。全盘重扫能发现，代价是遍历几千个目录、几分钟 ——
+/// 而用户心里这只是「看看更新了没有」。追剧把这部剧的网盘目录**记下来**，
+/// 之后只列那几个目录，秒级完成（见 `FollowService`）。
+///
+/// ## 为什么它紧挨着「播放」
+///
+/// 这一行按钮是按用户会按的顺序排的：先播放，再决定要不要长期跟这部。
+/// 而且它与 Android 电视端那颗胶囊**同序**（那边也放在播放之后、刮削之前，
+/// 见 `WorkDetailFormat.actionLabels`）—— 「同一个功能在哪儿」这件事本身
+/// 就是两端一致性的一部分，换设备时不该重新找一遍。
+///
+/// ## 已追剧时点亮
+///
+/// 与 `_EditGenresChip` 同一条理由：这是**一个被打开的状态**，不是一次性
+/// 动作。不点亮的话用户看不出「我现在到底追没追」，只能靠再点一次来试 ——
+/// 而再点一次恰好是取消，于是他会在两个状态之间来回撞。
+///
+/// ⛔ 写入走 `FollowController.toggleFollow` 而**不是**直接调仓储：那个方法
+///    负责写完之后的四处刷新（列表 / 角标 / 页头统计 / **本页**）。
+///    漏掉本页的表现是「点了按钮毫无反应」，而这类 bug 不报错。
+class _FollowButton extends ConsumerWidget {
+  const _FollowButton({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final followed = work.followed;
+    final news = work.newItemCount;
+    final color = followed ? AppTheme.accent : AppTheme.muted;
+
+    // 文案与 Android 端 `WorkDetailFormat.followLabel` 逐字同口径
+    // （那边是「☆ 追剧 / ★ 已追剧 / ★ 已追剧 · N 新」，符号由图标承担）。
+    final label = !followed
+        ? '追剧'
+        : (news > 0 ? '已追剧 · $news 集新' : '已追剧');
+
+    return Tooltip(
+      message: followed
+          ? (news > 0
+              ? '这部剧有 $news 条新文件还没看。点一下取消追剧'
+              : '正在追这部剧：网盘里出现新文件时会自动同步并提醒。点一下取消')
+          : '开启追剧：之后这部剧在网盘里出现新文件时，'
+              '会自动同步进媒体库，并在媒体库页提醒你',
+      child: OutlinedButton.icon(
+        onPressed: () => ref
+            .read(followControllerProvider.notifier)
+            .toggleFollow(work.key, !followed),
+        style: OutlinedButton.styleFrom(
+          // 点亮用**实心面**而不是加粗描边：深色 UI 上「亮起来」靠的是
+          // 面本身的明度（与电视端那颗胶囊同一条口径，用户两次点名
+          // 「线框不高级」）。所以这里是半透明底 + 同色描边，不是纯描边。
+          foregroundColor: color,
+          backgroundColor: followed ? color.withValues(alpha: 0.14) : null,
+          side: followed ? BorderSide(color: color.withValues(alpha: 0.5)) : null,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        icon: Icon(
+          followed
+              ? Icons.notifications_active_rounded
+              : Icons.notifications_none_rounded,
+          size: 16,
+        ),
+        label: Text(
+          label,
+          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
         ),
       ),
     );

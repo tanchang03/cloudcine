@@ -127,6 +127,31 @@ android {
         //    于是纯逻辑单测能跑，而不必引 Robolectric。
         unitTests.isReturnDefaultValues = true
     }
+
+    // ── 挡掉 Flutter 工具误生成的插件注册表 ─────────────────────────────────
+    //
+    // ⛔ 仓库根还有一份 `pubspec.yaml`（PC 端），而 `android/` 这个名字正好是
+    //    Flutter 约定的 Android 宿主位置。于是**任何** `flutter pub get` /
+    //    `flutter test` 都会往 `app/src/main/java/io/flutter/plugins/` 写一份
+    //    `GeneratedPluginRegistrant.java`，内容是 PC 端那套插件
+    //    （`video_player_android` / `wakelock_plus` / `volume_controller` …）。
+    //
+    //    本工程是**原生 Kotlin 独立工程**，`settings.gradle.kts` 不加载 Flutter
+    //    插件 ⇒ 那些类根本不存在 ⇒ `compileDebugJavaWithJavac` 直接 35 个
+    //    「找不到符号」、整个 Android 构建挂掉（2026-10-07 踩过，见
+    //    `android/.gitignore` 里同一件事的说明）。
+    //
+    //    排除而不是「构建前删掉」：Flutter 工具会在任意时刻重写它，删了还会
+    //    回来；排除是**声明式**的，重生成多少次都不影响编译。真要删是人工的
+    //    一次性清理，不该藏在构建脚本里。
+    //
+    // ⚠️ 走 `JavaCompile` 任务而不是 `sourceSets.main.java.filter.exclude`：
+    //    后者在 Kotlin DSL 里与 `Iterable.filter` 撞名（AGP 的
+    //    `AndroidSourceDirectorySet` 没有可用的 `filter` 属性），脚本编译不过。
+    //    这里的 `exclude` 是 `SourceTask` 的，按**源根相对路径**匹配。
+    tasks.withType<JavaCompile>().configureEach {
+        exclude("io/flutter/plugins/GeneratedPluginRegistrant.java")
+    }
 }
 
 // ── 发布产物另存一份品牌名 ──────────────────────────────────────────────────

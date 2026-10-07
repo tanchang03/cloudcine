@@ -11,6 +11,7 @@ import '../../domain/entities/cloud_account.dart';
 import '../../domain/entities/download_task.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/quality_option.dart';
+import '../../domain/services/follow_auto_check.dart';
 import '../../domain/services/folder_sort.dart';
 import '../../domain/services/library_backup_service.dart';
 import '../providers/app_providers.dart';
@@ -141,6 +142,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 _downloadSection(current),
                 const SizedBox(height: 14),
                 _scrapeSection(current),
+                const SizedBox(height: 14),
+                _followSection(current),
                 const SizedBox(height: 14),
                 _playbackSection(current),
                 const SizedBox(height: 14),
@@ -789,6 +792,98 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       _doubanProbeOk = ok;
       _doubanProbeResult = message;
     });
+  }
+
+  // -------------------------------------------------------------------
+  // 追剧 / 更新提醒
+  // -------------------------------------------------------------------
+
+  /// 追剧这一节。
+  ///
+  /// ## 为什么它单独一节，而不是并进「扫描」
+  ///
+  /// 追更检查**不是**扫描的轻量版：扫描遍历整个网盘、重建作品、推进续扫
+  /// 游标；追更检查只列**已追剧作品名下那几个目录**（去重后通常 1~5 个），
+  /// 秒级完成、只增不减。并进「扫描」那一节的话，用户会以为关掉它会影响
+  /// 媒体库的完整性 —— 实际上它只影响「有没有人替你盯着更新」。
+  ///
+  /// ## 为什么是下拉框而不是开关
+  ///
+  /// 这一项是**三态**：关 / 启动时 / 每 6 小时。开关（`_ToggleRow`）表达不了
+  /// 「一直挂着也要查」这个档位，硬塞成布尔的话用户只有「每次启动都查」和
+  /// 「永不查」两个选择。控件与 `_folderSection` 那个排序下拉**同款**
+  /// （`Row` + `SizedBox(width: 110)` + `Expanded(DropdownButton)`），
+  /// 两处长得不一样会让设置页看着像拼起来的。
+  Widget _followSection(AppSettings s) {
+    return SectionCard(
+      title: '追剧 / 更新提醒',
+      description: '在作品详情页点「追剧」之后，应用会记住这部剧的网盘目录，'
+          '定期只查那几个目录有没有新集 —— 不遍历整个网盘。',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SizedBox(
+                width: 110,
+                child: Text(
+                  '自动检查',
+                  style: TextStyle(fontSize: 12.5, color: AppTheme.text),
+                ),
+              ),
+              Expanded(
+                child: DropdownButton<FollowAutoCheck>(
+                  value: s.followAutoCheck,
+                  isExpanded: true,
+                  underline: const SizedBox.shrink(),
+                  dropdownColor: AppTheme.panel2,
+                  style: const TextStyle(fontSize: 12.5, color: AppTheme.text),
+                  items: [
+                    for (final mode in FollowAutoCheck.values)
+                      DropdownMenuItem(value: mode, child: Text(mode.label)),
+                  ],
+                  onChanged: (v) => unawaited(
+                    ref.read(settingsProvider.notifier).set(
+                          // 空值理论上到不了这里（`items` 覆盖了全部取值），
+                          // 但兜底必须是**默认值**而不是当前值 —— 写当前值
+                          // 会让一次误触看起来「点了没反应」。
+                          followAutoCheck: v ?? FollowAutoCheck.onLaunch,
+                        ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            switch (s.followAutoCheck) {
+              FollowAutoCheck.off =>
+                '不会自动检查。媒体库分类栏那颗「检查更新」仍然可以随时手动跑。',
+              FollowAutoCheck.onLaunch =>
+                '每次打开应用时查一次，两次之间至少隔 6 小时 —— '
+                    '一天开关十次也只会真查一次。',
+              FollowAutoCheck.every6h =>
+                '打开时查一次，之后每 6 小时再查一次。'
+                    '适合一直开着的机器；笔记本上没什么必要。',
+            },
+            style: const TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '检查**只列目录、只增不减**：不写续扫游标、也不会因为某个文件不见了'
+            '就从库里删东西。查出新集时会在媒体库的海报上打角标，'
+            '并把剧集列表里的新集标成 NEW。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            '这一项随备份包跨端同步 —— 在电脑上选了「关闭」，'
+            '电视上不会还在偷偷发请求。',
+            style: TextStyle(fontSize: 11, height: 1.7, color: AppTheme.dim),
+          ),
+        ],
+      ),
+    );
   }
 
   // -------------------------------------------------------------------
@@ -1491,8 +1586,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
   /// 媒体库被整体替换后，把所有读取它的视图全部作废。
   ///
-  /// 四个 provider 一个都不能少：列表、统计、两个角标计数。
-  /// 只作废列表的话，筛选面板上的「年份 / 类型」角标会停留在旧库的数字上。
+  /// ## 为什么是这几个 provider
+  ///
+  /// 它们都是**独立**从库里数出来的聚合数字，各自 `watch` 不同的信号，所以
+  /// 一个都不能少：
+  ///
+  ///   * `workListProvider` / `libraryStatsProvider`：列表与页头那句
+  ///     「N 个视频 · M 部作品」；
+  ///   * `categoryCountsProvider` / `playedCountProvider` /
+  ///     `followedUpdateCountProvider`：分类栏上三个角标。
+  ///     ⛔ 这三个**只** `watch(libraryListSignalProvider)`（不是
+  ///     `libraryWriteSignalProvider`），所以下面那一句 `bump()` 推不动它们 ——
+  ///     必须显式 invalidate。漏掉的表现是「恢复完之后列表是新库的内容，
+  ///     但分类栏上的数字还是旧库的」，而列表本身看着是对的，很难联想到它；
+  ///   * `yearCountsProvider` / `genreCountsProvider`：筛选面板的两组角标。
+  ///     只作废列表的话，面板上会停留在旧库的数字上。
   ///
   /// ⛔ 还要把 `settingsProvider` 一起作废 —— 它**不是**「媒体库视图」，
   ///    但恢复备份换掉的是整个数据库文件，`settings` 表跟着一起变了。
@@ -1501,10 +1609,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   ///    在设置页上依然显示为空，刮削也依然走匿名额度 —— 要重启应用才对。
   ///    （进程内的 `SettingsStore._cache` 由 `LibraryBackupService` 的
   ///    `onLibraryReplaced` 钩子清掉，两条缺一不可：一条管缓存、一条管状态。）
+  ///
+  /// ⚠️ 追剧状态（`followed` / `new_item_count`）本身是**随 db 字节**过来的，
+  ///    不需要在这里补写任何东西 —— 这里只是让「读它的视图」重看一遍。
   void _refreshLibraryViews() {
     ref.read(libraryWriteSignalProvider.notifier).bump();
     ref.invalidate(workListProvider);
     ref.invalidate(libraryStatsProvider);
+    ref.invalidate(categoryCountsProvider);
+    ref.invalidate(playedCountProvider);
+    ref.invalidate(followedUpdateCountProvider);
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
     ref.invalidate(settingsProvider);

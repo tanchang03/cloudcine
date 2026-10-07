@@ -52,8 +52,8 @@ data class ScanItem(
     val container: String,
     val resolution: String?,
     val sizeBytes: Long?,
-    /** 网盘修改时间，**Unix 秒**。 */
-    val modifiedAt: Long?,
+    /** 网盘修改时间，**Unix 秒**（库里存的就是秒，别再乘 1000）。 */
+    val modifiedAtSec: Long?,
     /** 时长（毫秒）。夸克 `duration` 下发的是秒，[LibraryScanner] 已经乘过 1000。 */
     val durationMs: Long?,
     /** 服务端读文件头得到的宽 / 高（比文件名里的 `2160p` 可靠）。 */

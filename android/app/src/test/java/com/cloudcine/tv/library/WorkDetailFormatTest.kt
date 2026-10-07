@@ -166,19 +166,25 @@ class WorkDetailFormatTest {
     // ==================================================================
 
     /**
-     * 四颗胶囊的文案与顺序。
+     * 五颗胶囊的文案与顺序。
      *
      * ⛔ 顺序**必须**与 `LibraryActivity.buildDetailActions` 逐项一致 ——
      *    光标位置就是按这个下标存的，顺序错了就是「点了 A 执行 B」。
+     *
+     * ⚠️ 与设计文档 §5.2(d) 的**有意偏离**：「追剧」在第 2 位（紧挨播放），
+     *    不是追加到末尾。理由见 [WorkDetailFormat.actionLabels] 的文档 ——
+     *    「选集」必须留在最后（它是这一行的出口，`focusItemsList`）。
+     *    这条断言就是那个位置的**唯一真源**：位置一改，它先红。
      */
     @Test
     fun `动作胶囊的顺序与文案`() {
         val labels = WorkDetailFormat.actionLabels(resumable = false, itemCount = 12)
-        assertEquals(4, labels.size)
+        assertEquals(5, labels.size)
         assertEquals("▶ 播放", labels[0].first)
-        assertEquals("手动刮削", labels[1].first)
-        assertEquals("刮削设置", labels[2].first)
-        assertEquals("选集（12）", labels[3].first)
+        assertEquals("☆ 追剧", labels[1].first)
+        assertEquals("手动刮削", labels[2].first)
+        assertEquals("刮削设置", labels[3].first)
+        assertEquals("选集（12）", labels[4].first)
         // 有续播进度时第一颗换成「续播」—— 这是「点卡片之后第一下按 OK」会播的
         // 那一条，用户得能一眼看出来它不是从头开始。
         assertEquals(
@@ -193,22 +199,61 @@ class WorkDetailFormatTest {
      * 按钮凭空消失的话，用户只会以为这个页面坏了 —— 他需要看到的是一个
      * 灰着的按钮加上一句解释（`LibraryActivity.applyAction` 会给）。
      * 刮削 / 设置**不受影响**：库里一条视频都没有，恰恰是最该去刮的时候。
+     * ⛔ 「追剧」也**不受影响**：一部还没入库任何文件的剧正是最该追的
+     *    （网盘上刚建了个空目录）。
      */
     @Test
     fun `没有可播文件时只有播放与选集置灰`() {
         val labels = WorkDetailFormat.actionLabels(resumable = false, itemCount = 0)
-        assertFalse(labels[0].second)
-        assertTrue(labels[1].second)
-        assertTrue(labels[2].second)
-        assertFalse(labels[3].second)
+        assertFalse("播放", labels[0].second)
+        assertTrue("追剧不受影响", labels[1].second)
+        assertTrue("手动刮削不受影响", labels[2].second)
+        assertTrue("刮削设置不受影响", labels[3].second)
+        assertFalse("选集", labels[4].second)
         // 文案里的计数仍然是 0（不是「选集（0 个）」那种别扭写法）。
-        assertEquals("选集（0）", labels[3].first)
+        assertEquals("选集（0）", labels[4].first)
     }
 
-    /** 有可播文件时四颗全亮。 */
+    /** 有可播文件时五颗全亮。 */
     @Test
     fun `有可播文件时全部可用`() {
         assertTrue(WorkDetailFormat.actionLabels(resumable = true, itemCount = 1).all { it.second })
+    }
+
+    // ==================================================================
+    // 追剧（schema v17）
+    // ==================================================================
+
+    /**
+     * 「追剧」胶囊的三态。
+     *
+     * ⛔ 三个都**必须返回非空文案**（胶囊置灰不消失，红线）—— 所以这里钉的是
+     *    文案，不是「有没有这一颗」。
+     */
+    @Test
+    fun `追剧胶囊的三态文案`() {
+        assertEquals("☆ 追剧", WorkDetailFormat.followLabel(followed = false, newCount = 0))
+        // ⛔ 没追剧时**不缀**「0 新」：`new_item_count` 在没追时恒为 0，
+        //    写出来是纯噪音。
+        assertEquals("☆ 追剧", WorkDetailFormat.followLabel(followed = false, newCount = 5))
+        assertEquals("★ 已追剧", WorkDetailFormat.followLabel(followed = true, newCount = 0))
+        assertEquals("★ 已追剧 · 2 新", WorkDetailFormat.followLabel(followed = true, newCount = 2))
+    }
+
+    /**
+     * 剧集行的「新集」前缀。
+     *
+     * ⛔ 不是新集时是**空串**而不是 `null`：调用方要拿它直接拼
+     *    `SpannableString`，`null` 会把「拼 / 不拼」拆成两个分支。
+     * ⛔ 前缀必须**自带尾随空白**：`■ NEW黑亚当.S01E13.mkv` 在沙发距离下
+     *    会连成一片（方块字符与英文之间没有天然的字距）。
+     */
+    @Test
+    fun `新集前缀`() {
+        assertEquals("", WorkDetailFormat.newEpisodePrefix(isNew = false))
+        val p = WorkDetailFormat.newEpisodePrefix(isNew = true)
+        assertEquals("■ NEW  ", p)
+        assertTrue("前缀必须自带尾随空白", p.endsWith(" "))
     }
 
     // ==================================================================

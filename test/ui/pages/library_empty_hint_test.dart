@@ -140,4 +140,53 @@ void main() {
   test('未设任何条件时不会误判成「有筛选」', () {
     expect(libraryEmptyHint(plain).action, LibraryEmptyAction.clearAll);
   });
+
+  // -------------------------------------------------------------------
+  // 追剧视图
+  // -------------------------------------------------------------------
+
+  test('追剧栏是空的 → 说的是「还没在追」而不是「这个分类下没有作品」', () {
+    const filter = LibraryFilter(followedOnly: true);
+
+    final hint = libraryEmptyHint(filter);
+
+    expect(
+      hint.body,
+      contains('追剧'),
+      reason: '「追剧」是**视图**不是分类。走通用那句「这个分类下暂时没有作品」'
+          '的话，用户会去分类栏里找一个不存在的入口 —— 而这一栏空着的真正'
+          '原因是「你还没追过任何一部」。',
+    );
+    expect(hint.actionLabel, '去看看全部');
+    expect(
+      hint.action,
+      LibraryEmptyAction.clearAll,
+      reason: '这一支必须能退出追剧视图（`clearAll` 会把 `followedOnly` 一起'
+          '复位），否则用户照做之后眼前还是同一个空列表。',
+    );
+  });
+
+  test('追剧栏 + 搜索词 → 仍然说「没有匹配的词」', () {
+    const filter = LibraryFilter(followedOnly: true, query: '魔法');
+
+    final hint = libraryEmptyHint(filter);
+
+    expect(
+      hint.action,
+      LibraryEmptyAction.clearQuery,
+      reason: '这时候空的原因是搜索词，不是「还没追过」—— 追剧那一支必须排在'
+          '搜索 / 面板条件**之后**。反过来的话，用户点「去看看全部」会连'
+          '自己打的词一起丢掉。',
+    );
+    expect(hint.body, contains('魔法'));
+  });
+
+  test('追剧栏 + 年份 → 仍然说「条件太紧，清掉就好」', () {
+    const filter = LibraryFilter(followedOnly: true, years: {2023});
+
+    final hint = libraryEmptyHint(filter);
+
+    expect(hint.action, LibraryEmptyAction.clearExtra);
+    expect(hint.body, contains('年份'));
+  });
 }

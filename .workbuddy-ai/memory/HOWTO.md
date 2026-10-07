@@ -5455,6 +5455,7 @@ Flutter 3.29 / Dart 3.7 的 macOS / Android TV 网盘媒体库播放器，对接
 - **引擎/硬解**：⛔ `hwdec` 写 **`mediacodec,auto-safe`**（逗号=回退）；`VideoControllerConfiguration.hwdec` 与 `PlayerBufferConfig.apply` **必须同值**且都在 `create()` 之前；判据读 `hwdec-current`（带 `copy` = 拷贝档，⛔ 空串不算）。⛔⛔ **10-04 那两轮别再走**：① 只加 `VideoViewType.platformView` →「更卡、音画不同步」；② 再加 `tunnel: true` →「4K 看不到画面，只有声音」。`main.dart:57` 只在 **macOS** 注册 fvp；DV P5 唯一出路是 **fvp/libmdk**。契约 `playback_engine.dart` / 路由 `playback_engine_router.dart` / 画面 `playback_surface.dart`。
 - **中继** `data/stream/local_stream_relay.dart`：⛔ **没有 `Isolate`/`compute`**（全在 Dart isolate）；只在用户显式选原画时才需要。`core/utils/http_range.dart` = `sealed class RangeRequest`（`NoRangeRequest`/`SatisfiableRange`/`UnsatisfiableRange`）+ `parseRangeRequest()`：⛔ **起点越界必须回 416**，别把「不知道流多长」（→200）与「要不到」（→416）合成一个返回值（旧实现用一个 `null` 表达两件事 ⇒ 416 成死代码、测试一直绿 ⇒ media3 丢前几 GB 对齐偏移 ⇒ **「正在加载…」永不消失**）。⛔ **`chunkSize` 别放大**（2 MiB→8 MiB 后首块 1.18s→15~45s、零成功播放；回归测试断言 `chunkSize/0.6MiB < 5000ms`）；提速调 `connections`/`prefetchBytes`。
 - **媒体库三轴（不能互推/合并）**：`MediaKind`（结构，只看文件名 `SxxExx`）· `MediaCategory`（语义，落 `media_works.category`）·「最近播放」（视图 `LibraryFilter.playedOnly`，与 `category` 互斥）。层级**不落库**（现算）：**季在外、部在内**，某层**少于 2 个选项不画**。⛔ **归一 = 打标记**（`mergedInto`）：不删行、不改 `group_key`、**不许链式**；⛔ `mergeWorkForUpsert` **无条件取旧值**（`mergedInto` / `introStartMs`/`introEndMs` 都是「扫描不许清」的列）。⛔ **目录名当系列名**：判定单元是**目录不是文件**（`DirectoryTitle`），**四处调用点都要传 `dirPath`**。⛔ 筛选「已刮削」= **`source==online`**（不是 `isScraped`）。⛔ `posterFaceX` 与 `posterUrl` **必须成对**（`faceAnchorX` 与 `thumbUrl` 同源成对）。⛔ 路径归一化只在 `core/utils/drive_paths.dart`。⛔ 字幕字节走 `decodeTextBytes`（先 UTF-8 后 GBK）。
+- **★ 刷新信号四件套**（叶子文件 `ui/providers/library_refresh_providers.dart`，避免循环 import）：`libraryWriteSignal` =「库里数据变了，**凡是读库的视图都该重看**」（扫描 / 发现 / 追更检查 / 批量刮削都推它）· `libraryListSignal` 只驱动**作品级列表**（避开 `folderTreeProvider` 每次读全表）· `playbackProgressSignal` 每次进度落库都推，只驱动详情页进度条 · `playbackLibraryLink` 只在**换条**时推，驱动「最近播放」顺序。⛔⛔ **任何读库的 `FutureProvider` 都必须 watch 对应的写信号** —— 漏掉的表现是「用户点一下刷新才看得见」（2026-10-07 追剧现场，细节 §9.8）。⛔ 角标类数据必须有**归零路径**。⛔⛔ **`ref.invalidateSelf()` 别在 provider 自己的 body 里用**（本次计算的 future 永不完成 ⇒ `disposed during loading state` ⇒ 页面卡死 / 单测超时），改手上那一份即可。
 - **播放器/页面**：⛔ **两份实现，别只改一个**（`player_window_app.dart` + `player_page.dart`：键位表/菜单/偏好还原/换流提示/hover 唤醒都要改两处）。⛔ 起播只走 `Media(start:)`（入口 `PlaybackMedia.build`，`seek` 只在播放中跳转；⚠️ 它**静默** ⇒ 换源后核对 `RestoreSeek`）。⛔ 进度两列别合并：`resumePositionMs`（起播，看完清）vs `maxPositionMs`（v15，只增不减）。⛔ 落库接 `PlaybackController.onPositionTick`，不暴露 `Player`。**音效 ≠ 音轨**（⛔ `af set` 返回值不能当依据；⛔ macOS `audio-spdif` 直通必卡死）。
 - **侧栏五项** 媒体库 `/library` · 文件夹 `/folders` · 扫描 · 下载 · 设置：⛔ `app_shell._items` 与 `app_router.branches` **必须同序**（判据是下标）；文件夹读**网盘实时目录**、媒体库读**本地索引**，**搜索词各一份**。
 - **目录视图**：三组**目录 → 视频 → 其他文件**（组间顺序是**结构**）。⛔ 入库判据只有 `classifyEntry` 一处。⛔ 下载取链**复用 `adapter.resolveStream`**（别打 `/file/download`，>50MiB 直接 23018）。
@@ -5729,6 +5730,40 @@ MEMORY.md 只留**标识符索引**，下列为**理由与完整判据**。
 
 **两个「测试写错了」的实例（都是测试起了作用）**：① `candidates` 按 `uid` 去重 ⇒ 用同一个 id 测「数字/字符串两种形态」会被合并成一条，两个 id 必须不同；② `isVideoFile("x.img")` 是 **false**（`.img` 不在白名单），我原先写成「前提：在白名单里」⇒ 断言反了。
 
+#### 5.5 TMDB 两代 Key 的**送法不同**（2026-10-07 血案）
+
+**现象**：刮削设置页填了 Key、点「测试」回 `401 Invalid API key`，看起来就是「Key 填错了」，
+但同一个 Key 在 PC 端能用。
+
+**根因**：TMDB 有两代凭证，**送的位置不一样**，服务端对送错位置**只回 401**：
+
+| 形态 | 长什么样 | 送法 |
+|---|---|---|
+| **v4 读取令牌** | `eyJ…` 开头的 JWT（很长） | `Authorization: Bearer <token>` |
+| **v3 API Key** | 32 位十六进制 | 查询参数 `?api_key=<key>` |
+
+把 v4 令牌塞进 `api_key=` 就是 401 —— 与「Key 真的填错了」**在响应上完全一样**，
+所以这条必须靠**形状**判，不能靠试。实测：`?api_key=<JWT>` → 401；`Bearer <JWT>` → 200。
+判据函数 `TmdbScraper.isV4Token`（认 `eyJ` 前缀）与 PC 端 `tmdb_client.dart` 的那份
+**逐字一致** —— 两边各写一份、哪天只改一边，就会变成「电脑能用、电视不能用」。
+
+#### 5.6 刮削设置页的「测试」按钮（`ScrapeProbe`）
+
+`TmdbScraper.probe()` 打 `/configuration`（最轻的、需要鉴权的接口）；
+`DoubanScraper.probe()` 打一次**真实搜索**（`/configuration` 那种接口在豆瓣不存在）。
+两者都把失败**分开报**，不合并成「失败」两个字：
+
+| 源 | 分类 |
+|---|---|
+| TMDB | 地址不通（DNS/反代）/ **401 = Key 被拒** / 其它 HTTP |
+| 豆瓣 | 连不上 / 业务码 `103`（要登录）/ HTTP 错 / 零命中 / 正常（并报 Cookie 里**含不含 `dbcl2`**） |
+
+⛔ 用**输入框当前值**测，不读库里已存的 —— 用户点「测试」的动机就是「我刚改的值对不对」，
+读旧值会让「测试通过」骗人。⛔ `probe` **不碰熔断**：测试是用户的主动动作，
+不该因为失败几次就把豆瓣关掉（熔断是给自动刮削用的）。
+⛔ `ScrapeProbe.ok` 只有**明确验证过**才置 `true`：零命中、超时都不算通过 ——
+把它写成「没抛异常就算过」的话，这个按钮就成了安慰剂。
+
 ### 6. 作品简介页：点卡片先去这里，不再直接播（2026-10-07）
 
 **起因（用户原话）**：「媒体文件无法进入简介页面，点击媒体文件应该先进入简介页面，
@@ -5851,6 +5886,247 @@ items.addAll(sortItems(items, itemsSortMode))     // ← 排的是空列表
 `:app:compileDebugKotlin` ✅ · `:app:testDebugUnitTest --tests 'com.cloudcine.tv.library.*'`
 **214 例全绿**（原 201 + `WorkDetailFormatTest` 13）· `:app:assembleDebug` ✅。
 
+### 7. 简介页文件列表：主标题必须是**文件名**（2026-10-07）
+
+**起因（用户原话）**：「媒体库媒体简介页面中，文件列表应该重点凸显的是文件名，
+而不是全部都是媒体名，否则剧集列表都是媒体名，看起来体验非常不好」。
+
+**根因**：`ItemsAdapter.getView` 里那一行写的是 `entry.displayTitle`，而
+`LibraryItem.displayTitle` 是 `title ?: name` —— **优先返回作品标题**。12 集全被
+归到同一部作品、`title` 都是「黑亚当」，于是整列印的是同一句话，一个字的信息量
+都没有。这就是 PC 端 2026-10-02 已经踩过、并记在本文件
+「提不出集号的行标题**不能**退回片名」那一节里的坑 —— Android 端重新踩了一遍。
+
+**修复形态**：改用 `EpisodeLabels.fileLabel(entry)`（文件名去掉扩展名）——
+与播放页 OSD「选集」**同一个函数**，两边口径从此不会再分叉。
+
+```
+主标题 18sp 白  黑亚当.2022.S01E03.1080p.WEB-DL      ← 文件名（去扩展名）
+副标题 13sp 灰  1080p · 1.2 GB · 看到 12:34 / 45:00
+标签   13sp 紫  S01E03                                ← 集号解析得出时才画
+右侧   13sp 灰  3 天前                                ← 网盘修改时间
+```
+
+#### 7.1 ⛔ **不**照抄 PC 的「剧名-文件名」前缀
+
+PC `_fileRowLabel` 拼 `剧名-文件名`（并做了「文件名已含剧名就不重复拼」的去重）。
+电视这一行**只有一行、尾部省略**，长剧名会把真正要看的文件名挤出屏幕 ——
+而本文件那一节自己写过：「只给一行的话被省略号吃掉的全是后半段的文件名」。
+所以 Android 端只留文件名：这一页的头部就挂着剧名和海报，前缀是纯噪音。
+
+⛔ 也**不能**把主标题改成 2 行来解决：列表区只有约 4 行的高度（见 6.4 的版面账），
+多一行就少一行剧集。电视行宽约 800dp / 18sp ≈ 44 汉字，真实文件名极少超。
+
+#### 7.2 顺带修掉两个同源的**不报错**问题
+
+1. **副标题的进度读错了列**：原来读 `resumePositionMs`，而它是「下次从哪儿接着播」，
+   **看完就清成 NULL** ⇒ 看完的那一集永远显示不出「看到」。改读
+   `maxPositionMs`（历史最大位置，永不回退/清除），走 `EpisodeLabels.progressLabel`，
+   并**钳到总时长**（否则会出现「看到 50:00 / 45:00」这种一眼假的东西）。
+2. **`fileLabel` 的扩展名门槛 5 → 4**：函数注释自己举的例子 `Mr. Robot` 点后正好
+   5 位，门槛写 5 时会被砍成 `Mr` —— 注释与行为不符。真实视频扩展名最长 4 位
+   （`mkv`/`mp4`/`webm`/`m2ts`），卡在 4 不会误伤。顺手删掉 `LibraryActivity`
+   里因此变成死代码的 `private fun clock()`。
+
+#### 7.3 补上一直缺的单测
+
+`EpisodeLabels` 是播放页与简介页**共用**的口径，却一直没有测试。新增
+`EpisodeLabelsTest`（11 例）钉住：只砍最后一个点 · 主标题取文件名而非作品标题 ·
+同片多版本可区分 · 无扩展名/点在最前（`.gitignore`）原样返回 · 点后超 4 位不砍 ·
+进度读 `max_position_ms`（看完仍显示）· 越过总时长钳住。
+
+`:app:testDebugUnitTest --tests 'com.cloudcine.tv.library.*'` **18 个类 / 243 例全绿**
+（含新增的 `EpisodeLabelsTest` 11 例）· `:app:compileDebugKotlin` ✅。
+
+#### 8. 扫描期边扫边显示 / 未刮削用网盘封面 / 扫完自动刮削（2026-10-07）
+
+**用户原话**：「扫描网盘过程中，只有等扫描结束后媒体库才能看到媒体文件，需要优化一下，
+一边扫描一边出现媒体库文件，并且没有刮削的媒体文件，没有封面这个不符合预期，没有刮削的
+媒体文件应该使用网盘的封面图，扫描完毕后后需要自动启动刮削，并将刮削进度显示出来」。
+
+##### 8.1 症状一：必须等扫描结束才看得到作品
+
+**根因**：扫描是**两相写入**，两相的节奏差了整整一个遍历。
+
+| 表 | 写法 | 节奏 |
+|---|---|---|
+| `media_items` | `LibraryScanner.flush()` → `db.applyScanItems(buf)` | 每 `FLUSH_AT = 200` 条一批 |
+| `media_works` | `db.insertMissingWorks()` + `db.refreshWorkStats()` | **整个遍历结束后一次** |
+
+作品墙查的是 `media_works`，扫描期间它一直是空的 ⇒ 「扫完才出现」。
+
+**修法**：`LibraryScanner` 里加 `publishWorks(force)`，在 `flush()` 落完批**之后**调用
+（顺序有讲究：`refreshWorkStats` 的 `item_count` 必须看得见刚落的这批）。
+
+```kotlin
+val known: MutableSet<String> = db.workKeys().toMutableSet()
+val dirty = LinkedHashSet<String>(256)          // 本轮新增/变更过的 group_key
+var lastPublish = 0L
+
+fun publishWorks(force: Boolean = false) {
+    val now = System.currentTimeMillis()
+    if (!force && now - lastPublish < PUBLISH_EVERY_MS) return   // 节流
+    lastPublish = now
+    val fresh = seeds.keys.filter { it !in known }
+    if (fresh.isNotEmpty()) {
+        worksCreated += db.insertMissingWorks(fresh.map { toWork(it, seeds.getValue(it)) })
+        known.addAll(fresh)
+    }
+    if (dirty.isNotEmpty()) {
+        db.refreshWorkStats(dirty)
+        // 顺手把本轮新拿到的网盘缩略图补进 poster_url（见 8.2）
+        ...
+        dirty.clear()
+    }
+}
+```
+
+三个设计约束，改了会出问题：
+
+1. ⛔ **`PUBLISH_EVERY_MS = 1000` 必须远大于 `REPORT_EVERY_MS = 400`**：每次发布都要跑一遍
+   `refreshWorkStats` 的全表 `GROUP BY`（`group_key` 上**没有索引**）。跟进度上报同频 = 把
+   扫描拖成龟速。进度条每 400 ms 跳一次，作品墙每 1 s 跳一次，观感已经够「实时」。
+2. ⛔ **只对 `dirty` 里的 key 跑 `refreshWorkStats`**，不是全表 —— 全表统计是 O(库大小)，
+   而 `dirty` 是本轮增量。
+3. ⛔ **发布必须在 `applyScanItems` 之后**。反了的话 `item_count` 会少算一批，作品卡上的
+   「N 集」会一直差一截，而且**不报错**。
+
+`Progress` 新增 `val works: Int` = **当前库里作品总数**（不是「本轮找到几个」）—— 这是 UI
+判断「要不要重画作品墙」的信号，`text` 也顺带拼上 `· 作品 N`。
+`discover()`（文件列表 MENU 的局部扫描）同样接了这一套，变量名用 `knownWorks` 以免与
+`flush()` 里管 group key 的局部 `known`（已改名 `oldKeys`）撞车。
+
+##### 8.2 症状二：没刮削的作品没有封面
+
+**根因**：扫描**确实**把夸克的 `preview_url` 写进了 `media_works.poster_url`
+（`LibraryScanner.kt` 的 `toWork`/`accumulate`），但**没有任何组件去下载它**。
+
+`PosterStore.fileFor(work)` 是三级查找，**三级全都要求本地已有真实文件**：
+① `poster_file` 列 → ② `PosterNaming.fileNameFor(key, posterUrl)` 现算 → ③ 目录索引。
+三级全落空 ⇒ 退化成「首字占位块」。
+
+而能下载的两个组件都不是干这个的：
+
+- `PosterFetcher`：只服务**刮削海报**，只被 `ScrapeActivity` 调用，走 `ScrapeHttp`
+  —— **没有网盘凭证**，拿来下夸克缩略图必然 401。
+- `EpisodeThumbs`：能力对，但它是**播放页专用**，目录（`filesDir/thumbs`）和命名
+  （`t-{hash8}.img`）都是另一套。
+
+PC 端早就是对的，Android 是唯一的例外：`lib/domain/entities/work_poster.dart`
+`WorkPoster.fromItems()` 挑第一张有 `thumbUrl` 的条目（**正片优先于花絮**），
+下载走 `lib/data/scrape/poster_cache.dart` `PosterCache.pathFor`（`_headersFor` 带 Cookie）。
+
+**修法**：新增 `CloudCoverFetcher`，**必须走 `PanApi.thumbBytes(url)`**
+（裸链回 `401 code=31001 require login`），产物落**海报目录**并用
+`PosterNaming.fileNameFor(key, url)` 命名 ⇒ `fileFor` 的第 ② 级**零改动直接命中**，
+而且**随备份包一起走**（`.ccbak` 会打包 posters 目录）。
+
+```kotlin
+class CloudCoverFetcher(private val dir: File, private val thumbBytes: (String) -> ByteArray) {
+    fun fetch(workKey: String, url: String?): String?   // 返回相对文件名，失败返回 null
+}
+```
+
+- 拿**函数类型**而不是 `PanApi`，是为了 JVM 单测能塞假实现（`PanApi` 要凭证，测不了）。
+- 守卫：空白 / 不以 `http` 开头 ⇒ 直接 `null`（**绝不自己拼 URL**）；文件已存在 ⇒ 直接返回；
+  `failed` / `inFlight` 按 `"$workKey|$u"` 去重（`failed` 的键必须是这个 token，
+  用 `target.name` 会永远匹配不上 ⇒ 每次滚动都重试）。
+- `.part` + rename 原子写。
+- ⛔ 失败**不持久化**：夸克 `preview_url` 是带签名的、会过期，今天的失败明天可能就成功了。
+
+配套三处改动：
+
+1. `LibraryScanner.Seed` 加 `var extraPosterUrl`，`accumulate()` 分流：
+   **正片**（`!isSampleOrExtra`）的缩略图进 `posterUrl`，**花絮**的进 `extraPosterUrl`；
+   `toWork` 取 `seed.posterUrl ?: seed.extraPosterUrl`。对标 PC `WorkPoster.fromItems`。
+2. `LibraryDb.backfillWorkPosterUrls(Map<String,String>)`：**只填 `poster_url IS NULL` 或 `= ''` 的行**。
+   为什么需要它 —— `insertMissingWorks` 是 `CONFLICT_IGNORE`，一次扫描没拿到缩略图的行
+   `poster_url` 就**永远是 NULL**，后续扫描再也填不上（静默数据缺口）。
+3. UI 侧触发点：`WorksAdapter.getView` 的占位分支 + `paintDetailPoster`。
+
+##### 8.3 症状三 + 四：扫完自动刮削、并显示进度
+
+**前置认知：自动刮削必须先有匹配闸门。** 手动刮削有人盯着，自动刮削没有 ——
+PC 的 `lib/domain/services/scrape_match.dart` 就是为此写的（「宁可漏刮，不要刮错」），
+**Android 端此前从未移植**（`titleSimilarity|ScrapeMatch|normalizeForMatch|maxYearGap`
+全库零命中）。所以顺序是：先移植闸门，再写编排。
+
+新增四个文件（`com.cloudcine.tv.library`）：
+
+| 文件 | 职责 |
+|---|---|
+| `ScrapeMatch.kt` | 闸门。纯函数 + `object ScrapeMatch.evaluate(...)` |
+| `ScrapeQueryBuilder.kt` | 「用什么词去搜」。手动 prefill 与自动刮削**共用一份** |
+| `ScrapeSourceBudget.kt` | 「这个源还值不值得问」 |
+| `AutoScraper.kt` | 编排：取待刮作品 → 搜 → 验 → 落库 → 下海报 → 报进度 |
+
+**闸门判据**（与 PC 逐字对齐）：年份硬闸 `MAX_YEAR_GAP = 2`；标题相似度
+`STRONG_SIMILARITY = 0.6` / `WEAK_SIMILARITY = 0.35`；前缀 `0.65 + 0.35×ratio`、
+包含 `0.55 + 0.25×ratio`、否则 bigram Dice。判定顺序**不能改**：
+年份闸 → 相似度 → `requireExactTitle`（只认全等）→ `≥ STRONG` 收 → `≥ WEAK` 需年份贴近
+→ 跨文种 + 年份贴近 收 → 拒。
+⛔ `allDigits` 检查必须放在 `na == nb` 早退**之后**，否则《2012》《1917》这种数字片名全废。
+⛔ 纯数字串永远不当名字用（`182` 命中《1821: Οι Ήρωες》那次事故）。
+
+`ScrapeQuery.requireExactTitle` 的语义：PC 是 `!parsed.isConfident`，而
+`isConfident = kind != unknown && title 非空 && (year != null || kind == episode)`；
+Android 的解析器只在标题为空时给 `unknown`（已被 `hasUsableTitle` 挡掉），
+所以化简成一句：**`kind == "movie" && year == null`**。
+
+`ScrapeQueryBuilder` 刻意**不重复判 `kind == unknown`** —— 那是 PC 判据的等价化简，
+不是漏了一条规则（注释里写明了，免得后人以为是 bug）。
+
+**待刮集合 `LibraryDb.worksNeedingScrape(limit)`**：
+
+```sql
+WHERE merged_into IS NULL
+  AND (source IS NULL OR (source <> 'online' AND source <> 'manual'))
+ORDER BY (last_modified_at IS NULL), last_modified_at DESC, year DESC, title ASC
+```
+
+三个排除各有理由：`merged_into` 非空的行**不在墙上**；`online` 是已刮好的；
+`manual` 是**用户自己改过的**（PC `customizeWork` 写的），自动刮削绝不能覆盖。
+
+**源预算 `ScrapeSourceBudget` 的核心判据**：`search()` 的失败语义是「返回空列表」，
+**分不清「源坏了」和「这个标题不在源里」**。用**耗时**来分：
+
+- 健康的源 0.3~2 s 就回；坏掉的源要烧完 12 s 超时。
+- **慢且空**（`elapsed ≥ SLOW_MS = 8000` 且无命中）⇒ 记一次失败，**连续 3 次丢源**。
+- **快且空** ⇒ **不算失败**（就是没这部片），并把计数清零。
+- 命中（不论快慢）⇒ 清零。丢源是**单向**的，丢掉的源本轮不再问。
+
+**`AutoScraper` 的三个提前退出**（缺一就会让用户干等）：
+
+1. **用户取消** —— 在作品之间检查 `LibraryScanner.Cancellation.isCancelled`。
+2. **所有源都被熔断** —— 再搜也是白搜。
+3. **`scraped == 0 && consecutiveMiss >= GIVE_UP_AFTER (= 12)`** —— 专门抓
+   **「凭证被拒」**这种情形：此时请求是**飞快**的（401 立刻回），
+   所以**源预算的「慢」启发式抓不到**，只能靠「连着一打作品一个都没刮到」来兜。
+   ⛔ `Verdict.noQuery`（这条文件名提不出可用标题）**不计入** `consecutiveMiss`，
+   否则库里堆一批 `01.mp4` 就会误判成凭证失效。
+
+`pickVerified` 按**源的顺序**取**第一个**通过闸门的候选 —— 源自己的相关性排序是权威，
+PC 的规则也是「第一个必须全等」。每个被拒的候选都 `Log` 出 `reason`，便于事后复盘。
+
+**为可测性做的两处接口收窄**（`AutoScraper` 直接依赖 `LibraryDb` 就 JVM 测不了）：
+
+```kotlin
+interface AutoScrapeStore {                 // 只留 4 个方法
+    fun worksNeedingScrape(limit: Int): List<Work>
+    fun itemsForWork(workKey: String): List<LibraryItem>
+    fun updateWorkScrape(workKey: String, meta: ScrapedMetadata): Work?
+    fun setWorkPosterFile(workKey: String, fileName: String)
+}
+```
+
+`companion object` 里的 `forLibrary(db, pipeline, posterFetcher, cancel)` 提供一个匿名对象
+适配器 —— 因为 `LibraryDb.updateWorkScrape` **带默认参数**，而 **Kotlin 接口不能有默认参数**。
+另外注入了 `clock: () -> Long` 和 `sleep: (Long) -> Unit`，测试里用来伪造「慢源」。
+
+**设置项**：`LibrarySettings.AUTO_SCRAPE_ON_SCAN = "auto_scrape_on_scan"`
+（键名与 PC 逐字一致）。⚠️ **PC 默认关**（豆瓣匿名额度约 10 次搜索），
+**Android 默认开**；默认值**不写在这个常量里**，写在 `LibraryActivity.autoScrapeEnabled()`。
+
 ## 7. PC TV 布局 / OSD 卡顿
 - `isTvLayout` = android + 逻辑宽≥960（⛔ 判据读 **view 宽**）。⛔ 页头 `actions` 必须 `Wrap`；⛔ **过扫描内边距只有 `app_shell` 一处**；⛔ 遥控器 **↓ 绝不接管**；⛔ **`SelectableText` 是焦点陷阱** → 用 `TvSelectableText`。
 - ⛔ **播放页 OSD 卡顿**：整页 rebuild ≈10 次/秒（`bufferEnd` 没节流）+ `SubtitleViewConfiguration` 无 `operator ==` + `DebugOverlay` 的 `kDebugOverlayEnabled = true` **硬编码**。
@@ -5859,3 +6135,209 @@ items.addAll(sortItems(items, itemsSortMode))     // ← 排的是空列表
 - 采样：⛔ 周期 **10 秒**，**故意不与**视频探针的 21 秒相等（会**拍频锁定**；10 与 21 互质）。⛔ **读不到一律留空、整段从日志行消失**，不许退化成 0。⛔ 进程 CPU 是**单核口径**，必须写「折合 N 核」。⛔ 系统 CPU「忙」**不含 iowait**；`/proc/stat` 只认汇总行 `cpu `（**别用 `cpu0`**）。⛔ `/proc/loadavg` 在电视上 `Permission denied`；`/proc/pressure/*` 在 Android 9 不存在 ⇒ 用 `procs_running`/`procs_blocked`（`parseProcStatProcs`，**同文件、不额外读盘**），写「可运行进程=N（4 核，超订 x.xx×）」——⛔ **核数必须一起写**。⛔ `/proc/self/stat` **按最后一个 `)` 切**。⛔ `df` 正则**从左锚定**、不按列 split；用异步 `Process.run`。macOS 无 `/proc`：内存退回 `ProcessInfo.currentRss`，CPU/负载留空属**正常**。
 - 取证：应用日志是**文件、不是 logcat** —— `DiagLog` 同步写 `files/logs/cloudcine-YYYY-MM-DD.log`，读 `adb shell run-as com.cloudcine.cloudcine cat files/logs/cloudcine-<日期>.log`；⛔ logcat `I/flutter` 基本只有引擎启动几行；⛔ **文件 mtime 不涨 = 应用真没做事**。**线程名读 `/proc/<pid>/task/*/comm`**：`top -H` 在 Android 9 全打进程名；⛔ 取字段写 `${12}`/`${13}`；切字段按**最后一个 `)`**。⛔ `exec-out screencap` 被 fvp 的 `Init wrapper sys mutex successful.` 污染 ⇒ 用 `shell screencap -p /sdcard/x.png` + `pull`。**`uiautomator dump` + `input tap X Y` 比猜 DPAD 可靠**；⛔ Flutter 语义树只在无障碍被触发后才暴露。★ **视频真帧率用 SurfaceFlinger 量**：`dumpsys SurfaceFlinger --list` 找层 → `--latency '<层名>'`（首行=刷新周期 ns，其后 128 帧三列时间戳）；**Flutter UI 帧率**用 `dumpsys gfxinfo <包名>` 两次取差。实测 `activeBuffer=[3840x2160:3840,Unknown 0x13]` 才是**视频层**；`SurfaceView #0` 是 `1920x1080 RGBA`。⛔ **LMK 会杀掉后台的云影**（电视仅 2.5 GB）⇒ 中继喂原型只有 2~3 分钟窗口；先 `am kill-all` 腾内存。
 - 打包：⛔ MSI 启动条件绝不能写 `VersionNT >= 1000`（钳在 603）⇒ 用 **`WindowsBuild >= 10240`** + `Installed OR`（MSI 条件**不支持括号**）。⛔ macOS 不许写 `keychain-access-groups`（→ 启动即 SIGKILL）、`app-sandbox` 必须 **`false`**。⚠️ 本机**出不了 Flutter release/profile 包**（对比云影与原型本身不公平：原型是原生 Kotlin，`debuggable` 几乎无代价；云影是 Flutter `app-debug.apk` = JIT，实测进程合计 **467%/400%**，主线程 200% + `DartWorker` 199% + `1.raster` 42%，ExoPlayer 只拿 12%）。
+
+## 9. 追剧 / 更新提醒（2026-10-07，两端已落地）
+
+产品口径与逐条理由见 `docs/追剧-更新提醒-设计方案.md`（12 章）。这里只留
+**改错不报错**的那些判据。
+
+### 9.1 数据 / 契约
+- 4 列加在 `media_works`（**不新建表**）：`followed` / `follow_started_at` /
+  `follow_checked_at` / `new_item_count`。schema **16 → 17**，两端同时改，
+  **无回填**（默认值恰好表达「没追剧」）。`LibrarySchemaTest` 逐字守着 DDL。
+- 三条判据全靠已有的 `media_items.first_seen_at` 做差：
+  ①本次新增 = `first_seen_at > follow_checked_at` → 角标增量累加；
+  ②追剧以来新增 = `first_seen_at > follow_started_at`；
+  ③`max_position_ms IS NULL`。②∧③ = 剧集行 NEW 标签（**播过自动消失，零额外写入**）。
+  ⛔ **刻意不用 `modified_at`**：替换文件（换更高码率）会误报「有新集」。
+- ⛔⛔ **自动检查绝不写 `media_works.updated_at`**。`libraryModifiedAt` 是同步 LWW
+  判据，写了就会「本地永远看起来更新 → 无条件上传 → 盖掉另一台设备的进度」。
+  只有**用户手动开关追剧**才写。节流零点放 `settings.follow_last_check_at`
+  （Unix **秒字符串**，不是 ISO8601 —— 两端解析器差异会静默差一个时区）。
+- ⛔ **按目录回写，不按发起者**（`/电影/` 平铺，一个目录含多部作品）。
+- ⛔ **目录失败不推进 `follow_checked_at`**（水位线不完整时推进 = 新集永久丢失）。
+- ⛔ `follow_checked_at` 取「**发现跑完之后**」的时刻，不是检查开始时刻 ——
+  库时间列是秒，取开始时刻会让本次插入的行在下一轮被重复计数。
+
+### 9.2 ⛔⛔ `FollowAutoCheck.off` 的 `throttleWindow == null` 是**反向**的
+`off` 的窗口是 `null`，而 `null` 在 `FollowService._run` 里的含义是
+「**不节流**」（想跑就跑）—— 两者含义**恰好相反**。只靠窗口判据的话，
+设成「关闭」之后**一次节流判断都不做** ⇒ 每次启动都真的去列网盘目录，
+而日志上一切正常。⇒ `_run` 里必须**先显式判 `policy == off`** 再读窗口。
+（`FollowAutoCheck.throttleWindow` 的文档已写明这个 `null` 不能当闸门用。）
+⚠️ 原 `test/domain/follow_service_test.dart` 有一例把这个 bug **钉成了正确行为**
+（断言 `skipped == false && calls == 1`，理由写「off 的窗口是 null，所以节流闸
+直接放行」）—— 已改。
+
+### 9.3 ★ 桌面页头放不下第 9 个按钮（2026-10-07 实测）
+`PageHeader` 桌面分支是 `Row`。媒体库页头原本 8 个控件在 **800px 宽**窗口下
+已顶满（可用宽 756），加「检查更新」**实测溢出 26px**；而 `Row` 溢出在 Release
+下是**静默裁掉**，看起来像「这个按钮本来就没有」。
+⇒ 「检查更新」落在**分类栏右端**（`_CategoryBar` 的 `_FollowCheckButton`）：
+那一带的胶囊是 `Expanded` 里一条横向滚动列表，右边从来没有东西，**零宽度压力**，
+而且它紧挨着「追剧」胶囊。TV 与桌面**同一份代码**（TV 页头整页只有 624 宽）。
+
+⛔ 别再试图「让 `PageHeader` 的 actions 折行」：`Row` 里非 flex 子项拿到的是
+**无界**主轴约束，永远不会 wrap；给 actions 加 `Flexible` 又只能和标题的
+`Expanded` 对半分（375/375，宽窗口下照样折行）。唯一可行的折行方案是把整个
+桌面页头改成 `Wrap` + 标题 `ConstrainedBox(maxWidth: 260)`，代价是**所有页面**
+的操作区从「右对齐」变成「紧跟标题左对齐」—— 视觉回归太大，不划算。
+
+### 9.4 触发时机
+| 平台 | 入口 | 时机 | 节流 |
+|---|---|---|---|
+| PC | 启动静默检查 | `AppShell` 挂 `_FollowLaunchCheck`，延迟 **20 秒** | 沿用窗口 |
+| PC | 手动 | 分类栏右端「检查更新」（`force: true`） | 无视 |
+| PC | 定时 | 设置页 `follow_auto_check` 三态：`off` / `on_launch`（默认）/ `every_6h` | 沿用窗口 |
+| Android | 进媒体库静默检查 | `LibraryActivity` 首帧后延迟 **1.5 秒** | 窗口 **30 分钟** |
+| Android | 手动 | MENU 覆盖层菜单「检查追剧更新」 | 无视 |
+
+- ⛔ PC 的启动触发器**必须挂在壳上**（`AppShell`），不是媒体库页：语义是
+  「一次会话一次」，挂在媒体库页会变成「每次进媒体库 20 秒后」。
+- ⛔ 它那两个 `Timer`（20 秒 + `every_6h`）**必须在 `dispose` 里 cancel** ——
+  漏了会让 widget 测试在收尾时炸「A Timer is still pending even after the
+  widget tree was disposed」，看起来像「加了段无关代码、一堆页面测试同时红」。
+- ⛔ `every_6h` 的周期与 `throttleWindow` **是同一个数（6h）但刻意不互相引用**：
+  比窗口密 = 白转一圈，比窗口疏 = 漏掉窗口边界那一次。两处一起改。
+- ⛔ 手动入口一律 `force: true`：无视窗口、也无视 `off`。把 `off` 也挡住的话，
+  那个按钮会变成「按下去什么都不发生」。
+- ⛔ 扫描 / 刮削在跑时**禁用**追更检查（两边的节流器是各自实例，并发跑等于把
+  实际 QPS 翻倍）。这是**单向**守卫（追更让着扫描），与 discovery 那边一致。
+
+### 9.5 PC 界面落点
+- 分类栏：「追剧 N」chip（⛔ **不加侧栏一级入口** —— `app_shell._items` 与
+  `app_router.branches` 必须同序，判据是**下标**）。角标 = **有更新的作品数**
+  （`new_item_count > 0`），不是「在追的作品数」—— 后者恒 > 0，角标永远亮着。
+- 海报卡角标：**左上角**（其余三角已占：左下评分 / 右下简介 / 右上文件名），
+  且只在 `!selecting` 时画。
+- 剧集行 NEW：`MediaItemRow` 的 `isNew` 参数（判据由 `_DetailBody` **算好传进来**，
+  只此一处），`_NewTag` 与主标题**同排**（不改行高 —— 与进度条压底边同一条理由）。
+  文案口径与 Android `newEpisodeTitle` 逐字一致（■ + NEW）。
+- 详情页 `_FollowButton`：放**播放之后、刮削之前**（与 Android 那颗胶囊同序）。
+  已追剧时**点亮**（半透明底 + 同色描边，⛔ 深色 UI 靠**实心面明度**不靠描边）。
+  写入走 `FollowController.toggleFollow`，它刷新**四处**：`workListProvider` /
+  `followedUpdateCountProvider` / `libraryStatsProvider` / **`workDetailProvider(key)`**。
+  ⛔ 漏最后一处的表现是「点了按钮毫无反应」（库里已追上，眼前那颗还写着「追剧」），
+  用户会再点一次 = 取消，来回几下就认为按钮坏了。
+- 空态：`libraryEmptyHint` 的追剧分支必须排在**搜索词 / 面板条件之后** ——
+  带条件时确实是「条件太紧，清掉就好」，排前面会让用户点「去看看全部」时把
+  自己打的词一起丢掉。
+- SnackBar：⛔ **只在 `outcome.hasNews` 时弹**（`newItems > 0`）。手动点一次
+  什么都没变时弹「没有更新」是最典型的噪音。用 `identical(prev?.outcome, …)`
+  挡同一份结果，否则用户会连吃两个一样的提示。「查看」要**把面板条件 + 搜索词
+  一起清掉**再切追剧，否则更新的那几部恰好不在旧条件里时，点完看到一片空。
+
+### 9.6 恢复备份之后
+`settings_page._refreshLibraryViews` 必须 invalidate **六个**：`workListProvider` /
+`libraryStatsProvider` / `categoryCountsProvider` / `playedCountProvider` /
+`followedUpdateCountProvider` / `yearCountsProvider` / `genreCountsProvider`，
+外加 `settingsProvider`。
+⛔ 后五个**只** `watch(libraryListSignalProvider)`（**不是**
+`libraryWriteSignalProvider`），所以函数里那句 `libraryWriteSignalProvider.bump()`
+**推不动它们**，必须显式 invalidate。漏掉的表现是「恢复完之后列表是新库的内容，
+但分类栏角标还是旧库的数字」—— 列表本身看着是对的，很难联想到它。
+（`categoryCounts` / `playedCount` 这两处是 2026-10-07 顺手补的既有缺口。）
+
+### 9.7 验证命令
+```
+# PC
+NO_PROXY="127.0.0.1,localhost" HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
+  flutter analyze lib
+NO_PROXY=... flutter test test/domain test/ui
+# ⚠️ `test/ui/widgets/tv_text_field_test.dart`「TV 下点一下进编辑态」在本机
+#    Flutter 3.29 下**恒红**（enterText 行为差异），与追剧无关，别去查它。
+# Android（JDK 21）
+JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home \
+  ./gradlew :app:testDebugUnitTest --tests 'com.cloudcine.tv.library.*'
+```
+
+### 9.8 追剧新集「看不见」的三层根因（2026-10-07 macOS 现场）
+
+用户原话：
+> 「遮天这部动画片设置为追剧后，点击更新后发现有 2 个更新，但是并没有在简介的
+>   文件列表中发现这俩文件」
+> 「**可能是因为没有刷新缓存，点击一下刷新可以看到 2 个新文件**」
+
+★ 最后这句是钥匙：它把方向从「新集落在别的季格」（我第一轮的判断）扭回
+**信号接线**。三方对齐（`logs/cloudcine-2026-10-07.log` / 用户库 / 源码）：
+日志 `[发现] 媒体 13（新增 2 / 已有 11）`、`[追剧] 检查结束：… 新增 2`，
+库里 `shroudingtheheavens.followed=1, new_item_count=2` ⇒ **库确实写对了**。
+
+#### ① 真根因：`workDetailProvider` 没订阅 `libraryWriteSignalProvider`
+`ui/providers/library_providers.dart`。它当时只
+`ref.watch(playbackProgressSignalProvider)`（播放进度），而写库的几条路径
+（扫描 / 发现 / **追更检查** / 批量刮削）推的是 `libraryWriteSignalProvider`
+（语义 =「库里数据变了，**凡是读库的视图都该重看**」）⇒ 详情页不在那条链的
+下游，不重查。
+
+**为什么这一类 bug 特别贵**：它既不像「写失败」（库里有数据），也不像
+「查询错」（点一下刷新就对），只能对着信号链一条条数。
+
+**修**：加 `ref.watch(libraryWriteSignalProvider);`。
+★ 一般化：**任何读库的 `FutureProvider`/`Notifier` 都必须 watch 写库信号**；
+漏掉的表现是「点了按钮毫无反应」。`FollowController._refreshAfterWrite` 的
+注释早就反复强调过这一条，这次漏掉的是**文件列表本身**。
+
+#### ② `clearFollowBadge` 此前**全工程没有调用点** ⇒ 角标永不消失
+海报上「更新 N」永远挂着，用户没有任何办法清掉。
+
+**修**：在 `workDetailProvider` 里判「这一部下已经没有任何『追剧后新增且没播过』
+的条目」时清掉。三条口径：
+- 判据必须与行级 `■ NEW` **同源**（同一个 `MediaWork.isNewSinceFollow` +
+  `maxPositions`），否则会出现「列表里一条 NEW 都没有、海报上还挂着 2」；
+- ⛔ 用 `maxPositions` 而不是 `resumePositionMs`（后者看完会被清成 NULL）；
+- ⛔ 只清 `new_item_count` 一列（`follow_started_at` / `follow_checked_at` /
+  `updated_at` 都不能动，理由见 `clearFollowBadge` 的注释）。
+
+#### ③ ⛔⛔ `ref.invalidateSelf()` 不能在 provider **自己的 body** 里用
+清完角标我原本写 `ref.invalidateSelf()` 把 `work` 刷成 `newItemCount = 0`。
+单测**直接超时 30 秒**，Riverpod 抛：
+`Bad state: The provider … was disposed during loading state, yet no value could
+be emitted.` —— 本次计算产出的那个 future **永远不完成**，而详情页正是靠它拿
+数据的（`.future` 被孤立）。
+
+**修**：`work = owner.copyWith(newItemCount: 0);` 直接改手上这一份。既省掉一次
+四查询，也不会把状态推回 loading（值本来就已知）。顺带避开另一个隐患：万一
+`clearFollowBadge` 没写成功，自我作废会变成**无限重建**。
+
+#### ④ 附带：`183 4K.mp4` 提不出集号
+`core/utils/filename_parser.dart` 的 `_parseDotted`：`183` 被当片名
+（`_isStandaloneRelease` 允许纯数字当名字，为《65》那部电影），紧接着
+「目录名作为系列名」那条规则用目录名顶掉 `title` 时**连季集号一起清掉** ⇒
+它在库里成了独立作品，而详情页按「作品 = 遮天」查文件，永远查不到。
+
+**修**：`bareEpisode` —— 三条守卫**同时**成立才算：
+① `title` 是纯数字（`^\d{1,4}$`）；② 编号与第一个技术标记之间**只隔空格**
+（`markerStart > 0`；点号不算）；③ **没有年份**。
+命中后 `title = null`（让目录名兜底）、`kind = episode`、`episode = bareEpisode`。
+回归样本全部不变：`65.2023.2160p…`（片名《65》）、`159.mkv`、`183.mp4`、
+`182.格力空调显示E6如何维修.mp4`。
+
+#### ⑤ 顺带的可见性改进（用户三选一里选的「格子角标 + 提示条」）
+`ui/pages/work_detail_page.dart`：
+- 季/部 chip 上加「N 新」小胶囊 `_NewCountBadge`（**品牌色**，不跟选中态走 ——
+  它的意思是「这里有新东西」，与「你正站在这一格」是两件事）；
+- 当前格一条新的都没有、而别处有时，选择器下面挂整条可点的 `_NewItemsHint`
+  （「有 N 集更新在「X」里 · 去看看」），点一下 `setState` 切格；
+- ⛔ 角标与行级 `■ NEW` 必须用**同一个** `isNewItem` 判据。
+
+#### ⑥ 新增守卫测试（三个文件，均已离线验证会变红）
+- `test/ui/providers/work_detail_follow_refresh_test.dart`
+  ① 写库 + 推 `libraryWriteSignalProvider` → 详情页必须多出那一行
+     （离线验证：注释掉那个 watch ⇒ `Expected: <3> / Actual: <2>`，**精确复现用户现场**）；
+  ② 两集新集都 `saveMaxPosition` 之后角标自动归零、且 `followStartedAt` 不动
+     （离线验证：`if (false)` 掉那个分支 ⇒ `Expected: <0> / Actual: <2>`）。
+- `test/ui/pages/work_detail_new_badge_test.dart`：新集在别的季 ⇒ 那一格挂「1 新」+
+  指路条出现；**点一下列表真的换了**。
+  ⚠️ 只断言「提示条消失」抓不住「只换高亮不换列表」—— 那种坏版本一样会消失
+  （因为已经站在那一格了），测试会绿而用户仍看不到那一集。
+- `test/core/filename_parser_test.dart` 新增一组「「编号 + 空格 + 分辨率」= 集号」
+  （5 例：`183 4K.mp4` 有/无目录 + 三条回归守卫）。
+
+#### ⑦ ⚠️ 写这类测试时踩的两个坑（下次直接照做）
+1. `upsertItems` 插入时**用 `now` 顶掉 `firstSeenAt`**（「首次入库时刻 = 本次
+   扫描时刻」是它的语义）⇒ 想让「老集」与「追剧起点」有先后，必须**传两次不同
+   的 `now`**，在 `MediaItem` 上填 `firstSeenAt` 是**无效的**。
+2. `saveMaxPosition` 收的是**完整 item id**（`quark:f3`），不是 `fileId`。
+   传错时它静默匹配 0 行 —— 正是「看过没有」这类判据最难查的失败形态。
+

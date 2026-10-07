@@ -7,6 +7,7 @@ import '../entities/media_work.dart';
 import '../entities/playback_preference.dart';
 import '../entities/subtitle_track.dart';
 import '../entities/drive_provider.dart';
+import '../entities/follow_dir.dart';
 import '../entities/scan_cursor.dart';
 import '../entities/work_poster.dart';
 
@@ -199,6 +200,136 @@ abstract class MediaRepository {
   /// ⚠️ 不能用 `copyWith(introStartMs: null)` 代替 —— `copyWith` 的 `??`
   /// 把 `null` 当「不改」，那是**清不掉的**（与 `mergedInto` 同一个坑）。
   Future<void> clearWorkIntroRange(String key);
+
+  // -------------------------------------------------------------------
+  // 追剧 / 更新提醒（schema v17）
+  // -------------------------------------------------------------------
+  //
+  // 四列一组：`followed` / `followStartedAt` / `followCheckedAt` /
+  // `newItemCount`。完整口径见 `MediaWork` 与 `tables.dart` 里的注释，
+  // 这里只重复三条最容易写错、且**错了不会报错**的：
+  //
+  //   1. ⛔ [setFollowed] **要**更新 `updated_at`（用户显式动作 = 真实内容
+  //      变更，该跨端同步）；[applyFollowCheck] / [setFollowNewItemCount]
+  //      **绝不能**更新它 —— 否则每次自动检查都会改同步判据
+  //      `libraryModifiedAt`，本机永远「看起来更新」，下一次同步无条件
+  //      上传，把另一台设备的播放进度盖掉。
+  //   2. ⛔ [applyFollowCheck] 里的计数是**增量累加**，不是重算 ——
+  //      重算会把用户刚清掉的角标又算回来。
+  //   3. ⛔ [setFollowNewItemCount] **只写计数一列**，**不动
+  //      `follow_started_at`** —— 动了的话剧集列表的 NEW 标签会跟着消失，
+  //      而用户还没看。
+
+  /// 开关一部作品的追剧。
+  ///
+  /// 开启时**同时建立两条水位线**：`follow_started_at = follow_checked_at = now`，
+  /// 并把 `new_item_count` 清 0。三件事必须一起做：
+  ///
+  ///   - `follow_started_at = now` ⇒ 此刻之前入库的集**都不算新增**
+  ///     （用户刚看完 12 集才开的追剧，不该把 12 集全标成 NEW）；
+  ///   - `follow_checked_at = now` ⇒ 第一次检查只报「开启之后」的新增，
+  ///     不会把开启那一刻之前扫到的东西重报一遍；
+  ///   - `new_item_count = 0` ⇒ 角标从零开始。
+  ///
+  /// 关闭时四列一起清回默认（`followed = false`、两条水位线 `NULL`、计数 0）。
+  /// ⛔ 清 `follow_started_at` 是**有意**的：用户关掉再打开 = 「重新开始追」，
+  /// 之前的 NEW 标签全部作废，这是预期行为。
+  Future<void> setFollowed(String key, bool followed, {DateTime? now});
+
+  /// 把一部作品的**未读新增条数**写成给定值（`0` = 清掉角标）。
+  ///
+  /// 两个调用场景，都在「用户看过了」这一侧：
+  ///   - `count == 0`：新集**全**看过了 ⇒ 角标消失；
+  ///   - `0 < count < 旧值`：只看了一部分 ⇒ 角标跟着降
+  ///     （`syncFollowReadCount`，见 `domain/services/follow_read.dart`）。
+  ///
+  /// ⛔ **绝不用于上调。** 上调的唯一入口是 [applyFollowCheck]：它才知道
+  ///    「本次检查真的发现了什么」。从「未读集合」重算出来的数字只允许变小，
+  ///    否则打开一次详情页就可能凭空冒出角标（那个集合的口径更宽，包含
+  ///    「追剧之后、但被全盘扫描而不是追更检查发现的集」）。
+  ///
+  /// ⛔ **只写 `new_item_count` 一列**：`follow_started_at` 原样保留 ——
+  /// 剧集行的 NEW 标签靠它，那是「哪几集是新的、我还没看」，与角标
+  /// 回答的不是同一个问题（角标 = 「有我不知道的新东西」）。
+  ///
+  /// ⛔ **不更新 `updated_at`**（理由见本节顶部第 1 条）。
+  ///
+  /// 没有 `now` 参数：这一列不写任何时间戳，多一个参数只会让人以为写了。
+  Future<void> setFollowNewItemCount(String key, int count);
+
+  /// 一次追更检查的写回（**一个事务**）。
+  ///
+  /// @param increments 作品 key → 本次新增条数。只放**有新增**的作品，
+  ///   没新增的不必出现在里面（但仍要在 [checkedKeys] 里推进水位线）。
+  /// @param checkedKeys 本次**成功检查过**的作品 key —— 水位线
+  ///   `follow_checked_at` 只对这些作品推进。
+  ///
+  /// ⛔ **列目录失败的目录所覆盖的作品必须排除在 [checkedKeys] 之外**：
+  ///    水位线是「已经看过这里了」的承诺，在没看成功时推进它，等于把这批
+  ///    新集永久划进「已读」—— 用户再也不会被提醒，而且没有任何报错。
+  ///    与全盘扫描那条「有目录列失败就不做陈旧清理」是同一条思路。
+  ///
+  /// ⛔ 不更新 `updated_at`（本节顶部第 1 条）。
+  Future<void> applyFollowCheck({
+    required Map<String, int> increments,
+    required Set<String> checkedKeys,
+    required DateTime checkedAt,
+  });
+
+  /// 全部**在追**的作品 key（只含 `merged_into IS NULL` 的行）。
+  ///
+  /// 空列表意味着「一次网盘请求都不用发」—— 调用方应当据此提前返回。
+  Future<List<String>> followedWorkKeys();
+
+  /// 这几部作品名下的**网盘目录**（去重，`FollowDir` 已按 fid 去重）。
+  ///
+  /// ## 并集口径
+  ///
+  /// 与 [itemsForWork] 一致：跨目录归一时源行的 `group_key` 从不改写，
+  /// 所以「这部作品的文件在哪些目录」的正确答案是**并集** ——
+  /// 只查目标自己的 `group_key` 会漏掉被折叠进来的那些文件所在的目录，
+  /// 表现是「合并过的剧永远收不到更新提醒」。
+  ///
+  /// ⛔ **必须去重**：一部剧的 12 集通常在同一个目录里，不去重就是
+  /// 12 次列目录请求（而夸克有 QPS 限制）。
+  ///
+  /// 每个 [FollowDir] 还带**这个目录覆盖到了哪些在追作品**（[FollowDir.workKeys]），
+  /// 因为一个目录可能含多部作品（`/电影/` 是平铺的）—— 检查回写要
+  /// 「按目录」展开到作品，见 §红线 5。
+  Future<List<FollowDir>> dirsForWorks(List<String> keys);
+
+  /// 有几部在追的作品带未读更新（分类栏「追剧 N」上的那个数字）。
+  ///
+  /// 与 [countPlayedWorks] 同类的角标计数：海报墙上不显示，只用于分类栏。
+  Future<int> countUpdatedWorks();
+
+  /// 这几部作品各自「**上次检查之后**新入库的条数」= `new_item_count` 的增量。
+  ///
+  /// 判据：`media_items.first_seen_at > COALESCE(follow_checked_at, follow_started_at)`。
+  ///
+  /// ## ⛔ 用 `COALESCE(checked, started)` 而不是裸 `checked`
+  ///
+  /// 只有 [setFollowed] 会把 `followed` 置 1，而它**同时**写两条水位线 ——
+  /// 所以「`followed = 1` 但 `follow_checked_at IS NULL`」本该不存在。
+  /// 但真出现了（手改的库、早期版本写的行）时，裸 `checked` 会让
+  /// `first_seen_at > NULL` 恒为 NULL、计数恒为 0 —— 这部剧**永远不提醒**，
+  /// 而且没有任何报错。退回 `follow_started_at` 是它的正确语义
+  /// （「检查到追剧开始那一刻」）。
+  ///
+  /// ⛔ 两个都 `NULL` 时**必须**得到 0，不能退到 epoch：那会把整部剧算成新增
+  /// （角标直接变成总集数）。SQL 里 `x > NULL` 天然是 NULL、COUNT 不计入，
+  /// 所以只要把 `COALESCE` 写进比较式就自动成立 —— **不要**写成
+  /// `COALESCE(a, b, 0)`。
+  ///
+  /// ## ⛔ 按**并集**口径数（与 [itemsForWork] 一致）
+  ///
+  /// 跨目录归一从不改写 `media_items.group_key`，所以被折叠进来的源作品名下
+  /// 的集**不在** `group_key = W.key` 里。只数存值的话，合并过的剧角标会
+  /// 永远少报那几集 —— 而 [dirsForWorks] 已经按并集把目录找齐了，
+  /// 两处口径不一致会让「检查到了新集但不报数」。
+  ///
+  /// 没在结果里的 key 视为 0（调用方不必先铺一遍零）。
+  Future<Map<String, int>> pendingNewItemCounts(List<String> keys);
 
   /// 按归组键取作品。
   Future<MediaWork?> workByKey(String key);
@@ -408,6 +539,17 @@ abstract class MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    /// 只看**在追**的作品（分类栏「追剧」那一栏）。
+    ///
+    /// 与 [playedOnly] 完全同类：是一个**视图**，不落库、不参与分类判定，
+    /// 而且与 [category] 互斥（分类栏是单选组）。
+    ///
+    /// ⛔ 为真时排序会**额外**把「有未读更新」的作品排到最前
+    /// （`newItemCount > 0` 优先），再按 [sort] 排。这是视图内的隐式规则，
+    /// **刻意不新增一个 `WorkSort` 取值** —— 那个枚举是两端共用的全局排序
+    /// 菜单口径，为一个视图加一档会让菜单里出现一个在别的栏里毫无意义的
+    /// 选项。
+    bool followedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -483,6 +625,7 @@ abstract class MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   });
 
@@ -499,6 +642,7 @@ abstract class MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   });
 
@@ -1084,62 +1228,154 @@ class InMemoryMediaRepository implements MediaRepository {
   Future<void> setWorkIntroStart(String key, int startMs) async {
     final work = _works[key];
     if (work == null) return;
-    _works[key] = _withIntro(work, startMs, work.introEndMs);
+    _works[key] = work.copyWith(introStartMs: startMs);
   }
 
   @override
   Future<void> setWorkIntroEnd(String key, int endMs) async {
     final work = _works[key];
     if (work == null) return;
-    _works[key] = _withIntro(work, work.introStartMs, endMs);
+    _works[key] = work.copyWith(introEndMs: endMs);
   }
 
   @override
   Future<void> clearWorkIntroRange(String key) async {
     final work = _works[key];
     if (work == null) return;
-    // 与 `unmergeWorks` 同一条：清空必须**整行重建** —— `copyWith` 的 `??`
-    // 把 `null` 当「不改」，走它等于「清了个寂寞」。
-    _works[key] = _withIntro(work, null, null);
+    // 清空可空字段只能靠 `copyWith` 的显式开关（`??` 把 `null` 当「不改」）。
+    //
+    // ⚠️ 这里曾经是一个逐列抄一遍的 `_withIntro` 整行重建。改成开关是因为
+    // 那种写法每加一列都要记得同步，而**漏一列是静默丢数据**：比如漏了
+    // `mergedInto`，清一次片头就会顺手把跨目录归一拆开；漏了 `followed`，
+    // 清一次片头就会顺手取消追剧。
+    _works[key] = work.copyWith(clearIntro: true);
   }
 
-  /// 整行重建，只换片头那两列。
-  ///
-  /// ⚠️ 逐列抄一遍看着笨，但这是**唯一**能清空可空字段的写法（理由见
-  /// [clearWorkIntroRange]）。漏抄一列的后果是静默丢数据：比如漏了
-  /// `mergedInto`，清一次片头就会顺手把跨目录归一拆开。
-  MediaWork _withIntro(MediaWork w, int? startMs, int? endMs) => MediaWork(
-        key: w.key,
-        provider: w.provider,
-        kind: w.kind,
-        title: w.title,
-        category: w.category,
-        categoryManual: w.categoryManual,
-        originalTitle: w.originalTitle,
-        year: w.year,
-        overview: w.overview,
-        posterUrl: w.posterUrl,
-        posterFile: w.posterFile,
-        posterFaceX: w.posterFaceX,
-        backdropUrl: w.backdropUrl,
-        backdropFile: w.backdropFile,
-        rating: w.rating,
-        genres: w.genres,
-        genresManual: w.genresManual,
-        onlineId: w.onlineId,
-        source: w.source,
-        scrapedAt: w.scrapedAt,
-        itemCount: w.itemCount,
-        totalBytes: w.totalBytes,
-        seasonCount: w.seasonCount,
-        mergedInto: w.mergedInto,
-        introStartMs: startMs,
-        introEndMs: endMs,
-        lastModifiedAt: w.lastModifiedAt,
-        firstSeenAt: w.firstSeenAt,
-        lastPlayedAt: w.lastPlayedAt,
-        updatedAt: w.updatedAt,
+  // -------------------------------------------------------------------
+  // 追剧 / 更新提醒（schema v17）
+  // -------------------------------------------------------------------
+
+  @override
+  Future<void> setFollowed(String key, bool followed, {DateTime? now}) async {
+    final work = _works[key];
+    if (work == null) return;
+    final ts = now ?? DateTime.now();
+    _works[key] = followed
+        ? work.copyWith(
+            followed: true,
+            // 两条水位线一起建立（理由见接口文档）。
+            followStartedAt: ts,
+            followCheckedAt: ts,
+            newItemCount: 0,
+            updatedAt: ts,
+          )
+        // ⛔ `clearFollow` 把两条水位线清回 `null` —— 关掉再打开 = 「重新
+        // 开始追」，之前的 NEW 标签全部作废，这是预期行为。
+        : work.copyWith(followed: false, clearFollow: true, updatedAt: ts);
+  }
+
+  @override
+  Future<void> setFollowNewItemCount(String key, int count) async {
+    final work = _works[key];
+    if (work == null) return;
+    // ⛔ 只写计数：不动两条水位线（NEW 标签靠 `followStartedAt`），
+    // 不动 `updatedAt`（它参与同步判据 `libraryModifiedAt`）。
+    _works[key] = work.copyWith(newItemCount: count);
+  }
+
+  @override
+  Future<void> applyFollowCheck({
+    required Map<String, int> increments,
+    required Set<String> checkedKeys,
+    required DateTime checkedAt,
+  }) async {
+    for (final key in checkedKeys) {
+      final work = _works[key];
+      if (work == null) continue;
+      _works[key] = work.copyWith(
+        followCheckedAt: checkedAt,
+        // ⛔ 增量累加，不是重算 —— 重算会把用户刚清掉的角标又算回来。
+        newItemCount: work.newItemCount + (increments[key] ?? 0),
       );
+    }
+  }
+
+  @override
+  Future<List<String>> followedWorkKeys() async => _works.values
+      .where((w) => w.followed && w.mergedInto == null)
+      .map((w) => w.key)
+      .toList(growable: false);
+
+  @override
+  Future<List<FollowDir>> dirsForWorks(List<String> keys) async {
+    if (keys.isEmpty) return const [];
+    // 并集口径：目标自己的 `group_key` ∪ 「被折叠进它们」的源行 —— 与
+    // `itemsForWork` 同一条理由（归一从不改写 `media_items.group_key`）。
+    // ⛔ 源 → 目标的翻译在收集时就要做：文件行上只有源的 key，而水位线
+    //    只写在目标行上（见 drift 实现的同款注释）。
+    final target = keys.toSet();
+    final sourceToTarget = <String, String>{};
+    for (final w in _works.values) {
+      final dst = w.mergedInto;
+      if (dst != null && target.contains(dst)) sourceToTarget[w.key] = dst;
+    }
+    final all = <String>{...keys, ...sourceToTarget.keys};
+
+    final dirPathById = <String, String>{};
+    final workKeysByDir = <String, Set<String>>{};
+    for (final item in _items.values) {
+      if (!all.contains(item.groupKey)) continue;
+      if (item.dirId.isEmpty) continue;
+      final owner = sourceToTarget[item.groupKey] ?? item.groupKey;
+      if (!target.contains(owner)) continue;
+      (workKeysByDir[item.dirId] ??= <String>{}).add(owner);
+      dirPathById.putIfAbsent(
+        item.dirId,
+        // 归一成带尾斜杠：它参与 `groupKey` 的计算。
+        () => drivePathWithTrailingSlash(item.dirPath),
+      );
+    }
+    return [
+      for (final e in dirPathById.entries)
+        FollowDir(
+          dirId: e.key,
+          dirPath: e.value,
+          workKeys: workKeysByDir[e.key] ?? const <String>{},
+        ),
+    ];
+  }
+
+  @override
+  Future<int> countUpdatedWorks() async => _works.values
+      .where((w) => w.newItemCount > 0 && w.mergedInto == null)
+      .length;
+
+  @override
+  Future<Map<String, int>> pendingNewItemCounts(List<String> keys) async {
+    final out = <String, int>{};
+    for (final key in keys) {
+      final work = _works[key];
+      // 水位线口径与 drift 实现逐字对齐：`checked` 缺了退回 `started`，
+      // 两个都缺算 0（**不是** epoch —— 那会把整部剧算成新增）。
+      final since = work == null
+          ? null
+          : (work.followCheckedAt ?? work.followStartedAt);
+      if (since == null) {
+        out[key] = 0;
+        continue;
+      }
+      // 并集口径：被折叠进来的源作品名下的集也算（`group_key` 从不改写）。
+      final sources = <String>{key};
+      for (final other in _works.values) {
+        if (other.mergedInto == key) sources.add(other.key);
+      }
+      out[key] = _items.values
+          .where((i) =>
+              sources.contains(i.groupKey) && i.firstSeenAt.isAfter(since))
+          .length;
+    }
+    return out;
+  }
 
   @override
   Future<List<MediaWork>> listWorks({
@@ -1147,6 +1383,7 @@ class InMemoryMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
     Set<int>? years,
     Set<String>? genres,
@@ -1179,6 +1416,11 @@ class InMemoryMediaRepository implements MediaRepository {
     if (scrapedOnly) {
       list = list.where((w) => w.source == ScrapeSource.online).toList();
     }
+    // 「在追」是**用户开关**（`followed`），不是「有更新」—— 有更新的那几部
+    // 只是排在前面（见下面的排序），仍然全都在这一栏里。
+    if (followedOnly) {
+      list = list.where((w) => w.followed).toList();
+    }
     // 年份：`years` 存的是**具体年份**（2023 只匹配 2023 年上映的作品）。
     // 没有年份的作品（`year == null`）归不进任何年份 —— 选了年份就等于把
     // 它排掉，与 drift 实现里 `year IN (...)` 的口径一致。
@@ -1208,7 +1450,18 @@ class InMemoryMediaRepository implements MediaRepository {
         );
       }).toList();
     }
-    list.sort((a, b) => _compareWorks(a, b, sort));
+    // 「追剧」视图里**有更新的排最前**：用户点进这一栏想看的几乎总是
+    // 「哪几部有新东西」。这是视图内的隐式规则，**不新增 `WorkSort` 取值**
+    // —— 那个枚举是两端共用的全局排序菜单口径（理由见接口文档）。
+    // 与 drift 侧的 `new_item_count > 0 DESC` 必须同口径。
+    list.sort((a, b) {
+      if (followedOnly) {
+        final x = a.hasUpdate ? 1 : 0;
+        final y = b.hasUpdate ? 1 : 0;
+        if (x != y) return y.compareTo(x);
+      }
+      return _compareWorks(a, b, sort);
+    });
     return _withUnionStats(list.skip(offset).take(limit).toList());
   }
 
@@ -1340,6 +1593,7 @@ class InMemoryMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   }) async {
     // 直接复用 [listWorks] 的筛选，而不是把条件再抄一遍：口径要严格等于
@@ -1348,6 +1602,7 @@ class InMemoryMediaRepository implements MediaRepository {
       category: category,
       playedOnly: playedOnly,
       scrapedOnly: scrapedOnly,
+      followedOnly: followedOnly,
       query: query,
       limit: _noLimit,
     );
@@ -1367,12 +1622,14 @@ class InMemoryMediaRepository implements MediaRepository {
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
+    bool followedOnly = false,
     String? query,
   }) async {
     final works = await listWorks(
       category: category,
       playedOnly: playedOnly,
       scrapedOnly: scrapedOnly,
+      followedOnly: followedOnly,
       query: query,
       limit: _noLimit,
     );

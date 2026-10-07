@@ -6,6 +6,10 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -22,18 +26,26 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
+import com.cloudcine.tv.library.AutoScraper
+import com.cloudcine.tv.library.CloudCoverFetcher
 import com.cloudcine.tv.library.DeviceIdentity
 import com.cloudcine.tv.library.EpisodeLabels
+import com.cloudcine.tv.library.FollowAutoCheck
+import com.cloudcine.tv.library.FollowUpdater
 import com.cloudcine.tv.library.LibraryBackupService
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.LibrarySettings
 import com.cloudcine.tv.library.ItemSortMode
 import com.cloudcine.tv.library.LibraryScanner
 import com.cloudcine.tv.library.MediaCategoryNames
 import com.cloudcine.tv.library.PlayTarget
 import com.cloudcine.tv.library.sortItems
+import com.cloudcine.tv.library.PosterFetcher
 import com.cloudcine.tv.library.PosterStore
+import com.cloudcine.tv.library.ScrapeHttp
+import com.cloudcine.tv.library.ScraperPipeline
 import com.cloudcine.tv.library.StartupSync
 import com.cloudcine.tv.library.SyncDecision
 import com.cloudcine.tv.library.Work
@@ -128,12 +140,61 @@ class LibraryActivity : Activity() {
     private lateinit var posters: PosterStore
     private lateinit var scanner: LibraryScanner
 
+    /**
+     * 未刮削作品的**封面兜底** —— 把网盘自带的缩略图拉下来当封面。
+     *
+     * ⛔ 它与 [posters] 是两件事：`posters` 只**查找 + 解码**（从不下网络），
+     *    这个负责把 `poster_url` 拉下来、**落进海报目录**。分开的理由见
+     *    [CloudCoverFetcher] 的类文档。
+     */
+    private lateinit var cloudCovers: CloudCoverFetcher
+
+    /**
+     * **追更检查**的执行器（schema v17 的「追剧」）。
+     *
+     * ⛔ 它复用 [scanner] 的**局部发现**（`discover(recursive = true)`），
+     *    **绝不**走 [LibraryScanner.scan] 全盘扫描 —— 后者会写续扫游标、
+     *    会拿「本次见到的 id」当白名单跑陈旧清理。只看到一棵子树时拿它当
+     *    白名单 = **把库清空**（红线 2）。
+     */
+    private lateinit var followUpdater: FollowUpdater
+
+    /** 追更检查的取消开关（与 [scanCancel] 同一套「非 null = 正在跑」判据）。 */
+    private var followCancel: LibraryScanner.Cancellation? = null
+
     // ── 扫描 ────────────────────────────────────────────────────────
     //
     // ⛔ 用「非 null 的取消开关」当「正在扫描」的判据，而不是另一个布尔量：
     //    两个变量迟早会有一个忘了同步（比如取消时清了标志、忘了清开关），
     //    表现是「返回键再也停不下扫描」。
     private var scanCancel: LibraryScanner.Cancellation? = null
+
+    /**
+     * 自动刮削的取消开关。与 [scanCancel] 同一套判据（非 null = 正在跑）。
+     *
+     * ⛔ 它**不能**与 [scanCancel] 合并：扫描与刮削是前后两段，扫描一结束
+     *    第一段就清空了，而刮削可能还要跑好几分钟 —— 合并的话返回键会在
+     *    最需要它的那段时间里失效。
+     */
+    private var scrapeCancel: LibraryScanner.Cancellation? = null
+
+    /**
+     * 已经为哪几部作品发起过网盘封面下载。
+     *
+     * ⛔ 需要它是因为**失败是记在内存里的**（`CloudCoverFetcher.failed`），
+     *    而简介页每次重画都会再问一次 —— 万一文件名算不出来（`poster_url`
+     *    里带了首尾空白之类），就会「没有文件 → 再下一次 → 还是没有」地
+     *    无限重画。这一层是最后一道闸：**每部作品每个页面实例只试一次**。
+     */
+    private val cloudCoverTried = HashSet<String>()
+
+    /**
+     * 「有网盘封面刚下好，作品墙该重画了」。
+     *
+     * ⛔ 不能每下好一张就 `notifyDataSetChanged()`：首次进库时未刮削的作品
+     *    可能有几百部，逐个重绑整墙等于把海报墙按住不让动。攒成一次。
+     */
+    private var cloudRefreshQueued = false
 
     // ── 视图 ────────────────────────────────────────────────────────
     private lateinit var root: FrameLayout
@@ -204,6 +265,21 @@ class LibraryActivity : Activity() {
     private var currentWork: Work? = null
     private var sort = LibraryDb.Sort.recentModified
     private var playedOnly = false
+
+    /**
+     * 「追剧」视图 —— 与 [playedOnly] **完全同类**：它是一个**视图**，不是分类。
+     *
+     * ⛔ 与分类 / [playedOnly] **互斥**：点它会退出当前分类，点分类会退出它。
+     *    两两互斥的三态（分类 / 最近播放 / 追剧）如果允许叠加，用户会看到
+     *    「动漫 ∩ 追剧」这种既没有标签也没有解释的空结果，而角标数字
+     *    （「追剧 5」）说的是全局，不是「动漫里的追剧」—— 两个数对不上。
+     *
+     * ⛔ 排序**照常由 [sort] 决定**，但仓储层在 `followedOnly` 时会把
+     *    `new_item_count DESC` 拼在最前（见 `LibraryDb.listWorks`）——
+     *    「有更新的排最前」是这个视图的意义所在，不能让它埋在「最近修改」里。
+     */
+    private var followedOnly = false
+
     private var posterOnly = false
 
     // ── 状态行工具条（排序 / 筛选 / 只看有海报 / 清空）───────────────
@@ -236,6 +312,30 @@ class LibraryActivity : Activity() {
 
     /** 播过的作品数（「最近播放」的角标）。 */
     private var playedCount = 0
+
+    /**
+     * **有更新**的作品数（分类栏「追剧 N」的角标）。
+     *
+     * ⛔ 数的是 `new_item_count > 0` 而不是 `followed = 1` —— 与 PC 端
+     *    `countUpdatedWorks` 逐字同口径。这个数字在电视上是一个**提醒**
+     *    （有 N 部动了），不是「你追了 N 部」的收藏计数；后者是 0 时角标
+     *    会消失，用户就再也不知道自己追了什么。
+     */
+    private var followedCount = 0
+
+    /**
+     * 「追剧自动检查」的**当前值**（真源是它，不是菜单上的字）。
+     *
+     * ⛔ 缓存在内存里而不是每次 `db.getSetting(...)`：读它发生在**主线程**上
+     *    （`onCreate` 的 `postDelayed` 回调、`openMenu`），而主线程读 SQLite
+     *    正是这个工程一直在避免的事（见 [loadWorks] 顶部那条注释）。
+     *    由 [loadWorks] 的后台任务顺带刷新 —— 它本来就在读库。
+     *
+     * ⛔ 默认 [FollowAutoCheck.ON_LAUNCH]：老库 / 从电脑同步过来但那边没设过的
+     *    库，`settings` 表里**根本没有这一行**。默认成 `OFF` 会让「追剧」这个
+     *    功能在新机器上静默失效（判据只写一处，见 [FollowAutoCheck.parse]）。
+     */
+    private var followAutoCheck = FollowAutoCheck.ON_LAUNCH
 
     /** 分面选项的角标：作用域是「分类 / 最近播放 / 已刮削 / 搜索词」，**不含**自己。 */
     private var yearCounts: Map<Int, Int> = emptyMap()
@@ -295,6 +395,22 @@ class LibraryActivity : Activity() {
         )
         posters = PosterStore(LibraryPaths.posterDir(this), POSTER_CACHE_BYTES)
         scanner = LibraryScanner(api = api, db = db)
+        // ⛔ 必须在这里建，且必须**在建 [scanner] 之后**：`checkFollow` 是
+        //    `onCreate` 结束后 1.5 秒（`postDelayed`）就会走到的路径。
+        //    `lateinit` 忘了赋值**不会崩**，只在日志里留一句
+        //    `UninitializedPropertyAccessException`（W 级），表现是
+        //    「追剧功能静默失效」—— 角标永远不涨、状态行永远不说话。
+        //    2026-10-07 真机部署时实际踩到：装机后进媒体库，日志里
+        //    `追剧检查失败 / lateinit property followUpdater has not been
+        //    initialized`，而界面上一切正常。
+        followUpdater = FollowUpdater(db = db, scanner = scanner)
+        // ⛔ 必须走 `api.thumbBytes`（带网盘 Cookie）：夸克的 `preview_url` 是
+        //    直链，裸链回 `401 code=31001 require login`。所以这里**不能**复用
+        //    [PosterFetcher] —— 那个用的是不带网盘凭证的 `ScrapeHttp`。
+        cloudCovers = CloudCoverFetcher(
+            dir = LibraryPaths.posterDir(this),
+            thumbBytes = { api.thumbBytes(it) },
+        )
 
         root = FrameLayout(this).apply { setBackgroundColor(BG) }
         root.addView(buildContent(), matchParent())
@@ -308,6 +424,19 @@ class LibraryActivity : Activity() {
         //    放在 `onCreate` 里会让首帧等它。海报墙先画出来，探测随后就到 ——
         //    它本来就是「顺带问一句」，不该挡住用户看东西。
         root.post { probeRemoteBackupAtStartup() }
+
+        // ── 进媒体库的静默追更检查 ────────────────────────────────────
+        //
+        // ⛔ 延迟 1.5 秒（`postDelayed`），不是 `post`：这条路径要列网盘目录，
+        //    与首帧那批「读库 + 扫海报目录」抢的是同一个后台线程池。晚一点
+        //    开始，海报墙就已经画完了 —— 而用户感知不到这 1.5 秒。
+        // ⛔ **绝不弹对话框**（红线 12）：结果只体现在状态行一句话 + 海报墙
+        //    角标 + 分类栏「追剧 N」。电视上弹窗会打断播放、抢焦点，还要用户
+        //    摸遥控器去点「确定」。
+        // ⛔ 窗口是 [FollowAutoCheck.LAUNCH_WINDOW_SEC]（30 分钟），**不是**
+        //    `follow_auto_check` 的 6 小时：电视常被反复唤醒（待机 → 进媒体库），
+        //    6 小时窗口会让绝大多数唤醒都什么都不做，用户会觉得「这功能没在跑」。
+        root.postDelayed({ maybeAutoCheckFollow() }, FOLLOW_LAUNCH_DELAY_MS)
     }
 
     override fun onDestroy() {
@@ -315,6 +444,8 @@ class LibraryActivity : Activity() {
         //    而 `close()` 与正在跑的语句之间没有保护（见 `LibraryDb` 类文档）。
         //    置了标志之后它最多再跑完当前那个目录。
         scanCancel?.cancel()
+        // 刮削同理：它可能正卡在一次搜索的超时里。
+        scrapeCancel?.cancel()
         super.onDestroy()
         // ⛔ 必须关：留着连接的话，下次 `rawBytes()` 会读到一份「少最后几次写入」
         //    的库（理由见 `LibraryDb.rawBytes` 的文档）。
@@ -680,6 +811,10 @@ class LibraryActivity : Activity() {
         val hasContent: Boolean,
         val counts: Map<String, Int>,
         val played: Int,
+        /** 有更新的作品数（「追剧 N」的角标）。 */
+        val followed: Int,
+        /** 「追剧自动检查」设置项的**原始字符串**（`null` = 这一行不存在）。 */
+        val followAuto: String?,
         val years: Map<Int, Int>,
         val genres: Map<String, Int>,
     )
@@ -695,6 +830,7 @@ class LibraryActivity : Activity() {
                 works = db.listWorks(
                     sort = sort,
                     playedOnly = playedOnly,
+                    followedOnly = followedOnly,
                     category = category,
                     years = years,
                     genres = genres,
@@ -703,11 +839,15 @@ class LibraryActivity : Activity() {
                 hasContent = db.hasContent(),
                 counts = db.categoryCounts(),
                 played = db.playedCount(),
+                followed = db.followedUpdateCount(),
+                // ⛔ 顺带读回来缓存进 [followAutoCheck]：`maybeAutoCheckFollow`
+                //    与菜单都在**主线程**上问这个值，不能让它去读库。
+                followAuto = db.getSetting(LibrarySettings.FOLLOW_AUTO_CHECK),
                 // ⛔ 分面角标的作用域**不含 years / genres 自己**：否则用户每勾一个
                 //    类型，剩下的类型角标就跟着变，勾到第二个时列表已经空了 ——
                 //    而面板唯一的承诺是「点下去至少有一条结果」。
-                years = db.yearCounts(category, playedOnly, scrapedOnly),
-                genres = db.genreCounts(category, playedOnly, scrapedOnly),
+                years = db.yearCounts(category, playedOnly, scrapedOnly, followedOnly),
+                genres = db.genreCounts(category, playedOnly, scrapedOnly, followedOnly),
             )
         }) { snap, err ->
             if (err != null) {
@@ -718,6 +858,8 @@ class LibraryActivity : Activity() {
             val s = snap ?: return@run
             counts = s.counts
             playedCount = s.played
+            followedCount = s.followed
+            followAutoCheck = FollowAutoCheck.parse(s.followAuto)
             yearCounts = s.years
             genreCounts = s.genres
             level = Level.WORKS
@@ -727,6 +869,7 @@ class LibraryActivity : Activity() {
                 TAG,
                 "媒体库：${s.works.size} 部（分类=${category ?: "全部"}" +
                     (if (playedOnly) "·最近播放" else "") +
+                    (if (followedOnly) "·追剧" else "") +
                     (if (scrapedOnly) "·已刮削" else "") +
                     (if (years.isNotEmpty()) "·年份$years" else "") +
                     (if (genres.isNotEmpty()) "·类型$genres" else "") +
@@ -737,8 +880,12 @@ class LibraryActivity : Activity() {
     }
 
     private fun defaultStatus(s: Snapshot): String = when {
+        // ⛔ 追剧视图空的时候**不能**说「这个分类下没有作品」—— 那会让用户以为
+        //    库里没东西。真正的原因是「你还没在追任何剧」，而出口在简介页。
+        s.works.isEmpty() && followedOnly -> "还没有在追的剧集 —— 进作品简介页点「追剧」"
         s.works.isEmpty() && s.hasContent -> "这个分类/筛选下没有作品"
         s.works.isEmpty() -> "媒体库是空的 —— 菜单 → 从网盘恢复，把电脑上的库同步下来"
+        followedOnly -> "在追 ${s.works.size} 部 · 其中 ${s.followed} 部有更新"
         else -> "共 ${s.works.size} 部"
     }
 
@@ -791,11 +938,30 @@ class LibraryActivity : Activity() {
      */
     private fun openWork(w: Work) {
         status.text = "读取「${w.title}」…"
-        Bg.run({ db.itemsForWork(w.key) }) { list, err ->
+        Bg.run({
+            // ⛔ 进简介页 = 「我看到了」⇒ 清掉未读角标（红线 8）。
+            //
+            // 只清 `new_item_count`：**不动** `follow_started_at`（剧集行的 NEW
+            // 标签靠它 —— 那是「哪几集是新的、我还没看」，与角标回答的不是同一个
+            // 问题；动它会让还没看的那几集的 NEW 一起消失），也**不动**
+            // `updated_at`（红线 1：它参与同步判据，写它会让本机永远「看起来更新」）。
+            //
+            // ⛔ 清完之后必须**重读这一行**：`currentWork` 上的 `newItemCount`
+            //    还是旧值，不重读的话追剧胶囊会一直写着「已追剧 · 2 新」，
+            //    而墙上那枚角标已经没了 —— 同一个数字在两个地方说法不一致。
+            db.clearFollowBadge(w.key)
+            db.workByKey(w.key) to db.itemsForWork(w.key)
+        }) { pair, err ->
             if (err != null) {
                 status.text = "读取失败：${err.message}"
                 return@run
             }
+            val fresh = pair?.first
+            val list = pair?.second
+            // ⛔ 别写成 `fresh ?: run { … return@run }`：内层 `run { }` 会把
+            //    `@run` 这个标签**遮住**（见 `refreshAfterScrape` 里同一处坑）。
+            //    行被删了（用户在别处移除了整部）时退回手上那份，页面照常打开。
+            val work = fresh ?: w
             // ⛔ 进作品**默认按修改时间倒序**：这是用户要的默认排序（见需求）。
             //    [sortItems] 对 [ItemSortMode.EPISODE_ORDER] 原样返回、对两种时间档
             //    重排；这里先按默认档排好，胶囊再画「当前档 = 修改时间倒序」。
@@ -808,7 +974,7 @@ class LibraryActivity : Activity() {
             items.clear()
             items.addAll(sortItems(list ?: emptyList(), itemsSortMode))
             level = Level.ITEMS
-            currentWork = w
+            currentWork = work
             itemsAdapter.notifyDataSetChanged()
             worksGrid.visibility = View.GONE
             itemsList.visibility = View.VISIBLE
@@ -828,8 +994,8 @@ class LibraryActivity : Activity() {
             //    空隙里（`barFocused` 还是 true，于是 dispatch 一直往那一支走）。
             tabsFocused = false
             barFocused = false
-            title.text = "媒体库 / ${w.title}"
-            status.text = "${w.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
+            title.text = "媒体库 / ${work.title}"
+            status.text = "${work.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
             hintBar.text = "←→ 换胶囊 · OK 播放 / 执行 · ↑↓ 换层 · 菜单 更多 · 返回 回作品墙"
             // ⛔ 焦点给列表、**光标**给动作行：列表拿到焦点它的选中高亮才画得出来，
             //    而 ←→ 这时归动作行管（见 [focusDetailActions] 的理由）。
@@ -927,7 +1093,13 @@ class LibraryActivity : Activity() {
         // 没海报时给一个「首字」占位块 —— 一片灰比一个字更让人以为坏了。
         detailPosterPlaceholder.text = w.title.take(1)
         detailPosterPlaceholder.visibility = View.VISIBLE
-        if (file == null) return
+        if (file == null) {
+            // 本地一个文件都没有 ⇒ 未刮削的作品，去拉网盘自带的缩略图。
+            // ⛔ 回来时重画的是**这一块**，不能靠 [queueCloudRefresh]（那个重画的
+            //    是背后的作品墙，此刻还是 GONE）。
+            fetchCloudCover(w) { if (currentWork?.key == w.key) paintDetailPoster(w) }
+            return
+        }
         // ⛔ 解码绝不能在主线程做（见 [PosterStore.decode]）。
         //    解完**只重画这一块**，不能 `notifyDataSetChanged()` 海报墙 ——
         //    那会连带重绑整个 `GridView`，而用户此刻正在看详情页。
@@ -939,6 +1111,63 @@ class LibraryActivity : Activity() {
             if (currentWork?.key != w.key) return@run
             paintDetailPoster(w)
         }
+    }
+
+    /**
+     * 未刮削的作品：把**网盘自带的缩略图**拉下来当封面。
+     *
+     * ## 为什么需要这一步
+     *
+     * 扫描时 `LibraryScanner` 已经把缩略图地址写进了 `media_works.poster_url`
+     * （夸克列目录下发的 `preview_url`），但 [PosterStore.fileFor] 的三级查找
+     * **每一级都要求本地真有文件** —— 而此前**没有任何组件负责下载它**。
+     * 结果就是「没刮削过的作品在墙上一块封面都没有」，正是用户报的那一条。
+     *
+     * ## 几个刻意的选择
+     *
+     * ⛔ **走 `api.thumbBytes`**（带网盘 Cookie），不能用 [PosterFetcher] ——
+     *    裸链回 `401 code=31001 require login`。
+     * ⛔ **落海报目录**、用 [com.cloudcine.tv.library.PosterNaming.fileNameFor]
+     *    命名：`fileFor` 的第②级零改动就能命中，而且缩略图会**随备份包搬走**。
+     * ⛔ 每部作品每个页面实例**只试一次**（[cloudCoverTried]）：失败记忆在
+     *    `CloudCoverFetcher` 里是内存态，而简介页每次重画都会再问一次。
+     * ⛔ 写库（回写 `poster_file`）放在**后台**做，回主线程只 `notifyDataSetChanged`。
+     *
+     * @param onReady 落盘成功后在主线程回调一次（简介页用它重画自己那一块）。
+     */
+    private fun fetchCloudCover(w: Work, onReady: (() -> Unit)? = null) {
+        val url = w.posterUrl?.takeIf { it.isNotBlank() } ?: return
+        if (!cloudCoverTried.add(w.key)) return
+        Bg.run({
+            val name = cloudCovers.fetch(w.key, url)
+            // ⛔ 回写 `poster_file`：`fileFor` 的第①级从此直接命中，不必每次都
+            //    现算文件名；更重要的是这一列**随库一起进备份包**。
+            if (name != null) runCatching { db.setWorkPosterFile(w.key, name) }
+            name
+        }) { name, err ->
+            if (err != null || name == null) return@run
+            queueCloudRefresh()
+            onReady?.invoke()
+        }
+    }
+
+    /**
+     * 攒一次作品墙重画。
+     *
+     * ⛔ 不能每下好一张封面就 `notifyDataSetChanged()`：首次进库时未刮削的作品
+     *    可能有几百部，逐个重绑整墙等于把海报墙按住不让动 —— 而用户此刻正想
+     *    滚一滚看看扫出来了什么。攒 [CLOUD_REFRESH_MS] 毫秒统一重画一次。
+     */
+    private fun queueCloudRefresh() {
+        if (cloudRefreshQueued) return
+        cloudRefreshQueued = true
+        worksGrid.postDelayed(
+            {
+                cloudRefreshQueued = false
+                if (!isFinishing) worksAdapter.notifyDataSetChanged()
+            },
+            CLOUD_REFRESH_MS,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -979,21 +1208,45 @@ class LibraryActivity : Activity() {
         val total = counts.values.sum()
         val items = ArrayList<NavItem>(10)
 
-        items.add(NavItem("全部", total, null, category == null && !playedOnly) {
-            category = null
-            playedOnly = false
-            loadWorks()
-        })
-        items.add(NavItem("最近播放", playedCount, "◷", playedOnly) {
-            category = null
-            playedOnly = true
-            loadWorks()
-        })
+        items.add(
+            NavItem("全部", total, null, category == null && !playedOnly && !followedOnly) {
+                category = null
+                playedOnly = false
+                followedOnly = false
+                loadWorks()
+            },
+        )
+        items.add(
+            NavItem("最近播放", playedCount, "◷", playedOnly) {
+                category = null
+                playedOnly = true
+                followedOnly = false
+                loadWorks()
+            },
+        )
+        // 追剧**紧跟「最近播放」**，与它同一种东西（视图，不是分类）。
+        // ⛔ 角标是「有更新的作品数」而不是「在追的作品数」：它是提醒，不是收藏计数
+        //    （与 PC 端 `countUpdatedWorks` 同口径）。所以 0 时它不亮，但**不消失**
+        //    —— 用户得有个地方点进去看自己追了什么。
+        items.add(
+            NavItem("追剧", followedCount, "✦", followedOnly) {
+                category = null
+                playedOnly = false
+                followedOnly = true
+                loadWorks()
+            },
+        )
         for (c in MediaCategoryNames.displayOrder) {
             items.add(
-                NavItem(MediaCategoryNames.label(c), counts[c] ?: 0, null, category == c && !playedOnly) {
+                NavItem(
+                    MediaCategoryNames.label(c),
+                    counts[c] ?: 0,
+                    null,
+                    category == c && !playedOnly && !followedOnly,
+                ) {
                     category = c
                     playedOnly = false
+                    followedOnly = false
                     loadWorks()
                 },
             )
@@ -1162,6 +1415,24 @@ class LibraryActivity : Activity() {
                     playedOnly = false
                     category = null
                     loadWorks()
+                },
+            )
+        }
+        if (followedOnly) {
+            items.add(
+                BarItem("✦ 退出追剧", true, "OK 回到全部分类") {
+                    followedOnly = false
+                    category = null
+                    loadWorks()
+                },
+            )
+            // ⛔ 追剧视图里放一颗「检查更新」是**刻意的第二个入口**（第一个在
+            //    菜单里）：用户切到这个视图就是为了看有没有新集，让他再按两次
+            //    菜单键去够同一个动作，是在惩罚最常用的路径。两处调的是同一个
+            //    [checkFollow]。
+            items.add(
+                BarItem("⟳ 检查更新", false, "OK 立刻检查在追的剧有没有新集（无视节流）") {
+                    checkFollow(force = true)
                 },
             )
         }
@@ -1345,17 +1616,24 @@ class LibraryActivity : Activity() {
             // ⛔ 文案与可用性来自 [WorkDetailFormat]（可单测），这里只负责把
             //    「第几颗胶囊做什么」接上 —— 顺序必须与那边逐项一致，
             //    因为光标位置就是按这个下标存的。
-            val labels = WorkDetailFormat.actionLabels(resumable, items.size)
-            actions.add(
-                DetailAction(labels[0].first, labels[0].second) { playWork(w) },
+            // ⛔ `followed` / `newItemCount` 一起传进去：「已追剧 · 2 新」那半句
+            //    只在这两个值都对的时候才该出现（见 [WorkDetailFormat.followLabel]）。
+            val labels = WorkDetailFormat.actionLabels(
+                resumable = resumable,
+                itemCount = items.size,
+                followed = w.followed,
+                newCount = w.newItemCount,
             )
-            actions.add(DetailAction(labels[1].first, labels[1].second) { openScrape(w) })
-            actions.add(DetailAction(labels[2].first, labels[2].second) { openScrapeSettings() })
+            actions.add(DetailAction(labels[0].first, labels[0].second) { playWork(w) })
+            // 追剧在第 2 位（紧挨播放），不是末尾 —— 理由见
+            // [WorkDetailFormat.actionLabels] 的文档。
+            actions.add(DetailAction(labels[1].first, labels[1].second) { toggleFollow(w) })
+            actions.add(DetailAction(labels[2].first, labels[2].second) { openScrape(w) })
+            actions.add(DetailAction(labels[3].first, labels[3].second) { openScrapeSettings() })
             // 「选集」不是一个动作，而是**把光标交给下面的列表** —— 它在电视上
             // 是「这一页怎么换集」的唯一说明；没有它，用户会以为这里只能播一条。
-            actions.add(
-                DetailAction(labels[3].first, labels[3].second) { focusItemsList() },
-            )
+            // ⛔ 它必须留在**最后**：它是这一行的出口（同上）。
+            actions.add(DetailAction(labels[4].first, labels[4].second) { focusItemsList() })
         }
         detailActions = actions
         actionsCursor = actionsCursor.coerceIn(0, (actions.size - 1).coerceAtLeast(0))
@@ -1823,26 +2101,41 @@ class LibraryActivity : Activity() {
     private fun buildFilterRows(): List<FRow> {
         val rows = ArrayList<FRow>(96)
 
-        // ── 分类（含「最近播放」这个视图）──
+        // ── 分类（含「最近播放」「追剧」这两个视图）──
         rows.add(FRow.Section("分类"))
-        rows.add(FRow.Toggle("全部", null, category == null && !playedOnly, false) {
-            category = null
-            playedOnly = false
-        })
-        rows.add(FRow.Toggle("最近播放", playedCount, playedOnly, false) {
-            category = null
-            playedOnly = true
-        })
+        rows.add(
+            FRow.Toggle("全部", null, category == null && !playedOnly && !followedOnly, false) {
+                category = null
+                playedOnly = false
+                followedOnly = false
+            },
+        )
+        rows.add(
+            FRow.Toggle("最近播放", playedCount, playedOnly, false) {
+                category = null
+                playedOnly = true
+                followedOnly = false
+            },
+        )
+        // ⛔ 角标 = 有更新的作品数（与导航带上那颗同口径）。
+        rows.add(
+            FRow.Toggle("追剧", followedCount, followedOnly, false) {
+                category = null
+                playedOnly = false
+                followedOnly = true
+            },
+        )
         for (c in MediaCategoryNames.displayOrder) {
             rows.add(
                 FRow.Toggle(
                     MediaCategoryNames.label(c),
                     counts[c] ?: 0,
-                    category == c && !playedOnly,
+                    category == c && !playedOnly && !followedOnly,
                     false,
                 ) {
                     category = c
                     playedOnly = false
+                    followedOnly = false
                 },
             )
         }
@@ -2087,9 +2380,20 @@ class LibraryActivity : Activity() {
                     loadWorks()
                 },
             )
+            // ⛔ 追剧的自动检查开关放在这里（而不是塞进「刮削设置」那一页）：
+            //    它是**媒体库**的行为，用户想找它时看的就是这张菜单。三档循环
+            //    的一颗，与上面「只看有海报：开/关」是同一种东西。
+            actions.add(
+                "追剧自动检查：${followAutoCheck.label}（OK 切换）" to { cycleFollowAutoCheck() },
+            )
             // ⛔ 「扫描 / 清空」放在**显示设置之后、备份之前**：前四项是「看什么」，
             //    这三项是「库里有什么」，最后三项是「和电脑同步」。按这个顺序
             //    分组，用户扫一眼就知道该往哪找。
+            // ⛔ 「检查追剧更新」放在**显示设置之后、扫描之前**：它是「库里有什么」
+            //    那一组的第一个动作，而且是**轻**的那个 —— 只列在追那几部剧的
+            //    目录（通常 1~5 个，秒级），与下面那个要跑几分钟的全盘扫描
+            //    放在一起，用户一眼能看出该先试哪个。
+            actions.add("⟳ 检查追剧更新（只查在追的剧）" to { checkFollow(force = true) })
             actions.add("重新扫描媒体库（网盘）" to { doScan() })
             actions.add("清空媒体库索引…" to { confirmWipe() })
             actions.add("同步（本地 ↔ 网盘）" to { doSync() })
@@ -2246,7 +2550,8 @@ class LibraryActivity : Activity() {
      * 重新扫描媒体库（全盘遍历网盘 → 解析 → 归组 → 入库）。
      *
      * ⛔ **不是「重新刮削」**：它只把文件发现出来、按片名归组，在线元数据
-     *    （海报 / 简介 / 评分）要另走刮削。分开的理由见 [LibraryScanner] 的类文档。
+     *    （海报 / 简介 / 评分）由扫完之后的 [startAutoScrape] 接手。分开的理由
+     *    见 [LibraryScanner] 的类文档。
      *
      * ⛔ 扫完**必须** `loadWorks()`：集数 / 季数 / 封面兜底 / 年份与类型的分面
      *    角标全都可能变了。不重读的话，用户刚扫完看到的还是旧数字，
@@ -2258,6 +2563,10 @@ class LibraryActivity : Activity() {
         scanCancel = cancel
         status.text = "扫描：准备中…"
         Log.i(TAG, "扫描：开始")
+        // ⛔ 「边扫边显示」的判据是**库里作品总数**（`Progress.works`），不是
+        //    「本次扫到几个文件」—— 前者变了才说明作品墙该重画。
+        //    放在这里当局部变量：它只在**这一次**扫描里有意义。
+        var lastWorks = -1
         Bg.run({
             scanner.scan(cancel) { p ->
                 // ⛔ 进度回调在**后台线程**上，碰 `status` 必须回主线程。
@@ -2268,6 +2577,11 @@ class LibraryActivity : Activity() {
                 //    看起来像「按了返回没反应」。
                 runOnUiThread {
                     if (scanCancel === cancel && !cancel.isCancelled) status.text = p.text
+                }
+                // 作品数变了 ⇒ 原地重画作品墙（**不动层级 / 焦点 / 简介页**）。
+                if (p.works != lastWorks) {
+                    lastWorks = p.works
+                    runOnUiThread { refreshWorksInPlace() }
                 }
             }
         }) { out, err ->
@@ -2284,6 +2598,125 @@ class LibraryActivity : Activity() {
             )
             finishJob(msg)
             loadWorks(msg)
+            // ⛔ 扫完**接着**刮 —— 用户的原话是「扫描完毕后需要自动启动刮削」。
+            //    排在 `loadWorks` **之后**：先把新扫到的作品画出来再开始刮，
+            //    否则用户是对着一面空墙等刮削。
+            startAutoScrape()
+        }
+    }
+
+    /**
+     * 扫描途中的**原地刷新**：只换列表内容，**不动**层级 / 焦点 / 简介页。
+     *
+     * ⛔ **不能用 [loadWorks]** —— 它会 `level = Level.WORKS`、
+     *    `currentWork = null`、把简介页那一整块 GONE 掉。扫描要跑几分钟，
+     *    用户完全可能在这期间点进一部作品看简介；被**踢回作品墙**是纯粹的打扰。
+     *    同理也不能走 [applyWorks]（它一样重置层级与可见性）。
+     *
+     * ⛔ 只在 [Level.WORKS] 下动列表：简介页的剧集列表是另一份数据
+     *    （`db.itemsForWork`），跟作品总数没关系。
+     */
+    private fun refreshWorksInPlace() {
+        if (level != Level.WORKS) return
+        Bg.run({
+            db.listWorks(
+                sort = sort,
+                playedOnly = playedOnly,
+                category = category,
+                years = years,
+                genres = genres,
+                scrapedOnly = scrapedOnly,
+            )
+        }) { list, err ->
+            if (err != null || list == null) return@run
+            // ⛔ 查回来时用户可能已经进了简介页 —— 那时列表归 `itemsList` 管。
+            if (level != Level.WORKS) return@run
+            val visible = if (posterOnly) list.filter { posters.fileFor(it) != null } else list
+            // ⛔ 键序完全一致就**不要** `notifyDataSetChanged()`：它会重置
+            //    `GridView` 的滚动位置，扫描期间每秒闪一下用户就没法翻墙了。
+            //    「作品总数变了、但当前筛选下没变」是常态（新扫到的是别的分类）。
+            if (visible.size == works.size &&
+                visible.withIndex().all { (i, w) -> w.key == works[i].key }
+            ) {
+                return@run
+            }
+            val selected = worksGrid.selectedItemPosition
+            works.clear()
+            works.addAll(visible)
+            worksAdapter.notifyDataSetChanged()
+            // 尽量还原选中项：`notifyDataSetChanged` 保住的是**下标**，
+            // 而列表变长之后同一个下标可能已经指向另一部作品。
+            if (selected in visible.indices) worksGrid.setSelection(selected)
+        }
+    }
+
+    /**
+     * 「扫描后自动刮削」开着吗。
+     *
+     * ⛔ 判据是「设置项**不是** `"false"`」而不是「等于 `"true"`」：这一列在
+     *    PC 端的旧库里**根本不存在**（那边默认关），而缺失在电视上应当读成
+     *    「开」（理由见 [startAutoScrape]）。写成相等判断的话，从电脑同步过来
+     *    的库会在电视上默认关掉 —— 用户根本不知道有这么个功能。
+     *
+     * ⛔ 会读库，**只能在后台线程调**。
+     */
+    private fun autoScrapeEnabled(): Boolean =
+        db.settingsMap()[LibrarySettings.AUTO_SCRAPE_ON_SCAN] != "false"
+
+    /**
+     * 扫描后的**自动刮削**。
+     *
+     * ⛔ 默认**开**，与 PC 端相反（那边默认关，理由是豆瓣匿名额度只有约 10 个
+     *    搜索词）。电视上用户没法像在电脑前那样随手点一下「刮削」，而
+     *    「扫完什么都没有、还得自己一部部刮」是更糟的体验。想关掉的话把
+     *    `auto_scrape_on_scan` 写成 `"false"`。
+     *
+     * ⛔ 没有可用的在线源（没配 Key / Cookie）时**直接跳过**：跑一遍只会得到
+     *    「成功 0/N」加一句废话。凭证在「刮削设置」里配。
+     *
+     * ⛔ 匹配闸门（[com.cloudcine.tv.library.ScrapeMatch]）是**必须**的：自动刮削
+     *    没有人盯着，没有闸门就会把「查询词带 2026、刮成 1994 年的片子」这类
+     *    事故复制到整库。
+     */
+    private fun startAutoScrape() {
+        if (scrapeCancel != null || scanCancel != null) return
+        val cancel = LibraryScanner.Cancellation()
+        scrapeCancel = cancel
+        status.text = "刮削：准备中…"
+        Bg.run({
+            if (!autoScrapeEnabled()) {
+                null
+            } else {
+                // ⛔ 每次都重新构造流水线，不能缓存：用户可能刚在「刮削设置」里
+                //    填完 Cookie 就回来了，缓存实例拿的还是旧值。
+                val pipeline = ScraperPipeline.fromSettings(db)
+                if (pipeline.availableSources.isEmpty()) {
+                    Log.i(TAG, "自动刮削：没有可用的在线源（未配 TMDB Key / 豆瓣 Cookie），跳过")
+                    null
+                } else {
+                    val fetcher = PosterFetcher(LibraryPaths.posterDir(this), ScrapeHttp)
+                    AutoScraper.forLibrary(db, pipeline, fetcher, cancel).run { p ->
+                        runOnUiThread { if (scrapeCancel === cancel) status.text = p.text }
+                    }
+                }
+            }
+        }) { out, err ->
+            scrapeCancel = null
+            if (err != null) {
+                Log.e(TAG, "自动刮削失败", err)
+                finishJob("自动刮削失败：${err.message}")
+                return@run
+            }
+            val o = out
+            if (o == null) {
+                finishJob("扫描完成")
+                return@run
+            }
+            finishJob(o.message)
+            Log.i(TAG, "自动刮削：${o.message}")
+            // 标题 / 海报 / 简介 / 分类都可能变了 ⇒ 整墙重读（这一次走 `loadWorks`，
+            // 因为它还要重算分面角标）。
+            if (o.scraped > 0) loadWorks(o.message)
         }
     }
 
@@ -2330,6 +2763,7 @@ class LibraryActivity : Activity() {
             }
             category = null
             playedOnly = false
+            followedOnly = false
             scrapedOnly = false
             years.clear()
             genres.clear()
@@ -2340,7 +2774,8 @@ class LibraryActivity : Activity() {
     }
 
     private fun doSync() {
-        if (!guard("同步")) return        Bg.run({
+        if (!guard("同步")) return
+        Bg.run({
             service.sync(onProgress = { sent, total ->
                 runOnUiThread { status.text = "同步：上传 $sent/$total" }
             })
@@ -2499,6 +2934,184 @@ class LibraryActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
+    // 追剧（schema v17）
+    // ------------------------------------------------------------------
+
+    /**
+     * 进媒体库时的**静默**追更检查。
+     *
+     * ⛔ 两道闸门在**主线程**（它们都是内存判断，不读库）：
+     *
+     *   1. **未登录**：没登录时列目录必失败，白跑一次还写日志。
+     *   2. **界面正忙**（扫描 / 刮削 / 面板开着）：与 `probeRemoteBackupAtStartup`
+     *      同一套判断 —— 扫描本身就在写同一批表，插进去只会互相拖慢。
+     *
+     * ⛔ 第三道闸门（`follow_auto_check = off`）**不在这里** —— 它要读库，
+     *    见 [checkFollow] 里的说明。
+     * ⛔ 它也**不检查 `busy`**：`busy` 是「正在做某个用户发起的动作」，而追更
+     *    检查恰恰是**用户没发起**的那个。用 `busy` 当闸门会让它永远撞在
+     *    「刚点完别的」上，等于随机失效。
+     */
+    private fun maybeAutoCheckFollow() {
+        if (!store.loggedIn) {
+            Log.i(TAG, "追剧：未登录，跳过")
+            return
+        }
+        if (scanCancel != null || scrapeCancel != null || filterVisible || overlayVisible) {
+            Log.i(TAG, "追剧：界面正忙，这次不检查")
+            return
+        }
+        checkFollow(force = false)
+    }
+
+    /**
+     * 跑一次追更检查。
+     *
+     * @param force `true` = 用户手动点的（菜单 / 状态行）：无视节流窗口。
+     *   它**不**代表「无视 `follow_auto_check = off`」是错的 —— 手动入口本来
+     *   就该在关掉自动检查时仍然可用（那是用户明确要求了），所以 `force`
+     *   会同时跳过开关与窗口两道闸门。
+     *
+     * ⛔ **静默失败**（红线 12）：失败只写状态行一句话 + 日志，不弹窗、
+     *    不重试。电视上弹一个错误框会打断播放、抢焦点，而且用户也没法处理。
+     * ⛔ **不写 `updated_at`**（红线 1）：检查的结果只落在 `follow_checked_at`
+     *    与 `new_item_count` 两列上，而它们**不参与**同步判据
+     *    `libraryModifiedAt()`。写 `updated_at` 会让本机永远「看起来更新」，
+     *    下次同步无条件上传、把另一台设备刚看的进度盖掉。
+     */
+    private fun checkFollow(force: Boolean) {
+        if (followCancel != null) {
+            if (force) status.text = "正在检查追剧更新…"
+            return
+        }
+        val cancel = LibraryScanner.Cancellation()
+        followCancel = cancel
+        // ⛔ 只有**用户点的那一次**才写状态行。静默检查在结果出来之前不该
+        //    动任何东西 —— 每次进媒体库都闪一句「检查追剧更新…」是噪音，
+        //    而且大多数时候它什么都不会发现。
+        if (force) status.text = "检查追剧更新…"
+        Bg.run({
+            // ⛔ `follow_auto_check` 的判定放在**后台**，不是主线程的
+            //    [maybeAutoCheckFollow] 里。两个理由：
+            //      1. 它要读库，而主线程读 SQLite 是这个工程一直在避免的事；
+            //      2. 缓存的那份 [followAutoCheck] 在**首帧那批读库还没回来**
+            //         时仍是默认的 `ON_LAUNCH` —— 用户明明设了「关闭」，延迟
+            //         1.5 秒的自动检查却会跑起来。这条竞态只在慢设备上出现，
+            //         而它恰好是「设置项看起来不生效」的经典形态。
+            val mode = FollowAutoCheck.parse(db.getSetting(LibrarySettings.FOLLOW_AUTO_CHECK))
+            if (!force && mode == FollowAutoCheck.OFF) {
+                Log.i(TAG, "追剧：自动检查已关闭，跳过")
+                FollowUpdater.Outcome(skipped = true)
+            } else {
+                followUpdater.check(
+                    force = force,
+                    // 启动检查用 30 分钟的窗口（不是 `follow_auto_check` 的 6 小时）：
+                    // 电视常被反复唤醒（待机 → 进媒体库），6 小时窗口会让绝大多数
+                    // 唤醒都什么都不做，用户会觉得「这功能没在跑」。
+                    windowSec = if (force) null else FollowAutoCheck.LAUNCH_WINDOW_SEC,
+                    cancel = cancel,
+                    onProgress = { p ->
+                        // ⛔ 回主线程再碰 View。`onProgress` 是在后台线程回调的。
+                        if (force) {
+                            runOnUiThread {
+                                if (followCancel === cancel) {
+                                    status.text = "检查追剧更新 ${p.done}/${p.total}"
+                                }
+                            }
+                        }
+                    },
+                )
+            }
+        }) { outcome, err ->
+            // ⛔ 先清开关再动界面：`followCancel === cancel` 那几处判断都靠它。
+            followCancel = null
+            if (err != null) {
+                // 静默失败：只有状态行 + 日志。**不回滚已经推进的水位线** ——
+                // 那部分是真实检查过的（见 `FollowUpdater.check` 的 `@param cancel`）。
+                Log.w(TAG, "追剧检查失败", err)
+                if (force) status.text = "检查追剧更新失败：${err.message}"
+                return@run
+            }
+            val o = outcome ?: return@run
+            if (o.skipped) {
+                Log.i(TAG, "追剧：未到节流窗口或已关闭，跳过")
+                return@run
+            }
+            Log.i(TAG, "追剧：${o.message.ifEmpty { "无更新" }}")
+            // ⛔ 状态行只在**有话说**时改写：`message` 为空串（无更新）时保持
+            //    原来的「共 N 部」—— 每次进媒体库都写一句「没有更新」是最典型的
+            //    噪音，而电视上的状态行本来就窄。
+            if (o.message.isNotEmpty()) status.text = o.message
+            // ⛔ 只有**真查出新集**才重读整页：`loadWorks` 会重建导航带 + 重排
+            //    海报墙 + 抢焦点（用户可能已经走到简介页了，被踢回墙上很烦）。
+            //    没更新时角标一个都没变，重读纯属浪费一次全量查询。
+            if (o.hasNews) loadWorks()
+        }
+    }
+
+    /**
+     * 循环切换「追剧自动检查」：`关闭 → 启动时检查 → 每 6 小时检查 → 关闭`。
+     *
+     * ⛔ 三档做成**循环的一颗**而不是子菜单：与同一张菜单里的「只看有海报：开/关」
+     *    是同一种东西，而菜单本来就有十来项，再开一层只会让光标走得更远。
+     * ⛔ 写的是 [FollowAutoCheck.id]（`off` / `on_launch` / `every_6h`），不是
+     *    `label` —— id 要跨端走（随 `.ccbak` 到电脑上），label 只是显示。
+     */
+    private fun cycleFollowAutoCheck() {
+        val next = when (followAutoCheck) {
+            FollowAutoCheck.OFF -> FollowAutoCheck.ON_LAUNCH
+            FollowAutoCheck.ON_LAUNCH -> FollowAutoCheck.EVERY_6H
+            FollowAutoCheck.EVERY_6H -> FollowAutoCheck.OFF
+        }
+        // ⛔ 先改内存里的真源再落库：菜单上的文案读的就是它，而写库是异步的。
+        followAutoCheck = next
+        status.text = "追剧自动检查：${next.label}"
+        Bg.run({ db.setSetting(LibrarySettings.FOLLOW_AUTO_CHECK, next.id) }) { _, err ->
+            if (err != null) {
+                Log.w(TAG, "追剧自动检查设置写库失败", err)
+                status.text = "设置保存失败：${err.message}"
+            }
+        }
+    }
+
+    /**
+     * 开 / 关当前这部作品的追剧。
+     *
+     * ⛔ 这是**用户显式动作** = 真实内容变更 ⇒ `LibraryDb.setFollowed` **要**写
+     *    `updated_at`（该跨端同步：电脑上追了这部，电视上打开也该有）。
+     *    与 [checkFollow] 恰好相反（红线 1）。
+     *
+     * ⛔ 开关之后**必须重读这一行**（不能在客户端改手上的 `Work`）：
+     *    `setFollowed` 一次动 4 列（`followed` / `follow_started_at` /
+     *    `follow_checked_at` / `new_item_count`），在 UI 层拼一个「差不多的新
+     *    Work」等于把同一套规则写第二遍 —— 与 [refreshAfterScrape] 同一条理由。
+     */
+    private fun toggleFollow(w: Work) {
+        val next = !w.followed
+        status.text = if (next) "开启追剧…" else "取消追剧…"
+        Bg.run({ db.setFollowed(w.key, next); db.workByKey(w.key) }) { fresh, err ->
+            if (err != null) {
+                Log.e(TAG, "追剧开关失败：${w.key}", err)
+                status.text = "追剧设置失败：${err.message}"
+                return@run
+            }
+            val nw = fresh ?: return@run
+            currentWork = nw
+            // 剧集列表不用重查（`setFollowed` 不碰 `media_items`），但**行首的
+            // NEW 标签**依赖 `followStartedAt` —— 刚开启追剧时基线是「现在」，
+            // 已有的集都不算新，所以必须重画一次列表把标签清掉。
+            itemsAdapter.notifyDataSetChanged()
+            buildDetailActions()
+            status.text = if (next) {
+                "已开启追剧 —— 网盘上有新集时会在这里提醒"
+            } else {
+                "已取消追剧「${nw.title}」"
+            }
+            Log.i(TAG, "追剧：${w.key} → ${if (next) "开" else "关"}")
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 按键
     // ------------------------------------------------------------------
 
@@ -2529,6 +3142,18 @@ class LibraryActivity : Activity() {
             if (down && event.keyCode == KeyEvent.KEYCODE_BACK) {
                 cancel.cancel()
                 status.text = "正在停止扫描…（已扫到的会保留）"
+                return true
+            }
+        }
+
+        // ⛔ 自动刮削同理：几百部作品可能还要跑好几分钟，而 `guard` 同样挡住了
+        //    其它动作。没有这个出口，用户只能杀应用。
+        // ⛔ 排在扫描后面：两段不会同时跑（`startAutoScrape` 在扫描结束之后才
+        //    被调用），所以顺序在这里只是为了读起来顺。
+        scrapeCancel?.let { cancel ->
+            if (down && event.keyCode == KeyEvent.KEYCODE_BACK) {
+                cancel.cancel()
+                status.text = "正在停止刮削…（已刮到的会保留）"
                 return true
             }
         }
@@ -2758,6 +3383,11 @@ class LibraryActivity : Activity() {
             val image = posterBox.getChildAt(0) as ImageView
             val placeholder = posterBox.getChildAt(1) as TextView
             val badge = posterBox.getChildAt(2) as TextView
+            // ⛔ 更新角标是**第 4 个子控件（下标 3）**，见 [buildCard] 的追加顺序。
+            //    加它的时候必须加在**末尾**：`getChildAt` 全是按下标取的，插在
+            //    中间会让上面那行 `getChildAt(2)` 拿到更新角标，评分就画到它上面
+            //    —— 而且不报错（红线 9）。
+            val updateBadge = posterBox.getChildAt(3) as TextView
             val strip = card.getChildAt(1) as LinearLayout
             val titleView = card.getChildAt(2) as TextView
             val metaView = card.getChildAt(3) as TextView
@@ -2786,6 +3416,10 @@ class LibraryActivity : Activity() {
                         posters.put(file, bitmap)
                         worksAdapter.notifyDataSetChanged()
                     }
+                } else {
+                    // 本地一个文件都没有 ⇒ 未刮削的作品：去拉网盘自带的缩略图
+                    // （见 [fetchCloudCover] 的文档）。下好之后它会自己重画。
+                    fetchCloudCover(w)
                 }
             }
 
@@ -2796,6 +3430,20 @@ class LibraryActivity : Activity() {
                 badge.visibility = View.VISIBLE
             } else {
                 badge.visibility = View.GONE
+            }
+
+            // 更新角标：只在真有新集时出现。
+            //
+            // ⛔ 判据是 `newItemCount > 0`，**不是** `followed`：追了但没更新时
+            //    海报上不该有任何东西（那只是「我在追」，不是「有东西可看」）。
+            //    用户清掉角标（进过简介页）之后它也会自己消失。
+            // ⛔ 文案是 `+N` 而不是「更新 N」：一格海报只有百来像素宽，
+            //    「更新」两个字会把数字挤没（PC 端横屏宽，那边写全称）。
+            if (w.newItemCount > 0) {
+                updateBadge.text = "+${w.newItemCount}"
+                updateBadge.visibility = View.VISIBLE
+            } else {
+                updateBadge.visibility = View.GONE
             }
 
             // 续播进度条：看了一半的片子才画。
@@ -2825,6 +3473,10 @@ class LibraryActivity : Activity() {
             placeholder.alpha = image.alpha
             // 评分角标跟着一起暗 —— 否则一排暗海报上浮着一堆亮角标，反而更乱。
             badge.alpha = image.alpha
+            // ⛔ 更新角标也**必须**跟着暗。漏了它的表现是「一片压暗的海报上
+            //    浮着一堆亮紫色的 +2」，比原来的问题更显眼 —— 而且它比评分角标
+            //    亮（品牌色实心 vs 深灰底），漏掉时一眼就能看出来。
+            updateBadge.alpha = image.alpha
             card.scaleX = if (selected) 1.07f else 1f
             card.scaleY = if (selected) 1.07f else 1f
             card.background = null
@@ -2885,6 +3537,32 @@ class LibraryActivity : Activity() {
                 leftMargin = dp(6)
             },
         )
+        // 更新角标（追剧）。**必须加在最后**，见 [WorksAdapter.getView] 的说明 ——
+        // 那是红线 9：`posterBox` 的子控件全是按下标取的，插在中间会把评分
+        // 角标顶到别的位置上，而且不报错。
+        //
+        // 四个角的占用：左下 = 评分，**左上 = 更新角标**，右下 = 无，右上 = 无。
+        // ⛔ 选左上而不是右上：PC 端右上角是「未刮削」的灰标（这里没画），
+        //    而且左上离左下最远，两枚角标不会在同一只眼睛里打架。
+        // ⛔ 样式与评分角标**同尺寸不同色**（品牌色实心 / 深色字）：同色的话
+        //    两枚小方块在沙发距离下分不出哪个是「★ 8.7」哪个是「+2」。
+        posterBox.addView(
+            TextView(this).apply {
+                setTextColor(0xFF1A1533.toInt())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTypeface(typeface, Typeface.BOLD)
+                setPadding(dp(7), dp(3), dp(7), dp(3))
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(5).toFloat()
+                    setColor(BRAND_TINT)
+                }
+            },
+            FrameLayout.LayoutParams(WRAP, WRAP).apply {
+                gravity = Gravity.TOP or Gravity.START
+                topMargin = dp(6)
+                leftMargin = dp(6)
+            },
+        )
         card.addView(posterBox)
 
         // 进度条：外框是轨道，里面两个加权块（已看 / 剩余）。
@@ -2939,16 +3617,52 @@ class LibraryActivity : Activity() {
     // ------------------------------------------------------------------
 
     /**
+     * 剧集行主标题：新集时在**行首**加一个品牌色的「■ NEW」。
+     *
+     * ## 为什么用 `SpannableString` 而不是再插一个 View
+     *
+     * 这一行是 `[列(标题/副标题)] [集号] [进度] [时间]` 四段，全是按下标取的
+     * （`row.getChildAt(0..3)`）。在中间插一个「NEW」小方块要把后面三段全部
+     * 重新编号 —— 而这类改动**不会报错**，只会让进度列画到时间列上。
+     * 拼进标题的 `SpannableString` 一行搞定，且 `ellipsize` 照常生效。
+     *
+     * ⛔ 前缀只染色 + 加粗，**不改整行的字号**：标题 18sp 是「文件名是重点」
+     *    这条口径撑起来的（见 [ItemsAdapter] 的表），把整行放大或加底色会
+     *    让 12 集里有 2 集看起来像另一种东西。
+     * ⛔ 前缀后面**留两个空格**：中文/方块字符与英文/数字之间不留白时，
+     *    沙发距离下会连成一片（「■ NEW黑亚当…」）。
+     */
+    private fun newEpisodeTitle(text: String, isNew: Boolean): CharSequence {
+        val prefix = WorkDetailFormat.newEpisodePrefix(isNew)
+        if (prefix.isEmpty()) return text
+        return SpannableString(prefix + text).apply {
+            setSpan(
+                ForegroundColorSpan(BRAND_TINT),
+                0,
+                prefix.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            setSpan(
+                StyleSpan(Typeface.BOLD),
+                0,
+                prefix.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+    }
+
+    /**
      * 作品简介页的「文件」列表 —— 一行 = 库里的一条文件。
      *
-     * ## 一行四样东西（从左到右）
+     * ## 一行五样东西（从左到右）
      *
      * | 位置 | 内容 | 为什么 |
      * |---|---|---|
-     * | 主标题 18sp 白 | **文件名**（去扩展名，[EpisodeLabels.fileLabel]） | ⛔ 不能用 `displayTitle`：它优先返回**作品标题**，整列会印成同一句话（「黑亚当」× 12），剧集之间、同一部电影的多个版本之间都分不出来 |
-     * | 副标题 13sp 灰 | 分辨率 · 大小 · `看到 12:34 / 45:00` | 进度读**历史最大位置**，看完的那一集也看得出来 |
+     * | 主标题 18sp 白 | **文件名**（去扩展名，[EpisodeLabels.fileLabel]），新集时行首带品牌色「■ NEW」 | ⛔ 不能用 `displayTitle`：它优先返回**作品标题**，整列会印成同一句话（「黑亚当」× 12），剧集之间、同一部电影的多个版本之间都分不出来 |
+     * | 副标题 13sp 灰 | 分辨率 · 大小 | ⛔ 进度不在这里 —— 它单独占一列 |
      * | 标签 13sp 品牌色 | `S01E03`（集号解析得出时才画） | 一眼扫集号，不用在文件名里找 |
-     * | 右侧 13sp 右对齐 | 网盘修改时间（相对时间） | 与 PC 端 `ModifiedTimeColumn` 同口径 |
+     * | 进度 13sp 固定列 | `62%` / `—`（历史**最大**位置占比） | 竖着扫一眼看出哪几集看过；⛔ 不是续播点（看完被清成 NULL） |
+     * | 时间 13sp 右对齐 | **网盘文件的修改时间**（相对时间） | 与 PC 端 `ModifiedTimeColumn` 同口径；⛔ 单位已是毫秒，别再 ×1000 |
      *
      * ⛔ 2026-10-07 用户原话：「文件列表应该重点凸显的是文件名，而不是全部都是
      *    媒体名，否则剧集列表都是媒体名，看起来体验非常不好」—— 当时这一行写的是
@@ -2998,14 +3712,26 @@ class LibraryActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(WRAP, WRAP)
                 row.addView(this)
             }
+            // 播放进度列：**单独一列**、固定宽度、右对齐，只写百分比（`62%`）。
+            // ⛔ 读的是历史最大位置（[EpisodeLabels.progressPercent]），不是续播点 ——
+            //    看完的那一集续播点会被清成 NULL，用它的话「看过没有」永远显示不出来。
+            // ⛔ 没有进度时写 `—` 而不是藏起来：这一列的价值就在于**竖着扫一眼**
+            //    看出哪几集看过，列时有时无的话就没法扫了（与时间列同一规矩）。
+            val progress = row.getChildAt(2) as? TextView ?: TextView(this@LibraryActivity).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                gravity = Gravity.END
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(dp(PROGRESS_COL_DP), WRAP)
+                row.addView(this)
+            }
             // 修改时间列：与 PC 端 `ModifiedTimeColumn` 同一口径 —— 固定宽度、
             // 右对齐、显示相对时间（`3 天前`），`null`/`0` 显示 `—`。
-            val time = row.getChildAt(2) as? TextView ?: TextView(this@LibraryActivity).apply {
+            val time = row.getChildAt(3) as? TextView ?: TextView(this@LibraryActivity).apply {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
                 gravity = Gravity.END
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
-                layoutParams = LinearLayout.LayoutParams(dp(96), WRAP)
+                layoutParams = LinearLayout.LayoutParams(dp(TIME_COL_DP), WRAP)
                 row.addView(this)
             }
 
@@ -3021,19 +3747,32 @@ class LibraryActivity : Activity() {
             //    也是 PC 端详情页 `rowLabel(RowLabelStyle.fileName)` 的口径。
             // ⛔ 但**不**照抄 PC 的「剧名-文件名」前缀：那一行在电视上只有一行、
             //    尾部省略，长剧名会把真正要看的文件名挤出屏幕外。
-            line1.text = EpisodeLabels.fileLabel(entry)
+            //
+            // 行首的「■ NEW」是**追剧以来才入库、且从没播过**的那几集
+            // （判据 `Work.isNewSinceFollow`，由 [WorkDetailFormat.newEpisodePrefix]
+            // 给文案）。⛔ 播过就自动消失，**不需要任何额外写入** —— 这也是为什么
+            // 这里没有一张「已读」表。
+            val isNew = currentWork?.isNewSinceFollow(entry) == true
+            line1.text = newEpisodeTitle(EpisodeLabels.fileLabel(entry), isNew)
+            // 副标题只报「这一条文件本身是什么」（清晰度 · 体积）。
+            // ⛔ 进度**不在这里**：它已经单独占一列了，两处都写就是同一件事印两遍
+            //    —— 这一行的宽度还要留给文件名。
             line2.text = buildString {
                 entry.resolution?.takeIf { it.isNotEmpty() }?.let { append("$it · ") }
                 append(formatSize(entry.sizeBytes ?: 0L))
-                // ⛔ 进度读 `max_position_ms`（[EpisodeLabels.progressLabel]），**不是**
-                //    `resume_position_ms`：看完的那一集续播点会被清成 NULL，用它的话
-                //    「这集看过没有」永远显示不出来。与播放页选集同一口径。
-                EpisodeLabels.progressLabel(entry)?.let { append(" · 看到 $it") }
             }
-            // ⛔ `modified_at` 存的是 **Unix 秒**，[Fmt.relativeTime] 要毫秒 ⇒ ×1000。
+            val percent = EpisodeLabels.progressPercent(entry)
+            progress.text = percent ?: "—"
+            // 看过 ⇒ 亮一档，没看过 ⇒ 与时间列的「不知道」同档灰。
+            progress.setTextColor(if (percent != null) 0xFFE5E7EB.toInt() else 0xFF4B5563.toInt())
+            // ⛔ [LibraryItem.modifiedAt] 已经是**毫秒**了（`LibraryDb.queryItems` 从库里
+            //    的秒乘过一次，好与网盘的 `updatedAtMs` 同单位）。这里**再乘一次 1000**
+            //    会得到一个公元 5 万多年的时间戳 ⇒ `Fmt.relativeTime` 的 `diffSec < 0`
+            //    那一支 ⇒ 每一行都写「刚刚」（2026-10-07 实机：三行全「刚刚」，用户
+            //    的原话是「修改时间不是网盘文件的修改时间」）。
             //    0 / null 当「网盘没给」，显示 `—`（而不是 1970 年）。
-            val m = entry.modifiedAt ?: 0L
-            time.text = Fmt.relativeTime(if (m > 0) m * 1000L else 0L, System.currentTimeMillis())
+            val m = entry.modifiedAtMs ?: 0L
+            time.text = Fmt.relativeTime(m, System.currentTimeMillis())
             time.setTextColor(if (m > 0) 0xFF9AA3B2.toInt() else 0xFF4B5563.toInt())
 
             row.setBackgroundColor(
@@ -3070,6 +3809,15 @@ class LibraryActivity : Activity() {
          */
         const val REQ_SCRAPE = 1001
 
+        /**
+         * 进媒体库后多久开始静默追更检查（毫秒）。
+         *
+         * ⛔ 1.5 秒是「首帧已经画完、海报墙那批读库 + 扫海报目录已经跑起来」
+         *    的估计值。放在 `post` 里（0 延迟）会与首屏那批抢同一个后台线程池
+         *    —— 而用户对这个检查**没有任何预期**，晚 1.5 秒他察觉不到。
+         */
+        const val FOLLOW_LAUNCH_DELAY_MS = 1500L
+
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
@@ -3100,6 +3848,22 @@ class LibraryActivity : Activity() {
         const val GRID_PAD_DP = 32
 
         /**
+         * 「播放进度」列宽（dp）。
+         *
+         * ⛔ 宽度要装得下最长的那个值（`100%` / `<1%`）**并且固定** —— 这一列是
+         *    给人竖着扫的，宽度随内容变会让整张表左右跳。
+         */
+        const val PROGRESS_COL_DP = 64
+
+        /**
+         * 「修改时间」列宽（dp）。
+         *
+         * ⛔ 96 是按最长的相对时间（`2026-09-01`）留的 —— 缩到 80 以下时那一档
+         *    会被省略号吃掉，而它恰好是**唯一**能被完整读出来的形态。
+         */
+        const val TIME_COL_DP = 96
+
+        /**
          * 简介页海报的宽度（dp），高度按 2:3 算。
          *
          * ⛔ **不要照抄 PC 端 `work_detail_page.dart` 的 138×207**：那是给
@@ -3122,6 +3886,15 @@ class LibraryActivity : Activity() {
          *    没有上限的话「从头滚到尾」等于把整个海报墙留在堆里。
          */
         const val POSTER_CACHE_BYTES = 12 * 1024 * 1024
+
+        /**
+         * 网盘封面下好之后，攒多久统一重画一次作品墙。
+         *
+         * ⛔ 不能每张都重画：首次进库时未刮削的作品可能有几百部，逐张
+         *    `notifyDataSetChanged()` 等于把海报墙按住不让动。300 ms 足够把
+         *    同一屏触发的那一批下载收进来。
+         */
+        const val CLOUD_REFRESH_MS = 300L
 
         /**
          * 覆盖层菜单上下留的呼吸位（dp，上下各一半）。

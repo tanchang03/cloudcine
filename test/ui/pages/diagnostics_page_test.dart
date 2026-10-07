@@ -152,6 +152,7 @@ void main() {
         posterCachePath: '/tmp/cloudcine-test-posters',
         deviceId: 'test-device',
         deviceName: '测试机',
+        schemaVersion: 17,
       );
 
   Widget pageOn(LibraryBackupService service) => ProviderScope(

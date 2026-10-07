@@ -60,6 +60,10 @@ class MediaWork {
     this.mergedInto,
     this.introStartMs,
     this.introEndMs,
+    this.followed = false,
+    this.followStartedAt,
+    this.followCheckedAt,
+    this.newItemCount = 0,
     this.lastModifiedAt,
     this.firstSeenAt,
     this.lastPlayedAt,
@@ -191,6 +195,63 @@ class MediaWork {
   IntroMarker? get introRange =>
       IntroMarker.fromMilliseconds(introStartMs, introEndMs);
 
+  // -------------------------------------------------------------------
+  // 追剧 / 更新提醒（v17）
+  // -------------------------------------------------------------------
+
+  /// 是否在追剧。四列里**唯一由用户直接改**的一列。
+  final bool followed;
+
+  /// **追剧起点**。`null` = 没在追剧 / 还没建立基线。
+  ///
+  /// ⛔ 只在用户开启追剧时写一次，之后**任何检查都不推进它** ——
+  /// 它是剧集行 NEW 标签的基线（见 [isNewSinceFollow]）。
+  final DateTime? followStartedAt;
+
+  /// **上次追更检查时刻**（水位线）。检查**成功**后才推进。
+  final DateTime? followCheckedAt;
+
+  /// 未读新增条数（角标数字）。增量累加，清零只清这一列。
+  final int newItemCount;
+
+  /// 有未读更新（海报墙角标据此决定画不画）。
+  bool get hasUpdate => newItemCount > 0;
+
+  /// 这一条媒体项算不算「追剧之后才出现的新集」。
+  ///
+  /// 两个条件缺一不可：
+  ///   1. `firstSeenAt > followStartedAt` —— 追剧**之后**才入库的；
+  ///      没有这一条的话，刚开启追剧那一刻会把已有的 12 集全标成 NEW；
+  ///   2. [played] 为假 —— **从没播过**。
+  ///
+  /// ## 为什么参数是原始值而不是 `MediaItem`
+  ///
+  /// ⛔ 「播过没有」的判据是 `media_items.max_position_ms`（历史最远位置，
+  ///    只增不减），而**它不在 `MediaItem` 域实体上** —— PC 端是另一条独立
+  ///    查询 `MediaRepository.maxPositions(itemIds)` 拿到的（详情页画进度条
+  ///    用的就是它）。所以这里让调用方把「播过没有」算好了传进来，
+  ///    而不是让实体去依赖另一个实体（那还会把 `media_item.dart` 里的
+  ///    `formatBytes` 一起引进来，与本文件的 `format.dart` 撞名）。
+  ///
+  /// ⛔ 第 2 条用 `maxPositionMs` 而不是 `resumePositionMs`：
+  ///    后者看完会被清成 `NULL`，拿它当判据的话「看完的一集」会重新变成
+  ///    NEW。`maxPositionMs` 是只增不减的历史最远位置，正是「看过没有」。
+  ///
+  /// 因为第 2 条，**播过就自动消失，不需要任何额外写入** —— 这也是为什么
+  /// 剧集行不需要一张「已读」表。
+  ///
+  /// 与 Android 端 `Work.isNewSinceFollow(item)` 同口径（那边 `LibraryItem`
+  /// 直接带 `maxPositionMs`，所以不需要这个参数）。
+  bool isNewSinceFollow({
+    required DateTime firstSeenAt,
+    required bool played,
+  }) {
+    final since = followStartedAt;
+    if (since == null) return false;
+    if (!firstSeenAt.isAfter(since)) return false;
+    return !played;
+  }
+
   /// 作品下所有文件的**网盘修改时间**最大值。
   ///
   /// 取 `MediaItem.modifiedAt` 的最大值：新增一集或替换一集时，
@@ -270,6 +331,32 @@ class MediaWork {
     String? mergedInto,
     int? introStartMs,
     int? introEndMs,
+    /// 把片头两列一起清成 `null`（与 [clearFollow] 同一个套路、同一条理由）。
+    ///
+    /// 加它之前，内存实现里靠一个逐列抄一遍的 `_withIntro` 重建整行 ——
+    /// 那种写法每加一列都要记得同步，漏一列就是静默丢数据（注释里专门
+    /// 警告过 `mergedInto` 那一列）。有了这个开关，清空就是一次 `copyWith`。
+    bool clearIntro = false,
+    bool? followed,
+    DateTime? followStartedAt,
+    DateTime? followCheckedAt,
+    int? newItemCount,
+    /// 把追剧的三列一起**清回默认**（两条水位线 `null` + 计数 `0`）。
+    ///
+    /// ## 为什么需要这个开关
+    ///
+    /// [copyWith] 对每个可空字段都用 `??` 兜底，**没法把字段改回 `null`** ——
+    /// 传 `null` 等于「不改」。所以「取消追剧」这件事用 `copyWith` 表达不出来，
+    /// 而它会**静默失败**：`followed` 变成 `false` 了，两条水位线却还留着，
+    /// 于是用户重新打开追剧时，`followStartedAt` 还是上一次的旧值 ——
+    /// 中间那段时间入库的集会被算成「追剧以来新增」，一开就是一堆 NEW。
+    ///
+    /// 与 `LibraryFilter.copyWith` 的 `clearCategory` 是同一个套路：
+    /// 不可空类型用 `??` 表达「不改」，可空类型就需要一个显式的清空开关。
+    ///
+    /// ⚠️ `followed` 本身**不在**这个开关的范围里：它是「开还是关」，
+    /// 由调用方显式传值。
+    bool clearFollow = false,
     DateTime? lastModifiedAt,
     DateTime? firstSeenAt,
     DateTime? lastPlayedAt,
@@ -303,6 +390,17 @@ class MediaWork {
         // 这一列。撤销合并走 `MediaRepository.unmergeWorks`（一条直接
         // UPDATE），不要在这里绕。
         mergedInto: mergedInto ?? this.mergedInto,
+        introStartMs: clearIntro ? null : (introStartMs ?? this.introStartMs),
+        introEndMs: clearIntro ? null : (introEndMs ?? this.introEndMs),
+        // ⚠️ 两个 `DateTime?` 与 [mergedInto] 同一条限制：传 `null` 是「不改」
+        // 而不是「清空」。要清空传 `clearFollow: true`
+        // （`MediaRepository.setFollowed(key, false)` 走的就是它）。
+        followed: followed ?? this.followed,
+        followStartedAt:
+            clearFollow ? null : (followStartedAt ?? this.followStartedAt),
+        followCheckedAt:
+            clearFollow ? null : (followCheckedAt ?? this.followCheckedAt),
+        newItemCount: clearFollow ? 0 : (newItemCount ?? this.newItemCount),
         lastModifiedAt: lastModifiedAt ?? this.lastModifiedAt,
         firstSeenAt: firstSeenAt ?? this.firstSeenAt,
         lastPlayedAt: lastPlayedAt ?? this.lastPlayedAt,
@@ -425,6 +523,12 @@ class MediaWork {
         // 「点一下自定义，跳片头就再也不生效了」，而且没有任何提示。
         introStartMs: introStartMs,
         introEndMs: introEndMs,
+        // 同理：追剧四列是**用户的追更状态**，与刮削无关。漏抄的表现是
+        // 「点一下自定义，追剧就没了，角标也没了」—— 而且没有任何提示。
+        followed: followed,
+        followStartedAt: followStartedAt,
+        followCheckedAt: followCheckedAt,
+        newItemCount: newItemCount,
         lastModifiedAt: lastModifiedAt,
         firstSeenAt: firstSeenAt,
         lastPlayedAt: lastPlayedAt,

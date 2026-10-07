@@ -444,6 +444,84 @@ void main() {
     });
   });
 
+  group('「编号 + 空格 + 分辨率」= 集号（2026-10-07）', () {
+    // 现场：`/来自：分享/Z 遮.天/183 4K.mp4`（遮天，第 183 集）。
+    //
+    // 与上面那组是**同一条规则的两个反面**：
+    //   - `65.2023.2160p…`：编号与标记之间是 `.`，且**自带年份** ⇒ 编号是片名；
+    //   - `183 4K.mp4`：编号与标记之间是**空格**，且**没有年份** ⇒ 编号是集号。
+    //
+    // ⛔ 修之前 `183` 被当片名（`_isStandaloneRelease` 允许纯数字当名字），
+    //    于是这一条成了一份独立作品；追剧检查把它当「新的一集」写进库，
+    //    而详情页按「作品 = 遮天」去查文件，永远查不到它 ——
+    //    用户看到的正是「提示有 2 个更新，列表里找不到」。
+    test('`183 4K.mp4` → 编号当集号，片名让给目录名', () {
+      final r = parser.parse('183 4K.mp4', dirPath: '/来自：分享/Z 遮.天/');
+
+      expect(r.episode, 183);
+      expect(
+        r.kind,
+        MediaKind.episode,
+        reason: '⚠️ 类型决定它进不进「追剧」的口径：判成 movie 就不会被当成'
+            '「新的一集」累加进角标。',
+      );
+      expect(r.season, isNull);
+      expect(
+        r.title,
+        isNot('183'),
+        reason: '⛔ 编号既然当集号用掉了，就不能再占片名位 —— 留着的话'
+            '「提不出片名就用目录名兜底」不生效，这一条会变成一部叫「183」'
+            '的独立作品（正是它修之前在库里的样子）。',
+      );
+      expect(
+        r.groupKey,
+        parser.parse('178 4K.mp4', dirPath: '/来自：分享/Z 遮.天/').groupKey,
+        reason: '同一目录下的各集必须归到**同一部作品**，否则追剧角标与'
+            '详情页文件列表会各看各的。',
+      );
+    });
+
+    test('没有目录可兜底时，片名留空（而不是留下一个数字当名字）', () {
+      final r = parser.parse('183 4K.mp4');
+
+      expect(r.episode, 183);
+      expect(r.kind, MediaKind.episode);
+      expect(r.title, isNull);
+    });
+
+    // ---- 下面三条是**回归守卫**：都是「看起来像、但不该被改」的老行为 ----
+
+    test('⛔ 编号与标记之间是点号 → 仍是片名（`182.格力空调…` 事故不许复发）', () {
+      final r = parser.parse('182.格力空调显示E6如何维修.mp4');
+
+      expect(r.episode, isNull);
+      expect(r.title, contains('格力空调显示E6如何维修'));
+    });
+
+    test('⛔ 整串就是一个编号（没有技术标记）→ 老行为不变', () {
+      for (final name in ['159.mkv', '183.mp4']) {
+        final r = parser.parse(name);
+        expect(
+          r.episode,
+          isNull,
+          reason: '$name：没有技术标记 ⇒ 分不清那是集号还是片名，'
+              '交给目录级归组去决定，解析器不擅自改判',
+        );
+        expect(r.kind, MediaKind.movie);
+      }
+    });
+
+    test('⛔ 自带年份的纯数字片名（《65》）→ 仍然是片名', () {
+      final r = parser.parse(
+        '65.2023.2160p.WEB-DL.DDP5.1.DV.HDR.H.265-FLUX.mkv',
+        dirPath: '/来自：分享/逃出白垩纪 (2023) 4K HDR & Dv/',
+      );
+
+      expect(r.title, '65');
+      expect(r.kind, MediaKind.movie);
+    });
+  });
+
   group('dirNameOf：从路径取末级目录名', () {
     // 扫描期与详情页的单片刮削**共用**它。两处对「什么算末级目录名」的理解
     // 一旦不同（比如一处去了尾斜杠、一处没去），同一个文件在两处就会解析出

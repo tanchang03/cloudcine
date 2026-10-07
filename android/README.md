@@ -142,9 +142,18 @@ tmdb_api_key · tmdb_api_base · tmdb_image_base · douban_cookie
 └────┘  简介正文（最多三行，超出省略）
 [▶ 续播] [手动刮削] [刮削设置] [选集（12）]      ← 动作胶囊（actionsScroll）
 [修改时间倒序] [剧集顺序] [标题]                ← 排序胶囊（itemsSortScroll）
-第 1 集 …                                    ← 剧集列表（ListView）
-第 2 集 …
+黑亚当.2022.S01E01.1080p.WEB-DL   S01E01  3 天前   ← 剧集列表（ListView）
+   1080p · 1.2 GB · 看到 12:34 / 45:00
+黑亚当.2022.S01E02.1080p.WEB-DL   S01E02  3 天前
+   1080p · 1.2 GB
 ```
+
+⛔ 列表**主标题是文件名**（`EpisodeLabels.fileLabel`，去扩展名），**不是**作品名
+（2026-10-07 用户反馈：「文件列表应该重点凸显的是文件名，而不是全部都是媒体名，
+否则剧集列表都是媒体名，看起来体验非常不好」）。用 `LibraryItem.displayTitle` 的话
+它优先返回作品标题，12 集会印成 12 个「黑亚当」。副标题的进度读**历史最大位置**
+（`maxPositionMs`，看完不清），不是续播点（看完会被清成 NULL ⇒ 看不出「看过没有」）。
+口径与播放页 OSD 的「选集」共用 `library/EpisodeLabels.kt`，由 `EpisodeLabelsTest` 钉死。
 
 | 胶囊 | 做什么 | 判据 |
 |---|---|---|

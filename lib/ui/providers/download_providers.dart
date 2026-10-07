@@ -37,18 +37,46 @@ final downloadQueueProvider =
 );
 
 class DownloadQueueController extends Notifier<List<DownloadTask>> {
-  late final DownloadQueue _queue;
+  /// 当前队列。
+  ///
+  /// ⛔⛔ **不能**写成 `late final`。Riverpod 在依赖变化时会**复用同一个
+  ///    Notifier 实例**再调一次 `build()`；而这里 `ref.watch` 了
+  ///    [downloadTaskStoreProvider]，它又挂在 `databaseProvider` 下面 ——
+  ///    恢复备份换掉整个 `AppDatabase` 时这条链会一起重建。`late final`
+  ///    第二次赋值直接抛
+  ///    `LateInitializationError: Field '_queue' has already been initialized`，
+  ///    表现是**整个界面变红**（2026-10-07 恢复备份后真机踩到）。
+  ///
+  ///    同目录的 `FollowController` / `ScanController` 早就按「可重建」写
+  ///    （`_disposed = false` 复位那一套），这里当初漏了。
+  ///
+  /// ⛔ 刻意用**可空字段 + 取值器**而不是 `late DownloadQueue _queue`：
+  ///    `late` 读未赋值会抛，而「忘了在 `build()` 里赋值」正是我们要在
+  ///    编译期之外也看得见的事；可空类型让「这里可能还没有队列」写进类型里。
+  DownloadQueue? _queue;
+
+  /// 当前队列。`build()` 一定会先赋值，所以这里可以直接 `!`。
+  DownloadQueue get _q => _queue!;
+
   int _concurrency = kDefaultDownloadConcurrency;
   bool _disposed = false;
 
   @override
   List<DownloadTask> build() {
+    // ⛔ 先把上一轮那个队列收掉（`build()` 会被调不止一次，见 [_queue] 的
+    //    文档）。不收的话：旧队列的进度回调还挂着、`_running` 里的暂停令牌
+    //    变成孤儿，而且它的 `store` 已经指向被换掉的那个库。
+    //
+    //    这里和下面 `ref.onDispose` 里各收一次是**故意**的：不依赖
+    //    「Riverpod 到底在 build 之前还是之后触发上一轮的 onDispose」，
+    //    而 `DownloadQueue.dispose()` 是幂等的。
+    _queue?.dispose();
     _disposed = false;
     final registry = ref.watch(adapterRegistryProvider);
     _concurrency = ref.read(settingsProvider).valueOrNull?.downloadConcurrency ??
         kDefaultDownloadConcurrency;
 
-    _queue = DownloadQueue(
+    final queue = DownloadQueue(
       store: ref.watch(downloadTaskStoreProvider),
       // 每次开跑现取一个服务实例（适配器注册表可以被重建，
       // 冻住一个旧适配器会拿着失效的会话去取链）。
@@ -57,10 +85,11 @@ class DownloadQueueController extends Notifier<List<DownloadTask>> {
       ),
       concurrency: () => _concurrency,
     );
+    _queue = queue;
 
-    _queue.onChanged = () {
+    queue.onChanged = () {
       if (_disposed) return;
-      state = _queue.tasks;
+      state = queue.tasks;
     };
 
     // 并发数变了：立刻按新值调度一次。
@@ -72,13 +101,16 @@ class DownloadQueueController extends Notifier<List<DownloadTask>> {
       if (value == null) return;
       if (value.downloadConcurrency == _concurrency) return;
       _concurrency = value.downloadConcurrency;
-      _queue.pump();
+      queue.pump();
     });
 
-    unawaited(_queue.init());
+    unawaited(queue.init());
     ref.onDispose(() {
       _disposed = true;
-      _queue.dispose();
+      // ⛔ 捕获**局部变量**而不是读 `_queue`：重建时这个回调可能在
+      //    `build()` 之后才被触发，那时 `_queue` 已经指向新队列了 ——
+      //    读字段就会把**新**队列收掉。
+      queue.dispose();
     });
     return const [];
   }
@@ -92,7 +124,7 @@ class DownloadQueueController extends Notifier<List<DownloadTask>> {
     String dirPath = '/',
     int? sizeBytes,
   }) =>
-      _queue.enqueue(
+      _q.enqueue(
         provider: provider,
         fileId: fileId,
         name: name,
@@ -101,16 +133,16 @@ class DownloadQueueController extends Notifier<List<DownloadTask>> {
         sizeBytes: sizeBytes,
       );
 
-  Future<void> pause(String id) => _queue.pause(id);
-  Future<void> resume(String id) => _queue.resume(id);
-  Future<void> pauseAll() => _queue.pauseAll();
-  Future<void> resumeAll() => _queue.resumeAll();
+  Future<void> pause(String id) => _q.pause(id);
+  Future<void> resume(String id) => _q.resume(id);
+  Future<void> pauseAll() => _q.pauseAll();
+  Future<void> resumeAll() => _q.resumeAll();
 
   /// 取消 / 移除记录（并清掉它留下的 `.part`）。
-  Future<void> remove(String id) => _queue.remove(id);
+  Future<void> remove(String id) => _q.remove(id);
 
-  Future<void> clearCompleted() => _queue.clearCompleted();
-  Future<void> clearAll() => _queue.clearAll();
+  Future<void> clearCompleted() => _q.clearCompleted();
+  Future<void> clearAll() => _q.clearAll();
 }
 
 /// 「进行中」的任务数（排队 + 下载中）。侧栏角标读它。
