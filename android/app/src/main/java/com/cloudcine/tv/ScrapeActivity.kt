@@ -25,6 +25,7 @@ import android.widget.TextView
 import com.cloudcine.tv.library.DoubanScraper
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.MediaCategoryNames
 import com.cloudcine.tv.library.PosterFetcher
 import com.cloudcine.tv.library.ScrapeCandidate
@@ -141,7 +142,10 @@ class ScrapeActivity : Activity() {
             finish()
             return
         }
-        db = LibraryDb(LibraryPaths.dbFile(this))
+        db = LibraryDb(
+            LibraryPaths.dbFile(this),
+            progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
+        )
 
         val frame = FrameLayout(this).apply { setBackgroundColor(BG) }
         frame.addView(buildContent(), matchParent())

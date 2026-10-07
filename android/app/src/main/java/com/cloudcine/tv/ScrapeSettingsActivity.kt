@@ -21,6 +21,7 @@ import android.widget.TextView
 import com.cloudcine.tv.library.DoubanScraper
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.LibrarySettings
 import com.cloudcine.tv.library.ScrapeProbe
 import com.cloudcine.tv.library.TmdbScraper
@@ -108,7 +109,10 @@ class ScrapeSettingsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        db = LibraryDb(LibraryPaths.dbFile(this))
+        db = LibraryDb(
+            LibraryPaths.dbFile(this),
+            progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
+        )
 
         val scroll = ScrollView(this).apply {
             setBackgroundColor(BG)

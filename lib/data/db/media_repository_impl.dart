@@ -18,7 +18,9 @@ import '../../domain/entities/work_poster.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_cursor.dart';
+import '../../domain/services/playback_progress.dart';
 import 'app_database.dart';
+import 'progress_store.dart';
 
 /// 把 [list] 按每段最多 [size] 个切成若干片（顺序不变）。
 ///
@@ -49,10 +51,30 @@ List<List<T>> _chunkedList<T>(List<T> list, int size) {
 /// 2. **刮削结果不被本地解析覆盖**。作品行的 upsert 在 `source == online`
 ///    时保留原有的标题/海报/简介 —— 否则「扫一遍」就会把辛苦刮来的海报
 ///    冲成文件名。
+///
+/// ## 播放进度：**写透**到独立进度库
+///
+/// 三个写方法（[markPlayed] / [saveResumePosition] / [saveMaxPosition]）
+/// 除了写 `media_items` 那三列，还会同步写一份到 [ProgressStore]。
+///
+/// 方向是**单向**的，这一点必须说清楚：
+///
+///   * **写的时候**：库列与进度库**都写**（进度库是主，库列是投影）；
+///   * **读的时候**：全部读库列，**一次都不读进度库**。
+///
+/// 于是「进度库是唯一真源、库列只是它的物化视图」这个关系成立，而二十多处
+/// SQL 查询（排序、聚合、进度条）一行都不用改。让投影追上真源的那一步是
+/// [applyProgressSnapshot]。
+///
+/// [progress] 可空：单测里大量用例只关心库本身，不该被迫造一个进度文件。
 class DriftMediaRepository implements MediaRepository {
-  DriftMediaRepository(this._db);
+  DriftMediaRepository(this._db, {ProgressStore? progress})
+      : _progress = progress;
 
   final AppDatabase _db;
+
+  /// 独立进度库。为 `null` 时所有写透都是**无操作**（单测的常见形态）。
+  final ProgressStore? _progress;
 
   /// `IN (…)` 里一次最多塞几个占位符。
   ///
@@ -716,6 +738,12 @@ class DriftMediaRepository implements MediaRepository {
     await (_db.update(_db.mediaItems)..where((t) => t.id.equals(itemId)))
         .write(MediaItemsCompanion(lastPlayedAt: Value(at)));
 
+    // 写透到独立进度库。**顺序是先库后进度库**：库这一笔决定「最近播放」
+    // 排序（用户立刻看得见），进度库那一笔决定「同步出去的是什么」。
+    // 两者都不该被对方的失败带走，所以进度库的异常在这里吞掉、只记日志 ——
+    // 进度是**可再生**的（下次播放会再写一遍），而排序不是。
+    _progress?.recordPlayed(itemId, at);
+
     final item = await itemById(itemId);
     if (item != null) {
       await (_db.update(_db.mediaWorks)
@@ -733,6 +761,11 @@ class DriftMediaRepository implements MediaRepository {
         : position.inMilliseconds;
     await (_db.update(_db.mediaItems)..where((t) => t.id.equals(itemId)))
         .write(MediaItemsCompanion(resumePositionMs: Value(ms)));
+
+    // 写透到独立进度库。口径与这里**逐字一致**（`null` / `<= 0` 都记成
+    // 「没有可续的点」，不写 0）—— 两处判据一旦不同，「哪一边赢」就会
+    // 随写入顺序变。见类文档。
+    _progress?.recordResume(itemId, ms);
   }
 
   @override
@@ -756,6 +789,154 @@ class DriftMediaRepository implements MediaRepository {
       'WHERE id = ?',
       <Object?>[position.inMilliseconds, itemId],
     );
+
+    // 写透到独立进度库。`recordMax` 自己也是「只增不减」，与上面那条 SQL
+    // 同一语义 —— 两处判据必须一样，否则「哪一边赢」会随写入顺序变。
+    _progress?.recordMax(itemId, position.inMilliseconds);
+  }
+
+  @override
+  Future<int> applyProgressSnapshot(ProgressBook book) async {
+    if (book.isEmpty) return 0;
+
+    // 1. 先读回这些 id 的**当前投影值**，在 Dart 侧算差集。
+    //
+    // ⛔ 不能对每一条都无条件 UPDATE：这个方法在每次启动、每次扫描入库之后
+    //    都会跑，而绝大多数时候**没有任何变化**。几千条无条件 UPDATE 会在
+    //    启动路径上多出几百毫秒的写入，并且把整张表的页全部标脏。
+    final ids = book.items.keys.toList(growable: false);
+    final current = <String, List<int?>>{};
+    for (final chunk in _chunkedList(ids, _sqlChunk)) {
+      final rows = await (_db.selectOnly(_db.mediaItems)
+            ..addColumns([
+              _db.mediaItems.id,
+              _db.mediaItems.resumePositionMs,
+              _db.mediaItems.maxPositionMs,
+              _db.mediaItems.lastPlayedAt,
+            ])
+            ..where(_db.mediaItems.id.isIn(chunk)))
+          .get();
+      for (final r in rows) {
+        final id = r.read(_db.mediaItems.id);
+        if (id == null) continue;
+        current[id] = [
+          r.read(_db.mediaItems.resumePositionMs),
+          r.read(_db.mediaItems.maxPositionMs),
+          // ⚠️ 换算成**毫秒**再比：`DateTimeColumn` 落盘是 Unix **秒**，
+          //    drift 读回来是 `DateTime`。直接用 `DateTime` 比会引入一次
+          //    「本地时区 → 毫秒」的往返，而它对本文件里的判据毫无意义。
+          r.read(_db.mediaItems.lastPlayedAt)?.millisecondsSinceEpoch,
+        ];
+      }
+    }
+
+    var changed = 0;
+    await _db.transaction(() async {
+      for (final e in book.items.entries) {
+        final have = current[e.key];
+        // 库里没有这一行 → 没有落点。**不新建行**：进度不决定一条媒体项
+        // 存不存在，那是扫描的事。
+        if (have == null) continue;
+
+        final entry = e.value;
+        final wantResume =
+            (entry.resumeMs == null || entry.resumeMs! <= 0)
+                ? null
+                : entry.resumeMs;
+        final wantMax =
+            (entry.maxMs == null || entry.maxMs! <= 0) ? null : entry.maxMs;
+
+        final haveResume = have[0];
+        final haveMax = have[1];
+        // 历史最大位置是**只增不减**的：真源里那份可能反而更小（比如这条
+        // 进度是另一台机器更早写的），此时保留库里的较大值。
+        final nextMax = (haveMax != null &&
+                (wantMax == null || haveMax >= wantMax))
+            ? haveMax
+            : wantMax;
+
+        final playedSec = entry.playedAtSec;
+        final havePlayedMs = have[2];
+        final wantPlayedMs = playedSec == null ? null : playedSec * 1000;
+        // 已读回执同样只前进。
+        final nextPlayedMs = (havePlayedMs != null &&
+                (wantPlayedMs == null || havePlayedMs >= wantPlayedMs))
+            ? havePlayedMs
+            : wantPlayedMs;
+
+        if (haveResume == wantResume &&
+            haveMax == nextMax &&
+            havePlayedMs == nextPlayedMs) {
+          continue; // 这一条本来就一致 —— 不写。
+        }
+
+        await (_db.update(_db.mediaItems)..where((t) => t.id.equals(e.key)))
+            .write(MediaItemsCompanion(
+          resumePositionMs: Value(wantResume),
+          maxPositionMs: Value(nextMax),
+          lastPlayedAt: Value(
+            nextPlayedMs == null
+                ? null
+                : DateTime.fromMillisecondsSinceEpoch(nextPlayedMs),
+          ),
+        ));
+        changed++;
+      }
+
+      // 2. 作品行上的 `last_played_at` 是**冗余列**（「最近播放」那一栏
+      //    筛的就是它）。回填完媒体项之后必须重算一次，否则「清空索引库 →
+      //    重扫 → 回填」之后作品级的时间戳还是空的，海报墙的「最近播放」
+      //    会一直是空的 —— 而详情页里每集的进度条却是对的，看起来像两套数据。
+      //
+      //    只按**已有值**重算（`COALESCE` 兜底保留旧值），不发明时间。
+      if (changed > 0) {
+        await _db.customStatement('''
+          UPDATE media_works SET last_played_at = COALESCE((
+            SELECT MAX(mi.last_played_at) FROM media_items mi
+            WHERE mi.group_key = media_works.key
+          ), last_played_at)
+        ''');
+      }
+    });
+
+    if (changed > 0) {
+      diag.info('进度', '进度回填：更新 $changed 条媒体项（共 ${book.length} 条待查）');
+    }
+    return changed;
+  }
+
+  @override
+  Future<ProgressBook> progressSnapshot() async {
+    final out = ProgressBook();
+    // 只取「三列里有任意一列非空」的行 —— 绝大多数行三列全空（从没播过），
+    // 把它们也读出来等于白物化整张表。
+    final rows = await (_db.selectOnly(_db.mediaItems)
+          ..addColumns([
+            _db.mediaItems.id,
+            _db.mediaItems.resumePositionMs,
+            _db.mediaItems.maxPositionMs,
+            _db.mediaItems.lastPlayedAt,
+          ])
+          ..where(_db.mediaItems.resumePositionMs.isNotNull() |
+              _db.mediaItems.maxPositionMs.isNotNull() |
+              _db.mediaItems.lastPlayedAt.isNotNull()))
+        .get();
+
+    for (final r in rows) {
+      final id = r.read(_db.mediaItems.id);
+      if (id == null) continue;
+      final playedMs =
+          r.read(_db.mediaItems.lastPlayedAt)?.millisecondsSinceEpoch;
+      final playedSec = playedMs == null ? null : playedMs ~/ 1000;
+      out.items[id] = ProgressEntry(
+        resumeMs: r.read(_db.mediaItems.resumePositionMs),
+        maxMs: r.read(_db.mediaItems.maxPositionMs),
+        playedAtSec: playedSec,
+        // 没有播放时间就没有合并依据 —— 记 0，让它输给任何有依据的记录。
+        updatedAtSec: playedSec ?? 0,
+      );
+    }
+    return out;
   }
 
   @override
@@ -1979,24 +2160,23 @@ class DriftMediaRepository implements MediaRepository {
 
   @override
   Future<DateTime?> latestLibraryChangeAt() async {
-    // 取「作品 updated_at」与「媒体项 first_seen_at / last_played_at」的最大值。
-    // 三者都是「库真的变过」的证据，任何一个变了都该算数 ——
-    // 只看作品表会漏掉「只播过、还没归组」的时刻。
+    // 取「作品 updated_at」与「媒体项 first_seen_at」的最大值。
+    //
+    // ⛔ **不含 `media_items.last_played_at`**（2026-10-07 摘掉）。播放进度
+    //    现在有独立通道（`playback_progress.json`），把它算进媒体库的同步
+    //    判据会让「看一集」触发一次整份 `.ccbak` 的上传 / 覆盖 —— 见接口上
+    //    `latestLibraryChangeAt` 的文档。Android 端必须同时改。
     final workExpr = _db.mediaWorks.updatedAt.max();
     final seenExpr = _db.mediaItems.firstSeenAt.max();
-    final playedExpr = _db.mediaItems.lastPlayedAt.max();
 
     final workRow = await (_db.selectOnly(_db.mediaWorks)..addColumns([workExpr]))
         .getSingle();
-    final itemRow = await (_db.selectOnly(_db.mediaItems)
-          ..addColumns([seenExpr, playedExpr]))
+    final itemRow = await (_db.selectOnly(_db.mediaItems)..addColumns([seenExpr]))
         .getSingle();
 
     DateTime? latest = workRow.read(workExpr);
-    for (final t in [itemRow.read(seenExpr), itemRow.read(playedExpr)]) {
-      if (t == null) continue;
-      if (latest == null || t.isAfter(latest)) latest = t;
-    }
+    final seen = itemRow.read(seenExpr);
+    if (seen != null && (latest == null || seen.isAfter(latest))) latest = seen;
     return latest;
   }
 

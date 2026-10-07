@@ -10,6 +10,7 @@ import '../entities/drive_provider.dart';
 import '../entities/follow_dir.dart';
 import '../entities/scan_cursor.dart';
 import '../entities/work_poster.dart';
+import '../services/playback_progress.dart';
 
 /// 媒体库列表的排序方式。
 ///
@@ -431,6 +432,66 @@ abstract class MediaRepository {
   /// 是**无操作**（而不是把已有的值抹掉）：调用方每 10 秒报一次位置，
   /// 起播那一刻位置就是 0，那时抹掉用户攒下的进度是最坏的结果。
   Future<void> saveMaxPosition(String itemId, Duration position);
+
+  /// 把**独立进度库**里的进度回填进媒体项行（只动上面那三列）。
+  ///
+  /// ## 为什么需要它
+  ///
+  /// 进度现在有**两个落点**：
+  ///
+  ///   * **真源** —— `ProgressStore`（`playback_progress.json`，独立文件）；
+  ///   * **投影** —— `media_items` 的 `resume_position_ms` /
+  ///     `max_position_ms` / `last_played_at`，以及冗余的
+  ///     `media_works.last_played_at`。
+  ///
+  /// 投影存在的唯一理由是**查询**：海报墙的「最近播放」排序、详情页每集的
+  /// 进度条、追剧的 NEW 判定、`unfinishedCount` 全是 SQL 级的聚合与排序，
+  /// 让它们改去读另一个文件等于把二十多处查询推倒重来。
+  ///
+  /// 代价是投影会**落后于真源**，而下面两件事都会让投影整体消失：
+  ///
+  ///   1. **清空索引库**（删 `media_items` / `media_works`）；
+  ///   2. **恢复媒体库备份**（整文件替换，换成别人那台机器的进度）。
+  ///
+  /// 所以这两件事之后（以及每次启动、每次扫描入库之后）都要调一次这个方法，
+  /// 把真源重新铺回投影。**它必须是幂等的** —— 会跑很多次，而绝大多数时候
+  /// 什么都不会变（那一趟应当只读不写）。
+  ///
+  /// ## 返回
+  ///
+  /// 实际被更新的行数。调用方据此决定要不要刷新列表视图（0 = 界面不用动）。
+  ///
+  /// ⛔ **不碰** `first_seen_at` / `updated_at` / `modified_at`：前两个参与
+  ///    媒体库的同步判据与排序，被一次回填扰动的话，同步方向会莫名其妙地翻转。
+  ///    `modified_at` 是网盘给的文件时间，更不该动。
+  Future<int> applyProgressSnapshot(ProgressBook book);
+
+  /// 从媒体项行里**导出**当前进度（把库里的投影读成一份进度快照）。
+  ///
+  /// ## 它存在的唯一理由：**播种**
+  ///
+  /// 独立进度库是后加的，所以**老用户升级上来的那一刻，磁盘上的
+  /// `playback_progress.json` 还不存在**，而库里已经攒了几百条进度。
+  /// 不把库里的那批读出来喂给进度库的话，它们会永远停在本地：
+  ///
+  ///   * 不会被上传到网盘（另一台机器看不到）；
+  ///   * 也不会参与合并（远程那条同名记录会一直赢）。
+  ///
+  /// 表现是「升级之后在电脑上看的进度，同步不到电视上」，而两边都显示
+  /// 同步成功 —— 又一个静默的错法。
+  ///
+  /// ## `updatedAtSec` 的取法
+  ///
+  /// 取 `last_played_at`（Unix 秒）。那一列为空时取 **0** —— 0 会让这一条
+  /// 输给任何一条远程记录，这正是「本地这条没有时间依据」时该有的表现：
+  /// 宁可让有依据的那一份赢。
+  ///
+  /// ## 与 [applyProgressSnapshot] 的关系
+  ///
+  /// 两者方向相反、**互不抵消**：导出 → 合并（含远程）→ 回填。
+  /// 回填只会把投影**往前推**（最大位置只增不减、已读时间只前进），
+  /// 所以「导出 → 回填」这一圈是幂等的，不会来回抖。
+  Future<ProgressBook> progressSnapshot();
 
   /// 读某一条的播放偏好（画质 / 音轨 / 字幕 / 字幕开关 / 音效）。
   ///
@@ -1126,6 +1187,91 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<int> applyProgressSnapshot(ProgressBook book) async {
+    var changed = 0;
+    for (final e in book.items.entries) {
+      final item = _items[e.key];
+      // 库里没有这一行 → 没有可回填的落点。**不新建行**：进度不决定
+      // 「这条媒体项存不存在」，那是扫描的事。
+      if (item == null) continue;
+      final entry = e.value;
+      var touched = false;
+
+      // 续播点：真源说什么就是什么（`null` 表示没有可续的点）。
+      final resume = _durationOrNull(entry.resumeMs);
+      if (_resume[e.key] != resume) {
+        if (resume == null) {
+          _resume.remove(e.key);
+        } else {
+          _resume[e.key] = resume;
+        }
+        touched = true;
+      }
+
+      // 历史最大位置：**只增不减**，与 `saveMaxPosition` 同一口径。
+      // 直接赋值的话，一台机器上「看过 40 分钟」会被另一台「刚看 2 分钟」
+      // 的回填顶掉 —— 而真源那边本来已经取了并集，这里再退回去就白做了。
+      final max = _durationOrNull(entry.maxMs);
+      if (max != null) {
+        final stored = _maxPositions[e.key];
+        if (stored == null || max > stored) {
+          _maxPositions[e.key] = max;
+          touched = true;
+        }
+      }
+
+      // 已读回执：同样只前进（「最近播放」不该倒退）。
+      final playedSec = entry.playedAtSec;
+      if (playedSec != null) {
+        final played = DateTime.fromMillisecondsSinceEpoch(playedSec * 1000);
+        final stored = _played[e.key];
+        if (stored == null || played.isAfter(stored)) {
+          _played[e.key] = played;
+          // 作品行上的那一列也要跟（与 `markPlayed` 同一口径），
+          // 否则「最近播放」那一栏用这个替身写测试时永远是空的。
+          final w = _works[item.groupKey];
+          if (w != null) {
+            _works[item.groupKey] = w.copyWith(lastPlayedAt: played);
+          }
+          touched = true;
+        }
+      }
+
+      if (touched) changed++;
+    }
+    return changed;
+  }
+
+  @override
+  Future<ProgressBook> progressSnapshot() async {
+    final out = ProgressBook();
+    for (final item in _items.values) {
+      final resume = _resume[item.id];
+      final max = _maxPositions[item.id];
+      final played = _played[item.id] ?? item.lastPlayedAt;
+      if (resume == null && max == null && played == null) continue;
+      final playedSec = played?.millisecondsSinceEpoch == null
+          ? null
+          : played!.millisecondsSinceEpoch ~/ 1000;
+      out.items[item.id] = ProgressEntry(
+        resumeMs: resume?.inMilliseconds,
+        maxMs: max?.inMilliseconds,
+        playedAtSec: playedSec,
+        // 没有播放时间就没有合并依据 —— 记 0，让它输给任何有依据的记录。
+        updatedAtSec: playedSec ?? 0,
+      );
+    }
+    return out;
+  }
+
+  /// 毫秒 → [Duration]；`null` / 非正数一律当「没有」。
+  ///
+  /// 与 `saveResumePosition` / `saveMaxPosition` 的口径一致：0 不是
+  /// 「从第 0 毫秒开始」，而是「没有这个值」。
+  static Duration? _durationOrNull(int? ms) =>
+      (ms == null || ms <= 0) ? null : Duration(milliseconds: ms);
+
+  @override
   Future<PlaybackPreference?> playbackPreferenceFor(
     String itemId, {
     String? groupKey,
@@ -1776,8 +1922,11 @@ class InMemoryMediaRepository implements MediaRepository {
       if (latest == null || t.isAfter(latest)) latest = t;
     }
     for (final i in _items.values) {
-      // 播放记录也算「库变过」：它决定「最近播放」，是要同步的内容。
-      final t = i.lastPlayedAt ?? i.firstSeenAt;
+      // ⛔ 只看 `firstSeenAt`，**不看 `lastPlayedAt`**：播放进度走独立通道
+      //    （见接口上 `latestLibraryChangeAt` 与 `applyProgressSnapshot`
+      //    的文档）。留着播放时间的话，「看一集」就会让整库显得更新过，
+      //    于是每一次播放都会带动整份 `.ccbak` 的上传 / 覆盖。
+      final t = i.firstSeenAt;
       if (latest == null || t.isAfter(latest)) latest = t;
     }
     return latest;

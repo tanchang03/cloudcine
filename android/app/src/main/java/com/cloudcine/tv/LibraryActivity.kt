@@ -52,6 +52,9 @@ import com.cloudcine.tv.library.ItemSortMode
 import com.cloudcine.tv.library.LibraryScanner
 import com.cloudcine.tv.library.MediaCategoryNames
 import com.cloudcine.tv.library.PlayTarget
+import com.cloudcine.tv.library.ProgressStore
+import com.cloudcine.tv.library.ProgressSync
+import com.cloudcine.tv.library.ProgressSyncGate
 import com.cloudcine.tv.library.sortItems
 import com.cloudcine.tv.library.PosterFetcher
 import com.cloudcine.tv.library.PosterStore
@@ -148,6 +151,50 @@ class LibraryActivity : Activity() {
     private lateinit var api: PanApi
     private lateinit var db: LibraryDb
     private lateinit var service: LibraryBackupService
+
+    /**
+     * 播放进度的独立存储（进程内唯一，见 [ProgressStore.shared]）。
+     *
+     * ⛔ 它与 [db] **互不隶属**：`cloudcine.sqlite` 被清空 / 被备份覆盖时，它
+     *    一个字都不会变。这正是「清空媒体库 / 恢复备份不丢进度」的全部实现。
+     */
+    private lateinit var progressStore: ProgressStore
+
+    /** 进度静默同步（播种 → 下载 → 逐条合并 → 回填 → 按需上传）。 */
+    private lateinit var progressSync: ProgressSync
+
+    /**
+     * 「每 30 分钟同步一次进度」的定时器体。
+     *
+     * ⛔ 自续期（跑完再 `postDelayed` 自己），不是 `scheduleAtFixedRate` —— 本工程
+     *    用的是 `Handler`，没有那个概念。用 `root` 当 Handler，`onDestroy` 里
+     *    `removeCallbacks(progressSyncTick)` 一次就能停干净。
+     */
+    private val progressSyncTick = object : Runnable {
+        override fun run() {
+            syncProgressSilently("定时")
+            root.postDelayed(this, PROGRESS_SYNC_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * 「启动那次」进度同步（延迟 [PROGRESS_SYNC_LAUNCH_DELAY_MS] 后跑）。
+     *
+     * ⛔ 必须是**具名字段**而不是 `postDelayed({ … })` 里的匿名 lambda：匿名
+     *    Runnable 拿不到引用，`onDestroy` 里就 `removeCallbacks` 不掉它。
+     *    后果是页面已经销毁、`db` 已经 `close()`，12 秒后它才跑 —— 而
+     *    `syncSilently` 第一步就要读库，于是 `LibraryDb.require()` 会把**刚关掉的
+     *    库重新打开**，留下一个**再也没人关**的句柄（本工程每个页面一个
+     *    Activity，来回切几次就攒几个）。
+     */
+    private val progressLaunchSync = Runnable {
+        // ⛔ 闸门在**执行时**判：`postDelayed` 那一刻还没到「本次启动」的语义边界，
+        //    而且本页会被反复重建 —— 不挡就变成「来回切一次同步一次」。
+        if (ProgressSyncGate.claimLaunchSync()) syncProgressSilently("启动")
+    }
+
+    /** 「退出播放器那次」进度同步（延迟 [PROGRESS_SYNC_AFTER_PLAYER_DELAY_MS]）。同上，必须可取消。 */
+    private val progressAfterPlayerSync = Runnable { syncProgressSilently("退出播放器") }
     private lateinit var posters: PosterStore
     private lateinit var scanner: LibraryScanner
 
@@ -429,13 +476,25 @@ class LibraryActivity : Activity() {
 
         store = CredStore(this)
         api = PanApi(store)
-        db = LibraryDb(LibraryPaths.dbFile(this))
+        // ⛔ 进度库的实例来自 `ProgressStore.shared`（进程内唯一），**不是**每次
+        //    自己 new 一个：本页会被反复重建，各自持一份内存副本的话，后落盘的
+        //    那份会把先落盘的整个覆盖掉（两边都显示成功）。
+        progressStore = ProgressStore.shared(LibraryPaths.progressFile(this))
+        db = LibraryDb(LibraryPaths.dbFile(this), progress = progressStore)
         service = LibraryBackupService(
             db = db,
             api = api,
             posterDir = LibraryPaths.posterDir(this),
             deviceId = DeviceIdentity.id(this),
             deviceName = DeviceIdentity.name(),
+        )
+        // 网盘那一步收成两个回调，而不是把 `service` 整个塞进去 —— 见
+        // `ProgressSync` 的类文档（真正需要的只有「读一个文件」「写一个文件」）。
+        progressSync = ProgressSync(
+            store = progressStore,
+            library = db,
+            downloadRemote = { service.downloadProgressFile() },
+            uploadRemote = { service.uploadProgressFile(it) },
         )
         posters = PosterStore(LibraryPaths.posterDir(this), POSTER_CACHE_BYTES)
         scanner = LibraryScanner(api = api, db = db)
@@ -494,6 +553,21 @@ class LibraryActivity : Activity() {
         //    `follow_auto_check` 的 6 小时：电视常被反复唤醒（待机 → 进媒体库），
         //    6 小时窗口会让绝大多数唤醒都什么都不做，用户会觉得「这功能没在跑」。
         root.postDelayed({ maybeAutoCheckFollow() }, FOLLOW_LAUNCH_DELAY_MS)
+
+        // ── 播放进度的静默同步 ────────────────────────────────────────
+        //
+        // 三个时机（用户定的）：**启动**、**退出播放器**、**每 30 分钟**。
+        //
+        // ⛔ 「启动」这一次要用 [ProgressSyncGate] 挡一下：本页会被反复重建
+        //    （从「文件列表」返回一次建一次），不挡就变成「来回切一次同步一次」。
+        //    零点在 `MainActivity`（每次从桌面点图标启动都会新建它）。
+        // ⛔ 延迟 12 秒（与 PC 端 `AppShell._FollowLaunchCheck` 同量级）：这条路径
+        //    要列网盘目录 + 下载一个小文件，与首帧那批「读库 + 扫海报目录」
+        //    抢的是同一个后台线程池。晚一点开始，海报墙就已经画完了。
+        // ⛔ 定时器挂在 `root` 上并在 `onDestroy` 里取消 —— 否则页面重建后旧
+        //    实例的 Runnable 还在跑，而它持有的是**已经关掉的** `db`。
+        root.postDelayed(progressLaunchSync, PROGRESS_SYNC_LAUNCH_DELAY_MS)
+        root.postDelayed(progressSyncTick, PROGRESS_SYNC_INTERVAL_MS)
     }
 
     override fun onDestroy() {
@@ -503,10 +577,22 @@ class LibraryActivity : Activity() {
         scanCancel?.cancel()
         // 刮削同理：它可能正卡在一次搜索的超时里。
         scrapeCancel?.cancel()
+        // ⛔ 进度定时器也要停：它持有本实例的 `db`，页面重建后旧实例的 Runnable
+        //    还在跑的话，用的就是**已经关掉的**那个句柄（本工程每个页面一个
+        //    Activity，来回切一次就重建一次）。⛔ 三个都要取消 —— 两个延迟触发的
+        //    同样是「会读库」的 Runnable，漏掉哪个都会让 `LibraryDb.require()`
+        //    把刚关掉的库重新打开，留下一个**再也没人关**的句柄。
+        root.removeCallbacks(progressSyncTick)
+        root.removeCallbacks(progressLaunchSync)
+        root.removeCallbacks(progressAfterPlayerSync)
         super.onDestroy()
         // ⛔ 必须关：留着连接的话，下次 `rawBytes()` 会读到一份「少最后几次写入」
         //    的库（理由见 `LibraryDb.rawBytes` 的文档）。
         runCatching { db.close() }
+        // 进度库的防抖写入可能在等 2 秒 —— 页面退出时立刻补一次。
+        // ⛔ 用 `flush()` 而**不是** `dispose()`：后者会把单例永久置成「不再自动
+        //    落盘」，而它还要跟着下一个页面继续用（见 `ProgressStore.dispose`）。
+        Bg.run({ progressStore.flush() })
     }
 
     // ------------------------------------------------------------------
@@ -2630,7 +2716,21 @@ class LibraryActivity : Activity() {
         //    系统低内存杀掉，那时连 `onDestroy` 都不一定跑完。已读回执在
         //    [play] 里**点击那一刻**就写好了，所以这里只需无条件重读。
         // ⛔ 也**不能**只判 `RESULT_OK`：那样这条分支永远不会进。
-        if (requestCode == REQ_PLAYER) reloadCurrentItems()
+        if (requestCode == REQ_PLAYER) {
+            reloadCurrentItems()
+            // 退出播放器 ⇒ 顺手把这一轮进度静默同步出去（用户定的三个时机之一）。
+            //
+            // ⛔ **延迟 2 秒**：播放页的 `onDestroy` 里那次「退出补写进度」是
+            //    **异步**的（`Bg.run`），而 `syncSilently` 的第一步就是读
+            //    `ProgressStore` 的内存副本。两个后台任务并发时，同步可能先跑完
+            //    —— 那样**最后那几秒的进度要等下一轮（30 分钟后）才传上去**。
+            //    2 秒远大于一次本地 SQLite 写入 + 内存合并，足够它落地。
+            // ⛔ 用 `root.postDelayed` 而不是 `Thread.sleep`：这是主线程。
+            // ⛔ 用**具名字段**（`progressAfterPlayerSync`）而不是匿名 lambda：
+            //    `onDestroy` 要能把它取消掉，否则页面销毁后它才跑，会把已经
+            //    `close()` 的库重新打开、留下一个没人关的句柄（见该字段的文档）。
+            root.postDelayed(progressAfterPlayerSync, PROGRESS_SYNC_AFTER_PLAYER_DELAY_MS)
+        }
     }
 
     /**
@@ -2788,6 +2888,11 @@ class LibraryActivity : Activity() {
             )
             finishJob(msg)
             loadWorks(msg)
+            // ⛔ 扫完**立刻把独立进度库贴回来**：新入库的 `media_items` 行三列
+            //    全是 NULL（进度不在那个文件里），不贴的话「清空索引库 → 重扫」
+            //    之后所有进度条都是空的 —— 而进度明明一条都没丢。
+            //    排在 `loadWorks` **之后**：先让海报墙是新的，再补进度。
+            backfillProgress("扫描后")
             // ⛔ 扫完**接着**刮 —— 用户的原话是「扫描完毕后需要自动启动刮削」。
             //    排在 `loadWorks` **之后**：先把新扫到的作品画出来再开始刮，
             //    否则用户是对着一面空墙等刮削。
@@ -2979,6 +3084,9 @@ class LibraryActivity : Activity() {
             //    上传虽然不动本地，但「最近修改」的时间戳变了、排序会变。
             finishJob(out?.message ?: "同步完成")
             loadWorks()
+            // ⛔ 恢复是**整份替换** `cloudcine.sqlite`：备份里那份旧进度会把本机
+            //    的进度列盖掉。进度真源在独立进度库（不受影响），这里把它贴回来。
+            if (out?.restores == true) backfillProgress("恢复备份后")
         }
     }
 
@@ -3013,6 +3121,8 @@ class LibraryActivity : Activity() {
             }
             finishJob("已恢复「${latest.name}」（${formatSize(latest.sizeBytes)}）")
             loadWorks()
+            // ⛔ 同上：恢复 = 整份替换库文件，备份里那份旧进度会盖掉本机进度列。
+            backfillProgress("恢复备份后")
         }
     }
 
@@ -3121,6 +3231,59 @@ class LibraryActivity : Activity() {
     private fun backupTime(epochMillis: Long): String {
         if (epochMillis <= 0L) return "时间未知"
         return SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(epochMillis))
+    }
+
+    // ------------------------------------------------------------------
+    // 播放进度的静默同步
+    // ------------------------------------------------------------------
+
+    /**
+     * 跑一轮进度同步。**绝不弹窗、绝不改状态行**。
+     *
+     * 挂在三个时机上（用户定的）：启动、退出播放器、每 30 分钟。
+     *
+     * ⛔ **未登录直接跳过**：没登录时列目录必失败，白跑一次还写一行日志。
+     * ⛔ **不判「界面正忙」**（与启动探测不同）：那一套挡的是「扫描 / 刮削正在
+     *    写同一批表」，而进度同步本身也只在 `media_items` 的三列上按行更新，
+     *    并且 `busy_timeout=5000` 会替它等。挡掉它反而会让「刚看完一集回来」
+     *    那次同步被吞掉 —— 而那次恰恰是最该同步的。
+     */
+    private fun syncProgressSilently(why: String) {
+        if (!store.loggedIn) {
+            Log.i(TAG, "[进度] $why：未登录，跳过")
+            return
+        }
+        Bg.run({ progressSync.syncSilently() }) { out, err ->
+            if (err != null) {
+                Log.w(TAG, "[进度] $why：同步异常（不影响使用）：${err.message}")
+                return@run
+            }
+            if (out == null) return@run
+            Log.i(
+                TAG,
+                "[进度] $why：${out.message}（播种 ${out.seeded}、合入 ${out.mergedIn}、" +
+                    "回填 ${out.applied}）",
+            )
+        }
+    }
+
+    /**
+     * **只做本地那一半**：把独立进度库里的进度贴回刚被换掉/清空的库列。
+     *
+     * 三处调用：**清空索引库之后**（`media_items` 被删光）、**恢复备份之后**
+     * （库文件被整份替换）、**重新扫描之后**（新入库的行三列全是 NULL）。
+     *
+     * ⛔ 不碰网盘：这三种情况下本地那份进度才是最新的，没必要为它走一趟网络。
+     *    真正的上传交给下一轮 [syncProgressSilently]。
+     */
+    private fun backfillProgress(why: String) {
+        Bg.run({ progressSync.backfill() }) { n, err ->
+            if (err != null) {
+                Log.w(TAG, "[进度] $why：回填失败（下一轮同步会再试）：${err.message}")
+                return@run
+            }
+            Log.i(TAG, "[进度] $why：回填 $n 条")
+        }
     }
 
     // ------------------------------------------------------------------
@@ -4556,6 +4719,38 @@ class LibraryActivity : Activity() {
          *    —— 而用户对这个检查**没有任何预期**，晚 1.5 秒他察觉不到。
          */
         const val FOLLOW_LAUNCH_DELAY_MS = 1500L
+
+        /**
+         * 进媒体库后多久开始跑「启动那次」进度同步（毫秒）。
+         *
+         * ⛔ 12 秒，比追更检查（1.5 秒）**晚得多**，理由：
+         *   * 它要列网盘目录 + 下载一个小文件，比「只读头部 64 KiB」重；
+         *   * 它**必须**排在追更检查之后 —— 两者都会列同一个备份目录，同时发
+         *     只会让网盘那边多一次限流风险；
+         *   * 用户对「进度同步」没有任何预期（它本来就是静默的），晚 12 秒他
+         *     察觉不到，而首屏那批「读库 + 扫海报目录」已经跑完了。
+         *
+         * 与 PC 端 `AppShell._FollowLaunchCheck` 的 20 秒同量级。
+         */
+        const val PROGRESS_SYNC_LAUNCH_DELAY_MS = 12_000L
+
+        /**
+         * 进度同步的定时周期（毫秒）—— **30 分钟**（用户定的）。
+         *
+         * ⛔ 与媒体库备份的判据无关：进度的同步判据是「两边内容是否一致」
+         *    （见 `ProgressSync`），一次空同步只花一个 `listDirectory`。
+         *    30 分钟是「够及时」与「别太频繁」的折中。
+         */
+        const val PROGRESS_SYNC_INTERVAL_MS = 30 * 60 * 1000L
+
+        /**
+         * 从播放页返回后，隔多久才开始那一轮进度同步（毫秒）。
+         *
+         * ⛔ 2 秒是为了等播放页 `onDestroy` 里那次**异步**的「退出补写进度」落地
+         *    （见 [onActivityResult] 的注释）。短了会漏掉最后几秒的进度，长了会
+         *    让「刚看完一集、换台电视接着看」这个场景多等一会儿。
+         */
+        const val PROGRESS_SYNC_AFTER_PLAYER_DELAY_MS = 2_000L
 
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT

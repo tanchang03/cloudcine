@@ -27,6 +27,7 @@ import com.cloudcine.tv.pan.formatSize
 import com.cloudcine.tv.library.FolderSortMode
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.LibraryScanner
 import com.cloudcine.tv.library.sortListing
 
@@ -100,7 +101,10 @@ class BrowseActivity : Activity() {
         super.onCreate(savedInstanceState)
         store = CredStore(this)
         api = PanApi(store)
-        db = LibraryDb(LibraryPaths.dbFile(this))
+        db = LibraryDb(
+            LibraryPaths.dbFile(this),
+            progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
+        )
         scanner = LibraryScanner(api = api, db = db)
 
         if (!store.loggedIn) {

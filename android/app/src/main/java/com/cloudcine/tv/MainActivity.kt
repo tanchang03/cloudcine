@@ -3,6 +3,9 @@ package com.cloudcine.tv
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.ProgressStore
+import com.cloudcine.tv.library.ProgressSyncGate
 import com.cloudcine.tv.library.StartupSync
 import com.cloudcine.tv.pan.CredStore
 
@@ -37,6 +40,18 @@ class MainActivity : Activity() {
         //    [LibraryActivity.probeRemoteBackupAtStartup]）按这个零点决定要不要
         //    问用户；放在媒体库页上就会变成「从文件列表返回一次问一次」。
         StartupSync.beginLaunch()
+
+        // ⛔ 播放进度库的**单例零点**也在这里，理由与上面那条一样：本 Activity 是
+        //    LAUNCHER 入口，保证「进程里只有一个进度库实例」在任何页面写进度
+        //    之前就已经成立。播放页也可能被「文件列表」直接拉起，那条路上媒体库页
+        //    未必建过 —— 靠「媒体库页会建」是不够的（两个实例各持一份内存副本，
+        //    后落盘的会把先落盘的整个覆盖掉，而两边都显示成功）。
+        //    这一行**不碰磁盘**（只 new 一个对象），放 `onCreate` 里是安全的。
+        ProgressStore.shared(LibraryPaths.progressFile(this))
+        // ⛔ 「本次启动的进度同步」的零点。与 [StartupSync] 同一个套路：媒体库页
+        //    会被反复重建（从「文件列表」返回一次建一次），不加这道闸就会变成
+        //    「来回切一次同步一次」。
+        ProgressSyncGate.beginLaunch()
 
         val store = CredStore(this)
         startActivity(

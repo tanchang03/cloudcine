@@ -225,6 +225,68 @@ class LibraryBackupService(
     /** 下载一份备份的原始字节。 */
     fun downloadBackup(fileId: String): ByteArray = api.fileBytes(fileId)
 
+    // ------------------------------------------------------------------
+    // 播放进度文件（`云影备份/playback_progress.json`）
+    //
+    // ⛔ 它是**独立的第二条通道**，与 `.ccbak` 备份包互不隶属：
+    //    * 备份包装的是 `cloudcine.sqlite` 的原始字节，每次上传都是**新文件名**
+    //      （带时间戳），所以目录里会攒下一串历史；
+    //    * 进度文件是**当前状态**，**固定名、覆盖写** —— 攒历史毫无意义，
+    //      而且恢复时还得挑「哪一份才是最新的」。
+    //    两者的生命周期完全不同，混在一起只会让「恢复备份」顺手把进度也换了。
+    // ------------------------------------------------------------------
+
+    /**
+     * 读网盘备份目录里的进度文件。
+     *
+     * `null` = **网盘上还没有这份文件**（全新用户 / 另一台设备还没同步过）——
+     * 这是**正常情况**，不是错误。
+     *
+     * ⛔ 目录不存在时**不创建**（走 [PanApi.findFolder]）：从没同步过进度的用户，
+     *    不该每开一次电视就被塞一个空目录。
+     *
+     * ⚠️ 网络失败 / 限流会**抛**（由 [PanApi] 抛）。调用方必须据此放弃上传 ——
+     *    见 [ProgressSync] 的类文档。
+     *
+     * 阻塞（网络）。调用方负责放到 [com.cloudcine.tv.pan.Bg]。
+     */
+    fun downloadProgressFile(
+        dirName: String = BackupPackage.BACKUP_DIR_NAME,
+        maxBytes: Int = MAX_PROGRESS_BYTES,
+    ): ByteArray? {
+        val dirFid = api.findFolder(PanApi.ROOT, dirName) ?: return null
+        val entry = api.listDirectory(dirFid, page = 1, size = 200)
+            .firstOrNull { !it.isDir && it.name == ProgressStore.FILE_NAME }
+            ?: return null
+        val bytes = api.fileBytes(entry.fid, maxBytes)
+        Log.i(tag, "[进度] 已下载网盘进度文件（${bytes.size} 字节，fid=${entry.fid}）")
+        return bytes
+    }
+
+    /**
+     * 覆盖写网盘上的进度文件。目录不存在时会**创建**它。
+     *
+     * ⛔ 同名文件**先删后传**（与 [uploadBackup] 同一套）。夸克的上传不会覆盖
+     *    同名文件，不删的话目录里会攒出两个同名文件，而下次下载拿到的可能是
+     *    旧的那个 —— 表现是「同步说成功，进度却一直不变」。
+     *
+     * 阻塞（网络）。调用方负责放到 [com.cloudcine.tv.pan.Bg]。
+     */
+    fun uploadProgressFile(
+        bytes: ByteArray,
+        dirName: String = BackupPackage.BACKUP_DIR_NAME,
+    ) {
+        val dirFid = api.ensureFolder(PanApi.ROOT, dirName)
+        api.listDirectory(dirFid, page = 1, size = 200)
+            .firstOrNull { !it.isDir && it.name == ProgressStore.FILE_NAME }
+            ?.let {
+                Log.i(tag, "[进度] 同名进度文件已存在，先删除旧文件 fid=${it.fid}")
+                api.deleteFiles(listOf(it.fid))
+            }
+        val fid = api.uploadFile(dirFid, ProgressStore.FILE_NAME, bytes)
+        Log.i(tag, "[进度] 上传完成「${ProgressStore.FILE_NAME}」（${bytes.size} 字节）→ fid=$fid")
+    }
+
     /** 下载**最新**的一份并恢复本地；没有任何备份时返回 `null`。 */
     fun restoreLatest(dirName: String = BackupPackage.BACKUP_DIR_NAME): RemoteBackup? {
         val latest = listRemoteBackups(dirName).firstOrNull() ?: return null
@@ -399,6 +461,17 @@ class LibraryBackupService(
          * 也只是一次 64 KiB 的读取。
          */
         const val MANIFEST_HEAD_BYTES = 64 * 1024
+
+        /**
+         * 进度文件下载的上限字节。
+         *
+         * 一份几千条的进度大约几百 KB；32 MiB 留了两个数量级。设上限的意义是
+         * **挡住把别的文件当成进度文件下下来**（同名目录里万一被人手工放了个
+         * 大文件），而不是真的会用到这个数。
+         *
+         * 与 PC 端 `downloadProgressFile(maxBytes = 32 MiB)` 同一个数。
+         */
+        const val MAX_PROGRESS_BYTES = 32 * 1024 * 1024
 
         /**
          * 默认备份文件名：`cloudcine_backup_2026-10-06T19-16-13.ccbak`。

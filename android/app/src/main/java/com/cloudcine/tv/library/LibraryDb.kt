@@ -31,8 +31,28 @@ import java.io.File
  * `SQLiteDatabase` 自身对多线程是安全的（内部串行化），但 [close] 与
  * 正在跑的查询之间没有保护 —— 只有「恢复备份」那一处会 close，
  * 而它本来就该在没有任何读的时候做（见 `LibraryBackupService.importBackup`）。
+ *
+ * ## 播放进度：**写透**到独立进度库
+ *
+ * `media_items` 的 `resume_position_ms` / `max_position_ms` / `last_played_at`
+ * 三列**不再是进度的真源**，而是 [ProgressStore]（`playback_progress.json`）的
+ * **物化投影**：
+ *
+ *   * **写**（[markPlayed] / [saveResumePosition] / [saveMaxPosition]）双写 ——
+ *     先写库列（二十多处 SQL 查询立刻看到），再写进度库；
+ *   * **读**只读库列（那些 SQL 一行没改）；
+ *   * **清空索引库 / 恢复备份之后**由 [applyProgressSnapshot] 从进度库贴回来。
+ *
+ * 单向依赖（库 → 进度库）是有意的：反过来（查询时去读进度库）需要跨文件 JOIN，
+ * 而本工程用的是裸 `SQLiteDatabase`，做不到。
+ *
+ * ⛔ [progress] 允许为 `null`（= 写透是无操作）。单测就是这种情况 ——
+ *    `android.database.sqlite` 在 JVM 单测里是空壳，本来也测不了这一层。
  */
-class LibraryDb(val file: File) {
+class LibraryDb(
+    val file: File,
+    private val progress: ProgressStore? = null,
+) : ProgressLibrary {
 
     private var db: SQLiteDatabase? = null
 
@@ -140,9 +160,20 @@ class LibraryDb(val file: File) {
      * 「媒体库最后一次内容变更时间」（Unix 秒）。`null` = 空库。
      *
      * ⛔ 这是**同步的判据**，必须与 PC 端 `latestLibraryChangeAt()` 逐项一致：
-     * `media_works.updated_at` 的最大值，并上 `media_items.first_seen_at` 与
-     * `media_items.last_played_at` 的最大值。少任何一项都会让「刚播过但还没
-     * 重新扫描」的机器被判成「没变过」，从而**在同步时把对方的进度盖掉**。
+     * `media_works.updated_at` 的最大值，并上 `media_items.first_seen_at` 的最大值。
+     *
+     * ⛔⛔ **刻意不含 `media_items.last_played_at`**（2026-10-07 摘掉）。进度已经
+     *    搬到独立进度库、由自己的通道同步，把它算进「库内容变更」有两个立刻
+     *    能撞上的坏处：
+     *
+     *      1. **看一集就上传一整份 `.ccbak`**。而看一集只该同步那一条进度；
+     *      2. **常开机的设备永远赢 LWW**。电视每天开着，它每看一集就把
+     *         `libraryModifiedAt` 往前推一次，于是电脑上刚扫好的库在启动时
+     *         会被判成「本机更旧」而被电视那份盖掉。
+     *
+     *    与 PC 端同一取舍（见 `media_repository_impl.dart` 的
+     *    `latestLibraryChangeAt`）。少任何一项都会让「刚扫过但还没重新扫描」的
+     *    机器被判成「没变过」。
      *
      * ⚠️ 空库返回 `null` 而不是 0：`null` 的语义是「没有内容，让远程赢」，
      * 而 0 会被当成「1970 年改过」—— 那台新机器就会拿空库去覆盖网盘。
@@ -153,16 +184,10 @@ class LibraryDb(val file: File) {
         d.rawQuery("SELECT MAX(updated_at) FROM media_works", null).use { c ->
             if (c.moveToFirst() && !c.isNull(0)) latest = c.getLong(0)
         }
-        d.rawQuery(
-            "SELECT MAX(first_seen_at), MAX(last_played_at) FROM media_items",
-            null,
-        ).use { c ->
-            if (c.moveToFirst()) {
-                for (i in 0 until 2) {
-                    if (c.isNull(i)) continue
-                    val v = c.getLong(i)
-                    if (latest == null || v > latest!!) latest = v
-                }
+        d.rawQuery("SELECT MAX(first_seen_at) FROM media_items", null).use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) {
+                val v = c.getLong(0)
+                if (latest == null || v > latest!!) latest = v
             }
         }
         return latest
@@ -1371,6 +1396,10 @@ class LibraryDb(val file: File) {
                 put("last_played_at", atSec)
             }, "key = ?", arrayOf(groupKey))
         }
+        // 写透到独立进度库。⛔ 时间戳口径是 **Unix 秒**，与上面那条 SQL 同一份
+        // 值 —— 两处各算一次「现在」的话，同一秒里先后落盘的两份会差一秒，
+        // 合并时就会莫名其妙地「远程赢」。
+        progress?.recordPlayed(itemId, atSec)
     }
 
     /**
@@ -1384,6 +1413,10 @@ class LibraryDb(val file: File) {
         require().update("media_items", ContentValues().apply {
             if (value == null) putNull("resume_position_ms") else put("resume_position_ms", value)
         }, "id = ?", arrayOf(itemId))
+        // 写透到独立进度库。口径与上面**逐字一致**（`null` / `<= 0` 都记成
+        // 「没有可续的点」，不写 0）—— 两处判据一旦不同，「哪一边赢」就会随
+        // 写入顺序变。
+        progress?.recordResume(itemId, value)
     }
 
     /**
@@ -1403,6 +1436,9 @@ class LibraryDb(val file: File) {
                 "max(COALESCE(max_position_ms, 0), ?) WHERE id = ?",
             arrayOf<Any>(positionMs, itemId),
         )
+        // 写透到独立进度库。`recordMax` 自己也是「只增不减」，与上面那条 SQL
+        // 同一语义 —— 两处判据必须一样，否则「哪一边赢」会随写入顺序变。
+        progress?.recordMax(itemId, positionMs)
     }
 
     /** 取续播位置（毫秒）。 */
@@ -1412,6 +1448,141 @@ class LibraryDb(val file: File) {
             "SELECT resume_position_ms FROM media_items WHERE id = ? LIMIT 1",
             arrayOf(itemId),
         ).use { c -> return if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null }
+    }
+
+    // ------------------------------------------------------------------
+    // 播放进度：独立进度库 ⇄ 库列（物化投影）
+    // ------------------------------------------------------------------
+
+    /** 一条媒体项三列的**当前投影值**。`null` = 那一列是 NULL。 */
+    private class Projection(
+        val resumeMs: Long?,
+        val maxMs: Long?,
+        val playedAtSec: Long?,
+    )
+
+    /**
+     * 把一份进度书**回填**进 `media_items` 的三列。返回被更新的行数。
+     *
+     * 与 PC 端 `DriftMediaRepository.applyProgressSnapshot` 同一套判据。
+     *
+     * ## 三条判据（缺一条就会「回填把进度改坏」）
+     *
+     *   1. **只写有变化的行**。这个方法在每次启动、每次扫描入库之后都会跑，而
+     *      绝大多数时候没有任何变化。几千条无条件 UPDATE 会在启动路径上多出
+     *      几百毫秒的写入，并且把整张表的页全部标脏。
+     *   2. **库里没有这一行就跳过**，**不新建行**：进度不决定一条媒体项存不
+     *      存在，那是扫描的事。
+     *   3. **只增不减的两列在回填时也要夹一次**：真源里那份可能反而更小
+     *      （比如这条进度是另一台机器更早写的），此时保留库里的较大值。
+     *      不然「回填」会变成「把进度往回拉」。
+     *
+     * ⛔ 回填完媒体项之后**必须重算 `media_works.last_played_at`**：它是冗余列
+     *    （「最近播放」那一栏筛的就是它）。不重算的话，「清空索引库 → 重扫 →
+     *    回填」之后作品级的时间戳还是空的，海报墙的「最近播放」会一直是空的 ——
+     *    而详情页里每集的进度条却是对的，看起来像两套数据。
+     *    只按**已有值**重算（`COALESCE` 兜底保留旧值），不发明时间。
+     */
+    override fun applyProgressSnapshot(book: ProgressBook): Int {
+        if (book.isEmpty) return 0
+        val d = require()
+
+        // 1. 分批读回当前投影值。⛔ 必须分批：SQLite 的变量上限是 999 个，
+        //    而一份进度书动辄几千条。
+        val current = HashMap<String, Projection>(book.length * 2)
+        for (chunk in book.items.keys.chunked(SQL_CHUNK)) {
+            val placeholders = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT id, resume_position_ms, max_position_ms, last_played_at " +
+                    "FROM media_items WHERE id IN ($placeholders)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: continue
+                    current[id] = Projection(
+                        resumeMs = if (c.isNull(1)) null else c.getLong(1),
+                        maxMs = if (c.isNull(2)) null else c.getLong(2),
+                        playedAtSec = if (c.isNull(3)) null else c.getLong(3),
+                    )
+                }
+            }
+        }
+
+        var changed = 0
+        d.beginTransaction()
+        try {
+            for ((id, entry) in book.items) {
+                val have = current[id] ?: continue // 库里没有这一行 → 没有落点。
+                // ⛔ 夹取规则在 [ProgressProjection.next] 里（纯函数，有单测）——
+                //    这三条一旦写错，表现全是静默的（进度条倒退 / 排序被扰动 /
+                //    每次启动无条件写几千行）。
+                val next = ProgressProjection.next(
+                    haveResumeMs = have.resumeMs,
+                    haveMaxMs = have.maxMs,
+                    havePlayedAtSec = have.playedAtSec,
+                    want = entry,
+                ) ?: continue // 这一条本来就一致 —— 不写。
+
+                val values = ContentValues()
+                if (next.resumeMs == null) values.putNull("resume_position_ms")
+                else values.put("resume_position_ms", next.resumeMs)
+                if (next.maxMs == null) values.putNull("max_position_ms")
+                else values.put("max_position_ms", next.maxMs)
+                if (next.playedAtSec == null) values.putNull("last_played_at")
+                else values.put("last_played_at", next.playedAtSec)
+                d.update("media_items", values, "id = ?", arrayOf(id))
+                changed++
+            }
+
+            if (changed > 0) {
+                d.execSQL(
+                    "UPDATE media_works SET last_played_at = COALESCE((" +
+                        "SELECT MAX(mi.last_played_at) FROM media_items mi " +
+                        "WHERE mi.group_key = media_works.key), last_played_at)",
+                )
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+
+        if (changed > 0) {
+            Log.i(TAG, "[进度] 进度回填：更新 $changed 条媒体项（共 ${book.length} 条待查）")
+        }
+        return changed
+    }
+
+    /**
+     * 把库里三列的**现有投影**读成一份进度书（播种用）。
+     *
+     * ⛔ 只取「三列里有任意一列非空」的行 —— 绝大多数行三列全空（从没播过），
+     *    把它们也读出来等于白物化整张表。
+     *
+     * ⚠️ [ProgressEntry.updatedAtSec] 用 `played_at` 兜底：库里的投影**没有**
+     *    「这一条什么时候被写的」这个信息（那是进度库独有的）。没有播放时间就
+     *    记 0 —— 让它输给任何有依据的记录，即「进度库里的那份赢」。这是对的：
+     *    进度库才是真源。
+     */
+    override fun progressSnapshot(): ProgressBook {
+        val out = ProgressBook()
+        require().rawQuery(
+            "SELECT id, resume_position_ms, max_position_ms, last_played_at " +
+                "FROM media_items WHERE resume_position_ms IS NOT NULL " +
+                "OR max_position_ms IS NOT NULL OR last_played_at IS NOT NULL",
+            null,
+        ).use { c ->
+            while (c.moveToNext()) {
+                val id = c.getString(0) ?: continue
+                val playedSec = if (c.isNull(3)) null else c.getLong(3)
+                out.items[id] = ProgressEntry(
+                    resumeMs = if (c.isNull(1)) null else c.getLong(1),
+                    maxMs = if (c.isNull(2)) null else c.getLong(2),
+                    playedAtSec = playedSec,
+                    updatedAtSec = playedSec ?: 0L,
+                )
+            }
+        }
+        return out
     }
 
     // ------------------------------------------------------------------
@@ -2060,6 +2231,14 @@ class LibraryDb(val file: File) {
 
         /** 当前 Unix 秒。⛔ 全库时间列都是秒，不是毫秒。 */
         fun nowSec(): Long = System.currentTimeMillis() / 1000L
+
+        /**
+         * `IN (…)` 每批最多绑多少个变量。
+         *
+         * ⛔ SQLite 的默认变量上限是 **999**（`SQLITE_MAX_VARIABLE_NUMBER`），
+         *    超了直接抛 `too many SQL variables`。400 留了一倍余量。
+         */
+        private const val SQL_CHUNK = 400
 
         /**
          * SQLite 在库文件旁边的辅助文件。替换库文件前必须一起删掉 ——

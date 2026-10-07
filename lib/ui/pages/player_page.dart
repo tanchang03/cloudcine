@@ -318,6 +318,14 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// provider 可能已经被销毁，行为不确定。
   late final PlaybackController _controller;
 
+  /// 进度静默同步的触发器。与 [_controller] 同一个理由在 `initState` 抓住 ——
+  /// 它只在 `dispose` 里用一次，而那一刻 `ref` 已经不该再被读。
+  ///
+  /// 「退出播放器」是进度同步的三个时机之一（另两个是启动与每 30 分钟）：
+  /// 用户看完一集、退回列表，这一趟正好把刚才的进度推上云 ——
+  /// 另一台设备下一秒打开就能接着看。
+  late final ProgressSyncTrigger _progressSync;
+
   /// 是否**收起 OSD**（顶栏 + 控制栏）。
   ///
   /// ⚠️ 这个名字容易误导，它**与「全屏」无关** —— 画面在任何情况下都铺满整屏
@@ -487,6 +495,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   void initState() {
     super.initState();
     _controller = ref.read(playbackControllerProvider);
+    _progressSync = ref.read(progressSyncTriggerProvider.notifier);
     // 播放状态一变就重算收起倒计时（见 [_onPlayStateChanged]）。
     _controller.addListener(_onPlayStateChanged);
     // 自动连播。**在这里挂、在 dispose 摘**：控制器是 Provider 级的单例，
@@ -725,6 +734,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     unawaited(TvOsdChannel.hide());
     TvOsdChannel.detach();
     _controller.removeListener(_onPlayStateChanged);
+
+    // 「退出播放器」= 进度同步的一个时机（见 [_progressSync] 的文档）。
+    // ⛔ 放在这里而不是「返回按钮」上，理由与下面那段 `stopAndRelease`
+    //    一样：返回按钮、系统返回键、手势返回、跳别的路由全都经过 `dispose`。
+    //    ⛔ 用**同步**的 `request()`（只自增一个计数器），不能在这里
+    //    `await` 任何东西 —— `dispose` 里挂起的异步会让 State 多活一会儿。
+    _progressSync.request();
     // 摘掉自动连播回调：它是**全局唯一**的那个（控制器是单例），
     // 留着会让下一次播完打到这个已经销毁的 State 上。
     if (_controller.onCompleted == _onCompleted) {

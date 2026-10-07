@@ -552,6 +552,80 @@ class LibraryBackupService {
   }
 
   // -------------------------------------------------------------------
+  // 播放进度文件（独立于媒体库备份的一条小通道）
+  // -------------------------------------------------------------------
+
+  /// 播放进度在网盘上的**固定文件名**。
+  ///
+  /// ## ⛔ 为什么是固定名，而备份包必须带时间戳
+  ///
+  /// 两者是**相反的**需求，别把规则串了：
+  ///
+  ///   * 备份包（`.ccbak`）是**多份历史**：用户会想「退回昨天那份」，所以
+  ///     文件名带时间戳、每次上传都是一份新文件；
+  ///   * 进度文件是**一份当前状态**：它要的是「两端看到同一个文件」，
+  ///     所以固定名 + 覆盖写。带时间戳的话，每次同步都会在网盘上堆一个新
+  ///     文件，而下一轮又只会去读**最新**的那一个 —— 目录会无限膨胀，
+  ///     且「哪份才是当前状态」要靠修改时间猜。
+  ///
+  /// ⛔ 代价是「同名覆盖 = 先删后传」中间有一段空窗（见
+  ///    [uploadFileToBackupDir]）。进度是**可再生 + 逐条合并**的数据：
+  ///    真丢了也只是这一轮同步白跑，下一轮 30 分钟后会重来。所以这个空窗
+  ///    在这里是可接受的，而备份包那边不可接受。
+  static const String progressFileName = 'playback_progress.json';
+
+  /// 下载网盘上的进度文件。**网盘上还没有 / 目录不存在时返回 `null`。**
+  ///
+  /// ⛔ 这条路**绝不创建目录**：它是每次启动都会跑的只读探测，从没备份过的
+  ///    用户不该被塞一个空目录。创建只在 [uploadProgressFile] 里发生。
+  Future<Uint8List?> downloadProgressFile({
+    String dirName = defaultBackupDir,
+    int maxBytes = 32 * 1024 * 1024,
+  }) async {
+    final dirFid = await _findBackupDir(dirName);
+    if (dirFid == null) {
+      diag.info('进度', '网盘上还没有「$dirName」目录，跳过下载');
+      return null;
+    }
+    final page = await _adapter.listDirectory(dirId: dirFid, pageSize: 200);
+    for (final e in page.entries) {
+      if (e.isDirectory || e.name != progressFileName) continue;
+      final bytes = await _adapter.readFileBytes(e.id, maxBytes: maxBytes);
+      diag.info('进度', '已下载远程进度文件：${bytes.length} 字节');
+      return bytes;
+    }
+    diag.info('进度', '网盘上没有「$progressFileName」，跳过');
+    return null;
+  }
+
+  /// 把进度文件覆盖上传到网盘（目录不存在则创建）。返回 fid。
+  Future<String> uploadProgressFile(
+    Uint8List bytes, {
+    String dirName = defaultBackupDir,
+  }) {
+    diag.info('进度', '上传进度文件（${bytes.length} 字节）');
+    return uploadFileToBackupDir(
+      fileName: progressFileName,
+      bytes: bytes,
+      dirName: dirName,
+      logTag: '进度',
+      what: '进度文件',
+    );
+  }
+
+  /// 在根目录下找一个**已存在**的目录，不存在返回 `null`（不创建）。
+  Future<String?> _findBackupDir(String dirName) async {
+    final page = await _adapter.listDirectory(
+      dirId: _adapter.rootId,
+      pageSize: 200,
+    );
+    for (final entry in page.entries) {
+      if (entry.isDirectory && entry.name == dirName) return entry.id;
+    }
+    return null;
+  }
+
+  // -------------------------------------------------------------------
   // 同步逻辑
   // -------------------------------------------------------------------
 

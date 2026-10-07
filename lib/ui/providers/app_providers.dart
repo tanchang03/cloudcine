@@ -10,6 +10,8 @@ import '../../data/auth/secret_backend.dart';
 import '../../data/auth/secure_credential_store.dart';
 import '../../data/db/app_database.dart';
 import '../../data/db/media_repository_impl.dart';
+import '../../data/db/progress_store.dart';
+import '../../data/db/progress_sync.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/http/dio_http_client.dart';
 import '../../data/http/http_client.dart';
@@ -164,8 +166,32 @@ final adapterRegistryProvider = Provider<AdapterRegistry>((ref) {
 });
 
 final mediaRepositoryProvider = Provider<MediaRepository>(
-  (ref) => DriftMediaRepository(ref.watch(databaseProvider)),
+  (ref) => DriftMediaRepository(
+    ref.watch(databaseProvider),
+    // 进度**独立存储**。仓储的三个写方法会写透到它（见 `DriftMediaRepository`
+    // 的类文档），而它自己与 `cloudcine.sqlite` **没有任何关系** ——
+    // 清空索引库 / 恢复备份都碰不到它。
+    progress: ref.watch(progressStoreProvider),
+  ),
 );
+
+/// 播放进度的独立存储（`<应用支持目录>/playback_progress.json`）。
+///
+/// ## 为什么它在组合根，而不是跟着数据库走
+///
+/// 它是**跨数据库实例存活**的：恢复备份会把 `AppDatabase` 整个换掉
+/// （见 [DatabaseHandle]），而进度文件必须在那次替换前后**原样不动** ——
+/// 那正是这个功能的全部意义。所以它挂在 `appSupportDirProvider` 上，
+/// 与 `databaseProvider` 是两棵互不影响的依赖树。
+final progressStoreProvider = Provider<ProgressStore>((ref) {
+  final dir = ref.watch(appSupportDirProvider);
+  final store = ProgressStore(
+    filePath: '$dir${Platform.pathSeparator}${ProgressStore.fileName}',
+  );
+  // 退出前把内存里最后那几条落盘（防抖窗口里可能还压着东西）。
+  ref.onDispose(() => unawaited(store.dispose()));
+  return store;
+});
 
 /// 应用设置的读写（`settings` 表的薄封装）。
 final settingsStoreProvider = Provider<SettingsStore>(
@@ -458,7 +484,138 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
         // 少了这一句，迁移会拖到用户下一次点进媒体库，中间那段时间库里
         // 还是旧结构（就是那个 `no such column: followed`）。
         await next.customSelect('SELECT 1').get();
+
+        // ⛔⛔ **把独立进度库铺回刚换上的这份库**。
+        //
+        // 恢复备份换掉的是**整个** `cloudcine.sqlite`，里面那三列进度跟着
+        // 一起被换成了备份里那份（可能是几周前的，也可能来自另一台机器）。
+        // 不铺回来的话，用户点一次「从网盘恢复」就把本机所有续播点、
+        // 历史进度、已读回执一起丢了 —— 而界面上显示的是「恢复成功」。
+        //
+        // 放在 `openDatabase` 里而不是 `onLibraryReplaced`：那一个是**同步**
+        // 回调（只做清缓存 / invalidate），而这里要读写数据库。
+        try {
+          final store = ref.read(progressStoreProvider);
+          await store.load();
+          // 先把这份恢复回来的库里带着的进度**收进**进度库（那可能是另一台
+          // 设备还没同步上来的记录），再把合并结果铺回去。
+          await store.mergeFrom(
+            await ref.read(mediaRepositoryProvider).progressSnapshot(),
+          );
+          await ref
+              .read(mediaRepositoryProvider)
+              .applyProgressSnapshot(store.book);
+          await store.flush();
+        } catch (e) {
+          // 回填失败不该让「恢复备份」这个动作报错：库已经换好了，
+          // 进度下一轮启动同步时会再铺一次。
+          diag.warn('进度', '恢复备份后回填进度失败（下次同步会重试）：$e');
+        }
       },
     );
   },
 );
+
+/// 播放进度的**静默同步服务**。
+///
+/// 三个依赖各自负责一件事：进度库（本地真源）、仓储（播种与回填）、
+/// 以及网盘那两个动作（读 / 写进度文件）。
+///
+/// ⚠️ 网盘那一步绑的是 `libraryBackupServiceProvider` 的两个方法，
+///    而不是整个服务对象 —— 服务本身只需要「读一个文件 / 写一个文件」，
+///    收窄之后单测用两个闭包就能覆盖全部分支。
+final progressSyncServiceProvider = Provider<ProgressSyncService>((ref) {
+  final backups = ref.watch(libraryBackupServiceProvider);
+  return ProgressSyncService(
+    store: ref.watch(progressStoreProvider),
+    repository: ref.watch(mediaRepositoryProvider),
+    downloadRemote: backups.downloadProgressFile,
+    uploadRemote: (bytes) => backups.uploadProgressFile(bytes),
+  );
+});
+
+/// 「现在同步一次进度」的**触发信号**。
+///
+/// ## 为什么是一个自增计数器，而不是直接调服务
+///
+/// 与 `library_refresh_providers.dart` 里那几个信号同一个理由：
+/// 调用方（播放页的 `dispose`）不该认识 `ProgressSyncService`，
+/// 否则「谁在什么时机同步」这件事会散落在页面里。这里只负责**说一声**，
+/// 由 [progressSyncSchedulerProvider] 决定怎么跑。
+///
+/// ## 为什么带节流
+///
+/// 退出播放页有**四条**路径（返回按钮、系统返回键、手势返回、跳到别的路由）
+/// 都经过同一个 `dispose`，而连播模式下用户可能一集一集连着退。
+/// 20 秒的窗口把这一串压成一次真正的同步。
+class ProgressSyncTrigger extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  DateTime? _lastRequestAt;
+
+  /// 请求同步一次。返回是否真的发起了（被节流时返回 `false`）。
+  bool request() {
+    final now = DateTime.now();
+    final last = _lastRequestAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 20)) {
+      return false;
+    }
+    _lastRequestAt = now;
+    state = state + 1;
+    return true;
+  }
+}
+
+final progressSyncTriggerProvider =
+    NotifierProvider<ProgressSyncTrigger, int>(ProgressSyncTrigger.new);
+
+/// 进度静默同步的**调度器**（纯副作用 Provider，不产出值）。
+///
+/// ## 三个触发点
+///
+/// | 时机 | 延迟 | 为什么是这个时机 |
+/// |---|---|---|
+/// | 启动 | 12 秒 | 让媒体库首屏先出来 —— 同步要走网络，不该跟首屏抢 |
+/// | 每 30 分钟 | — | 两台设备交替使用、且都不退播放器时，靠它兜住 |
+/// | 退出播放器 | 节流 20 秒 | 用户「看完这一集」的自然分界点 |
+///
+/// ⛔ 与 `relayConfigSyncProvider` 同一条规矩：**它不产出值，必须有人
+///    watch 才生效**（在 `CloudCineApp.build` 里）。漏了的话表现是
+///    「进度永远同步不出去」，而**没有任何报错**。
+///
+/// ⛔ 两个 `Timer` 都必须在 `onDispose` 里 cancel：Provider 重建
+///    （热重载、恢复备份换了库）时会重新执行本函数体，不取消的话每重建
+///    一次就多一个永不停止的定时器，最后会同时发起几十次同步。
+final progressSyncSchedulerProvider = Provider<void>((ref) {
+  final service = ref.watch(progressSyncServiceProvider);
+
+  void run(String why) {
+    if (service.isRunning) return;
+    unawaited(
+      service.syncSilently().then((outcome) {
+        if (!outcome.ok) diag.debug('进度', '[$why] 同步未完成：${outcome.message}');
+      }),
+    );
+  }
+
+  // 启动后延迟一次。
+  final launchTimer = Timer(const Duration(seconds: 12), () => run('启动'));
+
+  // 每 30 分钟一次。
+  final periodic = Timer.periodic(
+    const Duration(minutes: 30),
+    (_) => run('定时'),
+  );
+
+  // 「退出播放器」。
+  ref.listen<int>(progressSyncTriggerProvider, (previous, next) {
+    if (previous == next) return;
+    run('退出播放器');
+  });
+
+  ref.onDispose(() {
+    launchTimer.cancel();
+    periodic.cancel();
+  });
+});

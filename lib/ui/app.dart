@@ -34,6 +34,11 @@ class CloudCineApp extends ConsumerWidget {
     // read 只跑一次，用户之后在设置页改开关就不会生效。
     ref.watch(relayConfigSyncProvider);
 
+    // 播放进度的静默同步（启动后一次 + 每 30 分钟 + 退出播放器时）。
+    // 同样必须有人 watch 才会执行 —— 漏了的话表现是「进度永远同步不出去」，
+    // 而且**没有任何报错**。
+    ref.watch(progressSyncSchedulerProvider);
+
     // 调试浮层的开关。**用 select 只听这一个字段**：整个 `AppSettings` 有
     // 二十多项，直接 watch 会让「改个音量」也把整棵树重建一遍 —— 而这里
     // 挂的是 `MaterialApp` 的根，重建代价最大。

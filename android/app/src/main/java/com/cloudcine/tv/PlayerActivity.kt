@@ -44,6 +44,7 @@ import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
 import com.cloudcine.tv.library.PlaybackResume
+import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.ScanItem
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.PlayInfo
@@ -933,7 +934,10 @@ class PlayerActivity : Activity() {
      */
     private fun ensureLib(): LibraryDb {
         libDb?.let { return it }
-        val db = LibraryDb(LibraryPaths.dbFile(this))
+        val db = LibraryDb(
+            LibraryPaths.dbFile(this),
+            progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
+        )
         libDb = db
         return db
     }

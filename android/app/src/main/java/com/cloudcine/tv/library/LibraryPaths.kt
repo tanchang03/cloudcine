@@ -37,4 +37,18 @@ object LibraryPaths {
     fun posterDir(context: Context): File = File(context.filesDir, POSTER_DIR_NAME)
 
     fun thumbDir(context: Context): File = File(context.filesDir, THUMB_DIR_NAME)
+
+    /**
+     * 播放进度的独立存储文件。
+     *
+     * ⛔ 放在与库文件**同一个目录**（`filesDir`），但它**不属于**备份包 ——
+     *    [LibraryBackupService.exportBackup] 只打包 `dbFile` 与 `posterDir`
+     *    两样，所以清空索引库 / 恢复备份都碰不到它。这正是「进度独立存储」的
+     *    全部实现方式。
+     *
+     * ⚠️ 文件名（[ProgressStore.FILE_NAME]）与 PC 端
+     *    `getApplicationSupportDirectory()/playback_progress.json` **同名**，
+     *    也与网盘上那份同名。
+     */
+    fun progressFile(context: Context): File = File(context.filesDir, ProgressStore.FILE_NAME)
 }
