@@ -3820,6 +3820,18 @@ class LibraryActivity : Activity() {
             //    层），不靠 `clipToOutline` —— 后者在缩放态下裁切会失效。
             card.scaleX = s
             card.scaleY = s
+            // ⛔⛔ **放大必须以「顶边」为轴（`pivotY = 0`），不能用默认的居中**。
+            //    海报墙会把子视图裁在自己的 bounds 内（见 [PosterFocusDrawable]
+            //    的类文档），居中放大时卡片顶部会向上溢出 `0.05 × 卡高 ≈ 18.7px`，
+            //    第一行卡片正好贴着海报墙顶边 ⇒ 连**海报本身顶部 15px** 一起被切掉
+            //    （实测：选中后第一行海报顶边从 y=164 变成 y=180）。改成顶边为轴后
+            //    放大只向下长，向上溢出为 0，第一行不再丢像素。
+            // ⛔ 横向仍居中：左右各有 64px 的 `GRID_PAD_DP`，溢出 10px 完全放得下。
+            // ⛔ `setPivotX/Y` 收的是**像素**不是比例 —— `0.5f` 是半个像素，不是
+            //    50%（写错过一次，表现是「卡片只往右长、左边不动」）。而且一旦显式
+            //    设过，`View` 就不再自动跟随控件中心，两个轴都得自己给准。
+            card.pivotY = 0f
+            card.pivotX = cardW / 2f
             // ⛔ `convertView` 复用时旧卡片的描边不会自己消失（`foreground` 是
             //    视图状态），所以选中 / 非选中**每帧都要重设**。
             posterBox.foreground = if (selected) focusRing else null
@@ -3916,24 +3928,35 @@ class LibraryActivity : Activity() {
      *       每一圈的半径差在直边处互相抵消（看不出），到圆角处被弧长放大成
      *       块状同心弧。实机放大截图能直接看到条带，观感「粗糙、廉价」。
      *
-     * 现在的做法：**由外向内叠 `GLOW_STEPS` 层实心圆角矩形**。
-     *   - 每层 `alpha` 相同且极低（[GLOW_LAYER_ALPHA]）；
-     *   - 越靠里被越多层覆盖 ⇒ alpha 沿**法线方向连续累积**，
-     *     形成一条平滑的向外衰减曲线，没有任何硬边；
-     *   - 每层的圆角半径都按「外扩量」**同步增大**（`radiusPx + grow`），
-     *     这样每层都是上一层的**精确外扩**（等距曲线），直边与圆角的衰减
-     *     速度完全一致 —— 这正是消除圆角条带的关键。
+     * ## ★★ 为什么描边和光晕**全部画在海报内部**（这条是硬约束）
      *
-     * ⛔ 光晕只画在**环带**里（海报本体之外）：`foreground` 是画在 `ImageView`
-     *    **之上**的，不裁的话里面那些层会把海报本身也蒙上一层色。用一次
-     *    `clipPath`（外圆角矩形 **减去** 海报圆角矩形）裁出环带即可。
+     * 因为**海报墙会把子视图裁在自己的 bounds 内**：`AbsListView` 自带这层裁剪，
+     * 子视图上的 `clipChildren = false` / `clipToPadding = false` **都挡不住它**。
+     * 实测（1920×1080，8 列 × 203px，海报墙 padding 32dp=64px）：
+     *   - 第一行卡片**未放大**时顶边 ≈ y=183，海报墙顶边 ≈ y=179；
+     *   - 实测裁剪线 ≈ y=180 ⇒ **裁剪线就是海报墙自己的顶边**；
+     *   - 卡片选中放大 1.1（pivot 居中）⇒ 顶边上移 `0.05 × 卡高 ≈ 18.7px`，
+     *     再加描边外溢 3px ⇒ 被切掉 21.7px，**连海报本身顶部约 15px 也一起被切**；
+     *   - 第二行卡片顶边比裁剪线低一整行（约 398px），同样的 21.7px 溢出仍在
+     *     海报墙内部 ⇒ 完好。这就是「只有第一行被裁」的真正原因。
+     *
+     * 结论：**焦点效果一个像素都不许越出海报**。越出多少，第一行就被切多少。
+     * 于是本类改为：
+     *   - **描边内缩**：`inset = ringPx / 2`，描边**整个**落在海报内沿（外沿恰好
+     *     贴住海报边缘），视觉上仍是一圈「贴在封面上的边框」；
+     *   - **光晕向内衰减**：从描边内沿往海报内部 `GLOW_STEPS` 段递减 alpha 的
+     *     环带（见下），像一层由边缘渗进来的柔光。
+     * 配合 `WorksAdapter.getView` 里的 `card.pivotY = 0f`（放大只向下长、不向上
+     * 溢出），第一行卡片从此不会丢任何像素。
+     *
+     * ⛔ 光晕用**环带**而不是「叠实心圆角矩形」：实心嵌套矩形的覆盖层数**越靠里
+     *    越多**，alpha 是往中心递增的，方向正好相反。要「边缘最亮、往里变淡」，
+     *    只能逐段画环带（外圆角矩形 − 内圆角矩形，`EVEN_ODD` 一步搞定），
+     *    每段自己的 alpha 递减。段宽取 1px 上下，配合抗锯齿不会看出台阶。
      *
      * ⛔ 圆角必须与海报一致（[POSTER_CORNER_DP]）：不一致时描边会切进海报的四角，
-     *    或在海报外留出一圈背景色。
-     *
-     * ⛔ 这个 drawable 的绘制**不受 `bounds` 限制**（`Drawable.draw` 里往外画就行），
-     *    所以能画出海报之外的光晕 —— 前提是 `card.clipChildren = false`
-     *    （见 [buildCard]），否则会被父容器的子视图裁剪切掉。
+     *    或在海报内沿留出一圈背景色。内缩后的圆角要同步减小（`radius - inset`），
+     *    才是原圆角的**等距曲线**；减到 0 以下就钳成 0（那几段 alpha 已接近 0）。
      */
     private class PosterFocusDrawable(
         private val radiusPx: Float,
@@ -3948,20 +3971,16 @@ class LibraryActivity : Activity() {
             color = ringColor
         }
 
-        /** 光晕层：**实心**填充，各层同色同 alpha，靠「覆盖层数」累积出衰减。 */
+        /** 光晕段：实心填充的环带，逐段改 `alpha`。 */
         private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
             color = ringColor
-            alpha = GLOW_LAYER_ALPHA
         }
 
         private val rect = RectF()
 
-        /** 光晕环带（外圆角矩形 − 海报圆角矩形），用来把光晕挡在海报之外。 */
+        /** 一段光晕环带（外圆角矩形 − 内圆角矩形）。 */
         private val bandPath = Path()
-
-        /** 临时路径，只用于 `Path.op` 求差集。 */
-        private val innerPath = Path()
 
         override fun draw(canvas: Canvas) {
             val l = bounds.left.toFloat()
@@ -3970,33 +3989,30 @@ class LibraryActivity : Activity() {
             val b = bounds.bottom.toFloat()
             if (r <= l || b <= t) return
 
-            // ── 光晕：由外向内叠实心圆角矩形，alpha 连续累积 ──
+            // ── 光晕：从描边内沿往里，逐段递减 alpha（越靠边越亮）──
             if (glowPx > 0f) {
-                bandPath.reset()
-                rect.set(l - glowPx, t - glowPx, r + glowPx, b + glowPx)
-                bandPath.addRoundRect(
-                    rect, radiusPx + glowPx, radiusPx + glowPx, Path.Direction.CW,
-                )
-                innerPath.reset()
-                rect.set(l, t, r, b)
-                innerPath.addRoundRect(rect, radiusPx, radiusPx, Path.Direction.CW)
-                // 外圈 − 内圈 = 环带；海报本体被挖空，光晕不会蒙到画面上。
-                bandPath.op(innerPath, Path.Op.DIFFERENCE)
-
                 val step = glowPx / GLOW_STEPS
-                canvas.save()
-                canvas.clipPath(bandPath)
-                for (i in GLOW_STEPS downTo 1) {
-                    val grow = step * i
-                    rect.set(l - grow, t - grow, r + grow, b + grow)
-                    canvas.drawRoundRect(rect, radiusPx + grow, radiusPx + grow, glowPaint)
+                for (i in 0 until GLOW_STEPS) {
+                    val outIn = ringPx + step * i
+                    val inIn = ringPx + step * (i + 1)
+                    bandPath.reset()
+                    bandPath.fillType = Path.FillType.EVEN_ODD
+                    rect.set(l + outIn, t + outIn, r - outIn, b - outIn)
+                    val rOut = (radiusPx - outIn).coerceAtLeast(0f)
+                    bandPath.addRoundRect(rect, rOut, rOut, Path.Direction.CW)
+                    rect.set(l + inIn, t + inIn, r - inIn, b - inIn)
+                    val rIn = (radiusPx - inIn).coerceAtLeast(0f)
+                    bandPath.addRoundRect(rect, rIn, rIn, Path.Direction.CW)
+                    glowPaint.alpha = GLOW_ALPHA * (GLOW_STEPS - i) / GLOW_STEPS
+                    canvas.drawPath(bandPath, glowPaint)
                 }
-                canvas.restore()
             }
 
-            // ── 描边：压在光晕内侧，边缘最亮 ──
-            rect.set(l, t, r, b)
-            canvas.drawRoundRect(rect, radiusPx, radiusPx, ringPaint)
+            // ── 描边：内缩半个线宽 ⇒ 外沿贴住海报边缘、整体不越界 ──
+            val h = ringPx / 2f
+            rect.set(l + h, t + h, r - h, b - h)
+            val rr = (radiusPx - h).coerceAtLeast(0f)
+            canvas.drawRoundRect(rect, rr, rr, ringPaint)
         }
 
         override fun setAlpha(alpha: Int) {
@@ -4012,14 +4028,13 @@ class LibraryActivity : Activity() {
 
         private companion object {
             /**
-             * 光晕叠几层。层数越多，相邻两层的透明度落差越小 ⇒ 越平滑。
-             * 24 层配 [GLOW_LAYER_ALPHA]=7，合成峰值 alpha ≈ 124（不透明度的
-             * 48%），既明显又不糊。层数再往上加收益很小，只会多几次绘制。
+             * 光晕分几段。段宽 = `glowPx / GLOW_STEPS`，16px 光晕配 14 段
+             * ⇒ 每段约 1.14px，肉眼看不到台阶。
              */
-            const val GLOW_STEPS = 24
+            const val GLOW_STEPS = 14
 
-            /** 单层 alpha（0–255）。极低，靠层数堆出总强度。 */
-            const val GLOW_LAYER_ALPHA = 7
+            /** 最靠近描边那一段的 alpha（0–255）。往里逐段线性递减到 ≈ 1/14。 */
+            const val GLOW_ALPHA = 76
         }
     }
 
@@ -4033,10 +4048,10 @@ class LibraryActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             // ⛔ 底部留一点：卡片圆角会把最底下的文字下角切掉。
             setPadding(0, 0, 0, dp(6))
-            // ⛔ **必须关掉**：选中卡片的阴影是画在 `posterBox` 的 foreground 上的
-            //    （见 [PosterFocusDrawable]），海报左右两侧与卡片同宽 ⇒ 阴影有一半
-            //    在卡片之外。`clipChildren` 默认 true 会把它整圈切掉，表现就是
-            //    「加了阴影但什么都看不见」。
+            // ⛔ **必须关掉**：卡片选中时会整体放大 1.1，而放大是**绘制期变换**，
+            //    布局尺寸不变 ⇒ 放大后的内容会超出卡片自己的 bounds（底部最多
+            //    `0.05 × 卡高 ≈ 18.7px`）。`clipChildren` 默认 true 会把它切掉，
+            //    表现就是「选中卡片的下沿被削平」。
             clipChildren = false
         }
 
@@ -4454,16 +4469,20 @@ class LibraryActivity : Activity() {
          *
          * 3dp ≈ 6px。沙发上 3 米看 1080p，再细就成了一条看不清的灰线
          * （用户明确嫌过「线框」），再粗会把海报的边吃进去。
+         *
+         * ⛔ 描边**整个画在海报内沿**（内缩半个线宽），不向外溢 —— 理由见
+         *    [PosterFocusDrawable] 的类文档（海报墙会裁掉第一行的向上溢出）。
          */
         const val FOCUS_RING_DP = 3
 
         /**
-         * 选中卡片的**海报**光晕外扩（dp）。
+         * 选中卡片的**海报**光晕深度（dp），**向内**渗。
          *
-         * ⛔ 必须小于 [GRID_GAP_DP]（12dp）：光晕会画到相邻卡片的地界里，
-         *    超过间距就会糊在隔壁那张海报上。
-         * ⛔ 深色底上**不能**用黑色阴影代替它（那是第一版，实机上完全看不见）——
+         * ⛔ 是「往里渗」不是「往外扩」：往外扩会被海报墙裁掉（第一行整圈消失），
          *    理由见 [PosterFocusDrawable] 的类文档。
+         * ⛔ 深度别超过 `海报圆角 × 2` 太多：内缩后的圆角会被钳到 0，再深就成方形，
+         *    虽然那几段 alpha 已经接近 0、看不出来，但没必要。
+         * ⛔ 深色底上**不能**用黑色阴影代替它（那是第一版，实机上完全看不见）。
          */
         const val FOCUS_GLOW_DP = 8
 

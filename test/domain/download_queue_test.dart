@@ -273,7 +273,12 @@ void main() {
     // 真服务失败时会留下 `.part`（只有暂停/取消之外的成功路径才会 rename）。
     File('$target.part').writeAsStringSync('x' * 77);
     service.calls.single.release();
-    await _settle();
+    // ⚠️ 不能只 `_settle()` 固定拍数：失败落盘前要先 `await _partLength()`
+    // 走两次真文件 IO（exists + length），跑步机磁盘忙时 8 个空转可能不够，
+    // 读到的是「还没失败」的中间态（status 仍停在 downloading）。
+    // 等终态（failed）再断言，超时没到才是真失败。
+    await _settleUntil(
+        () => _task(queue, 'quark:f1').status == DownloadStatus.failed);
 
     final failed = _task(queue, 'quark:f1');
     expect(failed.status, DownloadStatus.failed);
