@@ -1,4 +1,5 @@
 import 'package:cloudcine/data/db/app_database.dart';
+import 'package:cloudcine/data/db/media_repository_impl.dart';
 import 'package:cloudcine/data/db/settings_store.dart';
 import 'package:cloudcine/data/registry/adapter_registry.dart';
 import 'package:cloudcine/domain/entities/capabilities.dart';
@@ -184,6 +185,24 @@ void main() {
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        // ⛔ 必须显式给出这一项（`pumpBrowser` 那一路不用，因为那几条用例
+        //    不点行）。
+        //
+        // 「点了就播」那条路会走到 `playDriveEntry` → `mediaRepositoryProvider`，
+        // 而组合根里的它现在**依赖 `progressStoreProvider`**（进度写透到
+        // `playback_progress.json`，见 `app_providers.dart`），后者又挂在
+        // `appSupportDirProvider` 上 —— 那个 provider 在 `main()` 之外一律
+        // 抛 `UnimplementedError`。所以不补这一项，用例的表现是**点一下行就
+        // 抛异常、页面根本没导航**，而失败信息只指向 `play_action.dart`，
+        // 看不出缺的是测试的 override。
+        //
+        // 这里给的是**不带进度库**的仓储（`DriftMediaRepository` 的
+        // `progress` 是可空的，类文档明说「单测里大量用例只关心库本身，
+        // 不该被迫造一个进度文件」）：这几条用例断言的是 `media_items`
+        // 有没有被写，进度那一路与它们无关，而挂一个真的 `ProgressStore`
+        // 反而会留下一个 2 秒的防抖落盘计时器 —— 测试结束时那个挂着的
+        // Timer 会让用例以「A Timer is still pending」失败。
+        mediaRepositoryProvider.overrideWithValue(DriftMediaRepository(db)),
         adapterRegistryProvider.overrideWithValue(
           AdapterRegistry([FakeDriveAdapter(tree())]),
         ),

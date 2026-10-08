@@ -13,7 +13,7 @@
 
 ## ★★ 媒体库数据结构 = 跨端同步的唯一契约（→ HOWTO「`cloudcine.sqlite`」/「`.ccbak`」）
 - `cloudcine.sqlite`（PC `getApplicationSupportDirectory()/`，`schemaVersion = 17`）7 表：`media_items`(PK `id`)·`media_works`(PK `key`)·`subtitle_refs`·`scan_cursors`·`settings`·`playback_prefs`·`download_tasks`（权威 `lib/data/db/tables.dart`）。⛔ 主键全是**文本**；⛔ `category` 默认**空串**。
-- ⚠️ 播放进度三列（`resume_position_ms`·`max_position_ms`·`last_played_at`）**已降级为物化投影**；真源 = `playback_progress.json`（**不进 `.ccbak`**）⇒ 清理/恢复媒体库**不再丢进度**。★★ 契约 `{v:1,items:{<id>:{r,m,p,u}}}`（ms·ms·秒·秒）；**逐条 LWW，但 `m`·`p` 取并集**。⛔ 写前必先 `load()`；`.tmp`+`rename`；⛔ **下载失败绝不上传**；★ `libraryModifiedAt` **已摘掉 `last_played_at`**。触发：启动+退出播放器+30 分钟；恢复/重扫后 `backfill()`。⛔ `ProgressStore` 进程单例；`LibraryDb(...)` 必传 `progress =`（`ProgressWiringTest` 守）→ 类文档见 `library/PlaybackProgress.kt`·`ProgressStore.kt`·`ProgressSync.kt`
+- ⚠️ 播放进度三列（`resume_position_ms`·`max_position_ms`·`last_played_at`）**已降级为物化投影**；真源 = `playback_progress.json`（**不进 `.ccbak`**）⇒ 清理/恢复媒体库**不再丢进度**。★★ 契约 `{v:1,items:{<id>:{r,m,p,u}}}`（ms·ms·秒·秒）；**逐条 LWW，但 `m`·`p` 取并集**。⛔ 写前必先 `load()`；`.tmp`+`rename`；⛔ **下载失败绝不上传**；★ `libraryModifiedAt` **已摘掉 `last_played_at`**。触发：启动+退出播放器+30 分钟；恢复/重扫后 `backfill()`。⛔ `ProgressStore` 进程单例；`LibraryDb(...)` 必传 `progress =`（`ProgressWiringTest` 守）→ 契约/类文档见 `library/PlaybackProgress.kt`
 - `.ccbak` = 全大端 `['CCBK'][manifestLen][manifest][dbLen][db][posters]`，⛔ **不是 ZIP**；目录 `云影备份`；文件名**必须带时间戳**；恢复 = **换掉整个 db**。★★ 同步判据 **`libraryModifiedAt`**（**不是** `createdAt`）；本地空库让远程赢、远程空备份不覆盖本地；冲突 = 不同设备且差 < 60s。⛔ 不备份网盘凭证。
 
 ## ★★ 追剧 / 更新提醒（→ HOWTO **§9**）
@@ -21,7 +21,7 @@
 - ★★ **「点过就不再是 NEW」两端同口径（→ §9.10/9.11）**：`last_played_at` 在**点击那一刻**写（`markPlayed`），⛔ **不等**进度落库、写完**必须重读该页**；⛔ 起播**不写** `max_position_ms`。PC 只下调计数、跟 `mergedInto`；Android 走 `onActivityResult(REQ_PLAYER)`。
 - ⛔⛔ 自动检查**绝不写 `media_works.updated_at`**（污染同步 LWW）；节流零点 `settings.follow_last_check_at`（Unix **秒字符串**）。⛔ 目录失败不推进水位线（水位线取「发现跑完之后」、按**目录**回写）。⛔⛔ `FollowAutoCheck.off` 的 `throttleWindow == null` = 不节流 ⇒ 必须 `_run` 里**显式**挡掉。⛔ 手动入口 `force: true`；⛔ 扫描/刮削在跑时禁用。
 - PC：`AppShell._FollowLaunchCheck`（延迟 20s + `every_6h`），⛔ 两个 `Timer` 必须 `dispose` cancel；「检查更新」在**分类栏右端**；角标 = `new_item_count > 0` 的作品数；⛔ 不加侧栏一级入口。⛔ 恢复备份后 `_refreshLibraryViews` invalidate 六个。
-- ⚠️⚠️ **已知缺口（2026-10-07，未修）**：检查更新的**增量统计与它触发的发现是两套口径** ⇒ 发现把新集归到**新作品**上时增量恒 0、报「没有更新」（`FollowService._run` 丢掉 `added`/`touchedWorkKeys`，增量另走 `pendingNewItemCounts`）。另：`导入 .ccbak` **整库替换**。→ §9.12
+- ⚠️⚠️ **已知缺口（2026-10-07，未修）**：检查更新的**增量统计与它触发的发现是两套口径** ⇒ 发现把新集归到**新作品**上时增量恒 0、报「没有更新」（细节 → §9.12）。另：`导入 .ccbak` **整库替换**。
 
 ## ★★ Android 端红线（→ HOWTO §AND-1）
 - ⛔⛔ 电视上 **`AbsListView.OnItemClickListener` 按 OK 不触发** ⇒ `dispatchKeyEvent` 自管 OK，**DOWN 与 UP 都要吞**（只吞 DOWN = 一按播两遍）。
