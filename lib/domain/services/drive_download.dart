@@ -181,8 +181,9 @@ class DriveDownloadService {
     //
     // ⚠️ 并发数**不是**本服务说了算：票据上可能钉了一个上限
     // （见 [StreamTicket.maxConnections]）。百度普通通道就是典型 ——
-    // 它的限速按**账号**算，8 条连接的总吞吐还不如 1 条，而且每条都会
-    // 被拖到读超时、最后被服务端掐断。所以这里一律用 `connectionsFor`。
+    // 它按**账号**限速，加连接不加吞吐，累计下到 ~10 MiB 还会 1/4/8 条
+    // 一起归零（那正是「下载卡在 0%」的根因）。所以这里一律用
+    // `connectionsFor`，不自己拍一个全局默认值。
     final totalSize = ticket.contentLength;
     final maxConnections = ticket.connectionsFor(connections);
     if (totalSize != null &&

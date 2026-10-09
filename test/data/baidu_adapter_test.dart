@@ -737,8 +737,8 @@ void main() {
     test('⛔ 非媒体：dlna 直链会被 CDN 拒 ⇒ 重取一次（去掉 origin）并钉死单连接', () async {
       // 2026-10-09 实测：拿 `origin=dlna` 的直链去取 PDF，CDN 回
       // `403 31329 hit black userlist , hit illeage dlna`（与账号无关）。
-      // 去掉 origin 之后文档能下，但那条通道被**按账号**限速到 ~80 KB/s，
-      // 而且多开连接只会把每条都拖到读超时 ⇒ 必须单连接。
+      // 去掉 origin 之后文档能下，但那条通道是**账号级**限速（~80 KB/s，
+      // 加连接不加吞吐）⇒ 必须单连接。
       var seen = 0;
       final r = await ready(
         routes: {
@@ -772,8 +772,9 @@ void main() {
       expect(calls.last.query.containsKey('origin'), isFalse,
           reason: '第二取必须去掉 origin，否则文档拿不到能下的直链');
       expect(ticket.maxConnections, 1,
-          reason: '普通通道限速按账号算，开多条连接只会让每条都读超时、'
-              '最后被服务端掐断 —— 那正是「下载卡在 0%」的原因');
+          reason: '普通通道是**账号级**限速：加连接不加吞吐（1 与 4 互有胜负、'
+              '方向随测量顺序翻转），而 8 条每次都会出现被掐断的连接。'
+              '4 条把服务端并发面扩大 4 倍 —— 收益不确定、风险确定。');
     });
 
     /// ② 路由能出直链、③ 也能用的标准布置。

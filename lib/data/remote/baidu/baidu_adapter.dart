@@ -590,9 +590,10 @@ class BaiduAdapter extends CloudDriveAdapter {
       return _ticketFrom(fast);
     }
 
-    // ── 非视频：dlna 直链会被 CDN 拒（`403 31329 hit illeage dlna`）──
-    //    重取一次、去掉 `origin`。那条覆盖面全，但被**按账号**限速到
-    //    ~80 KB/s，而且多开连接只会让每条都读超时 ⇒ 票据上钉死单连接。
+    // ── 非媒体：dlna 直链会被 CDN 拒（`403 31329 hit illeage dlna`）──
+    //    重取一次、去掉 `origin`。那条覆盖面全，但被**账号级**限速在
+    //    ~80 KB/s（加连接不加吞吐）⇒ 票据上钉死单连接，理由见
+    //    [_slowChannelConnections]。
     try {
       final plain = await _filemetasOf(path, origin: null);
       if (plain != null) {
@@ -615,11 +616,21 @@ class BaiduAdapter extends CloudDriveAdapter {
     return _ticketFrom(fast);
   }
 
-  /// 普通（无 `origin`）通道的连接数上限。
+  /// 普通（无 `origin`）通道的连接数上限 —— 钉死 1。
   ///
-  /// 该通道的限速是**按账号**的：2026-10-09 实测 1 条 82 KB/s、
-  /// 2 条 76 KB/s、4 条 73 KB/s、8 条 68 KB/s 且**全被服务端掐断**。
-  /// 加连接完全不加吞吐，只把每条连接都拖进读超时 —— 必须钉死 1。
+  /// ## 为什么不给这条通道开多连接
+  ///
+  /// 它的限速是**账号级**的：持续测量里 1 条与 4 条**互有胜负**（79 vs 65 KB/s、
+  /// 16 vs 93 KB/s，方向随测量顺序翻转），**没有可复现的正收益**；而 8 条在
+  /// 每次观测里都会出现「零字节 / 被服务端掐断」的连接。
+  /// 4 条把服务端并发面扩大 4 倍，**收益不确定、风险确定**。
+  ///
+  /// ⛔ 不要被 10 秒窗口骗到：那个尺度上 4 条看着比 1 条快 2.5 倍，
+  /// 那只是 TCP 慢启动的突发（见 `StreamTicket.maxConnections` 的实测说明）。
+  ///
+  /// ⛔⛔ 更要紧的是：**累计下到 ~10 MiB 之后，1 / 4 / 8 条会一起归零** ——
+  /// 这是账号额度用尽，不是「连接开多了」。所以提速这件事**在客户端没有杠杆**，
+  /// 能做的只有「别静默挂死」（`DriveDownloadService.stallTimeout`）。
   static const int _slowChannelConnections = 1;
 
   /// 打一次 `/api/filemetas`，返回原始结果；响应里没有可用直链时返回 `null`。
@@ -785,7 +796,8 @@ class BaiduAdapter extends CloudDriveAdapter {
   /// | `web` / `netdisk` / `android` / `tv` / `pan` | 否 | 206 ✅ | — | 206 ✅ | 36~40 KB/s |
   ///
   /// ⇒ **`origin=dlna` 是唯一快的通道，其余统统是「非会员普通下载通道」**，
-  /// 被**按账号**限速在 ~80 KB/s（加连接数不加吞吐，只会被掐断）。
+  /// 被**账号级**限速在 ~80 KB/s：加连接数**不加**吞吐，而且**累计下到
+  /// ~10 MiB 之后 1 / 4 / 8 条会一起归零**（账号额度用尽，不是「连接开多了」）。
   ///
   /// ⇒ 于是不能二选一，只能**按类型分流**：媒体（视频 / 音频）走 dlna、
   /// 其余走普通通道，见 [_resolveOriginalViaPathString]。类型取自响应里的

@@ -58,9 +58,26 @@ void applyTicketHeaders(
   HttpClientRequest request,
   Map<String, String> headers,
 ) {
+  applyTicketUserAgent(client, headers);
+  headers.forEach(request.headers.set);
+}
+
+/// 把票据里的 `User-Agent` 设到**客户端级**（[HttpClient.userAgent]）。
+///
+/// ## 什么时候要单独用这个
+///
+/// [applyTicketHeaders] 是「票据头 + 客户端 UA」的合体，正常调用方用它就够了。
+/// 但如果某个调用方**出于自己的原因**要手工贴头（比如中继的分块取块要过滤
+/// 掉 hop-by-hop 头），就必须**额外**调一次本函数 —— 光把 UA set 到
+/// `request.headers` 是不够的，302 之后那一跳认的只有客户端级的值。
+///
+/// 把它单独抽出来就是为了这个：2026-10-09 那天，下载层和透传路径都调了
+/// [applyTicketHeaders]，唯独中继的分块取块手工贴头时漏了 UA ⇒
+/// 百度 dlna 直链每次取块都 `403 31362 sign error`，**18304 次全失败**、
+/// 视频一播就 `Failed to open`。同一个不变量散在多处，就一定会有一处漏。
+void applyTicketUserAgent(HttpClient client, Map<String, String> headers) {
   final userAgent = headers['User-Agent'] ?? headers['user-agent'];
   if (userAgent != null && userAgent.isNotEmpty) {
     client.userAgent = userAgent;
   }
-  headers.forEach(request.headers.set);
 }

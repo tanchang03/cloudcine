@@ -477,6 +477,102 @@ void main() {
         greaterThanOrEqualTo(prefetchChunks - 2),
       );
     });
+
+    test('票据 UA 必须熬过 302 —— 否则 dlna 直链第二跳回 403 sign error', () async {
+      // 2026-10-09 现场：`/我的资源/VID_20261007_170446.mp4` 播放时
+      // **18304 次取块全是 403**，播放器一个字节都没拿到。
+      // 根因不在百度，在这里：分块取块把票据头**逐条 set 到 request.headers**，
+      // 而 `dart:io` 跟随 302 时会**丢掉请求头上的 `User-Agent`**（换成客户端级
+      // 默认值 `Dart/x.y (dart:io)`）。百度 `origin=dlna` 直链第二跳的 `sign`
+      // 正是按 UA 签的 ⇒ 一律 403 31362。只有设到**客户端级**才带得过去。
+      //
+      // 这条用例用「本地 302 → 本地 CDN」把两跳原样复刻出来，断言**第二跳**
+      // 看到的 UA 仍是票据里那个。
+      const total = 1000;
+      const chunk = 100;
+      final source = Uint8List(total);
+      for (var i = 0; i < total; i++) {
+        source[i] = i % 251;
+      }
+
+      // 第二跳 = CDN：只回 206，并记下它收到的 UA。
+      final secondHopUas = <String?>[];
+      final cdn = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(cdn.close);
+      cdn.listen((request) async {
+        secondHopUas.add(request.headers.value('User-Agent'));
+        final spec = parseRangeRequest(request.headers.value('Range'), total);
+        final range = spec is SatisfiableRange
+            ? spec.range
+            : const ByteRange(0, total - 1);
+        request.response
+          ..statusCode = HttpStatus.partialContent
+          ..headers.contentType = ContentType.binary
+          ..headers.set(
+            HttpHeaders.contentRangeHeader,
+            formatContentRange(range, total),
+          )
+          ..headers.set(HttpHeaders.contentLengthHeader, range.length)
+          ..add(Uint8List.sublistView(source, range.start, range.end + 1));
+        await request.response.close();
+      });
+
+      // 第一跳 = `d.pcs.baidu.com`：回 302 落到 CDN。
+      final edge = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(edge.close);
+      edge.listen((request) async {
+        request.response
+          ..statusCode = HttpStatus.found
+          ..headers.set(
+            HttpHeaders.locationHeader,
+            'http://127.0.0.1:${cdn.port}${request.uri.path}',
+          );
+        await request.response.close();
+      });
+
+      final relay = LocalStreamRelay(
+        chunkSize: chunk,
+        prefetchBytes: total,
+        maxCacheBytes: total,
+        connections: 2,
+      );
+      addTearDown(relay.dispose);
+
+      final endpoint = await relay.open(
+        StreamTicket(
+          url: Uri.parse(
+            'http://127.0.0.1:${edge.port}/file/abc?origin=dlna&sign=x',
+          ),
+          headers: const <String, String>{
+            'User-Agent': 'netdisk',
+            'Cookie': 'BDUSS=x',
+          },
+          contentLength: total,
+        ),
+      );
+      expect(endpoint, isNotNull);
+
+      final client = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(client.close);
+
+      final response = await (await client.getUrl(endpoint!.uri)).close();
+      final body = <int>[];
+      await for (final piece in response) {
+        body.addAll(piece);
+      }
+      expect(Uint8List.fromList(body), source,
+          reason: '第二跳认了 UA，字节才取得到');
+
+      expect(secondHopUas, isNotEmpty, reason: '第二跳必须真的被访问到');
+      expect(
+        secondHopUas.every((ua) => ua == 'netdisk'),
+        isTrue,
+        reason: '第二跳看到的 UA 是 ${secondHopUas.toSet()}，不是票据里的 netdisk —— '
+            '`dart:io` 跟随 302 会丢掉请求头上的 User-Agent，只认客户端级的那个。'
+            '漏掉这一步，dlna 直链的每一次取块都是 403 31362 sign error，'
+            '表现就是「取链成功但一播就 Failed to open」',
+      );
+    });
   });
 
   group('中继诊断日志 —— TV 上「Failed to open 127.0.0.1」的取证路径', () {

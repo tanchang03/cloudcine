@@ -1076,6 +1076,17 @@ class _RelaySession {
       if (_hopByHop.contains(entry.key.toLowerCase())) continue;
       request.headers.set(entry.key, entry.value);
     }
+    // ⛔⛔ 光把票据头 set 到 `request.headers` **不够**：直链回 302 时
+    //      `dart:io` 会把 `User-Agent` 换成客户端级默认值
+    //      （`Dart/x.y (dart:io)`），而百度 `origin=dlna` 直链**第二跳的
+    //      `sign` 正是按 UA 签的** ⇒ 每一次取块都回
+    //      `403 {"error_code":31362,"error_msg":"sign error"}`，
+    //      中继一个字节都拿不到、播放器直接 `Failed to open`。
+    //      （2026-10-09 现场：`/我的资源/VID_20261007_170446.mp4`，18304 次
+    //      取块全是 403。）只有设到**客户端级**才能熬过重定向 ——
+    //      见 [applyTicketUserAgent]；上面的透传路径走 [applyTicketHeaders]
+    //      早就覆盖了，这里因为要手工过滤 hop-by-hop 头才漏了。
+    applyTicketUserAgent(client, headers);
     request.headers.set(HttpHeaders.rangeHeader, 'bytes=${range.start}-${range.end}');
     // ⚠️ 禁用压缩：Range 与 gzip 同时用，服务端给的是**整条压缩流的一个
     // 区间**，根本解不出来。夸克实测对 identity 正常返回 206。
