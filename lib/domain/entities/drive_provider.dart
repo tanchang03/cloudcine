@@ -53,6 +53,27 @@ enum DriveProvider {
     return null;
   }
 
+  /// 用 [name] **或** [id] 解析。
+  ///
+  /// ## 为什么需要它（而不是统一用 `fromId`）
+  ///
+  /// 落库时用的不一定是同一个字面量：`DownloadTask.provider` 存的是
+  /// **枚举名**（`DownloadTask.idFor` 拿的是 `provider.name`），
+  /// 而 `media_items.id` 的前缀用的是 **`id`**。两者目前逐字相同
+  /// （`quark` / `baidu`），但那是**巧合**，不是契约 ——
+  /// 哪天有人给某个枚举值写成 `id: 'aliyun-drive'`，`fromId` 就解不出
+  /// 那些下载任务，表现是「任务卡在排队、永远不开始」而**不报错**。
+  ///
+  /// 先按 `id` 再按 `name`，两条都试，所以两种来源都能读。
+  static DriveProvider? fromNameOrId(String value) {
+    final byId = fromId(value);
+    if (byId != null) return byId;
+    for (final p in values) {
+      if (p.name == value) return p;
+    }
+    return null;
+  }
+
   /// 严格解析，解析失败抛 [ArgumentError]，用于读取本地库时快速暴露脏数据。
   static DriveProvider parse(String id) {
     final p = fromId(id);

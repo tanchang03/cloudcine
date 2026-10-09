@@ -3,6 +3,7 @@ import 'package:cloudcine/data/db/media_repository_impl.dart';
 import 'package:cloudcine/data/db/settings_store.dart';
 import 'package:cloudcine/data/registry/adapter_registry.dart';
 import 'package:cloudcine/domain/entities/drive_entry.dart';
+import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/ui/providers/app_providers.dart';
 import 'package:cloudcine/ui/providers/library_refresh_providers.dart';
 import 'package:cloudcine/ui/providers/scan_providers.dart';
@@ -84,7 +85,9 @@ void main() {
     var bumps = 0;
     container.listen(libraryListSignalProvider, (_, __) => bumps++);
 
-    await container.read(scanControllerProvider.notifier).start();
+    await container.read(scanControllerProvider.notifier).start(
+          provider: DriveProvider.quark,
+        );
 
     expect(
       bumps,

@@ -10,6 +10,7 @@ import '../providers/scan_providers.dart';
 import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/drive_tabs.dart';
 
 /// 扫描页。
 ///
@@ -37,6 +38,9 @@ class _ScanPageState extends ConsumerState<ScanPage> {
     final settings = ref.watch(settingsProvider).valueOrNull;
     final stats = ref.watch(libraryStatsProvider).valueOrNull;
     final loggedIn = auth?.isAuthorized ?? false;
+    // 扫哪一家由用户在这一页选（是一次只能扫一家的操作，没有「同时扫两家」）。
+    final connected = ref.watch(connectedDrivesProvider);
+    final drive = ref.watch(scanDriveProvider);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.only(bottom: 32),
@@ -101,6 +105,16 @@ class _ScanPageState extends ConsumerState<ScanPage> {
                     ),
                   ),
                   const SizedBox(height: 14),
+                  DriveTabs(
+                    drives: connected,
+                    selected: drive,
+                    enabled: !scan.running,
+                    label: '扫描',
+                    onChanged: (p) => ref
+                        .read(scanDriveChoiceProvider.notifier)
+                        .select(p),
+                  ),
+                  if (connected.length > 1) const SizedBox(height: 14),
                   Row(
                     children: [
                       FilledButton.icon(
@@ -111,6 +125,7 @@ class _ScanPageState extends ConsumerState<ScanPage> {
                                 .start(
                                   resume: _resume,
                                   pruneStale: _pruneStale,
+                                  provider: drive,
                                 ),
                         style: FilledButton.styleFrom(
                           backgroundColor: AppTheme.accent,
@@ -174,7 +189,11 @@ class _ScanPageState extends ConsumerState<ScanPage> {
                       actionLabel: '重试',
                       onAction: () => ref
                           .read(scanControllerProvider.notifier)
-                          .start(resume: _resume, pruneStale: _pruneStale),
+                          .start(
+                            resume: _resume,
+                            pruneStale: _pruneStale,
+                            provider: drive,
+                          ),
                     ),
                 ],
               ],

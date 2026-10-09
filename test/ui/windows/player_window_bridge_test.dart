@@ -267,7 +267,7 @@ void main() {
   group('fetchSubtitleText（网盘字幕正文）', () {
     test('把 fileId 交给回调，正文原样交回去', () async {
       String? asked;
-      onFetchSubtitleText = (fileId) async {
+      onFetchSubtitleText = (fileId, _) async {
         asked = fileId;
         return '1\n00:00:01,000 --> 00:00:02,000\n你好\n';
       };
@@ -275,7 +275,7 @@ void main() {
       final text = await handlePlayerWindowCall(
         const MethodCall(
           PlayerBridgeMethod.fetchSubtitleText,
-          <String, Object?>{'fileId': 'f1'},
+          <String, Object?>{'fileId': 'f1', 'provider': 'quark'},
         ),
       );
 
@@ -285,7 +285,7 @@ void main() {
 
     test('没有 fileId 时不回调 —— 拿一个空 id 去取只会得到一次无谓的请求', () async {
       var called = false;
-      onFetchSubtitleText = (_) async {
+      onFetchSubtitleText = (_, __) async {
         called = true;
         return 'x';
       };
@@ -309,7 +309,7 @@ void main() {
     });
 
     test('取不到时返回 null —— 播放窗口要据此提示，不能假装成功', () async {
-      onFetchSubtitleText = (_) async => null;
+      onFetchSubtitleText = (_, _) async => null;
 
       expect(
         await handlePlayerWindowCall(

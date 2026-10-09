@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/player_audio_effect.dart';
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/playback_preference.dart';
 import 'player_protocol.dart';
 import 'window_launch.dart';
@@ -243,10 +244,16 @@ Future<PlayRequest?> Function(TicketRefreshRequest request)? onTicketRefresh;
 ///
 /// 与 [onPlaybackProgress] 同样的理由必须由 UI 层装上（需要适配器与凭证）。
 ///
+/// ⛔ [provider] 是**这条字幕所属的那一家**，不是「当前网盘」。多家网盘
+///    同时在线、`fileId` 只在自己那家有效 —— 传错一家的后果是取不到字节，
+///    而播放窗口只会显示「字幕加载失败」，看不出是网盘弄错了。
+///    播放窗口从 `PlayRequest.itemId`（形如 `provider:fileId`）里拆出它。
+///
 /// 返回**已解码的 UTF-8 文本**；`null` 表示取不到（文件已删、取链失败、
 /// 平台不支持）。播放窗口拿到 null 应当**如实告诉用户**，不要静默什么都不做 ——
 /// 那会被读成「点了没反应」。
-Future<String?> Function(String fileId)? onFetchSubtitleText;
+Future<String?> Function(String fileId, DriveProvider provider)?
+    onFetchSubtitleText;
 
 /// 播放窗口要一张网盘缩略图时，主窗口该做什么。
 ///
@@ -437,11 +444,23 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       return fresh.toJson();
 
     case PlayerBridgeMethod.fetchSubtitleText:
-      final fileId = call.arguments is Map
-          ? (call.arguments as Map)['fileId']
-          : null;
+      final args = call.arguments is Map ? call.arguments as Map : null;
+      final fileId = args?['fileId'];
       if (fileId is! String || fileId.isEmpty) {
         diag.warn('窗口', '收到没有 fileId 的取字幕请求，忽略');
+        return null;
+      }
+      final rawProvider = args?['provider'];
+      // ⛔ 认不出网盘就**直接拒绝**，不要退回任何一家。退回会让这条字幕拿
+      //    别家的凭证去取字节 —— 取不到是小事，取到**错的**字节才是灾难。
+      //    老版本主窗口不会带这个字段，那种情况下宁可什么都不做。
+      final provider =
+          rawProvider is String ? DriveProvider.fromId(rawProvider) : null;
+      if (provider == null) {
+        diag.warn(
+          '窗口',
+          '取字幕请求没有可识别的网盘标识（${rawProvider ?? "-"}），忽略',
+        );
         return null;
       }
       final fetch = onFetchSubtitleText;
@@ -451,8 +470,11 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       }
       // 不打 fileId 之外的东西：字幕文件名可能含片子信息，但那不是秘密；
       // 反过来**不要**打返回内容 —— 那是整份字幕正文。
-      diag.info('窗口', '播放窗口要字幕正文 fid=$fileId');
-      final text = await fetch(fileId);
+      diag.info(
+        '窗口',
+        '播放窗口要字幕正文 fid=$fileId（${provider.shortName}）',
+      );
+      final text = await fetch(fileId, provider);
       if (text == null) {
         diag.warn('窗口', '取字幕正文失败 fid=$fileId');
         return null;

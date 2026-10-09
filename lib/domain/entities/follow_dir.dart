@@ -1,3 +1,5 @@
+import 'drive_provider.dart';
+
 /// 追更检查要扫的一个网盘目录，**以及它覆盖到哪些在追的作品**。
 ///
 /// ## 为什么是一个独立类型，而不是 `(String, String)` 或复用 `PendingDir`
@@ -31,10 +33,23 @@
 ///    **全部**成功了」）—— 由 `FollowPlan` 在内存里求逆，不需要再查一次库。
 class FollowDir {
   const FollowDir({
+    required this.provider,
     required this.dirId,
     required this.dirPath,
     required this.workKeys,
   });
+
+  /// 这个目录在**哪家网盘**上。
+  ///
+  /// ## ⛔ 为什么它是必需的（多网盘之后才加）
+  ///
+  /// `dirId` 只在**它自己那家**网盘里唯一 —— 夸克的 `fid` 与百度的
+  /// `fs_id` 是两套独立编号，撞号完全可能。而追更检查要拿 `dirId` 去
+  /// 列目录：少了 provider，一旦库里同时有两家的片子，就会拿百度的 id
+  /// 去问夸克 —— 表现为「检查完说没有更新」，而**日志一切正常**。
+  ///
+  /// 同理，[FollowPlan] 的去重键也必须是 `(provider, dirId)`。
+  final DriveProvider provider;
 
   /// 目录的网盘 fid（列目录要用的就是它）。
   final String dirId;
@@ -56,7 +71,11 @@ class FollowDir {
   /// （两个 `dirId` 相同、`workKeys` 不同的对象会被判成相等）。
   /// 需要去重的地方一律用 `Map<String, FollowDir>` 按 `dirId` 做键 ——
   /// 那也正是调用点的形状。
+  ///
+  /// ⚠️ 多网盘之后这个键必须扩成 `(provider, dirId)`：`dirId` 只在**同一家**
+  ///    网盘内唯一（见 [provider]）。`FollowPlan.of` 已经按这个口径去重。
 
   @override
-  String toString() => 'FollowDir($dirPath, $dirId, ${workKeys.length} 部)';
+  String toString() =>
+      'FollowDir(${provider.shortName} $dirPath, $dirId, ${workKeys.length} 部)';
 }

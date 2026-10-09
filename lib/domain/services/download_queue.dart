@@ -5,6 +5,7 @@ import '../../core/diagnostics/diag_log.dart';
 import '../../core/error/drive_error.dart';
 import '../adapters/download_task_store.dart';
 import '../entities/download_task.dart';
+import '../entities/drive_provider.dart';
 import 'drive_download.dart';
 
 /// 下载队列：**并发调度 + 暂停 / 继续 / 取消 + 持久化**。
@@ -35,7 +36,7 @@ import 'drive_download.dart';
 class DownloadQueue {
   DownloadQueue({
     required DownloadTaskStore store,
-    required DriveDownloadService Function() service,
+    required DriveDownloadService Function(DriveProvider provider) service,
     required int Function() concurrency,
     DateTime Function()? clock,
   })  : _store = store,
@@ -45,12 +46,20 @@ class DownloadQueue {
 
   final DownloadTaskStore _store;
 
-  /// 每次开跑现取一个服务实例。
+  /// 每次开跑现取一个服务实例，**按这条任务自己的网盘取**。
   ///
-  /// 做成工厂而不是构造时传一个实例：适配器注册表是可以被重建的
-  /// （见 `adapterRegistryProvider`），冻住一个旧适配器会在那种情况下
-  /// 拿着失效的会话去取链。
-  final DriveDownloadService Function() _service;
+  /// ## 为什么参数是 [DriveProvider] 而不是没有参数
+  ///
+  /// 媒体库是多家网盘混在一个库里的，队列里同时排着夸克和百度的文件是常态。
+  /// 以前这里冻结的是「当前网盘」那一个适配器 —— 接了第二家之后，
+  /// 另一家的任务会拿**别家**的凭证去取链，表现是「任务一直失败 / 卡住」，
+  /// 而队列本身一切正常。
+  ///
+  /// ## 为什么是工厂而不是构造时传一个实例
+  ///
+  /// 适配器注册表是可以被重建的（见 `adapterRegistryProvider`），冻住一个
+  /// 旧适配器会在那种情况下拿着失效的会话去取链。
+  final DriveDownloadService Function(DriveProvider provider) _service;
 
   /// 当前允许的同时下载数。每次调度现读 —— 用户在设置页改了它，
   /// 下一次 [_pump] 就生效，不需要重建整个队列。
@@ -341,7 +350,23 @@ class DownloadQueue {
     _setStatus(id, DownloadStatus.downloading, clearError: true);
 
     try {
-      final result = await _service().download(
+      // ⛔ 按**这条任务自己的**网盘取服务。`DownloadTask.provider` 存的是
+      //    枚举名（见 `DownloadTask.idFor`），所以用 `fromNameOrId` 解析 ——
+      //    只认 `id` 的话，哪天某个枚举值的 id 与 name 不一致，这些任务会
+      //    永远开不了跑，而队列界面上只显示「排队中」。
+      final provider = DriveProvider.fromNameOrId(snapshot.provider);
+      if (provider == null) {
+        // 直接 return：下面的 `finally` 会收掉 `_running` 并重新调度。
+        _setStatus(
+          id,
+          DownloadStatus.failed,
+          error: '这条任务的网盘标识无法识别（${snapshot.provider}）',
+        );
+        diag.warn('下载', '无法识别的网盘标识：${snapshot.provider}');
+        return;
+      }
+
+      final result = await _service(provider).download(
         fileId: snapshot.fileId,
         savePath: snapshot.savePath,
         startOffset: snapshot.receivedBytes,

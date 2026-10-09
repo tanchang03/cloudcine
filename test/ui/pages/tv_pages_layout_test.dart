@@ -47,11 +47,13 @@ import '../../support/focus_reach.dart';
 class _FakeAuth extends AuthController {
   @override
   Future<AuthState> build() async => AuthState(
-        account: CloudAccount(
-          provider: DriveProvider.quark,
-          authMode: AuthMode.browserCookie,
-          authorizedAt: DateTime(2026, 10, 3),
-        ),
+        accounts: {
+          DriveProvider.quark: CloudAccount(
+            provider: DriveProvider.quark,
+            authMode: AuthMode.browserCookie,
+            authorizedAt: DateTime(2026, 10, 3),
+          ),
+        },
       );
 }
 
@@ -416,11 +418,19 @@ void main() {
       (tester) async {
     final db = AppDatabase.memory();
     addTearDown(db.close);
+
+    // 扫描页现在读 `connectedDrivesProvider`，会经 `adapterRegistryProvider`
+    // → `credentialStoreProvider` → `appSupportDirProvider` 取凭证目录。
+    // 给一个真的空目录，别让它去碰用户的家目录。
+    final supportDir = Directory.systemTemp.createTempSync('cloudcine_tv_scan');
+    addTearDown(() => supportDir.deleteSync(recursive: true));
+
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
         mediaRepositoryProvider.overrideWithValue(DriftMediaRepository(db)),
         authControllerProvider.overrideWith(_FakeAuth.new),
+        appSupportDirProvider.overrideWithValue(supportDir.path),
       ],
     );
     addTearDown(container.dispose);

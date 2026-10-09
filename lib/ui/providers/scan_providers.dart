@@ -2,11 +2,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/error/drive_error.dart';
 import '../../data/db/settings_store.dart';
-import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_policy.dart';
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/services/scan_service.dart';
 import '../../domain/services/work_merge_service.dart';
 import 'app_providers.dart';
+import 'auth_providers.dart';
 import 'library_providers.dart';
 import 'library_refresh_providers.dart';
 import 'scrape_providers.dart';
@@ -160,9 +161,19 @@ class ScanController extends Notifier<ScanState> {
   ///
   /// 由这里读设置而不是让页面传参，是为了让「重试」那条路径也自动遵循同一个
   /// 决定 —— 页面传参时漏传一处就会静默地不刮（或反过来）。
+  /// 这次扫描扫**哪一家网盘**。
+  ///
+  /// ## ⛔ 为什么它必须是一个参数，而不是「当前网盘」
+  ///
+  /// 多家网盘同时在线，扫描器一次只能扫一家（`ScanService.scan` 收
+  /// `DriveProvider`）。用「当前网盘」会让「登录了百度，扫出来的却是夸克的
+  /// 目录」成为可能 —— 而那份会话可能早就失效了，表现是「扫描一直失败」。
+  ///
+  /// 由页面把选择传进来（见 `scanDriveProvider`），控制器不替用户决定。
   Future<void> start({
     bool resume = true,
     bool pruneStale = true,
+    required DriveProvider provider,
   }) async {
     if (state.running) return;
 
@@ -181,7 +192,7 @@ class ScanController extends Notifier<ScanState> {
     try {
       final service = await buildScanService(ref);
       final outcome = await service.scan(
-        DriveProvider.quark,
+        provider,
         resume: resume,
         pruneStale: pruneStale,
         scrape: autoScrape,
@@ -273,3 +284,32 @@ class ScanController extends Notifier<ScanState> {
 
 final scanControllerProvider =
     NotifierProvider<ScanController, ScanState>(ScanController.new);
+
+/// 扫描页**正在扫哪一家网盘**。
+///
+/// ## 为什么它与「浏览」是两个独立的选择
+///
+/// 两者都是「一次只服务一家」的操作（扫描器一次扫一家、目录树一次显示
+/// 一棵），但它们是**两件不同的事**：用户在扫描页选百度，不该把文件夹
+/// 视图也带过去 —— 那边可能正看着夸克的某棵子树找东西。
+///
+/// 与 `browseDriveChoiceProvider` 同口径：内存态、默认跟随第一家有账号的。
+class ScanDriveController extends Notifier<DriveProvider?> {
+  @override
+  DriveProvider? build() => null;
+
+  void select(DriveProvider provider) => state = provider;
+}
+
+final scanDriveChoiceProvider =
+    NotifierProvider<ScanDriveController, DriveProvider?>(
+  ScanDriveController.new,
+);
+
+/// 扫描页真正会扫的那一家。
+final scanDriveProvider = Provider<DriveProvider>((ref) {
+  final chosen = ref.watch(scanDriveChoiceProvider);
+  final connected = ref.watch(connectedDrivesProvider);
+  if (chosen != null && connected.contains(chosen)) return chosen;
+  return connected.isEmpty ? DriveProvider.quark : connected.first;
+});

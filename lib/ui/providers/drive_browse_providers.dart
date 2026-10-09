@@ -14,17 +14,58 @@ import '../../domain/services/scan_service.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../../domain/services/work_merge_suggester.dart';
 import 'app_providers.dart';
+import 'auth_providers.dart';
 import 'folder_providers.dart';
 import 'library_providers.dart';
 import 'library_refresh_providers.dart';
 import 'scan_providers.dart';
 import 'settings_providers.dart';
 
-/// 文件夹视图浏览的网盘。
+/// 文件夹视图在看**哪一家的目录树**。
 ///
-/// 现在只有夸克。写成常量而不是散落的字面量：接第二家网盘时这里是唯一的
-/// 改动点（页面上的登录判断、列目录、发现都从它取）。
-const DriveProvider browseProvider = DriveProvider.quark;
+/// ## ⛔ 它是「视图选择」，不是「账号切换」
+///
+/// 多家网盘**同时在线**（见 `AuthState.accounts`），所以不存在「当前网盘」
+/// 这回事。但目录树一次只能显示一棵 —— 所以这里记的是**用户正在看哪一棵**，
+/// 与账号毫无关系：选百度不会让夸克掉线，两家都还连着。
+///
+/// 页面上要有**可见的选择器**（见 `_DriveTabs`）：没有的话，用户连着两家
+/// 却只能看到其中一棵，而且不知道另一棵在哪 —— 那正是「没看到百度入口」
+/// 的观感。
+///
+/// ## 为什么是内存态（`null` = 跟随），不落库
+///
+/// 落库就等于把「当前网盘」这个概念又请回来了（曾经有过一个
+/// `SettingKeys.activeDrive`，已删）。而它真正要表达的只是「我上一次在看
+/// 哪棵树」，这是**视图偏好**，不是账号状态 —— 重启后回到第一家已连接的
+/// 网盘，代价只是多点一下，换来的是模型里少一个会漂移的全局真源。
+///
+/// ## 默认值的口径
+///
+/// 没选过（`null`）→ 第一家有账号的；一家都没登录 → 夸克（那是「这个
+/// 概念出现之前」的行为，且未登录时本来也列不出东西）。
+class BrowseDriveController extends Notifier<DriveProvider?> {
+  @override
+  DriveProvider? build() => null;
+
+  void select(DriveProvider provider) => state = provider;
+}
+
+/// 用户显式选择的那一家（未选过时为 `null`）。
+final browseDriveChoiceProvider =
+    NotifierProvider<BrowseDriveController, DriveProvider?>(
+  BrowseDriveController.new,
+);
+
+/// 文件夹视图真正的网盘 = **选择的那家**，没选过就跟第一家有账号的。
+///
+/// 调用方一律 `ref.watch(browseProvider)` / `ref.read(browseProvider)`。
+final browseProvider = Provider<DriveProvider>((ref) {
+  final chosen = ref.watch(browseDriveChoiceProvider);
+  final connected = ref.watch(connectedDrivesProvider);
+  if (chosen != null && connected.contains(chosen)) return chosen;
+  return connected.isEmpty ? DriveProvider.quark : connected.first;
+});
 
 /// 浏览栈上的一格 —— 一个**真实的网盘目录**。
 ///
@@ -176,7 +217,7 @@ class DriveBrowseController extends Notifier<List<DriveCrumb>> {
   List<DriveCrumb> build() {
     final rootId = ref
         .watch(adapterRegistryProvider)
-        .requireAdapter(browseProvider)
+        .requireAdapter(ref.watch(browseProvider))
         .rootId;
     return [DriveCrumb(id: rootId, name: driveRootPath, path: driveRootPath)];
   }
@@ -243,8 +284,9 @@ final driveListingProvider =
     // 所以 watch 它只有一个后果：每次发现/扫描写完库，就把**整个目录重新
     // 列一遍**（一个 3000 项的目录是 30 次请求），全打在夸克那条约 3 QPS
     // 的安全线上，换不到任何界面变化。
-    final adapter =
-        ref.watch(adapterRegistryProvider).requireAdapter(browseProvider);
+    final adapter = ref
+        .watch(adapterRegistryProvider)
+        .requireAdapter(ref.watch(browseProvider));
 
     final entries = <DriveEntry>[];
     String? pageToken;
@@ -419,7 +461,7 @@ class DiscoveryController extends Notifier<DiscoveryState> {
     try {
       final service = await _buildService();
       final outcome = await service.discoverDirectory(
-        browseProvider,
+        ref.read(browseProvider),
         dirId: crumb.id,
         dirPath: crumb.path,
         recursive: recursive,
@@ -456,7 +498,7 @@ class DiscoveryController extends Notifier<DiscoveryState> {
     try {
       final service = await _buildService();
       final outcome = await service.discoverFile(
-        browseProvider,
+        ref.read(browseProvider),
         entry: entry,
         dirPath: crumb.path,
         // 配同目录字幕要再列一次这个目录。**用 `crumb.id` 而不是

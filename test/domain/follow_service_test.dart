@@ -109,7 +109,11 @@ void main() {
     Set<String> incompleteDirs = const {},
     void Function(String dirId)? onCall,
   }) {
-    return ({required String dirId, required String dirPath}) async {
+    return ({
+      required DriveProvider provider,
+      required String dirId,
+      required String dirPath,
+    }) async {
       onCall?.call(dirId);
       if (failDirs.contains(dirId)) {
         return DiscoveryOutcome(

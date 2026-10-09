@@ -115,3 +115,31 @@ List<String> cookieHeaderKeyNames(String? header) {
   }
   return names;
 }
+
+/// 把 `Set-Cookie` 原始行解析成 `name=value`。
+///
+/// 每条形如 `name=value; Path=/; Domain=.baidu.com; HttpOnly`，
+/// 只取第一个 `;` 之前那段（属性对落库 / 发请求没用）。
+///
+/// ## 为什么住在这里而不是某一家网盘的登录文件里
+///
+/// 它原本定义在 `data/auth/quark_qr_login.dart`。接入百度时百度也要用它，
+/// 从「百度的登录客户端」去 import「夸克的登录客户端」是**假的耦合** ——
+/// 两家除了都吃 `Set-Cookie` 之外没有任何关系。它是个通用的 Cookie 工具，
+/// 所以搬到 `core/utils`（与 [parseCookieHeader] 同一个家）。
+///
+/// ⚠️ `quark_qr_login.dart` 仍然 `export` 它，所以老的
+/// `import '…/quark_qr_login.dart' show parseSetCookieLines;` 照常可用。
+Map<String, String> parseSetCookieLines(List<String> lines) {
+  final out = <String, String>{};
+  for (final line in lines) {
+    final semi = line.indexOf(';');
+    final pair = semi < 0 ? line : line.substring(0, semi);
+    final eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    final name = pair.substring(0, eq).trim();
+    final value = pair.substring(eq + 1).trim();
+    if (name.isNotEmpty) out[name] = value;
+  }
+  return out;
+}

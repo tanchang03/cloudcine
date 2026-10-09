@@ -27,6 +27,7 @@ import '../../data/playback/media_kit_playback_engine.dart';
 import '../../data/stream/dolby_vision_probe.dart';
 import '../../data/stream/local_stream_relay.dart';
 import '../../domain/adapters/stream_relay.dart';
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/playback_preference.dart';
 import '../../domain/entities/stream_ticket.dart';
 import '../../domain/services/cache_speed_meter.dart';
@@ -4519,15 +4520,39 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     }
   }
 
+  /// 当前这条片子属于**哪家网盘**。
+  ///
+  /// 从 `PlayRequest.itemId`（形如 `provider:fileId`，见 `MediaItem.id`）
+  /// 里拆出来 —— 字幕的 fid 只在自己那家有效，取字幕时必须带过去。
+  ///
+  /// ⚠️ 拿不到时返回 `null`，调用方**如实失败**而不是退回某一家：
+  ///    外挂字幕是「同目录的兄弟文件」，一定与片子同一家，退回别的网盘
+  ///    只会拿到错误的字节。
+  DriveProvider? get _currentProvider {
+    final itemId = _currentRequest?.itemId ?? '';
+    if (itemId.isEmpty) return null;
+    final colon = itemId.indexOf(':');
+    if (colon <= 0) return null;
+    return DriveProvider.fromId(itemId.substring(0, colon));
+  }
+
   /// 向主窗口要一条网盘字幕的正文。失败返回 null。
   ///
   /// 通道不通（`CHANNEL_UNREGISTERED`、主窗口没装回调）时**必须**给出提示：
   /// 静默什么都不做会被读成「点了没反应」。
   Future<String?> _fetchSubtitleText(String fileId) async {
+    final provider = _currentProvider;
+    if (provider == null) {
+      diag.warn(
+        '窗口',
+        '无法确定当前片子属于哪家网盘，取字幕放弃 fid=$fileId',
+      );
+      return null;
+    }
     try {
       return await playerWindowChannel.invokeMethod<String>(
         PlayerBridgeMethod.fetchSubtitleText,
-        <String, Object?>{'fileId': fileId},
+        <String, Object?>{'fileId': fileId, 'provider': provider.id},
       );
     } on WindowChannelException catch (e) {
       diag.warn('窗口', '取字幕正文失败（通道 ${e.code}）fid=$fileId');

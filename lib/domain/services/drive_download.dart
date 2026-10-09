@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../../core/error/drive_error.dart';
+import '../../core/utils/ticket_headers.dart';
 import '../adapters/cloud_drive_adapter.dart';
 import '../entities/stream_ticket.dart';
 
@@ -18,6 +20,25 @@ const int kDownloadConnections = 8;
 /// 与 `LocalStreamRelay` 同值：太小则 Range 请求开销占比高，太大则单块
 /// 下载中断后浪费的带宽多。2 MiB 在实测中是吞吐与恢复成本的平衡点。
 const int kDownloadChunkSize = 2 * 1024 * 1024;
+
+/// 包体的**静默超时**：超过这么久没有收到新数据就判失败。
+///
+/// ## 为什么需要它
+///
+/// `dart:io` 的 `HttpClient.idleTimeout` 管的是**连接池里的空闲连接**，
+/// 不是「正在读的响应」；`connectionTimeout` 只管建连。也就是说
+/// 「响应头回来了、包体却再也不来」这种情况**没有任何超时兜底** ——
+/// `await for` 会一直挂着。
+///
+/// 现场表现（2026-10-09，百度非会员通道）：下载卡在 0%，日志最后一行
+/// 还是「取链成功」，直到**七分多钟后**服务端自己把连接掐掉才报错。
+/// 加这道闸门之后，同样的静默会在 30 秒内变成一条明确的 `network` 错误，
+/// 用户看到的是「网络中断」而不是「卡死」。
+///
+/// ⚠️ 判据是「**两块之间**的间隔」，不是「整份下载的耗时」—— 后者会把
+/// 正常的大文件下载也判死。80 KB/s 的慢通道每块间隔只有毫秒级，
+/// 30 秒的静默只可能是真停滞。
+const Duration kDownloadStallTimeout = Duration(seconds: 30);
 
 /// 把网盘上的**一个文件**下载到本地磁盘。
 ///
@@ -68,16 +89,25 @@ class DriveDownloadService {
     HttpClient Function()? clientFactory,
     this.connections = kDownloadConnections,
     this.chunkSize = kDownloadChunkSize,
+    this.stallTimeout = kDownloadStallTimeout,
   }) : _clientFactory = clientFactory ?? _directClient;
 
   final CloudDriveAdapter adapter;
   final HttpClient Function() _clientFactory;
 
   /// 分块下载的并发连接数。
+  ///
+  /// ⚠️ 这只是**默认值**：票据上钉了上限时以票据为准
+  /// （见 [StreamTicket.maxConnections]）。
   final int connections;
 
   /// 分块下载的单块字节数。
   final int chunkSize;
+
+  /// 包体两块之间的最大静默时长，超过即判 `network` 失败。
+  ///
+  /// 可注入是为了能测 —— 拿默认的 30 秒写用例会让测试跑 30 秒。
+  final Duration stallTimeout;
 
   /// 文件小于此值时不走分块——单连接下小文件足够快，开多连接的握手
   /// 开销不划算。
@@ -148,11 +178,17 @@ class DriveDownloadService {
     // 文件足够大、服务端支持 Range、开了多条连接时走分块。
     // 任一条件不满足就退回单连接——这是正确的降级，不是「次等方案」：
     // 小文件单连接已经够快。
+    //
+    // ⚠️ 并发数**不是**本服务说了算：票据上可能钉了一个上限
+    // （见 [StreamTicket.maxConnections]）。百度普通通道就是典型 ——
+    // 它的限速按**账号**算，8 条连接的总吞吐还不如 1 条，而且每条都会
+    // 被拖到读超时、最后被服务端掐断。所以这里一律用 `connectionsFor`。
     final totalSize = ticket.contentLength;
+    final maxConnections = ticket.connectionsFor(connections);
     if (totalSize != null &&
         totalSize > offset + _kChunkThreshold &&
         ticket.supportsRange &&
-        connections > 1) {
+        maxConnections > 1) {
       try {
         return await _downloadChunked(
           ticket: ticket,
@@ -160,6 +196,7 @@ class DriveDownloadService {
           part: part,
           totalLength: totalSize,
           startOffset: offset,
+          connections: maxConnections,
           control: control,
           onProgress: onProgress,
         );
@@ -202,7 +239,9 @@ class DriveDownloadService {
       client.autoUncompress = false;
 
       final request = await client.getUrl(ticket.url);
-      ticket.headers.forEach(request.headers.set);
+      // ⛔ 不能只 `headers.forEach(set)`：直链 302 之后 Dart 会丢掉 UA，
+      //    而百度 CDN 的签名是按 UA 签的 —— 见 [applyTicketHeaders]。
+      applyTicketHeaders(client, request, ticket.headers);
       request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
       if (startOffset > 0) {
         request.headers.set(HttpHeaders.rangeHeader, 'bytes=$startOffset-');
@@ -210,10 +249,12 @@ class DriveDownloadService {
 
       final response = await request.close();
       if (response.statusCode >= 400) {
-        await response.drain<void>().catchError((Object _) {});
+        // 同上：留一小段体，见 `_readBodySnippet` 的文档。
+        final snippet = await _readBodySnippet(response);
         throw DriveException(
           type: _typeForStatus(response.statusCode),
-          message: '下载失败：服务器返回 HTTP ${response.statusCode}',
+          message: '下载失败：服务器返回 HTTP ${response.statusCode}'
+              '${snippet.isEmpty ? "" : "，响应体=$snippet"}',
           httpStatus: response.statusCode,
         );
       }
@@ -231,7 +272,9 @@ class DriveDownloadService {
       var received = startOffset;
       onProgress?.call(DriveDownloadProgress(received: received, total: declared));
 
-      await for (final chunk in response) {
+      // ⚠️ 必须过 `_stallGuarded`：见 [kDownloadStallTimeout] ——
+      //    没有它，「响应头到了、包体不来」会让这一行永远挂住。
+      await for (final chunk in _stallGuarded(response, stallTimeout)) {
         if (control?.isCancelled ?? false) throw const DriveDownloadCancelled();
         if (control?.isPaused ?? false) {
           paused = true;
@@ -316,6 +359,7 @@ class DriveDownloadService {
     required File part,
     required int totalLength,
     required int startOffset,
+    required int connections,
     required DriveDownloadControl? control,
     required void Function(DriveDownloadProgress)? onProgress,
   }) async {
@@ -376,7 +420,8 @@ class DriveDownloadService {
                   1;
 
               final request = await client.getUrl(ticket.url);
-              ticket.headers.forEach(request.headers.set);
+              // 同上：分块路径一样要熬过 302，见 [applyTicketHeaders]。
+              applyTicketHeaders(client, request, ticket.headers);
               request.headers
                   .set(HttpHeaders.acceptEncodingHeader, 'identity');
               request.headers
@@ -385,21 +430,27 @@ class DriveDownloadService {
               final response = await request.close();
 
               if (response.statusCode != HttpStatus.partialContent) {
-                await response.drain<void>().catchError((Object _) {});
+                // ⛔ **先留一小段响应体再丢弃**。网盘的业务错（百度的 `errno`、
+                // 夸克的 `code`）都写在体里；而「直链被 CDN 拒」这种**不是**
+                // 业务错的失败，响应体往往是唯一的线索。只报一句 `HTTP 403`
+                // 会把「请求形状不对」误判成「直链过期」——这个坑踩过。
+                final snippet = await _readBodySnippet(response);
                 if (response.statusCode == HttpStatus.ok) {
                   // 服务端无视 Range 返回整份——分块不可行。
                   throw _RangeNotSupportedException(response.statusCode);
                 }
                 throw DriveException(
                   type: _typeForStatus(response.statusCode),
-                  message: '分块下载失败：HTTP ${response.statusCode}',
+                  message: '分块下载失败：HTTP ${response.statusCode}'
+                      '${snippet.isEmpty ? "" : "，响应体=$snippet"}',
                   httpStatus: response.statusCode,
                 );
               }
 
               final pieces = <List<int>>[];
               var total = 0;
-              await for (final piece in response) {
+              // 同上：一条连接卡住不该把整次下载拖成「无限等」。
+              await for (final piece in _stallGuarded(response, stallTimeout)) {
                 if (control?.isCancelled ?? false) return;
                 if (control?.isPaused ?? false) return;
                 pieces.add(piece);
@@ -586,6 +637,92 @@ class DriveDownloadService {
         >= 500 => DriveErrorType.network,
         _ => DriveErrorType.unknown,
       };
+
+  /// 给包体加一道**静默超时**：两块之间超过 [idle] 没数据就报错。
+  ///
+  /// 为什么不能靠 `HttpClient` 自带的超时，见 [kDownloadStallTimeout]。
+  ///
+  /// 超时后除了往流里 `addError`，还会**主动取消上游订阅** —— 不然那条
+  /// TCP 连接会一直挂在 socket 上，`client.close(force: true)` 之前
+  /// 白白占着一个连接位（百度会因此把后续请求判成风控）。
+  static Stream<List<int>> _stallGuarded(
+    Stream<List<int>> source,
+    Duration idle,
+  ) {
+    late StreamSubscription<List<int>> sub;
+    final ctl = StreamController<List<int>>();
+    Timer? timer;
+
+    void arm() {
+      timer?.cancel();
+      timer = Timer(idle, () {
+        timer = null;
+        unawaited(sub.cancel());
+        if (ctl.isClosed) return;
+        ctl.addError(
+          DriveException(
+            type: DriveErrorType.network,
+            message: '下载停滞：超过 ${idle.inSeconds} 秒没有收到新数据',
+          ),
+        );
+        ctl.close();
+      });
+    }
+
+    void finish([Object? error, StackTrace? stack]) {
+      timer?.cancel();
+      timer = null;
+      if (ctl.isClosed) return;
+      if (error != null) ctl.addError(error, stack);
+      ctl.close();
+    }
+
+    sub = source.listen(
+      (chunk) {
+        if (ctl.isClosed) return;
+        arm();
+        ctl.add(chunk);
+      },
+      onError: (Object e, StackTrace s) => finish(e, s),
+      onDone: finish,
+      cancelOnError: true,
+    );
+    ctl.onCancel = () {
+      timer?.cancel();
+      timer = null;
+      return sub.cancel();
+    };
+    // 先武装一次：覆盖「响应头到了、**第一个字节**都不来」那种停滞。
+    arm();
+    return ctl.stream;
+  }
+
+  /// 读响应体最前面的 [maxBytes] 字节（用于错误信息），其余丢掉。
+  ///
+  /// 只留 300 字节：够分辨「JSON 业务错」（`errno` / `code` / `show_msg`）
+  /// 与「CDN 的 HTML 拒绝页」，又不会让超大错误体进内存。
+  ///
+  /// 为什么值得为它多读一次体：网盘直链被拒时，**响应体是唯一能区分
+  /// 「请求形状不对」与「链接真的过期」的证据** —— 两者在日志里都只是
+  /// 一个 `HTTP 403`（见 [DriveErrorType.urlExpired] 的注释）。
+  static Future<String> _readBodySnippet(
+    Stream<List<int>> body, {
+    int maxBytes = 300,
+  }) async {
+    final buf = <int>[];
+    try {
+      await for (final piece in body) {
+        buf.addAll(piece.take(maxBytes - buf.length));
+        if (buf.length >= maxBytes) break;
+      }
+    } catch (_) {
+      // 读体失败不影响「已经拿到状态码」这个结论。
+    }
+    return utf8
+        .decode(buf, allowMalformed: true)
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
 }
 
 /// 一次下载的进度快照。

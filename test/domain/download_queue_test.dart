@@ -335,7 +335,7 @@ void main() {
     var limit = 1;
     final queue = DownloadQueue(
       store: _MemoryStore(),
-      service: () => service,
+      service: (_) => service,
       concurrency: () => limit,
     );
 
@@ -583,7 +583,7 @@ DownloadQueue _build(
 }) =>
     DownloadQueue(
       store: store ?? _MemoryStore(),
-      service: () => service,
+      service: (_) => service,
       concurrency: () => concurrency,
       clock: () => _now,
     );

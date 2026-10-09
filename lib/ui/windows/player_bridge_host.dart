@@ -9,7 +9,6 @@ import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/text_encoding.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/remote/subtitle/opensubtitles_client.dart';
-import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/playback_preference.dart';
 import '../../domain/services/missing_media.dart';
 import '../../domain/services/playback_resume.dart';
@@ -256,10 +255,11 @@ final playerBridgeHostProvider = Provider<void>((ref) {
   //
   // 与另外两个服务不同，这个回调**只在用户真的选中一条字幕时**才被调，
   // 频率极低 —— 所以不用像进度回报那样考虑节流。
-  onFetchSubtitleText = (fileId) async {
+  onFetchSubtitleText = (fileId, provider) async {
     try {
-      final adapter =
-          ref.read(adapterRegistryProvider).requireAdapter(DriveProvider.quark);
+      final adapter = ref
+          .read(adapterRegistryProvider)
+          .requireAdapter(provider);
       // `readFileBytes` 返回的是**非空** `Uint8List`（不支持时抛，见
       // `CloudDriveAdapter` 的能力文档），所以只判空内容。
       final bytes = await adapter.readFileBytes(fileId);

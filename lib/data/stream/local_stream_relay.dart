@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/ticket_headers.dart';
 import '../../core/utils/hls_relay_rewrite.dart';
 import '../../core/utils/http_range.dart';
 import '../../domain/adapters/stream_relay.dart';
@@ -388,9 +389,9 @@ class LocalStreamRelay implements StreamRelay {
       // 少了它，中继自己也会被 `http_proxy` 代理掉 —— 那就等于没修。
       client = _directClient();
       final upstreamRequest = await client.getUrl(upstream);
-      for (final e in session.headers.entries) {
-        upstreamRequest.headers.set(e.key, e.value);
-      }
+      // ⛔ 与下载层同一条坑：直链 302 之后 Dart 会丢掉 UA，而百度 CDN 的
+      //    签名是按 UA 签的 —— 见 [applyTicketHeaders]。
+      applyTicketHeaders(client, upstreamRequest, session.headers);
       // 播放器（或上游）要求 Range 时原样带过去：分片也可能被 seek 分段取。
       final range = request.headers.value(HttpHeaders.rangeHeader);
       if (range != null) {

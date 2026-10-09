@@ -8,7 +8,6 @@ import '../../domain/entities/download_task.dart';
 import '../../domain/services/download_queue.dart';
 import '../../domain/services/drive_download.dart';
 import 'app_providers.dart';
-import 'drive_browse_providers.dart';
 import 'settings_providers.dart';
 
 /// 下载记录的持久化。
@@ -78,10 +77,20 @@ class DownloadQueueController extends Notifier<List<DownloadTask>> {
 
     final queue = DownloadQueue(
       store: ref.watch(downloadTaskStoreProvider),
-      // 每次开跑现取一个服务实例（适配器注册表可以被重建，
-      // 冻住一个旧适配器会拿着失效的会话去取链）。
-      service: () => DriveDownloadService(
-        adapter: registry.requireAdapter(browseProvider),
+      // ⛔ **按每条任务自己的网盘**取服务，不再冻结「当前网盘」那一个适配器。
+      //
+      //    库里同时有夸克和百度的文件，队列也同时排着两家的任务。冻住一个
+      //    的话，另一家的任务会拿别家的凭证去取链 —— 表现为「任务一直失败 /
+      //    卡住」，而队列本身一切正常，用户完全看不出是网盘弄错了。
+      //
+      // ⛔ 仍然**每次开跑现取**（适配器注册表可以被重建，冻住一个旧适配器
+      //    会拿着失效的会话去取链）。
+      //
+      // ⚠️ 不再 `watch(browseProvider)`：队列的命不再是「视图在看哪家」，
+      //    而是每条任务自己的归属。换浏览视图**不该**重建整个队列
+      //    （那会打断正在跑的任务）。
+      service: (provider) => DriveDownloadService(
+        adapter: registry.requireAdapter(provider),
       ),
       concurrency: () => _concurrency,
     );

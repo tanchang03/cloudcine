@@ -38,15 +38,19 @@ class _FakeAuth extends AuthController {
   /// （画 / 不画）都靠它区分，所以默认值必须是没有容量的那一份。
   final CloudAccount? account;
 
+  static final CloudAccount _defaultAccount = CloudAccount(
+    provider: DriveProvider.quark,
+    authMode: AuthMode.browserCookie,
+    authorizedAt: _authDate,
+  );
+
+  static final DateTime _authDate = DateTime(2026, 10, 3);
+
   @override
-  Future<AuthState> build() async => AuthState(
-        account: account ??
-            CloudAccount(
-              provider: DriveProvider.quark,
-              authMode: AuthMode.browserCookie,
-              authorizedAt: DateTime(2026, 10, 3),
-            ),
-      );
+  Future<AuthState> build() async {
+    final acc = account ?? _defaultAccount;
+    return AuthState(accounts: {acc.provider: acc});
+  }
 }
 
 /// 真的那个 `build()` 会去读设置并准备一次网盘扫描，与这里要测的东西无关。

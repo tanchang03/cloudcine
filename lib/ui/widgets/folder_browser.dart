@@ -1377,8 +1377,9 @@ class _DriveFileRow extends ConsumerWidget {
     final indexedIds = ref.watch(indexedFileIdsProvider).valueOrNull;
     final discovery = ref.watch(discoveryControllerProvider);
     final scanning = ref.watch(scanControllerProvider).running;
-    final inLibrary =
-        indexedIds?.contains(MediaItem.idFor(browseProvider, entry.id)) ?? false;
+    final inLibrary = indexedIds
+            ?.contains(MediaItem.idFor(ref.watch(browseProvider), entry.id)) ??
+        false;
     final selected =
         selecting && ref.watch(folderSelectionProvider).contains(entry.id);
 
@@ -1554,7 +1555,7 @@ class _DriveFileRow extends ConsumerWidget {
       await playDriveEntry(
         context,
         ref,
-        provider: browseProvider,
+        provider: ref.read(browseProvider),
         entry: entry,
         dirPath: crumb.path,
       );
@@ -1564,7 +1565,7 @@ class _DriveFileRow extends ConsumerWidget {
     // 已在库：**必须现查库拿 `MediaItem`**。起播入口要的是媒体项（它带着
     // fid、路径、解析结果），而这一行手上只有网盘条目。一次 SQLite 点查，
     // 比在列表里预先加载整库便宜得多。
-    final id = MediaItem.idFor(browseProvider, entry.id);
+    final id = MediaItem.idFor(ref.read(browseProvider), entry.id);
     final item = await ref.read(mediaRepositoryProvider).itemById(id);
     if (!context.mounted) return;
 
@@ -1578,7 +1579,7 @@ class _DriveFileRow extends ConsumerWidget {
       await playDriveEntry(
         context,
         ref,
-        provider: browseProvider,
+        provider: ref.read(browseProvider),
         entry: entry,
         dirPath: crumb.path,
       );

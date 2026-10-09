@@ -34,9 +34,21 @@
 library;
 
 import '../../core/diagnostics/diag_log.dart';
+import '../../core/utils/cookie_parser.dart' show parseSetCookieLines;
 import '../../core/utils/redact.dart';
 import '../http/http_client.dart';
 import '../remote/quark/quark_endpoints.dart';
+
+/// 把 `parseSetCookieLines` 转出去。
+///
+/// 它的实现已搬到 `core/utils/cookie_parser.dart`（通用的 Cookie 工具，
+/// 百度扫码也要用）。保留这层 `export` 是为了让既有的
+/// `import '…/quark_qr_login.dart' show parseSetCookieLines;`
+/// 一行都不用改。
+///
+/// ⛔ 必须是 `export` 而不是「在这里再包一个同名函数」：包一层会让两处
+/// 各自演化，而「`Set-Cookie` 怎么切分」只能有一套规则。
+export '../../core/utils/cookie_parser.dart' show parseSetCookieLines;
 
 /// 一次扫码登录会话：服务端下发的一次性 token + 二维码里要装的 URL。
 class QrLoginSession {
@@ -399,24 +411,6 @@ class QrLoginCookies {
 
   bool get hasEssential => QuarkEndpoints.essentialCookieNames
       .every((name) => (cookies[name] ?? '').isNotEmpty);
-}
-
-/// 把 `Set-Cookie` 原始行解析成 `name=value`。
-///
-/// 每条形如 `name=value; Path=/; Domain=.quark.cn; HttpOnly`，
-/// 只取第一个 `;` 之前那段（属性对落库/发请求没用）。
-Map<String, String> parseSetCookieLines(List<String> lines) {
-  final out = <String, String>{};
-  for (final line in lines) {
-    final semi = line.indexOf(';');
-    final pair = semi < 0 ? line : line.substring(0, semi);
-    final eq = pair.indexOf('=');
-    if (eq <= 0) continue;
-    final name = pair.substring(0, eq).trim();
-    final value = pair.substring(eq + 1).trim();
-    if (name.isNotEmpty) out[name] = value;
-  }
-  return out;
 }
 
 /// 过滤出可落库的 Cookie（与浏览器授权器一致的 known/essential 名单）。

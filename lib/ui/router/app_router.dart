@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/media_item.dart';
 import '../pages/auth_page.dart';
 import '../pages/auth_qr_login_page.dart';
@@ -45,9 +46,13 @@ final routerProvider = Provider<GoRouter>((ref) {
       final authorized = auth.valueOrNull?.isAuthorized ?? false;
       if (location == '/splash') return authorized ? '/library' : '/auth';
 
+      // 多家并存模型：授权页是「添加 / 重登一家网盘」的入口，**即使已经**
+      // **登录了别的网盘也必须可达**——否则已连夸克的用户永远点不进百度
+      // 的扫码页（表现就是「点了没反应 / 页面不切换」）。所以已授权时**不再**
+      // 把 `/auth*` 踢回 `/library`；登录成功后的跳转交给 [AuthQrLoginPage]
+      // 自己 `context.go('/library')` 完成。
       final atAuth = location.startsWith('/auth');
       if (!authorized && !atAuth) return '/auth';
-      if (authorized && atAuth) return '/library';
       return null;
     },
     routes: [
@@ -56,7 +61,20 @@ final routerProvider = Provider<GoRouter>((ref) {
         path: '/auth',
         builder: (_, __) => const AuthPage(),
         routes: [
-          GoRoute(path: 'qr', builder: (_, __) => const AuthQrLoginPage()),
+          GoRoute(
+            path: 'qr',
+            builder: (_, state) => AuthQrLoginPage(
+              // 走 query 而不是 path 段：`/auth/qr/quark` 与 `/auth/qr` 是
+              // 两条不同的路由，多一层就多一个「返回时落到哪」的问题。
+              //
+              // ⚠️ 解析不出来时退回夸克 —— 历史默认值（这个键出现之前
+              //    唯一的选择就是夸克）。
+              provider: DriveProvider.fromId(
+                    state.uri.queryParameters['drive'] ?? '',
+                  ) ??
+                  DriveProvider.quark,
+            ),
+          ),
         ],
       ),
 

@@ -22,6 +22,7 @@ class Capabilities {
     this.linkQps = 1.0,
     this.defaultPageSize = 50,
     this.authModes = const {},
+    this.canWrite = true,
   });
 
   final DriveProvider provider;
@@ -70,6 +71,23 @@ class Capabilities {
 
   /// 该网盘支持的授权方式集合
   final Set<AuthMode> authModes;
+
+  /// 这家网盘**能不能写**（上传 / 建目录 / 删除 / 移动）。
+  ///
+  /// ## 为什么需要一个显式的能力位，而不是只靠「基类默认抛 unsupported」
+  ///
+  /// 「抛异常」表达的是**运行时**的「这次不行」；而有一类需求必须在
+  /// **调用之前**就知道能不能写：
+  ///
+  ///   * **备份上传选哪家**。备份包只能落在**一家**网盘上（见
+  ///     `libraryBackupServiceProvider`）。接了百度之后，如果挑中它，
+  ///     用户点「备份」只会拿到一句 `unsupported` —— 而他明明已经登录了
+  ///     夸克，只是不知道要选。选之前能判，就能直接挑一个能写的。
+  ///   * UI 上「加入媒体库 / 上传」这类入口该不该**置灰**，而不是点了才报错。
+  ///
+  /// ⚠️ 它说的是「这家网盘整体上支不支持写」，不是「这个账号有没有权限」
+  ///    （会员等级、目录只读这类差异仍然靠运行时异常表达）。
+  final bool canWrite;
 
   /// 是否声明了**播放取链**的体积上限
   bool get hasFileSizeLimit => maxSingleFileBytes != null;

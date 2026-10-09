@@ -9,6 +9,7 @@ import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/tmdb_client.dart';
 import '../../domain/entities/cloud_account.dart';
 import '../../domain/entities/download_task.dart';
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/quality_option.dart';
 import '../../domain/services/follow_auto_check.dart';
@@ -130,9 +131,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 _AccountCard(
-                  account: auth?.account,
+                  accounts: auth?.accounts ?? const {},
                   canPersist: auth?.canPersist ?? true,
-                  onSignOut: () => _confirmSignOut(),
+                  onSignOutAll: () => _confirmSignOut(),
+                  onSignOutOne: (provider) => ref
+                      .read(authControllerProvider.notifier)
+                      .signOut(provider: provider),
                 ),
                 const SizedBox(height: 14),
                 _scanSection(current),
@@ -1324,7 +1328,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         backgroundColor: AppTheme.panel2,
         title: const Text('退出登录？', style: TextStyle(fontSize: 15)),
         content: const Text(
-          '本机保存的夸克凭证会被删除，下次需要重新扫码。'
+          '本机保存的全部网盘凭证会被删除，下次需要重新扫码。'
           '已经扫好的媒体库会保留。',
           style: TextStyle(fontSize: 12.5, height: 1.7, color: AppTheme.muted),
         ),
@@ -1702,19 +1706,20 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
 
 class _AccountCard extends StatelessWidget {
   const _AccountCard({
-    required this.account,
+    required this.accounts,
     required this.canPersist,
-    required this.onSignOut,
+    required this.onSignOutAll,
+    required this.onSignOutOne,
   });
 
-  final CloudAccount? account;
+  final Map<DriveProvider, CloudAccount> accounts;
   final bool canPersist;
-  final VoidCallback onSignOut;
+  final VoidCallback onSignOutAll;
+  final void Function(DriveProvider provider) onSignOutOne;
 
   @override
   Widget build(BuildContext context) {
-    final acc = account;
-    if (acc == null) {
+    if (accounts.isEmpty) {
       return const SectionCard(
         title: '账号',
         child: Text(
@@ -1724,29 +1729,26 @@ class _AccountCard extends StatelessWidget {
       );
     }
 
-    final used = acc.storageUsedBytes;
-    final total = acc.storageTotalBytes;
-
+    // 多家并存：每张账号卡一行，各自带「退出」按钮；整段右上角再给一个
+    // 「全部退出」（设置页那个旧「退出登录」的语义 = 全退）。
     return SectionCard(
       title: '账号',
       trailing: TextButton.icon(
-        onPressed: onSignOut,
+        onPressed: onSignOutAll,
         icon: const Icon(Icons.logout_rounded, size: 15),
-        label: const Text('退出登录'),
+        label: const Text('全部退出'),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          KeyValueRow(label: '账号', value: acc.label),
-          KeyValueRow(label: '网盘', value: acc.provider.displayName),
-          KeyValueRow(label: '登录方式', value: acc.authMode.displayName),
-          if (acc.memberLabel != null)
-            KeyValueRow(label: '会员', value: acc.memberLabel!),
-          if (used != null && total != null && total > 0)
-            KeyValueRow(
-              label: '空间',
-              value: '${formatBytes(used)} / ${formatBytes(total)}',
-            ),
+          for (final e in accounts.entries) ...[
+            if (e.key != accounts.keys.first)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Divider(height: 0.5, color: AppTheme.line),
+              ),
+            _OneAccount(account: e.value, onSignOut: () => onSignOutOne(e.key)),
+          ],
           if (!canPersist)
             const Padding(
               padding: EdgeInsets.only(top: 8),
@@ -1757,6 +1759,55 @@ class _AccountCard extends StatelessWidget {
             ),
         ],
       ),
+    );
+  }
+}
+
+/// 单家网盘的账号信息行（含「退出这一家」）。
+class _OneAccount extends StatelessWidget {
+  const _OneAccount({required this.account, required this.onSignOut});
+
+  final CloudAccount account;
+  final VoidCallback onSignOut;
+
+  @override
+  Widget build(BuildContext context) {
+    final acc = account;
+    final used = acc.storageUsedBytes;
+    final total = acc.storageTotalBytes;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                acc.label,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.text,
+                ),
+              ),
+            ),
+            TextButton.icon(
+              onPressed: onSignOut,
+              icon: const Icon(Icons.logout_rounded, size: 14),
+              label: Text('退出${acc.provider.shortName}'),
+            ),
+          ],
+        ),
+        KeyValueRow(label: '网盘', value: acc.provider.displayName),
+        KeyValueRow(label: '登录方式', value: acc.authMode.displayName),
+        if (acc.memberLabel != null)
+          KeyValueRow(label: '会员', value: acc.memberLabel!),
+        if (used != null && total != null && total > 0)
+          KeyValueRow(
+            label: '空间',
+            value: '${formatBytes(used)} / ${formatBytes(total)}',
+          ),
+      ],
     );
   }
 }

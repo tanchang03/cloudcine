@@ -28,11 +28,13 @@ import 'package:flutter_test/flutter_test.dart';
 class _FakeAuth extends AuthController {
   @override
   Future<AuthState> build() async => AuthState(
-        account: CloudAccount(
-          provider: DriveProvider.quark,
-          authMode: AuthMode.browserCookie,
-          authorizedAt: DateTime(2026, 10, 1),
-        ),
+        accounts: {
+          DriveProvider.quark: CloudAccount(
+            provider: DriveProvider.quark,
+            authMode: AuthMode.browserCookie,
+            authorizedAt: DateTime(2026, 10, 1),
+          ),
+        },
       );
 }
 

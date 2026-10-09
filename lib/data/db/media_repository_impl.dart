@@ -18,6 +18,7 @@ import '../../domain/entities/work_poster.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_cursor.dart';
+import '../../domain/services/follow_plan.dart';
 import '../../domain/services/playback_progress.dart';
 import 'app_database.dart';
 import 'progress_store.dart';
@@ -1255,13 +1256,20 @@ class DriftMediaRepository implements MediaRepository {
 
     final all = <String>{...keys, ...sourceToTarget.keys};
 
-    // 按 fid 去重。一部剧的 12 集通常在同一个目录里，不去重就是 12 次
-    // 列目录请求，而夸克有 QPS 限制。
-    final dirPathById = <String, String>{};
+    // 按 `(provider, dirId)` 去重。一部剧的 12 集通常在同一个目录里，
+    // 不去重就是 12 次列目录请求，而夸克有 QPS 限制。
+    //
+    // ⛔ 键必须是复合的：`dir_id` 只在**同一家**网盘内唯一 —— 夸克的 `fid`
+    //    与百度的 `fs_id` 是两套独立编号，撞号完全可能。只按 `dirId` 去重
+    //    会把两家的目录并成一个，然后只按先出现的那家去列目录，
+    //    另一家的那几部剧**永远不会被检查**，而日志上看不出任何异常。
+    final dirPathByKey = <String, String>{};
+    final dirMetaByKey = <String, (DriveProvider, String)>{};
     final workKeysByDir = <String, Set<String>>{};
     for (final chunk in _chunkedList(all.toList(growable: false), _sqlChunk)) {
       final rows = await (_db.selectOnly(_db.mediaItems)
             ..addColumns([
+              _db.mediaItems.provider,
               _db.mediaItems.dirId,
               _db.mediaItems.dirPath,
               _db.mediaItems.groupKey,
@@ -1277,9 +1285,25 @@ class DriftMediaRepository implements MediaRepository {
         if (group == null) continue;
         final owner = sourceToTarget[group] ?? group;
         if (!target.contains(owner)) continue;
-        (workKeysByDir[id] ??= <String>{}).add(owner);
-        dirPathById.putIfAbsent(
-          id,
+
+        final rawProvider = r.read(_db.mediaItems.provider);
+        // 认不出的 provider 说明库里混进了脏数据。**跳过而不是退回夸克** ——
+        // 退回会让它拿夸克的 fid 去问夸克，静默地查错网盘。
+        final provider =
+            rawProvider == null ? null : DriveProvider.fromId(rawProvider);
+        if (provider == null) {
+          diag.warn(
+            '追剧',
+            '媒体项的 provider 无法识别（$rawProvider），跳过目录 $id',
+          );
+          continue;
+        }
+
+        final key = FollowPlan.dirKey(provider, id);
+        (workKeysByDir[key] ??= <String>{}).add(owner);
+        dirMetaByKey[key] = (provider, id);
+        dirPathByKey.putIfAbsent(
+          key,
           // ⛔ 归一成带尾斜杠：`dirPath` 参与 `groupKey` 的计算，
           //    少了尾斜杠会让同一个文件在追更检查里算出**另一个**
           //    groupKey，表现是「检查完多出一部重复的作品」。
@@ -1290,9 +1314,10 @@ class DriftMediaRepository implements MediaRepository {
       }
     }
     return [
-      for (final e in dirPathById.entries)
+      for (final e in dirPathByKey.entries)
         FollowDir(
-          dirId: e.key,
+          provider: dirMetaByKey[e.key]!.$1,
+          dirId: dirMetaByKey[e.key]!.$2,
           dirPath: e.value,
           workKeys: workKeysByDir[e.key] ?? const <String>{},
         ),

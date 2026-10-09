@@ -21,7 +21,11 @@ import 'scan_service.dart';
 /// **不报错**的。
 ///
 /// 组合根负责把它接到真实现上（`recursive: true`，见红线 3）。
+///
+/// ⚠️ [provider] 是**每个目录各自**的网盘，不是「当前网盘」：媒体库是多家
+///    混在一起的，同一个 `dirId` 在两家网盘里可能都合法（编号独立）。
 typedef DiscoverDirectoryFn = Future<DiscoveryOutcome> Function({
+  required DriveProvider provider,
   required String dirId,
   required String dirPath,
 });
@@ -263,6 +267,7 @@ class FollowService {
       );
       try {
         final outcome = await _discover(
+          provider: dir.provider,
           dirId: dir.dirId,
           dirPath: dir.dirPath,
         );
@@ -271,7 +276,7 @@ class FollowService {
         //    那批新集可能正好在没读到的子目录里 —— 推进水位线等于把它们
         //    永久划进「已读」，用户再也不会被提醒，而且没有任何报错。
         if (!outcome.isComplete || outcome.failedDirs > 0) {
-          failed.add(dir.dirId);
+          failed.add(FollowPlan.dirKey(dir.provider, dir.dirId));
           diag.warn(
             '追剧',
             '目录未读完整，本次不推进水位线：${dir.dirPath}'
@@ -280,7 +285,7 @@ class FollowService {
         }
       } catch (e) {
         // 单个目录失败不该毁掉整次检查 —— 其它目录的结果照样有效。
-        failed.add(dir.dirId);
+        failed.add(FollowPlan.dirKey(dir.provider, dir.dirId));
         diag.warn('追剧', '列目录失败：${dir.dirPath}（$e）');
       }
     }
@@ -364,6 +369,16 @@ class FollowService {
 ///    发现不了新集（红线 3）。把它写死在这里，是为了让调用点没有机会传错 ——
 ///    传成 `false` 的后果是「有的剧就是不提醒」，而检查日志一切正常。
 ///
+/// ## 为什么不再收一个 `provider` 参数
+///
+/// 以前这里固定一家网盘（「当前网盘」）。多家网盘混在一个库之后，
+/// **每个目录各自的网盘**由 `FollowDir.provider` 带来（它从 `media_items`
+/// 的 `provider` 列读出），本函数只负责转发。
+///
+/// ⚠️ 固定一家的错法是**静默**的：库里有百度的片子、而这里写死夸克时，
+///    百度那几部剧的目录会拿夸克的 `fid` 去问夸克 —— 多半列出一个空目录，
+///    检查结束报「没有更新」，用户以为这几部剧没更新过。
+///
 /// ## `buildService` 为什么是异步的
 ///
 /// `MediaDiscoveryService` 要一个已经解析好的 `ScanPolicy`（并发数 / 限速），
@@ -372,9 +387,12 @@ class FollowService {
 /// 缓存一份的话，用户在设置页改了并发数要重启 App 才生效。
 DiscoverDirectoryFn followDiscoveryAdapter({
   required Future<MediaDiscoveryService> Function() buildService,
-  required DriveProvider provider,
 }) {
-  return ({required String dirId, required String dirPath}) async {
+  return ({
+    required DriveProvider provider,
+    required String dirId,
+    required String dirPath,
+  }) async {
     final service = await buildService();
     return service.discoverDirectory(
       provider,

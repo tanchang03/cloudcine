@@ -115,10 +115,11 @@ class DriveCleanupController extends Notifier<DriveCleanupState> {
   }) async {
     if (plan.entries.isEmpty || state.running) return null;
 
-    final adapter =
-        ref.read(adapterRegistryProvider).adapterFor(browseProvider);
+    final adapter = ref
+        .read(adapterRegistryProvider)
+        .adapterFor(ref.read(browseProvider));
     if (adapter == null) {
-      diag.warn('文件', '批量删除：夸克适配器未注册');
+      diag.warn('文件', '批量删除：当前网盘适配器未注册');
       return null;
     }
 
@@ -229,7 +230,9 @@ class DriveCleanupController extends Notifier<DriveCleanupState> {
         continue;
       }
 
-      final item = await repo.itemById(MediaItem.idFor(browseProvider, entry.id));
+      final item = await repo.itemById(
+        MediaItem.idFor(ref.read(browseProvider), entry.id),
+      );
       // 非视频文件（字幕 / 图片 / 压缩包）在索引里本来就没有行，查不到是
       // 正常情况，不是错误。
       if (item != null) doomed[item.id] = item;

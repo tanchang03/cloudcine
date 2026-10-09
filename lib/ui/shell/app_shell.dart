@@ -434,6 +434,20 @@ const List<({IconData icon, String label, String path})> _navItems = [
 /// 下载数」，一个看起来像数据错了的界面 bug。
 const int _downloadsIndex = 3;
 
+/// 顶栏那一行账号摘要：**已连接了几家网盘**。
+///
+/// ⛔ 不要写成某一个账号名。多家同时在线时，显示一个名字会让用户以为
+///    「只连了那一家」—— 而连着两家的正是常态。
+///
+/// 一家时 = 那家的账号名（与以前一致）；两家及以上 = 「已连接 N 家」；
+/// 零家 = 「未登录」。
+String _accountSummary(AuthState? auth) {
+  final accounts = auth?.accounts ?? const {};
+  if (accounts.isEmpty) return '未登录';
+  if (accounts.length == 1) return accounts.values.first.label;
+  return '已连接 ${accounts.length} 家网盘';
+}
+
 /// TV 顶部一级导航（参考夸克网盘 TV 版媒体库首页）。
 ///
 /// 布局 = 左 logo + 中间横排 5 个入口 + 右账号/诊断：
@@ -472,8 +486,10 @@ class _TopBar extends ConsumerWidget {
               ),
             ),
           const Spacer(),
+          // ⛔ 多家网盘同时在线，所以这里显示的是**已连接了几家**，
+          //    不是某一个账号名 —— 写死一个名字会让用户以为只连了那一家。
           Text(
-            auth?.account?.label ?? '未登录',
+            _accountSummary(auth),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontSize: 13, color: AppTheme.muted),
@@ -635,14 +651,18 @@ class _Sidebar extends ConsumerWidget {
             ),
           const Spacer(),
           const Divider(height: 0.5, color: AppTheme.line),
-          _AccountBlock(
-            name: auth?.account?.label ?? '未登录',
-            detail: auth?.account?.memberLabel,
-            degraded: auth != null && !auth.canPersist,
-            busy: auth?.busy ?? false,
-            onSignOut: () =>
-                ref.read(authControllerProvider.notifier).signOut(),
-          ),
+          // ⛔ **每家已连接的网盘一行**，而不是只显示「一个账号」。
+          //
+          //    多家同时在线是常态。只画一行的话，用户连了百度却看不见它 ——
+          //    而且完全不知道自己连着两家（他看到的就是「一个账号」）。
+          //    这正是「没看到百度网盘的对接入口」的根因。
+          ..._accountRows(ref, auth, context),
+          // 还有能连但没连的网盘时，给一个「添加」入口。
+          //
+          // ⛔ 它是**唯一**不需要先登出就能到达登录页的地方 —— 以前登录页
+          //    藏在「退出登录」之后，而退出登录看起来是把账号删掉，
+          //    没人会为了「加一个网盘」去点它。
+          ..._addDriveRow(ref, auth, context),
           _NavTile(
             icon: Icons.receipt_long_rounded,
             label: '诊断日志',
@@ -776,18 +796,29 @@ class _AccountBlock extends StatelessWidget {
     required this.detail,
     required this.degraded,
     required this.busy,
-    required this.onSignOut,
+    this.onSignOut,
+    this.signOutLabel,
+    this.onTap,
   });
 
   final String name;
   final String? detail;
   final bool degraded;
   final bool busy;
-  final VoidCallback onSignOut;
+
+  /// 为 `null` 时不画退出按钮（「未登录」那一行就是这个情形）。
+  final VoidCallback? onSignOut;
+
+  /// 退出按钮的悬浮提示。多家并存时「退出登录」是有歧义的 ——
+  /// 必须写清退出的是哪一家。
+  final String? signOutLabel;
+
+  /// 点整行要做什么（未登录时 = 去登录页）。为 `null` 时整行不可点。
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
+    final row = Padding(
       // ⛔ 上间距从 12 收到 8：侧栏那一列在 540 高的电视上本来就装不下
       // （原来溢出 25px），这里是给「系统字体被放大」留的余量 ——
       // 侧栏**没有**套 `AppTheme.tvTextScaler`，字会跟着系统缩放长高，
@@ -811,7 +842,7 @@ class _AccountBlock extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  degraded ? '凭证仅本次有效' : (detail ?? '夸克网盘'),
+                  degraded ? '凭证仅本次有效' : (detail ?? '网盘'),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -822,19 +853,120 @@ class _AccountBlock extends StatelessWidget {
               ],
             ),
           ),
-          // 侧栏底部那个 ⤴ 是纯图标 —— TV 上补「退出登录」，
+          // 侧栏底部那个 ⤴ 是纯图标 —— TV 上补文字标签，
           // 否则它看起来和「关掉窗口」没什么区别。
-          TvIconLabel(
-            label: '退出登录',
-            enabled: !busy,
-            child: IconButton(
-              onPressed: busy ? null : onSignOut,
-              iconSize: 15,
-              tooltip: '退出登录',
-              icon: const Icon(Icons.logout_rounded),
+          if (onSignOut != null)
+            TvIconLabel(
+              label: signOutLabel ?? '退出登录',
+              enabled: !busy,
+              child: IconButton(
+                onPressed: busy ? null : onSignOut,
+                iconSize: 15,
+                // ⛔ 多家并存时「退出登录」是有歧义的 —— 必须写清哪一家。
+                tooltip: signOutLabel ?? '退出登录',
+                icon: const Icon(Icons.logout_rounded),
+              ),
             ),
-          ),
         ],
+      ),
+    );
+
+    // 「未登录」那一行整行可点（去登录页）。已连接的行不可点 ——
+    // 点它没有任何可去的地方，给反馈反而是噪音。
+    if (onTap == null) return row;
+    return InkWell(onTap: onTap, child: row);
+  }
+}
+
+/// 侧栏底部每一家**已连接**网盘一行。
+///
+/// 一行一家，各自带一个退出按钮 —— 登出百度不该把夸克也踢掉。
+List<Widget> _accountRows(WidgetRef ref, AuthState? auth, BuildContext context) {
+  final accounts = auth?.accounts ?? const {};
+  if (accounts.isEmpty) {
+    // ⚠️ 一家都没连时也**要说一句**，否则这一块整片空白，用户不知道
+    //    那是「没登录」还是「这一块坏了」。
+    return [
+      _AccountBlock(
+        name: '未登录',
+        detail: '点这里连接网盘',
+        degraded: false,
+        busy: false,
+        onTap: () => context.push('/auth'),
+      ),
+    ];
+  }
+
+  return [
+    for (final e in accounts.entries)
+      _AccountBlock(
+        name: e.value.label,
+        detail: e.value.memberLabel ?? e.key.displayName,
+        // 凭证存不下来（Web 端）时提示「本次会话有效」。
+        degraded: auth?.canPersist == false,
+        busy: auth?.busy ?? false,
+        // ⛔ 只登出**这一家**。
+        onSignOut: () =>
+            ref.read(authControllerProvider.notifier).signOut(provider: e.key),
+        signOutLabel: '退出${e.key.shortName}',
+      ),
+  ];
+}
+
+/// 「还没连的网盘 → 添加」那一行。全连上了就没有。
+///
+/// ## ⛔ 为什么它必须存在
+///
+/// 以前登录页唯一的入口是账号行上的「退出登录」（先登出，路由才把人踢到
+/// `/auth`）。而「退出登录」看起来是**删掉账号** —— 没有人会为了「再加
+/// 一家网盘」去点它。所以接了百度之后，用户在界面上找不到任何入口。
+List<Widget> _addDriveRow(WidgetRef ref, AuthState? auth, BuildContext context) {
+  final accounts = auth?.accounts ?? const {};
+  final all = ref.watch(selectableDrivesProvider);
+  final missing = [
+    for (final p in all)
+      if (!accounts.containsKey(p)) p,
+  ];
+  if (missing.isEmpty) return const [];
+
+  return [
+    _AddDriveTile(
+      label: '添加网盘（${missing.map((p) => p.shortName).join('／')}）',
+      onTap: () => context.push('/auth'),
+    ),
+  ];
+}
+
+/// 「添加网盘」那一行 —— 一个带 `+` 的朴素列表项。
+///
+/// 做成列表项而不是按钮：它和上面的账号行是同一列的东西，长得像按钮会
+/// 让人以为它是个「动作」，而它其实是「另一家网盘的入口」。
+class _AddDriveTile extends StatelessWidget {
+  const _AddDriveTile({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 6, 12, 6),
+        child: Row(
+          children: [
+            const Icon(Icons.add_rounded, size: 16, color: AppTheme.dim),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12, color: AppTheme.muted),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

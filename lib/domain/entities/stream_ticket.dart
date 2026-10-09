@@ -14,6 +14,7 @@ class StreamTicket {
     this.supportsRange = true,
     this.contentType,
     this.qualities = const [],
+    this.maxConnections,
   });
 
   /// 直链地址（含签名查询串，**不要打进日志**）
@@ -44,6 +45,33 @@ class StreamTicket {
   /// [url] 与 [qualities] 的关系：`url` 是**默认要播的那条**（原画优先），
   /// 它必然也出现在 `qualities` 里（如果服务端给了梯度）。
   final List<QualityOption> qualities;
+
+  /// 这条流**最多**能承受的并发连接数；`null` = 没有额外约束，用消费方默认值。
+  ///
+  /// 存在的理由：网盘的「多连接加速」只在**每条连接各自限速**的通道上成立。
+  /// 2026-10-09 对百度两条通道实测（同一账号、同一份 Cookie、同一份文件）：
+  ///
+  /// | 通道 | 1 条 | 2 条 | 4 条 | 8 条 |
+  /// |---|---|---|---|---|
+  /// | `origin=dlna`（视频） | 1.1 MB/s | 2.0 MB/s | 3.1 MB/s | 4.1 MB/s |
+  /// | 不带 `origin`（文档） | **82 KB/s** | 76 KB/s ❌ | 73 KB/s ❌ | 68 KB/s ❌ 被掐断 |
+  ///
+  /// 后者的限速是**按账号**的：加连接数完全不加总吞吐，只会让每条连接
+  /// 都慢到读超时、最后被服务端掐断（`Connection closed while receiving
+  /// data`）—— 表现正是「下载卡在 0% 不动，几分钟后报一个看不懂的错」。
+  ///
+  /// 所以「这条通道该开几条连接」这件事只有**取链的适配器**知道，
+  /// 它把它写在票据上；下载服务照做，不再自己拍一个全局默认值。
+  final int? maxConnections;
+
+  /// 实际要用的并发连接数：票据给了上限就用它，否则用 [fallback]。
+  ///
+  /// 收敛到一处，避免「判分块时用一个数、真开连接时用另一个数」。
+  int connectionsFor(int fallback) {
+    final m = maxConnections;
+    if (m == null) return fallback;
+    return m < 1 ? 1 : m;
+  }
 
   /// 服务端是否提供了多档清晰度。
   bool get hasQualityChoice => qualities.length > 1;
@@ -81,6 +109,8 @@ class StreamTicket {
       supportsRange: supportsRange,
       contentType: contentType,
       qualities: qualities,
+      // 换档不换通道：并发上限是**通道**的属性，与档位无关。
+      maxConnections: maxConnections,
     );
   }
 
@@ -151,5 +181,6 @@ class StreamTicket {
   String toString() => 'StreamTicket($redactedUrl, '
       'headers=${headers.keys.join(",")}, expires=$expiresAt, '
       'len=$contentLength, range=$supportsRange, '
+      'conns=${maxConnections ?? "-"}, '
       'qualities=${qualities.length})';
 }

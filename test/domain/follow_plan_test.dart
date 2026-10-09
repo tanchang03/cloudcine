@@ -1,3 +1,4 @@
+import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/follow_dir.dart';
 import 'package:cloudcine/domain/services/follow_plan.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -18,6 +19,7 @@ import 'package:flutter_test/flutter_test.dart';
 /// 在单测里被钉死。
 void main() {
   FollowDir dir(String id, String path, List<String> works) => FollowDir(
+        provider: DriveProvider.quark,
         dirId: id,
         dirPath: path,
         workKeys: works.toSet(),
@@ -40,7 +42,9 @@ void main() {
         reason: '同一部剧的 12 集通常在一个目录里，不去重就是 12 次列目录请求',
       );
       expect(plan.dirs.map((d) => d.dirId).toList(), ['d1', 'd2'], reason: '顺序 = 首次出现顺序');
-      expect(plan.dirsByWork['adam'], {'d1'});
+      // 目录键现在是 `provider:dirId`（见 FollowPlan.dirKey）—— 与
+      // `MediaItem.id` 同构，便于库里直接用这个键对齐。
+      expect(plan.dirsByWork['adam'], {'quark:d1'});
     });
 
     test('路径取首次出现的那个（重复输入的路径不一致时不抖动）', () {
@@ -73,7 +77,7 @@ void main() {
         dir('tv', '/剧集/黑亚当/', ['adam']),
       ]);
 
-      expect(plan.checkedWorks({'movies'}), {'adam'});
+      expect(plan.checkedWorks({'quark:movies'}), {'adam'});
     });
   });
 
@@ -85,7 +89,7 @@ void main() {
       ]);
 
       expect(
-        plan.checkedWorks({'d2'}),
+        plan.checkedWorks({'quark:d2'}),
         isEmpty,
         reason: '水位线是「这里已经看过了」的承诺。d2 没读到，那批新集可能正好'
             '在里面 —— 推进等于把它们永久划进「已读」，用户再也不会被提醒',
@@ -98,7 +102,7 @@ void main() {
         dir('movies', '/电影/', ['a']),
         dir('tv', '/剧集/黑亚当/', ['adam']),
       ]);
-      expect(plan.checkedWorks({'tv'}), {'a'});
+      expect(plan.checkedWorks({'quark:tv'}), {'a'});
     });
   });
 

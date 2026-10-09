@@ -10,6 +10,7 @@ import '../entities/drive_provider.dart';
 import '../entities/follow_dir.dart';
 import '../entities/scan_cursor.dart';
 import '../entities/work_poster.dart';
+import '../services/follow_plan.dart';
 import '../services/playback_progress.dart';
 
 /// 媒体库列表的排序方式。
@@ -1467,24 +1468,30 @@ class InMemoryMediaRepository implements MediaRepository {
     }
     final all = <String>{...keys, ...sourceToTarget.keys};
 
-    final dirPathById = <String, String>{};
+    final dirPathByKey = <String, String>{};
+    final dirMetaByKey = <String, (DriveProvider, String)>{};
     final workKeysByDir = <String, Set<String>>{};
     for (final item in _items.values) {
       if (!all.contains(item.groupKey)) continue;
       if (item.dirId.isEmpty) continue;
       final owner = sourceToTarget[item.groupKey] ?? item.groupKey;
       if (!target.contains(owner)) continue;
-      (workKeysByDir[item.dirId] ??= <String>{}).add(owner);
-      dirPathById.putIfAbsent(
-        item.dirId,
+      // 键是 `(provider, dirId)`：`dirId` 只在同一家网盘内唯一（与 drift
+      // 实现逐字同口径）。
+      final key = FollowPlan.dirKey(item.provider, item.dirId);
+      (workKeysByDir[key] ??= <String>{}).add(owner);
+      dirMetaByKey[key] = (item.provider, item.dirId);
+      dirPathByKey.putIfAbsent(
+        key,
         // 归一成带尾斜杠：它参与 `groupKey` 的计算。
         () => drivePathWithTrailingSlash(item.dirPath),
       );
     }
     return [
-      for (final e in dirPathById.entries)
+      for (final e in dirPathByKey.entries)
         FollowDir(
-          dirId: e.key,
+          provider: dirMetaByKey[e.key]!.$1,
+          dirId: dirMetaByKey[e.key]!.$2,
           dirPath: e.value,
           workKeys: workKeysByDir[e.key] ?? const <String>{},
         ),

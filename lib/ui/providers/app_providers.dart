@@ -5,6 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/tv_device.dart';
+import '../../data/auth/baidu_qr_driver.dart';
+import '../../data/auth/baidu_qr_login.dart';
+import '../../data/auth/quark_qr_driver.dart';
 import '../../data/auth/quark_qr_login.dart';
 import '../../data/auth/secret_backend.dart';
 import '../../data/auth/secure_credential_store.dart';
@@ -19,6 +22,7 @@ import '../../data/playback/fvp_playback_engine.dart';
 import '../../data/playback/media_kit_playback_engine.dart';
 import '../../data/playback/video_player_exo_playback_engine.dart';
 import '../../data/registry/adapter_registry.dart';
+import '../../data/remote/baidu/baidu_adapter.dart';
 import '../../data/remote/quark/quark_adapter.dart';
 import '../../data/scrape/douban_client.dart';
 import '../../data/scrape/poster_cache.dart';
@@ -29,7 +33,13 @@ import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/services/library_backup_service.dart';
 import '../../domain/services/playback_controller.dart';
+import '../../domain/services/qr_login_driver.dart';
 import '../../domain/services/subtitle_service.dart';
+// ⚠️ 与 `auth_providers.dart` 互相 import（那边要 `credentialStoreProvider` /
+//    `adapterRegistryProvider`，这边要 `authControllerProvider` 挑备份网盘）。
+//    Dart 允许循环 import，而这里两个文件都只有**顶层 provider 声明**，
+//    没有求值顺序依赖 —— Riverpod 是惰性的，谁先被 watch 谁先建。
+import 'auth_providers.dart';
 import 'library_refresh_providers.dart';
 import 'settings_providers.dart';
 
@@ -149,10 +159,19 @@ final credentialStoreProvider = Provider<CredentialStore>(
 
 final httpClientProvider = Provider<HttpClientLike>((ref) => DioHttpClient());
 
-/// 已接入的网盘适配器。目前只有夸克。
+/// 已接入的网盘适配器。夸克（读写全能力）+ 百度（**只读**：授权 / 遍历 / 取流）。
+///
+/// ⛔ 注册表里放的是**全部**适配器，而且是**常驻**的 —— 不存在「只注册
+///    当前那一家」这种做法。重建注册表会把所有适配器 `dispose` 掉
+///    （[ref.onDispose]），而 `dispose` 会丢掉会话 —— 也就是「登出了一家，
+///    另一家也跟着掉线」。多家同时在线的前提就是它只建一次。
 final adapterRegistryProvider = Provider<AdapterRegistry>((ref) {
   final registry = AdapterRegistry([
     QuarkAdapter(
+      http: ref.watch(httpClientProvider),
+      credentialStore: ref.watch(credentialStoreProvider),
+    ),
+    BaiduAdapter(
       http: ref.watch(httpClientProvider),
       credentialStore: ref.watch(credentialStoreProvider),
     ),
@@ -236,16 +255,46 @@ final posterCacheProvider = Provider<PosterCache>(
 
 /// 字幕内容的取用与解码。
 ///
-/// 取字节走当前网盘的 `readFileBytes` —— 字幕直链**没有请求头参数**
-/// （见 `SubtitleResolver` 的类文档），所以字节必须由我们自己取回来。
+/// 取字节走**片子自己那家网盘**的 `readFileBytes` —— 字幕直链**没有请求头
+/// 参数**（见 `SubtitleResolver` 的类文档），所以字节必须由我们自己取回来。
+///
+/// ⛔ [provider] 由调用方给（`MediaItem.provider` / `PlayRequest.itemId` 的
+///    前缀），**不是**「当前网盘」。媒体库里同时有夸克和百度的片子，
+///    用一家去取另一家的字幕只会拿到 404，表现为「字幕加载失败」
+///    而用户看不出是网盘弄错了。
 final subtitleResolverProvider = Provider<SubtitleResolver>(
   (ref) => SubtitleResolver(
-    readBytes: (fileId) => ref
+    readBytes: (provider, fileId) => ref
         .read(adapterRegistryProvider)
-        .requireAdapter(DriveProvider.quark)
+        .requireAdapter(provider)
         .readFileBytes(fileId),
   ),
 );
+
+/// 备份上传/下载落到**哪一家**网盘。
+///
+/// ## 为什么需要「挑一家」
+///
+/// `LibraryBackupService` 是**单个**适配器（备份包只落在一处），而多家网盘
+/// 同时在线时就有得选了。判据是 `Capabilities.canWrite` —— 百度这次对接是
+/// **只读**的（见 `BaiduAdapter.baiduCapabilities`），挑中它的后果是用户点
+/// 「备份」只拿到一句 `unsupported`，而他明明已经登录了夸克，只是不知道
+/// 该选哪个。
+///
+/// 一家能写的都没有时返回 `null`（调用方据此给提示），**不退回夸克** ——
+/// 退回会让「只登录了百度」的用户看到一串看不懂的错误。
+final backupDriveProvider = Provider<DriveProvider?>((ref) {
+  final registry = ref.watch(adapterRegistryProvider);
+  final accounts =
+      ref.watch(authControllerProvider).valueOrNull?.accounts ?? const {};
+  for (final provider in registry.providers) {
+    if (!accounts.containsKey(provider)) continue;
+    final adapter = registry.adapterFor(provider);
+    if (adapter == null) continue;
+    if (adapter.capabilities.canWrite) return provider;
+  }
+  return null;
+});
 
 /// 本地流式中继（多连接并发预取网盘直链）。
 ///
@@ -378,12 +427,43 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
   return controller;
 });
 
-/// 扫码登录客户端（主登录链路）。
+/// 扫码登录客户端（夸克，主登录链路）。
 ///
 /// 只依赖 [httpClientProvider]，所以它跟网盘适配器共用同一个 HTTP 抽象 ——
 /// 单元测试里换成假客户端就能覆盖全部状态分支。
 final qrLoginClientProvider = Provider<QuarkQrLoginClient>(
   (ref) => QuarkQrLoginClient(http: ref.watch(httpClientProvider)),
+);
+
+/// 扫码登录客户端（百度）。
+///
+/// 链路与夸克完全不同（三跳都在 `passport.baidu.com`），所以是**两个客户端**
+/// 而不是一个带开关的 —— 差异见 `baidu_qr_login.dart` 的类文档。
+final baiduQrLoginClientProvider = Provider<BaiduQrLoginClient>(
+  (ref) => BaiduQrLoginClient(http: ref.watch(httpClientProvider)),
+);
+
+/// 扫码登录驱动的**工厂**。
+///
+/// ## ⛔ 为什么是工厂，不是 `Provider.family`
+///
+/// 驱动**持有会话状态**（token / sign / 待兑换的回执）。`family` 会缓存
+/// 实例，第二次进扫码页拿到的还是上一次那个会话 —— 表现是「点了刷新，
+/// 轮询的却还是旧 sign」。工厂每次调都新建一个，页面自己管生命周期。
+final qrLoginDriverFactoryProvider = Provider<QrLoginDriver Function(DriveProvider)>(
+  (ref) {
+    // 两个客户端都**惰性**建：工厂被求值时不碰它们，只在真正 new 驱动时读。
+    return (provider) => switch (provider) {
+          DriveProvider.quark =>
+            QuarkQrDriver(client: ref.read(qrLoginClientProvider)),
+          DriveProvider.baidu =>
+            BaiduQrDriver(client: ref.read(baiduQrLoginClientProvider)),
+          _ => throw StateError(
+              '${provider.displayName} 暂不支持扫码登录'
+              '（当前只有夸克与百度接入了扫码链路）',
+            ),
+        };
+  },
 );
 
 /// 本机设备唯一标识。
@@ -417,10 +497,25 @@ String _getDeviceName() {
 /// 依赖 [adapterRegistryProvider]（网盘上传/下载）、[appSupportDirProvider]
 /// （数据库路径）、[posterCacheDirProvider]（海报缓存路径），
 /// 以及 [mediaRepositoryProvider] 提供的「库内容最后变更时间」。
+///
+/// ## ⚠️ 绑的是**当前网盘**
+///
+/// 备份服务。备份包落在 [backupDriveProvider] 挑出来的那一家。
+///
+/// ⛔ **百度目前是只读适配器**（`uploadFile` 继承基类默认实现，抛
+///    `unsupported`）。所以 [backupDriveProvider] 只会挑到夸克；
+///    只有百度在线时，备份上传会如实报「不支持」。这是能力如实反映，
+///    不是 bug —— 写入链路要等真实账号验证过读链路之后再单独做。
+///    进度文件的**上传**同理，而**下载**不受影响。
 final libraryBackupServiceProvider = Provider<LibraryBackupService>(
   (ref) {
     final registry = ref.watch(adapterRegistryProvider);
-    final adapter = registry.requireAdapter(DriveProvider.quark);
+    // ⛔ 没有一家能写的网盘时**退回夸克**，而不是抛。这个服务还负责
+    //    **下载**（从网盘恢复），那条路径不需要写权限，也不该因为
+    //    「没人能上传」而整个不可用。真去上传时由 `LibraryBackupService`
+    //    拿到 `unsupported`，那是准确的、可解释的错误。
+    final drive = ref.watch(backupDriveProvider) ?? DriveProvider.quark;
+    final adapter = registry.requireAdapter(drive);
     final supportDir = ref.watch(appSupportDirProvider);
     final posterPath = ref.watch(posterCacheDirProvider);
     // 库文件路径要在两个地方用：告诉服务「备份里那份字节该落到哪」，

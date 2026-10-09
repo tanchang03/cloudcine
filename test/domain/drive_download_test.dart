@@ -51,6 +51,7 @@ void main() {
     int chunkSize = 1 << 16,
     Duration chunkDelay = Duration.zero,
     bool ignoreRange = false,
+    List<String>? rangeLog,
   }) async {
     final bytes = Uint8List(total);
     for (var i = 0; i < total; i++) {
@@ -66,6 +67,10 @@ void main() {
       // 一个未捕获的异步异常把测试判红。
       try {
         final response = request.response;
+        // 记下每一次请求的 `Range`。单连接路径（断点 0）**不发** Range，
+        // 分块路径则必然发 `bytes=a-b` —— 这是从外面能看见的
+        // 「走了哪条路」的唯一可靠痕迹。
+        rangeLog?.add(request.headers.value(HttpHeaders.rangeHeader) ?? '-');
         if (statusCode >= 400) {
           response.statusCode = statusCode;
           await response.close();
@@ -134,6 +139,73 @@ void main() {
       bytes: bytes,
     );
   }
+
+  /// 起一个「会 302 的源站」：第二跳**只在 UA 与票据一致时**才给数据。
+  ///
+  /// 复刻百度 2026-10-09 实测到的真实现象：
+  ///
+  ///   - 第一跳 `d.pcs.baidu.com/file/<fid>` 回 **302**，落点是 CDN 主机；
+  ///   - 第二跳的 `sign` **是按 `User-Agent` 签的** —— 同一个 URL，
+  ///     `User-Agent: netdisk` 回 `206`，其它任何 UA 回
+  ///     `403 {"error_code":31362,"error_msg":"sign error"}`；
+  ///   - 而 `dart:io` 的 `HttpClient` **自动跟随重定向时会丢掉
+  ///     `User-Agent`**（换成客户端默认的 `Dart/x.y (dart:io)`，
+  ///     `Range` / `Referer` 却保留）⇒ 第二跳必然 403。
+  Future<({HttpServer server, StreamTicket ticket, Uint8List bytes})>
+      redirectingSource({required String ticketUa}) async {
+    final bytes = Uint8List.fromList(List<int>.generate(200, (i) => i % 251));
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    final base = 'http://127.0.0.1:${server.port}';
+
+    server.listen((request) async {
+      final response = request.response;
+      if (request.uri.path == '/file') {
+        response.statusCode = HttpStatus.found;
+        response.headers
+            .set(HttpHeaders.locationHeader, '$base/real?sign=a%2Fb');
+        await response.close();
+        return;
+      }
+      // 第二跳：签名（这里用 UA 代表）不对就照百度的样子拒绝。
+      if (request.headers.value(HttpHeaders.userAgentHeader) != ticketUa) {
+        response.statusCode = HttpStatus.forbidden;
+        response.headers.contentType = ContentType.json;
+        response.write('{"error_code":31362,"error_msg":"sign error"}');
+        await response.close();
+        return;
+      }
+      response.statusCode = HttpStatus.ok;
+      response.headers.contentLength = bytes.length;
+      response.add(bytes);
+      await response.close();
+    });
+
+    return (
+      server: server,
+      ticket: StreamTicket(
+        url: Uri.parse('$base/file'),
+        headers: {'User-Agent': ticketUa},
+        contentLength: bytes.length,
+      ),
+      bytes: bytes,
+    );
+  }
+
+  test('⛔ 直链 302 之后，票据的 User-Agent 必须**跟着跳**', () async {
+    // 少了这一步，Dart 会把 UA 换成 `Dart/x.y (dart:io)`，而百度 CDN 的
+    // 直链签名**是按 UA 签的** ⇒ 第二跳 403 `31362 sign error`，
+    // 而下载层把 403 归成 `urlExpired` ⇒ 现场看到的是「直链过期了」，
+    // 于是所有排查都往「重新取链」上走，永远查不到真正的原因。
+    final src = await redirectingSource(ticketUa: 'netdisk');
+    final target = '${tmp.path}/跨跳.bin';
+
+    await DriveDownloadService(adapter: _TicketAdapter(src.ticket))
+        .download(fileId: 'f1', savePath: target);
+
+    expect(File(target).readAsBytesSync(), src.bytes,
+        reason: '重定向那一跳必须带着票据的 UA，否则 CDN 按签名拒绝');
+  });
 
   test('整份落盘：字节与源一致，不留 .part', () async {
     final src = await source(4000, httpContentLength: 4000);
@@ -383,6 +455,97 @@ void main() {
   });
 
   // ============================================================
+  // 包体静默 / 通道并发上限
+  // ============================================================
+
+  /// 起一个「先给一点点、然后彻底沉默」的源站。
+  ///
+  /// 复刻 2026-10-09 的现场：百度非会员通道在 `13:57:22` 取链成功之后
+  /// 一直有极少量字节、然后**彻底停住**，日志最后一行还停在「取链成功」，
+  /// UI 停在 0%。`HttpClient` 的 `connectionTimeout` / `idleTimeout`
+  /// 都管不到「响应头到了、包体却不再来」这一段 —— 必须由下载层自己兜底。
+  Future<({HttpServer server, StreamTicket ticket})> stallingSource() async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    server.listen((request) async {
+      try {
+        final response = request.response;
+        response.statusCode = 200;
+        response.headers.contentLength = 100000;
+        // 先给 64 字节（让客户端拿到响应头 + 第一块），然后不再发任何东西。
+        response.add(Uint8List.fromList(List<int>.filled(64, 7)));
+        await response.flush();
+        await Future<void>.delayed(const Duration(seconds: 20));
+      } catch (_) {}
+    });
+    return (
+      server: server,
+      ticket: StreamTicket(
+        url: Uri.parse('http://127.0.0.1:${server.port}/stall.bin'),
+        headers: const {'Cookie': 'k=v'},
+        contentLength: 100000,
+      ),
+    );
+  }
+
+  test('包体静默不动：按超时判失败，而不是无限等下去', () async {
+    final src = await stallingSource();
+    final target = '${tmp.path}/stall.bin';
+
+    final sw = Stopwatch()..start();
+    await expectLater(
+      DriveDownloadService(
+        adapter: _TicketAdapter(src.ticket),
+        stallTimeout: const Duration(milliseconds: 300),
+      ).download(fileId: 'f1', savePath: target),
+      throwsA(isA<DriveException>()
+          .having((e) => e.type, 'type', DriveErrorType.network)
+          .having((e) => e.message, 'message', contains('停滞'))),
+    );
+    sw.stop();
+
+    expect(sw.elapsedMilliseconds, lessThan(5000),
+        reason: '没有这道闸门时这一行会挂到服务端自己掐连接为止 ——'
+            '现场是七分多钟，而用户看到的是「卡在 0% 不动」');
+    expect(File(target).existsSync(), isFalse);
+    expect(File('$target.part').existsSync(), isFalse);
+  });
+
+  test('票据钉了单连接：文件再大也不开分块', () async {
+    // 百度普通通道的限速是**按账号**的（1 条 82 KB/s、8 条 68 KB/s 且
+    // 全被掐断）。所以「够大就分块」这条判据必须能被票据上的上限否决，
+    // 否则文档下载永远是「8 条连接打一条慢通道 → 每条读超时 → 失败」。
+    final ranges = <String>[];
+    final src = await source(
+      20000,
+      httpContentLength: 20000,
+      rangeLog: ranges,
+    );
+    final target = '${tmp.path}/slow.bin';
+
+    final result = await DriveDownloadService(
+      adapter: _TicketAdapter(
+        StreamTicket(
+          url: src.ticket.url,
+          headers: src.ticket.headers,
+          contentLength: 20000,
+          maxConnections: 1,
+        ),
+      ),
+      connections: 8,
+      // 阈值 = 1024 * 4 = 4 KiB ⇒ 20000 字节本来**会**走分块。
+      chunkSize: 1024,
+    ).download(fileId: 'f1', savePath: target);
+
+    expect(result.bytes, 20000);
+    expect(File(target).readAsBytesSync(), src.bytes);
+    expect(ranges, isNotEmpty);
+    expect(ranges.every((r) => r == '-'), isTrue,
+        reason: '单连接路径（断点 0）不发 Range；出现 `bytes=a-b` 就说明'
+            '还是走了分块 —— 那正是要挡掉的行为');
+  });
+
+  // ============================================================
   // 多连接分块下载
   //
   // 以下测试用 `connections: 3, chunkSize: 1024` 把阈值压到 4 KiB，
@@ -400,6 +563,7 @@ void main() {
         })> chunkedSource(
       int total, {
       bool ignoreRange = false,
+      List<String>? rangeLog,
     }) async {
       final bytes = Uint8List(total);
       for (var i = 0; i < total; i++) {
@@ -414,6 +578,7 @@ void main() {
           final response = request.response;
 
           final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
+          rangeLog?.add(rangeHeader ?? '-');
           var from = 0;
           var count = bytes.length;
           var ranged = false;
@@ -595,6 +760,25 @@ void main() {
 
       expect(File(target).readAsBytesSync(), src.bytes);
       expect(result.bytes, 100);
+    });
+
+    test('票据没钉上限 ⇒ 照旧走分块（默认行为不被改坏）', () async {
+      // 加了 `StreamTicket.maxConnections` 之后，**没钉上限**的票据
+      // 必须还是走多连接 —— dlna 通道每条连接各自限速（1 条 1.1 MB/s、
+      // 8 条 4.1 MB/s），把它也一起关掉就等于白白丢 4 倍带宽。
+      final ranges = <String>[];
+      final src = await chunkedSource(20000, rangeLog: ranges);
+      final target = '${tmp.path}/fast.bin';
+
+      await DriveDownloadService(
+        adapter: _TicketAdapter(src.ticket),
+        connections: 3,
+        chunkSize: 1024,
+      ).download(fileId: 'f1', savePath: target);
+
+      expect(File(target).readAsBytesSync(), src.bytes);
+      expect(ranges.where((r) => r.startsWith('bytes=')), isNotEmpty,
+          reason: '出现 `bytes=a-b` 才说明走的是分块路径');
     });
   });
 }

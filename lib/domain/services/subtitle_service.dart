@@ -5,6 +5,7 @@ import '../../core/utils/file_names.dart';
 import '../../core/utils/subtitle_formats.dart';
 import '../../core/utils/text_encoding.dart';
 import '../entities/drive_entry.dart';
+import '../entities/drive_provider.dart';
 import '../entities/media_item.dart';
 import '../entities/subtitle_track.dart';
 
@@ -251,10 +252,13 @@ class ResolvedSubtitle {
 ///    失败再 GBK）再交给播放器，能把这一类问题**根治**。
 class SubtitleResolver {
   SubtitleResolver({
-    required Future<Uint8List> Function(String fileId) readBytes,
+    required Future<Uint8List> Function(DriveProvider provider, String fileId)
+        readBytes,
   }) : _readBytes = readBytes;
 
-  final Future<Uint8List> Function(String fileId) _readBytes;
+  /// 取字节。**必须带上网盘** —— 见 [load] 的说明。
+  final Future<Uint8List> Function(DriveProvider provider, String fileId)
+      _readBytes;
 
   /// 已取回的字幕（trackId → 内容），避免同一次会话内重复下载。
   final Map<String, ResolvedSubtitle> _cache = {};
@@ -263,7 +267,20 @@ class SubtitleResolver {
   ///
   /// [SubtitleOrigin.embedded] 会抛 —— 内嵌轨由播放器自己切轨，没有内容
   /// 可取（它的字节在视频文件里）。
-  Future<ResolvedSubtitle> load(SubtitleTrack track) async {
+  ///
+  /// ## ⛔ 为什么 [provider] 必须由调用方给，而不是内部去问「当前网盘」
+  ///
+  /// 媒体库是**多家网盘混在一个库里**的（主键是 `provider:fileId`），
+  /// 所以「当前网盘」这个概念不存在。字幕的 fid 只在**它自己那家**网盘里
+  /// 有效，用错一家去 `readFileBytes` 的后果是 404 / 参数错 ——
+  /// 表现为「字幕加载失败」，而用户完全看不出是网盘选错了。
+  ///
+  /// 调用方手上一定有正确的值：内置播放页有 `MediaItem.provider`，
+  /// 独立播放窗口有 `PlayRequest.itemId` 的前缀。
+  Future<ResolvedSubtitle> load(
+    SubtitleTrack track, {
+    required DriveProvider provider,
+  }) async {
     if (track.origin == SubtitleOrigin.embedded) {
       throw ArgumentError('内嵌字幕不需要取内容，应由播放器切轨');
     }
@@ -286,8 +303,12 @@ class SubtitleResolver {
       throw ArgumentError('网盘字幕缺少文件 ID：${track.displayLabel}');
     }
 
-    diag.info('字幕', '开始取字幕字节 fid=$fileId（${track.fileName ?? "-"}）');
-    final bytes = await _readBytes(fileId);
+    diag.info(
+      '字幕',
+      '开始取字幕字节 fid=$fileId（${track.fileName ?? "-"}，'
+          '网盘=${provider.displayName}）',
+    );
+    final bytes = await _readBytes(provider, fileId);
 
     // 解码 → 统一成 UTF-8 文本。这是「中文不乱码」的关键一步。
     final text = decodeTextBytes(bytes);

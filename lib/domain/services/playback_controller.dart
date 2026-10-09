@@ -19,6 +19,7 @@ import '../../data/playback/video_player_exo_playback_engine.dart';
 import '../adapters/cloud_drive_adapter.dart';
 import '../adapters/stream_relay.dart';
 import '../entities/media_item.dart';
+import '../entities/drive_provider.dart';
 import '../entities/playback_preference.dart';
 import '../entities/quality_option.dart';
 import '../entities/stream_ticket.dart';
@@ -234,6 +235,24 @@ class PlaybackController extends ChangeNotifier {
 
   /// 当前正在播放的媒体项
   MediaItem? get item => _item;
+
+  /// 当前条目属于**哪家网盘**。字幕取字节必须带上它。
+  ///
+  /// ## ⛔ 为什么没有默认值
+  ///
+  /// 媒体库是多家网盘混在一个库里的（主键 `provider:fileId`），所以没有
+  /// 「当前网盘」可退。退回某一家的后果是：跨网盘播片时拿**别家**的凭证
+  /// 去 `readFileBytes` —— 表现为「字幕加载失败」，而用户完全看不出原因。
+  ///
+  /// 三个调用点（预取 + 选中 + 本地字幕）都在 [open] 之后，`_item` 必然非空。
+  /// 所以这里抛得出来就说明调用顺序错了 —— 那是真 bug，应当响亮地失败。
+  DriveProvider get _itemProvider {
+    final item = _item;
+    if (item == null) {
+      throw StateError('尚未打开任何条目，无法确定字幕属于哪家网盘');
+    }
+    return item.provider;
+  }
 
   /// 当前票据（含全部清晰度档位）
   StreamTicket? get ticket => _ticket;
@@ -975,7 +994,7 @@ class PlaybackController extends ChangeNotifier {
 
   Future<void> _prefetchOne(SubtitleTrack track) async {
     try {
-      await _subtitleResolver.load(track);
+      await _subtitleResolver.load(track, provider: _itemProvider);
       diag.debug('字幕', '预取完成：${track.displayLabel}');
     } catch (e) {
       diag.debug('字幕', '预取失败（${track.displayLabel}）：$e');
@@ -1015,7 +1034,7 @@ class PlaybackController extends ChangeNotifier {
           // ⚠️ 走 [PlaybackEngine.loadExternalSubtitleText] 而不是
           // 「落成临时文件再给 URI」：mdk 只吃 URI，那件事由它的实现兜底
           // （见契约里那条方法的文档）。本层不该知道临时文件的存在。
-          final resolved = await _subtitleResolver.load(track);
+          final resolved = await _subtitleResolver.load(track, provider: _itemProvider);
           if (!resolved.isText) {
             throw StateError('网盘字幕应当解出文本');
           }
@@ -1027,7 +1046,7 @@ class PlaybackController extends ChangeNotifier {
           );
 
         case SubtitleOrigin.localFile:
-          final resolved = await _subtitleResolver.load(track);
+          final resolved = await _subtitleResolver.load(track, provider: _itemProvider);
           final path = resolved.path;
           if (path == null) throw StateError('本地字幕缺少路径');
           await _engine.loadExternalSubtitle(path);

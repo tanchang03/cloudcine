@@ -1,3 +1,4 @@
+import '../entities/drive_provider.dart';
 import '../entities/follow_dir.dart';
 
 /// 一次追更检查的**纯决策**：从「要查哪些目录」推出「哪些作品的水位线可以推进」。
@@ -40,16 +41,26 @@ class FollowPlan {
 
   /// 从「目录 → 它覆盖的作品」反推出整个计划。
   ///
-  /// [dirs] 里同一个 fid 出现多次时**合并** `workKeys`（取并集），路径取
-  /// 首次出现的那个。仓储实现已经去过重，这里再兜一次是为了让这个类
-  /// **自己**就是可信的 —— 单测直接喂重复输入也应该得到正确的计划。
+  /// [dirs] 里同一个 `(provider, dirId)` 出现多次时**合并** `workKeys`
+  /// （取并集），路径取首次出现的那个。仓储实现已经去过重，这里再兜一次
+  /// 是为了让这个类**自己**就是可信的 —— 单测直接喂重复输入也应该得到
+  /// 正确的计划。
+  ///
+  /// ## ⛔ 去重键是 `(provider, dirId)` 而不是 `dirId`
+  ///
+  /// `dirId` 只在**它自己那家**网盘内唯一：夸克的 `fid` 与百度的 `fs_id`
+  /// 是两套独立编号，撞号完全可能。只按 `dirId` 去重的话，两家的目录会被
+  /// 判成同一个、`workKeys` 被并到一起，然后**只按先出现的那家**去列目录
+  /// —— 另一家的目录一次都没查，表现是「那几部剧永远不提醒更新」。
   factory FollowPlan.of(Iterable<FollowDir> dirs) {
     final byId = <String, FollowDir>{};
     for (final d in dirs) {
-      final prev = byId[d.dirId];
-      byId[d.dirId] = prev == null
+      final key = dirKey(d.provider, d.dirId);
+      final prev = byId[key];
+      byId[key] = prev == null
           ? d
           : FollowDir(
+              provider: d.provider,
               dirId: d.dirId,
               dirPath: prev.dirPath,
               workKeys: {...prev.workKeys, ...d.workKeys},
@@ -58,8 +69,9 @@ class FollowPlan {
 
     final dirsByWork = <String, Set<String>>{};
     for (final d in byId.values) {
-      for (final key in d.workKeys) {
-        (dirsByWork[key] ??= <String>{}).add(d.dirId);
+      final key = dirKey(d.provider, d.dirId);
+      for (final work in d.workKeys) {
+        (dirsByWork[work] ??= <String>{}).add(key);
       }
     }
 
@@ -70,6 +82,18 @@ class FollowPlan {
       },
     );
   }
+
+  /// 目录的全局唯一键：`provider:dirId`。
+  ///
+  /// 与 `MediaItem.id` 同构（都是 `provider:fileId`），所以库里任何一处
+  /// 拿 `MediaItem.id` 拼出来的键都能直接对上。
+  ///
+  /// ⚠️ **公开**（不是私有）：`FollowService` 收集「这次哪些目录没读完整」
+  ///    时用的必须是**同一个键**，否则 [checkedWorks] 一个都匹配不上 ——
+  ///    表现是「有目录失败，但所有作品的水位线照样被推进」，也就是把没读到
+  ///    的新集永久划进「已读」，而日志上只会看到一条 warn。
+  static String dirKey(DriveProvider provider, String dirId) =>
+      '${provider.id}:$dirId';
 
   /// 这次检查结束后，**哪些作品的水位线可以推进**。
   ///

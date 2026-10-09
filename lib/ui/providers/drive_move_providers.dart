@@ -220,10 +220,11 @@ class DriveMoveController extends Notifier<DriveMoveState> {
       return null;
     }
 
-    final adapter =
-        ref.read(adapterRegistryProvider).adapterFor(browseProvider);
+    final adapter = ref
+        .read(adapterRegistryProvider)
+        .adapterFor(ref.read(browseProvider));
     if (adapter == null) {
-      diag.warn('文件', '批量移动：夸克适配器未注册');
+      diag.warn('文件', '批量移动：当前网盘适配器未注册');
       return null;
     }
 

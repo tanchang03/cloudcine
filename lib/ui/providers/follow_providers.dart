@@ -8,7 +8,6 @@ import '../../domain/services/follow_service.dart';
 import '../../domain/services/media_discovery.dart';
 import '../../domain/services/scan_service.dart';
 import 'app_providers.dart';
-import 'drive_browse_providers.dart';
 import 'library_providers.dart';
 import 'library_refresh_providers.dart';
 import 'scan_providers.dart';
@@ -76,6 +75,12 @@ final followServiceProvider = Provider<FollowService>((ref) {
     settings: ref.watch(settingsStoreProvider),
     // ⛔ 适配器**写死** `recursive: true`（见 [followDiscoveryAdapter]）：
     //    剧集常在 `S01/` 子目录里，只看一层会永远发现不了新集。
+    //
+    // ⚠️ **不再传 `provider`**：每家网盘同时在线，而每个目录属于哪家由
+    //    `FollowDir.provider` 自己带（从 `media_items.provider` 读出来）。
+    //    固定一家的话，另一家那几部剧会拿错的 id 去列目录 —— 多半列到空
+    //    目录，检查结束报「没有更新」，用户以为那几部剧真没更新。
+    //
     // ⛔ 每次列目录都**现建**一个 `MediaDiscoveryService`（`buildScanPolicy`
     //    现读设置），与 `DiscoveryController._buildService` 一致 ——
     //    缓存一份的话，用户在设置页改了并发 / 限速要重启才生效。
@@ -85,7 +90,6 @@ final followServiceProvider = Provider<FollowService>((ref) {
         library: ref.read(mediaRepositoryProvider),
         policy: await buildScanPolicy(ref),
       ),
-      provider: browseProvider,
     ),
   );
 });

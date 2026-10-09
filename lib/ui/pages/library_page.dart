@@ -346,9 +346,17 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     final VoidCallback? scrapeAction = (!canScrape || busyScanning)
         ? null
         : () => ref.read(libraryScrapeControllerProvider.notifier).start();
+    // ⛔ 从媒体库页头发起的「重新扫描」也要带上**扫哪一家**。
+    //
+    //    这里跟扫描页**同一个选择**（`scanDriveProvider`），而不是再算一遍
+    //    「默认第一家有账号的」—— 两处各算一遍的话，用户在扫描页选了百度、
+    //    回到媒体库点「重新扫描」却扫了夸克，那种不一致最难解释。
+    final scanDrive = ref.watch(scanDriveProvider);
     final VoidCallback? rescanAction = busyScanning
         ? null
-        : () => ref.read(scanControllerProvider.notifier).start();
+        : () => ref
+            .read(scanControllerProvider.notifier)
+            .start(provider: scanDrive);
     void selectAction() =>
         ref.read(librarySelectionProvider.notifier).enter();
 

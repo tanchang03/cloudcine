@@ -147,4 +147,68 @@ void main() {
       expect(next, same(ticket));
     });
   });
+
+  /// 「这条通道最多开几条连接」。
+  ///
+  /// 2026-10-09 对百度两条通道实测（同一账号、同一文件）：
+  /// `origin=dlna` 每条连接各自限速（1 条 1.1 MB/s、8 条 4.1 MB/s），
+  /// 而普通通道是**按账号**限速（1 条 82 KB/s、8 条 68 KB/s 且全被掐断）。
+  /// 所以「开几条」不能由下载服务拍一个全局默认值 —— 它写在票据上。
+  group('StreamTicket.maxConnections', () {
+    test('票据没写上限时用消费方的默认值', () {
+      final ticket = StreamTicket(url: Uri.parse('https://cdn/a.mkv'));
+
+      expect(ticket.maxConnections, isNull);
+      expect(ticket.connectionsFor(8), 8);
+      expect(ticket.connectionsFor(3), 3,
+          reason: '默认值是多少就返回多少，不该被悄悄改成 8');
+    });
+
+    test('票据钉了上限就以票据为准', () {
+      final ticket = StreamTicket(
+        url: Uri.parse('https://cdn/a.pdf'),
+        maxConnections: 1,
+      );
+
+      expect(ticket.connectionsFor(8), 1,
+          reason: '普通通道按账号限速，8 条连接的总吞吐还不如 1 条，'
+              '而且每条都会被拖到读超时、最后被服务端掐断 ——'
+              '那正是「下载卡在 0% 不动」的样子');
+    });
+
+    test('上限小于 1 时收敛到 1 —— 绝不能算出 0 条连接', () {
+      // 0 条连接会让「文件足够大」那条分块判据静默失效，
+      // 表现是「大文件永远走单连接」，而单连接在这条通道上是**错的**。
+      final ticket = StreamTicket(
+        url: Uri.parse('https://cdn/a.pdf'),
+        maxConnections: 0,
+      );
+
+      expect(ticket.connectionsFor(8), 1);    });
+
+    test('换档不换通道：并发上限跟着票据走', () {
+      // 上限是**通道**的属性，与清晰度无关。漏掉它会让换到转码档之后
+      // 又回到「8 条连接打一条慢通道」。
+      final ticket = StreamTicket(
+        url: Uri.parse('https://cdn/origin.mkv'),
+        maxConnections: 1,
+      );
+
+      final next = ticket.withQuality(
+        const QualityOption(
+          id: '4k',
+          label: '4K',
+          url: null,
+        ),
+      );
+
+      // 没地址的档位原样返回 —— 换个有地址的再试。
+      expect(next, same(ticket));
+
+      final switched = ticket.withQuality(
+        QualityOption(id: '4k', label: '4K', url: Uri.parse('https://cdn/4k.mkv')),
+      );
+      expect(switched.maxConnections, 1);
+    });
+  });
 }

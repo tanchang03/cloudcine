@@ -7,6 +7,7 @@ import '../providers/auth_providers.dart';
 import '../providers/drive_browse_providers.dart';
 import '../providers/folder_providers.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/drive_tabs.dart';
 import '../widgets/folder_browser.dart';
 import '../widgets/storage_meter.dart';
 import '../widgets/tv_affordance.dart';
@@ -113,6 +114,10 @@ class _FolderPageState extends ConsumerState<FolderPage> {
 
   @override
   Widget build(BuildContext context) {
+    // ⛔ 这一页**所有**按网盘的取值都来自它（容量条、看到的目录树）。
+    final drive = ref.watch(browseProvider);
+    final connected = ref.watch(connectedDrivesProvider);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -140,11 +145,33 @@ class _FolderPageState extends ConsumerState<FolderPage> {
             ),
           ],
         ),
+        // ⛔ **必须有一排可见的切换**。多家网盘同时在线，而目录树一次只能
+        //    显示一棵 —— 没有它，用户连着两家却只看到其中一棵，而且不知道
+        //    另一棵在哪（那正是「没看到百度入口」的观感）。
+        //
+        //    换它**不会**让任何一家掉线：那只是「我在看哪棵树」的选择。
+        Padding(
+          padding: const EdgeInsets.fromLTRB(22, 0, 22, 8),
+          child: DriveTabs(
+            drives: connected,
+            selected: drive,
+            label: '浏览',
+            onChanged: (p) {
+              ref.read(browseDriveChoiceProvider.notifier).select(p);
+              // 换网盘 = 换一整棵树：浏览栈（目录 id）在另一家毫无意义，
+              // 留着会拿着别家的 fid 去列目录。
+              ref.read(driveBrowseProvider.notifier).reset();
+            },
+          ),
+        ),
         // 容量条（总量 / 已用 / 剩余 + 一条小进度条）。
+        //
+        // ⛔ 显示的是**正在浏览的那一家**的容量，不是「某一家」的 ——
+        //    多家同时在线，显示错一家的容量比不显示更误导。
         //
         // 未登录或拿不到容量时它自己返回空 —— 判据收在组件里，这里不重复。
         DriveStorageMeter(
-          account: ref.watch(authControllerProvider).valueOrNull?.account,
+          account: ref.watch(accountForProviderProvider(drive)),
         ),
         Expanded(child: FolderBrowser(onClearSearch: _clearSearch)),
       ],

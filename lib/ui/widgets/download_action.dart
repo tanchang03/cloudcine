@@ -63,7 +63,7 @@ Future<void> downloadDriveEntry(
   if (!context.mounted) return;
 
   await ref.read(downloadQueueProvider.notifier).enqueue(
-        provider: browseProvider.name,
+        provider: ref.read(browseProvider).name,
         fileId: entry.id,
         name: entry.name,
         savePath: savePath,
@@ -113,8 +113,9 @@ Future<void> downloadDriveFolder(
   final saveRoot = root;
   if (!context.mounted) return;
 
-  final adapter =
-      ref.read(adapterRegistryProvider).requireAdapter(browseProvider);
+  final adapter = ref
+      .read(adapterRegistryProvider)
+      .requireAdapter(ref.read(browseProvider));
   final settings = ref.read(settingsProvider).valueOrNull;
 
   // 与扫描共用同一个节流间隔：批量下载的遍历同样是「每个目录一次请求」，
@@ -164,9 +165,10 @@ Future<void> downloadDriveFolder(
   }
 
   final queue = ref.read(downloadQueueProvider.notifier);
+  final providerName = ref.read(browseProvider).name;
   for (final item in plan) {
     await queue.enqueue(
-      provider: browseProvider.name,
+      provider: providerName,
       fileId: item.entry.id,
       name: item.name,
       // ⚠️ 只拼**子目录相对路径**，不再拼一遍目录名：桌面那条路上

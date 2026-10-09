@@ -1,3 +1,4 @@
+import 'package:cloudcine/data/auth/quark_qr_driver.dart';
 import 'package:cloudcine/data/auth/quark_qr_login.dart';
 import 'package:cloudcine/data/http/http_client.dart';
 import 'package:cloudcine/ui/pages/auth_qr_login_page.dart';
@@ -101,8 +102,11 @@ void main() {
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
-          qrLoginClientProvider.overrideWithValue(
-            QuarkQrLoginClient(http: _NoNetHttp()),
+          // 页面现在从**驱动工厂**拿会话（夸克 / 百度两家的形态差异被驱动
+          // 吃掉，页面里没有 `if (provider == ...)`），所以覆盖点也在这里。
+          qrLoginDriverFactoryProvider.overrideWithValue(
+            (provider) =>
+                QuarkQrDriver(client: QuarkQrLoginClient(http: _NoNetHttp())),
           ),
         ],
         child: MaterialApp(
