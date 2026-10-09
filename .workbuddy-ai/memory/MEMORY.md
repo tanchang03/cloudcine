@@ -17,7 +17,7 @@
 - 4 列在 `media_works`：`followed`/`follow_started_at`/`follow_checked_at`/`new_item_count`（schema **17**，无回填）。判据用 `first_seen_at` 做差（⛔ 不用 `modified_at`）。NEW = 追剧后新增 ∧ **`max_position_ms`·`last_played_at` 两条都空**。
 - ★★ **「点过就不再是 NEW」两端同口径**：`last_played_at` 在**点击那一刻**写（`markPlayed`），⛔ **不等**进度落库、写完**必须重读该页**；⛔ 起播**不写** `max_position_ms`。PC 只下调计数、跟 `mergedInto`；Android 走 `onActivityResult(REQ_PLAYER)`。
 - ⛔⛔ 自动检查**绝不写 `media_works.updated_at`**（污染同步 LWW）；节流零点 `settings.follow_last_check_at`（Unix **秒字符串**）。⛔ 目录失败不推进水位线（按**目录**回写）。⛔⛔ `FollowAutoCheck.off` 的 `throttleWindow == null` = 不节流 ⇒ 必须 `_run` 里**显式**挡掉。⛔ 手动入口 `force: true`；⛔ 扫描/刮削在跑时禁用。
-- PC：`AppShell._FollowLaunchCheck`（延迟 20s + `every_6h`），⛔ 两个 `Timer` 必须 `dispose`；「检查更新」在**分类栏右端**；角标 = `new_item_count > 0` 的作品数；⛔ 不加侧栏一级入口。⚠️⚠️ **未修缺口**：增量统计与发现两套口径 ⇒ 新集归到新作品时增量恒 0、报「没有更新」（§9.12）。
+- PC：`AppShell._FollowLaunchCheck`（延迟 20s + `every_6h`），⛔ 两个 `Timer` 必须 `dispose`；入口位置/角标口径见 §9。⚠️⚠️ **未修缺口**：增量统计与发现两套口径 ⇒ 新集归到新作品时增量恒 0、报「没有更新」（§9.12）。
 
 ## ★★ Android 端红线
 - ⛔⛔ 电视上 **`AbsListView.OnItemClickListener` 按 OK 不触发** ⇒ `dispatchKeyEvent` 自管 OK，**DOWN 与 UP 都要吞**。
@@ -41,17 +41,18 @@
 
 ## Flutter PC 端红线
 - 最常踩三条：⛔ `chunkSize` 别放大（2→8 MiB⇒零成功播放）；⛔ `app_shell._items` 与 `app_router.branches` **必须同序**（判据是**下标**）；⛔ 恢复备份后清设置缓存（`SettingsStore._cache`+`SettingsController`）。
+- ★★ 页面级 UI 测试（裸铺 `LibraryPage` 等）**必须**注入 `appSupportDirProvider`（真临时目录）：页面读 `scanDriveProvider` 会连锁到 `credentialStoreProvider` ⇒ 缺了报 `UnimplementedError`（CI 红）。⛔ 别照抄设置页用例连 `posterCacheDirProvider` 一起注入 —— 媒体库页不读它（已实测）。
 
 ## ★★ 百度网盘（细节 → `2026-10-08/09.md`）
 - 代码：`lib/data/remote/baidu/*` + `lib/data/auth/baidu_qr{_login,_driver}.dart`。⛔ 开放平台不可用（xpan 恒 `9019`）⇒ **BDUSS 扫码**。
 - ★★ **直链两跳**：`d.pcs.baidu.com` **302** → `*.baidupcs.com`。⛔⛔ Dart 自动重定向丢 UA ⇒ **消费票据一律走 `applyTicketHeaders`**（手工贴头也须 `applyTicketUserAgent`）。
-- ★★ **两条通道吞吐差 30 倍**（10-09 实测）：`origin=dlna` 直链带 `vuk`、**只服务媒体**（视频/音频 1~2.9 MB/s；文档 `403 31329`）；不带 `origin` 覆盖面全但**按账号**限速 ~80 KB/s ⇒ 取链**先带 dlna**，按 `info[].category`（1=视频·2=音频，`canUseDlna`）分流，非媒体**重取一次去 origin**。⛔ 普通通道**必须单连接**；⛔ **连接数不是提速杠杆**（1 vs 4 互有胜负；跑 ~10 MiB 后账号额度耗尽，1/4/8 一起归零）⇒ `StreamTicket.maxConnections`+`connectionsFor()`（`withQuality`/`_mergeOriginalAndLadder` 都要带）。⛔ 无 `vuk` 直链**第一跳必带 `Cookie`**。⛔ `stallTimeout`(`_stallGuarded`) 兜「响应头到了包体不来」。
+- ★★ **两通道吞吐差 30 倍**（10-09 实测）：`origin=dlna` 带 `vuk`、**只服务媒体**（视频/音频 1~2.9 MB/s；文档 `403 31329`）；不带 `origin` 覆盖全但**按账号**限速 ~80 KB/s ⇒ 取链**先带 dlna**，按 `info[].category`（1=视频·2=音频，`canUseDlna`）分流，非媒体**重取一次去 origin**。⛔ 普通通道**必须单连接**；⛔ **连接数不是提速杠杆**（1 vs 4 互有胜负；跑 ~10 MiB 后账号额度耗尽，1/4/8 一起归零）⇒ `maxConnections`+`connectionsFor()`（`withQuality`/`_mergeOriginalAndLadder` 都要带）。⛔ 无 `vuk` 直链**第一跳必带 `Cookie`**；⛔ `stallTimeout`(`_stallGuarded`) 兜「响应头到了包体不来」。
 - ⛔⛔ 与夸克**三处结构性差异**：目录标识是**路径**（`dir=/电影`，`rootId='/'`）· 列表在**顶层 `list`** · 目录位 **`isdir:1`**。⛔ 原画哨兵**必须**用 `kOriginalQualityId`。
-- ★★ **扫码链 4 步**：①`getqrcode` ②`unicast` ③换票（主线 `GET /v2/api/bdusslogin`，⛔ **不带 `loginVersion`**）④落地网盘域（回 **302**，`u`=落点 ⇒ ⛔ 禁自动重定向、**但必须手动逐跳跟到 `pan.baidu.com`**，否则 `uinfo` 恒 `-6`）。⚠️ 三条易错分支与落地 Cookie 放行见 `2026-10-08/09.md`。
-- ★★ **`bdstoken` 必带**（每条 `/api/*` 都带，**读也要**；缺了回 `-6` ⇒ 适配器「补令牌重试一次」自愈）。第 5 步换 **netdisk STOKEN**（只认 `stoken_list.netdisk`）。⛔ 必带 `Origin`·`Referer`·浏览器 UA；⛔ 4 步**同一批 Cookie**（`start()` 清罐）。⚠️ `-6` **一码多义** ⇒ 打原始响应体。
-- ★★ **多网盘并存（无「当前网盘」概念）**：`AuthState` = `Map<DriveProvider,CloudAccount>`。`CloudDriveAdapter` = 唯一架构边界（新网盘 = 实现 adapter + 加枚举值，必须 `extends` 继承四个抛 `unsupported` 的写默认）。⛔ 用到网盘处都收**显式** `DriveProvider`（`MediaItem.provider`/`DownloadTask.provider`）。
-  - 视图选 provider（内存态、不持久化）：`browseDriveChoiceProvider`+派生 `browseProvider`、`scanDriveChoiceProvider`+派生 `scanDriveProvider`，默认首个已连网盘（无则 quark）。
-  - `connectedDrivesProvider`（已登录）vs `selectableDrivesProvider`（注册了 `AuthMode.qrCode` 的 adapter）；`accountForProviderProvider = Provider.family<CloudAccount?,DriveProvider>`；`backupDriveProvider` = 首个 `capabilities.canWrite` 的已连盘。⛔ `QrLoginDriver` 由**工厂**产出（⛔ 不能用 `family` ⇒ 缓存实例 = 旧 sign）。
+- ★★ **扫码链 4 步**：`getqrcode` → `unicast` → 换票 → 落地网盘域。⛔ 换票主线 `GET /v2/api/bdusslogin`、**不带 `loginVersion`**（`qrbdusslogin`=风控分支、`v5`=小程序分支）；④ 回 **302** ⇒ ⛔ 禁自动重定向、**但必须手动逐跳跟到 `pan.baidu.com`**（否则 `uinfo` 恒 `-6`）。
+- ★★ **`bdstoken` 必带**（每条 `/api/*` 都带，**读也要**；缺了回 `-6` ⇒ 适配器「补令牌重试一次」自愈）。第 5 步换 **netdisk STOKEN**。⛔ 必带 `Origin`·`Referer`·浏览器 UA；⛔ 4 步**同一批 Cookie**。⚠️ `-6` **一码多义** ⇒ 打原始响应体。
+- ★★ **多网盘并存（无「当前网盘」概念）**：`AuthState` = `Map<DriveProvider,CloudAccount>`。`CloudDriveAdapter` = 唯一架构边界（新网盘 = 实现 adapter + 加枚举值，必须 `extends` 继承四个抛 `unsupported` 的写默认）。⛔ 用到网盘处都收**显式** `DriveProvider`。
+  - 视图选择（内存态、不持久化）：`browseDriveChoiceProvider`→`browseProvider`、`scanDriveChoiceProvider`→`scanDriveProvider`，默认首个已连网盘（无则 quark）。
+  - 其他：`connectedDrivesProvider`（已登录）/`selectableDrivesProvider`（注册了 `AuthMode.qrCode` 的）/`accountForProviderProvider`/`backupDriveProvider`（首个 `canWrite` 的已连盘）。⛔ `QrLoginDriver` 由**工厂**产出（⛔ 不能用 `family` ⇒ 缓存实例 = 旧 sign）。
 
 ## 运维 / 打包 / 测试
 - 采样/取证 → `HOWTO.md` §8；发版 → §10。

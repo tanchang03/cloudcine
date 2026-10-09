@@ -25,6 +25,7 @@ import 'dart:typed_data';
 
 import '../../core/diagnostics/diag_log.dart';
 import '../../core/utils/dolby_vision.dart';
+import '../../core/utils/ticket_headers.dart';
 
 /// 取「文件头部前 [maxBytes] 字节」的能力。
 ///
@@ -54,6 +55,15 @@ Future<Uint8List?> fetchHeadBytesDirect(
   try {
     final request = await client.getUrl(url);
     headers.forEach(request.headers.set);
+    // ⛔⛔ 光把票据头 set 到 `request.headers` **不够**：直链回 302 时
+    //      `dart:io` 会把 `User-Agent` 换成客户端级默认值
+    //      （`Dart/x.y (dart:io)`），而百度 `origin=dlna` 直链**第二跳的
+    //      `sign` 正是按 UA 签的** ⇒ 探测拿到 `403 31362 sign error`，
+    //      按「不是 DV」处理返回 `null`。而 `null` 与「不是 DV」在接口上
+    //      无法区分 ⇒ **DV P5 片源不换内核、画面偏绿**，且日志里一条错误
+    //      都没有（2026-10-09 与中继分块取块是同一类漏洞）。
+    //      只有设到**客户端级**才能熬过重定向 —— 见 [applyTicketUserAgent]。
+    applyTicketUserAgent(client, headers);
     request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-${maxBytes - 1}');
     // 与取链那条路一致：不要压缩。带 gzip 拿到的不是文件的原始字节，
     // 而 EBML / ISO BMFF 的魔数判据是逐字节的。

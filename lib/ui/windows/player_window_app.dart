@@ -20,6 +20,7 @@ import '../../core/utils/player_audio_effect.dart';
 import '../../core/utils/player_buffer_progress.dart';
 import '../../core/utils/seek_acceleration.dart';
 import '../../core/utils/text_encoding.dart';
+import '../../core/utils/ticket_headers.dart';
 import '../../core/utils/track_bridge.dart';
 import '../../core/utils/track_labels.dart';
 import '../../data/playback/fvp_playback_engine.dart';
@@ -1597,6 +1598,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       for (final e in request.headers.entries) {
         httpRequest.headers.set(e.key, e.value);
       }
+      // ⛔ 与 `fetchHeadBytesDirect` 同一条理由：直链回 302 时 `dart:io` 会
+      //    丢掉请求头上的 `User-Agent`，而百度 dlna 直链第二跳的 `sign`
+      //    是按 UA 签的。少了这一句，自检会拿回一个 403 并**误报**
+      //    「是我们给的凭证不对」—— 而这条自检存在的全部意义就是分开
+      //    「凭证不对」和「播放器读不动」。见 [applyTicketUserAgent]。
+      applyTicketUserAgent(client, request.headers);
       final response = await httpRequest.close();
 
       final chunks = <List<int>>[];
@@ -1679,6 +1686,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       for (final e in request.headers.entries) {
         httpRequest.headers.set(e.key, e.value);
       }
+      // ⛔ 同上：分片自检也要把 UA 设到**客户端级**，否则 302 之后
+      //    「HTTP 403」会被读成凭证问题。见 [applyTicketUserAgent]。
+      applyTicketUserAgent(client, request.headers);
       final response = await httpRequest.close();
       var total = 0;
       await for (final chunk in response) {

@@ -183,6 +183,60 @@ void main() {
       expect(cookie, 'a=b');
     });
 
+    test('⛔ 票据 UA 必须熬过 302 —— 否则 dlna 直链第二跳回 403，探测静默变 null',
+        () async {
+      // 2026-10-09：中继分块取块漏设客户端级 UA，18304 次取块全 403。
+      // 同一类漏洞在**杜比视界探测**这条路上也在 —— 而且它更隐蔽：
+      // 探测**故意打上游直链**（不是中继那条 `127.0.0.1`，见
+      // `player_window_app.dart` 里 `selectFor` 上方的注释），而
+      // `dart:io` 跟随 302 时会把请求头上的 `User-Agent` 换成客户端级默认值
+      // （`Dart/x.y (dart:io)`）。百度 `origin=dlna` 直链**第二跳的 `sign`
+      // 正是按 UA 签的** ⇒ 探测拿到 403，按「不是 DV」处理返回 `null`，
+      // 而 `null` 与「不是 DV」在接口上无法区分 ⇒ **DV P5 片源不换内核、
+      // 画面偏绿**，日志里一条错误都没有。
+      final secondHopUas = <String?>[];
+      final cdn = await _serve((req, res) async {
+        final ua = req.headers.value('User-Agent');
+        secondHopUas.add(ua);
+        if (ua != 'netdisk') {
+          // 复刻百度 CDN 的真实行为：sign 按 UA 签，UA 不对就 403。
+          res.statusCode = HttpStatus.forbidden;
+          res.write('{"error_code":31362,"error_msg":"sign error"}');
+          await res.close();
+          return;
+        }
+        res.statusCode = HttpStatus.partialContent;
+        res.headers.set(HttpHeaders.contentRangeHeader, 'bytes 0-7/1000');
+        res.add(List<int>.filled(8, 0));
+        await res.close();
+      });
+      addTearDown(cdn.stop);
+
+      final edge = await _serve((req, res) async {
+        res.statusCode = HttpStatus.found;
+        res.headers.set(HttpHeaders.locationHeader, cdn.uri.toString());
+        await res.close();
+      });
+      addTearDown(edge.stop);
+
+      final bytes = await fetchHeadBytesDirect(
+        edge.uri,
+        const {'User-Agent': 'netdisk', 'Cookie': 'BDUSS=x'},
+        8,
+      );
+
+      expect(secondHopUas, isNotEmpty, reason: '第二跳必须真的被访问到');
+      expect(
+        secondHopUas.every((ua) => ua == 'netdisk'),
+        isTrue,
+        reason: '第二跳看到的 UA 是 ${secondHopUas.toSet()}，不是票据里的 netdisk —— '
+            '`dart:io` 跟随 302 会丢掉请求头上的 User-Agent，只认客户端级的那个。'
+            '漏掉这一步，探测对 dlna 直链一律 403 ⇒ 静默返回 null ⇒ '
+            'DV P5 不换内核、画面偏绿',
+      );
+      expect(bytes, isNotNull, reason: '第二跳认了 UA，字节才取得到');
+    });
+
     test('上游 4xx → null（按「不是 DV」处理，不当错误）', () async {
       final server = await _serve((req, res) async {
         res.statusCode = 404;

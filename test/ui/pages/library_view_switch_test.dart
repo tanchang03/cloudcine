@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:cloudcine/core/utils/filename_parser.dart';
 import 'package:cloudcine/data/db/app_database.dart';
 import 'package:cloudcine/data/db/media_repository_impl.dart';
@@ -82,12 +84,25 @@ void main() {
       item('c', 'f3'),
     ], now: now);
 
+    // 媒体库页头会读 `scanDriveProvider`（「重新扫描」必须带上**扫哪一家**），
+    // 它经 `connectedDrivesProvider` → `adapterRegistryProvider` →
+    // `credentialStoreProvider` → `appSupportDirProvider` 去取凭证目录。
+    // 这个 provider 在 `main()` 里注入，单测里给一个真的空目录 ——
+    // 别让它去碰用户的家目录。
+    // ⚠️ 页面目前**不读** `posterCacheDirProvider`，所以这里刻意不注入它
+    // （设置页那条用例才需要）。哪天海报卡片改成 watch 它，这条用例会红 ——
+    // 那正是「页面加 watch 要同步补 override」的正常信号。
+    final supportDir =
+        Directory.systemTemp.createTempSync('cloudcine_view_switch');
+    addTearDown(() => supportDir.deleteSync(recursive: true));
+
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
         mediaRepositoryProvider.overrideWithValue(repo),
         authControllerProvider.overrideWith(FakeAuth.new),
         scanControllerProvider.overrideWith(FakeScan.new),
+        appSupportDirProvider.overrideWithValue(supportDir.path),
       ],
     );
     addTearDown(container.dispose);
