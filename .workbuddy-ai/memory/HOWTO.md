@@ -6601,32 +6601,56 @@ return item.maxPositionMs == null && item.lastPlayedAt == null   // 原：只看
 ### 10.1 触发方式
 `.github/workflows/release.yml` 只认 **`v*` tag**：
 ```bash
+dart tool/version.dart --set 0.1.0 && git commit -am "chore: 0.1.0"   # 先把版本号统一
 git tag -a v0.1.0 -m "…" && git push origin v0.1.0
 ```
-推 tag ⇒ 跑测试 → 三端构建 → **全部成功才** `gh release create`。
-⛔ 上架是**独立 job**（`needs: [build-macos, build-windows, build-android]`），
-任一平台失败 ⇒ **Release 根本不出现**（只留下 tag 和一次红的 run）。
+推 tag ⇒ **version-guard（版本号一致性）** → 跑测试 → 三端构建 →
+**全部成功才** `gh release create`。
+⛔ 上架是**独立 job**（`needs: [version-guard, build-macos, build-windows, build-android]`），
+任一前置 job 失败 ⇒ **Release 根本不出现**（只留下 tag 和一次红的 run）。
 所以「tag 推出去就收不回来」在本仓库只对 **tag** 成立，Release 是有闸门的。
+⛔ 版本号守卫排在**造产物之前**（三个构建 job 都 `needs` 它）—— 2026-10-11 之前
+它不存在，于是 v0.1.6 那次挂出的产物名叫 `cloudcine-0.1.1-*`。
 ⛔ `workflow_dispatch` 手动触发时 `github.ref` 是**分支名** ⇒ release job 的
 `if: startsWith(github.ref, 'refs/tags/v')` 不成立 ⇒ 只构建、不上架，产物留在
 本次 run 的 Artifacts 里。想先试就跑它。
 
-### 10.2 ⛔⛔ 版本号有**两个源头，必须同时改**
-| 平台 | 真源 | 产物名 |
-|---|---|---|
-| macOS / Windows | `pubspec.yaml` 的 `version: x.y.z+N` | `cloudcine-x.y.z-macos.dmg` / `-windows-x64.msi` |
-| Android | `android/app/build.gradle.kts` 的 `versionName` | `cloudcine-<versionName>-b<versionCode>-android.apk` |
+### 10.2 ★★ 版本号：一处真源 + 两道守卫（2026-10-11 整改，取代旧的「两个源头」）
+真源**只有一个**：`pubspec.yaml` 的 `version: x.y.z+build`。其余落点全部派生：
 
-两边不一致 ⇒ **同一个 Release 挂着两个版本号**（2026-10-07 修：Android 侧是
-从没改过的占位 `1.0.0`，PC 侧是 `0.1.0`）。README 与 `.github/release-notes.md`
-承诺的是统一的 `cloudcine-x.y.z-*`。
-- ⛔ `versionCode` 必须**单调递增**（不递增 ⇒ 已装设备报「应用未安装」）；
-  `pubspec` 的 `+N` 与它同义，也应同步。
+| 落点 | 怎么来 |
+|---|---|
+| macOS `CFBundleShortVersionString` | Flutter 构建期从 pubspec 注入 `FLUTTER_BUILD_NAME`（自动） |
+| Windows exe VERSIONINFO / MSI 包名 / zip 名 | `FLUTTER_VERSION` + `build_package.ps1` 读 pubspec（自动） |
+| 设置页「关于」显示的版本 `_kAppVersion` | **手写** ⇒ `tool/version.dart` 写入 |
+| Android `versionName` / `versionCode` | **手写** ⇒ `tool/version.dart` 写入 |
+
+```bash
+dart tool/version.dart --set 0.2.0   # ① 改版本号（写 pubspec + 同步另外两处）
+dart tool/version.dart --check       # 只校验（有问题退出码 1）
+dart tool/version.dart               # 按 pubspec 同步
+dart tool/version.dart --print       # 只打印版本号（CI 取 outputs）
+```
+- ★★ **`versionCode = major*10000 + minor*100 + patch`，且与 pubspec 的 `+build` 同值**
+  （0.1.6 → 106）。这样天然单调递增，不用人工维护「上次用到几了」的计数器 ——
+  那个计数器正是漂移的温床。⚠️ 历史值：0.1.1 时代 versionCode 是手写的 `2`。
+- ★★ 两道守卫，判定逻辑**只有 `tool/version.dart` 一份**：
+  `release.yml` 的 `version-guard` job（三个构建 job 都 `needs` 它，排在造产物之前）
+  + `test/core/version_consistency_test.dart`（`flutter test` 里跑，本地就红）。
+- ⛔⛔ **tag 必须等于 pubspec 的版本**（`--check --tag "$GITHUB_REF_NAME"`）。
+  手动触发 workflow 时 `GITHUB_REF_NAME` 是分支名 ⇒ 脚本识别出「不是版本 tag」
+  并跳过该项，只校验代码内自洽。
+- ⛔ **不许让 Gradle 去读仓库根的 pubspec** —— `android/` 是独立原生工程
+  （见 MEMORY.md「两个互不引用的工程」），那样会把两条构建链路重新焊死。
+  所以是「手写字面量 + 机器守卫」，不是「自动派生」。
+- ⛔ 在 workflow 里**再抄一份 grep/sed 解析**是禁止的（第二份实现 = 改一处就分叉）。
+  build-android 的版本号已改成取 `needs.version-guard.outputs.version`。
 - ⛔ `applicationId` 不许动（换包名 = 丢磁盘缓存）。
-- ⛔ **tag 名**（`v0.1.0`）也要跟这两个对上 —— Release 标题用的是 `GITHUB_REF_NAME`。
 
 ### 10.3 本地预检（推 tag 之前跑；等价于 release job 的两道门）
 ```bash
+dart tool/version.dart --check --tag v0.2.0   # 版本号一致性（秒级，先跑这个）
+
 # Android（JDK 21 + SDK 36）—— 与 build-android 同命令
 cd android
 JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home \
@@ -6785,3 +6809,50 @@ exo.setMediaItem(url) → exo.prepare() → exo.seekTo(startMs)   // 续播点
 - `DiskPrefetcher` 类注释「播放器：`CacheDataSource` 正常读写 —— 它读过的段会落盘」；
 - `PlayerActivity.startDiskPrefetch` 的「70% 留出余量给播放器自己写的那部分（已播段）」。
 两处都错在**假设播放器会写缓存**，而它传的是 `setCacheWriteDataSinkFactory(null)`。
+
+## 12. 版本号一致性整改（2026-10-11，tag v0.1.6）
+
+### 12.1 事故现场（四个版本号四个样）
+```
+git tag v0.1.6  ·  pubspec.yaml 0.1.1+2  ·  settings_page _kAppVersion 0.1.0
+                ·  android versionName 0.1.1 / versionCode 2
+```
+⇒ Release 标题是 `云影 CloudCine v0.1.6`，下载下来是 `cloudcine-0.1.1-macos.dmg`，
+装进手机应用内「关于」又显示 `0.1.0`。用户报 bug 说不清版本，也没法凭文件名判断装哪个。
+
+根因不是「忘了改」，而是**版本号有四个落点、且没有机器守卫**：
+- macOS / Windows 的版本是**构建期从 pubspec 自动派生**的（Info.plist 的
+  `$(FLUTTER_BUILD_NAME)`、Runner.rc 的 `FLUTTER_VERSION`、MSI 包名由
+  `build_package.ps1` 读 pubspec）⇒ 这三处从来不会漂；
+- 会漂的是**手写的两处**（设置页 `_kAppVersion`、Android `versionName`/`versionCode`）
+  加上**人为约定的 tag**。
+
+### 12.2 整改（改了哪些文件）
+| 文件 | 改了什么 |
+|---|---|
+| `tool/version.dart`（新增） | 唯一实现：解析三处 + 可选 tag；`--check` / `--print` / `--set` / 默认同步 |
+| `lib/ui/pages/settings_page.dart` | `_kAppVersion` 0.1.0 → 0.1.6，注释改成「⛔ 不要手改」 |
+| `android/app/build.gradle.kts` | versionName 0.1.6 / versionCode 106，注释同上 |
+| `pubspec.yaml` | `0.1.1+2` → `0.1.6+106` |
+| `.github/workflows/release.yml` | 新增 `version-guard` job（三构建 job 都 needs 它）；release job 增加「产物文件名版本 == tag 版本」正反两向断言；build-android 的版本号改取 guard 的 outputs |
+| `test/core/version_consistency_test.dart`（新增） | 本地守卫，复用 `tool/version.dart` 的判定 |
+
+验证：`flutter analyze` → `No issues found!`；`flutter test test/core/version_consistency_test.dart`
+→ `+4 All tests passed!`；`dart tool/version.dart --check --tag v0.1.5` 故意用旧 tag ⇒ 退出码 1 ✅；
+`--tag main`（分支名）⇒ 跳过 tag 项 ✅；`./gradlew :app:assembleRelease --dry-run` 通过 ✅。
+
+### 12.3 两个容易踩的实现细节
+- ⛔ `repoRoot` **不能靠 `Platform.script` 推**：`tool/version.dart` 被单测 `import` 时
+  `Platform.script` 指的是 flutter_test 的宿主脚本。改成从 cwd 逐级向上找
+  「同时有 `pubspec.yaml` 与 `android/app/build.gradle.kts`」的目录。
+- ⛔ CLI 参数要同时支持 `--set=0.1.6` 与 `--set 0.1.6`。本次第一版只认前者，
+  于是 `--set 0.1.6` 被**静默忽略**、脚本照常按「默认同步」跑完并成功退出 ——
+  这种「参数没生效但退出码 0」最难查。
+
+### 12.4 遗留
+- v0.1.6 的 Release（如果已挂出）里产物名是错的。要修正得删 Release + 删 tag
+  后重新打；不想动就 `dart tool/version.dart --set 0.1.7` 走下一版。
+- Android 端**没有**任何地方显示版本号（无「关于」页）⇒ 真机自测时只能看
+  APK 文件名或 `dumpsys package com.cloudcine.tv | grep versionName`。
+- ⚠️ 本机 Agent 沙箱里 `grep` 对某些文件（`README.md`、`android/app/build.gradle.kts`）
+  **静默返回空**，误判成「文件里没有」。改用 Grep 工具或 Read。

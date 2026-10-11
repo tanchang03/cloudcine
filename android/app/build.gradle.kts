@@ -36,15 +36,26 @@ android {
         minSdk = 21
         // 目标机是 Android 9 / API 28，按 34 编译。
         targetSdk = 34
-        // ⚠️ 发版前**手动**改这两个值。`versionCode` 必须单调递增，
-        //    否则已装设备会报「应用未安装」。
-        // ⛔ `versionName` 必须与 `pubspec.yaml` 的 `version` 保持一致：
-        //    `release.yml` 里 macOS/Windows 的产物名读 pubspec，Android 读这里，
-        //    两边不一致时同一个 Release 会挂出 `cloudcine-0.1.0-macos.dmg` 和
-        //    `cloudcine-1.0.0-b1-android.apk` 两个版本号（README 承诺的是统一的
-        //    `cloudcine-x.y.z-*`）。
-        versionCode = 2
-        versionName = "0.1.1"
+        // ⛔⛔ **这两个值不要手改** —— 由 `tool/version.dart` 从
+        //    `pubspec.yaml` 的 `version: x.y.z+build` 派生写入：
+        //      versionName = x.y.z
+        //      versionCode = x*10000 + y*100 + z（= pubspec 的 `+build`）
+        //    改版本号只改 pubspec，然后跑 `dart tool/version.dart`。
+        //
+        //    为什么 Android 不自己去读 pubspec：`android/` 是**独立原生工程**，
+        //    让 Gradle 解析仓库根的文件会把两条构建链路重新焊死。所以选择
+        //    「手写字面量 + 机器守卫」：`.github/workflows/release.yml` 的
+        //    `version-guard` job 与 `test/core/version_consistency_test.dart`
+        //    都会在漂移时直接失败。
+        //
+        //    ⚠️ 历史教训（2026-10-11）：tag v0.1.6 时这里还写着 0.1.1、
+        //    设置页写着 0.1.0、pubspec 写着 0.1.1 —— 同一个 Release 页上
+        //    标题是 v0.1.6、文件名是 cloudcine-0.1.1-*、应用内显示 0.1.0。
+        //    versionCode 用公式而不是人工递增，也是同一次整改的产物：
+        //    「上次用到几了」这种计数器是漂移的温床，而 versionCode 一旦
+        //    回退，已装设备会报「应用未安装」。
+        versionCode = 107
+        versionName = "0.1.7"
     }
 
     // ── 发布签名 ────────────────────────────────────────────────────────────

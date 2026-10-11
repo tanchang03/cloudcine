@@ -59,6 +59,6 @@
 
 ## 运维 / 打包 / 测试
 - ⛔⛔ **macOS Release 签名不许带 `get-task-allow`** ⇒ Runner **Release** 须 `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO`（⛔ 只关 Release；判据 `codesign -d --entitlements -`）。
-- ★★ **发版**：tag 必须 `v*` 触发 `release.yml`。⛔⛔ **版本号两处同改**：`pubspec.yaml` 的 `version` 与 `android/app/build.gradle.kts` 的 `versionName`。
+- ★★ **发版**：tag 必须 `v*` 触发 `release.yml`。★★ **版本号只改 `pubspec.yaml` 的 `version: x.y.z+build`**，再跑 `dart tool/version.dart` 同步设置页与 Android（`versionCode = x*10000+y*100+z`，与 `+build` 同值）。两道守卫：`release.yml` 的 `version-guard` job（三构建 job 都 `needs` 它）+ `test/core/version_consistency_test.dart`。⛔ `version-guard` 判定逻辑只有 `tool/version.dart` 一份，别在 workflow 里再抄 grep/sed。⛔ 别让 Gradle 读仓库根 pubspec（Android 是独立工程）。
 - 测试：纯函数优先、断言写「为什么」；⛔ **每个需求只跑相关单测，不回归全量**；修 bug **先加测试确认红**。Android 用 `:app:testDebugUnitTest --tests '…library.*'`。⛔ 断言**终态**；终态前夹真 IO ⇒ 轮询（`_settleUntil`）。
 - ⛔⛔ 本机 shell 带 `HTTP_PROXY/HTTPS_PROXY=127.0.0.1:5xxxx` ⇒ `flutter test` 必报 `Invalid WebSocket upgrade request`（**与代码无关**）。跑 test/analyze/build 一律 `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost`。

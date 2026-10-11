@@ -1,19 +1,24 @@
 name: Release
 
-# 推一个 v* 的 tag 就会自动：跑测试 → 构建 macOS + Windows + Android 交付物
+# 推一个 v* 的 tag 就会自动：校验版本号 → 跑测试 → 构建 macOS + Windows + Android 交付物
 # → 发布到 Releases 页。
 #
-#   git tag v0.2.1
-#   git push origin v0.2.1
+#   dart tool/version.dart --set 0.2.1     # ① 改版本号（写 pubspec + 同步其它两处）
+#   git commit -am "chore: 0.2.1"          # ② 提交
+#   git tag v0.2.1 && git push origin v0.2.1   # ③ 打 tag（⛔ 必须与 ① 一致）
+#
+# ⛔⛔ **tag 与代码里的版本号必须是同一个数**，否则 version-guard job 直接红，
+#     连产物都不会开始构建。理由见下面 version-guard 那段注释。
 #
 # 也可以手动触发（Actions → Release → Run workflow），
 # 手动触发只构建、不上架，产物在本次运行的 Artifacts 里，方便先试。
+# 手动触发时没有 tag 可比，version-guard 只校验「代码内三处自洽」。
 #
-# ── 为什么是四个 job（三个构建 + 一个上架） ────────────────────────────────
+# ── 为什么是五个 job（一个守卫 + 三个构建 + 一个上架） ──────────────────────
 # build-macos / build-windows / build-android **只负责造产物并上传为 run artifact**，
-# 真正的上架交给最后那个 release job，它 needs 三个构建 job。
+# 真正的上架交给最后那个 release job，它 needs 四个前置 job。
 #
-# 这样 Release **只有在三个平台都构建成功之后才会出现**。
+# 这样 Release **只有在版本号自洽、且三个平台都构建成功之后才会出现**。
 # 若沿用「macOS job 里直接 gh release create」的写法，Windows 一旦失败，
 # 下载页上就已经挂着一个缺 Windows 包的 Release 了 —— 而 tag 发出去就收不回来。
 #
@@ -46,8 +51,52 @@ permissions:
   contents: write # 创建 Release 需要写权限
 
 jobs:
+  # ── 版本号守卫 ─────────────────────────────────────────────────────────────
+  # 这一个 job 存在的唯一理由：**在造任何产物之前**确认「tag 上的版本号」与
+  # 「代码里的版本号」是同一个数。
+  #
+  # 2026-10-11 的实况：tag v0.1.6 · pubspec 0.1.1+2 · 设置页 0.1.0 ·
+  # Android versionName 0.1.1 —— Release 标题写着 v0.1.6，下载下来却是
+  # `cloudcine-0.1.1-macos.dmg`，装进手机应用内「关于」又显示 0.1.0。
+  # 用户报 bug 时说不清是哪个版本，也没法凭文件名判断该装哪个。
+  #
+  # 检查必须**排在构建之前**（所以三个构建 job 都 needs 它），而不是等
+  # release job 去比对文件名 —— 那时产物已经造完、artifact 已经上传了。
+  #
+  # ⛔ 判定逻辑只有一份：`tool/version.dart`。这里**不要**再抄一遍 grep/sed
+  #    解析 —— 第二份实现意味着改一处就分叉（同一个教训见本文件后面
+  #    「用 glob 而不是拼名字」那段）。
+  version-guard:
+    name: 版本号一致性守卫
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 只为了跑一个纯 Dart 脚本（`dart:io` + 正则），不装 Flutter —— 二十来秒的事。
+      - name: 安装 Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: 校验版本号
+        id: check
+        run: |
+          # 供后面的 job 用（release job 拿它断言产物文件名），别再抄一份解析。
+          VERSION="$(dart tool/version.dart --print)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # 手动触发时 GITHUB_REF_NAME 是分支名（如 main），脚本会识别出
+          # 「不是版本 tag」并跳过 tag 这一项，只校验代码内三处自洽。
+          dart tool/version.dart --check --tag "$GITHUB_REF_NAME"
+
   build-macos:
     name: 构建 macOS 安装包
+    needs: version-guard
     runs-on: macos-latest
     timeout-minutes: 45
 
@@ -194,6 +243,7 @@ jobs:
 
   build-windows:
     name: 构建 Windows 交付物
+    needs: version-guard
     # Flutter **不支持交叉编译到 Windows**，所以这里钉 windows-2022（理由同 ci.yml）。
     runs-on: windows-2022
     timeout-minutes: 45
@@ -249,6 +299,7 @@ jobs:
 
   build-android:
     name: 构建 Android APK（原生工程）
+    needs: version-guard
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -262,10 +313,14 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 版本号直接取守卫 job 的结果，**不再自己 sed 一遍 build.gradle.kts** ——
+      # 守卫已经断言过 `versionName == pubspec.version == tag`，这里再解析一次
+      # 等于把「版本号从哪来」写成第二份实现。本值只用于写 step summary。
       - name: 读取版本号
+        env:
+          VERSION: ${{ needs.version-guard.outputs.version }}
         run: |
-          VERSION="$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')"
-          [ -n "$VERSION" ] || { echo "::error::读不到 android/app/build.gradle.kts 的 versionName"; exit 1; }
+          [ -n "$VERSION" ] || { echo "::error::拿不到版本号"; exit 1; }
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: 安装 JDK
@@ -391,8 +446,9 @@ jobs:
 
   release:
     name: 发布到 Releases
-    # 只有三个平台都构建成功，Release 才会出现 —— 这是把上架单独拆成一个 job 的唯一理由。
-    needs: [build-macos, build-windows, build-android]
+    # 只有版本号自洽、且三个平台都构建成功，Release 才会出现 ——
+    # 这是把守卫与上架拆成独立 job 的唯一理由。
+    needs: [version-guard, build-macos, build-windows, build-android]
     # 手动触发时 github.ref 是分支名而不是 tag，这时只构建、不上架，产物留在 Artifacts 里。
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -410,6 +466,34 @@ jobs:
 
       - name: 列出待发布文件
         run: ls -lh dist
+
+      # 最后一道闸：产物**文件名里的版本号**必须就是 tag 的版本号。
+      #
+      # version-guard 已经保证了「代码内版本号 == tag」，三个平台的产物名又都是
+      # 从各自的版本号派生的，所以这一步在正常情况下必然通过 —— 留着它是为了
+      # 挡住「某个平台的打包脚本自己另起了一套命名」这种回归：
+      # 那种情况下文件名会悄悄带上另一个版本号，而下载页上没人会去数。
+      - name: 校验产物文件名与 tag 版本一致
+        env:
+          VERSION: ${{ needs.version-guard.outputs.version }}
+        run: |
+          echo "tag 版本：v${VERSION}"
+          ls -1 dist
+
+          # 期望存在（三个平台至少各一个包）。
+          if ! ls -1 dist/cloudcine-${VERSION}-* >/dev/null 2>&1; then
+            echo "::error::dist 里没有 cloudcine-${VERSION}-* —— 产物名与 tag 版本对不上"
+            exit 1
+          fi
+
+          # 反向也查一遍：不该混进别的版本号。
+          # （`|| true` 是必需的：grep 无匹配时退出码是 1，会被 `set -e` 当成失败。）
+          STRAY="$(ls -1 dist | grep -vE "^cloudcine-${VERSION}-" || true)"
+          if [ -n "$STRAY" ]; then
+            echo "::error::dist 里混进了版本号不是 ${VERSION} 的文件："
+            echo "$STRAY"
+            exit 1
+          fi
 
       - name: 发布到 Releases
         env:

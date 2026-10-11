@@ -26,12 +26,20 @@ import '../widgets/common_widgets.dart';
 import '../widgets/tv_adjust_slider.dart';
 import '../widgets/tv_text_field.dart';
 
-/// 版本号。**必须与 `pubspec.yaml` 的 `version` 保持一致。**
+/// 版本号。
+///
+/// ⛔⛔ **不要手改这个字面量** —— 它是 `pubspec.yaml` 的 `version:` 的派生值，
+/// 由 `tool/version.dart` 写入（`dart tool/version.dart` 同步 /
+/// `--check` 校验）。CI 的 `version-guard` job 与
+/// `test/core/version_consistency_test.dart` 都会在漂移时直接失败。
+///
+/// 历史教训（2026-10-11）：tag 是 v0.1.6 时这里还写着 0.1.0，
+/// pubspec 是 0.1.1、Android 是 0.1.1 —— 同一个版本在三个地方三个样。
 ///
 /// 没有引入 `package_info_plus`：它为了一个字符串拖进来一条平台通道，
 /// 而这条通道在单元测试里必须被 mock 掉。多一处 mock 就多一处
 /// 「测试里是好的、真机上是空的」。
-const String _kAppVersion = '0.1.0';
+const String _kAppVersion = '0.1.7';
 
 /// 设置页。
 class SettingsPage extends ConsumerStatefulWidget {
