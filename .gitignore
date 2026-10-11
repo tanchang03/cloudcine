@@ -101,3 +101,5 @@ logs
 .emu/tmp/netsim.ini.init.lock
 .emu/tmp/netsim.ini.lock
 .emu/tmp/android/netsimd/netsim_session_stats.json
+.emu/avd/CloudCineTV.avd/emulator-user.ini
+.emu/avd/CloudCineTV.avd/modem_simulator/modem_nvram.json
