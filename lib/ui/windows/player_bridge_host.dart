@@ -461,6 +461,36 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     }
   };
 
+  // -------------------------------------------------------------------
+  // 服务九：播放窗口关闭 → 立刻同步一轮进度
+  // -------------------------------------------------------------------
+  //
+  // ## 为什么必须有这一条（2026-10-10 现场）
+  //
+  // 用户报「播放进度同步到网盘之后，**不同环境最后播放的集数还是不一样**」。
+  // 数据本身是全的（逐条进度早就整份同步），缺的是**上传的时机**：
+  // 主窗口的进度同步只有「启动 +12 秒」「每 30 分钟」「内置播放页 dispose」
+  // 三个触发点，而**第三个在 PC 上永远走不到** —— PC 的播放跑在这个独立窗口
+  // 的引擎里，那条 `dispose` 挂在**内置播放页**上（见 `app_providers.dart`
+  // 的 `progressSyncSchedulerProvider`）。
+  //
+  // 于是最常见的路径「在电脑上看完一集 → 关掉播放窗口 → 去电视上接着看」
+  // 会读到网盘上那份**最多落后半小时**的进度 —— 电视算出来的「最后播放
+  // 集数」自然还是上一集。这一条把那个时机补上。
+  //
+  // ⚠️ 走 `progressSyncTriggerProvider.request()` 而不是直接调服务：
+  //    那条路自带 **20 秒节流**（连播时用户会一集一集连着关）与「上一轮没
+  //    跑完就跳过」，而且它才是「谁在什么时机同步」这件事的唯一登记处。
+  //    这里只负责说一声 —— 与内置播放页 `dispose` 里那一句完全同义。
+  onPlayerWindowClosed = () {
+    final requested =
+        ref.read(progressSyncTriggerProvider.notifier).request();
+    diag.info(
+      '进度',
+      requested ? '播放窗口已关闭，立刻同步一轮进度' : '播放窗口已关闭，但上一轮同步刚跑过（节流中）',
+    );
+  };
+
   ref.onDispose(() {
     onPlaybackProgress = null;
     onTicketRefresh = null;
@@ -473,6 +503,7 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     onRemoveMissingMedia = null;
     onSaveAudioEffect = null;
     onSavePlaybackPreference = null;
+    onPlayerWindowClosed = null;
   });
 });
 

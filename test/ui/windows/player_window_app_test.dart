@@ -43,6 +43,12 @@ void main() {
   /// 被拦下来的「向主窗口要新直链」调用。
   late List<Map<Object?, Object?>> refreshCalls;
 
+  /// 播放窗口发往主窗口的**方法名**（跨引擎通道），按顺序记。
+  ///
+  /// 记名字而不是记整条调用：这里要钉的是「有没有说那一句话」——
+  /// 参数长什么样是 `player_protocol.dart` 的事，那边有自己的用例。
+  late List<String> bridgeMethods;
+
   /// `path_provider` 的通道。
   ///
   /// ⚠️ **必须拦下来，否则半个测试套件会以看不出原因的方式失败。**
@@ -60,6 +66,7 @@ void main() {
   setUp(() {
     windowCalls = <MethodCall>[];
     refreshCalls = <Map<Object?, Object?>>[];
+    bridgeMethods = <String>[];
 
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(childChannel, (call) async {
@@ -84,6 +91,7 @@ void main() {
         case 'invokeMethod':
           final args = (call.arguments as Map).cast<Object?, Object?>();
           final method = args['method'];
+          if (method is String) bridgeMethods.add(method);
           if (method == PlayerBridgeMethod.refreshTicket) {
             refreshCalls.add(args);
           }
@@ -621,6 +629,78 @@ void main() {
         reason: 'ExcludeFocus 没拦住滑块 —— 控制栏里的 ← / → 会继续被它吃掉',
       );
     });
+
+    testWidgets('焦点链断掉之后快捷键仍然生效 —— 全屏切换后就是这个状态', (tester) async {
+      // 2026-10-10 现场：用户报「**PC 端全屏播放时**没有快捷键响应，空格不暂停、
+      // 左右不跳进度」。键位表里这三条一直都在（上面两条用例钉着），所以问题
+      // 不在表，而在**事件走不到表上**：
+      //
+      // `CallbackShortcuts` 是「往焦点链里插一个节点」，只有主焦点落在它的
+      // 子树里才收得到按键。而 macOS 的原生全屏（`NSWindow.toggleFullScreen`）
+      // 会把窗口搬到另一个 Space，切换过程中 Flutter 这一侧的主焦点会被丢到
+      // 根 scope —— 于是整张键位表**同时**失灵，且不报任何错。
+      // 同一个根因见 flutter/flutter#166237。
+      //
+      // 兜底挂在 `HardwareKeyboard` 上（它不看焦点），这条用例把那条路钉住。
+      await pumpPlayer(tester);
+
+      final root = FocusManager.instance.primaryFocus;
+      expect(root, isNotNull, reason: '起窗后本来就该有主焦点（`Focus(autofocus)`）');
+
+      // ⛔ 必须用 `UnfocusDisposition.scope`：默认的 `unfocus()` 会把焦点交给
+      //    **最近的祖先 scope**，而那个 scope 有可能仍在播放页子树里 ——
+      //    断链就模拟不出来，这条用例会退化成一条永远绿的假用例。
+      root!.unfocus(disposition: UnfocusDisposition.scope);
+      await tester.pump();
+      expect(
+        root.hasFocus,
+        isFalse,
+        reason: '这条用例的前提就是「焦点链断了」—— 前提不成立的话它什么都没测',
+      );
+
+      // F 走的是同一条链，且**不需要播放器**就能观察到结果（会调原生通道）。
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.pump();
+
+      expect(
+        windowCalls
+            .where((c) => c.method == 'setFullScreen')
+            .map((c) => c.arguments),
+        [true],
+        reason: '焦点链断掉之后 F 就不生效了 —— 这就是用户报的「全屏下快捷键没反应」',
+      );
+      await drainTimers(tester);
+    });
+
+    testWidgets('焦点链健康时兜底通道不许再处理一次 —— 否则一次 → 会跳 20 秒', (tester) async {
+      // `HardwareKeyboard` 的处理器是「**全部都会跑一遍**」的
+      // （`_dispatchKeyEvent` 不因为某个返回 true 就提前结束），所以兜底那一条
+      // 必须自己判断「焦点链还健康吗」。判断漏了的后果是每次按键被处理两次：
+      //   * 空格 → 暂停再播放，用户看到的是「按了没反应」；
+      //   * → → 跳两次 10 秒，进度多跳一格。
+      // 两种都不报错，只会让人觉得「按键有点飘」—— 所以必须有用例盯着。
+      await pumpPlayer(tester);
+
+      expect(
+        FocusManager.instance.primaryFocus?.hasFocus,
+        isTrue,
+        reason: '前提：起窗后焦点链是健康的',
+      );
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.pump();
+
+      // 一次 F 只能切一次全屏。双触发的话这里会是 [true, false]
+      // （`_setFullScreen(!_fullScreen)` 被连着调两次，一来一回）。
+      expect(
+        windowCalls
+            .where((c) => c.method == 'setFullScreen')
+            .map((c) => c.arguments),
+        [true],
+        reason: '兜底通道在焦点健康时也处理了一次 —— 按键被处理了两遍',
+      );
+      await drainTimers(tester);
+    });
   });
 
   group('诊断页进出', () {
@@ -1061,6 +1141,57 @@ void main() {
         find.byTooltip('停止并关闭'),
         findsOneWidget,
         reason: '菜单存续期间倒计时到点也不能收控制栏',
+      );
+      await drainTimers(tester);
+    });
+  });
+
+  group('关窗', () {
+    testWidgets('点「停止并关闭」要通知主窗口 —— 这是「关窗就同步进度」的时机', (tester) async {
+      // 2026-10-10 现场：用户报「播放进度同步到网盘之后，**不同环境最后播放的
+      // 集数还是不一样**」。进度数据本身是全的（逐条早就在同步），缺的是
+      // **上传的时机**：主窗口的同步只在「启动 +12 秒 / 每 30 分钟 / 内置播放页
+      // dispose」三处触发，而**第三条在 PC 上永远走不到** —— PC 的播放跑在这个
+      // 独立窗口的引擎里。
+      //
+      // 于是「电脑上看完一集 → 关掉播放窗口 → 去电视接着看」会读到网盘上那份
+      // 最多落后半小时的进度，电视算出来的「最后播放集数」自然还是上一集。
+      await pumpPlayer(tester);
+
+      await tester.tap(find.byTooltip('停止并关闭'));
+      await tester.pump();
+
+      expect(
+        bridgeMethods,
+        contains(PlayerBridgeMethod.playerClosed),
+        reason: '关窗却不说一声 —— 那一集要等最多 30 分钟才会上传到网盘',
+      );
+      // 关窗那条路本身不能被这条通知带坏。
+      expect(
+        windowCalls.map((c) => c.method),
+        contains('close'),
+        reason: '通知主窗口不等于可以不关窗',
+      );
+      await drainTimers(tester);
+    });
+
+    testWidgets('通知只发一次 —— 三个关窗路径会互相重叠', (tester) async {
+      // 「停止并关闭」按钮、原生关窗通知、引擎随窗口销毁三条路都会走到
+      // `_releasePlayer`，而且常常前后脚发生。发两次不会出错（主窗口那边有
+      // 20 秒节流），但会让日志里出现两条一模一样的记录，排查时容易误判
+      // 「同步被触发了两次」。
+      await pumpPlayer(tester);
+
+      await tester.tap(find.byTooltip('停止并关闭'));
+      await tester.pump();
+      // 再来一次（原生通知 / dispose 那条路）。
+      await tester.tap(find.byTooltip('停止并关闭'), warnIfMissed: false);
+      await tester.pump();
+
+      expect(
+        bridgeMethods.where((m) => m == PlayerBridgeMethod.playerClosed).length,
+        1,
+        reason: '重复通知只会让日志说谎',
       );
       await drainTimers(tester);
     });

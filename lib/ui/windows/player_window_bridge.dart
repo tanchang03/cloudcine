@@ -44,6 +44,28 @@ abstract final class PlayerBridgeMethod {
   /// [PlaybackProgressReport.toJson]。
   static const String reportProgress = 'reportProgress';
 
+  /// 播放窗口 → 主窗口：「这个播放窗口要没了」。
+  ///
+  /// ## 为什么必须有这一条（2026-10-10 现场）
+  ///
+  /// 用户报「播放进度同步到网盘之后，**不同环境最后播放的集数还是不一样**」。
+  /// 追下去发现：PC 端的播放发生在**独立窗口那个引擎**里，进度是它报回来、
+  /// 由主窗口落库的（[reportProgress]）—— 但主窗口的进度同步只有三个触发点：
+  /// **启动 +12 秒**、**每 30 分钟**、以及「内置播放页 dispose」
+  /// （见 `app_providers.dart` 的 `progressSyncSchedulerProvider`）。
+  ///
+  /// 第三条在 PC 上**永远不成立**：PC 走的是独立窗口，那条 `dispose` 挂在
+  /// 内置播放页上，跑不到。于是「在电脑上看完一集 → 关掉播放窗口 → 去电视上
+  /// 接着看」这条最自然的路径上，网盘上那份进度**最多可能落后半小时** ——
+  /// 电视读到的自然还是上一集。
+  ///
+  /// 落库是「本机即时」的，上传才是「跨环境可见」的。少的就是这一次上传的
+  /// 时机，所以这里补一条「播放窗口没了 → 主窗口立刻同步一轮」。
+  ///
+  /// ⚠️ 不带参数。播放窗口**不需要**（也不该）知道同步这件事怎么做 ——
+  ///    它只说「我要走了」，落库、合并、上传全留在主窗口。
+  static const String playerClosed = 'playerClosed';
+
   /// 播放窗口 → 主窗口：「这条直链失效了，再给我一条」。参数是
   /// [TicketRefreshRequest.toJson]，返回 [PlayRequest.toJson] 或 null。
   ///
@@ -330,6 +352,20 @@ Future<MissingMediaBrief?> Function(String itemId)? onQueryMissingMedia;
 /// 事（`MissingMediaController`），播放窗口不需要知道。
 Future<bool> Function(MissingMediaRemoval request)? onRemoveMissingMedia;
 
+/// 播放窗口**要没了**时，主窗口该做什么。
+///
+/// 与上面几个回调同样必须由 UI 层装上（需要仓储与网盘服务）。
+///
+/// 存在的唯一理由是**给进度同步补一个时机**：PC 端播放走独立窗口，而主窗口的
+/// 进度同步只在「启动 +12 秒 / 每 30 分钟 / 内置播放页 dispose」三处触发 ——
+/// 第三条在 PC 上永远走不到。少了它，「看完一集 → 关窗 → 换台设备接着看」
+/// 会读到**最多落后半小时**的进度。详细现场见 [PlayerBridgeMethod.playerClosed]。
+///
+/// ⚠️ 返回 `void`（不 await）：这条消息到达时播放窗口已经在拆自己了，让它等
+///    一轮「下载 + 合并 + 上传」既没必要也会卡住关窗。同步本身由主窗口的
+///    调度器去跑（它自带节流与「上一轮没跑完就跳过」）。
+void Function()? onPlayerWindowClosed;
+
 /// 主窗口侧：还没被播放窗口取走的播放请求。
 ///
 /// **为什么要有这个「待取」盒子，而不是创建窗口后直接把请求推过去** ——
@@ -405,6 +441,16 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       // 平时的 10 秒一次回报也走这条路，但它们对顺序没有要求，等一下（一次
       // 本地 SQLite 写入）没有任何代价。
       await handler(report);
+      return null;
+
+    case PlayerBridgeMethod.playerClosed:
+      final onClosed = onPlayerWindowClosed;
+      if (onClosed == null) {
+        diag.debug('窗口', '收到播放窗口关闭通知但没有回调（UI 层还没装上）');
+        return null;
+      }
+      diag.info('窗口', '播放窗口已关闭，请主窗口同步一轮进度');
+      onClosed();
       return null;
 
     case PlayerBridgeMethod.refreshTicket:

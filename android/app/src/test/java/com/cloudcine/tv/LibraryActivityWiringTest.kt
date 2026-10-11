@@ -121,6 +121,47 @@ class LibraryActivityWiringTest {
     }
 
     /**
+     * 简介页**动作行**上按 ↑ 绝不能离开这一页。
+     *
+     * ## 为什么这条要单独立一个守卫
+     *
+     * 2026-10-11 用户反馈：「媒体简介页面中，焦点在默认位置时，为啥点击遥控器上键
+     * 会推出简介页面？这个体验非常糟糕」。
+     *
+     * 根因不是写错了，而是**理由过期了**：动作行是简介页最上面那一层，于是当初
+     * 顺手把 ↑ 接成了 `backToWorks()`（「再往上没有东西了，与返回键同义」）。
+     * 但 [openWork] 末尾调的 [focusDetailActions] 会把**默认光标放在动作行**——
+     * 用户刚进页面按一下 ↑ 就被弹回作品墙。
+     *
+     * 这类事故的特点：**不编译报错、不崩、日志干净**，只有人坐在电视前才看得见。
+     * 所以用静态守卫把「方向键不许做破坏性跳转」这条规矩钉住。
+     *
+     * ⛔ 断言的是**整段分支**而不是某一行：`KEYCODE_DPAD_UP -> …` 的写法随时可能
+     *    改成 `when { … }` / 提前 `return`，钉行号会立刻脱节；钉「这一段里不许出现
+     *    `backToWorks`」则与写法无关。
+     */
+    @Test
+    fun `动作行上按上键不会退出简介页`() {
+        val code = codeOnly(readSource())
+        val block = braceBlock(code, "if (actionsFocused) {")
+
+        // 抽不到 / 抽错段落 = 守卫自己坏了。⛔ 必须报出来，否则它会一直绿灯。
+        assertTrue(
+            "没能从 LibraryActivity.kt 的代码区里抽出 `if (actionsFocused) { … }` 这一段 —— " +
+                "正则/配对已与源文件脱节，请修正本测试",
+            block.contains("KEYCODE_DPAD_DOWN") && block.contains("applyAction"),
+        )
+        assertTrue(
+            "简介页动作行的按键分支里出现了 `backToWorks()`。\n" +
+                "进简介页时默认光标就落在动作行（openWork 末尾调 focusDetailActions），" +
+                "所以 ↑ 一旦接了「回作品墙」，用户刚进来按一下上键就被踢出去（2026-10-11 反馈）。\n" +
+                "「离开这一页」是返回键的职责（handleBack 第一步 `level == Level.ITEMS` 已覆盖），" +
+                "方向键不该有破坏性副作用。",
+            !block.contains("backToWorks"),
+        )
+    }
+
+    /**
      * 剔除注释后的源码。
      *
      * 用**行级**过滤而不是正则剥块注释：`LibraryActivity.kt` 里有网盘 URL 之类的
@@ -133,6 +174,31 @@ class LibraryActivityWiringTest {
             val t = line.trimStart()
             t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")
         }.joinToString("\n")
+
+    /**
+     * 从 `head` 那个 `{` 开始做花括号配对，返回**整段**（含首尾花括号）。
+     *
+     * ⛔ 只在**剔除注释后**的源码上调用：注释里的 `{` / `}`（本文件到处是这种
+     *    说明性引用）会把配对算歪。抽不到时返回空串 —— 调用方必须把它当成
+     *    「守卫坏了」报出来，不能当成「检查通过」。
+     */
+    private fun braceBlock(code: String, head: String): String {
+        val start = code.indexOf(head)
+        if (start < 0) return ""
+        val open = code.indexOf('{', start)
+        if (open < 0) return ""
+        var depth = 0
+        for (i in open until code.length) {
+            when (code[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return code.substring(start, i + 1)
+                }
+            }
+        }
+        return ""
+    }
 
     /** 代码区里是否存在 `name = …`（行首赋值，允许 `this.` 前缀）。 */
     private fun hasAssignment(code: String, name: String): Boolean =

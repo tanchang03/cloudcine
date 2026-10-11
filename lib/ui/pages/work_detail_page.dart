@@ -8,6 +8,7 @@ import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/services/follow_read.dart';
 import '../../domain/services/item_sort.dart';
+import '../../domain/services/play_target.dart';
 import '../../domain/services/work_levels.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
@@ -181,8 +182,29 @@ class _DetailBodyState extends ConsumerState<_DetailBody> {
         visible.where((i) => !i.isSampleOrExtra).toList(growable: false);
     final extras =
         visible.where((i) => i.isSampleOrExtra).toList(growable: false);
-    final primary =
-        features.isNotEmpty ? features.first : (visible.isEmpty ? null : visible.first);
+    // 「点播放会播哪一条」—— **当前这一格（选中的季 / 部）里的续播那一集**。
+    //
+    // ⛔ 这里曾经是 `features.first`，也就是「永远播第一集」：用户在第 3 季
+    //    点播放会被丢回第 3 季第 1 集，而同一部剧在电视上（简介页的播放胶囊）
+    //    会接着上次看的那一集 —— 用户报的「不同环境最后播放集数不一样」
+    //    有一半就是这一条（2026-10-10 修）。
+    //
+    // ⛔ 规则**不在这里重写**：走 `PlayTarget.resolve`，与海报墙点卡片、
+    //    Android 简介页、播放器的「下一集」全部同源。重写一份的后果是
+    //    「从海报墙点进去播第 8 集，从详情页点播放播第 1 集」。
+    //
+    // ⚠️ 只在**当前这一格**里挑（而不是整部作品）：用户手选了「第 2 季」就是
+    //    想在第 2 季里操作，把他丢到第 1 季的某一集是另一种莫名其妙。
+    //    这一条与「默认高亮哪一季」是配套的 —— 那个默认值取的也是续播那一集
+    //    所在的季（见 `_resolveSeason`），所以两处永远指向同一格。
+    final primary = PlayTarget.resolve(
+      items: visible,
+      resume: detail.resumePositions,
+      lastPlayedAt: <String, DateTime>{
+        for (final i in visible)
+          if (i.lastPlayedAt != null) i.id: i.lastPlayedAt!,
+      },
+    );
 
     // 列表**显示**顺序。
     //

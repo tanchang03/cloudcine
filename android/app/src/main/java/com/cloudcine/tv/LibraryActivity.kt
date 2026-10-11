@@ -1162,12 +1162,18 @@ class LibraryActivity : Activity() {
             barFocused = false
             title.text = "媒体库 / ${work.title}"
             status.text = "${work.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
+            // ⛔ 提示只说「↑↓ 换层」：简介页里 ↑ 走到最上面那一层就停住，**不会**
+            //    退出这一页（2026-10-11 修）。退出只认返回键，所以这里单独写明。
             hintBar.text = "←→ 换胶囊 · OK 播放 / 执行 · ↑↓ 换层 · 菜单 更多 · 返回 回作品墙"
-            // ⛔ 焦点给列表、**光标**给动作行：列表拿到焦点它的选中高亮才画得出来，
-            //    而 ←→ 这时归动作行管（见 [focusDetailActions] 的理由）。
+            // ⛔ 焦点给列表、**光标**给动作行：←→ 这时归动作行管（见
+            //    [focusDetailActions] 的理由），而列表持有焦点，方向键才不会
+            //    掉进「谁也不管」的空隙里。
+            // ⛔ 顺序要紧：**先**把光标交给动作行、**再**把焦点给列表。反过来的话，
+            //    `requestFocus()` 触发的那次布局会按「还没进胶囊」的标志先画一遍
+            //    行背景，选中行亮一下再被收掉 —— 用户看到的是「闪一下」。
             itemsList.setSelection(0)
-            itemsList.requestFocus()
             focusDetailActions()
+            itemsList.requestFocus()
         }
     }
 
@@ -1591,6 +1597,50 @@ class LibraryActivity : Activity() {
         }
     }
 
+    /**
+     * 剧集列表里第 [position] 行现在该不该画「选中高亮」。
+     *
+     * ⛔ 判据本体在 [WorkDetailFormat.itemRowHighlighted]（纯函数、可单测），
+     *    这里只负责把 Activity 里的三个状态喂进去。**别把判据抄一份到这儿** ——
+     *    [ItemsAdapter.getView] 与 [repaintSelectedItemRow] 都调它，
+     *    抄成两份就会出现「一行还亮着、另一行该亮不亮」。
+     *
+     * 不变量：**同一时刻只有一层在发光**。简介页的焦点永远留在列表上，
+     * 两行胶囊只吃「光标态」；光标在胶囊上时列表行**不许**再亮
+     * （2026-10-11 用户反馈：两块亮品牌色同屏，分不清 ←→ 管哪一行）。
+     */
+    private fun rowHighlighted(position: Int): Boolean =
+        WorkDetailFormat.itemRowHighlighted(
+            listFocused = itemsList.isFocused,
+            actionsFocused = actionsFocused,
+            itemsSortFocused = itemsSortFocused,
+            isSelectedRow = itemsList.selectedItemPosition == position,
+        )
+
+    /**
+     * 胶囊行的「光标」移进 / 移出时，把列表选中行的背景重画一遍。
+     *
+     * ## 为什么只重画那一行
+     *
+     * [listRowFocusDrawable] 对**所有**非选中行返回的都是**全透明**色块，
+     * 所以光标态一翻转，观感上**只有选中那一行**会变。
+     *
+     * ⛔ 别图省事写 `itemsAdapter.notifyDataSetChanged()`：那会让 ListView
+     *    重建**全部可见行**（每行要查缩略图内存缓存、拼「几分钟前」文案），
+     *    而这一步就发生在按键处理里 —— 每按一次 ←→ 全量重建，电视上就是
+     *    一路掉帧（本工程对「按 MENU → 上屏」的量级一直卡在 ms 级）。
+     * ⛔ 也别只 `invalidate()`：行背景是在 `getView` 里按标志算的，
+     *    不重走一遍只是把**旧背景**再画一次。
+     * ⛔ 列表还没布局过（`getChildAt` 返回 null）时直接放过 —— 下一次
+     *    `getView` 会按新标志算，结果一样，不需要 `post` 兜底。
+     */
+    private fun repaintSelectedItemRow() {
+        val pos = itemsList.selectedItemPosition
+        if (pos < 0) return
+        val child = itemsList.getChildAt(pos - itemsList.firstVisiblePosition)
+        if (child != null) child.background = listRowFocusDrawable(rowHighlighted(pos))
+    }
+
     /** 卡片的圆角 tile 底：选中=品牌色、常态=略亮深色，外圈这圈就是「卡」的边。 */
     private fun cardTile(fill: Int): Drawable = GradientDrawable().apply {
         cornerRadius = dp(14).toFloat()
@@ -1940,9 +1990,13 @@ class LibraryActivity : Activity() {
     /**
      * ↑ 从排序胶囊进动作行（进作品时也走这里）。
      *
-     * ⛔ **不抢焦点**（不 `requestFocus()`）：焦点留在 [itemsList] 上，列表的
-     *    选中高亮才画得出来，动作行只吃「光标态」。与 [focusItemsSort] 同一套
-     *    理由 —— 焦点一挪走，底下那行的高亮就没了，用户会以为列表被清空了。
+     * ⛔ **不抢焦点**（不 `requestFocus()`）：焦点一直留在 [itemsList] 上 ——
+     *    列表持有焦点，方向键才不会掉进「谁也不管」的空隙里，↓ 交回列表时
+     *    也不用再做一次 `requestFocus()`。
+     * ⛔ 但**列表的选中高亮要收掉**（[repaintSelectedItemRow]）：胶囊的光标态
+     *    与列表的选中高亮都是**亮品牌色实心**，同时画出来屏幕上就有两块
+     *    「当前」，用户不知道 ←→ 管的是哪一行（2026-10-11 用户反馈）。
+     *    不变量与判据本体见 [WorkDetailFormat.itemRowHighlighted]。
      * ⛔ 这几个 `focus*` 函数**必须互相清掉对方的标志位**（与 [focusTabs] 那一组
      *    同一条规矩）：漏清一个就会出现「两行胶囊同时发光」，用户完全不知道
      *    按键现在管的是哪一行。
@@ -1952,24 +2006,28 @@ class LibraryActivity : Activity() {
         actionsFocused = true
         paintDetailActions()
         buildItemsSortBar()
-        infoLine.text = "←→ 选动作 · OK 执行 · ↓ 到列表 · ↑ 回作品墙"
+        repaintSelectedItemRow()
+        // ⛔ 提示里**不许**再写「↑ 回作品墙」：方向键不退出这一页，退出只认返回键。
+        infoLine.text = "←→ 选动作 · OK 执行 · ↓ 到列表 · 返回 回作品墙"
     }
 
-    /** ↑ 从列表首行进排序胶囊：胶囊吃光标态，列表的选中高亮仍在（不抢焦点）。 */
+    /** ↑ 从列表首行进排序胶囊：胶囊吃光标态，列表的选中高亮**收掉**（理由同 [focusDetailActions]）。 */
     private fun focusItemsSort() {
         actionsFocused = false
         itemsSortFocused = true
         paintDetailActions()
         buildItemsSortBar()
+        repaintSelectedItemRow()
         infoLine.text = "OK 应用排序 · ↑ 到动作 · ↓ 返回列表"
     }
 
-    /** 把光标交回列表（两行胶囊都失去光标态），并恢复底部提示。 */
+    /** 把光标交回列表（两行胶囊都失去光标态、选中高亮恢复），并还原底部提示。 */
     private fun focusItemsList() {
         actionsFocused = false
         itemsSortFocused = false
         paintDetailActions()
         buildItemsSortBar()
+        repaintSelectedItemRow()
         // ⛔ 光标在胶囊上时底部那行被改成了「OK 应用排序…」，交回列表要还原。
         //    简介正文现在画在**上面的头部**里（见 [paintDetailHead]），所以这行
         //    改成按键提示，不再是同一段简介在屏幕上印两遍。
@@ -3654,7 +3712,7 @@ class LibraryActivity : Activity() {
             return true
         }
 
-        // ── 简介页动作行拿到光标：←→ 移、OK 执行、↓ 到排序胶囊、↑/返回 回作品墙 ──
+        // ── 简介页动作行拿到光标：←→ 移、OK 执行、↓ 到排序胶囊、↑ 无事、返回 回作品墙 ──
         // ⛔ 必须排在 `itemsSortFocused` **之前**：动作行在屏幕上就在排序胶囊上面，
         //    两层不会同时为真，但顺序写反的话（万一标志位漏清）↑↓ 会互相打架。
         // ⛔ 只在 `Level.ITEMS` 下有意义：作品墙那一层这一行是 GONE。
@@ -3667,9 +3725,25 @@ class LibraryActivity : Activity() {
                 KeyEvent.KEYCODE_NUMPAD_ENTER,
                 -> if (down) applyAction()
                 KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusItemsSort()
-                // ⛔ 动作行是最上面那一层，再往上没有东西了 ⇒ 与返回键同义（回作品墙）。
-                //    返回键本身由 [handleBack] 统一处理，走到那儿同样是回作品墙。
-                KeyEvent.KEYCODE_DPAD_UP -> if (down) backToWorks()
+                // ⛔ 动作行是**最上面那一层**，↑ 在这里**吃掉但不做任何事**。
+                //
+                //    这里原先接的是 `backToWorks()`，理由是「再往上没有东西了，
+                //    与返回键同义」。这个理由本身没错，但它忽略了一件事：
+                //    **进简介页时默认光标就落在这一行**（[openWork] 末尾调
+                //    [focusDetailActions]）—— 于是用户刚进来、想往上看看还有
+                //    什么，一按 ↑ 就被一脚踢回作品墙。2026-10-11 反馈原话：
+                //    「焦点在默认位置时，为啥点击遥控器上键会推出简介页面？
+                //     这个体验非常糟糕」。
+                //
+                //    ★ 规矩：**方向键不做破坏性跳转**。「离开这一页」是返回键
+                //    的职责，[handleBack] 第一步（`level == Level.ITEMS`
+                //    ⇒ `backToWorks()`）已经覆盖，菜单里也另有一项
+                //    「返回作品墙」。所以这里没有任何理由再留一条 ↑ 退出。
+                //    ⛔ 若将来给简介页加了「更上层」（比如顶部标签栏），
+                //    这里应改成 `focus…()` 交给那一层，仍然**不是** `backToWorks()`。
+                //    回归守卫见 `LibraryActivityWiringTest` 的
+                //    `动作行上按上键不会退出简介页`。
+                KeyEvent.KEYCODE_DPAD_UP -> Unit
                 KeyEvent.KEYCODE_MENU -> if (down) openMenu()
                 // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
                 else -> return super.dispatchKeyEvent(event)
@@ -3692,7 +3766,8 @@ class LibraryActivity : Activity() {
                 //    不是「往下走一层」：排序胶囊上按返回该退出这一页。
                 KeyEvent.KEYCODE_DPAD_DOWN -> if (down) focusItemsList()
                 // ⛔ 排序胶囊上面**还有动作行**，所以 ↑ 是「再上一层」而不是
-                //    「回作品墙」。只有动作行上再按 ↑ 才退出这一页。
+                //    「回作品墙」。动作行之上已经没有层了，那里再按 ↑ 是**无事**
+                //    （⛔ 不是退出这一页 —— 见那一支的说明）。
                 KeyEvent.KEYCODE_DPAD_UP -> if (down) focusDetailActions()
                 KeyEvent.KEYCODE_MENU -> if (down) openMenu()
                 // ⛔ 不认识的键放行（音量、电源、HDMI…），别把遥控器全吞了。
@@ -4523,9 +4598,7 @@ class LibraryActivity : Activity() {
             time.text = Fmt.relativeTime(m, System.currentTimeMillis())
             time.setTextColor(if (m > 0) 0xFF9AA3B2.toInt() else 0xFF4B5563.toInt())
 
-            row.background = listRowFocusDrawable(
-                itemsList.isFocused && itemsList.selectedItemPosition == position,
-            )
+            row.background = listRowFocusDrawable(rowHighlighted(position))
             return row
         }
 

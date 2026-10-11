@@ -1,5 +1,16 @@
 # 在云影上接入 Media3 ExoPlayer（方案 1：自建 Android 播放内核）
 
+> ⛔ **本方案已作废，仅作历史记录保留（2026-10-06 起）。**
+> 它的前提是「继续用 Flutter 跑 Android，只把播放内核换成 ExoPlayer」；实际
+> 采纳的是更彻底的一条路 —— **Android 端整体改为 `android/` 下的原生 Kotlin
+> 工程**（原生 ExoPlayer + MediaCodec 直出 SurfaceView + 原生 OSD），Flutter
+> 侧收缩为 PC 端。因此本文第 5 节的验证步骤里那句 `flutter build apk --release`
+> **现在已经跑不通**（`android/` 不含 Flutter 嵌入），Android 产物一律
+> `cd android && ./gradlew :app:assembleRelease`。
+> 决策理由与实测证据见根 `README.md`「仓库结构」与
+> `docs/AndroidTV-4K-丢帧-夸克对标.md`。保留本文是因为其中「为什么 fvp 在
+> MiTV 上硬解失败」的分析仍然成立。
+
 > 起草日期：2026-10-05
 > 背景：小米 MiTV 上 fvp/libmdk 的 MediaCodec 链在 MiTV 硬解不成功（`VDEC Exit` / 300% CPU），
 > 而夸克（ExoPlayer 路线）播同片源 4K 仅 30% CPU。本方案规划用 Media3 ExoPlayer 替换 fvp 在

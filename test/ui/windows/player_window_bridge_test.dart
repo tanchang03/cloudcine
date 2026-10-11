@@ -136,6 +136,34 @@ void main() {
       expect(result, isNull);
     });
 
+    test('playerClosed 通知 UI 层 —— 这是「关窗就同步一轮进度」的唯一时机', () async {
+      // 2026-10-10 现场：用户报「进度同步到网盘之后，**不同环境最后播放的集数
+      // 还是不一样**」。数据是全的，缺的是**上传的时机** —— PC 的播放跑在独立
+      // 窗口那个引擎里，而主窗口的进度同步只在「启动 +12 秒 / 每 30 分钟 /
+      // 内置播放页 dispose」三处触发，第三条在 PC 上永远走不到。
+      //
+      // 于是最常见的路径「电脑上看完一集 → 关掉播放窗口 → 去电视接着看」会读到
+      // 网盘上那份最多落后半小时的进度。这条消息就是补上的那个时机。
+      var closed = 0;
+      onPlayerWindowClosed = () => closed++;
+
+      final result = await handlePlayerWindowCall(
+        const MethodCall(PlayerBridgeMethod.playerClosed),
+      );
+
+      expect(result, isNull, reason: '播放窗口已经在拆自己了，没什么可回给它的');
+      expect(closed, 1, reason: '收到通知却不同步 —— 那台电视还是读到旧进度');
+    });
+
+    test('还没装上关闭回调时安静丢弃 —— 不能因此崩掉主窗口', () async {
+      // 容器还没起来（`main()` 阶段就注册了通道处理器）时会走到这里。
+      final result = await handlePlayerWindowCall(
+        const MethodCall(PlayerBridgeMethod.playerClosed),
+      );
+
+      expect(result, isNull);
+    });
+
     test('refreshTicket 把新链交回去', () async {
       onTicketRefresh = (request) async => PlayRequest(
             url: 'https://cdn.example.com/fresh.mp4',
@@ -641,9 +669,13 @@ void main() {
 
 /// 清掉 bridge 里的**进程级全局**。
 ///
-/// 五个回调都是全局的（见 `player_window_bridge.dart` 的说明），漏清一个的表现
+/// 回调都是全局的（见 `player_window_bridge.dart` 的说明），漏清一个的表现
 /// 是「前一条用例装上的回调在后一条里还活着」—— 于是后一条明明没装回调却收到了
 /// 调用，或者更糟：它以为「没装回调」的路径被测过了，其实没有。
+///
+/// ⚠️ 这份清单**必须与 `player_window_bridge.dart` 里那批顶层回调一一对应**。
+/// 少写一个不会让任何用例变红 —— 它只会让「没装回调」那类分支**看起来**被测过。
+/// 新增回调时记得同时加在这里。
 void _resetGlobals() {
   debugSetPendingPlayRequest(null);
   onPlaybackProgress = null;
@@ -652,4 +684,10 @@ void _resetGlobals() {
   onFetchThumbnail = null;
   onSearchOnlineSubtitles = null;
   onFetchOnlineSubtitle = null;
+  onSaveIntroRange = null;
+  onQueryMissingMedia = null;
+  onRemoveMissingMedia = null;
+  onSaveAudioEffect = null;
+  onSavePlaybackPreference = null;
+  onPlayerWindowClosed = null;
 }

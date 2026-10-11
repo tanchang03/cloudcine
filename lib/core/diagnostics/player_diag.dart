@@ -6,9 +6,11 @@
 /// 走一遍 UI（还要在 TV 上拿遥控器点），而且实验结束忘了关掉会悄悄改变
 /// 线上行为。`--dart-define` 让「开了什么」在构建命令里留痕，也不会漏进正式包。
 ///
-/// 用法：
+/// 用法（⚠️ 只在 **PC 端**有效：这是 Dart 编译期常量，`android/` 那份原生
+/// Kotlin 工程里没有它，`flutter build apk` 也构建不了 Android —— 见
+/// 根 README「方式二：从源码构建」）：
 /// ```
-/// flutter build apk --debug --dart-define=CC_DIAG_BYPASS_RELAY=true
+/// flutter run -d macos --dart-define=CC_DIAG_BYPASS_RELAY=true
 /// ```
 library;
 

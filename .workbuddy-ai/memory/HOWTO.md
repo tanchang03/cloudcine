@@ -592,6 +592,72 @@ CLI 探针跑在非 GUI 会话里，**结论不可信** —— 必须打包成 `
   写成用例的理由：Flutter 哪天改了滑块的键盘行为，我们的修复会**静默失效** ——
   快捷键还挂在表里，按下去却没反应。那时这条会红。
 
+#### 全屏之后整张键位表静默失灵（2026-10-10）
+
+用户报「PC 全屏播放时快捷键没反应」。键位表**早就写全了**（空格 / ← / → 都在
+`_playbackShortcuts`），所以真因不在表里，而在**事件根本到不了表**：
+
+- `CallbackShortcuts` 是往**焦点链**里插一个节点，只有主焦点落在它子树里才收得到。
+- macOS 走 `NSWindow.toggleFullScreen`（原生全屏）时窗口被移到另一个 Space，
+  **第一响应者 / Flutter 焦点链被拆掉**，整张表**同时**静默失效
+  （flutter/flutter#166237，仍未修）。症状：全屏后按什么都没反应、**零报错**，退出全屏又好了。
+
+两条一起上（缺一不可）：
+
+1. **Dart 兜底**：`HardwareKeyboard.instance.addHandler(_onHardwareKey)`。它的分发是
+   「**所有处理器都调一遍**」（`_dispatchKeyEvent` 不短路）⇒ 兜底必须用
+   `if (_rootFocus.hasFocus) return false;` 挡掉**焦点链健康**的情况，否则一次按键处理两遍。
+2. **原生恢复第一响应者**：`windowDidEnterFullScreen` / `windowDidExitFullScreen` /
+   `windowDidBecomeKey` 里 `window.makeFirstResponder(controller.view)`（已是则跳过）。
+
+配套：`_onFullScreenChanged` / `_setFullScreen` 成功后 `_restoreKeyboardFocus()`
+（`addPostFrameCallback` 里 `_rootFocus.requestFocus()`）。`_rootFocus` 同时是「焦点链还健康吗」的探针。
+
+测试：`test/ui/windows/player_window_app_test.dart` 用
+`root.unfocus(disposition: UnfocusDisposition.scope)` 模拟断链，断言 `F` 仍触发 `setFullScreen`；
+另有一条断言**焦点链健康时兜底不许再处理一次**。
+
+#### 关窗必须报 `playerClosed`（进度上网盘的时机，2026-10-10）
+
+进度数据本身（`r`/`m`/`p`）一直在同步，缺口在**上传时机**：
+
+- PC 的进度同步有三个触发点：启动 +12s、每 30 分钟、**内置播放页 `dispose`**。
+- 第三个在 PC 上**永远不触发** —— PC 播放跑在**独立窗口的另一个引擎**里，内置页的 `dispose`
+  根本不会发生。于是「看完一集就关窗」后，进度最多要等 **30 分钟**才上网盘。
+- Android 早在 `onActivityResult(REQ_PLAYER)` 返回后 **2s** 就同步 ⇒ 两端最后播放集数不同步。
+
+修法：`_releasePlayer()` 开头发 `PlayerBridgeMethod.playerClosed`（**幂等只发一次**，`_closedNotified` 守），
+主窗口 `player_bridge_host.dart` 收到后 `progressSyncTriggerProvider.notifier.request()`
+（自带 20s 节流）。测试见 `player_window_app_test.dart` 的 `关窗` 组与 `player_window_bridge_test.dart`。
+
+#### 「该播哪一集」口径统一（2026-10-10）
+
+PC 的 `WorkDetail.primary` 与详情页播放按钮曾用 `features.first`（= 永远第一集），
+而 Android 简介页用 `PlayTarget.resolve` ⇒ 口径分裂。现统一走 `PlayTarget.resolve`，
+需要 `resumePositions`（**不是** `maxPositions`：前者看完会清零、用来算该播哪一集；
+后者单调不清零、用来画进度条）。回归见 `test/ui/providers/work_detail_primary_test.dart`。
+
+## 安卓端细节补遗（原在 MEMORY.md，2026-10-10 下沉）
+
+### `TvOsdView` 与 `SeekPlan`
+
+- `TvOsdView` 挂在 `android.R.id.content` 之上；回调**只回传行下标** ⇒ 派发时必须按 `Row.id` 对，不能按下标。
+- `SeekPlan` 松手才 `seekTo`，兜底 800 ms **大于**按键自动重复间隔（否则长按方向键会被兜底反复 seek）。
+- JVM 单测里 `org.json` / `Base64` 是**空壳**（`testOptions.unitTests.returnDefaultValues`）⇒
+  解析用 `MiniJson`、编码用 `OssAuth.base64`，别调系统那俩。
+
+## 百度网盘两通道的完整实测（2026-10-09，原在 MEMORY.md）
+
+取链**先带 `origin=dlna`**（带 `vuk`）：只服务**媒体**，视频/音频 1~2.9 MB/s，文档回 `403 31329`。
+不带 `origin` 覆盖全，但**按账号**限速 ~80 KB/s。⇒ 按 `info[].category`（1=视频·2=音频，`canUseDlna`）
+分流，非媒体**重取一次去掉 `origin`**。
+
+- ⛔ 普通通道**必须单连接**；⛔ **连接数不是提速杠杆**（1 vs 4 互有胜负；跑 ~10 MiB 后账号额度耗尽，
+  1/4/8 一起归零）⇒ `maxConnections` + `connectionsFor()`，`withQuality` / `_mergeOriginalAndLadder`
+  都要带。
+- ⛔ 无 `vuk` 的直链**第一跳必带 `Cookie`**；⛔ `stallTimeout`（`_stallGuarded`）兜
+  「响应头到了、包体不来」。
+
 ## 豆瓣为什么这么难缠（2026-10-01）
 
 规则本体在 `MEMORY.md`，这里是实测记录。

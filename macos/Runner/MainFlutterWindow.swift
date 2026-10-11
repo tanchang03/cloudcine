@@ -107,6 +107,13 @@ final class ChildWindowController: NSObject, NSWindowDelegate {
   private let channel: FlutterMethodChannel
   private weak var window: NSWindow?
 
+  /// 这个子窗口的 Flutter 视图控制器。
+  ///
+  /// 只为一件事留着：**全屏切换之后把第一响应者还给 Flutter 视图**
+  /// （见 [restoreFirstResponder]）。`weak` 是必须的 —— 控制器由窗口持有，
+  /// 这里强引用会变成一条窗口 → 控制器 → 视图控制器 → 窗口的环。
+  private weak var controller: FlutterViewController?
+
   /// 已请求过释放。用来避免重复通知 Dart。
   private var closingNotified = false
 
@@ -155,6 +162,7 @@ final class ChildWindowController: NSObject, NSWindowDelegate {
       binaryMessenger: controller.engine.binaryMessenger
     )
     let instance = ChildWindowController(channel: channel, window: window)
+    instance.controller = controller
     channel.setMethodCallHandler(instance.handle)
     window.delegate = instance
     instances.append(instance)
@@ -315,12 +323,60 @@ final class ChildWindowController: NSObject, NSWindowDelegate {
   ///
   /// 用 `Did`（动画结束之后）而不是 `Will`：Dart 拿到状态是用来切布局的，
   /// 在动画途中切会让画面先跳一下。
+  ///
+  /// ## ⛔ 顺带必须把第一响应者还给 Flutter 视图
+  ///
+  /// 2026-10-10 现场：用户报「**PC 端全屏播放时**没有快捷键响应，空格不暂停、
+  /// 左右不跳进度」。Dart 侧的键位表里这三条一直都在，所以问题不在表 ——
+  /// 而在**按键根本没进 Flutter**。
+  ///
+  /// macOS 的原生全屏会把窗口搬到一个新的 Space，并重建这一层的响应者链；
+  /// 切完之后 `NSWindow.firstResponder` 不再是我们那个 `FlutterView`，
+  /// 于是引擎收不到任何键盘事件（鼠标不受影响 —— 引擎的 `FlutterView`
+  /// 对 `acceptsFirstMouse` 返回 YES，所以点一下画面还是好的，只有键盘哑了）。
+  ///
+  /// 这与 flutter/flutter#166237 是同一个根因（那边描述得更细：用 Esc 退出
+  /// 全屏后快捷键失效，再按一次 Esc 又好了 —— 因为那一次按键让响应者链
+  /// 重新落回视图上）。那边至今没有修复，所以只能自己兜。
+  ///
+  /// 用 `Did` 而不是 `Will` 来做这件事是**有意的**：`Will` 时窗口还在过渡中，
+  /// 此刻设的第一响应者会被 AppKit 随后的重建覆盖掉。
   func windowDidEnterFullScreen(_ notification: Notification) {
+    restoreFirstResponder()
     channel.invokeMethod("onFullScreenChanged", arguments: true)
   }
 
   func windowDidExitFullScreen(_ notification: Notification) {
+    restoreFirstResponder()
     channel.invokeMethod("onFullScreenChanged", arguments: false)
+  }
+
+  /// 窗口重新成为 key window 时也还一次。
+  ///
+  /// 用户从别的应用 / 主窗口切回来时，AppKit 会把第一响应者还原成「上一次
+  /// 记住的那一个」—— 而全屏切换可能把那个记忆清成了窗口自己。多还这一次
+  /// 很便宜，而且能让「切出去看一眼再切回来，快捷键还好使」成立。
+  func windowDidBecomeKey(_ notification: Notification) {
+    restoreFirstResponder()
+  }
+
+  /// 把键盘焦点还给 Flutter 视图。
+  ///
+  /// ## 为什么可以无条件设
+  ///
+  /// Flutter 桌面端的**所有**输入都走这一个视图：键盘、文本输入法
+  /// （`FlutterView` 自己就是 `NSTextInputClient`）、鼠标。子窗口里没有别的
+  /// 原生视图需要抢第一响应者（播放器的界面全是 Flutter 画的），所以
+  /// 「第一响应者 = FlutterView」是这个窗口唯一正确的状态。
+  ///
+  /// 已经就是它时 `makeFirstResponder` 是**幂等**的（AppKit 会先比一次，
+  /// 相同则直接返回 YES、不发通知），所以不需要在这里判断当前是谁。
+  private func restoreFirstResponder() {
+    guard let window = window,
+          let view = controller?.view ?? window.contentViewController?.view
+    else { return }
+    if window.firstResponder === view { return }
+    window.makeFirstResponder(view)
   }
 
   /// 关窗时**尽力**通知 Dart 去释放 mpv。

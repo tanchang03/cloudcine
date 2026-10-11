@@ -143,4 +143,41 @@ object WorkDetailFormat {
      *    「怎么说」，与 [metaLine] 同一分工。
      */
     fun newEpisodePrefix(isNew: Boolean): String = if (isNew) "■ NEW  " else ""
+
+    // ------------------------------------------------------------------
+    // 简介页的「谁在发光」（2026-10-11）
+    // ------------------------------------------------------------------
+
+    /**
+     * 剧集列表里**当前选中那一行**现在该不该画「选中高亮」。
+     *
+     * ## 这条判据为什么值得单独钉住
+     *
+     * 简介页上有三层：**动作胶囊行 / 排序胶囊行 / 剧集列表**。其中焦点
+     * （Android 的 `requestFocus`）**永远留在列表上**，两行胶囊只吃「光标态」
+     * —— 这是刻意的，理由见 `LibraryActivity.focusDetailActions` 的文档。
+     *
+     * 代价是：列表的选中高亮与胶囊的光标态会**同时**出现在屏幕上，而两者
+     * 都是**亮品牌色实心**（列表行还多一条 4dp 左侧强调条）。2026-10-11
+     * 用户反馈进简介页的默认状态（光标在「▶ 播放」上）：
+     *
+     * > 「剧集列表和按钮的焦点样式有冲突……列表里也有当前焦点的样式，
+     * > 体验上有一定的干扰」
+     *
+     * 于是定下这条**不变量**：**同一时刻只有一层在发光**。
+     * 光标在任一行胶囊上 ⇒ 列表不高亮；光标交回列表 ⇒ 高亮恢复。
+     *
+     * ⛔ 判据**只写在这里**：`ItemsAdapter.getView` 与
+     *    `LibraryActivity.repaintSelectedItemRow` 都调它。抄成两份的话，
+     *    胶囊上下一移就会出现「一行还亮着、另一行该亮不亮」。
+     * ⛔ [listFocused] 不能省：菜单 / 筛选面板 / 退出确认框是**覆盖层**，
+     *    它们弹出来时列表其实已经失去焦点了（`isFocused == false`），
+     *    这时候还画高亮就是「底下那层偷偷发光」。
+     */
+    fun itemRowHighlighted(
+        listFocused: Boolean,
+        actionsFocused: Boolean,
+        itemsSortFocused: Boolean,
+        isSelectedRow: Boolean,
+    ): Boolean = listFocused && !actionsFocused && !itemsSortFocused && isSelectedRow
 }

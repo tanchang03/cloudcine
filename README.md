@@ -137,6 +137,13 @@ flutter pub get
 
 **Android 端**前置条件：JDK **21**（用 Android Studio 自带的 JBR 25 会编译失败）、Android SDK Platform 36。**不需要 Flutter。**
 
+> ⛔ **别在仓库根跑 `flutter build apk`** —— 它必然失败，报
+> `Build failed due to use of deleted Android v1 embedding`。
+> 原因：`android/` 是一个**独立的原生 Kotlin 工程**（`settings.gradle.kts` 里
+> 只有 `include(":app")`，没有 Flutter 插件、清单里也没有 `flutterEmbedding`），
+> 但仓库根是 Flutter 工程，`flutter` 工具会把它当成自己的 Android 宿主目录去找
+> v2 嵌入标记，找不到就报这条。**Android 的 APK 一律用 Gradle 构建。**
+
 ```bash
 cd android
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home

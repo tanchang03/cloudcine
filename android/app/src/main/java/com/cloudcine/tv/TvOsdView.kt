@@ -138,7 +138,14 @@ class TvOsdView(context: Context) : FrameLayout(context) {
     /** 纵向列表里封面的来源。不设 = 列表只画文字（和以前一样）。 */
     var thumbs: ThumbSource? = null
 
-    /** 当前是否已把焦点「进入」纵向列表（云影的 `_inList`）。 */
+    /**
+     * 当前是否已把焦点「进入」纵向列表（云影的 `_inList`）。
+     *
+     * ⛔ 它同时决定**右半边画不画光标态**：没进列表时 ←→ 对列表毫无作用，
+     *    那一项只能保留「正在播」的状态标记，不能再画光标（判据在
+     *    [OsdFocus.listItemIsCursor]）。横向 chips 不受它影响 —— 那一种
+     *    光标在左栏时 ←→ 本来就能直接改值。
+     */
     var inList: Boolean = false
         private set
 
@@ -393,10 +400,42 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         if (i == selChip) return
         selChip = i
         if (inList) {
+            // ⛔ 顺序：先按**当前**的可见窗口决定要不要滚，再重画。
+            //    反过来的话，`notifyDataSetChanged()` 之后 `firstVisiblePosition`
+            //    未必还是布局时那个值，边界判断会飘。
+            val scroll = listView?.let {
+                if (it.childCount == 0) OsdFocus.ListScroll.KEEP
+                else OsdFocus.listScrollFor(
+                    selChip, it.firstVisiblePosition, it.lastVisiblePosition,
+                )
+            } ?: OsdFocus.ListScroll.KEEP
             listAdapter?.notifyDataSetChanged()
-            listView?.setSelection(selChip)
+            applyListScroll(scroll)
         } else {
             applyChipSelection()
+        }
+    }
+
+    /**
+     * 按 [scroll] 把纵向列表滚到该在的位置。
+     *
+     * ⛔ 只在**真的越界**时才滚。之前这里写的是 `listView.setSelection(selChip)`
+     *    —— 而它的语义是「把 selChip 滚到**第一行**」，于是每按一次 ↑↓ 内容就
+     *    整体平移一格，高亮框**一直钉在第一行**：用户看到的是「数据在滚、
+     *    焦点没动」（2026-10-11 用户反馈，判据见 [OsdFocus.listScrollFor]）。
+     * ⛔ 也别改成 `smoothScrollToPosition`：OSD 是「一帧到位、不做动画」。
+     * ⛔ 行高是固定的（[LIST_ROW_H]），所以「滚到底行」直接算偏移即可，
+     *    不必去问某个具体子视图的高度。
+     */
+    private fun applyListScroll(scroll: OsdFocus.ListScroll) {
+        val lv = listView ?: return
+        when (scroll) {
+            OsdFocus.ListScroll.KEEP -> Unit
+            OsdFocus.ListScroll.TO_TOP -> lv.setSelectionFromTop(selChip, 0)
+            OsdFocus.ListScroll.TO_BOTTOM -> {
+                val rowH = dp(LIST_ROW_H).toInt()
+                lv.setSelectionFromTop(selChip, (lv.height - rowH).coerceAtLeast(0))
+            }
         }
     }
 
@@ -674,7 +713,16 @@ class TvOsdView(context: Context) : FrameLayout(context) {
             val title = textBox.getChildAt(0) as TextView
             val strip = textBox.getChildAt(1) as LinearLayout
 
-            val selected = position == selChip
+            // ⛔ **光标态**（`selected`）与**状态态**（`playing`）是两回事，别合并：
+            //      * `playing`（`position == row.active`）是**事实** —— 现在放的是
+            //        哪一集。光标在左栏时也要画（▶ 前缀 + 品牌色竖条），
+            //        否则用户打开菜单就不知道自己在看第几集。
+            //      * `selected` 是**光标** —— 必须跟着输入走。它只在真的进了
+            //        列表（`inList`）时才算，判据见 [OsdFocus.listItemIsCursor]。
+            //        之前写成 `position == selChip` 的后果：菜单一打开，左栏光标
+            //        在「选集」上，右半边却已经有一块品牌色实心块 —— 用户以为
+            //        焦点在列表里，按 ↑↓ 却发现是在挪左栏（2026-10-11 反馈）。
+            val selected = OsdFocus.listItemIsCursor(position, selChip, inList)
             val playing = position == row.active
             val enabled = row.isEnabled(position)
 

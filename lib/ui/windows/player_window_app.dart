@@ -144,11 +144,31 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 三指手势）时会被回调纠正回来。
   bool _fullScreen = false;
 
+  /// 播放页根节点的焦点。
+  ///
+  /// ## 为什么要自己持有它，而不是让 `Focus` 内部造一个
+  ///
+  /// `Focus(autofocus: true)` 只在**第一次 build** 时请求一次焦点。窗口进/出
+  /// 全屏时，原生那一步（`NSWindow.toggleFullScreen`）会把窗口搬到另一个
+  /// Space，Flutter 这一侧的焦点链可能被拆掉 —— 而 `autofocus` 不会因此
+  /// 再跑一遍。持有一个节点，我们就能在「全屏状态变了」之后**显式**把它
+  /// 抢回来（见 [_restoreKeyboardFocus]）。
+  ///
+  /// ⚠️ 它同时是 [_onHardwareKey] 里「焦点链还健康吗」的判据。
+  final FocusNode _rootFocus = FocusNode(debugLabel: '播放页根焦点');
+
   /// 窗口是否置顶。
   ///
   /// 这个没有原生回调 —— 置顶只能由我们自己改，不存在「被系统改掉」的路径，
   /// 所以本地状态就是真相。
   bool _alwaysOnTop = false;
+
+  /// 「这个播放窗口要没了」这条通知发过没有。
+  ///
+  /// 三个关窗路径（「停止并关闭」按钮、原生关窗通知、引擎随窗口销毁）会互相
+  /// 重叠地走到 [_releasePlayer]，所以通知本身必须幂等 —— 重复发只会让主窗口
+  /// 多做一次（被节流挡掉的）同步。
+  bool _closedNotified = false;
 
   /// 当前「音效」预设。
   ///
@@ -574,6 +594,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   @override
   void initState() {
     super.initState();
+    // 兜底键位处理：`CallbackShortcuts` 依赖焦点链，而焦点链在**原生全屏
+    // 切换**之后可能整条断掉（macOS 上实测如此 —— 见 [_onHardwareKey]）。
+    // 挂在 `HardwareKeyboard` 上就不看焦点，断链时照样收得到按键。
+    HardwareKeyboard.instance.addHandler(_onHardwareKey);
     // 引导流程要碰平台通道，放到首帧之后 —— 在 initState 里直接 await 会让
     // 第一帧迟迟出不来，窗口看起来像卡住了。
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
@@ -581,6 +605,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   @override
   void dispose() {
+    // 摘掉全局处理器：它挂在 `HardwareKeyboard` 这个单例上，不摘的话
+    // 窗口关掉之后它还在收按键，而且闭包还指向一个已经拆掉的 State。
+    HardwareKeyboard.instance.removeHandler(_onHardwareKey);
+    _rootFocus.dispose();
     _urlController.dispose();
     // 隐藏浮层的倒计时必须在这里掐掉：它到点会 `setState`，而那时 element
     // 已经在拆了。测试里则会表现成「A Timer is still pending」。
@@ -624,6 +652,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// **不调用 `setState`**：它可能从 `dispose()` 里被调到。
   Future<void> _releasePlayer() async {
+    // ⛔ 放在最前面（`_router` 判空之前）：这个窗口只有「要走」这一种情况会
+    //    走到这里，而通知本身是幂等的。放在判空之后会漏掉「窗口开着但这次
+    //    没播成」那条路 —— 那种情况下也确实没什么可同步的，但把时机统一
+    //    收在一处，比在三个调用点各判一次可靠。
+    _notifyClosed();
+
     final router = _router;
     if (router == null) return;
     _router = null;
@@ -668,6 +702,39 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     await closeChildWindow();
   }
 
+  /// 告诉主窗口「这个播放窗口要没了」。**只发一次、不 await**。
+  ///
+  /// ## 它为什么存在（2026-10-10 现场）
+  ///
+  /// 用户报「播放进度同步到网盘之后，**不同环境最后播放的集数还是不一样**」。
+  ///
+  /// 根因不在进度数据本身 —— 逐条进度（续播点 / 最长位置 / 最近播放时刻）
+  /// 早就整份同步了。缺的是**上传的时机**：主窗口的进度同步只有三个触发点
+  /// （启动 +12 秒 / 每 30 分钟 / 内置播放页 dispose，见 `app_providers.dart`
+  /// 的 `progressSyncSchedulerProvider`），而**第三条在 PC 上永远走不到** ——
+  /// PC 的播放跑在这个独立窗口的引擎里，那条 `dispose` 挂在**内置播放页**上。
+  ///
+  /// 于是最常见的路径「在电脑上看完一集 → 关掉播放窗口 → 去电视上接着看」
+  /// 会读到网盘上那份**最多落后半小时**的进度：电视算出来的「最后播放集数」
+  /// 自然还是上一集。
+  ///
+  /// ⚠️ 不 await 是刻意的：消息发出时这个窗口已经在拆自己了，等一轮
+  ///    「下载 + 合并 + 上传」只会卡住关窗。同步由主窗口的调度器去跑 ——
+  ///    它自带 20 秒节流与「上一轮没跑完就跳过」，重复通知没有代价。
+  void _notifyClosed() {
+    if (_closedNotified) return;
+    _closedNotified = true;
+    unawaited(
+      playerWindowChannel
+          .invokeMethod<void>(PlayerBridgeMethod.playerClosed)
+          .catchError((Object e) {
+        // 通道可能已经拆了（引擎先走一步，比如用户直接关窗）。这不是错误：
+        // 进度同步还会在「启动 +12 秒」「每 30 分钟」那两处兜住。
+        diag.debug('播放窗口', '通知主窗口「窗口已关闭」失败：$e');
+      }),
+    );
+  }
+
   // -------------------------------------------------------------------
   // 窗口形态：全屏 / 置顶
   // -------------------------------------------------------------------
@@ -680,6 +747,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   Future<void> _onFullScreenChanged(bool fullScreen) async {
     if (!mounted || _fullScreen == fullScreen) return;
     setState(() => _fullScreen = fullScreen);
+    // ⛔ 不能省。原生全屏切换会拆掉 Flutter 这一侧的主焦点，而
+    //    `CallbackShortcuts` 是挂在焦点链上的 —— 不抢回来，进全屏之后
+    //    空格 / ← / → 会**整张表一起失灵**，且不报任何错。
+    //    见 [_onHardwareKey] 里那段现场记录。
+    _restoreKeyboardFocus();
   }
 
   /// 切换全屏。
@@ -690,7 +762,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     final previous = _fullScreen;
     setState(() => _fullScreen = on);
 
-    if (await setChildWindowFullScreen(on)) return;
+    if (await setChildWindowFullScreen(on)) {
+      // 原生侧**接上了**才抢焦点。接不上时窗口形态根本没变，抢一次也无害，
+      // 但放在这里语义更清楚：这条路的动机就是「窗口形态变了」。
+      _restoreKeyboardFocus();
+      return;
+    }
 
     // 原生侧没接上（通道没装好 / 平台不支持）→ 把界面回滚。
     // 不回滚的话按钮会显示「已全屏」而窗口纹丝不动，用户只会觉得按钮坏了。
@@ -2716,6 +2793,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
           child: Focus(
             // 没有它快捷键收不到事件：`CallbackShortcuts` 只在自己处于焦点
             // 链上时才生效，而这个窗口里没有别的可聚焦控件。
+            //
+            // ⚠️ 节点由我们持有（而不是让 `Focus` 自己造）：全屏切换之后要
+            //    显式把焦点抢回来，见 [_restoreKeyboardFocus]。
+            focusNode: _rootFocus,
             autofocus: true,
             child: _showDiagnostics ? _buildDiagnosticsPage() : _buildPlayer(),
           ),
@@ -2789,6 +2870,87 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.escape): _onEscapeKey,
       };
+
+  /// 焦点链**断掉**时的兜底键位处理。返回「这一下我处理了吗」。
+  ///
+  /// ## 它补的是哪个洞（2026-10-10 现场）
+  ///
+  /// 用户报「**PC 端全屏播放时**缺少快捷键响应：空格暂停、左右调进度」。
+  /// 键位表里这三条一直都在（见 [_playbackShortcuts]），所以问题不在表，
+  /// 而在「事件根本走不到表上」。
+  ///
+  /// macOS 的原生全屏（`NSWindow.toggleFullScreen`）会把窗口搬到**另一个
+  /// Space**。这个切换过程中 Flutter 这一侧的**主焦点会被丢掉** ——
+  /// 而 `CallbackShortcuts` 是「往焦点链里插一个节点」，主焦点一旦落到我们
+  /// 子树之外（通常是根 scope），从它出发往上冒泡的按键就再也经过不了我们，
+  /// 于是一整张键位表**同时**失灵，且不报任何错。同一个根因在
+  /// flutter/flutter#166237 里有完整复现（那边还多一个症状：再按一次 Esc 就
+  /// 恢复了 —— 因为那次按键让焦点重新落回了链上）。
+  ///
+  /// ## 为什么挂在 `HardwareKeyboard` 上就能绕开
+  ///
+  /// `HardwareKeyboard` 的处理器**完全不看焦点** —— 引擎送进来的每一个按键
+  /// 都会跑一遍（`_dispatchKeyEvent` 是「全部处理器都调一遍」，不因为某个
+  /// 返回 true 就提前结束）。所以焦点链断了它也照样收得到。
+  ///
+  /// ## ⛔ 为什么必须有 `_rootFocus.hasFocus` 这道闸
+  ///
+  /// 正因为「全部处理器都会跑」，焦点链**健康**时这条路和 `CallbackShortcuts`
+  /// 会**各处理一次**：
+  ///   * 空格 → 暂停再播放，用户看到的是「按了没反应」；
+  ///   * → → 跳两次 10 秒，进度直接多跳一格。
+  /// 这两种都不会报错，只会让人觉得「按键有点飘」。
+  ///
+  /// `hasFocus` 是安全的判据：它表示「这个节点**或它的某个后代**持有主焦点」。
+  /// 只要它为假，主焦点就一定在我们的子树之外，`CallbackShortcuts` 那一层
+  /// 必然收不到 —— 两边不可能同时命中。
+  ///
+  /// ## 为什么用同一张键位表
+  ///
+  /// 兜底不是「另一套快捷键」：诊断页上仍然只有 Esc（空格要留给输入框），
+  /// 所以这里读的是**当前生效的那张表**。走这条路与走 `CallbackShortcuts`
+  /// 的语义必须逐条一致，否则「断链时能用的键」和「正常时能用的键」会分叉。
+  bool _onHardwareKey(KeyEvent event) {
+    // 焦点链健康 → 一个字都不做，全部交给 `CallbackShortcuts`。
+    if (_rootFocus.hasFocus) return false;
+
+    final table = _showDiagnostics ? _diagnosticsShortcuts : _playbackShortcuts;
+    // 与 `CallbackShortcuts` 一样**把所有命中的都执行掉**（不是命中一条就
+    // 返回）：那边是 `for` 里逐个 `accepts` 再 `call`。我们的表里触发器互不
+    // 相同，行为等价 —— 但保持一致，将来有人加了一条同键的也不会两边不同。
+    var handled = false;
+    for (final entry in table.entries) {
+      // `accepts` 自己就把「不是按下 / 长按重复」的事件挡掉了（键松开、
+      // 字符输入都返回 false），所以这里不需要再判事件类型。
+      if (entry.key.accepts(event, HardwareKeyboard.instance)) {
+        entry.value();
+        handled = true;
+      }
+    }
+    if (handled) {
+      diag.debug('播放窗口', '焦点链断了，快捷键走兜底通道：${event.logicalKey.keyLabel}');
+    }
+    return handled;
+  }
+
+  /// 把焦点抢回播放页根节点。**全屏状态变化之后必须调一次**。
+  ///
+  /// 放在帧后再请求：原生那边是全屏**动画**，而动画途中 Flutter 的焦点
+  /// 管理器可能正在处理「窗口失去 / 重新获得 key」那一串事件 —— 在动画开始
+  /// 那一刻抢焦点会被后面那次焦点清理盖掉。
+  ///
+  /// ⚠️ 诊断页上**不抢**：那一页有手输直链的 `TextField`，用户可能正把光标
+  ///    停在地址里，抢焦点等于把他正在打的内容打断。而且诊断页本来也不依赖
+  ///    播放快捷键（只有 Esc），走 [_onHardwareKey] 兜底就够了。
+  void _restoreKeyboardFocus() {
+    if (_showDiagnostics) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_rootFocus.hasFocus) return;
+      _rootFocus.requestFocus();
+      diag.debug('播放窗口', '全屏切换后把焦点抢回播放页根节点');
+    });
+  }
 
   /// 空格：播放 / 暂停。
   ///

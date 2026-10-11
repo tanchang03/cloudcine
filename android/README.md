@@ -196,6 +196,12 @@ tmdb_api_key · tmdb_api_base · tmdb_image_base · douban_cookie
 
 ## 三、构建
 
+> ⛔ **本目录是独立原生 Kotlin 工程，`flutter build apk` 在这里没有任何意义。**
+> 在仓库根跑它会报 `Build failed due to use of deleted Android v1 embedding` ——
+> 因为 `settings.gradle.kts` 只有 `include(":app")`（没引 Flutter 插件），
+> 清单里也没有 `flutterEmbedding`，Flutter 工具找不到 v2 嵌入标记就误判成 v1。
+> APK 一律走下面的 Gradle 命令。
+
 ```bash
 cd android
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home

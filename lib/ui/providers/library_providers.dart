@@ -828,6 +828,7 @@ class WorkDetail {
     required this.items,
     this.mergedSources = const [],
     this.maxPositions = const {},
+    this.resumePositions = const {},
   });
 
   final MediaWork work;
@@ -845,6 +846,20 @@ class WorkDetail {
   ///
   /// 缺键 = 从没播过（进度条不画），与「播了但不足 1 秒」是同一件事。
   final Map<String, Duration> maxPositions;
+
+  /// 每条文件的**续播点**（`itemId → 续播位置`）。只有 `> 0` 的才在。
+  ///
+  /// ## 为什么与 [maxPositions] 两份都要
+  ///
+  /// 它们回答的是两个不同的问题，而**两个问题这里都要**：
+  ///   * 画进度条 → 用 [maxPositions]（看完不清零）；
+  ///   * 算「点播放该播哪一集」→ 用这一份（见 [primary] 与
+  ///     `PlayTarget.resolve` 的第 ① 步 —— 判据正是「**还留着**续播点」，
+  ///     因为看完的那一集续播点会被清掉，那种情况下重播那一集不是用户想要的）。
+  ///
+  /// 把 `maxPositions` 拿去当续播判据是最容易犯的错：看完的一集它的值仍然是
+  /// 满的，于是「点播放」永远回到**已经看完**的那一集。
+  final Map<String, Duration> resumePositions;
 
   /// 已被折叠进这一部的**其他作品行**（跨目录归一的产物）。
   ///
@@ -864,9 +879,33 @@ class WorkDetail {
   List<MediaItem> get extras =>
       items.where((i) => i.isSampleOrExtra).toList(growable: false);
 
-  /// 可播的第一项（用于「播放」按钮与详情页自动选中）。
-  MediaItem? get primary =>
-      features.isNotEmpty ? features.first : (items.isEmpty ? null : items.first);
+  /// 「点播放会播哪一条」—— 与海报墙点卡片、Android 简介页的播放胶囊**同一条
+  /// 规则**（[PlayTarget.resolve]，不是各写一份「取第一条」）。
+  ///
+  /// ## 它同时决定「打开详情页默认高亮哪一季」
+  ///
+  /// 详情页的 `_resolveSeason` / `_resolvePart` 拿它去找所在的那一格 ——
+  /// 于是「默认高亮的那一季」与「点播放会播的那一集」永远是同一格。
+  ///
+  /// ## ⛔ 这里曾经是 `features.first`（2026-10-10 修）
+  ///
+  /// 症状：**PC 上从详情页点播放永远播第一集**，而同一部剧在电视上（简介页的
+  /// 播放胶囊走 `PlayTarget.resolve`）会接着上次看的那一集 —— 用户报的就是
+  /// 「不同环境最后播放集数不一样」。
+  ///
+  /// 而它旁边的注释当时已经写着「他要的是**续播那一集** / 第一集」、以及
+  /// 「这条口径与 `PlayTarget.resolve` 一致」—— 也就是说**实现与自己声明的
+  /// 口径不符**，只是没人发现（`features.first` 在没有进度时恰好等于第①条）。
+  ///
+  /// 全新、一集都没播过时行为完全不变（resolve 的第 ③ 步就是第一条）。
+  MediaItem? get primary => PlayTarget.resolve(
+        items: items,
+        resume: resumePositions,
+        lastPlayedAt: <String, DateTime>{
+          for (final i in items)
+            if (i.lastPlayedAt != null) i.id: i.lastPlayedAt!,
+        },
+      );
 
   bool get hasMultipleVersions => features.length > 1;
 }
@@ -926,6 +965,13 @@ final workDetailProvider =
   // 永远来自同一次读 —— 分成两个 provider 的话，刷新时机不同会让进度条
   // 比列表晚一拍，看起来像闪了一下。
   final maxPositions = await repo.maxPositions(
+    items.map((i) => i.id).toList(growable: false),
+  );
+  // 续播点也要单独查一次。它与 `maxPositions` 是**两个不同的问题**，而
+  // 详情页两个都要：画进度条用 `maxPositions`（看完不清零），算「点播放该播
+  // 哪一集」用这一份（`PlayTarget.resolve` 第 ① 步的判据是「**还留着**续播
+  // 点」）。见 `WorkDetail.resumePositions`。
+  final resumePositions = await repo.resumePositions(
     items.map((i) => i.id).toList(growable: false),
   );
 
@@ -992,6 +1038,7 @@ final workDetailProvider =
     items: items,
     mergedSources: merged,
     maxPositions: maxPositions,
+    resumePositions: resumePositions,
   );
 });
 

@@ -257,6 +257,91 @@ class WorkDetailFormatTest {
     }
 
     // ==================================================================
+    // 「谁在发光」—— 简介页的三层光标态
+    // ==================================================================
+
+    /**
+     * ⛔ **本组是这次修复的核心**（2026-10-11 用户反馈）。
+     *
+     * 简介页默认落在**动作胶囊**上（「▶ 播放」亮着），而焦点永远留在
+     * 剧集列表上 —— 所以「列表选中行」与「胶囊光标态」会同时为真。
+     * 两块都是亮品牌色实心，用户的原话是「有冲突……有干扰」。
+     *
+     * 不变量：**同一时刻只有一层在发光**。
+     */
+    @Test
+    fun `胶囊持光标时列表选中行不发光`() {
+        // 默认状态：焦点在列表（恒真）+ 光标在动作胶囊 + 首行是选中行。
+        assertFalse(
+            "光标在动作胶囊上时列表行还在发光 —— 屏幕上就有两块品牌色了",
+            WorkDetailFormat.itemRowHighlighted(
+                listFocused = true,
+                actionsFocused = true,
+                itemsSortFocused = false,
+                isSelectedRow = true,
+            ),
+        )
+        // 排序胶囊同理：它也是「胶囊行」，与动作行是同一种东西。
+        assertFalse(
+            "光标在排序胶囊上时列表行还在发光",
+            WorkDetailFormat.itemRowHighlighted(
+                listFocused = true,
+                actionsFocused = false,
+                itemsSortFocused = true,
+                isSelectedRow = true,
+            ),
+        )
+    }
+
+    /** 光标交回列表（按 ↓ / 选中「选集」）⇒ 选中行的高亮必须**恢复**。 */
+    @Test
+    fun `光标交回列表后选中行恢复发光`() {
+        assertTrue(
+            "光标回到列表了，选中行却不亮 —— 用户会以为列表没有选中项",
+            WorkDetailFormat.itemRowHighlighted(
+                listFocused = true,
+                actionsFocused = false,
+                itemsSortFocused = false,
+                isSelectedRow = true,
+            ),
+        )
+    }
+
+    /**
+     * ⛔ 只有**选中那一行**发光。判据里 `isSelectedRow` 掉了的话，
+     *    整个列表会一起亮起来（这个错在真机上极刺眼，但在纯逻辑上「多亮几行」
+     *    看着毫无问题）。
+     */
+    @Test
+    fun `未选中的行永远不发光`() {
+        assertFalse(
+            WorkDetailFormat.itemRowHighlighted(
+                listFocused = true,
+                actionsFocused = false,
+                itemsSortFocused = false,
+                isSelectedRow = false,
+            ),
+        )
+    }
+
+    /**
+     * ⛔ 覆盖层（菜单 / 筛选面板 / 退出确认框）弹出时列表已经**失去焦点**，
+     *    这时不许再画高亮 —— 否则覆盖层底下那层会「偷偷发光」。
+     *    判据里省掉 `listFocused` 的话这一条就会漏。
+     */
+    @Test
+    fun `列表失去焦点时不发光`() {
+        assertFalse(
+            WorkDetailFormat.itemRowHighlighted(
+                listFocused = false,
+                actionsFocused = false,
+                itemsSortFocused = false,
+                isSelectedRow = true,
+            ),
+        )
+    }
+
+    // ==================================================================
 
     /**
      * 造一部作品。
