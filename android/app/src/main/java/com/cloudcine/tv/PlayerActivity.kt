@@ -1264,11 +1264,38 @@ class PlayerActivity : Activity() {
      * 第二次打开同一个文件时那段就能命中缓存，省掉一次
      * `pos=0` 的嗅探往返（实测 250~500ms）。
      *
+     * ⛔⛔ **但「起点 0」不能变成「从 0 一直往前爬」**（2026-10-11 评估发现）：
+     *    [DiskPrefetcher] 只会**往前**挪锚点，而挪锚点（`reanchor`）**只在
+     *    用户跳转**时被调。于是**续播**时 —— 本工程绝大多数起播都是续播 ——
+     *    播放头在 31:20、预取器却在从字节 0 往下灌，要把用户**已经看过**的
+     *    前 31 分钟全下完，才轮到播放头前方。
+     *
+     *    实测（模拟器，`01.mp4` 续播到 1880s）：
+     *    ```
+     *    17:45:05.327  续播：起播跳到 1880s（库里记的续播点）
+     *    17:45:05.331  磁盘预取：已启动（键 quark:e631…:origin · 码率 0.24 MiB/s）
+     *    17:45:06.328  … 磁盘 本片 0 B … 预取 第 0 块 · 领先 0 B
+     *    ```
+     *    `预取 第 0 块` = 还在下文件头那一块。根因是**顺序**：
+     *    [startPlayer] 里 `exo.seekTo(startMs)`（续播点）发生在
+     *    `startDiskPrefetch(...)` **之前**，那次 `onPositionDiscontinuity(SEEK)`
+     *    打过来时 `prefetcher` 还是 null ⇒ `reanchor` 成了空操作。
+     *
+     * ★ **修法（2026-10-11 已落地）**：把「起点」和「首块」拆开 ——
+     *    起点仍是 0，但**首块只下 [PrefetchPlan.HEAD_BYTES]**（够把
+     *    `moov` / 索引落盘），首块一提交就跳到续播点。判据分别在
+     *    [PrefetchPlan.chunkSpan] 与 [PrefetchPlan.jumpAfterHead]。
+     *    ⇒ 这里要把续播点换算成字节传下去（[PrefetchPlan.resumeAnchorBytes]），
+     *    而不是再补一次 `reanchor` —— 后者会在「首块下完之前」就跳，
+     *    文件头反而永远落不了盘。
+     *
      * ## 领先量为什么是「缓存上限的 70%」
      *
      * ⛔ 不能设成无上限：那会一口气把缓存灌满，而用户可能看 5 分钟就退出 ——
-     * 白下、白写盘。70% 留出余量给播放器自己写的那部分（已播段），
-     * 让 LRU 有腾挪空间。
+     * 白下、白写盘。70% 留出余量给 **LRU 的腾挪空间**。
+     * ⛔ 别再写「留给播放器自己写的那部分（已播段）」（2026-10-11 更正）：
+     *    **播放器根本不写缓存**（`setCacheWriteDataSinkFactory(null)`），
+     *    唯一的写者就是这个预取器。
      *
      * @param cache 为 null（空间不够 / 初始化失败）时**直接不预取**，
      *   播放走纯网络 —— 这是正常路径，不是错误。
@@ -1324,12 +1351,20 @@ class PlayerActivity : Activity() {
         //    预取下的东西播放器就一个字节都命中不了，而现象只是「缓冲白下了」，
         //    不报任何错。所以这里**复用同一个函数**，不复制公式。
         val key = cacheKeyFor(uri)
+        // ⛔ 续播点 → 字节位置：**必须用上面那个 `bytesPerSec`**（= 码率 ×
+        //    1048576，字节/秒）。单位搞混会让锚点差 100 万倍，而现象只是
+        //    「预取器跑到文件外面去了」，不报任何错。判据见
+        //    [PrefetchPlan.resumeAnchorBytes]（`<= 0` / 码率未知 ⇒ 不跳）。
+        val resumeAnchor = PrefetchPlan.resumeAnchorBytes(resumeAtMs, bytesPerSec)
         val p = DiskPrefetcher(
             cache = cache,
             dataSourceFactory = upstream,
             uri = uri,
             cacheKey = key,
             startPositionBytes = 0L,
+            // ⛔ 首块（文件头）下完就跳到这里，别再灌用户已经看过的那一段 ——
+            //    见 KDoc「为什么起点是 0」那一节。
+            jumpAfterHeadBytes = resumeAnchor,
             totalBytes = -1L,
             maxLeadBytes = lead,
             // ⛔ 只读主线程写好的**快照**，绝不在这里碰 `player` ——
@@ -1338,10 +1373,20 @@ class PlayerActivity : Activity() {
         )
         prefetcher = p
         p.start()
+        // ⛔ 先把文案**拼完整**再 `format`：早先写成 `Log.i(...)` 后面吊一个
+        //    `.format(rate)`，那玩意儿贴在 `)` 上 ⇒ 语法错。判据：这里只出现
+        //    一个 `Log.i(` 与一个配对的 `)`，`.format(rate)` 作用在**字符串**上。
+        val jumpNote = if (resumeAnchor > 0L) {
+            "跳到续播点 ${resumeAnchor / 1048576} MiB）"
+        } else {
+            "继续往前（无续播点））"
+        }
         Log.i(
             TAG,
-            "磁盘预取：已启动（键 $key · 码率 %.2f MiB/s ⇒ 领先上限 ${lead / 1048576} MiB）"
-                .format(rate),
+            (
+                "磁盘预取：已启动（键 $key · 码率 %.2f MiB/s ⇒ 领先上限 ${lead / 1048576} MiB · " +
+                    "首块 ${PrefetchPlan.HEAD_BYTES / 1048576} MiB 后$jumpNote"
+                ).format(rate),
         )
     }
 

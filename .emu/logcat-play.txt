@@ -1,0 +1,787 @@
+--------- beginning of main
+10-11 17:44:48.882  6425  6425 E Clearcut-EventLogger: Unexpected log parameter shown_channel_count
+--------- beginning of system
+10-11 17:44:48.884   499   519 V WindowManager: Sent Transition #34 createdAt=10-11 17:44:48.789 via request=TransitionRequestInfo { type = CLOSE, triggerTask = null, remoteTransition = null, displayChange = null }
+10-11 17:44:48.884   499   519 V WindowManager:     startWCT=WindowContainerTransaction { changes = {} hops = [] errorCallbackToken=null taskFragmentOrganizer=null }
+10-11 17:44:48.884   499   519 V WindowManager:     info={id=34 t=CLOSE f=0x0 trk=0 r=[0@Point(0, 0)] c=[{WCT{RemoteToken{7dab75c Task{3a275c9 #14 type=standard A=10122:com.cloudcine.tv}}} m=TO_BACK f=NONE leash=Surface(name=Task=14)/@0x75a8ca9 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{RemoteToken{4b6c3dc Task{c5b4c58 #1 type=home}}} m=TO_FRONT f=NONE leash=Surface(name=Task=1)/@0x5fd99e2 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:48.885   838   904 V WindowManagerShell: onTransitionReady android.os.BinderProxy@5efa6: {id=34 t=CLOSE f=0x0 trk=0 r=[0@Point(0, 0)] c=[{WCT{android.window.IWindowContainerToken$Stub$Proxy@a916032} m=TO_BACK f=NONE leash=Surface(name=Task=14)/@0x1efcde7 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{android.window.IWindowContainerToken$Stub$Proxy@3e16183} m=TO_FRONT f=NONE leash=Surface(name=Task=1)/@0xb813d94 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:48.886   838   904 V WindowManagerShell: Playing animation for (#34)android.os.BinderProxy@5efa6@0
+10-11 17:44:48.886   838   904 V WindowManagerShell:  try handler com.android.wm.shell.keyguard.KeyguardTransitionHandler@5a36fe7
+10-11 17:44:48.886   838   904 V WindowManagerShell:  try handler com.android.wm.shell.activityembedding.ActivityEmbeddingController@6593794
+10-11 17:44:48.886   838   904 V WindowManagerShell:  try handler com.android.wm.shell.pip.tv.TvPipTransition@363f23d
+10-11 17:44:48.886   838   904 V WindowManagerShell:  try handler com.android.wm.shell.transition.RemoteTransitionHandler@d8aea32
+10-11 17:44:48.886   838   904 V WindowManagerShell: Transition doesn't have explicit remote, search filters for match for {id=34 t=CLOSE f=0x0 trk=0 r=[0@Point(0, 0)] c=[{WCT{android.window.IWindowContainerToken$Stub$Proxy@a916032} m=TO_BACK f=NONE leash=Surface(name=Task=14)/@0x1efcde7 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{android.window.IWindowContainerToken$Stub$Proxy@3e16183} m=TO_FRONT f=NONE leash=Surface(name=Task=1)/@0xb813d94 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:48.886   838   904 V WindowManagerShell:  Delegate animation for #34 to null
+10-11 17:44:48.886   838   904 V WindowManagerShell:  try handler com.android.wm.shell.transition.DefaultTransitionHandler@c2d2383
+10-11 17:44:48.886   838   904 V WindowManagerShell: start default transition animation, info = {id=34 t=CLOSE f=0x0 trk=0 r=[0@Point(0, 0)] c=[{WCT{android.window.IWindowContainerToken$Stub$Proxy@a916032} m=TO_BACK f=NONE leash=Surface(name=Task=14)/@0x1efcde7 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{android.window.IWindowContainerToken$Stub$Proxy@3e16183} m=TO_FRONT f=NONE leash=Surface(name=Task=1)/@0xb813d94 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:48.886   838   904 V WindowManagerShell: loadAnimation: anim=android.view.animation.AlphaAnimation@5f14d7e animAttr=0xa type=CLOSE isEntrance=true
+10-11 17:44:48.887   838   904 V WindowManagerShell: loadAnimation: anim=android.view.animation.AlphaAnimation@22eab2c animAttr=0xb type=CLOSE isEntrance=false
+10-11 17:44:48.888   838   904 V WindowManagerShell:  animated by com.android.wm.shell.transition.DefaultTransitionHandler@c2d2383
+10-11 17:44:48.904   499   560 I ImeTracker: com.google.android.tvlauncher:cd7f71a6: onRequestHide at ORIGIN_SERVER_HIDE_INPUT reason HIDE_UNSPECIFIED_WINDOW
+10-11 17:44:48.906   499   560 I ImeTracker: com.google.android.tvlauncher:cd7f71a6: onCancelled at PHASE_SERVER_SHOULD_HIDE
+10-11 17:44:48.907  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onFinishInput():3264 
+10-11 17:44:48.908  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 0, locked = false
+10-11 17:44:48.908  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1899 onStartInput(EditorInfo{inputType=0x0(NULL) imeOptions=0x0 privateImeOptions=null actionName=UNSPECIFIED actionLabel=null actionId=0 initialSelStart=-1 initialSelEnd=-1 initialCapsMode=0x0 hintText=null label=null packageName=com.google.android.tvlauncher fieldId=0 fieldName=null extras=null hintLocales=[]}, false)
+10-11 17:44:48.908  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.shouldHideHeaderOnInitialState():4091 ShouldHideHeaderOnInitialState = false
+10-11 17:44:48.908   499   523 W WindowManager: Failed to deliver inset control state change to w=Window{3b0800e u0 com.cloudcine.tv/com.cloudcine.tv.PlayerActivity EXITING}
+10-11 17:44:48.908   499   523 W WindowManager: android.os.DeadObjectException
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.BinderProxy.transactNative(Native Method)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.BinderProxy.transact(BinderProxy.java:584)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.view.IWindow$Stub$Proxy.insetsControlChanged(IWindow.java:479)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.WindowState.notifyInsetsControlChanged(WindowState.java:3802)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.InsetsStateController.lambda$notifyPendingInsetsControlChanged$3(InsetsStateController.java:343)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.InsetsStateController.$r8$lambda$8yykPRG1GyNq_J17QvL9d5xANMc(InsetsStateController.java:0)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.InsetsStateController$$ExternalSyntheticLambda2.run(R8$$SyntheticClass:0)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.WindowAnimator.executeAfterPrepareSurfacesRunnables(WindowAnimator.java:294)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.RootWindowContainer.performSurfacePlacementNoTrace(RootWindowContainer.java:811)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.RootWindowContainer.performSurfacePlacement(RootWindowContainer.java:756)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.WindowSurfacePlacer.performSurfacePlacementLoop(WindowSurfacePlacer.java:177)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.WindowSurfacePlacer.performSurfacePlacement(WindowSurfacePlacer.java:126)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.WindowSurfacePlacer.performSurfacePlacement(WindowSurfacePlacer.java:115)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.wm.WindowSurfacePlacer$Traverser.run(WindowSurfacePlacer.java:57)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.Handler.handleCallback(Handler.java:958)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.Handler.dispatchMessage(Handler.java:99)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.Looper.loopOnce(Looper.java:205)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.Looper.loop(Looper.java:294)
+10-11 17:44:48.908   499   523 W WindowManager: 	at android.os.HandlerThread.run(HandlerThread.java:67)
+10-11 17:44:48.908   499   523 W WindowManager: 	at com.android.server.ServiceThread.run(ServiceThread.java:46)
+10-11 17:44:48.909  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 1, locked = false
+10-11 17:44:48.930   366   458 D audioserver: FGS Logger Transaction failed
+10-11 17:44:48.930   366   458 D audioserver: -129
+10-11 17:44:48.944   366   458 D audioserver: FGS Logger Transaction failed
+10-11 17:44:48.944   366   458 D audioserver: -129
+10-11 17:44:48.967 18735 18735 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+10-11 17:44:48.975 18735 18735 I AndroidRuntime: Using default boot image
+10-11 17:44:48.975 18735 18735 I AndroidRuntime: Leaving lock profiling enabled
+10-11 17:44:48.978 18735 18735 I app_process: Using CollectorTypeCC GC.
+10-11 17:44:49.058 18735 18735 D nativeloader: InitDefaultPublicLibraries for_preload=1: libandroid.so:libaaudio.so:libamidi.so:libbinder_ndk.so:libc.so:libcamera2ndk.so:libdl.so:libEGL.so:libGLESv1_CM.so:libGLESv2.so:libGLESv3.so:libicu.so:libicui18n.so:libicuuc.so:libjnigraphics.so:liblog.so:libmediandk.so:libm.so:libnativehelper.so:libnativewindow.so:libOpenMAXAL.so:libOpenSLES.so:libRS.so:libstdc++.so:libsync.so:libvulkan.so:libwebviewchromium_plat_support.so:libz.so
+10-11 17:44:49.065 18735 18735 D app_process: Time zone APEX ICU file found: /apex/com.android.tzdata/etc/icu/icu_tzdata.dat
+10-11 17:44:49.065 18735 18735 D app_process: I18n APEX ICU file found: /apex/com.android.i18n/etc/icu/icudt72l.dat
+10-11 17:44:49.068  6425  6425 E Clearcut-EventLogger: Unexpected log parameter tray_notification_count
+10-11 17:44:49.092 18735 18735 W libc    : Access denied finding property "ro.product.name_for_attestation"
+10-11 17:44:49.092 18735 18735 W libc    : Access denied finding property "ro.product.brand_for_attestation"
+10-11 17:44:49.092 18735 18735 W libc    : Access denied finding property "ro.product.model_for_attestation"
+10-11 17:44:49.088 18735 18735 W main    : type=1400 audit(0.0:2840): avc:  denied  { read } for  name="u:object_r:build_attestation_prop:s0" dev="tmpfs" ino=76 scontext=u:r:shell:s0 tcontext=u:object_r:build_attestation_prop:s0 tclass=file permissive=0
+10-11 17:44:49.088 18735 18735 W main    : type=1400 audit(0.0:2841): avc:  denied  { read } for  name="u:object_r:build_attestation_prop:s0" dev="tmpfs" ino=76 scontext=u:r:shell:s0 tcontext=u:object_r:build_attestation_prop:s0 tclass=file permissive=0
+10-11 17:44:49.088 18735 18735 W main    : type=1400 audit(0.0:2842): avc:  denied  { read } for  name="u:object_r:build_attestation_prop:s0" dev="tmpfs" ino=76 scontext=u:r:shell:s0 tcontext=u:object_r:build_attestation_prop:s0 tclass=file permissive=0
+10-11 17:44:49.093 18735 18735 D AndroidRuntime: Calling main entry com.android.commands.monkey.Monkey
+10-11 17:44:49.094 18735 18735 W Monkey  : args: [-p, com.cloudcine.tv, -c, android.intent.category.LAUNCHER, 1]
+10-11 17:44:49.094 18735 18735 W Monkey  :  arg: "-p"
+10-11 17:44:49.094 18735 18735 W Monkey  :  arg: "com.cloudcine.tv"
+10-11 17:44:49.094 18735 18735 W Monkey  :  arg: "-c"
+10-11 17:44:49.094 18735 18735 W Monkey  :  arg: "android.intent.category.LAUNCHER"
+10-11 17:44:49.094 18735 18735 W Monkey  :  arg: "1"
+10-11 17:44:49.094 18735 18735 W Monkey  : data="com.cloudcine.tv"
+10-11 17:44:49.094 18735 18735 W Monkey  : data="android.intent.category.LAUNCHER"
+10-11 17:44:49.102   499   560 W ActivityManager: registerReceiverWithFeature: no app for null
+10-11 17:44:49.103 18735 18735 W System  : No Compatibility callbacks set! Querying change 263076149
+10-11 17:44:49.103 18735 18735 W System  : No Compatibility callbacks set! Querying change 263076149
+10-11 17:44:49.103 18735 18735 W System  : No Compatibility callbacks set! Querying change 263076149
+10-11 17:44:49.105   499   560 D CompatibilityChangeReporter: Compat change id reported: 161252188; UID 10122; state: DISABLED
+10-11 17:44:49.105   499   560 W ActivityTaskManager: callingPackage for (uid=2000, pid=18735) has no WPC
+10-11 17:44:49.106   499   560 E CellBroadcastUtils: getDefaultCellBroadcastReceiverPackageName: no package found
+10-11 17:44:49.109   499   560 D CompatibilityChangeReporter: Compat change id reported: 205907456; UID 10122; state: ENABLED
+10-11 17:44:49.109   499   560 I ActivityTaskManager: Add Task{3a275c9 #14 type=standard A=10122:com.cloudcine.tv} to hidden list because adding Task{3d91925 #15 type=standard A=10122:com.cloudcine.tv}
+10-11 17:44:49.109   499   560 I ActivityTaskManager: START u0 {act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.cloudcine.tv/.MainActivity} with LAUNCH_MULTIPLE from uid 2000 (BAL_ALLOW_PERMISSION) result code=0
+10-11 17:44:49.110   838   904 V WindowManagerShell: Transition requested: android.os.BinderProxy@d99c071 TransitionRequestInfo { type = OPEN, triggerTask = TaskInfo{userId=0 taskId=15 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.cloudcine.tv/.MainActivity } baseActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} topActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} origActivity=null realActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} numActivities=1 lastActiveTime=3159648 supportsMultiWindow=true resizeMode=1 isResizeable=true minWidth=-1 minHeight=-1 defaultMinSize=220 token=WCT{android.window.IWindowContainerToken$Stub$Proxy@b7f8e56} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=true launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=null topActivityInfo=ActivityInfo{f31fed7 com.cloudcine.tv.MainActivity} launchCookies=[] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=false isVisible=false isVisibleRequested=false isSleeping=false topActivityInSizeCompat=false topActivityEligibleForLetterboxEducation= false topActivityLetterboxed= false isFromDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 locusId=null displayAreaFeatureId=1 cameraCompatControlState=hidden}, remoteTransition = null, displayChange = null }
+10-11 17:44:49.110 18735 18735 I Monkey  : Events injected: 1
+10-11 17:44:49.110   499   522 D CompatibilityChangeReporter: Compat change id reported: 135634846; UID 10122; state: DISABLED
+10-11 17:44:49.110   499   522 D CompatibilityChangeReporter: Compat change id reported: 177438394; UID 10122; state: DISABLED
+10-11 17:44:49.110   499   522 D CompatibilityChangeReporter: Compat change id reported: 135772972; UID 10122; state: DISABLED
+10-11 17:44:49.111   499   522 D CompatibilityChangeReporter: Compat change id reported: 135754954; UID 10122; state: ENABLED
+10-11 17:44:49.111   499   530 D CompatibilityChangeReporter: Compat change id reported: 143937733; UID 10122; state: ENABLED
+10-11 17:44:49.114   499   573 D CompatibilityChangeReporter: Compat change id reported: 265195908; UID 10122; state: ENABLED
+10-11 17:44:49.117   338   338 D Zygote  : Forked child process 18751
+10-11 17:44:49.117 18735 18735 I Monkey  : ## Network stats: elapsed time=12ms (0ms mobile, 0ms wifi, 12ms not connected)
+10-11 17:44:49.117   499   530 I ActivityManager: Start proc 18751:com.cloudcine.tv/u0a122 for next-top-activity {com.cloudcine.tv/com.cloudcine.tv.MainActivity}
+10-11 17:44:49.117 18735 18735 I app_process: System.exit called, status: 0
+10-11 17:44:49.117 18735 18735 I AndroidRuntime: VM exiting with result code 0.
+10-11 17:44:49.155 18751 18751 I om.cloudcine.tv: Late-enabling -Xcheck:jni
+10-11 17:44:49.165 18751 18751 I om.cloudcine.tv: Using CollectorTypeCC GC.
+10-11 17:44:49.175  1649  1677 I adbd    : jdwp connection from 18751
+10-11 17:44:49.213   838   904 D WindowManagerShell: TvPipController: onTaskStackChanged()
+10-11 17:44:49.219 18751 18751 D CompatibilityChangeReporter: Compat change id reported: 171979766; UID 10122; state: ENABLED
+10-11 17:44:49.219 18751 18751 D CompatibilityChangeReporter: Compat change id reported: 242716250; UID 10122; state: ENABLED
+10-11 17:44:49.224 18751 18751 W ziparchive: Unable to open '/data/app/~~Kk9zTKjeyJGEs3dQGtk8Tg==/com.cloudcine.tv-NnPOhk2y1BtQiIvBqHdR1A==/base.dm': No such file or directory
+10-11 17:44:49.224 18751 18751 W ziparchive: Unable to open '/data/app/~~Kk9zTKjeyJGEs3dQGtk8Tg==/com.cloudcine.tv-NnPOhk2y1BtQiIvBqHdR1A==/base.dm': No such file or directory
+10-11 17:44:49.297 18751 18751 D nativeloader: Configuring clns-6 for other apk /data/app/~~Kk9zTKjeyJGEs3dQGtk8Tg==/com.cloudcine.tv-NnPOhk2y1BtQiIvBqHdR1A==/base.apk. target_sdk_version=34, uses_libraries=, library_path=/data/app/~~Kk9zTKjeyJGEs3dQGtk8Tg==/com.cloudcine.tv-NnPOhk2y1BtQiIvBqHdR1A==/lib/arm64, permitted_path=/data:/mnt/expand:/data/user/0/com.cloudcine.tv
+10-11 17:44:49.303   838   904 V WindowManagerShell: Transition animation finished (aborted=false), notifying core (#34)android.os.BinderProxy@5efa6@0
+10-11 17:44:49.304   499   519 V WindowManager: Finish Transition #34: created at 10-11 17:44:48.789 collect-started=0.325ms request-sent=10.237ms started=23.122ms ready=23.117ms sent=94.794ms finished=515.039ms
+10-11 17:44:49.304   499  2764 W WindowManager: Exception thrown during dispatchAppVisibility Window{3b0800e u0 com.cloudcine.tv/com.cloudcine.tv.PlayerActivity EXITING}
+10-11 17:44:49.304   499  2764 W WindowManager: android.os.DeadObjectException
+10-11 17:44:49.304   499  2764 W WindowManager: 	at android.os.BinderProxy.transactNative(Native Method)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at android.os.BinderProxy.transact(BinderProxy.java:584)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at android.view.IWindow$Stub$Proxy.dispatchAppVisibility(IWindow.java:546)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.WindowState.sendAppVisibilityToClients(WindowState.java:3271)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.WindowContainer.sendAppVisibilityToClients(WindowContainer.java:1221)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.WindowToken.setClientVisible(WindowToken.java:409)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.ActivityRecord.setClientVisible(ActivityRecord.java:6946)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.ActivityRecord.postApplyAnimation(ActivityRecord.java:5637)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.ActivityRecord.commitVisibility(ActivityRecord.java:5580)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.Transition.finishTransition(Transition.java:1151)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.TransitionController.finishTransition(TransitionController.java:868)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.WindowOrganizerController.finishTransition(WindowOrganizerController.java:396)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at android.window.IWindowOrganizerController$Stub.onTransact(IWindowOrganizerController.java:286)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at com.android.server.wm.WindowOrganizerController.onTransact(WindowOrganizerController.java:181)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at android.os.Binder.execTransactInternal(Binder.java:1344)
+10-11 17:44:49.304   499  2764 W WindowManager: 	at android.os.Binder.execTransact(Binder.java:1275)
+10-11 17:44:49.304   499  2764 I Process : Sending signal. PID: 7136 SIG: 9
+10-11 17:44:49.306   499   522 W ActivityManager: setHasOverlayUi called on unknown pid: 7136
+10-11 17:44:49.307   838   904 V WindowManagerShell: Track 0 became idle
+10-11 17:44:49.309 18751 18751 V GraphicsEnvironment: Currently set values for:
+10-11 17:44:49.309 18751 18751 V GraphicsEnvironment:   angle_gl_driver_selection_pkgs=[]
+10-11 17:44:49.309 18751 18751 V GraphicsEnvironment:   angle_gl_driver_selection_values=[]
+10-11 17:44:49.309 18751 18751 V GraphicsEnvironment: ANGLE GameManagerService for com.cloudcine.tv: false
+10-11 17:44:49.309 18751 18751 V GraphicsEnvironment: com.cloudcine.tv is not listed in per-application setting
+10-11 17:44:49.309 18751 18751 V GraphicsEnvironment: Neither updatable production driver nor prerelease driver is supported.
+10-11 17:44:49.312   499  2764 I ActivityManager: Flag disabled. Ignoring finishAttachApplication from uid: 10122. pid: 18751
+10-11 17:44:49.318 18751 18773 D libEGL  : loaded /vendor/lib64/egl/libEGL_emulation.so
+10-11 17:44:49.319 18751 18773 D libEGL  : loaded /vendor/lib64/egl/libGLESv1_CM_emulation.so
+10-11 17:44:49.320 18751 18773 D libEGL  : loaded /vendor/lib64/egl/libGLESv2_emulation.so
+10-11 17:44:49.329   499  2764 E CellBroadcastUtils: getDefaultCellBroadcastReceiverPackageName: no package found
+10-11 17:44:49.331   499  2764 I ActivityTaskManager: START u0 {cmp=com.cloudcine.tv/.LibraryActivity} with LAUNCH_MULTIPLE from uid 10122 (BAL_ALLOW_VISIBLE_WINDOW) result code=0
+10-11 17:44:49.337   499   522 I DisplayDeviceRepository: Display device changed: DisplayDeviceInfo{"Built-in Screen": uniqueId="local:4619827259835644672", 1920 x 1080, modeId 1, renderFrameRate 60.000004, defaultModeId 1, supportedModes [{id=1, width=1920, height=1080, fps=60.000004, alternativeRefreshRates=[], supportedHdrTypes=[]}], colorMode 0, supportedColorModes [0], hdrCapabilities HdrCapabilities{mSupportedHdrTypes=[], mMaxLuminance=500.0, mMaxAverageLuminance=500.0, mMinLuminance=0.0}, allmSupported false, gameContentTypeSupported false, density 320, 320.0 x 320.0 dpi, appVsyncOff 1000000, presDeadline 16666666, touch INTERNAL, rotation 0, type INTERNAL, address {port=0, model=0x401cec6a7a2b7b}, deviceProductInfo DeviceProductInfo{name=EMU_display_0, manufacturerPnpId=GGL, productId=1, modelYear=null, manufactureDate=ManufactureDate{week=27, year=2006}, connectionToSinkType=0}, state ON, committedState ON, frameRateOverride , brightnessMinimum 0.0, brightnessMaximum 1.0, brightnessDefault 0.39763778, hdrSdrRatio NaN, FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY, FLAG_ROTATES_WITH_CONTENT, FLAG_SECURE, FLAG_SUPPORTS_PROTECTED_BUFFERS, FLAG_TRUSTED, installOrientation 0, displayShape DisplayShape{ spec=729782573 displayWidth=1920 displayHeight=1080 physicalPixelDisplaySizeRatio=1.0 rotation=0 offsetX=0 offsetY=0 scale=1.0}}
+10-11 17:44:49.338   499   522 I DisplayDeviceRepository: Display device changed: DisplayDeviceInfo{"Built-in Screen": uniqueId="local:4619827259835644672", 1920 x 1080, modeId 1, renderFrameRate 60.000004, defaultModeId 1, supportedModes [{id=1, width=1920, height=1080, fps=60.000004, alternativeRefreshRates=[], supportedHdrTypes=[]}], colorMode 0, supportedColorModes [0], hdrCapabilities HdrCapabilities{mSupportedHdrTypes=[], mMaxLuminance=500.0, mMaxAverageLuminance=500.0, mMinLuminance=0.0}, allmSupported false, gameContentTypeSupported false, density 320, 320.0 x 320.0 dpi, appVsyncOff 1000000, presDeadline 16666666, touch INTERNAL, rotation 0, type INTERNAL, address {port=0, model=0x401cec6a7a2b7b}, deviceProductInfo DeviceProductInfo{name=EMU_display_0, manufacturerPnpId=GGL, productId=1, modelYear=null, manufactureDate=ManufactureDate{week=27, year=2006}, connectionToSinkType=0}, state ON, committedState ON, frameRateOverride , brightnessMinimum 0.0, brightnessMaximum 1.0, brightnessDefault 0.39763778, hdrSdrRatio NaN, FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY, FLAG_ROTATES_WITH_CONTENT, FLAG_SECURE, FLAG_SUPPORTS_PROTECTED_BUFFERS, FLAG_TRUSTED, installOrientation 0, displayShape DisplayShape{ spec=729782573 displayWidth=1920 displayHeight=1080 physicalPixelDisplaySizeRatio=1.0 rotation=0 offsetX=0 offsetY=0 scale=1.0}}
+10-11 17:44:49.364 18751 18751 D CompatibilityChangeReporter: Compat change id reported: 210923482; UID 10122; state: ENABLED
+10-11 17:44:49.366 18751 18751 D CompatibilityChangeReporter: Compat change id reported: 171228096; UID 10122; state: ENABLED
+10-11 17:44:49.374 18751 18751 I CloudCine: 海报墙：8 列 × 203px（屏宽 1920px）
+10-11 17:44:49.384 18751 18751 D CompatibilityChangeReporter: Compat change id reported: 237531167; UID 10122; state: DISABLED
+10-11 17:44:49.386 18751 18751 W OpenGLRenderer: Unknown dataspace 0
+10-11 17:44:49.388   499  2764 W WindowManager: Failed looking up window session=Session{e65aeb2 18751:u0a10122} callers=com.android.server.wm.WindowManagerService.windowForClientLocked:6034 com.android.server.wm.Session.updateRequestedVisibleTypes:690 android.view.IWindowSession$Stub.onTransact:1034 
+10-11 17:44:49.405   499 18728 D CoreBackPreview: Window{e1d63b9 u0 com.cloudcine.tv/com.cloudcine.tv.LibraryActivity}: Setting back callback OnBackInvokedCallbackInfo{mCallback=android.window.IOnBackInvokedCallback$Stub$Proxy@85c85ac, mPriority=0, mIsAnimationCallback=false}
+10-11 17:44:49.426   156   156 I hwservicemanager: getTransport: Cannot find entry android.hardware.configstore@1.0::ISurfaceFlingerConfigs/default in either framework or device VINTF manifest.
+10-11 17:44:49.426 18751 18771 W OpenGLRenderer: Failed to choose config with EGL_SWAP_BEHAVIOR_PRESERVED, retrying without...
+10-11 17:44:49.426 18751 18771 W OpenGLRenderer: Failed to initialize 101010-2 format, error = EGL_SUCCESS
+10-11 17:44:49.443   156   156 I hwservicemanager: getTransport: Cannot find entry android.hardware.graphics.mapper@4.0::IMapper/default in either framework or device VINTF manifest.
+10-11 17:44:49.443 18751 18771 I Gralloc4: mapper 4.x is not supported
+10-11 17:44:49.445   838   904 D WindowManagerShell: TvPipController: onTaskStackChanged()
+10-11 17:44:49.449 18751 18771 E OpenGLRenderer: Unable to match the desired swap behavior.
+10-11 17:44:49.480   838   904 V WindowManagerShell: onTransitionReady android.os.BinderProxy@d99c071: {id=35 t=OPEN f=0x0 trk=1 r=[0@Point(0, 0)] c=[{WCT{android.window.IWindowContainerToken$Stub$Proxy@12db173} m=OPEN f=NONE leash=Surface(name=Task=15)/@0x53933c4 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{android.window.IWindowContainerToken$Stub$Proxy@e77c830} m=TO_BACK f=NONE leash=Surface(name=Task=1)/@0x4b8f2ad sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:49.480   838   904 V WindowManagerShell: Playing animation for (#35)android.os.BinderProxy@d99c071@1
+10-11 17:44:49.481   838   904 V WindowManagerShell:  try handler com.android.wm.shell.keyguard.KeyguardTransitionHandler@5a36fe7
+10-11 17:44:49.481   838   904 V WindowManagerShell:  try handler com.android.wm.shell.activityembedding.ActivityEmbeddingController@6593794
+10-11 17:44:49.481   838   904 V WindowManagerShell:  try handler com.android.wm.shell.pip.tv.TvPipTransition@363f23d
+10-11 17:44:49.481   838   904 V WindowManagerShell:  try handler com.android.wm.shell.transition.RemoteTransitionHandler@d8aea32
+10-11 17:44:49.481   838   904 V WindowManagerShell: Transition doesn't have explicit remote, search filters for match for {id=35 t=OPEN f=0x0 trk=1 r=[0@Point(0, 0)] c=[{WCT{android.window.IWindowContainerToken$Stub$Proxy@12db173} m=OPEN f=NONE leash=Surface(name=Task=15)/@0x53933c4 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{android.window.IWindowContainerToken$Stub$Proxy@e77c830} m=TO_BACK f=NONE leash=Surface(name=Task=1)/@0x4b8f2ad sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:49.481   838   904 V WindowManagerShell:  Delegate animation for #35 to null
+10-11 17:44:49.481   838   904 V WindowManagerShell:  try handler com.android.wm.shell.transition.DefaultTransitionHandler@c2d2383
+10-11 17:44:49.481   838   904 V WindowManagerShell: start default transition animation, info = {id=35 t=OPEN f=0x0 trk=1 r=[0@Point(0, 0)] c=[{WCT{android.window.IWindowContainerToken$Stub$Proxy@12db173} m=OPEN f=NONE leash=Surface(name=Task=15)/@0x53933c4 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{android.window.IWindowContainerToken$Stub$Proxy@e77c830} m=TO_BACK f=NONE leash=Surface(name=Task=1)/@0x4b8f2ad sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:49.481   499   519 W ziparchive: Unable to open '/data/app/~~Kk9zTKjeyJGEs3dQGtk8Tg==/com.cloudcine.tv-NnPOhk2y1BtQiIvBqHdR1A==/base.dm': No such file or directory
+10-11 17:44:49.481   838   904 V WindowManagerShell: loadAnimation: anim=android.view.animation.AlphaAnimation@827f1cf animAttr=0x9 type=OPEN isEntrance=false
+10-11 17:44:49.481   838   904 V WindowManagerShell: loadAnimation: anim=android.view.animation.AlphaAnimation@6b2ca65 animAttr=0x8 type=OPEN isEntrance=true
+10-11 17:44:49.481   838   904 V WindowManagerShell:  animated by com.android.wm.shell.transition.DefaultTransitionHandler@c2d2383
+10-11 17:44:49.481   499   519 I ActivityTaskManager: Displayed com.cloudcine.tv/.LibraryActivity for user 0: +373ms
+10-11 17:44:49.482   499   519 V WindowManager: Sent Transition #35 createdAt=10-11 17:44:49.106 via request=TransitionRequestInfo { type = OPEN, triggerTask = TaskInfo{userId=0 taskId=15 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.cloudcine.tv/.MainActivity } baseActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} topActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} origActivity=null realActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} numActivities=1 lastActiveTime=3159648 supportsMultiWindow=true resizeMode=1 isResizeable=true minWidth=-1 minHeight=-1 defaultMinSize=220 token=WCT{RemoteToken{4e25098 Task{3d91925 #15 type=standard A=10122:com.cloudcine.tv}}} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=true launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=null topActivityInfo=ActivityInfo{67ad0f1 com.cloudcine.tv.MainActivity} launchCookies=[] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=false isVisible=false isVisibleRequested=false isSleeping=false topActivityInSizeCompat=false topActivityEligibleForLetterboxEducation= false topActivityLetterboxed= false isFromDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 locusId=null displayAreaFeatureId=1 cameraCompatControlState=hidden}, remoteTransition = null, displayChange = null }
+10-11 17:44:49.482   499   519 V WindowManager:     startWCT=WindowContainerTransaction { changes = {} hops = [] errorCallbackToken=null taskFragmentOrganizer=null }
+10-11 17:44:49.482   499   519 V WindowManager:     info={id=35 t=OPEN f=0x0 trk=1 r=[0@Point(0, 0)] c=[{WCT{RemoteToken{4e25098 Task{3d91925 #15 type=standard A=10122:com.cloudcine.tv}}} m=OPEN f=NONE leash=Surface(name=Task=15)/@0xf278275 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0},{WCT{RemoteToken{4b6c3dc Task{c5b4c58 #1 type=home}}} m=TO_BACK f=NONE leash=Surface(name=Task=1)/@0x5fd99e2 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:44:49.522   499 18728 D CompatibilityChangeReporter: Compat change id reported: 214016041; UID 10122; state: ENABLED
+10-11 17:44:49.522   499 18728 I ImeTracker: com.cloudcine.tv:16a60ff7: onRequestHide at ORIGIN_SERVER_HIDE_INPUT reason HIDE_UNSPECIFIED_WINDOW
+10-11 17:44:49.522   499 18728 I ImeTracker: com.cloudcine.tv:16a60ff7: onCancelled at PHASE_SERVER_SHOULD_HIDE
+10-11 17:44:49.523  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onFinishInput():3264 
+10-11 17:44:49.523  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 0, locked = false
+10-11 17:44:49.524  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1899 onStartInput(EditorInfo{inputType=0x0(NULL) imeOptions=0x0 privateImeOptions=null actionName=UNSPECIFIED actionLabel=null actionId=0 initialSelStart=-1 initialSelEnd=-1 initialCapsMode=0x0 hintText=null label=null packageName=com.cloudcine.tv fieldId=0 fieldName=null extras=null hintLocales=[]}, false)
+10-11 17:44:49.524  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.shouldHideHeaderOnInitialState():4091 ShouldHideHeaderOnInitialState = false
+10-11 17:44:49.524  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 1, locked = false
+10-11 17:44:49.546 18751 18781 D TrafficStats: tagSocket(101) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:49.571 18751 18751 I CloudCine: 媒体库：129 部（分类=全部）· 海报索引 314 个文件 · 命中 129
+10-11 17:44:49.647  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onFinishInput():3264 
+10-11 17:44:49.647  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 0, locked = false
+10-11 17:44:49.648  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1899 onStartInput(EditorInfo{inputType=0x0(NULL) imeOptions=0x0 privateImeOptions=null actionName=UNSPECIFIED actionLabel=null actionId=0 initialSelStart=-1 initialSelEnd=-1 initialCapsMode=0x0 hintText=null label=null packageName=com.cloudcine.tv fieldId=0 fieldName=null extras=null hintLocales=[]}, false)
+10-11 17:44:49.648  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.shouldHideHeaderOnInitialState():4091 ShouldHideHeaderOnInitialState = false
+10-11 17:44:49.648  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 1, locked = false
+10-11 17:44:49.888   838   904 V WindowManagerShell: Transition animation finished (aborted=false), notifying core (#35)android.os.BinderProxy@d99c071@1
+10-11 17:44:49.888   499   519 V WindowManager: Finish Transition #35: created at 10-11 17:44:49.106 collect-started=0.03ms request-sent=3.268ms started=3.827ms ready=237.807ms sent=373.045ms finished=782.098ms
+10-11 17:44:49.889  6425  6473 D EGL_emulation: app_time_stats: avg=16.57ms min=1.28ms max=101.94ms count=43
+10-11 17:44:49.890   838   904 V WindowManagerShell: Track 1 became idle
+10-11 17:44:49.890   838   904 V WindowManagerShell: All active transition animations finished
+10-11 17:44:49.901   372   372 E BpTransactionCompletedListener: Failed to transact (-32)
+10-11 17:44:49.901   372   372 E BpTransactionCompletedListener: Failed to transact (-32)
+10-11 17:44:50.199 18751 18781 D TrafficStats: tagSocket(125) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:50.599 18751 18781 I CloudCine: [备份] 启动探测：unchanged（本地=1791709622s，远程=1791709622000），最新备份=「cloudcine_backup_2026-10-11T09-07-29.ccbak」
+10-11 17:44:50.599 18751 18751 I CloudCine: 启动探测：unchanged，无需打扰用户
+10-11 17:44:50.906 18751 18787 I CloudCine: 追剧：开始检查，在追 1 部 · 目录 1 个
+10-11 17:44:51.126 18751 18787 D CompatibilityChangeReporter: Compat change id reported: 247079863; UID 10122; state: ENABLED
+10-11 17:44:51.281 18751 18787 I 云影扫描: 发现 /来自：分享/Z 遮.天/（含子目录）：媒体 13（新增 0 / 已有 13）· 作品 2 · 目录 2
+10-11 17:44:51.323 18751 18771 D EGL_emulation: app_time_stats: avg=224.83ms min=1.57ms max=1568.47ms count=8
+10-11 17:44:51.342 18751 18787 I CloudCine: 追剧：检查结束 无更新
+10-11 17:44:51.352 18751 18751 I CloudCine: 追剧：无更新
+10-11 17:44:51.799   340  3268 D android.hardware.audio@7.1-impl.ranchu: threadLoop: entering standby, frames: 55751296
+10-11 17:44:53.124   499  1937 E TaskPersister: File error accessing recents directory (directory doesn't exist?).
+10-11 17:44:53.836   417   836 D BufferPoolAccessor2.0: evictor expired: 1, evicted: 0
+10-11 17:44:57.177   366   788 D audioserver: FGS Logger Transaction failed
+10-11 17:44:57.177   366   788 D audioserver: -129
+10-11 17:44:57.196 18751 18771 D EGL_emulation: app_time_stats: avg=345.27ms min=15.14ms max=5608.35ms count=17
+10-11 17:44:57.339   366   458 D audioserver: FGS Logger Transaction failed
+10-11 17:44:57.339   366   458 D audioserver: -129
+10-11 17:44:58.248   366   788 D audioserver: FGS Logger Transaction failed
+10-11 17:44:58.248   366   788 D audioserver: -129
+10-11 17:44:58.257 18751 18771 D EGL_emulation: app_time_stats: avg=262.67ms min=1.49ms max=1003.77ms count=4
+10-11 17:44:58.269   366   458 D AudioFlinger: mixer(0xb40000752d4fc930) throttle end: throttle time(36)
+10-11 17:44:58.474   366   458 D audioserver: FGS Logger Transaction failed
+10-11 17:44:58.474   366   458 D audioserver: -129
+10-11 17:44:59.323 18751 18771 D EGL_emulation: app_time_stats: avg=262.67ms min=1.76ms max=1002.72ms count=4
+10-11 17:44:59.349 18751 18787 D TrafficStats: tagSocket(103) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:59.351 18751 18776 D TrafficStats: tagSocket(104) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:59.355 18751 18788 D TrafficStats: tagSocket(126) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:59.440 18751 18781 D TrafficStats: tagSocket(96) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:59.522 18751 18787 D TrafficStats: tagSocket(133) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:59.523 18751 18788 D TrafficStats: tagSocket(135) with statsTag=0xffffffff, statsUid=-1
+10-11 17:44:59.524 18751 18776 D TrafficStats: tagSocket(141) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:01.342   340  3268 D android.hardware.audio@7.1-impl.ranchu: threadLoop: entering standby, frames: 55953664
+10-11 17:45:01.415 18751 18787 I CloudCine: [进度] 已载入进度文件：磁盘 44 条、合入 44 条（内存共 44 条）
+10-11 17:45:01.526 18751 18771 D EGL_emulation: app_time_stats: avg=88.07ms min=7.83ms max=1606.16ms count=25
+10-11 17:45:02.350 18751 18751 I CloudCine: 简介页动作：▶ 续播
+10-11 17:45:02.370 18751 18751 I CloudCine: 点卡片直接播：兰香如故 → 01.mp4（续播 1880002ms · 最近播 1791372158）
+10-11 17:45:02.371   499   560 D CompatibilityChangeReporter: Compat change id reported: 265464455; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 265452344; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 266124927; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 265451093; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 265456536; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 255940284; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 236283604; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 263959004; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 264304459; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 264301586; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 254631730; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 273509367; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 263259275; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 174042980; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 174042936; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 181136395; UID 10122; state: DISABLED
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 194480991; UID 10122; state: ENABLED
+10-11 17:45:02.372   499   560 E CellBroadcastUtils: getDefaultCellBroadcastReceiverPackageName: no package found
+10-11 17:45:02.372   499   560 D CompatibilityChangeReporter: Compat change id reported: 197654537; UID 10122; state: ENABLED
+10-11 17:45:02.373   499   560 D CompatibilityChangeReporter: Compat change id reported: 184838306; UID 10122; state: DISABLED
+10-11 17:45:02.373   499   560 D CompatibilityChangeReporter: Compat change id reported: 185004937; UID 10122; state: DISABLED
+10-11 17:45:02.375   499   560 E Transition: Trying to add a ready-group twice: Display{#0 state=ON size=1920x1080 ROTATION_0}
+10-11 17:45:02.375   499   560 D CompatibilityChangeReporter: Compat change id reported: 194833441; UID 10122; state: ENABLED
+10-11 17:45:02.375   838   904 V WindowManagerShell: Transition requested: android.os.BinderProxy@69a4bc7 TransitionRequestInfo { type = OPEN, triggerTask = TaskInfo{userId=0 taskId=15 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.cloudcine.tv/.MainActivity } baseActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.LibraryActivity} topActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.PlayerActivity} origActivity=null realActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} numActivities=2 lastActiveTime=3172913 supportsMultiWindow=true resizeMode=1 isResizeable=true minWidth=-1 minHeight=-1 defaultMinSize=220 token=WCT{android.window.IWindowContainerToken$Stub$Proxy@5b315f4} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=true launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=null topActivityInfo=ActivityInfo{ca8e11d com.cloudcine.tv.PlayerActivity} launchCookies=[] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=true isVisible=true isVisibleRequested=true isSleeping=false topActivityInSizeCompat=false topActivityEligibleForLetterboxEducation= false topActivityLetterboxed= false isFromDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 locusId=null displayAreaFeatureId=1 cameraCompatControlState=hidden}, remoteTransition = null, displayChange = null }
+10-11 17:45:02.375   499   560 I ActivityTaskManager: START u0 {cmp=com.cloudcine.tv/.PlayerActivity (has extras)} with LAUNCH_SINGLE_TASK from uid 10122 (BAL_ALLOW_VISIBLE_WINDOW) result code=0
+10-11 17:45:02.401 18751 18751 I CloudCine: 调试浮层（全局参数）= 关闭
+10-11 17:45:02.401   372   372 I BpBinder: onLastStrongRef automatically unlinking death recipients: 
+10-11 17:45:02.412   499   560 W WindowManager: Failed looking up window session=Session{e65aeb2 18751:u0a10122} callers=com.android.server.wm.WindowManagerService.windowForClientLocked:6034 com.android.server.wm.Session.updateRequestedVisibleTypes:690 android.view.IWindowSession$Stub.onTransact:1034 
+10-11 17:45:02.412 18751 18776 D TrafficStats: tagSocket(111) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.412   499   560 D CompatibilityChangeReporter: Compat change id reported: 168419799; UID 10122; state: DISABLED
+10-11 17:45:02.412   499   560 D CompatibilityChangeReporter: Compat change id reported: 273564678; UID 10122; state: DISABLED
+10-11 17:45:02.420   499   560 D CoreBackPreview: Window{2c67fc2 u0 com.cloudcine.tv/com.cloudcine.tv.PlayerActivity}: Setting back callback OnBackInvokedCallbackInfo{mCallback=android.window.IOnBackInvokedCallback$Stub$Proxy@ce53110, mPriority=0, mIsAnimationCallback=false}
+10-11 17:45:02.425 18751 18771 E OpenGLRenderer: Unable to match the desired swap behavior.
+10-11 17:45:02.439   499   519 I ActivityTaskManager: Displayed com.cloudcine.tv/.PlayerActivity for user 0: +66ms
+10-11 17:45:02.439   838   904 V WindowManagerShell: onTransitionReady android.os.BinderProxy@69a4bc7: {id=36 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[{null m=OPEN f=FILLS_TASK leash=Surface(name=ActivityRecord{1e0b937 u0 com.cloudcine.tv/.PlayerActivity)/@0x1ecdf92 sb=Rect(0, 0 - 0, 0) eb=Rect(0, 0 - 1920, 1080) d=-1->0 r=-1->0:-1},{null m=TO_BACK f=FILLS_TASK leash=Surface(name=ActivityRecord{b1ec57c u0 com.cloudcine.tv/.LibraryActivity)/@0xae5dd63 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:45:02.439   838   904 V WindowManagerShell: Playing animation for (#36)android.os.BinderProxy@69a4bc7@0
+10-11 17:45:02.439   838   904 V WindowManagerShell:  try handler com.android.wm.shell.keyguard.KeyguardTransitionHandler@5a36fe7
+10-11 17:45:02.439   499   519 V WindowManager: Sent Transition #36 createdAt=10-11 17:45:02.372 via request=TransitionRequestInfo { type = OPEN, triggerTask = TaskInfo{userId=0 taskId=15 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.cloudcine.tv/.MainActivity } baseActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.LibraryActivity} topActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.PlayerActivity} origActivity=null realActivity=ComponentInfo{com.cloudcine.tv/com.cloudcine.tv.MainActivity} numActivities=2 lastActiveTime=3172913 supportsMultiWindow=true resizeMode=1 isResizeable=true minWidth=-1 minHeight=-1 defaultMinSize=220 token=WCT{RemoteToken{4e25098 Task{3d91925 #15 type=standard A=10122:com.cloudcine.tv}}} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=true launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=null topActivityInfo=ActivityInfo{b544e3c com.cloudcine.tv.PlayerActivity} launchCookies=[] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=true isVisible=true isVisibleRequested=true isSleeping=false topActivityInSizeCompat=false topActivityEligibleForLetterboxEducation= false topActivityLetterboxed= false isFromDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 locusId=null displayAreaFeatureId=1 cameraCompatControlState=hidden}, remoteTransition = null, displayChange = null }
+10-11 17:45:02.439   838   904 V WindowManagerShell:  try handler com.android.wm.shell.activityembedding.ActivityEmbeddingController@6593794
+10-11 17:45:02.439   838   904 V WindowManagerShell:  try handler com.android.wm.shell.pip.tv.TvPipTransition@363f23d
+10-11 17:45:02.439   499   519 V WindowManager:     startWCT=WindowContainerTransaction { changes = {} hops = [] errorCallbackToken=null taskFragmentOrganizer=null }
+10-11 17:45:02.439   838   904 V WindowManagerShell:  try handler com.android.wm.shell.transition.RemoteTransitionHandler@d8aea32
+10-11 17:45:02.439   499   519 V WindowManager:     info={id=36 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[{null m=OPEN f=FILLS_TASK leash=Surface(name=ActivityRecord{1e0b937 u0 com.cloudcine.tv/.PlayerActivity)/@0x980d60e sb=Rect(0, 0 - 0, 0) eb=Rect(0, 0 - 1920, 1080) d=-1->0 r=-1->0:-1},{null m=TO_BACK f=FILLS_TASK leash=Surface(name=ActivityRecord{b1ec57c u0 com.cloudcine.tv/.LibraryActivity)/@0x4e8f409 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:45:02.439   838   904 V WindowManagerShell: Transition doesn't have explicit remote, search filters for match for {id=36 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[{null m=OPEN f=FILLS_TASK leash=Surface(name=ActivityRecord{1e0b937 u0 com.cloudcine.tv/.PlayerActivity)/@0x1ecdf92 sb=Rect(0, 0 - 0, 0) eb=Rect(0, 0 - 1920, 1080) d=-1->0 r=-1->0:-1},{null m=TO_BACK f=FILLS_TASK leash=Surface(name=ActivityRecord{b1ec57c u0 com.cloudcine.tv/.LibraryActivity)/@0xae5dd63 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:45:02.439   838   904 V WindowManagerShell:  Delegate animation for #36 to null
+10-11 17:45:02.439   838   904 V WindowManagerShell:  try handler com.android.wm.shell.transition.DefaultTransitionHandler@c2d2383
+10-11 17:45:02.439   838   904 V WindowManagerShell: start default transition animation, info = {id=36 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[{null m=OPEN f=FILLS_TASK leash=Surface(name=ActivityRecord{1e0b937 u0 com.cloudcine.tv/.PlayerActivity)/@0x1ecdf92 sb=Rect(0, 0 - 0, 0) eb=Rect(0, 0 - 1920, 1080) d=-1->0 r=-1->0:-1},{null m=TO_BACK f=FILLS_TASK leash=Surface(name=ActivityRecord{b1ec57c u0 com.cloudcine.tv/.LibraryActivity)/@0xae5dd63 sb=Rect(0, 0 - 1920, 1080) eb=Rect(0, 0 - 1920, 1080) d=0}]}
+10-11 17:45:02.439   838   904 V WindowManagerShell: loadAnimation: anim=android.view.animation.AlphaAnimation@1f77219 animAttr=0x5 type=OPEN isEntrance=false
+10-11 17:45:02.439   838   904 V WindowManagerShell: loadAnimation: anim=android.view.animation.AlphaAnimation@37562de animAttr=0x4 type=OPEN isEntrance=true
+10-11 17:45:02.440   838   904 V WindowManagerShell:  animated by com.android.wm.shell.transition.DefaultTransitionHandler@c2d2383
+10-11 17:45:02.440 18751 18751 I CloudCine: 选集：兰丨香r故 共 20 条，当前下标 0
+10-11 17:45:02.445 18751 18751 I CloudCine: 菜单内容：选集=01 → [01],02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20 | 连接数=8 条 → 1 条（关）,2 条,4 条,[8 条] | 音轨=— → (无选项) | 音效=跟随片源 → [跟随片源],强制立体声 | 字幕=— → 关闭 | 倍速=正常速度 → 0.5x,0.75x,[正常速度],1.25x,1.5x,2.0x | 调试=关闭 → [关闭],开启
+10-11 17:45:02.488   499  2868 I ImeTracker: com.cloudcine.tv:b6bbcd13: onRequestHide at ORIGIN_SERVER_HIDE_INPUT reason HIDE_UNSPECIFIED_WINDOW
+10-11 17:45:02.489   499  2868 I ImeTracker: com.cloudcine.tv:b6bbcd13: onCancelled at PHASE_SERVER_SHOULD_HIDE
+10-11 17:45:02.489  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onFinishInput():3264 
+10-11 17:45:02.489  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 0, locked = false
+10-11 17:45:02.489  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1899 onStartInput(EditorInfo{inputType=0x0(NULL) imeOptions=0x0 privateImeOptions=null actionName=UNSPECIFIED actionLabel=null actionId=0 initialSelStart=-1 initialSelEnd=-1 initialCapsMode=0x0 hintText=null label=null packageName=com.cloudcine.tv fieldId=0 fieldName=null extras=null hintLocales=[]}, false)
+10-11 17:45:02.489  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.shouldHideHeaderOnInitialState():4091 ShouldHideHeaderOnInitialState = false
+10-11 17:45:02.489  1148  1148 I GoogleInputMethodService: GoogleInputMethodService.updateDeviceLockedStatus():2111 repeatCheckTimes = 1, locked = false
+10-11 17:45:02.491   838   904 D WindowManagerShell: TvPipController: onTaskStackChanged()
+10-11 17:45:02.537 18751 18771 D EGL_emulation: app_time_stats: avg=40.13ms min=12.03ms max=585.59ms count=25
+10-11 17:45:02.587 18751 18776 I CloudCine: play/info 档位=super(1440x810,1506kbps,0.1839477537698647MB/s), high(960x540,0kbps,0.0152587890625MB/s), low(480x270,400kbps,0.05328655242919922MB/s)
+10-11 17:45:02.626 18751 18787 D TrafficStats: tagSocket(105) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.696 18751 18751 I CloudCine: 取链成功：01.mp4 时长=2797s 服务端默认档=super
+10-11 17:45:02.697 18751 18751 I CloudCine:   档位 origin：原画 1920x1080 658 MiB 需 0.24 MB/s
+10-11 17:45:02.697 18751 18751 I CloudCine:   档位 super：超清 1440x810 515 MiB 需 0.18 MB/s
+10-11 17:45:02.697 18751 18751 I CloudCine:   档位 high：高清 960x540 43 MiB 需 0.02 MB/s
+10-11 17:45:02.697 18751 18751 I CloudCine:   档位 low：流畅 480x270 149 MiB 需 0.05 MB/s
+10-11 17:45:02.710 18751 18781 I CloudCine: 并行读取器启动：8 条连接 · 每块 1024 KiB · 窗口 8 MiB · 起点 0 · 终点 12582911 · 累计建 1 · 存活 1
+10-11 17:45:02.728 18751 18831 D TrafficStats: tagSocket(96) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.728 18751 18834 D TrafficStats: tagSocket(109) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.728 18751 18833 D TrafficStats: tagSocket(161) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.728 18751 18832 D TrafficStats: tagSocket(155) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.728 18751 18835 D TrafficStats: tagSocket(153) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.729 18751 18836 D TrafficStats: tagSocket(157) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.730 18751 18837 D TrafficStats: tagSocket(154) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.730 18751 18845 D TrafficStats: tagSocket(120) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:02.851   838   904 V WindowManagerShell: Transition animation finished (aborted=false), notifying core (#36)android.os.BinderProxy@69a4bc7@0
+10-11 17:45:02.852   499   519 V WindowManager: Finish Transition #36: created at 10-11 17:45:02.372 collect-started=0.017ms request-sent=2.776ms started=3.346ms ready=19.197ms sent=66.33ms finished=479.732ms
+10-11 17:45:02.853   838   904 V WindowManagerShell: Track 0 became idle
+10-11 17:45:02.853   838   904 V WindowManagerShell: All active transition animations finished
+10-11 17:45:03.015 18751 18787 I CloudCine: [进度] 已下载网盘进度文件（4004 字节，fid=0444a86b2ac249719356feff94d2476d）
+10-11 17:45:03.111 18751 18781 I CloudCine: 并行读取器首字节：411ms（8 条连接并行中）
+10-11 17:45:03.519 18751 18787 I CloudCine: [进度] 同名进度文件已存在，先删除旧文件 fid=0444a86b2ac249719356feff94d2476d
+10-11 17:45:03.864 18751 18751 I CloudCine: 同目录没有可用字幕文件
+10-11 17:45:04.048 18751 18787 I CloudCine: 上传：分片 1 片 × 4194304 字节（OSS: ul-sz/kRuYqOYn/5449112341/39bda9df13804d9b86e12cf4f0d494de6acb5a9f/6acb5a9fa3d10fcf66214104a2c4d8294f72e0ad）
+10-11 17:45:04.189   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:04.194 18751 18787 D TrafficStats: tagSocket(92) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:04.208   499   763 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:04.208   499   763 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:04.209   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:05.215 18751 18787 I CloudCine: [进度] 上传完成「playback_progress.json」（4017 字节）→ fid=16277319e5394cfb8fbd9d765a0499ca
+10-11 17:45:05.215 18751 18787 I CloudCine: [进度] 同步完成：本地 44 条 ｜ 播种 0、合入 0、回填 0 条 ｜ 已上传
+10-11 17:45:05.215 18751 18751 I CloudCine: [进度] 启动：已同步并上传（播种 0、合入 0、回填 0）
+10-11 17:45:05.270 18751 18781 I CloudCine: 并行读取器关闭：8 连接 · 各 [2.00,2.00,2.00,2.00,1.00,1.00,1.00,1.00] MiB · 请求 12 次 · 重试 0 · 耗时 2.5s · 累计建 1 · 存活 0
+10-11 17:45:05.271 18751 18781 I CloudCine: ★ 并行带宽探测：12.00 MiB / 2.56s = 4.69 MiB/s（8 连接） · 8 连接 · 各 [2.00,2.00,2.00,2.00,1.00,1.00,1.00,1.00] MiB · 请求 12 次 · 重试 0 · 耗时 2.5s
+10-11 17:45:05.271 18751 18751 I CloudCine: ★ 实测并行带宽：12.00 MiB / 2.56s = 4.69 MiB/s（8 连接）
+10-11 17:45:05.271 18751 18751 I CloudCine: 自动选档：origin（原画 1920x1080，需 0.24 MB/s，实测 4.69 MB/s，余量 95%）
+10-11 17:45:05.272 18751 18751 I CloudCine: 起播档位 origin（原画）1920x1080 658 MiB 需 0.24 MB/s
+10-11 17:45:05.272 18751 18751 I CloudCine: 档位 URL：host=video-play-c-zb.drive.quark.cn path 末段=6aa9622984f718f8a2a94dde837a4c7d268abb4b
+10-11 17:45:05.276 18751 18751 I CloudCine: 磁盘缓存：已启用 · 目录 /data/user/0/com.cloudcine.tv/cache/media_cache · 上限 851 MiB（可用 3750 MiB，给系统留 2048 MiB 后取一半）
+10-11 17:45:05.278 18751 18751 I CloudCine: 数据源：多连接并行（8 条 × 2048 KiB/块）· 缓存键 quark:e631c05f7ca741bdb2a5ce494e5dbe53:origin · 磁盘缓存 384 / 1043 MiB（磁盘可用 4134 MiB）
+10-11 17:45:05.278 18751 18751 I CloudCine: Java 堆上限 576 MiB ⇒ 缓冲字节上限 64 MiB（不许再写死）
+10-11 17:45:05.278 18751 18751 I CloudCine: 后缓冲 30000ms（码率 0.24 MiB/s，后缓冲只占预算的 16 MiB）
+10-11 17:45:05.281 18751 18751 I CloudCine: 音效：跟随片源（按输出设备的能力自动下混）
+10-11 17:45:05.287 18751 18751 I ExoPlayerImpl: Init f590739 [AndroidXMedia3/1.5.1] [emu64a, sdk_google_atv64_arm64, Google, 34]
+10-11 17:45:05.294   499 18728 D CompatibilityChangeReporter: Compat change id reported: 161145287; UID 10122; state: ENABLED
+10-11 17:45:05.306 18751 18751 W om.cloudcine.tv: Accessing hidden method Landroid/media/AudioTrack;->getLatency()I (unsupported, reflection, allowed)
+10-11 17:45:05.310 18751 18751 W libc    : Access denied finding property "vendor.display-size"
+10-11 17:45:05.324 18751 18751 I CloudCine: [控制栏] 00:00 / --:-- · 已缓冲+0s · 速率 0 KB/s · 已暂停
+10-11 17:45:05.326 18751 18751 I CloudCine: 状态 2
+10-11 17:45:05.327 18751 18751 I CloudCine: 续播：起播跳到 1880s（库里记的续播点）
+10-11 17:45:05.328   499 18728 I WifiService: acquireWifiLock uid=10122 lockMode=3
+10-11 17:45:05.330 18751 18875 I CloudCine: 预取器启动：起点 0 MiB · 分块 128 MiB · 领先上限 1139 MiB
+10-11 17:45:05.331 18751 18751 I CloudCine: 磁盘预取：已启动（键 quark:e631c05f7ca741bdb2a5ce494e5dbe53:origin · 码率 0.24 MiB/s ⇒ 领先上限 1139 MiB）
+10-11 17:45:05.349 18751 18872 I CloudCine: 并行读取器启动：8 条连接 · 每块 2048 KiB · 窗口 16 MiB · 起点 0 · 终点 未知 · 累计建 3 · 存活 2
+10-11 17:45:05.349 18751 18872 I CloudCine: 并行源打开：pos=0 len=未知 连接=8 每块=2048KiB
+10-11 17:45:05.354 18751 18751 I CloudCine: 菜单内容：选集=01 → [01],02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20 | 画质=原画 → [原画],超清,高清,流畅 | 连接数=8 条 → 1 条（关）,2 条,4 条,[8 条] | 音轨=— → (无选项) | 音效=跟随片源 → [跟随片源],强制立体声 | 字幕=— → 关闭 | 倍速=正常速度 → 0.5x,0.75x,[正常速度],1.25x,1.5x,2.0x | 调试=关闭 → [关闭],开启
+10-11 17:45:05.356 18751 18751 I CloudCine: 画质档位：原画(origin) 1920×1080 · 2.0 Mbps · 需 0.24 MB/s | 超清(super) 1440×810 · 1.5 Mbps · 需 0.18 MB/s | 高清(high) 960×540 · 需 0.02 MB/s | 流畅(low) 480×270 · 0.4 Mbps · 需 0.05 MB/s
+10-11 17:45:05.358   499 18728 D MediaMetricsManagerService: failed to get player_metrics_app_blocklist from DeviceConfig
+10-11 17:45:05.358   499 18728 V MediaMetricsManagerService: Logging level blocked: Failed to get PLAYER_METRICS_APP_BLOCKLIST.
+10-11 17:45:05.359 18751 18876 D TrafficStats: tagSocket(112) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.359 18751 18882 D TrafficStats: tagSocket(117) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.362 18751 18875 I CloudCine: 并行读取器启动：8 条连接 · 每块 2048 KiB · 窗口 16 MiB · 起点 0 · 终点 134217727 · 累计建 3 · 存活 2
+10-11 17:45:05.362 18751 18875 I CloudCine: 并行源打开：pos=0 len=134217728 连接=8 每块=2048KiB
+10-11 17:45:05.362 18751 18877 D TrafficStats: tagSocket(113) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.368 18751 18878 D TrafficStats: tagSocket(118) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.368 18751 18880 D TrafficStats: tagSocket(120) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.368 18751 18886 D TrafficStats: tagSocket(121) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.368 18751 18885 D TrafficStats: tagSocket(124) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.368 18751 18901 D TrafficStats: tagSocket(126) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.370 18751 18890 D TrafficStats: tagSocket(123) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.370 18751 18883 D TrafficStats: tagSocket(125) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.372   499  2764 D MediaMetricsManagerService: failed to get player_metrics_app_blocklist from DeviceConfig
+10-11 17:45:05.372   499  2764 V MediaMetricsManagerService: Logging level blocked: Failed to get PLAYER_METRICS_APP_BLOCKLIST.
+10-11 17:45:05.374 18751 18895 D TrafficStats: tagSocket(128) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.375 18751 18879 D TrafficStats: tagSocket(130) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.375 18751 18884 D TrafficStats: tagSocket(133) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.377 18751 18771 D EGL_emulation: app_time_stats: avg=980.84ms min=12.00ms max=2656.65ms count=3
+10-11 17:45:05.379   499  1937 E TaskPersister: File error accessing recents directory (directory doesn't exist?).
+10-11 17:45:05.618 18751 18875 I CloudCine: 并行读取器首字节：285ms（8 条连接并行中）
+10-11 17:45:05.627 18751 18872 I CloudCine: 并行读取器首字节：297ms（8 条连接并行中）
+10-11 17:45:05.899   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:05.910 18751 18872 I CloudCine: 并行读取器关闭：8 连接 · 各 [0.01,0.05,0.12,0.09,0.05,0.00,0.00,0.06] MiB · 请求 8 次 · 重试 0 · 耗时 0.5s · 累计建 3 · 存活 1
+10-11 17:45:05.911 18751 18872 I CloudCine: 并行读取器启动：8 条连接 · 每块 2048 KiB · 窗口 16 MiB · 起点 686089649 · 终点 未知 · 累计建 4 · 存活 2
+10-11 17:45:05.912 18751 18872 I CloudCine: 并行源打开：pos=686089649 len=未知 连接=8 每块=2048KiB
+10-11 17:45:05.921 18751 18902 D TrafficStats: tagSocket(112) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.923   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:05.924 18751 18904 D TrafficStats: tagSocket(113) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.930 18751 18907 D TrafficStats: tagSocket(130) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.930 18751 18905 D TrafficStats: tagSocket(155) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.930 18751 18903 D TrafficStats: tagSocket(133) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.931 18751 18908 D TrafficStats: tagSocket(177) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.931 18751 18906 D TrafficStats: tagSocket(173) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:05.932 18751 18909 D TrafficStats: tagSocket(175) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:06.328 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜解码器 未起｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5302 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 828 KB/s｜进程CPU 0.0%（折合 4 核 0.0%） · 内存 195 MB｜Java 堆 60/576 MB · 系统可用内存 1952 MB｜UI 58.0 fps · 最大帧间隔 18.6 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:06.329 18751 18751 I CloudCine: [控制栏] 31:20 / --:-- · 已缓冲+0s · 速率 1.10 MB/s · 缓冲中 · 1.10 MB/s
+10-11 17:45:06.627 18751 18872 I CloudCine: 并行读取器首字节：716ms（8 条连接并行中）
+10-11 17:45:06.838 18751 18771 D EGL_emulation: app_time_stats: avg=362.70ms min=1.14ms max=501.50ms count=4
+10-11 17:45:07.070 18751 18872 I CloudCine: 并行读取器关闭：8 连接 · 各 [2.00,2.00,0.12,0.00,0.00,0.00,0.00,0.00] MiB · 请求 8 次 · 重试 0 · 耗时 1.1s · 累计建 4 · 存活 1
+10-11 17:45:07.083 18751 18872 I CloudCine: 并行读取器启动：8 条连接 · 每块 2048 KiB · 窗口 16 MiB · 起点 48 · 终点 未知 · 累计建 5 · 存活 2
+10-11 17:45:07.084 18751 18872 I CloudCine: 并行源打开：pos=48 len=未知 连接=8 每块=2048KiB
+10-11 17:45:07.092 18751 18915 D TrafficStats: tagSocket(93) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.095 18751 18916 D TrafficStats: tagSocket(94) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.098 18751 18914 D TrafficStats: tagSocket(113) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.103 18751 18869 W VideoCapabilities: Unrecognized profile/level 0/3 for video/mpeg2
+10-11 17:45:07.104 18751 18869 W VideoCapabilities: Unrecognized profile/level 0/3 for video/mpeg2
+10-11 17:45:07.108 18751 18869 D MediaCodecInfo: NoSupport [codec.profileLevel, hvc1.2.4.L120.90, video/hevc] [c2.android.hevc.decoder, video/hevc] [emu64a, sdk_google_atv64_arm64, Google, 34]
+10-11 17:45:07.108 18751 18869 D MediaCodecInfo: NoSupport [codec.profileLevel, hvc1.2.4.L120.90, video/hevc] [c2.android.hevc.decoder, video/hevc] [emu64a, sdk_google_atv64_arm64, Google, 34]
+10-11 17:45:07.118 18751 18751 I CloudCine: 轨道变化：
+10-11 17:45:07.118 18751 18751 I CloudCine:   视频 ×1
+10-11 17:45:07.118 18751 18751 I CloudCine:     #0 视频 1 · 1920x1080  video/hevc  ← 选中
+10-11 17:45:07.118 18751 18751 I CloudCine:   音轨 ×1
+10-11 17:45:07.118 18751 18751 I CloudCine:     #0 音轨 1 · 立体声  audio/mp4a-latm
+10-11 17:45:07.118 18751 18751 I CloudCine:   音轨 ×1
+10-11 17:45:07.118 18751 18751 I CloudCine:     #0 音轨 1 · 5.1 · 杜比+  audio/eac3
+10-11 17:45:07.118 18751 18751 I CloudCine:   音轨 ×1
+10-11 17:45:07.118 18751 18751 I CloudCine:     #0 音轨 1 · 立体声  audio/mp4a-latm  ← 选中
+10-11 17:45:07.183   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:07.204   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:07.331 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜解码器 未起｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5300 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 3.64 MB/s｜进程CPU 61.7%（折合 4 核 15.4%） · 内存 216 MB｜Java 堆 55/576 MB · 系统可用内存 1918 MB｜UI 60.0 fps · 最大帧间隔 19.6 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:07.332 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 6.66 MB/s · 缓冲中 · 6.66 MB/s
+10-11 17:45:07.702 18751 18872 I CloudCine: 并行读取器关闭：8 连接 · 各 [0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00] MiB · 请求 8 次 · 重试 0 · 耗时 0.6s · 累计建 5 · 存活 1
+10-11 17:45:07.710   499   931 D MediaMetricsManagerService: failed to get player_metrics_app_blocklist from DeviceConfig
+10-11 17:45:07.710   499   931 V MediaMetricsManagerService: Logging level blocked: Failed to get PLAYER_METRICS_APP_BLOCKLIST.
+10-11 17:45:07.711 18751 18872 I CloudCine: 并行读取器启动：8 条连接 · 每块 2048 KiB · 窗口 16 MiB · 起点 475764441 · 终点 未知 · 累计建 6 · 存活 2
+10-11 17:45:07.711 18751 18872 I CloudCine: 并行源打开：pos=475764441 len=未知 连接=8 每块=2048KiB
+10-11 17:45:07.712 18751 18869 I DMCodecAdapterFactory: Creating an asynchronous MediaCodec adapter for track type video
+10-11 17:45:07.719 18751 18928 D CCodec  : allocate(c2.android.hevc.decoder)
+10-11 17:45:07.720 18751 18928 I Codec2Client: Available Codec2 services: "default" "software"
+10-11 17:45:07.721 18751 18919 D TrafficStats: tagSocket(93) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.721 18751 18923 D TrafficStats: tagSocket(94) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.722 18751 18921 D TrafficStats: tagSocket(113) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.722 18751 18922 D TrafficStats: tagSocket(112) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.723 18751 18928 I CCodec  : setting up 'default' as default (vendor) store
+10-11 17:45:07.724 18751 18924 D TrafficStats: tagSocket(122) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.725 18751 18925 D TrafficStats: tagSocket(123) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.728 18751 18928 I CCodec  : Created component [c2.android.hevc.decoder]
+10-11 17:45:07.728 18751 18928 D CCodecConfig: read media type: video/hevc
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.max-count.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: output.subscribed-indices.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: input.buffers.allocator-ids.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: output.buffers.allocator-ids.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.allocator-ids.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: output.buffers.pool-ids.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.pool-ids.values
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: ignored struct field coded.color-format.locations
+10-11 17:45:07.729 18751 18928 D CCodecConfig: ignoring local param raw.size (0xd2001800) as it is already supported
+10-11 17:45:07.729 18751 18928 D CCodecConfig: ignoring local param default.color (0x5200180b) as it is already supported
+10-11 17:45:07.729 18751 18928 D ReflectedParamUpdater: ignored struct field raw.hdr-static-info.mastering
+10-11 17:45:07.729 18751 18928 I CCodecConfig: query failed after returning 12 values (BAD_INDEX)
+10-11 17:45:07.730 18751 18928 D CCodecConfig: c2 config diff is Dict {
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 coded.pl.level = 24584
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 coded.pl.profile = 24576
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 coded.vui.color.matrix = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 coded.vui.color.primaries = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 coded.vui.color.range = 2
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 coded.vui.color.transfer = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 default.color.matrix = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 default.color.primaries = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 default.color.range = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 default.color.transfer = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 input.buffers.max-size.value = 2097152
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 input.delay.value = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   string input.media-type.value = "video/hevc"
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 output.delay.value = 8
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   string output.media-type.value = "video/raw"
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.color.matrix = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.color.primaries = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.color.range = 2
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.color.transfer = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.max-size.height = 240
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.max-size.width = 320
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.pixel-format.value = 35
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::i32 raw.rotation.flip = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::i32 raw.rotation.value = 0
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.sar.height = 1
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.sar.width = 1
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.size.height = 240
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2::u32 raw.size.width = 320
+10-11 17:45:07.730 18751 18928 D CCodecConfig:   c2
+10-11 17:45:07.730 18751 18928 W ColorUtils: expected specified color aspects (2:0:0:0)
+10-11 17:45:07.732 18751 18926 I MediaCodec: MediaCodec will operate in async mode
+10-11 17:45:07.732 18751 18926 D MediaCodec: flushMediametrics
+10-11 17:45:07.732 18751 18926 D SurfaceUtils: connecting to surface 0xb4000076f12acc80, reason connectToSurface
+10-11 17:45:07.732 18751 18926 I MediaCodec: [c2.android.hevc.decoder] setting surface generation to 19201025
+10-11 17:45:07.732 18751 18926 D SurfaceUtils: disconnecting from surface 0xb4000076f12acc80, reason connectToSurface(reconnect)
+10-11 17:45:07.732 18751 18926 D SurfaceUtils: connecting to surface 0xb4000076f12acc80, reason connectToSurface(reconnect)
+10-11 17:45:07.732 18751 18928 I CCodecBufferChannel: Using latch times for frame rendered signals - present fences not supported
+10-11 17:45:07.733 18751 18928 D CCodec  : [c2.android.hevc.decoder] buffers are bound to CCodec for this session
+10-11 17:45:07.733 18751 18928 D CCodecConfig: no c2 equivalents for log-session-id
+10-11 17:45:07.733 18751 18928 D CCodecConfig: no c2 equivalents for color-standard
+10-11 17:45:07.733 18751 18928 D CCodecConfig: no c2 equivalents for native-window
+10-11 17:45:07.733 18751 18928 D CCodecConfig: no c2 equivalents for flags
+10-11 17:45:07.733 18751 18928 D CCodecConfig: config failed => CORRUPTED
+10-11 17:45:07.733 18751 18928 D CCodecConfig: c2 config diff is   c2::u32 default.color.matrix = 1
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 default.color.primaries = 1
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 default.color.range = 2
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 default.color.transfer = 3
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 raw.max-size.height = 1080
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 raw.max-size.width = 1920
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 raw.size.height = 1080
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 raw.size.width = 1920
+10-11 17:45:07.733 18751 18928 W Codec2Client: query -- param skipped: index = 1107298332.
+10-11 17:45:07.733 18751 18928 D CCodec  : client requested max input size 755589, which is smaller than what component recommended (2097152); overriding with component recommendation.
+10-11 17:45:07.733 18751 18928 W CCodec  : This behavior is subject to change. It is recommended that app developers double check whether the requested max input size is in reasonable range.
+10-11 17:45:07.733 18751 18928 D CCodec  : encoding statistics level = 0
+10-11 17:45:07.733 18751 18928 D CCodec  : setup formats input: AMessage(what = 0x00000000) = {
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t height = 1080
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t level = 65536
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t max-input-size = 2097152
+10-11 17:45:07.733 18751 18928 D CCodec  :   string mime = "video/hevc"
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t profile = 1
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t width = 1920
+10-11 17:45:07.733 18751 18928 D CCodec  :   Rect crop(0, 0, 1919, 1079)
+10-11 17:45:07.733 18751 18928 D CCodec  : }
+10-11 17:45:07.733 18751 18928 D CCodec  : setup formats output: AMessage(what = 0x00000000) = {
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t android._color-format = 2135033992
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t android._video-scaling = 1
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t rotation-degrees = 0
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t color-standard = 1
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t color-range = 2
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t color-transfer = 3
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t sar-height = 1
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t sar-width = 1
+10-11 17:45:07.733 18751 18928 D CCodec  :   Rect crop(0, 0, 1919, 1079)
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t width = 1920
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t height = 1080
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t max-height = 1080
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t max-width = 1920
+10-11 17:45:07.733 18751 18928 D CCodec  :   string mime = "video/raw"
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t android._dataspace = 260
+10-11 17:45:07.733 18751 18928 D CCodec  :   int32_t color-format = 2130708361
+10-11 17:45:07.733 18751 18928 D CCodec  : }
+10-11 17:45:07.733 18751 18928 I CCodecConfig: query failed after returning 12 values (BAD_INDEX)
+10-11 17:45:07.733 18751 18928 D CCodecConfig: c2 config diff is   c2::u32 raw.color.matrix = 1
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 raw.color.primaries = 1
+10-11 17:45:07.733 18751 18928 D CCodecConfig:   c2::u32 raw.color.transfer = 3
+10-11 17:45:07.734 18751 18869 D MediaCodec: keep callback message for reclaim
+10-11 17:45:07.735 18751 18928 W Codec2Client: query -- param skipped: index = 1342179345.
+10-11 17:45:07.735 18751 18928 W Codec2Client: query -- param skipped: index = 2415921170.
+10-11 17:45:07.735 18751 18928 W Codec2Client: query -- param skipped: index = 1610614798.
+10-11 17:45:07.735 18751 18928 D C2Store : Using DMABUF Heaps
+10-11 17:45:07.736 18751 18928 D CCodecBufferChannel: [c2.android.hevc.decoder#240] Created input block pool with allocatorID 16 => poolID 17 - OK (0)
+10-11 17:45:07.736 18751 18928 D CCodecBufferChannel: [c2.android.hevc.decoder#240] Query output surface allocator returned 0 params => BAD_INDEX (6)
+10-11 17:45:07.736 18751 18928 I CCodecBufferChannel: [c2.android.hevc.decoder#240] Created output block pool with allocatorID 18 => poolID 31 - OK
+10-11 17:45:07.736 18751 18928 D CCodecBufferChannel: [c2.android.hevc.decoder#240] Configured output block pool ids 31 => OK
+10-11 17:45:07.736 18751 18928 D Codec2-OutputBufferQueue: C2SurfaceSyncMemory created 20(20)
+10-11 17:45:07.736 18751 18928 D Codec2-OutputBufferQueue: remote graphic buffer migration 0/0
+10-11 17:45:07.736 18751 18928 D Codec2Client: setOutputSurface -- failed to set consumer usage (6/BAD_INDEX)
+10-11 17:45:07.736 18751 18928 D Codec2Client: setOutputSurface -- generation=19201025 consumer usage=0x900 sync
+10-11 17:45:07.737   417   861 D C2BqBuffer: local generation change 19201025 , bqId: 80534931767298 migrated buffers # 0
+10-11 17:45:07.737 18751 18928 D Codec2Client: Surface configure completed
+10-11 17:45:07.737 18751 18928 I DMABUFHEAPS: Using DMA-BUF heap named: system
+10-11 17:45:07.738   410  2325 W ResourceManagerService: Ignoring request to add new resource entry with value <= 0
+10-11 17:45:07.739 18751 18869 D MediaCodecInfo: NoSupport [codec.profileLevel, hvc1.2.4.L120.90, video/hevc] [c2.android.hevc.decoder, video/hevc] [emu64a, sdk_google_atv64_arm64, Google, 34]
+10-11 17:45:07.739 18751 18869 W MediaCodecRenderer: Format exceeds selected codec's capabilities [id=1, mimeType=video/hevc, codecs=hvc1.2.4.L120.90, res=1920x1080, color=BT709/Limited range/SDR SMPTE 170M/10/10, fps=25.0, c2.android.hevc.decoder]
+10-11 17:45:07.739 18751 18751 I CloudCine: 解码器 c2.android.hevc.decoder（初始化 29ms）
+10-11 17:45:07.739 18751 18869 I DMCodecAdapterFactory: Creating an asynchronous MediaCodec adapter for track type audio
+10-11 17:45:07.740 18751 18751 I CloudCine: 片源 1920x1080 25.00fps hvc1.2.4.L120.90
+10-11 17:45:07.740 18751 18947 D CCodec  : allocate(c2.android.aac.decoder)
+10-11 17:45:07.740   499   560 D MediaMetricsManagerService: failed to get player_metrics_app_blocklist from DeviceConfig
+10-11 17:45:07.740   499   560 V MediaMetricsManagerService: Logging level blocked: Failed to get PLAYER_METRICS_APP_BLOCKLIST.
+10-11 17:45:07.741   417 18944 D SimpleC2Component: Using output block pool with poolID 31 => got 31 - 0
+10-11 17:45:07.742 18751 18947 I CCodec  : setting up 'default' as default (vendor) store
+10-11 17:45:07.743   417 18944 E C2SoftHevcDec: Fatal error in decoder 0x43dd
+10-11 17:45:07.743 18751 18947 I CCodec  : Created component [c2.android.aac.decoder]
+10-11 17:45:07.744 18751 18947 D CCodecConfig: read media type: audio/mp4a-latm
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.max-count.values
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: output.subscribed-indices.values
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: input.buffers.allocator-ids.values
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: output.buffers.allocator-ids.values
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.allocator-ids.values
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: output.buffers.pool-ids.values
+10-11 17:45:07.745 18751 18947 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.pool-ids.values
+10-11 17:45:07.745 18751 18947 I CCodecConfig: query failed after returning 20 values (BAD_INDEX)
+10-11 17:45:07.745 18751 18947 D CCodecConfig: c2 config diff is Dict {
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 coded.aac-packaging.value = 0
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 coded.bitrate.value = 64000
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 coded.pl.level = 0
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 coded.pl.profile = 8192
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::i32 coding.drc.album-mode.value = 0
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::float coding.drc.attenuation-factor.value = 1
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::float coding.drc.boost-factor.value = 1
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::i32 coding.drc.compression-mode.value = 3
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::i32 coding.drc.effect-type.value = 3
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::float coding.drc.encoded-level.value = 0.25
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::float coding.drc.reference-level.value = -16
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 input.buffers.max-size.value = 8192
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 input.delay.value = 0
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   string input.media-type.value = "audio/mp4a-latm"
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 output.delay.value = 2
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::float output.drc.output-loudness.value = 0.25
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   string output.media-type.value = "audio/raw"
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 raw.channel-count.value = 1
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 raw.channel-mask.value = 0
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 raw.max-channel-count.value = 8
+10-11 17:45:07.745 18751 18947 D CCodecConfig:   c2::u32 raw.sample-rate.value = 44100
+10-11 17:45:07.745 18751 18947 D CCodecConfig: }
+10-11 17:45:07.747 18751 18947 I MediaCodec: MediaCodec will operate in async mode
+10-11 17:45:07.747 18751 18947 D MediaCodec: flushMediametrics
+10-11 17:45:07.747 18751 18947 D CCodec  : [c2.android.aac.decoder] buffers are bound to CCodec for this session
+10-11 17:45:07.747 18751 18947 D CCodecConfig: no c2 equivalents for log-session-id
+10-11 17:45:07.747 18751 18947 D CCodecConfig: no c2 equivalents for flags
+10-11 17:45:07.747 18751 18928 D CCodecBufferChannel: [c2.android.hevc.decoder#240] work failed to complete: 14
+10-11 17:45:07.747 18751 18926 E MediaCodec: Codec reported err 0xe/14 (Unknown error -14), actionCode 0, while in state 6/STARTED
+10-11 17:45:07.747 18751 18926 D MediaCodec: flushMediametrics
+10-11 17:45:07.747 18751 18947 D CCodecConfig: config failed => CORRUPTED
+10-11 17:45:07.747 18751 18947 D CCodecConfig: c2 config diff is   c2::u32 raw.channel-count.value = 2
+10-11 17:45:07.747 18751 18947 D CCodecConfig:   c2::u32 raw.sample-rate.value = 48000
+10-11 17:45:07.747 18751 18947 W Codec2Client: query -- param skipped: index = 1107298332.
+10-11 17:45:07.747 18751 18947 D CCodec  : client requested max input size 1251, which is smaller than what component recommended (8192); overriding with component recommendation.
+10-11 17:45:07.747 18751 18947 W CCodec  : This behavior is subject to change. It is recommended that app developers double check whether the requested max input size is in reasonable range.
+10-11 17:45:07.747 18751 18947 D CCodec  : encoding statistics level = 0
+10-11 17:45:07.747 18751 18947 D CCodec  : setup formats input: AMessage(what = 0x00000000) = {
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-drc-album-mode = 0
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-drc-boost-level = 127
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-drc-cut-level = 127
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-drc-effect-type = 3
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-encoded-target-level = -1
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-max-output-channel_count = 8
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t aac-target-ref-level = 64
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t bitrate = 64000
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t channel-count = 2
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t channel-mask = 0
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t level = 0
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t max-input-size = 8192
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t max-output-channel-count = 8
+10-11 17:45:07.747 18751 18947 D CCodec  :   string mime = "audio/mp4a-latm"
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t profile = 2
+10-11 17:45:07.747 18751 18947 D CCodec  :   int32_t sample-rate = 48000
+10-11 17:45:07.747 18751 18947 D CCodec  : }
+10-11 17:45:07.748 18751 18947 D CCodec  : setup formats output: AMessage(what = 0x00000000) = {
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-drc-album-mode = 0
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-drc-boost-level = 127
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-drc-cut-level = 127
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-drc-effect-type = 3
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-drc-output-loudness = -1
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-encoded-target-level = -1
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-max-output-channel_count = 8
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t aac-target-ref-level = 64
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t channel-count = 2
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t channel-mask = 0
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t max-output-channel-count = 8
+10-11 17:45:07.748 18751 18947 D CCodec  :   string mime = "audio/raw"
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t sample-rate = 48000
+10-11 17:45:07.748 18751 18947 D CCodec  :   int32_t android._config-pcm-encoding = 2
+10-11 17:45:07.748 18751 18947 D CCodec  : }
+10-11 17:45:07.748 18751 18947 I CCodecConfig: query failed after returning 20 values (BAD_INDEX)
+10-11 17:45:07.748 18751 18926 D SurfaceUtils: disconnecting from surface 0xb4000076f12acc80, reason disconnectFromSurface
+10-11 17:45:07.748 18751 18869 D MediaCodec: keep callback message for reclaim
+10-11 17:45:07.748 18751 18947 W Codec2Client: query -- param skipped: index = 1342179345.
+10-11 17:45:07.748 18751 18947 W Codec2Client: query -- param skipped: index = 2415921170.
+10-11 17:45:07.748 18751 18947 W Codec2Client: query -- param skipped: index = 1610614798.
+10-11 17:45:07.749 18751 18947 D CCodecBufferChannel: [c2.android.aac.decoder#247] Created input block pool with allocatorID 16 => poolID 18 - OK (0)
+10-11 17:45:07.753 18751 18947 I CCodecBufferChannel: [c2.android.aac.decoder#247] Created output block pool with allocatorID 16 => poolID 32 - OK
+10-11 17:45:07.753 18751 18947 D CCodecBufferChannel: [c2.android.aac.decoder#247] Configured output block pool ids 32 => OK
+10-11 17:45:07.753   417 18948 D SimpleC2Component: Using output block pool with poolID 32 => got 32 - 0
+10-11 17:45:07.754 18751 18869 E MediaCodecVideoRenderer: Video codec error
+10-11 17:45:07.754 18751 18869 E MediaCodecVideoRenderer:   android.media.MediaCodec$CodecException: Error 0xe
+10-11 17:45:07.755 18751 18869 D MediaCodecInfo: NoSupport [codec.profileLevel, hvc1.2.4.L120.90, video/hevc] [c2.android.hevc.decoder, video/hevc] [emu64a, sdk_google_atv64_arm64, Google, 34]
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal: Playback error
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:   androidx.media3.exoplayer.ExoPlaybackException: MediaCodecVideoRenderer error, index=0, format=Format(1, null, null, video/hevc, hvc1.2.4.L120.90, -1, null, [1920, 1080, 25.0, ColorInfo(BT709, Limited range, SDR SMPTE 170M, false, 10bit Luma, 10bit Chroma)], [-1, -1]), format_supported=NO_EXCEEDS_CAPABILITIES
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.handleMessage(ExoPlayerImplInternal.java:641)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at android.os.Handler.dispatchMessage(Handler.java:102)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at android.os.Looper.loopOnce(Looper.java:205)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at android.os.Looper.loop(Looper.java:294)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at android.os.HandlerThread.run(HandlerThread.java:67)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:   Caused by: androidx.media3.exoplayer.video.MediaCodecVideoDecoderException: Decoder failed: c2.android.hevc.decoder
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.video.MediaCodecVideoRenderer.createDecoderException(MediaCodecVideoRenderer.java:2105)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.mediacodec.MediaCodecRenderer.render(MediaCodecRenderer.java:899)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.video.MediaCodecVideoRenderer.render(MediaCodecVideoRenderer.java:1094)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.doSomeWork(ExoPlayerImplInternal.java:1138)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.handleMessage(ExoPlayerImplInternal.java:562)
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:       ... 4 more
+10-11 17:45:07.757 18751 18869 E ExoPlayerImplInternal:   Caused by: android.media.MediaCodec$CodecException: Error 0xe
+10-11 17:45:07.757 18751 18926 E MediaCodec: flush() is valid only at Executing states; currently at Released state
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal: Disable failed.
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:   java.lang.IllegalStateException: flush() is valid only at Executing states; currently at Released state
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:   
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at android.media.MediaCodec.native_flush(Native Method)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at android.media.MediaCodec.flush(MediaCodec.java:2504)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.mediacodec.AsynchronousMediaCodecAdapter.flush(AsynchronousMediaCodecAdapter.java:265)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.mediacodec.MediaCodecRenderer.flushCodec(MediaCodecRenderer.java:965)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.mediacodec.MediaCodecRenderer.flushOrReleaseCodec(MediaCodecRenderer.java:958)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.mediacodec.MediaCodecRenderer.onDisabled(MediaCodecRenderer.java:782)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.video.MediaCodecVideoRenderer.onDisabled(MediaCodecVideoRenderer.java:890)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.BaseRenderer.disable(BaseRenderer.java:244)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.disableRenderer(ExoPlayerImplInternal.java:1859)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.resetInternal(ExoPlayerImplInternal.java:1577)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.stopInternal(ExoPlayerImplInternal.java:1536)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at androidx.media3.exoplayer.ExoPlayerImplInternal.handleMessage(ExoPlayerImplInternal.java:687)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at android.os.Handler.dispatchMessage(Handler.java:102)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at android.os.Looper.loopOnce(Looper.java:205)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at android.os.Looper.loop(Looper.java:294)
+10-11 17:45:07.759 18751 18869 E ExoPlayerImplInternal:       at android.os.HandlerThread.run(HandlerThread.java:67)
+10-11 17:45:07.759 18751 18869 D MediaCodec: keep callback message for reclaim
+10-11 17:45:07.759 18751 18947 I CCodecConfig: query failed after returning 20 values (BAD_INDEX)
+10-11 17:45:07.759 18751 18947 W Codec2Client: query -- param skipped: index = 1342179345.
+10-11 17:45:07.759 18751 18947 W Codec2Client: query -- param skipped: index = 2415921170.
+10-11 17:45:07.759 18751 18947 W Codec2Client: query -- param skipped: index = 1610614798.
+10-11 17:45:07.760 18751 18926 D CCodecBufferChannel: [c2.android.hevc.decoder#240] MediaCodec discarded an unknown buffer
+10-11 17:45:07.760 18751 18926 D CCodecBufferChannel: [c2.android.hevc.decoder#240] MediaCodec discarded an unknown buffer
+10-11 17:45:07.761 18751 18926 D CCodecBufferChannel: [c2.android.hevc.decoder#240] MediaCodec discarded an unknown buffer
+10-11 17:45:07.761 18751 18943 E BufferQueueProducer: [SurfaceView[com.cloudcine.tv/com.cloudcine.tv.PlayerActivity]#2(BLAST Consumer)2](id:493f00000002,api:0,p:-1,c:18751) cancelBuffer: BufferQueue has no connected producer
+10-11 17:45:07.761 18751 18947 D CCodecBufferChannel: [c2.android.aac.decoder#247] MediaCodec discarded an unknown buffer
+10-11 17:45:07.761 18751 18947 D CCodecBufferChannel: [c2.android.aac.decoder#247] MediaCodec discarded an unknown buffer
+10-11 17:45:07.761 18751 18947 D CCodecBufferChannel: [c2.android.aac.decoder#247] MediaCodec discarded an unknown buffer
+10-11 17:45:07.761 18751 18947 D CCodecBufferChannel: [c2.android.aac.decoder#247] MediaCodec discarded an unknown buffer
+10-11 17:45:07.761   417   861 D C2BqBuffer: configuring null producer: igbp_information(0)
+10-11 17:45:07.762 18751 18926 D MediaCodec: flushMediametrics
+10-11 17:45:07.762 18751 18926 D MediaCodec: flushMediametrics
+10-11 17:45:07.762 18751 18926 W MediaCodec: no metrics handle found
+10-11 17:45:07.762 18751 18947 I hw-BpHwBinder: onLastStrongRef automatically unlinking death recipients
+10-11 17:45:07.762   417 18727 I hw-BpHwBinder: onLastStrongRef automatically unlinking death recipients
+10-11 17:45:07.763   499   560 I WifiService: releaseWifiLock uid=10122
+10-11 17:45:07.763 18751 18951 I hw-BpHwBinder: onLastStrongRef automatically unlinking death recipients
+10-11 17:45:07.763   417   862 I hw-BpHwBinder: onLastStrongRef automatically unlinking death recipients
+10-11 17:45:07.763   417   861 D BufferPoolAccessor2.0: Destruction - bufferpool2 0xb40000757844f158 cached: 0/0M, 0/0% in use; allocs: 0, 0% recycled; transfers: 0, 0% unfetched
+10-11 17:45:07.764 18751 18947 D MediaCodec: flushMediametrics
+10-11 17:45:07.764 18751 18947 D MediaCodec: flushMediametrics
+10-11 17:45:07.764 18751 18947 W MediaCodec: no metrics handle found
+10-11 17:45:07.764 18751 18751 E CloudCine: 播放失败 ERROR_CODE_DECODING_FAILED: MediaCodecVideoRenderer error, index=0, format=Format(1, null, null, video/hevc, hvc1.2.4.L120.90, -1, null, [1920, 1080, 25.0, ColorInfo(BT709, Limited range, SDR SMPTE 170M, false, 10bit Luma, 10bit Chroma)], [-1, -1]), format_supported=NO_EXCEEDS_CAPABILITIES
+10-11 17:45:07.764 18751 18751 E CloudCine: androidx.media3.exoplayer.ExoPlaybackException: MediaCodecVideoRenderer error, index=0, format=Format(1, null, null, video/hevc, hvc1.2.4.L120.90, -1, null, [1920, 1080, 25.0, ColorInfo(BT709, Limited range, SDR SMPTE 170M, false, 10bit Luma, 10bit Chroma)], [-1, -1]), format_supported=NO_EXCEEDS_CAPABILITIES
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at androidx.media3.exoplayer.ExoPlayerImplInternal.handleMessage(ExoPlayerImplInternal.java:641)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at android.os.Handler.dispatchMessage(Handler.java:102)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at android.os.Looper.loopOnce(Looper.java:205)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at android.os.Looper.loop(Looper.java:294)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at android.os.HandlerThread.run(HandlerThread.java:67)
+10-11 17:45:07.764 18751 18751 E CloudCine: Caused by: androidx.media3.exoplayer.video.MediaCodecVideoDecoderException: Decoder failed: c2.android.hevc.decoder
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at androidx.media3.exoplayer.video.MediaCodecVideoRenderer.createDecoderException(MediaCodecVideoRenderer.java:2105)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at androidx.media3.exoplayer.mediacodec.MediaCodecRenderer.render(MediaCodecRenderer.java:899)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at androidx.media3.exoplayer.video.MediaCodecVideoRenderer.render(MediaCodecVideoRenderer.java:1094)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at androidx.media3.exoplayer.ExoPlayerImplInternal.doSomeWork(ExoPlayerImplInternal.java:1138)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	at androidx.media3.exoplayer.ExoPlayerImplInternal.handleMessage(ExoPlayerImplInternal.java:562)
+10-11 17:45:07.764 18751 18751 E CloudCine: 	... 4 more
+10-11 17:45:07.764 18751 18751 E CloudCine: Caused by: android.media.MediaCodec$CodecException: Error 0xe
+10-11 17:45:07.765 18751 18751 I CloudCine: 状态 1
+10-11 17:45:07.765   499   560 D MediaMetricsManagerService: failed to get player_metrics_app_blocklist from DeviceConfig
+10-11 17:45:07.765   499   560 V MediaMetricsManagerService: Logging level blocked: Failed to get PLAYER_METRICS_APP_BLOCKLIST.
+10-11 17:45:07.765   499   560 D MediaMetricsManagerService: failed to get player_metrics_app_blocklist from DeviceConfig
+10-11 17:45:07.765   499   560 V MediaMetricsManagerService: Logging level blocked: Failed to get PLAYER_METRICS_APP_BLOCKLIST.
+10-11 17:45:07.817 18751 18882 D TrafficStats: tagSocket(125) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.818 18751 18883 D TrafficStats: tagSocket(130) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.821 18751 18885 D TrafficStats: tagSocket(135) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.821 18751 18890 D TrafficStats: tagSocket(145) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.823 18751 18895 D TrafficStats: tagSocket(146) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.823 18751 18901 D TrafficStats: tagSocket(150) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.824 18751 18880 D TrafficStats: tagSocket(148) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:07.838 18751 18771 D EGL_emulation: app_time_stats: avg=250.02ms min=16.26ms max=501.71ms count=4
+10-11 17:45:08.325   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:08.334 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5285 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 18.00 MB/s｜进程CPU 37.9%（折合 4 核 9.5%） · 内存 221 MB｜Java 堆 73/576 MB · 系统可用内存 1925 MB｜UI 60.0 fps · 最大帧间隔 18.9 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:08.334 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 14.39 MB/s · 14.39 MB/s
+10-11 17:45:08.339 18751 18872 I CloudCine: 并行读取器关闭：8 连接 · 各 [0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00] MiB · 请求 8 次 · 重试 0 · 耗时 0.6s · 累计建 6 · 存活 1
+10-11 17:45:08.349   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:08.855 18751 18771 D EGL_emulation: app_time_stats: avg=338.90ms min=15.50ms max=517.61ms count=3
+10-11 17:45:09.338 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5284 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 494 KB/s｜进程CPU 15.9%（折合 4 核 4.0%） · 内存 221 MB｜Java 堆 73/576 MB · 系统可用内存 1926 MB｜UI 60.0 fps · 最大帧间隔 19.4 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:09.339 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 716 KB/s · 716 KB/s
+10-11 17:45:09.538   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:09.556   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:09.855 18751 18771 D EGL_emulation: app_time_stats: avg=500.15ms min=497.64ms max=502.67ms count=2
+10-11 17:45:10.343 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5284 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 732 KB/s｜进程CPU 14.9%（折合 4 核 3.7%） · 内存 221 MB｜Java 堆 73/576 MB · 系统可用内存 1927 MB｜UI 61.0 fps · 最大帧间隔 21.2 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:10.343 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 845 KB/s · 845 KB/s
+10-11 17:45:10.654 18751 18901 D TrafficStats: tagSocket(115) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:10.654 18751 18880 D TrafficStats: tagSocket(125) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:10.655 18751 18885 D TrafficStats: tagSocket(120) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:10.851   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:10.876   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:11.347 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5269 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 14.72 MB/s｜进程CPU 22.9%（折合 4 核 5.7%） · 内存 206 MB｜Java 堆 24/576 MB · 系统可用内存 1931 MB｜UI 60.0 fps · 最大帧间隔 19.5 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:11.348 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 14.71 MB/s · 14.71 MB/s
+10-11 17:45:11.354 18751 18771 D EGL_emulation: app_time_stats: avg=499.68ms min=499.43ms max=499.88ms count=3
+10-11 17:45:12.157   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:12.177   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:12.351 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5268 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 906 KB/s｜进程CPU 17.9%（折合 4 核 4.5%） · 内存 206 MB｜Java 堆 24/576 MB · 系统可用内存 1931 MB｜UI 60.0 fps · 最大帧间隔 20.7 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:12.352 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 940 KB/s · 940 KB/s
+10-11 17:45:12.355 18751 18771 D EGL_emulation: app_time_stats: avg=500.37ms min=500.13ms max=500.60ms count=2
+10-11 17:45:12.738 18751 18942 D BufferPoolAccessor2.0: bufferpool2 0xb4000077412ee2b8 : 0(0 size) total buffers - 0(0 size) used buffers - 2/7 (recycle/alloc) - 1/2 (fetch/transfer)
+10-11 17:45:12.738 18751 18942 D BufferPoolAccessor2.0: evictor expired: 1, evicted: 1
+10-11 17:45:12.755   417   836 D BufferPoolAccessor2.0: evictor expired: 1, evicted: 0
+10-11 17:45:13.171  2470  2532 D TrafficStats: tagSocket(77) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:13.269 18751 18880 D TrafficStats: tagSocket(94) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:13.269 18751 18895 D TrafficStats: tagSocket(112) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:13.270 18751 18890 D TrafficStats: tagSocket(135) with statsTag=0xffffffff, statsUid=-1
+10-11 17:45:13.356 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5253 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 827 KB/s｜进程CPU 21.9%（折合 4 核 5.5%） · 内存 207 MB｜Java 堆 25/576 MB · 系统可用内存 1945 MB｜UI 60.0 fps · 最大帧间隔 19.5 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:13.357 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 14.60 MB/s · 14.60 MB/s
+10-11 17:45:13.370 18751 18771 D EGL_emulation: app_time_stats: avg=507.55ms min=497.76ms max=517.33ms count=2
+10-11 17:45:13.478   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:13.498   499   762 W BestClock: java.time.DateTimeException: Missing network time fix
+10-11 17:45:13.738 18751 18942 D BufferPoolAccessor2.0: bufferpool2 0xb4000077412efc28 : 0(0 size) total buffers - 0(0 size) used buffers - 6/11 (recycle/alloc) - 1/2 (fetch/transfer)
+10-11 17:45:13.738 18751 18942 D BufferPoolAccessor2.0: evictor expired: 1, evicted: 1
+10-11 17:45:14.358 18751 18751 I CloudCine: [统计] Media3 ExoPlayer · SurfaceView（零拷贝）｜片源 1920x1080 · 25.00fps · hvc1.2.4.L120.90｜解码器 c2.android.hevc.decoder｜渲染 0.0 fps · 丢帧 0 · 已解码 0｜缓冲 内存 +0s（后缓冲 30.0s）· 占用 0/64 MiB｜磁盘 本片 0 B · 目录 1552/1627 MiB · 盘剩 5252 MiB｜预取 第 0 块 · 领先 0 B（上限 1.11 GiB） · 网络 14.69 MB/s｜进程CPU 14.0%（折合 4 核 3.5%） · 内存 207 MB｜Java 堆 26/576 MB · 系统可用内存 1945 MB｜UI 61.0 fps · 最大帧间隔 20.0 ms｜按键→下一帧 0.0 ms（最大 0.0，n=0）
+10-11 17:45:14.359 18751 18751 I CloudCine: [控制栏] 31:20 / 46:36 · 已缓冲+0s · 速率 957 KB/s · 957 KB/s
+10-11 17:45:14.371 18751 18771 D EGL_emulation: app_time_stats: avg=500.19ms min=499.30ms max=501.07ms count=2

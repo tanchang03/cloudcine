@@ -31,23 +31,55 @@ import androidx.media3.datasource.cache.CacheWriter
  *
  * ## 与播放器的分工（不抢同一个 span）
  *
- * - **播放器**：`CacheDataSource` 正常读写 —— 它读过的段会落盘，
- *   所以「已经播过的部分」回拖时能命中。
- * - **预取器**：只下**播放头前方**的那一段，并用 [playheadBytes] 控制领先量。
+ * - **播放器**：`CacheDataSource` **只读**（`PlayerActivity` 传了
+ *   `setCacheWriteDataSinkFactory(null)`）—— 它读到的字节**一个都不落盘**。
+ *   ⛔ 别再写成「它读过的段会落盘、已播部分回拖能命中」（2026-10-11 更正）：
+ *   那是错的，写者只有下面这一条线程。后果是「播放器自己缓冲在内存里的那段，
+ *   一旦 seek 就被 ExoPlayer 丢掉、且盘上也没有」。
+ * - **预取器**：唯一写者。起点是 [startPositionBytes]（**当前调用方传 0**），
+ *   之后**只按 [reanchor] 往前挪**，而 [reanchor] 只在**用户跳转**时被调。
+ *   ⛔ 所以「续播」场景下它下的是**播放头后面**那一段（用户已经看过、
+ *   大概率不会再看的片头），要一直下到播放头才谈得上「播头前方有数据」。
+ *   ⚠️ 待修：见 `PlayerActivity.startDiskPrefetch` 的「为什么起点是 0」一节。
  *
  * 两边偶尔撞到同一段时，`SimpleCache.startFile` 会拒绝第二个写者，
  * `CacheDataSource` / `CacheWriter` 都会把它当普通 IO 失败降级处理
  * （一个继续走网络、一个重试），**不会崩**。
  *
+ * ## ★ 提交粒度与请求粒度**解耦**（2026-10-11 修）
+ *
+ * 修之前：`CacheDataSink` **没开**增量提交（media3 的方法名是
+ * `setFragmentSize`，ExoPlayer 2.x 时代叫 `setFragmentFileSize`），
+ * 于是一个 128 MiB 的 `DataSpec` 只在**整块读完**时才 `commitFile`。
+ * 在此之前那个 span `isCached = false` ⇒ 进度条那层淡蓝**不画**它、
+ * 播放器 `CacheDataSource` 读它 = **未命中回网络**。后果是「预取前沿后面
+ * 最多 128 MiB 下了但用不上」—— 按媒体时间算，原画档 ≈ 35 秒，
+ * 低码率档（0.24 MiB/s）≈ **9 分钟**。
+ *
+ * 修法：给 `CacheDataSink.Factory` 加 `setFragmentSize(PrefetchPlan.FRAGMENT_BYTES)`。
+ * 请求仍是 [PrefetchPlan.CHUNK_BYTES]（8 条连接的复用效率不退化），但**每 8 MiB 落一次盘**。
+ * 顺带把「跳转丢弃量」从一整块 128 MiB 降到**至多一个片段 8 MiB**
+ * （`reanchor` 打断时，**已提交的片段会留下**，只有当前那个片段丢掉）。
+ *
+ * ## ★ 首块之后立刻锚到续播点（2026-10-11 修）
+ *
+ * 修之前：起点恒为 0，而 [reanchor] **只在用户跳转时**才被调 ⇒ 续播时
+ * 预取器会从字节 0 一路灌 —— 灌的全是用户**已经看过**的那一段
+ * （实测 `01.mp4` 续播到 1880s，日志里 `预取 第 0 块`）。
+ *
+ * 修法：起点仍是 0（文件头 / `moov` / 索引每次起播都要读，落盘能省一次
+ * 嗅探往返），但**首块只下 [PrefetchPlan.HEAD_BYTES]**，下完立刻跳到
+ * [jumpAfterHeadBytes]。判据在 [PrefetchPlan.jumpAfterHead]。
+ *
  * ## 分块大小为什么是 128 MiB
  *
- * [CacheWriter] 一次 `cache()` 调用写一个 span，而每个 span 都要
- * `open()` 一次数据源 —— 对我们的 [ParallelRangeDataSource] 就是
- * 「重建 8 条连接」。实测 8 连接铺开 12 MiB 要 1.05s，
- * 分块太小会让连接建立开销吃掉带宽。
+ * [CacheWriter] 一次 `cache()` 调用 `open()` 一次数据源 —— 对我们的
+ * [ParallelRangeDataSource] 就是「重建 8 条连接」。实测 8 连接铺开 12 MiB
+ * 要 1.05s，分块太小会让连接建立开销吃掉带宽。
  *
- * 128 MiB 在 11 MiB/s 下约 12 秒一块，开销可忽略；
- * 同时它也是 LRU 的淘汰粒度 —— 太大则一次扔太多，太小则文件碎片多。
+ * 128 MiB 在 11 MiB/s 下约 12 秒一块，开销可忽略。
+ * ⛔ 它**不再**是 LRU 的淘汰粒度（那是 `SimpleCache` 按 span 做的），
+ *    所以「太大一次扔太多」这个顾虑已经不成立了。
  *
  * ## 用户跳转后必须**重新锚定**（2026-10-06 补）
  *
@@ -60,9 +92,11 @@ import androidx.media3.datasource.cache.CacheWriter
  * 它**只往前锚**（往回跳时已经下好的那段仍然有用，靠「领先太多就等」
  * 自然处理），并**打断正在写的那一块**，让新位置立刻开始下。
  *
- * ⚠️ 打断的代价：被打断的 span **不会** `commitFile`，那部分数据被丢弃
- *    （最多一整块 = [CHUNK_BYTES] ≈ 11 MiB/s 下 12 秒）。这是有意的取舍 ——
- *    让播放头前方**立刻**开始下，比省下这 12 秒更值。
+ * ⚠️ 打断的代价：正在写的那**一个片段**（最多 [PrefetchPlan.FRAGMENT_BYTES]）不会
+ *    `commitFile`，那部分数据被丢弃。这是有意的取舍 ——
+ *    让播放头前方**立刻**开始下，比省下这点数据更值。
+ *    ⛔ 开 `setFragmentFileSize` 之前，这里的代价是**一整块 128 MiB**
+ *    （低码率档下 ≈ 9 分钟的视频），那正是「拖一次进度条就多一个洞」的成因。
  */
 class DiskPrefetcher(
     private val cache: Cache,
@@ -83,8 +117,21 @@ class DiskPrefetcher(
      * `PlayerActivity.diskCacheSnapshot()`。
      */
     val cacheKey: String,
-    /** 从哪开始预取（字节）。一般是起播位置。 */
+    /** 从哪开始预取（字节）。**恒为 0** —— 首块是为了把文件头 / `moov` 落盘。 */
     private val startPositionBytes: Long,
+    /**
+     * 首块（[PrefetchPlan.HEAD_BYTES]）下完之后立刻跳到的字节位置（续播点）。
+     *
+     * `<= 0` = **不跳**（从头看，或者拿不到码率算不出续播点）—— 那时预取器
+     * 本来就该一路往前灌，跳反而是错的。
+     *
+     * ⛔ 判据（何时该跳、跳之前要满足什么）在 [PrefetchPlan.jumpAfterHead]，
+     *    别在这里再写一份。**这个参数解决的是「续播时从字节 0 爬」**：
+     *    预取器只会往前挪锚点，而挪锚点只在**用户跳转**时发生 ——
+     *    续播那次 `seekTo` 打过来时它还没建好，于是老老实实从 0 往下灌，
+     *    灌的全是用户已经看过的那一段（2026-10-11 实测确认）。
+     */
+    private val jumpAfterHeadBytes: Long,
     /** 文件总长（字节）；**负数 = 未知**。 */
     private val totalBytes: Long,
     /** 允许领先播放头多少字节 —— 超过就停下等播放头追上来。 */
@@ -254,7 +301,15 @@ class DiskPrefetcher(
         Log.i(
             TAG,
             "预取器启动：起点 ${nextPositionBytes / 1048576} MiB · " +
-                "分块 ${CHUNK_BYTES / 1048576} MiB · 领先上限 ${maxLeadBytes / 1048576} MiB",
+                "分块 ${PrefetchPlan.CHUNK_BYTES / 1048576} MiB · " +
+                "提交粒度 ${PrefetchPlan.FRAGMENT_BYTES / 1048576} MiB · " +
+                "领先上限 ${maxLeadBytes / 1048576} MiB · " +
+                if (jumpAfterHeadBytes > 0L) {
+                    "首块 ${PrefetchPlan.HEAD_BYTES / 1048576} MiB 后跳到 " +
+                        "${jumpAfterHeadBytes / 1048576} MiB（续播点）"
+                } else {
+                    "无续播锚点（从片头一路往前）"
+                },
         )
         while (!cancelled) {
             // ── 用户跳转 ⇒ 重新锚定 ────────────────────────────────
@@ -287,10 +342,14 @@ class DiskPrefetcher(
                 if (!sleep(WAIT_SLICE_MS)) return
                 continue
             }
+            // ⛔ 首块只下 [PrefetchPlan.HEAD_BYTES]（把文件头 / `moov` 落盘），
+            //    下完立刻跳到续播点 —— 判据在 [PrefetchPlan.chunkSpan]。
+            //    不这样切的话，「起点 0」就变成「从 0 一路爬到续播点」。
+            val span = PrefetchPlan.chunkSpan(chunks, jumpAfterHeadBytes)
             val end = if (totalBytes > 0) {
-                minOf(nextPositionBytes + CHUNK_BYTES, totalBytes)
+                minOf(nextPositionBytes + span, totalBytes)
             } else {
-                nextPositionBytes + CHUNK_BYTES
+                nextPositionBytes + span
             }
             val length = end - nextPositionBytes
             if (length <= 0) return
@@ -301,10 +360,23 @@ class DiskPrefetcher(
             //    2. `CacheDataSource` **不会自动写缓存** —— 不给
             //       `setCacheWriteDataSinkFactory`，读到的数据一个字节都不落盘，
             //       预取器就退化成「白下载一遍」。
+            // ⛔ `setFragmentSize` 是**必须**的（2026-10-11 修）：不给它，
+            //    一个 128 MiB 的 DataSpec 只在**整块读完**才 `commitFile`
+            //    ⇒ 前沿后面那 128 MiB 下了也读不到（未提交的 span 不算已缓存）。
+            //    给了它，「请求粒度」与「提交粒度」就解耦了：请求仍 128 MiB
+            //    （连接复用不退化），但每 8 MiB 落一次盘，而且 `reanchor`
+            //    打断时**已提交的片段会留下**、只丢当前那一个片段。
+            // ⚠️ 方法名是 `setFragmentSize`（media3 的命名），**不是**
+            //    `setFragmentFileSize`（那是 ExoPlayer 2.x 的老名字）——
+            //    javap 实测 media3-datasource 1.5.1 只有前者。
             val source = CacheDataSource.Factory()
                 .setCache(cache)
                 .setUpstreamDataSourceFactory(dataSourceFactory)
-                .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(cache))
+                .setCacheWriteDataSinkFactory(
+                    CacheDataSink.Factory()
+                        .setCache(cache)
+                        .setFragmentSize(PrefetchPlan.FRAGMENT_BYTES),
+                )
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
                 .createDataSource()
             // ⛔ `DataSpec` 必须自带 key：`CacheWriter.cache()` 一进来就
@@ -344,6 +416,20 @@ class DiskPrefetcher(
                         "预取结束：本块只拿到 ${actual / 1048576} MiB，判定已到文件末尾",
                     )
                     return
+                }
+                // ── 首块（文件头）下完 ⇒ 立刻锚到续播点 ────────────────
+                // ⛔ 只**登记**锚点，不直接改 `nextPositionBytes`：那块正在写的
+                //    数据已经收工，但「块与块之间」才是唯一不会跟 in-flight
+                //    打架的时刻（同 [reanchor] 的理由）。
+                // ⛔ 判据在 [PrefetchPlan.jumpAfterHead]（只跳一次、且必须往前跳）。
+                val jump = PrefetchPlan.jumpAfterHead(chunks, nextPositionBytes, jumpAfterHeadBytes)
+                if (jump > 0L) {
+                    pendingAnchorBytes = jump
+                    Log.i(
+                        TAG,
+                        "预取首块（文件头）已落盘 ⇒ 跳到续播点 ${jump / 1048576} MiB，" +
+                            "不再灌已经看过的那一段",
+                    )
                 }
             } catch (e: Exception) {
                 if (cancelled) return
@@ -388,8 +474,9 @@ class DiskPrefetcher(
     companion object {
         private const val TAG = "CloudCine"
 
-        /** 单个 span 的大小。见类注释里「为什么是 128 MiB」。 */
-        const val CHUNK_BYTES = 128L * 1024 * 1024
+        // ⛔ 分块 / 提交粒度 / 首块大小都搬到 [PrefetchPlan] 了（那里是纯函数，
+        //    能被 `PrefetchPlanTest` 钉住）。这里**别再各留一份常量** ——
+        //    抄成两份就会出现「单测按 8 MiB 过、运行时按 128 MiB 跑」。
 
         private const val WAIT_SLICE_MS = 1_000L
         private const val RETRY_BACKOFF_MS = 2_000L

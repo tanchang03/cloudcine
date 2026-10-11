@@ -6662,3 +6662,126 @@ apk（`cloudcine-0.1.0-*` 与 `cloudcine-1.0.0-*`）。CI 是干净检出，不�
 - `gh release create --generate-notes` 从**提交信息**生成 changelog，而本仓库提交
   信息大量是 `nil` ⇒ 自动更新日志基本是空的。要体面的 changelog 就得自己写进
   `.github/release-notes.md`（它排在自动日志**之前**）。
+
+## 11. 「拖到已缓冲区间还要缓冲」—— 评估结论（2026-10-11）
+
+用户原话：「影片播放过程中，缓冲了大量的缓存进度，此时拉动播放进度并且进度在
+缓冲进度范围内，依然会有一个加载缓冲过程，这个看起来之前的缓存并没有发挥作用呢？」
+
+### 11.1 先纠正一个前提：seek 不复用「已缓冲」
+
+`PlayerControlsView` 的头注释写着「ExoPlayer 的 `seekTo` 落在已缓冲区间内时
+**不需要任何网络**，直接从 `SampleQueue` 里出帧」。**这句话只对了一半**，
+去 media3 源码核对（`ChunkSampleStream.seekToUs`）：
+
+```java
+boolean seekInsideBuffer;
+if (seekToMediaChunk != null) { ... }
+else {
+  long nextLoadPositionUs = getNextLoadPositionUs();
+  boolean allowTimeBeyondBuffer =
+      nextLoadPositionUs == C.TIME_END_OF_SOURCE || positionUs < nextLoadPositionUs;
+  seekInsideBuffer = primarySampleQueue.seekTo(positionUs, allowTimeBeyondBuffer);
+}
+...
+if (seekInsideBuffer) { /* 只移动读指针，不重置 */ }
+else {
+  // We can't seek inside the buffer, and so need to reset.
+  pendingResetPositionUs = positionUs; loadingFinished = false; mediaChunks.clear();
+  ... discardToEnd() / resetSampleQueues() ...
+}
+```
+
+⇒ **只有落在 `SampleQueue` 保留窗口内的跳转才不碰数据源。窗口之外一律
+`resetSampleQueues()` ⇒ 从数据源重读。** 窗口大小：
+
+| 方向 | 上限 | 依据 |
+|---|---|---|
+| 前向 | `min(字节预算, maxBufferMs=120s)` | 原画 64 MiB ÷ 3.67 MiB/s ≈ **17s**；低码率档 120s |
+| 后向 | `BufferPlan.backBufferMs` | 预算 1/4 反算，钳 **[2s, 30s]** |
+
+所以「已经缓冲在内存里的那段」在 seek 之后**一律作废**（ExoPlayer 丢弃队列），
+能不能快，全看**盘上有没有**。
+
+### 11.2 盘上「有」也不等于「读得到」：三个结构性缺口
+
+**① 提交粒度 128 MiB ⇒ 前沿那一段「下了但用不上」**
+`DiskPrefetcher.CHUNK_BYTES = 128 MiB`，而 `CacheDataSink` **没开
+`setFragmentFileSize`** ⇒ 一个 DataSpec 只在**整块读完**才 `commitFile`。
+在此之前该 span `isCached = false`：
+- 进度条那层淡蓝**不画**它（`diskCacheSnapshot` 显式跳过，见 1379 行）；
+- 播放器 `CacheDataSource` 读它 = **未命中 ⇒ 回网络重下**。
+
+按媒体时间算：原画档（3.67 MiB/s）≈ 35 s，低码率档（0.24 MiB/s）≈ **9 分钟**。
+
+**② 每次前向跳转都丢弃正在写的那一块 ⇒ 盘上出现真空洞**
+`DiskPrefetcher.reanchor()` 开头就 `currentWriter?.cancel()` + `currentSource?.close()`，
+而被取消的 span **不 commit**。于是 `[0, 旧前沿) ∪ [新锚点, …)` 中间是真的没数据
+（`DiskCacheSnapshot.ranges` 的注释也承认了这点，但只按「最多 12 秒」估代价 ——
+那是按 11 MiB/s **下载速度**算的；按**媒体时间**算是最长 9 分钟）。
+
+⇒ 用户拖一次 → 留一个洞 → 再拖回洞里 → **回网络**。而淡蓝那层看着还是「一大片
+都有」，因为洞在低码率档下只占很窄一条。
+
+**③ 播放器只读缓存 ⇒ 它自己缓冲的东西一个字节都不落盘**
+`startPlayer` 里 `.setCacheWriteDataSinkFactory(null)`（注释写明「让 DiskPrefetcher
+当唯一写者，换来零崩溃风险」）。代价比注释里写的（「起播头十几秒会被重复下载」）
+更大：**播放器读过的段永远不会变成「已缓存」**，所以「刚播过的地方」回拖也
+只能靠预取器恰好覆盖到。
+
+### 11.3 已实测确认：续播时预取器从字节 0 开始，且没人把它锚过去
+
+`startPlayer` 的顺序是：
+
+```
+exo.setMediaItem(url) → exo.prepare() → exo.seekTo(startMs)   // 续播点
+                     → exo.playWhenReady = true
+                     → startDiskPrefetch(...)                  // ← 预取器在这里才诞生
+```
+
+⇒ 续播那次 `onPositionDiscontinuity(SEEK)` 打过来时 `prefetcher` 还是 `null`，
+`prefetcher?.reanchor(bytes)` **是空操作**；而 `startDiskPrefetch` 传的是
+`startPositionBytes = 0L`，`reanchor` 又**只在用户跳转时**才被调。
+
+实测（模拟器，`兰香如故 01.mp4`，续播到 1880s）：
+
+```
+17:45:05.327  续播：起播跳到 1880s（库里记的续播点）
+17:45:05.331  磁盘预取：已启动（键 quark:e631c05f…:origin · 码率 0.24 MiB/s ⇒ 领先上限 1139 MiB）
+17:45:06.328  … 磁盘 本片 0 B … 预取 第 0 块 · 领先 0 B（上限 1.11 GiB）
+```
+
+`预取 第 0 块` + 播放头 31:20 ⇒ **预取器在灌用户已经看过的那 31 分钟**。
+按 0.24 MiB/s 的档位，要下到播放头得先灌 ≈ 451 MiB；换成原画档是几个 GiB。
+
+### 11.4 一行日志就能定性（排查时先看它）
+
+`PlayerActivity.seekToPosition` 每次提交跳转都打一行：
+
+```
+跳转提交[触摸/快进] → 1880s（跳前内存缓冲到 1750s，内存区间内 / 磁盘缓存命中 / 两处都没命中）
+```
+
+- `内存区间内` ⇒ 前向跳、在 SampleQueue 窗口里 ⇒ **应该瞬间出画**，若还卡就是别的问题；
+- `磁盘缓存命中` ⇒ 字节在盘上，重读走本地 ⇒ 只剩 `bufferForPlaybackMs(1500ms)` 的重填；
+- `两处都没命中` ⇒ **一定回网络**，用户看到的「加载缓冲」就是这个。
+
+⚠️ `covers()` 用的是**估算字节**（`estimatedBytes` = 时间 × `Quality.requiredMbPerSec`），
+而 `requiredMbPerSec` 是**平均码率**（`sizeBytes / duration`）⇒ VBR 片源上这行
+日志的「命中/没命中」**可能是错的**。它只是**线索**，不是判据；判据要看
+`磁盘 本片 X MiB` 与 `预取 第 N 块` 两个读数。
+
+### 11.5 修复清单（按性价比排序，尚未实施）
+
+| # | 改动 | 收益 | 风险 |
+|---|---|---|---|
+| 1 | 预取器的 `CacheDataSink.Factory` 加 `setFragmentFileSize(8 MiB)` | 前沿那 128 MiB 立刻可读、淡蓝立刻长出来 | 低（只是提交更碎，span 数变多 ⇒ `getCachedSpans` 变慢，需同步降频） |
+| 2 | `startDiskPrefetch` 之后补 `prefetcher?.reanchor(estimatedBytes(startMs))` | 续播不再从 0 爬 | 低 |
+| 3 | `CHUNK_BYTES` 128 MiB → 8~16 MiB，或让 `reanchor` **补完当前块再跳** | 消除「拖一次丢一块」的洞 | 中（块小 ⇒ 连接重建开销 ↑；「补完再跳」⇒ 跳转后延迟起下） |
+| 4 | 让播放器也写缓存（给 `CacheDataSource` 一个 `CacheDataSink`） | 「刚播过的地方」回拖一定命中 | 中（与预取器撞 span 会 `IllegalStateException`，得先做互斥） |
+| 5 | 淡蓝那层改用**实际字节/时间**对照（或干脆画成「已提交 span 的字节直方图」） | 不再「画得比实际多」 | 低，但要改 UI 语义 |
+
+⛔ 顺带更正了两处**已经与代码矛盾**的注释（本次已改）：
+- `DiskPrefetcher` 类注释「播放器：`CacheDataSource` 正常读写 —— 它读过的段会落盘」；
+- `PlayerActivity.startDiskPrefetch` 的「70% 留出余量给播放器自己写的那部分（已播段）」。
+两处都错在**假设播放器会写缓存**，而它传的是 `setCacheWriteDataSinkFactory(null)`。

@@ -1,7 +1,7 @@
 # 云影（cloudcine）长期约定
 
 **两个互不引用的工程**：`android/` = ★ Android/TV 正式实现（原生 Kotlin，`com.cloudcine.tv`）；`lib/ macos/ windows/ pubspec.yaml` = Flutter PC 端。
-- 细节下沉：理由 → `HOWTO.md`；逐日 → `YYYY-MM-DD.md`；产品 → `android/README.md`。**只留红线 + 标识符**；⚠️ 超 1.2 万字节被截断 ⇒ 加新条目**先删旧的**。
+- 细节下沉：理由 → `HOWTO.md`；逐日 → `YYYY-MM-DD.md`；产品 → `android/README.md`。**只留红线 + 标识符**；⚠️ 超 1.2 万字节截断 ⇒ 加新条目**先删旧的**。
 
 ## 仓库结构 / 版本控制 / CI
 - ⛔⛔ **仓库根跑 `flutter build apk` 必报 `deleted Android v1 embedding`** ⇒ Android 产物**只**走 `cd android && ./gradlew :app:assembleRelease`（JDK 21）。⛔ 根 `tool/adb_tv.sh` 已死 ⇒ 用 `android/tool/adb_tv.sh`。⛔ `applicationId`/`versionCode` 别改（换包名 = 丢磁盘缓存）。
@@ -30,9 +30,10 @@
 - ★★ **归一并集**：⛔ `mergeWorksInto` 只给源行打 `merged_into`、**从不改写 `group_key`** ⇒ 查询 = 「自己名下 ∪ 源名下」（`itemsForWork`/`ownerKeyOf`、`listWorks`/`withUnionStats`、`unfinishedCount`）。⛔⛔ **并集不许塞进 `WORK_COLUMNS` 逐行子查询**（7.5s）⇒ 走**页级** `unionStats`。`checkFollow` 完站简介页走 `reloadCurrentItems()`。
 - ★★ **刮削**：TMDB 优先 + 豆瓣兜底。⛔ **TMDB 两代 Key 送法不同**：v4（`eyJ`）走 `Bearer`，v3（hex）走 `api_key`，送错 **401**。`AUTO_SCRAPE_ON_SCAN`：PC 关、Android 开。
 - ★★ **扫描进度**：⛔ `PUBLISH_EVERY_MS=1000` **≫** `REPORT_EVERY_MS=400` 且在 `applyScanItems` 之后；UI 原地刷新。⛔ 未刮削封面用 `PanApi.thumbBytes`（带 Cookie；裸链 `401`）。
-- ★★ **海报墙**：`TARGET_CARD_DP` **同时**决定列数与卡高（**100dp → 8 列/2 行**）。⛔ 别低于 88dp；⛔ 卡片上留白 dp(8)→dp(4) 决定第二行能否露出；底部 dp(6) 不能动。
+- ✅ **「拖进已缓冲区间还要缓冲」已修**（2026-10-11）→ HOWTO §11 是评估；修法 = `PrefetchPlan`（纯决策层）+ `DiskPrefetcher` 开增量提交（media3 名 **`setFragmentSize`**，⛔ 不是 `setFragmentFileSize`）+ 首块只下 `HEAD_BYTES` 后跳续播点。守卫 `PrefetchPlanTest`/`PrefetchWiringTest`。
+- ★★ **海报墙**：`TARGET_CARD_DP` **同时**决定列数与卡高（**100dp → 8 列/2 行**）。⛔ 别低于 88dp；⛔ 卡上留白 dp(8)→dp(4) 决定第二行能否露出；底部 dp(6) 不能动。
 - `library/`：`LibrarySchema` = 唯一真源；`LibraryDb` 只补表补列、⛔ **不做旧版迁移**、补列须 `col.copy(notNull = false)`、⛔ **不用 WAL**；`LibraryItem` 带 `dirId`。`pan/`：⛔ 目录只认 `dir` 位（`0`=目录/`1`=文件）。
-- ⛔ JVM 单测 `org.json`/`Base64` 是空壳 ⇒ 用 `MiniJson`/`OssAuth.base64`；`TvOsdView`/`SeekPlan` → HOWTO。
+- ⛔ JVM 单测 `org.json`/`Base64` 是空壳 ⇒ 用 `MiniJson`/`OssAuth.base64`。
 - 工程约定：minSdk 21/targetSdk 34/compileSdk 36/Media3 1.5.1；⛔ 不引 OkHttp/media3-ui/AppCompat/Material/RecyclerView。Gradle 8.10.2/AGP 8.7.0/Kotlin 2.1.0；**`JAVA_HOME` 用 JDK 21**。
 
 ## ★★ 真机调试 / 4K 卡顿
@@ -41,23 +42,23 @@
 
 ## Flutter PC 端红线
 - 最常踩三条：⛔ `chunkSize` 别放大（2→8 MiB⇒零成功播放）；⛔ `app_shell._items` 与 `app_router.branches` **必须同序**（判据是**下标**）；⛔ 恢复备份后清设置缓存（`SettingsStore._cache`+`SettingsController`）。
-- ★★ **macOS 原生全屏会拆掉 Flutter 焦点链** ⇒ `CallbackShortcuts` 整张表**同时**失灵、**不报错**（flutter#166237）⇒ `HardwareKeyboard` 兜底（⛔ `_rootFocus.hasFocus` 挡双触发）+ 原生 `makeFirstResponder`。机理 → HOWTO。
-- ★★ **PC 独立播放窗口关窗必须报 `PlayerBridgeMethod.playerClosed`**（`_releasePlayer()` 开头，**幂等**）⇒ 主窗口立刻同步进度。⛔ 少它 = 进度最多晚 30 分钟上网盘 ⇒ **跨环境最后播放集数不同步**（Android 在 `REQ_PLAYER` 后 2s 同步）。
-- ★★ `WorkDetail.primary` / 详情页 `primary` **走 `PlayTarget.resolve`**；⛔ 曾用 `features.first`（永远第一集）。⛔ `resumePositions` 与 `maxPositions` 别混：画进度条用后者、算该播哪一集用前者。机理 → HOWTO。
-- ★★ 页面级 UI 测试（裸铺 `LibraryPage` 等）**必须**注入 `appSupportDirProvider`（真临时目录）：页面读 `scanDriveProvider` 会连锁到 `credentialStoreProvider` ⇒ 缺了报 `UnimplementedError`（CI 红）。
+- ★★ **macOS 原生全屏会拆掉 Flutter 焦点链** ⇒ `CallbackShortcuts` 整张表**同时**失灵、**不报错**（flutter#166237）⇒ `HardwareKeyboard` 兜底（⛔ `_rootFocus.hasFocus` 挡双触发）+ 原生 `makeFirstResponder`。→ HOWTO。
+- ★★ **PC 独立播放窗口关窗必须报 `PlayerBridgeMethod.playerClosed`**（`_releasePlayer()` 开头，**幂等**）⇒ 主窗口立刻同步进度。⛔ 少它 = 进度最多晚 30 分钟上网盘 ⇒ **跨环境最后播放集数不同步**。
+- ★★ `WorkDetail.primary` / 详情页 `primary` **走 `PlayTarget.resolve`**；⛔ 曾用 `features.first`（永远第一集）。⛔ `resumePositions` 与 `maxPositions` 别混：画进度条用后者、算该播哪一集用前者。→ HOWTO。
+- ★★ 页面级 UI 测试（裸铺 `LibraryPage` 等）**必须**注入 `appSupportDirProvider`：页面读 `scanDriveProvider` 会连锁到 `credentialStoreProvider` ⇒ 缺了报 `UnimplementedError`（CI 红）。
 
 ## ★★ 百度网盘（细节 → HOWTO）
-- 代码：`lib/data/remote/baidu/*` + `lib/data/auth/baidu_qr{_login,_driver}.dart`。⛔ 开放平台不可用（xpan 恒 `9019`）⇒ **BDUSS 扫码**。
-- ★★ **直链两跳**：`d.pcs.baidu.com` **302** → `*.baidupcs.com`。⛔⛔ Dart 自动重定向丢 UA ⇒ **消费票据一律走 `applyTicketHeaders`**（手贴也须 `applyTicketUserAgent`）。
-- ★★ **两通道**：取链**先带 `origin=dlna`**（只服务媒体），非媒体（`canUseDlna`）**重取一次去 origin**。⛔ 普通通道**必须单连接**、**连接数不是提速杠杆** ⇒ `maxConnections`+`connectionsFor()`。⛔ 无 `vuk` 直链**第一跳必带 `Cookie`**；⛔ `stallTimeout` 兜「响应头到了包体不来」。
-- ⛔⛔ 与夸克**三处结构性差异**：目录标识是**路径**（`dir=/电影`，`rootId='/'`）· 列表在**顶层 `list`** · 目录位 **`isdir:1`**。⛔ 原画哨兵**必须**用 `kOriginalQualityId`。
-- ★★ **扫码链 4 步**：`getqrcode`→`unicast`→换票→落地网盘域。⛔ 换票走 `GET /v2/api/bdusslogin`、**不带 `loginVersion`**；④ 回 **302** ⇒ ⛔ 禁自动重定向、**但必须手动逐跳跟到 `pan.baidu.com`**（否则 `uinfo` 恒 `-6`）。
+- 代码：`lib/data/remote/baidu/*` + `lib/data/auth/baidu_qr{_login,_driver}.dart`。⛔ 开放平台不可用（`9019`）⇒ **BDUSS 扫码**。
+- ★★ **直链两跳**：`d.pcs.baidu.com` **302** → `*.baidupcs.com`。⛔⛔ Dart 自动重定向丢 UA ⇒ **消费票据走 `applyTicketHeaders`**（手贴也须 `applyTicketUserAgent`）。
+- ★★ **两通道**：取链**先带 `origin=dlna`**（只服务媒体），非媒体（`canUseDlna`）**重取一次去 origin**。⛔ 普通通道**必须单连接**、**连接数≠提速** ⇒ `maxConnections`/`connectionsFor()`。⛔ 无 `vuk` 直链**第一跳必带 `Cookie`**；⛔ `stallTimeout` 兜「头到了包体不来」。
+- ⛔⛔ 与夸克**三处结构性差异**：目录标识是**路径**（`dir=/电影`，`rootId='/'`）· 列表在**顶层 `list`** · 目录位 **`isdir:1`**。⛔ 原画哨兵用 `kOriginalQualityId`。
+- ★★ **扫码链 4 步**：`getqrcode`→`unicast`→换票→落地网盘域。⛔ 换票走 `GET /v2/api/bdusslogin`、**不带 `loginVersion`**；④ 回 **302** ⇒ ⛔ 禁自动重定向、**但须手动逐跳跟到 `pan.baidu.com`**（否则 `uinfo` 恒 `-6`）。
 - ★★ **`bdstoken` 必带**（每条 `/api/*` 都带，**读也要**；缺了回 `-6` ⇒ 适配器「补令牌重试一次」自愈）。第 5 步换 **netdisk STOKEN**。⛔ 必带 `Origin`·`Referer`·浏览器 UA；⛔ 4 步**同一批 Cookie**。⚠️ `-6` **一码多义** ⇒ 打原始响应体。
 - ★★ **多网盘并存（无「当前网盘」概念）**：`AuthState` = `Map<DriveProvider,CloudAccount>`。`CloudDriveAdapter` = 唯一架构边界（新网盘 = 实现 adapter + 加枚举值，须 `extends` 继承四个 `unsupported` 写默认）。⛔ 用到网盘处都收**显式** `DriveProvider`。
-  - 视图选择（内存态）：`browseDriveChoiceProvider`/`scanDriveChoiceProvider`，默认首个已连盘（无则 quark）。其他：`connectedDrivesProvider`/`selectableDrivesProvider`（`AuthMode.qrCode`）/`accountForProviderProvider`/`backupDriveProvider`（首个 `canWrite`）。⛔ `QrLoginDriver` 由**工厂**产出（⛔ 不能 `family` ⇒ 缓存 = 旧 sign）。
+  - 视图选择（内存态）：`browseDriveChoiceProvider`/`scanDriveChoiceProvider`，默认首个已连盘（无则 quark）。其他：`connectedDrivesProvider`/`selectableDrivesProvider`（`AuthMode.qrCode`）/`backupDriveProvider`（首个 `canWrite`）。⛔ `QrLoginDriver` 由**工厂**产出（⛔ 不能 `family` ⇒ 缓存 = 旧 sign）。
 
 ## 运维 / 打包 / 测试
 - ⛔⛔ **macOS Release 签名不许带 `get-task-allow`** ⇒ Runner **Release** 须 `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO`（⛔ 只关 Release；判据 `codesign -d --entitlements -`）。
 - ★★ **发版**：tag 必须 `v*` 触发 `release.yml`。⛔⛔ **版本号两处同改**：`pubspec.yaml` 的 `version` 与 `android/app/build.gradle.kts` 的 `versionName`。
 - 测试：纯函数优先、断言写「为什么」；⛔ **每个需求只跑相关单测，不回归全量**；修 bug **先加测试确认红**。Android 用 `:app:testDebugUnitTest --tests '…library.*'`。⛔ 断言**终态**；终态前夹真 IO ⇒ 轮询（`_settleUntil`）。
-- ⛔⛔ 本机 shell 带 `HTTP_PROXY/HTTPS_PROXY=127.0.0.1:5xxxx` ⇒ `flutter test` 必报 `Unable to connect to flutter_tester process: Invalid WebSocket upgrade request`（**与代码无关**）。跑 test/analyze/build 一律 `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost`。
+- ⛔⛔ 本机 shell 带 `HTTP_PROXY/HTTPS_PROXY=127.0.0.1:5xxxx` ⇒ `flutter test` 必报 `Invalid WebSocket upgrade request`（**与代码无关**）。跑 test/analyze/build 一律 `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost`。
