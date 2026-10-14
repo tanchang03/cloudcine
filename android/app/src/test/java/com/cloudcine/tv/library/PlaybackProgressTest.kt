@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 进度模型（[ProgressEntry] / [ProgressBook]）的**纯逻辑**单测。
+ * 进度模型（[ProgressEntry] / [WorkSkipEntry] / [ProgressBook]）的**纯逻辑**单测。
  *
  * 这里覆盖的是这个功能里最不能出错的一段：**合并方向**。它一旦错了，表现是
  * 「两台设备各看一集，其中一集的进度莫名消失」，而且两边都显示同步成功 ——
@@ -16,8 +16,9 @@ import org.junit.Test
  * ## ⛔ 为什么专门测「跨端 JSON 形状」
  *
  * 这份 JSON 是**跨端契约**：电视写、电脑读，反之亦然。字段名（`r`/`m`/`p`/`u`、
- * 顶层 `v`/`items`）与 PC 端 `playback_progress.dart` **逐字对齐**，改一个字母
- * 就会变成「两端的进度永远合不到一起」，而两边各自的自测全绿。
+ * 作品段的 `is`/`ie`/`oo`/`mu`/`le`/`lo`/`ls`/`lu`、顶层 `v`/`items`/`works`）
+ * 与 PC 端 `playback_progress.dart` **逐字对齐**，改一个字母就会变成「两端的
+ * 进度永远合不到一起」，而两边各自的自测全绿。
  * 所以下面用**手写的字面量 JSON**（模拟对面写出来的字节）来验，而不是只做
  * 「自己序列化 → 自己反序列化」的往返 —— 那种往返在两端都改错时一样会过。
  */
@@ -29,6 +30,26 @@ class PlaybackProgressTest {
         played: Long? = null,
         updated: Long,
     ) = ProgressEntry(resumeMs = resume, maxMs = max, playedAtSec = played, updatedAtSec = updated)
+
+    private fun skip(
+        introStart: Long? = null,
+        introEnd: Long? = null,
+        outroOffset: Long? = null,
+        manualAt: Long = 0,
+        learnedIntroEnd: Long? = null,
+        learnedOutroOffset: Long? = null,
+        learnedSamples: Int = 0,
+        learnedAt: Long = 0,
+    ) = WorkSkipEntry(
+        introStartMs = introStart,
+        introEndMs = introEnd,
+        outroOffsetMs = outroOffset,
+        manualUpdatedAtSec = manualAt,
+        learnedIntroEndMs = learnedIntroEnd,
+        learnedOutroOffsetMs = learnedOutroOffset,
+        learnedSamples = learnedSamples,
+        learnedUpdatedAtSec = learnedAt,
+    )
 
     // ------------------------------------------------------------------
     // mergedWith：三条规则
@@ -135,7 +156,9 @@ class PlaybackProgressTest {
 
         // ⛔ 断的是**字面量**而不是「再解析回来」：PC 端 `jsonDecode` 读的就是
         //    这串文本，多一个空格/少一个字段都可能让它的 `as int?` 拿到 null。
-        assertEquals("""{"v":1,"items":{"quark:F1":{"r":1000,"m":5000,"p":100,"u":200}}}""", book.toJsonString())
+        //    ⚠️ 顶层 `v` 是**格式版本**（v2 起多了 `works` 段），两端只在字段
+        //    增删时才动它 —— 改了这里就必须同步改 `playback_progress.dart`。
+        assertEquals("""{"v":2,"items":{"quark:F1":{"r":1000,"m":5000,"p":100,"u":200}}}""", book.toJsonString())
     }
 
     @Test
@@ -233,5 +256,226 @@ class PlaybackProgressTest {
         assertTrue(entry(played = 1, updated = 1).isReadOnly)
         assertFalse("有位置就不是「只有已读」", entry(resume = 1, played = 1, updated = 1).isReadOnly)
         assertFalse("maxMs 也算位置", entry(max = 1, played = 1, updated = 1).isReadOnly)
+    }
+
+    // ------------------------------------------------------------------
+    // WorkSkipEntry.mergedWith：两组各判各的
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `手标组与学习组各判各的 —— 手标时间戳大就手标赢，与学习无关`() {
+        // ⛔ 这是「合成一个时间戳」最容易踩的那个坑：A 机手标了片头（manual 更新），
+        //    B 机学出了片尾（learned 更新）。合成一个的话，后写的那次会把前一次
+        //    整个抹掉，而两台机器都显示同步成功。
+        val mine = skip(introStart = 0, introEnd = 95_000, manualAt = 900)
+        val theirs = skip(learnedIntroEnd = 88_000, learnedSamples = 4, learnedAt = 100)
+
+        val merged = mine.mergedWith(theirs)
+
+        assertEquals("手标组：本机更新 ⇒ 本机的留下", 95_000L, merged.introEndMs)
+        assertEquals(900L, merged.manualUpdatedAtSec)
+        assertEquals("学习组：远程更新 ⇒ 远程的合进来", 88_000L, merged.learnedIntroEndMs)
+        assertEquals(4, merged.learnedSamples)
+        assertEquals(100L, merged.learnedUpdatedAtSec)
+    }
+
+    @Test
+    fun `学习组更新时整组替换 —— 清除动作必须能赢`() {
+        // 场景：用户点了「清除自动学习的结论」。清除写的是「空组 + 时间戳前进」，
+        // 若按字段合并，清除只会清掉一半，界面上看起来是「清不干净」。
+        val mine = skip(learnedIntroEnd = 88_000, learnedOutroOffset = 70_000, learnedSamples = 4, learnedAt = 100)
+        val cleared = skip(learnedAt = 500) // 学习组整组为空，但时刻前进
+
+        val merged = mine.mergedWith(cleared)
+
+        assertNull("片头结论被清掉", merged.learnedIntroEndMs)
+        assertNull("片尾结论也一起清掉（整组替换）", merged.learnedOutroOffsetMs)
+        assertEquals(0, merged.learnedSamples)
+        assertEquals("清除留下的时刻要保住，否则下一轮又会输给旧结论", 500L, merged.learnedUpdatedAtSec)
+        assertFalse("清干净之后这条就什么都不是了", merged.hasLearned)
+    }
+
+    @Test
+    fun `两组时间戳都相等时保留自己（同秒写入不会来回抖）`() {
+        val mine = skip(introStart = 0, introEnd = 111, manualAt = 500, learnedIntroEnd = 111, learnedAt = 500)
+        val theirs = skip(introStart = 0, introEnd = 222, manualAt = 500, learnedIntroEnd = 222, learnedAt = 500)
+
+        val merged = mine.mergedWith(theirs)
+
+        assertEquals(111L, merged.introEndMs)
+        assertEquals(111L, merged.learnedIntroEndMs)
+    }
+
+    @Test
+    fun `hasManual 与 hasLearned 的边界 —— 半条手标也算有内容`() {
+        // ⚠️ 与 PC 端 `WorkSkipFormat` 的「半条不算一条完整片头」是**两个判据**：
+        //    那边管的是「要不要显示这一行」，这边管的是「要不要把这一组同步出去」。
+        //    半条手标（只有起点）仍然要同步 —— 否则用户在 PC 上标了一半、电视上
+        //    看不到。
+        assertTrue("只有起点也算有内容", skip(introStart = 0).hasManual)
+        assertTrue("只有片尾也算有内容", skip(outroOffset = 70_000).hasManual)
+        assertFalse("时间戳不算内容", skip(manualAt = 500).hasManual)
+        assertTrue(skip(learnedOutroOffset = 70_000).hasLearned)
+        assertFalse("样本数不算内容", skip(learnedSamples = 9).hasLearned)
+        assertTrue("两组都空 ⇒ 整条空", skip().isEmpty)
+        assertFalse(skip(introStart = 0).isEmpty)
+    }
+
+    // ------------------------------------------------------------------
+    // WorkSkipEntry 的 JSON 形状（跨端契约）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `作品段的短键与 PC 端逐字一致`() {
+        val json = skip(
+            introStart = 0,
+            introEnd = 90_000,
+            outroOffset = 70_000,
+            manualAt = 111,
+            learnedIntroEnd = 88_000,
+            learnedOutroOffset = 66_000,
+            learnedSamples = 4,
+            learnedAt = 222,
+        ).toJson()
+
+        // ⛔ 断的是**序列化出来的文本**而不是 Map 的相等：`Map.equals` 会拿
+        //    `Int` 与 `Long` 的装箱类型去比，两边打印一模一样却判不相等 ——
+        //    而真正跨端的东西本来就是这串文本（PC 端 `jsonDecode` 读的是它）。
+        assertEquals(
+            """{"is":0,"ie":90000,"oo":70000,"mu":111,"le":88000,"lo":66000,"ls":4,"lu":222}""",
+            MiniJson.write(json),
+        )
+    }
+
+    @Test
+    fun `零时间戳与空字段都省掉（几千部作品也撑得住体积）`() {
+        // 只有手标、从没学过 ⇒ 学习那四个键一个都不该出现。
+        assertEquals(
+            mapOf("ie" to 90_000L),
+            skip(introEnd = 90_000, manualAt = 0).toJson(),
+        )
+        // ⛔ `mu` 为 0 时省掉，而不是写一个 0：0 的语义是「有内容但没有时间依据」，
+        //    显式写出来会让人误以为它是个真实的时刻（1970 年）。
+        assertEquals(
+            mapOf("le" to 88_000L, "lu" to 7L),
+            skip(learnedIntroEnd = 88_000, learnedSamples = 0, learnedAt = 7).toJson(),
+        )
+    }
+
+    @Test
+    fun `能读懂 PC 端写出来的作品段字面量 JSON`() {
+        // ⛔ 这一串是照 `playback_progress.dart` 的 `WorkSkipEntry.toJson()` 手写的。
+        //    别改成「自己序列化的结果」—— 那样两端同时改错也会过。
+        val fromPc = """
+            {"v":2,"items":{},"works":{
+              "quark:G1":{"is":0,"ie":90000,"oo":70000,"mu":1791285373},
+              "quark:G2":{"le":88000,"lo":66000,"ls":4,"lu":1791285400},
+              "quark:G3":{"is":0}
+            }}
+        """.trimIndent()
+
+        val book = ProgressBook.fromJsonString(fromPc)
+
+        assertEquals(0, book.length)
+        assertEquals(3, book.workCount)
+        val g1 = book.skipFor("quark:G1")!!
+        assertEquals(0L, g1.introStartMs)
+        assertEquals(90_000L, g1.introEndMs)
+        assertEquals(70_000L, g1.outroOffsetMs)
+        assertEquals(1_791_285_373L, g1.manualUpdatedAtSec)
+        assertFalse("G1 只有手标组", g1.hasLearned)
+
+        val g2 = book.skipFor("quark:G2")!!
+        assertFalse("G2 只有学习组", g2.hasManual)
+        assertEquals(88_000L, g2.learnedIntroEndMs)
+        assertEquals(4, g2.learnedSamples)
+
+        assertTrue("G3 半条手标也要读进来", book.skipFor("quark:G3")!!.hasManual)
+    }
+
+    @Test
+    fun `作品段两组全空的条目整条丢弃（不留空壳）`() {
+        // ⛔ 留着空壳的话，「两边其实都没东西」会被判成有差异 ⇒ 每 30 分钟白传一次。
+        val book = ProgressBook.fromJsonString(
+            """{"v":2,"items":{},"works":{"w1":{"mu":5},"w2":{"ls":3},"w3":{"ie":90000}}}""",
+        )
+        assertEquals(1, book.workCount)
+        assertNull(book.skipFor("w1"))
+        assertNull("只有样本数不算内容", book.skipFor("w2"))
+        assertEquals(90_000L, book.skipFor("w3")!!.introEndMs)
+    }
+
+    @Test
+    fun `v1 老文件（没有 works 键）照读 —— 缺键是空段，不是空书`() {
+        // ⛔ 老版本的进度文件就是这个形状。把「缺 works」当成「整份文件无效」
+        //    会让所有老用户升级后进度全丢。
+        val v1 = """{"v":1,"items":{"quark:F1":{"r":1000,"u":100}}}"""
+        val book = ProgressBook.fromJsonString(v1)
+
+        assertEquals(1, book.length)
+        assertEquals(0, book.workCount)
+        assertEquals(1000L, book["quark:F1"]!!.resumeMs)
+        assertTrue("items 段还在 ⇒ 不是空书", book.isNotEmpty)
+    }
+
+    @Test
+    fun `作品段为空时整个 works 键省掉`() {
+        val book = ProgressBook()
+        book["quark:F1"] = entry(resume = 1000, updated = 100)
+        assertEquals(
+            """{"v":2,"items":{"quark:F1":{"r":1000,"u":100}}}""",
+            book.toJsonString(),
+        )
+    }
+
+    @Test
+    fun `putSkip 写入空条目等于删除`() {
+        val book = ProgressBook()
+        book.putSkip("w1", skip(introEnd = 90_000, manualAt = 5))
+        assertEquals(1, book.workCount)
+
+        book.putSkip("w1", skip())
+        assertEquals(0, book.workCount)
+        assertNull(book.skipFor("w1"))
+    }
+
+    // ------------------------------------------------------------------
+    // ProgressBook.mergeFrom：两段都算
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `mergeFrom 把作品段的改动也算进返回值 —— 0 意味着不用上传`() {
+        val mine = ProgressBook()
+        mine.putSkip("w1", skip(introEnd = 90_000, manualAt = 5))
+
+        val same = ProgressBook()
+        same.putSkip("w1", skip(introEnd = 90_000, manualAt = 5))
+        assertEquals("只改过片头标记也必须算出来，否则同步永远不触发", 0, mine.mergeFrom(same))
+
+        val newer = ProgressBook()
+        newer.putSkip("w1", skip(introEnd = 95_000, manualAt = 9))
+        newer.putSkip("w2", skip(learnedIntroEnd = 88_000, learnedAt = 9))
+        assertEquals("一条覆盖 + 一条新增", 2, mine.mergeFrom(newer))
+
+        assertEquals(95_000L, mine.skipFor("w1")!!.introEndMs)
+        assertEquals(88_000L, mine.skipFor("w2")!!.learnedIntroEndMs)
+    }
+
+    @Test
+    fun `作品段与条目段互不干扰 —— 两段的键长得像也不能串`() {
+        // ⛔ `items` 的键是 `provider:fileId`、`works` 的键是 `provider:groupId`。
+        //    同名不同段的两条必须各归各的。
+        val book = ProgressBook()
+        book["quark:X"] = entry(resume = 60_000, updated = 100)
+        book.putSkip("quark:X", skip(introEnd = 90_000, manualAt = 100))
+
+        assertEquals(1, book.length)
+        assertEquals(1, book.workCount)
+        assertEquals(60_000L, book["quark:X"]!!.resumeMs)
+        assertEquals(90_000L, book.skipFor("quark:X")!!.introEndMs)
+
+        val parsed = ProgressBook.fromJsonString(book.toJsonString())
+        assertEquals(60_000L, parsed["quark:X"]!!.resumeMs)
+        assertEquals(90_000L, parsed.skipFor("quark:X")!!.introEndMs)
     }
 }

@@ -195,6 +195,188 @@ data class ProgressEntry(
 }
 
 /**
+ * 一部作品的**片头 / 片尾**记录（进度文件 v2）。
+ *
+ * 与 PC 端 `WorkSkipEntry`（`lib/domain/services/playback_progress.dart`）
+ * 是**同一份契约**：同样的键名、同样的合并规则、同样的单位。
+ *
+ * ## 它为什么住在进度文件里，而不是跟着 `.ccbak` 走
+ *
+ * 片头 / 片尾是**播放行为**的产物（用户拖一下、或学到一次结论），而媒体库
+ * 备份（`.ccbak`）是**手动**的 —— 用户得去点「上传备份 / 从网盘恢复」。
+ * 让「看了几集攒出来的片头」等一次手动备份才能到另一台设备上，这个功能
+ * 就等于半残。所以它与播放进度共用同一条**静默**通道。
+ *
+ * `media_works` 上那几列因此退化成**物化投影**（与进度三列同一种角色）：
+ * 播放器与 SQL 查询读它，而真源是这个文件。
+ *
+ * ## ⛔ 两组字段、两个时间戳
+ *
+ * 手标与学习是**两条独立支路**（`media_works` 里也是两组列），所以合并时
+ * 也各判各的：
+ *
+ * | 组 | 字段 | 判据 |
+ * |---|---|---|
+ * | 手标 | [introStartMs] / [introEndMs] / [outroOffsetMs] | [manualUpdatedAtSec] |
+ * | 学习 | [learnedIntroEndMs] / [learnedOutroOffsetMs] / [learnedSamples] | [learnedUpdatedAtSec] |
+ *
+ * ⛔ 合成一个时间戳的话，「A 机手标了片头、B 机学出了片尾」会变成互相覆盖
+ *    —— 而两台机器都显示同步成功，用户只会觉得「有时候同步丢东西」。
+ *
+ * ## ⛔ 单位
+ *
+ * 三个毫秒字段一律**毫秒**（与 `media_works` 的列逐字对齐）；
+ * 两个时间戳一律 **Unix 秒**（与 [ProgressEntry.updatedAtSec] 同口径）。
+ * 片尾存的是**距末尾的偏移**，不是绝对时间 —— 各集片长不同，绝对时间跨集
+ * 不可比。
+ */
+data class WorkSkipEntry(
+    /** 手标片头起点（毫秒）。`null` = 没标。 */
+    val introStartMs: Long? = null,
+
+    /** 手标片头终点（毫秒）。与 [introStartMs] 成对，半条当没有。 */
+    val introEndMs: Long? = null,
+
+    /**
+     * 手标**片尾偏移**（毫秒，距末尾）。`null` = 没标。
+     *
+     * ⛔ 存偏移不存绝对时间：用户在第 1 集标「41:30」，第 2 集片长不同，
+     *    绝对时间搬过去就错了；而「离结尾还有 90 秒」是同一件事。
+     */
+    val outroOffsetMs: Long? = null,
+
+    /** 手标那一组最后一次被写入（Unix 秒）。`0` = 从没手标过。 */
+    val manualUpdatedAtSec: Long = 0,
+
+    /** 学习出的片头**终点**（毫秒）。起点恒为 `0`（片头总在开头），不单独存。 */
+    val learnedIntroEndMs: Long? = null,
+
+    /** 学习出的片尾偏移（毫秒，距末尾）。 */
+    val learnedOutroOffsetMs: Long? = null,
+
+    /** 学习结论背后的样本数。纯说明性数字，不参与合并判据。 */
+    val learnedSamples: Int = 0,
+
+    /** 学习那一组最后一次被写入（Unix 秒）。`0` = 从没学过。 */
+    val learnedUpdatedAtSec: Long = 0,
+) {
+
+    /** 手标那一组有没有内容。 */
+    val hasManual: Boolean
+        get() = introStartMs != null || introEndMs != null || outroOffsetMs != null
+
+    /** 学习那一组有没有内容。 */
+    val hasLearned: Boolean
+        get() = learnedIntroEndMs != null || learnedOutroOffsetMs != null
+
+    /** 两组都空 = 这一条什么信息都没有（落盘与上传时直接丢掉）。 */
+    val isEmpty: Boolean get() = !hasManual && !hasLearned
+
+    /**
+     * 与 [other] 合并，返回**胜出**的那一份。
+     *
+     * ⛔ 两组**各判各的**（见类文档）。组内是**整体** LWW，不是逐字段 ——
+     *    一次「清除」与一次「设定」都是整组替换，逐字段合并会让清除动作
+     *    只清掉一半，而界面上看起来是「清不干净」。
+     *
+     * 相等时**保留自己**（`>=`）：两台设备在同一秒各写一次时，结果在两台
+     * 机器上是同一个，不会来回抖（与 [ProgressEntry.mergedWith] 同一条）。
+     */
+    fun mergedWith(other: WorkSkipEntry): WorkSkipEntry {
+        val manualWins = manualUpdatedAtSec >= other.manualUpdatedAtSec
+        val m = if (manualWins) this else other
+        val learnedWins = learnedUpdatedAtSec >= other.learnedUpdatedAtSec
+        val l = if (learnedWins) this else other
+        return WorkSkipEntry(
+            introStartMs = m.introStartMs,
+            introEndMs = m.introEndMs,
+            outroOffsetMs = m.outroOffsetMs,
+            manualUpdatedAtSec = m.manualUpdatedAtSec,
+            learnedIntroEndMs = l.learnedIntroEndMs,
+            learnedOutroOffsetMs = l.learnedOutroOffsetMs,
+            learnedSamples = l.learnedSamples,
+            learnedUpdatedAtSec = l.learnedUpdatedAtSec,
+        )
+    }
+
+    /** 内容是否与 [other] 完全相同（含两个时间戳）。合并后据此判断要不要上传。 */
+    fun sameAs(other: WorkSkipEntry): Boolean =
+        introStartMs == other.introStartMs &&
+            introEndMs == other.introEndMs &&
+            outroOffsetMs == other.outroOffsetMs &&
+            manualUpdatedAtSec == other.manualUpdatedAtSec &&
+            learnedIntroEndMs == other.learnedIntroEndMs &&
+            learnedOutroOffsetMs == other.learnedOutroOffsetMs &&
+            learnedSamples == other.learnedSamples &&
+            learnedUpdatedAtSec == other.learnedUpdatedAtSec
+
+    /**
+     * 序列化成紧凑 JSON（`null` 字段与 `0` 时间戳都省掉）。
+     *
+     * ⛔ 键名（`is`/`ie`/`oo`/`mu`/`le`/`lo`/`ls`/`lu`）与 PC 端**逐字一致** ——
+     *    两端读的是同一个文件，错一个键就是「那一半同步不过去」。
+     */
+    fun toJson(): Map<String, Any?> {
+        val out = LinkedHashMap<String, Any?>(8)
+        introStartMs?.let { out["is"] = it }
+        introEndMs?.let { out["ie"] = it }
+        outroOffsetMs?.let { out["oo"] = it }
+        if (manualUpdatedAtSec > 0L) out["mu"] = manualUpdatedAtSec
+        learnedIntroEndMs?.let { out["le"] = it }
+        learnedOutroOffsetMs?.let { out["lo"] = it }
+        if (learnedSamples > 0) out["ls"] = learnedSamples
+        if (learnedUpdatedAtSec > 0L) out["lu"] = learnedUpdatedAtSec
+        return out
+    }
+
+    override fun toString(): String =
+        "WorkSkipEntry(手标 $introStartMs→$introEndMs / 距末尾 $outroOffsetMs @$manualUpdatedAtSec, " +
+            "学习 →$learnedIntroEndMs / 距末尾 $learnedOutroOffsetMs " +
+            "($learnedSamples 样本) @$learnedUpdatedAtSec)"
+
+    companion object {
+
+        /**
+         * 从 JSON 反序列化。
+         *
+         * ⛔ **两组都空的条目一律丢掉**：它不带任何信息，留着只会在合并与上传
+         *    时让「两边其实都没东西」也判定为有差异。
+         *
+         * ⚠️ 与 [ProgressEntry.fromJson] 不同，这里**不要求时间戳非零**：
+         *    手标组可能来自 `LibraryDb.skipMarkerSnapshot` 的播种，而
+         *    `media_works` 上**没有手标时刻这一列**（只有学习那条路有
+         *    `learned_at`）。丢掉它们等于「老用户升级前标好的片头永远同步
+         *    不出去」，而那正是播种要解决的问题。
+         */
+        fun fromJson(raw: Any?): WorkSkipEntry? {
+            val map = raw as? Map<*, *> ?: return null
+            val entry = WorkSkipEntry(
+                introStartMs = asLong(map["is"]),
+                introEndMs = asLong(map["ie"]),
+                outroOffsetMs = asLong(map["oo"]),
+                manualUpdatedAtSec = asLong(map["mu"]) ?: 0L,
+                learnedIntroEndMs = asLong(map["le"]),
+                learnedOutroOffsetMs = asLong(map["lo"]),
+                learnedSamples = asLong(map["ls"])?.coerceAtLeast(0L)?.toInt() ?: 0,
+                learnedUpdatedAtSec = asLong(map["lu"]) ?: 0L,
+            )
+            return if (entry.isEmpty) null else entry
+        }
+
+        /** JSON 数字 → `Long?`。与 `ProgressEntry.asLong` 同一套（接受 `1000.0`）。 */
+        private fun asLong(v: Any?): Long? = when (v) {
+            is Long -> v
+            is Int -> v.toLong()
+            is Short -> v.toLong()
+            is Byte -> v.toLong()
+            is Double -> if (v.isFinite()) v.toLong() else null
+            is Float -> if (v.isFinite()) v.toLong() else null
+            else -> null
+        }
+    }
+}
+
+/**
  * 全量进度：`itemId -> ProgressEntry`。
  *
  * `itemId` 的口径与 `media_items.id` **逐字一致**（`provider:fileId`，见
@@ -213,13 +395,24 @@ data class ProgressEntry(
 class ProgressBook(
     /** 全部条目。**直接持有这个 Map**（不做防御性拷贝）—— 它只在同步路径上流转。 */
     val items: MutableMap<String, ProgressEntry> = LinkedHashMap(),
+
+    /**
+     * 作品级的片头 / 片尾记录：`media_works.key -> WorkSkipEntry`（v2 新增）。
+     *
+     * 键的口径与 `media_works.key` **逐字一致**（`provider:groupId`），
+     * 与 [items] 的 `provider:fileId` 不是一回事 —— 别互相塞。
+     */
+    val works: MutableMap<String, WorkSkipEntry> = LinkedHashMap(),
 ) {
 
     val length: Int get() = items.size
 
-    val isEmpty: Boolean get() = items.isEmpty()
+    /** 作品级记录数。 */
+    val workCount: Int get() = works.size
 
-    val isNotEmpty: Boolean get() = items.isNotEmpty()
+    val isEmpty: Boolean get() = items.isEmpty() && works.isEmpty()
+
+    val isNotEmpty: Boolean get() = items.isNotEmpty() || works.isNotEmpty()
 
     /** 取一条；没有返回 `null`。 */
     operator fun get(itemId: String): ProgressEntry? = items[itemId]
@@ -229,12 +422,28 @@ class ProgressBook(
         items[itemId] = entry
     }
 
+    /** 取一部作品的片头 / 片尾记录；没有返回 `null`。 */
+    fun skipFor(workKey: String): WorkSkipEntry? = works[workKey]
+
+    /**
+     * 写入 / 覆盖一部作品的片头 / 片尾记录。
+     *
+     * ⛔ 内容是空（两组都空）时**直接删掉这一条**，而不是留一个空壳：
+     *    空壳会一直参与合并与上传，让「两边其实都没东西」也判定为有差异。
+     */
+    fun putSkip(workKey: String, entry: WorkSkipEntry) {
+        if (entry.isEmpty) works.remove(workKey) else works[workKey] = entry
+    }
+
     /**
      * 把 [other] 合进**自己**，返回**被改变（或新增）的条目数**。
      *
      * 返回 0 意味着两边已经一致 —— 调用方据此决定「不用上传」。这个判据很重要：
      * 没有它的话，每 30 分钟一次的空同步都会在网盘上走一遍「先删后传」，而那是
      * **有失败风险**的（见 `LibraryBackupService.uploadBackup` 的文档）。
+     *
+     * ⛔ 两段（[items] / [works]）都算进返回值：只算前者的话，一次「只改了
+     *    片头标记」的同步会判定为「无需上传」，用户看到的是标记同步不过去。
      */
     fun mergeFrom(other: ProgressBook): Int {
         var changed = 0
@@ -251,6 +460,19 @@ class ProgressBook(
                 changed++
             }
         }
+        for ((key, value) in other.works) {
+            val mine = works[key]
+            if (mine == null) {
+                works[key] = value
+                changed++
+                continue
+            }
+            val merged = mine.mergedWith(value)
+            if (!merged.sameAs(mine)) {
+                works[key] = merged
+                changed++
+            }
+        }
         return changed
     }
 
@@ -263,10 +485,21 @@ class ProgressBook(
     fun toJson(): Map<String, Any?> {
         val body = LinkedHashMap<String, Any?>(items.size)
         for ((k, v) in items) body[k] = v.toJson()
-        return linkedMapOf("v" to FORMAT_VERSION, "items" to body)
+        val out = LinkedHashMap<String, Any?>(3)
+        out["v"] = FORMAT_VERSION
+        out["items"] = body
+        // ⛔ `works` 为空时**整个键省掉**：绝大多数用户的绝大多数时候这一段
+        //    是空的，而这一项每 30 分钟就要序列化 + 上传一次。
+        //    读回来时缺键 = 空（见 [fromJsonString]），两端都认。
+        if (works.isNotEmpty()) {
+            val worksBody = LinkedHashMap<String, Any?>(works.size)
+            for ((k, v) in works) worksBody[k] = v.toJson()
+            out["works"] = worksBody
+        }
+        return out
     }
 
-    override fun toString(): String = "ProgressBook(${items.size} 条)"
+    override fun toString(): String = "ProgressBook(${items.size} 条 + ${works.size} 部作品)"
 
     companion object {
 
@@ -279,8 +512,12 @@ class ProgressBook(
          *
          * 读取端目前**不校验**这个值（字段是向后兼容的：认不出来的键直接忽略，
          * 缺的键按 `null` 处理），留着是为了将来真要做破坏性变更时有个抓手。
+         *
+         * 版本沿革：
+         *   * **v1** —— 只有 `items`（逐条播放进度）。
+         *   * **v2** —— 多了 `works`（作品级片头 / 片尾，见 [WorkSkipEntry]）。
          */
-        const val FORMAT_VERSION = 1
+        const val FORMAT_VERSION = 2
 
         /**
          * 从 JSON 文本解析。
@@ -296,12 +533,25 @@ class ProgressBook(
             val root = runCatching { MiniJson.parse(text) }.getOrNull() ?: return ProgressBook()
             val map = root as? Map<*, *> ?: return ProgressBook()
             val out = ProgressBook()
-            val raw = map["items"] as? Map<*, *> ?: return out
-            for ((k, v) in raw) {
-                val key = k as? String ?: continue
-                if (key.isEmpty()) continue
-                val entry = ProgressEntry.fromJson(v) ?: continue
-                out.items[key] = entry
+            val raw = map["items"] as? Map<*, *>
+            if (raw != null) {
+                for ((k, v) in raw) {
+                    val key = k as? String ?: continue
+                    if (key.isEmpty()) continue
+                    val entry = ProgressEntry.fromJson(v) ?: continue
+                    out.items[key] = entry
+                }
+            }
+            // ⛔ `works` 缺失 ⇒ 空映射，**不是**空书 —— v1 的文件里没有这一
+            //    段，那是合法的老文件，它的 items 必须照读。
+            val rawWorks = map["works"] as? Map<*, *>
+            if (rawWorks != null) {
+                for ((k, v) in rawWorks) {
+                    val key = k as? String ?: continue
+                    if (key.isEmpty()) continue
+                    val entry = WorkSkipEntry.fromJson(v) ?: continue
+                    out.works[key] = entry
+                }
             }
             return out
         }

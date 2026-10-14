@@ -116,8 +116,14 @@ object EpisodeLabels {
         return "${clock(at.coerceAtMost(total))} / ${clock(total)}"
     }
 
-    /** `1:02:03` / `02:03` —— 与 PC 端 `tvClockLabel` 同口径。 */
-    private fun clock(ms: Long): String {
+    /**
+     * `1:02:03` / `02:03` —— 与 PC 端 `tvClockLabel` 同口径。
+     *
+     * ⛔ `internal` 而不是 `private`：[WorkDetailFormat.skipLine] 也要用它画
+     *    「片头 00:00–01:32 / 片尾 距末尾 01:20」。两处各抄一份的话，迟早
+     *    漂移成「列表里写 `1:02:03`、简介页写 `01:02:03`」。
+     */
+    internal fun clock(ms: Long): String {
         val total = ms / 1000
         val h = total / 3600
         val m = (total % 3600) / 60

@@ -11,6 +11,7 @@ import '../../domain/services/item_sort.dart';
 import '../../domain/services/play_target.dart';
 import '../../domain/services/work_levels.dart';
 import '../../domain/services/work_merge_service.dart';
+import '../../domain/services/work_skip_format.dart';
 import '../providers/app_providers.dart';
 import '../providers/follow_providers.dart';
 import '../providers/library_providers.dart';
@@ -26,6 +27,7 @@ import '../widgets/media_item_row.dart';
 import '../widgets/merge_work_dialog.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
+import '../widgets/skip_marker_dialog.dart';
 import '../widgets/tv_affordance.dart';
 import '../widgets/tv_focus.dart';
 
@@ -1008,11 +1010,21 @@ class _InfoColumn extends ConsumerWidget {
             ),
           ),
         ],
+        // 片头 / 片尾的**具体时间点**。
+        //
+        // ⛔ 必须写出来，不能只写「已学到片头」：用户判断不了它对不对，
+        //    就没法决定要不要手动改。括号里的「手标 / 自动学习」是这个
+        //    功能诚实的代价 —— 两种来源的可信度完全不同，混着说会让猜错的
+        //    那个看起来和用户标的一样可信。
+        if (WorkSkipFormat.line(work) case final line?) ...[
+          const SizedBox(height: 12),
+          _SkipLine(text: line, work: work),
+        ],
         const SizedBox(height: 18),
-        // 用 `Wrap` 而不是 `Row`：这一行现在有六个按钮（播放 / 追剧 / 刮削 /
-        // 手动 / 自定义 / 合并到…），主窗口没有最小宽度限制，用户把窗口拖窄时
-        // `Row` 会直接溢出报黄条。`Wrap` 在空间不够时把「N 个文件」挤到
-        // 下一行，按钮一个都不会变形。
+        // 用 `Wrap` 而不是 `Row`：这一行现在有七个按钮（播放 / 追剧 / 刮削 /
+        // 手动 / 自定义 / 合并到… / 片头片尾），主窗口没有最小宽度限制，
+        // 用户把窗口拖窄时 `Row` 会直接溢出报黄条。`Wrap` 在空间不够时把
+        // 「N 个文件」挤到下一行，按钮一个都不会变形。
         Wrap(
           spacing: 10,
           runSpacing: 10,
@@ -1046,6 +1058,7 @@ class _InfoColumn extends ConsumerWidget {
             _ManualScrapeButton(work: work),
             _CustomizeButton(work: work),
             _MergeButton(work: work),
+            _SkipButton(work: work),
             Text(
               '$visibleCount 个文件',
               maxLines: 1,
@@ -1163,6 +1176,106 @@ class _EditGenresChip extends ConsumerWidget {
 /// ⛔ 写入走 `FollowController.toggleFollow` 而**不是**直接调仓储：那个方法
 ///    负责写完之后的四处刷新（列表 / 角标 / 页头统计 / **本页**）。
 ///    漏掉本页的表现是「点了按钮毫无反应」，而这类 bug 不报错。
+/// 片头 / 片尾那一行（**具体时间点 + 来源**）。整行可点，直达手动指定的入口。
+///
+/// ## 为什么整行都能点
+///
+/// 这一行存在的意义就是让人判断「它对不对」，判断完了最自然的下一步就是
+/// 「那我自己填一个」。只给一个小按钮的话，用户得先读、再去找按钮在哪。
+class _SkipLine extends ConsumerWidget {
+  const _SkipLine({required this.text, required this.work});
+
+  final String text;
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Tooltip(
+      message: '点一下手动指定片头 / 片尾的时间点',
+      child: InkWell(
+        onTap: () => _open(context, ref),
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.fast_forward_rounded,
+                size: 14,
+                color: AppTheme.accent,
+              ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  text,
+                  style: const TextStyle(fontSize: 12, color: AppTheme.accent),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _open(BuildContext context, WidgetRef ref) async {
+    final changed = await SkipMarkerDialog.show(context, work);
+    if (changed) ref.invalidate(workDetailProvider(work.key));
+  }
+}
+
+/// 「片头 / 片尾」入口 —— 手动指定时间点，或清除自动学习的结论。
+///
+/// ## 为什么它**总是**在场
+///
+/// 自动学习要攒够样本才敢下结论，而且它是**猜**的。猜错时没有报错，只有
+/// 「它跳到一个莫名其妙的位置」。没有这个入口，用户唯一的出路是清掉学习
+/// 结果重新攒 —— 而那要重新看好几集。
+///
+/// ⛔ TV 上不给这个入口：手标要把播放头定位到某一秒，遥控器做不到
+///    （见 `player_tv_panel.dart` 的注释）。那边的同一行只显示、不能改。
+class _SkipButton extends ConsumerWidget {
+  const _SkipButton({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Tooltip(
+      message: '手动指定这部作品的片头 / 片尾时间点（每一集共用）',
+      child: OutlinedButton.icon(
+        onPressed: () async {
+          final changed = await SkipMarkerDialog.show(context, work);
+          if (!changed) return;
+          // 手标与学习结论都落在 `media_works` 上，而这一页读的就是
+          // `workDetailProvider` —— 不 invalidate 的话改完了界面还是旧的，
+          // 用户会以为没保存上（而库里其实已经写了）。
+          ref.invalidate(workDetailProvider(work.key));
+        },
+        style: OutlinedButton.styleFrom(
+          foregroundColor: work.hasManualSkip ? AppTheme.accent : AppTheme.muted,
+          backgroundColor: work.hasManualSkip
+              ? AppTheme.accent.withValues(alpha: 0.14)
+              : null,
+          side: work.hasManualSkip
+              ? BorderSide(color: AppTheme.accent.withValues(alpha: 0.5))
+              : null,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(9),
+          ),
+        ),
+        icon: const Icon(Icons.fast_forward_rounded, size: 16),
+        label: const Text(
+          '片头 / 片尾',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
 class _FollowButton extends ConsumerWidget {
   const _FollowButton({required this.work});
 

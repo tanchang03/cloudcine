@@ -61,6 +61,63 @@ object WorkDetailFormat {
     /** 播放胶囊的文案。有续播进度时是「▶ 续播」，否则「▶ 播放」。 */
     fun playLabel(resumable: Boolean): String = if (resumable) "▶ 续播" else "▶ 播放"
 
+    // ------------------------------------------------------------------
+    // 片头 / 片尾（schema v18）
+    // ------------------------------------------------------------------
+
+    /**
+     * 「片头 / 片尾」那一行；**什么都没学出来时返回 `null`**（那一行不画）。
+     *
+     * ## 它回答的是「这个功能到底在不在工作」
+     *
+     * 自动学习是**静默**的：用户能感知到的只有「片头自己跳过去了」。还没攒够
+     * 样本、或者学错了的时候，界面上**没有任何线索** —— 用户只会觉得这功能
+     * 时灵时不灵。这一行把生效的结论摆出来，并**如实区分「手动标注」与
+     * 「自动学习」**（库里是两组列，取值链 手标 > 学习）。
+     *
+     * ## 格式
+     *
+     * ```
+     * 片头 00:00–01:32（自动学习） · 片尾 距末尾 01:20（自动学习）
+     * ```
+     *
+     * ⛔ 片尾写「距末尾 X」而不是绝对时间：各集片长不同（正片 45 分钟、特辑
+     *    60 分钟），绝对时间在这一行上是**没有意义的数** —— 同一部剧里对不上。
+     * ⛔ 学不出来时**不画「暂无」那一行**：简介页头部已经挤了标题 / 原名 /
+     *    元数据 / 简介，为一条「暂无」再占一行是纯噪音。
+     */
+    fun skipLine(w: Work): String? {
+        val parts = ArrayList<String>(2)
+        // ⛔ 手标优先 —— 与 `IntroSession.marker` 的取值链一致（那里是唯一的
+        //    一份实现）。这里只负责把**生效的那一条**如实说出来，不重判。
+        val manual = IntroMarker.fromMilliseconds(w.introStartMs, w.introEndMs)
+        val intro = manual ?: w.learnedIntroRange
+        if (intro != null) {
+            val source = if (manual != null) "手动标注" else "自动学习"
+            parts.add("片头 ${EpisodeLabels.clock(intro.startMs)}–" +
+                "${EpisodeLabels.clock(intro.endMs)}（$source）")
+        }
+        // ⛔ 片尾同样**手标优先**：v19 起 `outro_offset_ms` 是用户在 PC 上
+        //    标的那一条，与 `learned_outro_offset_ms`（学习）是两条独立支路，
+        //    取值链 手标 > 学习 —— 与上面片头那一半同一条链，不能各判各的。
+        val manualOutro = w.outroOffsetMs?.takeIf { it > 0L }
+        val outro = manualOutro ?: w.learnedOutroOffsetMs?.takeIf { it > 0L }
+        if (outro != null) {
+            val source = if (manualOutro != null) "手动标注" else "自动学习"
+            parts.add("片尾 距末尾 ${EpisodeLabels.clock(outro)}（$source）")
+        }
+        return if (parts.isEmpty()) null else parts.joinToString(" · ")
+    }
+
+    /**
+     * 「清除片头 / 片尾学习」那颗菜单项要不要出现。
+     *
+     * ⛔ 判据是 [Work.hasLearnedSkip]（**只看学习结论**，不看手标）：
+     *    手标是用户自己在 PC 上标的，电视上既改不了也不该由电视清掉 ——
+     *    给一颗点了没反应的菜单项比不给更糟。
+     */
+    fun canClearLearnedSkip(w: Work): Boolean = w.hasLearnedSkip
+
     /**
      * 动作胶囊的**文案 + 可用性**（`Pair(文案, 可用)`，不含动作本身）。
      *

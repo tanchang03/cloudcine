@@ -280,4 +280,97 @@ void main() {
       expect(skip(const Duration(seconds: -5)), isFalse);
     });
   });
+
+  group('OutroSkip —— 片尾偏移的取值链与落点（schema 19）', () {
+    // ⛔ 这一组防的是「**在电脑上标了片尾，电视上不跳**」：手标那一列唯一的
+    //    来源是 PC 端（电视上没有界面可写），Android 只读得到学习出来的那份。
+    //    不读手标的话两端都不报错，用户只会觉得「时灵时不灵」。
+    //
+    // ⛔ 与 Android 端 `OutroSkip`（`library/IntroSkip.kt`）逐字同源 ——
+    //    两条链必须同形，否则会漂移成「片头认手标、片尾只认学习」。
+
+    group('effectiveOffset —— 手标 > 学习', () {
+      test('两份都有 → 手标赢', () {
+        expect(
+          OutroSkip.effectiveOffset(
+            manual: const Duration(seconds: 120),
+            learned: const Duration(seconds: 90),
+          ),
+          const Duration(seconds: 120),
+          reason: '手标是用户明确指定的，学习是推断 —— 推断压过明确指定，'
+              '用户完全没法知道是哪一层在生效',
+        );
+      });
+
+      test('只有学习 → 用学习', () {
+        expect(
+          OutroSkip.effectiveOffset(learned: const Duration(seconds: 90)),
+          const Duration(seconds: 90),
+        );
+      });
+
+      test('都没有 → null（不跳也不提示）', () {
+        expect(OutroSkip.effectiveOffset(), isNull);
+      });
+
+      test('非正当没标', () {
+        expect(OutroSkip.effectiveOffset(manual: Duration.zero), isNull);
+        expect(
+          OutroSkip.effectiveOffset(
+            manual: const Duration(seconds: -1),
+            learned: const Duration(seconds: -1),
+          ),
+          isNull,
+        );
+        expect(
+          OutroSkip.effectiveOffset(
+            manual: Duration.zero,
+            learned: const Duration(seconds: 90),
+          ),
+          const Duration(seconds: 90),
+          reason: '手标是 0 等于没标，要落到学习那一份上，而不是整体当没有',
+        );
+      });
+    });
+
+    group('start —— 落点必须用这一集的片长现算', () {
+      const duration = Duration(minutes: 45);
+
+      test('距末尾 90 秒 + 片长 45 分钟 → 落点在 43:30', () {
+        expect(
+          OutroSkip.start(duration: duration, offset: const Duration(seconds: 90)),
+          const Duration(minutes: 43, seconds: 30),
+        );
+      });
+
+      test('没有偏移 → null', () {
+        expect(OutroSkip.start(duration: duration), isNull);
+        expect(OutroSkip.start(duration: duration, offset: Duration.zero), isNull);
+      });
+
+      test('片长未知 → null —— 不能拿 0 当片长', () {
+        // ⛔ 拿 0 当片长的话，「跳片尾」会变成「跳到 0 秒」。
+        expect(
+          OutroSkip.start(duration: Duration.zero, offset: const Duration(seconds: 90)),
+          isNull,
+        );
+      });
+
+      test('偏移 ≥ 片长 → null，而不是一个 0 之前的落点', () {
+        // 场景：用户在长片里标了「距末尾 10 分钟」，切到一集只有 8 分钟的花絮。
+        const offset = Duration(minutes: 10);
+        expect(OutroSkip.start(duration: const Duration(minutes: 8), offset: offset), isNull);
+        // 恰好等于片长也不行：落点会是 0，等于「整集都是片尾」。
+        expect(OutroSkip.start(duration: const Duration(minutes: 10), offset: offset), isNull);
+        // 片长比偏移**多 1 毫秒**才成立。
+        expect(
+          OutroSkip.start(
+            duration: const Duration(minutes: 10) + const Duration(milliseconds: 1),
+            offset: offset,
+          ),
+          const Duration(milliseconds: 1),
+        );
+      });
+    });
+  });
 }

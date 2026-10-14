@@ -594,12 +594,23 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
           await store.load();
           // 先把这份恢复回来的库里带着的进度**收进**进度库（那可能是另一台
           // 设备还没同步上来的记录），再把合并结果铺回去。
+          //
+          // ⚠️ 片头 / 片尾标记（`media_works` 那几列）**同样要收**：
+          //    进度文件刻意不进 `.ccbak`，所以「从另一台机器恢复媒体库」
+          //    之后，那台机器上标好的片头只会出现在恢复回来的库行里 ——
+          //    不收进进度库的话它们同步不到第三台设备。
           await store.mergeFrom(
             await ref.read(mediaRepositoryProvider).progressSnapshot(),
+          );
+          await store.mergeFrom(
+            await ref.read(mediaRepositoryProvider).skipMarkerSnapshot(),
           );
           await ref
               .read(mediaRepositoryProvider)
               .applyProgressSnapshot(store.book);
+          await ref
+              .read(mediaRepositoryProvider)
+              .applySkipMarkerSnapshot(store.book);
           await store.flush();
         } catch (e) {
           // 回填失败不该让「恢复备份」这个动作报错：库已经换好了，

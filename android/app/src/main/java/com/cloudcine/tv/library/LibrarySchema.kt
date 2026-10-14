@@ -33,7 +33,7 @@ object LibrarySchema {
      * 后会跑一遍迁移（多数是 `ADD COLUMN`，会直接报 duplicate column）；
      * 写大了 → PC 端直接判定「来自更高版本的数据库」并只打一条 warn。
      */
-    const val VERSION = 17
+    const val VERSION = 19
 
     /** 一列的定义。 */
     data class Column(
@@ -100,7 +100,7 @@ object LibrarySchema {
     private fun real(name: String) = Column(name, "REAL", notNull = false)
 
     // ------------------------------------------------------------------
-    // 7 张表
+    // 8 张表
     // ------------------------------------------------------------------
 
     val mediaItems = Table(
@@ -179,6 +179,12 @@ object LibrarySchema {
             text("merged_into"),
             int("intro_start_ms"),
             int("intro_end_ms"),
+            // v19：**手标**的片尾偏移（毫秒，距末尾）。
+            //
+            // ⛔ 与 `learned_outro_offset_ms`（学习）是两条独立支路，取值链
+            //    **手标 > 学习**。存「距末尾」而不是绝对时间：各集片长不同，
+            //    绝对时间跨集不可比。
+            int("outro_offset_ms"),
             // v17：追剧 / 更新提醒。四列一组，缺一列这个功能就不成立。
             // ⛔ 默认值 `0` / `NULL` / `NULL` / `0` 恰好表达「这部作品没在追剧」，
             //    所以升级不需要回填，行为与升级前完全一致。
@@ -186,6 +192,26 @@ object LibrarySchema {
             int("follow_started_at"),
             int("follow_checked_at"),
             int("new_item_count", notNull = true, default = 0),
+            // v18：自动学习出的片头 / 片尾区间 + 样本数 + 学习时刻。
+            //
+            // ⛔ 与上面的 `intro_start_ms` / `intro_end_ms`（用户**手标**）
+            //    是两条独立支路，优先级：文件章节 > 手标 > 学习。
+            //    不复用那两列 —— 它们有「扫描不许覆盖」的保护分支，
+            //    而且 UI 要如实区分「你标的」与「自动学的」。
+            //
+            // ⛔ 这 5 列**不参与 `libraryModifiedAt()`**（那个判据只算
+            //    `media_works.updated_at` ∪ `media_items.first_seen_at`）。
+            //    学习是播放的副产品，算进同步判据会让「看一集」变成
+            //    「上传一整份备份」，与进度三列被摘掉是同一条理由。
+            int("learned_intro_start_ms"),
+            int("learned_intro_end_ms"),
+            // ⛔ 片尾存**距末尾的偏移**，不是绝对时间：各集片长不同
+            //    （正片 45 分钟、特辑 60 分钟），绝对时间跨集不可比。
+            //    播放时用 `duration - learned_outro_offset_ms` 现算落点。
+            //    片尾**没有终点列** —— 终点恒为片长。
+            int("learned_outro_offset_ms"),
+            int("learned_samples", notNull = true, default = 0),
+            int("learned_at"),
         ),
         primaryKey = listOf("key"),
     )
@@ -271,6 +297,59 @@ object LibrarySchema {
         primaryKey = listOf("id"),
     )
 
+    /**
+     * 「跳过片头 / 片尾」的**原始样本表**（v18）。
+     *
+     * ⛔ 与 PC 端 `tables.dart` 的 `SkipSamples` **逐字一致**。
+     *
+     * ## 为什么原始样本要落库
+     *
+     * 学习是**跨集**的：单集的「用户从 0 拖到 92 秒」既可能是跳片头，也可能
+     * 只是随便拖。只有把同一部剧多集的落点放在一起看，才能判断那是一个
+     * **稳定的片头**还是一个**偶然的拖拽**。所以每集落点先存下来，攒够
+     * 样本（`SkipLearning.MIN_SAMPLES`）才谈得上聚合。
+     *
+     * ## 与 `media_works.learned_*` 的分工
+     *
+     *   * 这张表是**输入**（每次播放都可能写一行）；
+     *   * `learned_*` 是**输出**（聚合结论，供播放器一次查询拿到）。
+     *
+     * ## ⛔ 不参与同步判据
+     *
+     * 与 `media_items` 的三列进度同一条理由：这是每次播放都会写的高频数据，
+     * 算进 `libraryModifiedAt()` 会让「看一集」变成「上传一整份 `.ccbak`」。
+     * 但它会随备份包一起走（备份装的是整个库文件的字节）—— 这是**想要的**：
+     * 两端各看几集，样本合起来更容易越过样本数门槛。
+     */
+    val skipSamples = Table(
+        name = "skip_samples",
+        columns = listOf(
+            // 主键 `itemId#kind#createdAt`：两端各自生成也不会撞车
+            // （自增 id 在合并两份库时必然冲突）。
+            text("id", notNull = true),
+            text("item_id", notNull = true),
+            // 一条样本自带作品归属，聚合不依赖 JOIN `media_items`
+            // （那张表的行会被扫描删掉）。
+            text("work_key", notNull = true),
+            // `SkipKind.name`：`intro` / `outro`。存名字不存序号 ——
+            // 加一种类型时序号会整体错位，旧数据会静默变成另一种类型。
+            text("kind", notNull = true),
+            // 落点（毫秒）。片头 = 从开头跳到的位置；片尾 = 「不想再看」的位置。
+            int("anchor_ms", notNull = true),
+            // 这次播放的总时长（毫秒）。片尾聚合靠它换算偏移。
+            int("duration_ms", notNull = true),
+            // `durationMs - anchorMs`，**只有片尾样本有值**。
+            int("offset_ms"),
+            // 负样本（用户撤销 / 回拖作废的那一次）。不参与聚合，
+            // 且会把同作品的结论降级重算。
+            bool("negative"),
+            // 产生这条样本的设备（只用于排查，不参与聚合）。
+            text("device", notNull = true, default = "''"),
+            int("created_at", notNull = true),
+        ),
+        primaryKey = listOf("id"),
+    )
+
     /** 全部表，**顺序与 PC 端 `@DriftDatabase(tables: […])` 一致**（便于人工比对）。 */
     val TABLES: List<Table> = listOf(
         mediaItems,
@@ -280,6 +359,7 @@ object LibrarySchema {
         settings,
         playbackPrefs,
         downloadTasks,
+        skipSamples,
     )
 
     // ------------------------------------------------------------------
@@ -298,6 +378,34 @@ object LibrarySchema {
      * 写成 `== 'true'` 会让新装用户永远不记进度。
      */
     const val KEY_REMEMBER_PROGRESS = "remember_position"
+
+    /**
+     * 「自动跳过片头」的总开关（v18）。
+     *
+     * ⛔ 键名与 PC 端 `SettingKeys.skipIntro` **逐字一致**（`skip_intro`）。
+     *    它在 `settings` 表里、随备份包跨端走 —— 在电脑上关掉，电视上也关。
+     *
+     * ⚠️ 判据是 `!= "false"`（缺失即开），与 PC 端
+     *    `player_page.dart` 的 `values[SettingKeys.skipIntro] != 'false'`
+     *    逐字同口径。写成 `== "true"` 的话，**从电脑同步过来的旧库**
+     *    （那一列在 PC 的旧版本里根本不存在）在电视上会默认关掉 ——
+     *    用户根本不知道有这么个功能。
+     *
+     * ⛔ 它**只管片头**。片尾的自动跳转跟着 [KEY_AUTO_PLAY_NEXT] 走 ——
+     *    片尾误跳的代价是丢掉结局，不可逆，所以门槛更高（见
+     *    `PlayerActivity.maybeHandleOutro` 的文档）。
+     */
+    const val KEY_SKIP_INTRO = "skip_intro"
+
+    /**
+     * 「自动连播」开关（v18 起也决定片尾是否**自动**跳下一集）。
+     *
+     * ⛔ 键名与 PC 端 `SettingKeys.autoPlayNext` 逐字一致（`auto_play_next`）。
+     * ⚠️ 判据是 `!= "false"`（缺失即开），与 PC 端 `player_page.dart` 一致。
+     *
+     * 关掉时片尾**只提示不跳**（`PlayerActivity.maybeHandleOutro`）。
+     */
+    const val KEY_AUTO_PLAY_NEXT = "auto_play_next"
 }
 
 /**

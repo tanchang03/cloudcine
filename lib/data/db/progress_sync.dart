@@ -11,15 +11,18 @@ import 'progress_store.dart';
 /// ## 它做的四件事（顺序不能换）
 ///
 ///   1. **播种** —— 把媒体库行里已有的进度读进进度库
-///      （[MediaRepository.progressSnapshot]）。老用户升级上来的那一刻，
-///      进度文件还不存在，而库里已经攒了几百条；不播种的话那批进度
-///      永远留在本地，同步不到别的设备。
+///      （[MediaRepository.progressSnapshot]），以及把作品行上已有的片头 /
+///      片尾标记读进去（[MediaRepository.skipMarkerSnapshot]）。老用户升级
+///      上来的那一刻，进度文件还不存在，而库里已经攒了几百条进度、可能还有
+///      手标好的片头；不播种的话那批数据永远留在本地，同步不到别的设备。
 ///   2. **下载** —— 取网盘上的 `云影备份/playback_progress.json`。
 ///   3. **合并** —— 逐条 LWW（[ProgressBook.mergeFrom]）。**不是**整份覆盖：
-///      两台设备各看一集，两条都该留下。
+///      两台设备各看一集，两条都该留下；一台手标了片头、另一台学出了片尾，
+///      两条也该都留下（两组各判各的，见 [WorkSkipEntry]）。
 ///   4. **回填** —— 把合并后的结果写回 `media_items` 的三列
-///      （[MediaRepository.applyProgressSnapshot]），让二十多处 SQL 查询
-///      立刻看到新进度。
+///      （[MediaRepository.applyProgressSnapshot]）与 `media_works` 的片头 /
+///      片尾列（[MediaRepository.applySkipMarkerSnapshot]），让二十多处 SQL
+///      查询立刻看到新进度。
 ///
 /// 最后才决定要不要上传：**只有当合并后的状态与网盘上那份不同**才传。
 ///
@@ -109,9 +112,13 @@ class ProgressSyncService {
 
     // 1. 播种：库里的投影 → 进度库。只有第一次（或恢复备份之后）会真的
     //    合进东西，之后这一步恒为 0。
+    //
+    //    两段分开播：进度是**每一条媒体项**、片头 / 片尾是**每一部作品**，
+    //    来源与「没有这一行怎么办」的规则都不一样（见两个方法各自的文档）。
     var seeded = 0;
     try {
       seeded = await _store.mergeFrom(await _repository.progressSnapshot());
+      seeded += await _store.mergeFrom(await _repository.skipMarkerSnapshot());
     } catch (e) {
       diag.warn('进度', '从媒体库播种进度失败（继续走远程那一步）：$e');
     }
@@ -152,9 +159,14 @@ class ProgressSyncService {
     if (remoteBytes == null) {
       needUpload = _store.book.isNotEmpty;
     } else {
-      final union = ProgressBook(Map<String, ProgressEntry>.of(
-        ProgressBook.fromBytes(remoteBytes).items,
-      ));
+      // ⛔ 两段都要塞进去。只放 `items` 的话，「网盘上那份只有片头标记、
+      //    本机又完全同意」会被算成「远程是空的 ⇒ 我全都要上传」，
+      //    于是每 30 分钟都白传一次（而上传是**有失败风险**的动作）。
+      final remoteBook = ProgressBook.fromBytes(remoteBytes);
+      final union = ProgressBook(
+        Map<String, ProgressEntry>.of(remoteBook.items),
+        Map<String, WorkSkipEntry>.of(remoteBook.works),
+      );
       needUpload = union.mergeFrom(_store.book) > 0;
     }
 
@@ -178,8 +190,8 @@ class ProgressSyncService {
 
     diag.info(
       '进度',
-      '同步完成：本地 ${_store.book.length} 条 ｜ 播种 $seeded、'
-      '合入 $mergedIn、回填 $applied 条 ｜ '
+      '同步完成：本地 ${_store.book.length} 条进度 + ${_store.book.workCount} 部作品 ｜ '
+      '播种 $seeded、合入 $mergedIn、回填 $applied 行 ｜ '
       '${uploaded ? "已上传" : "无需上传"}',
     );
     return ProgressSyncOutcome(
@@ -193,14 +205,24 @@ class ProgressSyncService {
     );
   }
 
-  /// 把进度库回填进媒体库；返回被更新的行数。失败不抛。
+  /// 把进度库回填进媒体库；返回被更新的行数（媒体项 + 作品）。失败不抛。
+  ///
+  /// ⛔ 两段都要回填。只回填 `items` 的话，从另一台设备同步过来的片头 /
+  ///    片尾会停在进度文件里 —— 界面（简介页那一行、播放器的跳片头）读的是
+  ///    `media_works`，于是用户看到的是「同步成功了，但跳片头还是不生效」。
   Future<int> _applyToLibrary() async {
+    var applied = 0;
     try {
-      return await _repository.applyProgressSnapshot(_store.book);
+      applied += await _repository.applyProgressSnapshot(_store.book);
     } catch (e) {
-      diag.warn('进度', '回填媒体库失败（进度已落盘，下次再试）：$e');
-      return 0;
+      diag.warn('进度', '回填媒体库进度失败（进度已落盘，下次再试）：$e');
     }
+    try {
+      applied += await _repository.applySkipMarkerSnapshot(_store.book);
+    } catch (e) {
+      diag.warn('进度', '回填媒体库片头/片尾失败（进度已落盘，下次再试）：$e');
+    }
+    return applied;
   }
 }
 

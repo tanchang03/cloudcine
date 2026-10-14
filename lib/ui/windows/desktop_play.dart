@@ -339,6 +339,15 @@ Future<PlayRequest> buildPlayRequest(
     // 这一对只能随请求过去 —— 库在主窗口。
     introStartMs: work?.introStartMs,
     introEndMs: work?.introEndMs,
+    // 手标的**片尾偏移**。⛔ 与学习那一份分开传：播放窗口里的取值链是
+    // 手标 > 学习（片尾没有文件章节可用）。
+    outroOffsetMs: work?.outroOffsetMs,
+    // 自动学习出来的那一份。⛔ 与手标**分开传**：播放窗口里的取值链是
+    // 章节 > 手标 > 学习，合成一个字段就没了优先级 —— 而「你亲手标的被
+    // 机器猜的盖掉」是最不能忍的一种回归。
+    learnedIntroStartMs: work?.learnedIntroStartMs,
+    learnedIntroEndMs: work?.learnedIntroEndMs,
+    learnedOutroOffsetMs: work?.learnedOutroOffsetMs,
   );
 }
 

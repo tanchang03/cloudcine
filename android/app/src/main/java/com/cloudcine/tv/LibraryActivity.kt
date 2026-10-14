@@ -289,13 +289,21 @@ class LibraryActivity : Activity() {
     //    经常是「看看这部是什么」「换一集」「刮一下海报」。
     //
     // 版式**对标 PC 端 `work_detail_page.dart` 的 `_InfoColumn`**：左海报、
-    // 右侧「标题 / 原名 / 元数据行 / 简介」，下面一行动作胶囊。
+    // 右侧「标题 / 原名 / 元数据行 / 片头片尾 / 简介」，下面一行动作胶囊。
     private lateinit var detailHead: LinearLayout
     private lateinit var detailPoster: ImageView
     private lateinit var detailPosterPlaceholder: TextView
     private lateinit var detailTitle: TextView
     private lateinit var detailOriginal: TextView
     private lateinit var detailMeta: TextView
+
+    /**
+     * 「片头 / 片尾」那一行（schema v18）。
+     *
+     * ⛔ 学不出来时整行 `GONE`（见 [WorkDetailFormat.skipLine] 的文档）——
+     *    头部已经挤了标题 / 原名 / 元数据 / 简介，为一条「暂无」占一行是噪音。
+     */
+    private lateinit var detailSkip: TextView
     private lateinit var detailOverview: TextView
 
     // 简介页的**动作胶囊行**（播放 / 手动刮削 / 刮削设置 / 选集）。
@@ -784,6 +792,16 @@ class LibraryActivity : Activity() {
             setPadding(0, dp(7), 0, 0)
         }
         infoCol.addView(detailMeta)
+        // 片头 / 片尾那一行。⛔ 用**青色系**而不是元数据那行的品牌紫：它回答的
+        //    是「播放时会自动做什么」，与「这部作品是什么」不是一类信息。
+        detailSkip = TextView(this).apply {
+            setTextColor(0xFF7FD8C4.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dp(6), 0, 0)
+        }
+        infoCol.addView(detailSkip)
         detailOverview = TextView(this).apply {
             setTextColor(MUTED)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -1199,8 +1217,12 @@ class LibraryActivity : Activity() {
      *
      * ⛔ 保留光标位置：用户很可能正停在第 12 集上，刷新一下把他弹回第 1 集
      *    是另一种「莫名其妙」。
+     *
+     * @param statusAfter 刷新完写进状态行的文案；`null` = 用默认的
+     *   「N 个文件」那一句。存在的理由：调用方（如「清除学习」）需要给一个
+     *   **动作回执**，而状态行只有一处赋值点，晚写的会被这次刷新的回调盖掉。
      */
-    private fun reloadCurrentItems() {
+    private fun reloadCurrentItems(statusAfter: String? = null) {
         val cur = currentWork ?: return
         if (level != Level.ITEMS) return
         Bg.run({ db.itemsForWork(cur.key) to db.workForDetail(cur.key) }) { pair, err ->
@@ -1219,10 +1241,47 @@ class LibraryActivity : Activity() {
             paintDetailHead()
             buildDetailActions()
             title.text = "媒体库 / ${w.title}"
-            status.text =
-                "${w.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
+            status.text = statusAfter
+                ?: "${w.subtitle.ifEmpty { "${items.size} 个文件" }} · ${items.size} 个文件"
             if (keep in items.indices) itemsList.setSelection(keep)
             Log.i(TAG, "原地刷新简介页：${w.key} → ${items.size} 条（光标停在 $keep）")
+        }
+    }
+
+    /**
+     * 清掉这一部作品的**片头 / 片尾学习结论**（样本保留）。
+     *
+     * ## ⛔ 只清「学习」那一组列
+     *
+     * [LibraryDb.clearLearnedSkip] 只把 `learned_*` 三列置空，**不动**手标
+     * （`intro_start_ms` / `intro_end_ms`）、**不删样本**、**不写 `updated_at`**：
+     *
+     *   * 手标是用户自己在电脑上标的，电视既改不了也不该由电视清掉；
+     *   * 用户点它的意图是「学错了，别再用」，不是「把学习历史抹掉」——
+     *     留着样本，下次攒够条件会重新学；如果那时结果还是错的，说明规则
+     *     本身有问题，而不是数据不够；
+     *   * 写 `updated_at` 会污染同步判据（见 `libraryModifiedAt`）。
+     *
+     * ⛔ 清完必须**原地刷新这一页**：头部那行「片头 …」还在的话，用户会以为
+     *    没清掉 —— 而它其实已经清了，只是这一页没人通知它重画。
+     */
+    private fun clearLearnedSkip(w: Work) {
+        status.text = "正在清除「${w.title}」的片头/片尾学习…"
+        Bg.run({ db.clearLearnedSkip(w.key) }) { _, err ->
+            if (err != null) {
+                status.text = "清除失败：${err.message}"
+                Log.w(TAG, "清除片头/片尾学习失败：${w.key}", err)
+                return@run
+            }
+            Log.i(TAG, "已清除片头/片尾学习：${w.key}")
+            val done = "已清除「${w.title}」的片头/片尾学习 · 下次攒够样本会重新学"
+            // ⛔ 站错页 / 换过人就不刷（与 [reloadCurrentItems] 的两条守卫同一套
+            //    理由：晚到的结果打到别的作品上，表现是「刚切过去画面自己变了」）。
+            if (level != Level.ITEMS || currentWork?.key != w.key) {
+                status.text = done
+                return@run
+            }
+            reloadCurrentItems(statusAfter = done)
         }
     }
 
@@ -1294,6 +1353,12 @@ class LibraryActivity : Activity() {
         //    所以不判空、不设 GONE —— 元数据是这一页最该一眼看到的东西。
         detailMeta.text = WorkDetailFormat.metaLine(w)
         detailMeta.visibility = View.VISIBLE
+
+        // 片头 / 片尾（schema v18）。⛔ 学不出来时**整行 GONE**，不写「暂无」——
+        //    头部已经很挤，为一条「暂无」占一行是纯噪音。见 skipLine 的文档。
+        val skip = WorkDetailFormat.skipLine(w)
+        detailSkip.text = skip ?: ""
+        detailSkip.visibility = if (skip == null) View.GONE else View.VISIBLE
 
         val overview = WorkDetailFormat.overviewText(w)
         detailOverview.text = overview ?: ""
@@ -2669,6 +2734,13 @@ class LibraryActivity : Activity() {
                 // ⛔ 刮削入口紧跟在播放后面：它是**对这一部作品**的动作，
                 //    和「同步 / 备份」那种全局动作不是一类。
                 actions.add("手动刮削「${cur.title}」" to { openScrape(cur) })
+                // ⛔ 只在**真的学过**的时候出现（`canClearLearnedSkip`）。给一颗
+                //    点了没反应的菜单项比不给更糟；而它必须是菜单项、不是动作
+                //    胶囊 —— 胶囊行有一条「选集恒在最后」的排序红线，且这是
+                //    低频动作，不该占一屏宽里的一格。
+                if (WorkDetailFormat.canClearLearnedSkip(cur)) {
+                    actions.add("清除「${cur.title}」的片头/片尾学习" to { clearLearnedSkip(cur) })
+                }
             }
             actions.add("同步（本地 ↔ 网盘）" to { doSync() })
             actions.add("上传备份到网盘" to { doUpload() })

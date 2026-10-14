@@ -23,8 +23,10 @@ import '../../domain/entities/playback_preference.dart';
 import '../../domain/entities/quality_option.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/services/episode_queue.dart';
+import '../../domain/services/intro_marker.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/playback_exit_policy.dart';
+import '../../domain/services/skip_learning.dart';
 import '../platform/tv_osd_channel.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
@@ -502,6 +504,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     // 不摘的话它会在页面销毁之后继续持有这个 State 的闭包（`_onCompleted`
     // 里要 `setState` / 读 provider），下一次播完会打到已销毁的页面上。
     _controller.onCompleted = _onCompleted;
+    // 片头 / 片尾的**自动学习**。与 `onCompleted` 同理：**在这里挂、在
+    // `dispose` 摘** —— 控制器是 Provider 级单例，不摘的话它会在页面销毁
+    // 之后继续持有这个 State 的闭包，而 `_onSkipAnchor` 要写库 + `setState`。
+    _controller.onSkipAnchor = _onSkipAnchor;
+    _controller.onOutroReached = _onOutroReached;
     // 原生 TV 菜单（`android/.../TvOsdView.kt`）的两个事件。与 `onCompleted`
     // 同理：**在这里挂、在 `dispose` 摘** —— 不摘的话原生侧一次 `onClose`
     // 会打到已经销毁的这个 State 上。
@@ -522,7 +529,10 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   ///
   /// 「下一集是哪一条」的规则本体在 [EpisodeQueue]（两个播放器共用）——
   /// 这里只负责取列表、把当前项交出去、然后把结果播起来。
-  Future<void> _playNextEpisode() async {
+  ///
+  /// [reportSwitch] 见 [_openEpisode]：**自动跳过片尾引起的切集必须传
+  /// `false`**，否则那条切集会变成一条样本，而它恰恰是我们自己跳的。
+  Future<void> _playNextEpisode({bool reportSwitch = true}) async {
     final current = _item;
     if (current == null) return;
 
@@ -546,7 +556,25 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (!mounted) return;
 
     diag.info('播放', '自动连播 → ${next.displayTitle}');
-    await _openItem(next);
+    await _openEpisode(next, reportSwitch: reportSwitch);
+  }
+
+  /// 切到某一集。**自动连播与面板「选集」都走这里**，[_bootstrap] 不走。
+  ///
+  /// ⛔ 与 [_openItem] 的唯一区别：切之前把「这一集看到哪儿了」报给学习器。
+  ///    那是**片尾唯一的信号来源**（见 `SkipAnchorCollector.noteEpisodeSwitch`），
+  ///    漏了它整套学习就只能学出片头。
+  ///
+  /// ## ⛔ [reportSwitch] 为什么必须存在
+  ///
+  /// 「自动跳过片尾」也会切集，但那次切集**不能**被记成样本 —— 采样点就是
+  /// 我们按学习结论跳过去的那个位置，它会变成一条「用户在这儿不想看了」的
+  /// 正样本，把结论自己喂大：下一轮中位数更靠前，再下一轮更靠前……
+  /// 几次之后片尾会爬到正片中间。这是**自我实现**，而它看起来完全像
+  /// 「越学越准」。
+  Future<void> _openEpisode(MediaItem item, {bool reportSwitch = true}) async {
+    if (reportSwitch) _controller.noteEpisodeSwitch();
+    await _openItem(item);
   }
 
   /// 改一项偏好并**立刻写库**。
@@ -746,6 +774,23 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (_controller.onCompleted == _onCompleted) {
       _controller.onCompleted = null;
     }
+    // ⚠️ 「退出播放」也要先当成一次**片尾信号**发出去，而且必须在**摘回调
+    //    之前** —— 看到最后一集看完按返回，与看到最后切下一集，是同一件事。
+    //    顺序反了的话这个信号会打到空处（回调已经摘了），而它是片尾唯一的
+    //    信号来源，丢了就等于片尾永远学不出来。
+    //
+    //    采集器自己会把「没看到片尾就退出」滤掉（落点距末尾太远 ⇒
+    //    `SkipLearning.classify` 返回 `null`），所以这里可以无条件调。
+    _controller.noteEpisodeSwitch();
+    // 摘掉学习回调。与 `onCompleted` 同一条理由：控制器是单例，留着它会在
+    // 页面销毁之后继续持有这个 State 的闭包，而 `_onSkipAnchor` 要读 `_item`
+    // / `_work` / `ref`。
+    if (_controller.onSkipAnchor == _onSkipAnchor) {
+      _controller.onSkipAnchor = null;
+    }
+    if (_controller.onOutroReached == _onOutroReached) {
+      _controller.onOutroReached = null;
+    }
     //   - 桌面：保留播放（可以一边浏览一边听）；
     //   - Android / Android TV：停止并释放解码器 —— 页面都走了，不该还占着
     //     4K 解码器与网络连接，而那边也没有通知栏控件能停它。
@@ -895,6 +940,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       autoLoadSubtitles: autoSub,
       // 手标区间（兜底）。文件章节那份由控制器自己探测，且优先级更高。
       introMarker: work?.introRange,
+      // 自动学习出来的区间 / 片尾偏移。⛔ 与手标**分开传**：控制器里的取值
+      // 链是 章节 > 手标 > 学习（见 `IntroSession.marker`），合成一个参数
+      // 就没了优先级 —— 而「你亲手标的被机器学出来的盖掉」是最不能忍的
+      // 一种回归。片尾同理：手标 > 学习。
+      learnedIntroMarker: work?.learnedIntroRange,
+      manualOutroOffset: _manualOutroOffsetOf(work),
+      learnedOutroOffset: _outroOffsetOf(work),
       skipIntro: _skipIntro,
       // 音轨 / 字幕的还原。控制器按**特征**匹配（内嵌轨号逐文件不同），
       // 匹配不上就退回默认 —— 见 `TrackPreference`。
@@ -906,17 +958,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   // 片头标记（手标那一半）
   // -------------------------------------------------------------------
 
-  /// 把「当前位置」记成片头起点 / 终点，或清除整个标记。
+  /// 把「当前位置」记成片头起点 / 片头终点 / **片尾起点**，或清除整个标记。
   ///
-  /// ## 为什么三个动作都写库、且写完**从库里重读**
+  /// ## 为什么几个动作都写库、且写完**从库里重读**
   ///
-  /// 仓储那三个方法是**分开的**（`setWorkIntroStart` / `setWorkIntroEnd` /
-  /// `clearWorkIntroRange`），而不是一个带可空参数的 —— 因为 `copyWith`
-  /// 的 `??` 把 `null` 当成「不改」，用一个方法表达不了「清除」。
+  /// 仓储那几个方法是**分开的**（`setWorkIntroStart` / `setWorkIntroEnd` /
+  /// `setWorkOutroOffset` / `clearWorkIntroRange`），而不是一个带可空参数的
+  /// —— 因为 `copyWith` 的 `??` 把 `null` 当成「不改」，用一个方法表达不了
+  /// 「清除」。
   ///
   /// 本地这份同样不能用 `copyWith` 造：`copyWith(introStartMs: null)` 清不掉
   /// 字段。重读一次既绕开了它，又保证界面显示的就是库里真正存着的东西 ——
   /// 代价是一次 `SELECT`，而标片头是极低频动作。
+  ///
+  /// ## ⛔ 片尾存的是**距末尾的偏移**
+  ///
+  /// 用户在第 1 集把播放头停在 41:30 说「这儿是片尾」，而第 1 集片长 43:00
+  /// —— 落库的是 `90 秒`，不是 `41:30`。各集片长不同，绝对时间搬到第 2 集
+  /// 就错位了。所以这里要**现算 `片长 - 当前位置`**，也就必须先知道片长。
   Future<void> _markIntro(_IntroAction action) async {
     final work = _work;
     if (work == null) return;
@@ -949,9 +1008,27 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         await repo.setWorkIntroEnd(work.key, ms);
         message = '片头终点已记为 ${_fmt(Duration(milliseconds: ms))}';
 
+      case _IntroAction.setOutro:
+        // ⛔ 片长未知时**给提示、不记 0**：记 0 的后果是「这部作品从此不再
+        //    提示片尾」（`outroStart` 会算成片长本身），而用户看到的是
+        //    「标了但没反应」，且没有任何办法自己发现。
+        final duration = _controller.duration;
+        if (duration <= Duration.zero) {
+          _toast('还不知道这一集有多长，等画面出片长之后再标片尾');
+          return;
+        }
+        final offsetMs = duration.inMilliseconds - ms;
+        if (offsetMs <= 0) {
+          _toast('现在已经是最后一帧了，往前退一点再标片尾');
+          return;
+        }
+        await repo.setWorkOutroOffset(work.key, offsetMs);
+        message = '片尾起点已记为 ${_fmt(Duration(milliseconds: ms))}'
+            '（距末尾 ${_fmt(Duration(milliseconds: offsetMs))}）';
+
       case _IntroAction.clear:
         await repo.clearWorkIntroRange(work.key);
-        message = '已清除片头标记';
+        message = '已清除手动标记';
 
       case _IntroAction.jump:
         return; // 上面已经处理过。
@@ -963,8 +1040,11 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
     // 标完之后区间还不成立（只标了一半 / 起终点反了）必须**说一声**：
     // 否则用户看到的是「两个点都标了，可是还是不跳」。
-    final incomplete =
-        action != _IntroAction.clear && _controller.introMarker == null;
+    //
+    // ⛔ 片尾不受这条影响 —— 它只有一个点，不存在「半条」。
+    final incomplete = action != _IntroAction.clear &&
+        action != _IntroAction.setOutro &&
+        _controller.introMarker == null;
     _toast(
       incomplete
           ? '$message。片头要同时有起点和终点、且起点在终点之前，'
@@ -977,6 +1057,127 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     if (!mounted) return;
     setState(() => _work = work);
     _controller.applyManualIntro(work.introRange);
+    // 学习结论与手标**分开同步**：控制器里它们是两条独立的来源，
+    // 合成一条会让「手标优先」这条规则在控制器里失效。
+    _controller.applyLearnedIntro(work.learnedIntroRange);
+    _controller.applyManualOutro(_manualOutroOffsetOf(work));
+    _controller.applyLearnedOutro(_outroOffsetOf(work));
+  }
+
+  /// 作品行里**手标**的「片尾距末尾偏移」→ `Duration`（没标过时为 `null`）。
+  ///
+  /// ⛔ 非正数当没标（与 `OutroSkip`、`PlayRequest.fromJson` 同一口径）：
+  ///    偏移 0 意味着「片尾从片长那一刻才开始」，也就是没有片尾。
+  static Duration? _manualOutroOffsetOf(MediaWork? work) {
+    final ms = work?.outroOffsetMs;
+    if (ms == null || ms <= 0) return null;
+    return Duration(milliseconds: ms);
+  }
+
+  /// 作品行里的「片尾距末尾偏移」→ `Duration`（没学过时为 `null`）。
+  static Duration? _outroOffsetOf(MediaWork? work) {
+    final ms = work?.learnedOutroOffsetMs;
+    if (ms == null || ms <= 0) return null;
+    return Duration(milliseconds: ms);
+  }
+
+  // -------------------------------------------------------------------
+  // 片头 / 片尾的自动学习（采集侧）
+  // -------------------------------------------------------------------
+
+  /// 采集到一个**有效落点**：先记样本，再把这部作品的样本整体重聚合一次。
+  ///
+  /// ## 为什么每次都**重聚合全部样本**
+  ///
+  /// 判据是中位数 + MAD（见 `SkipLearning`）—— 加一条样本既可能让原本
+  /// 不够的样本数跨过门槛，也可能让**已有结论失效**（散布被撑爆）。
+  /// 增量公式算不出这两件事，而样本是「每集最多两条」的极小数据量，
+  /// 全量重算的代价可以忽略。
+  ///
+  /// ## ⛔ 为什么全程 `try/catch`
+  ///
+  /// 这个回调可能从 `dispose()` 里发出来（「看完按返回」也是片尾信号）。
+  /// 那时页面已经在下线，任何异常都会变成一条**无人接管的异步错误** ——
+  /// 表现是「退出播放页时闪一下红屏」。而学习是纯粹的锦上添花，
+  /// 绝不值得把播放页拖下水。
+  Future<void> _onSkipAnchor(SkipAnchor anchor) async {
+    try {
+      final item = _item;
+      final work = _work;
+      if (item == null || work == null) return;
+
+      final kind = SkipLearning.classify(anchor);
+      if (kind == null) {
+        // 最常见的一条：用户拖到正片中间看剧情。不是错误，不打 warn。
+        diag.info('学习', '落点不在片头 / 片尾窗口内，丢弃：$anchor');
+        return;
+      }
+
+      final repo = ref.read(mediaRepositoryProvider);
+      final now = DateTime.now();
+      await repo.addSkipSample(
+        SkipSample(
+          id: SkipSample.idFor(itemId: item.id, kind: kind, at: now),
+          itemId: item.id,
+          workKey: work.key,
+          kind: kind,
+          anchor: anchor.anchor,
+          duration: anchor.duration,
+          // 设备只用于排查，不参与聚合（见 `SkipSample.device`）。
+          device: Platform.localHostname,
+          createdAt: now,
+        ),
+      );
+
+      final samples = await repo.skipSamplesForWork(work.key);
+      final outcome = SkipLearning.learn(samples);
+      if (outcome.isEmpty) {
+        diag.info(
+          '学习',
+          '${work.key}：样本 ${samples.length} 条，还没学出可用结论（${kind.label}）',
+        );
+        return;
+      }
+
+      // ⛔ `saveLearnedSkip` 自己会挡住「空结论」，这里不必再判一次；
+      //    但**必须**在写完之后重读 —— 它写的是「整体覆盖」，不是增量。
+      await repo.saveLearnedSkip(work.key, outcome, now: now);
+      diag.info('学习', '${work.key} → $outcome');
+
+      final fresh = await repo.workByKey(work.key);
+      if (!mounted || fresh == null) return;
+      // ⛔ 期间用户可能已经切到下一集了（`noteEpisodeSwitch` 是**先**发信号、
+      //    `_openItem` 随后就把 `_work` 换掉，而这里中间隔着两次库往返）。
+      //    晚到的结论打到新一集上，表现是「刚切过去画面自己跳一下」。
+      if (_work?.key != work.key) return;
+      _applyWork(fresh);
+    } catch (e) {
+      diag.warn('学习', '落点处理失败（不影响播放）：$e');
+    }
+  }
+
+  /// 播放头进入了学习出的片尾区间。
+  ///
+  /// ## ⛔ 默认不自动跳
+  ///
+  /// 片尾的信号天生比片头弱：片头有「起点 = 0」这个强锚，片尾没有 ——
+  /// 「跳过片尾」与「快进去看结局」在信号上长得一模一样。误跳的代价是
+  /// 用户**直接丢掉结局**，不可逆。所以默认只提示（见设计文档 §八 / §十）。
+  ///
+  /// ## 但开着「自动连播」时例外
+  ///
+  /// 那说明用户已经明确要过「这一集看完就接下一集」——片尾只是把这件事
+  /// 提前到他不想看的地方。所以这里跟着 `_autoPlayNext` 走：
+  /// 开着就跳，关着就只提示。
+  void _onOutroReached(Duration start) {
+    if (!_autoPlayNext) {
+      _toast('已到片尾');
+      return;
+    }
+    _toast('已跳过片尾 · 播放下一集');
+    // ⛔ `reportSwitch: false`：这次切集是**我们自己**跳的，记成样本会
+    //    把学习结论越喂越靠前（见 `_openEpisode` 的文档）。
+    unawaited(_playNextEpisode(reportSwitch: false));
   }
 
   /// 一条轻提示。用 SnackBar 而不是播放器里那个 `notice` 药丸：
@@ -1114,7 +1315,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                       onPickAudioTrack: _pickAudioTrack,
                       onPickAudioEffect: _setAudioEffect,
                       onPickRate: controller.setRate,
-                      onPickEpisode: _openItem,
+                      onPickEpisode: _openEpisode,
                       onJumpIntro: _jumpIntro,
                       onClose: _closeTvPanel,
                       onActivity: _scheduleControlsHide,
@@ -1415,7 +1616,7 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         onPickAudioTrack: _pickAudioTrack,
         onPickAudioEffect: _setAudioEffect,
         onPickRate: _controller.setRate,
-        onPickEpisode: _openItem,
+        onPickEpisode: _openEpisode,
         onJumpIntro: _jumpIntro,
         onClose: _closeTvPanel,
       );
@@ -1990,13 +2191,19 @@ String _fmtClock(Duration d) {
   return h > 0 ? '$h:$m:$s' : '$m:$s';
 }
 
-/// 片头菜单能触发的四个动作。
+/// 片头菜单能触发的五个动作。
+///
+/// ⚠️ 名字叫「片头菜单」，但片尾也归它管 —— 两者是同一件事的两端（跳过开头 /
+/// 跳过结尾），拆成两个控制栏按钮只会让本来就窄的控制栏更挤。
 enum _IntroAction {
   /// 把当前位置记为片头起点。
   setStart,
 
   /// 把当前位置记为片头终点。
   setEnd,
+
+  /// 把当前位置记为**片尾起点**（落库时换算成「距末尾的偏移」）。
+  setOutro,
 
   /// 清掉手标的那一份（文件章节不受影响）。
   clear,
@@ -2413,14 +2620,40 @@ class _IntroMenu extends StatelessWidget {
           '这部作品下的每一集都会用';
     }
 
+    // 片尾那一段。⛔ 与片头**不是同一套优先级**：片尾没有文件章节可用
+    // （章节只标片头），所以是两级 —— 手标 > 学习。
+    //
+    // ⛔ 显示的是**距末尾的偏移**而不是绝对时间：各集片长不同，绝对时间在
+    //    这部作品里没有唯一解（见 `MediaWork.outroOffsetMs`）。
+    final manualOutro = controller.manualOutroOffset;
+    final learnedOutro = _PlayerPageState._outroOffsetOf(work);
+    // 生效的那一份：手标 > 学习（走 `OutroSkip`，与播放时**同一份判据**）——
+    // 文案要如实标出真正生效的那一份的来源，否则用户永远查不出是哪层在生效。
+    final effectiveOutro = OutroSkip.effectiveOffset(
+      manual: manualOutro,
+      learned: learnedOutro,
+    );
+    final String outroLabel;
+    final String outroStatus;
+    if (effectiveOutro == null) {
+      outroLabel = '还没有片尾标识';
+      outroStatus = '播到片尾处点「标为片尾起点」，这部作品下的每一集都会用';
+    } else if (effectiveOutro == manualOutro) {
+      outroLabel = '片尾 距末尾 ${_fmtClock(effectiveOutro)}（手动标记）';
+      outroStatus = '来自你手动标记的片尾起点，这部作品下的每一集共用';
+    } else {
+      outroLabel = '片尾 距末尾 ${_fmtClock(effectiveOutro)}（自动学习）';
+      outroStatus = '来自自动学习的结论。手动标一次会压过它';
+    }
+
     final now = _fmtClock(controller.position);
 
     return Builder(
       builder: (buttonContext) => _MenuButton(
-        tooltip: '片头',
+        tooltip: '片头 / 片尾',
         onTap: () => unawaited(_openAnchoredMenu<_IntroAction>(
           buttonContext: buttonContext,
-          title: '片头',
+          title: '片头 / 片尾',
           maxWidth: 330,
           onSelected: onAction,
           rows: (context, select) => [
@@ -2456,16 +2689,33 @@ class _IntroMenu extends StatelessWidget {
                 detail: '当前位置 $now',
               ),
             ),
+            _MenuTile(
+              child: _MenuRow(
+                label: outroLabel,
+                detail: outroStatus,
+                dim: effectiveOutro == null,
+              ),
+            ),
+            _MenuTile(
+              onTap: () => select(_IntroAction.setOutro),
+              child: _MenuRow(
+                label: '把当前位置标为片尾起点',
+                detail: '当前位置 $now',
+              ),
+            ),
             // 「清除」只在真的手标过时才给 —— 章节那份清不掉（它在文件里），
             // 给一个点了没反应的按钮比不给更让人困惑。
-            if (manual != null)
+            //
+            // ⛔ 判据是**三列**（片头起 / 片头止 / 片尾偏移）里任意一个非空，
+            //    不是只看片头：只标了片尾的用户也必须能清掉它。
+            if (manual != null || work.outroOffsetMs != null)
               _MenuTile(
                 onTap: () => select(_IntroAction.clear),
                 child: _MenuRow(
                   label: '清除手动标记',
                   detail: fromChapters
-                      ? '清掉之后仍会用文件里的章节'
-                      : '清掉之后这一部不再自动跳过片头',
+                      ? '清掉之后片头仍会用文件里的章节'
+                      : '清掉之后这一部不再自动跳过片头 / 提示片尾',
                 ),
               ),
           ],
@@ -2473,7 +2723,7 @@ class _IntroMenu extends StatelessWidget {
         child: _BarButton(
           icon: Icons.content_cut_rounded,
           label: '片头',
-          active: marker != null,
+          active: marker != null || manualOutro != null,
         ),
       ),
     );

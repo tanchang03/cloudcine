@@ -66,9 +66,84 @@ data class Work(
      *    而用户还没看。
      */
     val newItemCount: Int = 0,
+    /**
+     * **手标**的片头起点 / 终点（毫秒）；`null` = 没标过。
+     *
+     * ⛔ 电视上**没有界面可写**这两列 —— 它们唯一的来源是 PC 端（用户在电脑上
+     *    标好，随备份包过来）。但**必须读**：不读的话「在电脑上标好的片头，
+     *    电视上不跳」，而两端都不会报错，用户只会觉得「时灵时不灵」。
+     *
+     * 与 [learnedIntroStartMs] 是两条独立支路，取值链 **手标 > 学习**
+     * （判据只有一份实现：`IntroSession.marker`）。
+     */
+    val introStartMs: Long? = null,
+    /** 手标的片头终点（毫秒）。与 [introStartMs] 成对，半条当没有。 */
+    val introEndMs: Long? = null,
+    /**
+     * **手标**的片尾偏移（毫秒，距末尾）；`null` = 没标（schema v19）。
+     *
+     * ⛔ 电视上**没有界面可写**（用户在电脑上标，随进度文件同步过来），
+     *    但播放器**必须读**：不读就是「电脑上标了片尾，电视上不跳」，
+     *    而两端都不报错。
+     *
+     * ⛔ 与 [learnedOutroOffsetMs] 是两条独立支路，取值链 **手标 > 学习**。
+     */
+    val outroOffsetMs: Long? = null,
+    /**
+     * **自动学习**出来的片头起点（毫秒）；`null` = 还没学出来（schema v18）。
+     *
+     * ⛔ 与手标（`media_works.intro_start_ms`）**分成两组列**，不能合。
+     *    取值链是 **手标 > 学习**：手标是用户明确指定的，学习是推断。推断压过
+     *    明确指定，会出现「我明明标过，它却按自己学的跳」—— 而用户完全没有
+     *    办法知道是哪一层在生效。
+     */
+    val learnedIntroStartMs: Long? = null,
+    /** 自动学习出来的片头终点（毫秒）。 */
+    val learnedIntroEndMs: Long? = null,
+    /**
+     * 自动学习出来的**片尾起点距末尾的偏移**（毫秒）。
+     *
+     * ⛔ 存偏移不存绝对时间：各集片长不同，绝对时间跨集不可比。落点用
+     *    `durationMs - offset` 现算（见 [learnedOutroStart]）。
+     */
+    val learnedOutroOffsetMs: Long? = null,
 ) {
     /** 有未读更新（海报墙角标据此决定画不画）。 */
     val hasUpdate: Boolean get() = newItemCount > 0
+
+    /**
+     * 学习出来的片头区间；半条标记（只学到一半）当没有。
+     *
+     * ⛔ 判据与手标**共用** `IntroMarker.fromMilliseconds` —— 两份各判一次，
+     *    迟早漂移成「手标的能跳、学出来的跳不了」。
+     */
+    val learnedIntroRange: IntroMarker?
+        get() = IntroMarker.fromMilliseconds(learnedIntroStartMs, learnedIntroEndMs)
+
+    /**
+     * **手标**的片尾落点（`durationMs - outroOffsetMs`）。
+     *
+     * ⛔ 与 [learnedOutroStart] 逐字同一条规则（都走 `OutroSkip.startMs`），
+     *    但读的是**另一组列**（手标 vs 学习）。刻意不互相调用：谁先谁后由
+     *    播放器的优先级链决定（片尾与片头同链：**手标 > 学习**），
+     *    合在一处会把那条链藏起来。
+     *
+     * @return 没标过、时长未知、或算出来 ≤ 0 时返回 `null`。
+     */
+    fun outroStart(durationMs: Long): Long? =
+        OutroSkip.startMs(durationMs, outroOffsetMs)
+
+    /**
+     * 学习出来的片尾落点（`duration - offset`）。
+     *
+     * @return 没学过、时长未知、或算出来 ≤ 0 时返回 `null`（＝不跳也不提示）。
+     */
+    fun learnedOutroStart(durationMs: Long): Long? =
+        OutroSkip.startMs(durationMs, learnedOutroOffsetMs)
+
+    /** 有没有任何学习结论（简介页据此决定显不显示「自动学习」那一行）。 */
+    val hasLearnedSkip: Boolean
+        get() = learnedIntroRange != null || learnedOutroOffsetMs != null
 
     /**
      * 这一条媒体项算不算「追剧之后才出现的新集」。

@@ -575,4 +575,186 @@ void main() {
       expect(a.hashCode == b.hashCode, isFalse);
     });
   });
+
+  // -------------------------------------------------------------------
+  // 片头 / 片尾标记（跨引擎传的那一组）
+  // -------------------------------------------------------------------
+
+  /// 这一组字段是**两条独立支路**（手标 / 学习），各有各的来源与优先级。
+  /// 合成一个字段的后果是「你亲手标的被机器学出来的盖掉」，而两台设备都
+  /// 显示正常 —— 所以「分开传」这件事必须被单独钉住。
+  group('PlayRequest 片头 / 片尾标记', () {
+    test('手标片尾偏移能原样过一趟通道', () {
+      const original = PlayRequest(
+        url: 'https://a/b.mp4',
+        title: 't',
+        introStartMs: 5000,
+        introEndMs: 95000,
+        outroOffsetMs: 90000,
+        learnedIntroStartMs: 1000,
+        learnedIntroEndMs: 88000,
+        learnedOutroOffsetMs: 70000,
+      );
+
+      final restored = PlayRequest.fromJson(original.toJson())!;
+
+      expect(restored.outroOffsetMs, 90000);
+      expect(restored.introStartMs, 5000);
+      expect(restored.introEndMs, 95000);
+      expect(restored.learnedOutroOffsetMs, 70000);
+      expect(restored, original);
+    });
+
+    test('⛔ 学习出的片头起点是 0 时要还原成区间 —— 0 是合法值，不是「没给」', () {
+      // 库里的 `learned_intro_start_ms` **就是字面量 0**（片头总在开头，
+      // 见 `saveLearnedSkip`）。把它归一成 null 的后果是 `learnedIntroRange`
+      // 变成 null ⇒ **独立窗口永远用不上学出来的片头**，而内置播放页
+      // （不走这条通道）是好的 —— 用户只会觉得「窗口播放器有时候不跳片头」。
+      const original = PlayRequest(
+        url: 'https://a/b.mp4',
+        title: 't',
+        learnedIntroStartMs: 0,
+        learnedIntroEndMs: 88000,
+      );
+
+      final restored = PlayRequest.fromJson(original.toJson())!;
+
+      expect(restored.learnedIntroStartMs, 0);
+      final range = restored.learnedIntroRange;
+      expect(range, isNotNull);
+      expect(range!.start, Duration.zero);
+      expect(range.end, const Duration(milliseconds: 88000));
+    });
+
+    test('手标片头起点是 0 时同样要保留（起点判据是 >= 0）', () {
+      final restored = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mp4',
+        'title': 't',
+        'introStartMs': 0,
+        'introEndMs': 95000,
+      })!;
+
+      expect(restored.introStartMs, 0);
+      expect(restored.introRange, isNotNull);
+      expect(restored.introRange!.start, Duration.zero);
+    });
+
+    test('起点是负数仍然当没给 —— 只挡非法值，不挡 0', () {
+      final restored = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mp4',
+        'title': 't',
+        'introStartMs': -1,
+        'introEndMs': 95000,
+      })!;
+
+      expect(restored.introStartMs, isNull);
+      expect(restored.introRange, isNull);
+    });
+
+    test('手标片尾与学习片尾是**两个** getter，不能合成一个', () {
+      // ⛔ 菜单要显示「这一份是你手标的还是学出来的」；合成一个就说不清了。
+      const request = PlayRequest(
+        url: 'https://a/b.mp4',
+        title: 't',
+        outroOffsetMs: 60000,
+        learnedOutroOffsetMs: 300000,
+      );
+
+      expect(request.manualOutroOffset, const Duration(minutes: 1));
+      expect(request.learnedOutroOffset, const Duration(minutes: 5));
+    });
+
+    test('非正数一律当没标 —— 0 秒的片尾没有意义', () {
+      // 与 `introStartMs` / `learnedOutroOffsetMs` 同一口径。写进去的后果是
+      // 「整集都是片尾」（落点 = 片长），用户一进片就被告知「已到片尾」。
+      final restored = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mp4',
+        'title': 't',
+        'outroOffsetMs': 0,
+      })!;
+      expect(restored.outroOffsetMs, isNull);
+      expect(restored.manualOutroOffset, isNull);
+
+      final negative = PlayRequest.fromJson(const <String, Object?>{
+        'url': 'https://a/b.mp4',
+        'title': 't',
+        'outroOffsetMs': -1,
+      })!;
+      expect(negative.outroOffsetMs, isNull);
+    });
+
+    test('手标片尾不同就不相等 —— 否则「刚标的片尾」不会让请求重建', () {
+      const a = PlayRequest(url: 'u', title: 't', outroOffsetMs: 90000);
+      const b = PlayRequest(url: 'u', title: 't', outroOffsetMs: 120000);
+      const none = PlayRequest(url: 'u', title: 't');
+
+      expect(a == b, isFalse);
+      expect(a == none, isFalse);
+      expect(a.hashCode == b.hashCode, isFalse);
+    });
+  });
+
+  group('IntroRangeSaveRequest / IntroRangeSnapshot（手标回主窗口落库）', () {
+    test('片尾偏移能原样过一趟通道', () {
+      const request = IntroRangeSaveRequest(
+        itemId: 'quark:F1',
+        outroOffsetMs: 90000,
+      );
+
+      final restored = IntroRangeSaveRequest.fromJson(request.toJson())!;
+
+      expect(restored.itemId, 'quark:F1');
+      expect(restored.outroOffsetMs, 90000);
+      expect(restored.startMs, isNull);
+      expect(restored.endMs, isNull);
+      expect(restored.clear, isFalse);
+      expect(restored.isEmpty, isFalse);
+    });
+
+    test('只带片尾的请求**不算空** —— 空的话主窗口会直接返回、不写库', () {
+      // ⛔ 判据漏掉 `outroOffsetMs` 的后果：用户点了「标为片尾起点」，
+      //    播放窗口显示成功，而库里什么都没变。
+      const onlyOutro = IntroRangeSaveRequest(
+        itemId: 'quark:F1',
+        outroOffsetMs: 90000,
+      );
+      expect(onlyOutro.isEmpty, isFalse);
+
+      const nothing = IntroRangeSaveRequest(itemId: 'quark:F1');
+      expect(nothing.isEmpty, isTrue);
+    });
+
+    test('非正数的片尾偏移当没给', () {
+      final restored = IntroRangeSaveRequest.fromJson(const <String, Object?>{
+        'itemId': 'quark:F1',
+        'outroOffsetMs': 0,
+      })!;
+      expect(restored.outroOffsetMs, isNull);
+      expect(restored.isEmpty, isTrue);
+    });
+
+    test('回执里带上落库之后的片尾偏移 —— 播放窗口据此显示真相', () {
+      const snapshot = IntroRangeSnapshot(
+        startMs: 5000,
+        endMs: 95000,
+        outroOffsetMs: 90000,
+      );
+
+      // ⚠️ `IntroRangeSnapshot.fromJson` 返回**非空**类型（解不开时给一个
+      //    空快照，而不是 null）—— 所以这里没有 `!`。
+      final restored = IntroRangeSnapshot.fromJson(snapshot.toJson());
+
+      expect(restored, snapshot);
+      expect(restored.outroOffsetMs, 90000);
+    });
+
+    test('片尾偏移不同就不相等 —— 否则播放窗口不会按新值刷新', () {
+      const a = IntroRangeSnapshot(outroOffsetMs: 90000);
+      const b = IntroRangeSnapshot(outroOffsetMs: 120000);
+      const none = IntroRangeSnapshot();
+
+      expect(a == b, isFalse);
+      expect(a == none, isFalse);
+    });
+  });
 }

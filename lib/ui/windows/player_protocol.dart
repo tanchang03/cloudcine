@@ -573,6 +573,10 @@ class PlayRequest {
     this.preference,
     this.introStartMs,
     this.introEndMs,
+    this.outroOffsetMs,
+    this.learnedIntroStartMs,
+    this.learnedIntroEndMs,
+    this.learnedOutroOffsetMs,
     this.streamRelay = true,
     this.relayConnections = 8,
   });
@@ -734,6 +738,30 @@ class PlayRequest {
   final int? introStartMs;
   final int? introEndMs;
 
+  /// 用户**手标**的片尾起点距末尾的偏移（毫秒）。`null` = 没标过。
+  ///
+  /// ⛔ 传偏移而不是绝对时间：各集片长不同，绝对时间跨集不可比
+  ///    （与 [learnedOutroOffsetMs] 用的是同一种表示，两条路才能互相印证）。
+  ///
+  /// ⛔ 与 [learnedOutroOffsetMs] **分开传**：播放窗口里的取值链是
+  ///    **手标 > 学习**。合成一个字段就等于让「你亲手标的」输给「机器猜的」。
+  final int? outroOffsetMs;
+
+  /// **自动学习**出来的片头区间（毫秒）。`null` = 还没学出来。
+  ///
+  /// ## ⛔ 与 [introStartMs] 分开传，不能合成一个
+  ///
+  /// 播放窗口里的取值链是 **文件章节 > 手标 > 学习**（见 `IntroSession.marker`）。
+  /// 合成一个字段就等于把「你亲手标的」和「机器猜的」压成同一优先级 ——
+  /// 而手标被学习结果盖掉，是最不能忍的一种回归。
+  final int? learnedIntroStartMs;
+  final int? learnedIntroEndMs;
+
+  /// **自动学习**出来的片尾起点距末尾的偏移（毫秒）。`null` = 还没学出来。
+  ///
+  /// ⛔ 传偏移而不是绝对时间：各集片长不同，绝对时间跨集不可比。
+  final int? learnedOutroOffsetMs;
+
   /// 播原画时是否走本地多路中继（并发预取）。**默认开**。
   ///
   /// ## 为什么必须随请求投过来
@@ -753,6 +781,25 @@ class PlayRequest {
   /// 挡住「终点早于起点」这类脏数据，规则只能有一份。
   IntroMarker? get introRange =>
       IntroMarker.fromMilliseconds(introStartMs, introEndMs);
+
+  /// 学习出来的片头区间；半条当没有（判据与 [introRange] 共用一份）。
+  IntroMarker? get learnedIntroRange =>
+      IntroMarker.fromMilliseconds(learnedIntroStartMs, learnedIntroEndMs);
+
+  /// 手标的片尾起点距末尾的偏移；非正数当没有。
+  ///
+  /// ⛔ 与 [learnedOutroOffset] 分开两个 getter（而不是合成一个「最终偏移」）：
+  ///    播放窗口的片尾菜单要显示「这一份是你手标的还是学出来的」。
+  Duration? get manualOutroOffset {
+    final ms = outroOffsetMs;
+    return (ms == null || ms <= 0) ? null : Duration(milliseconds: ms);
+  }
+
+  /// 学习出来的片尾起点距末尾的偏移；非正数当没有。
+  Duration? get learnedOutroOffset {
+    final ms = learnedOutroOffsetMs;
+    return (ms == null || ms <= 0) ? null : Duration(milliseconds: ms);
+  }
 
   Map<String, Object?> toJson() => <String, Object?>{
         'url': url,
@@ -775,6 +822,10 @@ class PlayRequest {
         'preference': preference?.toJson(),
         'introStartMs': introStartMs,
         'introEndMs': introEndMs,
+        'outroOffsetMs': outroOffsetMs,
+        'learnedIntroStartMs': learnedIntroStartMs,
+        'learnedIntroEndMs': learnedIntroEndMs,
+        'learnedOutroOffsetMs': learnedOutroOffsetMs,
         'streamRelay': streamRelay,
         'relayConnections': relayConnections,
       };
@@ -837,6 +888,10 @@ class PlayRequest {
     final rawSkipIntro = raw['skipIntro'];
     final rawIntroStart = raw['introStartMs'];
     final rawIntroEnd = raw['introEndMs'];
+    final rawOutroOffset = raw['outroOffsetMs'];
+    final rawLearnedIntroStart = raw['learnedIntroStartMs'];
+    final rawLearnedIntroEnd = raw['learnedIntroEndMs'];
+    final rawLearnedOutroOffset = raw['learnedOutroOffsetMs'];
     final rawStreamRelay = raw['streamRelay'];
     final rawRelayConnections = raw['relayConnections'];
     final rawAudioEffect = raw['audioEffect'];
@@ -863,13 +918,41 @@ class PlayRequest {
       // 字段就会静默关掉连播与跳片头 —— 而这两项在设置页上是**开着**的。
       autoPlayNext: rawAutoNext != false,
       skipIntro: rawSkipIntro != false,
-      // 非正数当没有：0 秒的片头没有意义，而写进去会让 `IntroMarker`
-      // 的 `isValid` 之外多一条隐式规则。
-      introStartMs: rawIntroStart is int && rawIntroStart > 0
+      // ⛔ **起点允许是 0**（判据是 `>= 0`，不是 `> 0`）。
+      //
+      //    「非正数当没有」这条规则对**起点**是错的：0 是一个合法的起点
+      //    （`IntroMarker.fromMilliseconds` 就允许 `startMs == 0`，只挡负数）。
+      //    归一成 `null` 的后果是 `introRange` 变成 `null` —— 用户标好的区间
+      //    在独立窗口里凭空消失，而请求本身看着完全正常。
+      //
+      //    终点仍然是 `> 0`：0 长度的片头跳过去毫无意义。
+      introStartMs: rawIntroStart is int && rawIntroStart >= 0
           ? rawIntroStart
           : null,
       introEndMs:
           rawIntroEnd is int && rawIntroEnd > 0 ? rawIntroEnd : null,
+      // 手标片尾与学习片尾的口径**完全一致**（非正数当没有）：两份数据在
+      // 播放窗口里共用同一套 `duration - offset` 换算，判据分开写迟早漂移。
+      // ⛔ 片尾**偏移**的 0 是真的没有意义（落点 = 片长，整集都算片尾），
+      //    所以这里保持 `> 0`。
+      outroOffsetMs:
+          rawOutroOffset is int && rawOutroOffset > 0 ? rawOutroOffset : null,
+      // ⛔⛔ 学习出的片头起点**必须是 `>= 0`**：库里 `learned_intro_start_ms`
+      //     存的**就是字面量 0**（片头总在开头，见 `saveLearnedSkip`）。
+      //     按 `> 0` 归一成 `null` 的后果是 `learnedIntroRange` 恒为 `null`
+      //     ⇒ **独立窗口永远用不上学出来的片头**，而内置播放页（不走这条
+      //     通道）是好的 —— 用户只会觉得「窗口播放器有时候不跳片头」。
+      learnedIntroStartMs: rawLearnedIntroStart is int &&
+              rawLearnedIntroStart >= 0
+          ? rawLearnedIntroStart
+          : null,
+      learnedIntroEndMs: rawLearnedIntroEnd is int && rawLearnedIntroEnd > 0
+          ? rawLearnedIntroEnd
+          : null,
+      learnedOutroOffsetMs: rawLearnedOutroOffset is int &&
+              rawLearnedOutroOffset > 0
+          ? rawLearnedOutroOffset
+          : null,
       // 与 autoPlayNext / skipIntro 同一套判据：只有**显式 false** 才关。
       // 写成 `rawStreamRelay == true` 的话，主窗口某次漏带这个字段就会静默
       // 关掉中继 —— 而设置页上它是开着的。
@@ -939,6 +1022,10 @@ class PlayRequest {
           other.skipIntro == skipIntro &&
           other.introStartMs == introStartMs &&
           other.introEndMs == introEndMs &&
+          other.outroOffsetMs == outroOffsetMs &&
+          other.learnedIntroStartMs == learnedIntroStartMs &&
+          other.learnedIntroEndMs == learnedIntroEndMs &&
+          other.learnedOutroOffsetMs == learnedOutroOffsetMs &&
           other.streamRelay == streamRelay &&
           other.relayConnections == relayConnections &&
           other.audioEffect == audioEffect &&
@@ -960,8 +1047,17 @@ class PlayRequest {
         sizeBytes,
         autoPlayNext,
         skipIntro,
-        introStartMs,
-        introEndMs,
+        // ⚠️ 片头 / 片尾这一组**合成一个槽**：`Object.hash` 最多接 20 个位置
+        //    参数，而这一组已经有 6 个（手标 3 + 学习 3）。摊平会直接顶到上限，
+        //    下一个字段就只能改成 `Object.hashAll` 那种别扭形状。
+        Object.hash(
+          introStartMs,
+          introEndMs,
+          outroOffsetMs,
+          learnedIntroStartMs,
+          learnedIntroEndMs,
+          learnedOutroOffsetMs,
+        ),
         streamRelay,
         relayConnections,
         audioEffect,
@@ -1116,12 +1212,13 @@ class TicketRefreshRequest {
       'TicketRefreshRequest($itemId, ${qualityId ?? "-"}, ${position.inSeconds}s)';
 }
 
-/// 播放窗口 → 主窗口的「把这部作品的片头区间存下来」请求。
+/// 播放窗口 → 主窗口的「把这部作品的片头 / 片尾标记存下来」请求。
 ///
 /// ## 为什么标记要回主窗口写
 ///
-/// 片头区间存在 `MediaWork.introStartMs` —— 库在主窗口。播放窗口刻意不碰
-/// 数据库（见 `PlayerWindowApp` 的类文档），所以它只能把「标了什么」报回来。
+/// 片头 / 片尾存在 `MediaWork.introStartMs` / `outroOffsetMs` —— 库在主窗口。
+/// 播放窗口刻意不碰数据库（见 `PlayerWindowApp` 的类文档），所以它只能把
+/// 「标了什么」报回来。
 ///
 /// ## 为什么用 `itemId` 而不是 `groupKey`
 ///
@@ -1129,18 +1226,21 @@ class TicketRefreshRequest {
 /// （它连 `groupKey` 这个概念都没有）。**由主窗口按 itemId 查库补全** ——
 /// 让播放窗口去拼一个它不认识的键，就是把一个已经结构化的信息降级成字符串。
 ///
-/// ## 三个动作，与仓储的三个方法一一对应
+/// ## 四个动作，与仓储的四个方法一一对应
 ///
-///   - [clear] 为 true → 清掉整个手标区间（**优先于**另两个字段）；
+///   - [clear] 为 true → 清掉整个手标（**优先于**另三个字段）；
 ///   - [startMs] / [endMs] 非空 → 各写各的。允许只写一半 —— 用户是先标起点、
 ///     播一段、再标终点的，中间那段时间库里存着「半条标记」是正常状态
-///     （`IntroMarker.fromMilliseconds` 会把半条当没有，所以不会误跳）。
+///     （`IntroMarker.fromMilliseconds` 会把半条当没有，所以不会误跳）；
+///   - [outroOffsetMs] 非空 → 写片尾。⚠️ 它是**距末尾的偏移**，由播放窗口
+///     按它自己知道的片长换算好再报上来（片长只有播放器知道）。
 @immutable
 class IntroRangeSaveRequest {
   const IntroRangeSaveRequest({
     required this.itemId,
     this.startMs,
     this.endMs,
+    this.outroOffsetMs,
     this.clear = false,
   });
 
@@ -1153,16 +1253,21 @@ class IntroRangeSaveRequest {
   /// 新的片头终点（毫秒）。`null` = 不改这一半。
   final int? endMs;
 
-  /// 清掉整个手标区间（文件里的章节不受影响）。
+  /// 新的**片尾起点距末尾的偏移**（毫秒）。`null` = 不改这一项。
+  final int? outroOffsetMs;
+
+  /// 清掉整个手标（文件里的章节不受影响）。
   final bool clear;
 
-  /// 三个字段全空 = 什么都不用做。主窗口据此**直接返回**，不白跑一次写库。
-  bool get isEmpty => !clear && startMs == null && endMs == null;
+  /// 所有字段都空 = 什么都不用做。主窗口据此**直接返回**，不白跑一次写库。
+  bool get isEmpty =>
+      !clear && startMs == null && endMs == null && outroOffsetMs == null;
 
   Map<String, Object?> toJson() => <String, Object?>{
         'itemId': itemId,
         'startMs': startMs,
         'endMs': endMs,
+        'outroOffsetMs': outroOffsetMs,
         'clear': clear,
       };
 
@@ -1174,18 +1279,21 @@ class IntroRangeSaveRequest {
 
     final start = raw['startMs'];
     final end = raw['endMs'];
+    final outro = raw['outroOffsetMs'];
     return IntroRangeSaveRequest(
       itemId: itemId,
       // 非正数当没给：0 秒的片头没有意义（与 `PlayRequest.fromJson` 同口径）。
       startMs: start is int && start > 0 ? start : null,
       endMs: end is int && end > 0 ? end : null,
+      outroOffsetMs: outro is int && outro > 0 ? outro : null,
       clear: raw['clear'] == true,
     );
   }
 
   @override
   String toString() =>
-      'IntroRangeSaveRequest($itemId, ${clear ? "清除" : "$startMs~$endMs"})';
+      'IntroRangeSaveRequest($itemId, '
+      '${clear ? "清除" : "$startMs~$endMs 距末尾 $outroOffsetMs"})';
 }
 
 /// 主窗口回答 [IntroRangeSaveRequest] 时给出的**落库之后的真实值**。
@@ -1195,23 +1303,29 @@ class IntroRangeSaveRequest {
 /// 是被接受还是被拒。把值回给它，界面就能显示真相。
 @immutable
 class IntroRangeSnapshot {
-  const IntroRangeSnapshot({this.startMs, this.endMs});
+  const IntroRangeSnapshot({this.startMs, this.endMs, this.outroOffsetMs});
 
   final int? startMs;
   final int? endMs;
 
+  /// 落库之后的**片尾距末尾偏移**（毫秒）。`null` = 没标过 / 已被清除。
+  final int? outroOffsetMs;
+
   Map<String, Object?> toJson() => <String, Object?>{
         'introStartMs': startMs,
         'introEndMs': endMs,
+        'outroOffsetMs': outroOffsetMs,
       };
 
   static IntroRangeSnapshot fromJson(Object? raw) {
     if (raw is! Map) return const IntroRangeSnapshot();
     final start = raw['introStartMs'];
     final end = raw['introEndMs'];
+    final outro = raw['outroOffsetMs'];
     return IntroRangeSnapshot(
       startMs: start is int && start > 0 ? start : null,
       endMs: end is int && end > 0 ? end : null,
+      outroOffsetMs: outro is int && outro > 0 ? outro : null,
     );
   }
 
@@ -1220,13 +1334,102 @@ class IntroRangeSnapshot {
       identical(this, other) ||
       other is IntroRangeSnapshot &&
           other.startMs == startMs &&
-          other.endMs == endMs;
+          other.endMs == endMs &&
+          other.outroOffsetMs == outroOffsetMs;
 
   @override
   int get hashCode => Object.hash(startMs, endMs);
 
   @override
   String toString() => 'IntroRangeSnapshot(${startMs ?? "-"}~${endMs ?? "-"})';
+}
+
+/// 播放窗口 → 主窗口的「我在这一集采集到了一个**有效落点**」回报。
+///
+/// ## 为什么采集在播放窗口、聚合在主窗口
+///
+/// 采集要贴着播放头（判断「拖过去之后有没有停下来看」），那只有播放窗口
+/// 做得到。而**聚合与落库**要读这部作品的**全部**样本、还要写结论列 ——
+/// 库在主窗口（与 [IntroRangeSaveRequest] 同一条边界）。
+///
+/// 所以这条消息只带**一条原始样本**，不带任何结论：结论由主窗口重算。
+/// 让播放窗口算结论是错的 —— 它手里只有这一集的样本，算出来的一定是
+/// 「这一集说了算」，而学习本来就是跨集聚合。
+///
+/// ## ⛔ 主窗口收到后**必须整体重聚合**，不能只把这条样本塞进去
+///
+/// 判据是中位数 + MAD：加一条样本既可能让样本数跨过门槛，也可能让**已有
+/// 结论失效**（散布被撑爆）。增量更新表达不了这两件事。
+@immutable
+class SkipAnchorReport {
+  const SkipAnchorReport({
+    required this.itemId,
+    required this.kind,
+    required this.anchorMs,
+    required this.durationMs,
+  });
+
+  /// 本地索引库里这一项的 id。主窗口据此查 `groupKey`。
+  ///
+  /// 与 [IntroRangeSaveRequest] 同一条：播放窗口只认 `itemId`，它连
+  /// `groupKey` 这个概念都没有。
+  final String itemId;
+
+  /// `intro` / `outro`（与 `SkipKind.name` 逐字一致）。
+  ///
+  /// ⚠️ 传字符串而不是序号：序号在两端各有一份枚举顺序，加一个值就会
+  /// 静默错位 —— 而错位的表现是「片尾样本被当成片头」，最难查的那种。
+  final String kind;
+
+  /// 落点（毫秒）。片头 = 从开头跳到的位置；片尾 = 「不想再看」的位置。
+  final int anchorMs;
+
+  /// 这次播放的总时长（毫秒）。片尾聚合要用它算距末尾的偏移。
+  final int durationMs;
+
+  bool get isEmpty => itemId.isEmpty || anchorMs <= 0 || durationMs <= 0;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'itemId': itemId,
+        'kind': kind,
+        'anchorMs': anchorMs,
+        'durationMs': durationMs,
+      };
+
+  /// 畸形输入返回 null（与 [IntroRangeSaveRequest.fromJson] 同口径）。
+  static SkipAnchorReport? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final itemId = raw['itemId'];
+    final kind = raw['kind'];
+    final anchor = raw['anchorMs'];
+    final duration = raw['durationMs'];
+    if (itemId is! String || itemId.isEmpty) return null;
+    if (kind is! String || kind.isEmpty) return null;
+    if (anchor is! int || anchor <= 0) return null;
+    if (duration is! int || duration <= 0) return null;
+    return SkipAnchorReport(
+      itemId: itemId,
+      kind: kind,
+      anchorMs: anchor,
+      durationMs: duration,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SkipAnchorReport &&
+          other.itemId == itemId &&
+          other.kind == kind &&
+          other.anchorMs == anchorMs &&
+          other.durationMs == durationMs;
+
+  @override
+  int get hashCode => Object.hash(itemId, kind, anchorMs, durationMs);
+
+  @override
+  String toString() => 'SkipAnchorReport($itemId, $kind, '
+      '${(anchorMs / 1000).round()}s/${(durationMs / 1000).round()}s)';
 }
 
 /// 进度回报的节流器。

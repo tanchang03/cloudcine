@@ -6856,3 +6856,286 @@ git tag v0.1.6  ·  pubspec.yaml 0.1.1+2  ·  settings_page _kAppVersion 0.1.0
   APK 文件名或 `dumpsys package com.cloudcine.tv | grep versionName`。
 - ⚠️ 本机 Agent 沙箱里 `grep` 对某些文件（`README.md`、`android/app/build.gradle.kts`）
   **静默返回空**，误判成「文件里没有」。改用 Grep 工具或 Read。
+
+---
+
+# 片头 / 片尾自动学习（2026-10-11，schema v18）
+
+需求原话：*「每次都要点击进度条跳过片头、到片尾时手动跳到下一集，但库里没有所有剧集的
+片头片尾时间点 —— 能不能按剧集为单位自动学习？」* 并特别要求考虑
+**「拖拽时间点不在片头片尾」**的场景。
+
+评估报告在 `docs/片头片尾-自动学习-可行性评估.md`；这里只记**落地后的设计取舍与陷阱**。
+
+## 13.1 为什么不能直接用「用户拖到哪儿」当片头
+
+拖拽这个动作**动机是多义的**：跳片头、跳片尾、拖到中间看剧情、误触、扫剧。
+直接记 `(from → to)` 学出来的是一团噪声。所以中间加一层**「有效落点」**：
+
+| 条件 | 理由 |
+|---|---|
+| `rate == 1.0` | 倍速下「位置」的语义变了（用户在扫剧），锚点与其他集不可比 |
+| `to - from >= 3s` | 幅度太小是误触 / 防抖抖动 |
+| `to > from` | 后退是「回看」，不是「跳过什么」 |
+| 落点之后**连续自然播放 ≥ 15s** 且不再 seek | 拖过去瞄一眼就再拖走的，不算 |
+
+**「拖拽点不在片头片尾」正是靠最后一条挡掉的**：用户拖到第 20 分钟看剧情，那也
+是个「有效落点」，但它落不进片头窗口（`15s ~ 3min`，且要求起播位置 < 30s），
+分类时直接返回 `null`，不进样本。
+
+## 13.2 ⛔ 片尾**没有**停留确认，只有「切集 / 退出」这一个信号
+
+片头有「起点 = 0」这个强锚，片尾没有 —— 「跳过片尾」与「快进去看结局」在信号上
+长得一模一样。而**停留确认是不可撤回的**（确认完 `pending` 就清了）：用户拖到片尾
+前 1 分钟、看 20 秒、然后把整集看完 —— 那说明那 60 秒里有内容，不是片尾，但确认
+早就发出去了。
+
+所以 `SkipAnchorCollector.notePosition` **只产片头**。片尾走另一条终态信号
+`noteEpisodeSwitch(positionMs, durationMs)`：用户「不想看了」的意图在**切下一集**
+这个动作上表达得比任何 seek 都清楚，而且它是终态，没有「再看一会儿」的可能。
+
+⛔ 传的是**切集那一刻**的播放头位置，不是「用户之前拖到哪儿」—— 传拖拽落点会把
+中间看过的内容也算进片尾。
+
+## 13.3 片尾存「距末尾偏移」，不存绝对时间
+
+各集片长不同（正片 45 分钟、特辑 60 分钟），绝对时间跨集不可比。所以
+`skip_samples` 同时存 `anchor_ms` 与 `duration_ms`，聚合时用
+`offset = duration - anchor`。`media_works` 侧只留 `learned_outro_offset_ms` 一列
+（**没有终点列** —— 终点恒为片长），播放时 `duration - offset` 现算。
+
+## 13.4 ⛔⛔ 自我实现：自动跳**绝不能**记成样本
+
+这是整个功能里最隐蔽的一条。自动跳片头 / 自动跳片尾都会产生「位置突变」与
+「换集」，而这两件事**正是采集器的输入**。不挡的话：采样点就是我们自己跳过去的
+那个位置 → 它变成一条「用户在这儿不想看了」的正样本 → 结论越喂越靠前 →
+**而它看起来完全像「越学越准」**。
+
+三处落实：
+
+| 端 | 路径 | 挡法 |
+|---|---|---|
+| PC 内置播放页 | `player_page.dart` | `_seek(..., user: false)` / `_openEpisode(reportSwitch: false)` |
+| PC 独立窗口 | `player_window_app.dart` | 同上（`_seek(target, user: false)` / `_openEpisode(entry, reportSwitch: false)`） |
+| Android | `PlayerActivity.kt` | `seekToPosition(..., user = false)` / `switchEpisode(next, fromOutro = true)` |
+
+Android 的 `fromOutro` 标记**只能挂在 Activity 实例上、由 `onNewIntent` 消费**：
+换集走的是 `startActivity(PlayerActivity)` + `singleTask`（见 `switchEpisode` 的类
+注释），系统**不会**新建实例，所以标记在 `onNewIntent` 里读到的是同一个对象。
+⛔ 标记必须在 `startActivity` **之前**挂上 —— 那条路是**同步**的。
+
+## 13.5 「当场学会」：新结论写回后必须同步进状态机
+
+用户第一次拖到片尾切集，样本就够了、结论立刻写回。如果只写库、不更新正在播的
+那个状态机，**这一集就再也不会提示** —— 而它恰恰是用户第一次手动操作的那一集。
+
+- PC：`PlaybackController.applyLearnedOutro(offset)` 里把 `_outroReached` **归零**；
+- Android：回调里 `learnedOutroOffsetMs = ...; outroHandled = false`。
+
+片头同理（`applyLearnedIntro` / `introSession.setLearned`）。
+
+## 13.6 两端阈值必须逐字同源
+
+`lib/domain/services/skip_learning.dart` ↔ `library/SkipLearning.kt`，**一个数都不能
+改**。两端各调一套的症状是「同一部剧，PC 学得出片头、电视学不出来」，而两边都
+「看起来对」，因为没有任何地方会报错。用镜像单测钉住：
+`test/domain/skip_learning_test.dart` ↔ `SkipLearningTest.kt`
+（含「阈值逐字一致」「`kind` 落库字符串一致」「样本主键两端可复现」三条跨端契约）。
+
+## 13.7 ⛔ 学习数据**不参与** `libraryModifiedAt()`
+
+与进度三列被摘掉同一条理由：学习是播放的副产品，算进同步判据会让「看一集」变成
+「上传一整份 `.ccbak`」。`saveLearnedSkip` / `clearLearnedSkip` **绝不写**
+`media_works.updated_at`。
+
+反过来，`skip_samples` 表**会随备份包一起走**（备份装的是整个库文件的字节）——
+这是**想要的**：两端各看几集，样本合起来更容易越过 `MIN_SAMPLES`（3）。
+
+## 13.8 恢复旧备份：新字段怎么补回来
+
+`.ccbak` 装的是**整个 SQLite 文件的原始字节**，恢复 = 覆盖 `cloudcine.sqlite`。
+所以「从旧版本恢复」拿到的可能是一个**结构比当前 schema 旧**的库。补结构有两条路：
+
+| | 触发条件 | 实现 |
+|---|---|---|
+| PC `onUpgrade` | `PRAGMA user_version` **小于**当前版本 | `app_database.dart` 的 `MigrationStrategy` |
+| PC `beforeOpen` **结构自检** | **每次打开都跑** | `_ensureSchemaComplete(Migrator(this))`，**不信任 `user_version`** |
+| Android `ensureSchema` | 每次打开 | `LibraryDb.ensureSchema`，补列时 `col.copy(notNull = false)` |
+
+⛔⛔ 只有 `onUpgrade` 是不够的。真实路径：
+**PC(v19) 导出 → 还没升级的电视(v17) 恢复 → 电视再导出 → PC 恢复**，
+落到 PC 手上的是「`user_version` = 17、结构已经是 19」的库。只靠 `onUpgrade`
+会跑一遍 v18 / v19 迁移、对**已存在**的列发 `ALTER TABLE … ADD COLUMN` ⇒
+`duplicate column name` ⇒ **恢复备份整个失败，而库文件其实已经换掉了**。
+
+⛔ `Migrator.addColumn` **不做存在性检查**（drift 2.31 实测），所以自检必须先查
+`PRAGMA table_info` 再决定加不加 —— 幂等是硬要求。
+
+回归测试：`test/data/db_schema_backfill_test.dart` 四组（基线 / 版本号被写小 /
+版本号是当前版但结构停在 v17 / 重复打开幂等）。第三组是**只有 `beforeOpen` 能救**的
+那种形态，也就是「恢复之后缺字段」最直接的样子。
+
+⚠️ 判据是 `newColumns = v18Columns ∪ v19Columns`（v17 之后新加的全部列）。
+⛔ 加列时必须同步扩这个列表 —— 漏钉的后果**不是报错**，而是「标了片尾，重开就没了」
+（手标组按组 LWW，缺列时整组被打回 `NULL`）。
+
+★★ 跨端契约守卫：`test/core/schema_consistency_test.dart` —— 读
+`android/.../library/LibrarySchema.kt` 的**源码**（正则抠 `text("x")`/`int("x")`/`real("x")`/
+`bool("x")` 与 `Table(name = "…")`）与 drift 运行时 `AppDatabase.memory().allTables` /
+`$columns` 做**集合比对**（两方向都查：Android 多的列 / PC 多的列分别报）。三条：
+`LibrarySchema.VERSION == AppDatabase.currentSchemaVersion`、`media_works` 列名相等、
+全表列名相等。⛔ 抠列名**必须先去掉行注释** —— Kotlin 注释里大量反引号包着的列名会被误抓。
+★ 它补上了 Android `LibrarySchemaTest` 期望 DDL 靠人手抄的盲区：**两端同时改错也会红**。
+
+## 13.9 Android 端零章节基础
+
+Media3 / ExoPlayer **不暴露容器章节**（PC 端有 `IntroMarkerDetector` 走章节）。
+所以两端的取值链**刻意不同**：
+
+- PC：**文件章节 > 手标 > 学习**
+- Android：**手标 > 学习**
+
+手标那两列（`intro_start_ms` / `intro_end_ms`）Android **没有界面可写**，但
+`WORK_COLUMNS` 里**必须读** —— PC 端标好的会随备份包过来，不读就是「电脑上标了
+片头，电视上不跳」，而两端都不报错。
+
+## 13.10 片尾默认**只提示不自动跳**
+
+误跳的代价是用户**直接丢掉结局**，不可逆。所以片尾自动跳跟着 `auto_play_next`
+走（PC `_onOutroReached` ↔ Android `maybeHandleOutro` 同形）：关掉时只弹
+「已到片尾」。而开着自动连播说明用户已经明确要过「这一集看完就接下一集」。
+
+## 13.11 真机自测清单
+
+1. 连电视：`android/tool/adb_tv.sh`（⛔ 别用仓库根那个，已死）。
+2. 找一部**没看过**的剧，连看 3 集，每集都在片头里手动拖到片头后、看到片尾前手动切下一集。
+3. 第 4 集起播应弹「已跳过片头」；到片尾应弹「已跳过片尾 · 播放下一集」（自动连播开着时）。
+4. 设置页（刮削设置）应能关掉「跳过片头 / 自动连播」，关掉后**立即生效**（下一集起）。
+5. ⛔ 排查时别 `logcat -d | tail -N`（会被截断），先落文件再 Grep。
+   关键字：`跳过片头` / `到达片尾` / `学习结论已更新` / `落点已记录`。
+
+## 13.12 手标片尾（v19）与跨引擎传参的两个坑
+
+**片尾两级，没有章节。** 片头的取值链是 `文件章节 > 手标 > 学习`，而片尾只有
+`手标 > 学习` —— 章节只标片头（`chapter-list` 推不出「片尾从哪儿开始」）。
+⛔⛔ 这条链与「片长 - 偏移」的换算**只有一份实现**（`OutroSkip`，两端各一个文件），
+所有调用点都委托它 —— 曾经散在四处各写一遍，见 §13.13。
+
+**⛔ 片尾存「距末尾的偏移」，换算必须在知道片长的那一侧做。**
+独立窗口回主窗口落库时，报上去的已经是 `片长 - 当前位置`（`IntroRangeSaveRequest.outroOffsetMs`）
+—— 主窗口拿不到片长。**片长未知时给提示、绝不记 0**：偏移 0 的落点就是片长本身，
+这部作品从此不再提示片尾，而界面上写着「已标记」。
+
+**⛔⛔ `PlayRequest.fromJson` 里「非正数当没有」这条规则只对「终点 / 偏移」成立，
+对「起点」是错的。** 库里 `learned_intro_start_ms` **存的就是字面量 0**
+（片头总在开头，`saveLearnedSkip` 写死 0）。按 `> 0` 归一成 `null` 的后果是
+`learnedIntroRange` 恒 `null` ⇒ **独立窗口永远用不上学出来的片头**，而内置播放页
+（不走这条通道）是好的 —— 用户只会觉得「窗口播放器有时候不跳片头」，两端都不报错。
+判据：`introStartMs` / `learnedIntroStartMs` 用 `>= 0`；`introEndMs` /
+`learnedIntroEndMs` / `outroOffsetMs` / `learnedOutroOffsetMs` 用 `> 0`。
+
+**⛔ JUnit 的 `Map.equals` 会拿 `Int` / `Long` 装箱类型去比。** 两个 Map 的
+`toString` 一模一样却判不相等（`ls` 一侧 `Int`、一侧 `Long`）。这类「跨端键名 / 形状」
+断言一律改成**比 `MiniJson.write(...)` 出来的文本** —— 那本来才是跨端的东西。
+
+## 13.13 ⛔⛔「读了但没用」：片尾手标两端各漏一次（2026-10-11 收尾自查）
+
+13 项任务全绿之后，顺着「简介页显示了，但播放时到底用不用」查了一遍，
+两端**各查出一个静默缺口**。这一类 bug 的共同形状是：
+
+```
+库列 → 实体（Work / MediaWork）→ 简介页显示 ✅
+                              ↘ 播放器：从来没看过这一列 ❌
+```
+
+界面正常、日志正常、**纯函数单测也全绿**（测的是 `OutroSkip` / `MediaWork.outroStart`
+这种叶子），只有真正播到片尾才发现「没跳」。
+
+### ① Android：`PlayerActivity` 只读了学习那一份
+
+`LibraryModels.kt` 的 `Work.outroOffsetMs` 文档写着「播放器**必须读**：不读就是
+『电脑上标了片尾，电视上不跳』」—— 而 `maybeHandleOutro` 里是
+`val offset = learnedOutroOffsetMs ?: return`。**手标片尾同步到电视、简介页也显示
+「手动标注」，播放时完全绕过。** 文档写了、实现没做，是最容易骗过 review 的一种。
+
+### ② PC：同一条链有**四份**各写各的
+
+`PlaybackController.outroStart`、`MediaWork.outroStart`、`MediaWork.learnedOutroStart`、
+`player_window_app._maybeNotifyOutro` 各写了一遍 `duration - offset`。
+而且**非正数口径两端不同源**：Android 把 `offset <= 0` 当「没标」，
+PC 会算出 `start = duration`（落点 = 片尾）—— 同一条链，两种行为。
+
+### 修法：把链收进一个纯函数，两端同形
+
+| 端 | 落点 | 取值链 + 换算 |
+|---|---|---|
+| Android | `library/IntroSkip.kt` | `object OutroSkip`（`Long` 毫秒） |
+| PC | `domain/services/intro_marker.dart` | `abstract final class OutroSkip`（`Duration`） |
+
+`effectiveOffset(手标, 学习)` + `start(片长, 偏移)`，三条守卫两端逐字一致：
+① 非正数当没标；② 片长未知不跳；③ 落点 ≤ 0 不跳（偏移 ≥ 片长 = 数据坏了）。
+
+调用点全部改为委托：Android 的 `PlayerActivity.maybeHandleOutro` + `Work.outroStart`
++ `Work.learnedOutroStart`；PC 的 `PlaybackController.outroStart` + `MediaWork` 两个
++ `player_window_app._maybeNotifyOutro` + 两个菜单的「手动标记 / 自动学习」文案判来源
+（`effectiveOffset(...)`，不再是 `manual != null`）。
+
+### ★★ 守卫：钉**接线**，不钉数值
+
+这类缺口纯函数单测永远抓不到，必须读源文件做静态检查（与 `ProgressWiringTest`
+同一套路）。**必须先剔注释** —— 本仓库注释里到处写着 `OutroSkip` / `outroOffsetMs`。
+
+- Android `SkipWiringTest`：两条支路都读 / 换流时手标也要归零 /
+  `maybeHandleOutro` 走 `OutroSkip` 且**不含**裸的 `learnedOutroOffsetMs ?:` /
+  `Work` 两个落点都委托 `OutroSkip.startMs`。
+- PC `test/core/outro_wiring_test.dart`：内置页传 `manualOutroOffset` /
+  `desktop_play.dart` 带 `outroOffsetMs`（**跨引擎那一跳**）/ 独立窗口走 `OutroSkip` /
+  控制器与 `MediaWork` 都委托 / `onSaveIntroRange` 调 `setWorkOutroOffset`。
+
+⛔ 两条守卫都做过**负向验证**（把 bug 放回去确认变红）—— 不验的守卫等于恒真断言：
+`SkipWiringTest` ⇒ `片尾判定走 OutroSkip 的取值链 FAILED`；
+`outro_wiring_test` ⇒ `独立窗口的 PlayRequest 带上手标片尾 [E]`。
+
+## 13.14 ⛔ 清除片头/片尾：库列与进度文件必须**一起**清
+
+同一个自查里查出的第三处，方向不同：不是「读了没用」，而是**「清了没留痕」**。
+
+片头 / 片尾的**真源是进度文件**，`media_works` 那几列只是物化投影。所以
+「清除」如果只写库、不动进度文件，后果不是「清得不彻底」，而是
+**「清掉了又自己回来」**：
+
+```
+① 点「清除学习结论」 → media_works 三列置 NULL ✅
+② 进度库内存里仍留着上一轮播种进来的学习组（hasLearned == true）
+③ 下一次同步（30 分钟一次 / 启动时）：
+     applySkipMarkerSnapshot 只写「有内容」的那一组
+   ⇒ 把旧结论原样写回 media_works ❌ —— 界面上明明写着「已清除」
+```
+
+**两端不对称**：Android 的 `LibraryDb.clearLearnedSkip` **一直**会调
+`progress.recordLearnedSkip(…全空…)`；PC 的 `MediaRepositoryImpl.clearLearnedSkip`
+**只写库**（2026-10-11 收尾自查时补上）。`clearWorkIntroRange` 那一侧 PC 是对的
+（写空手标组 + `mu` 前进），所以这个缺口只在学习那一组。
+
+回归测试：`test/data/skip_clear_progress_test.dart`（`DriftMediaRepository` +
+`AppDatabase.memory()` + 真 `ProgressStore`）。三条：
+① 清除学习后进度文件里那一组也空、`lu` 前进、手标组不受影响；
+② 清除手标同理（`mu` 前进、学习组不受影响）；
+③ ⚠️ **已知缺口**（见下）。①做过负向验证：去掉那一句 ⇒ 用例红。
+
+### ⚠️ 已知缺口：墓碑会被 `putSkip` 丢掉
+
+`WorkSkipEntry.isEmpty` 是**按内容**判的（`!hasManual && !hasLearned`），
+而 `putSkip` 遇到空条目**直接删掉整条**。于是当作品**只有**学习结论（没有手标）时：
+
+1. 清除 → 两组都空 → 整条被删 → 进度文件里**没有留下任何痕迹**；
+2. 下一轮 `mergeFrom(网盘那份)` → 旧结论又被合回来；
+3. `applySkipMarkerSnapshot` 看到 `hasLearned == true` → **写回 `media_works`**。
+
+即「清除了，过半小时又回来了」，且**两端都有**（不是不对称 bug）。
+
+修法（未做，跨端契约改动）：让 `isEmpty` 也看时间戳 —— `mu` / `lu` 前进过的
+空组 = **墓碑**，不算空；`applySkipMarkerSnapshot` 改用「时间戳 > 0」而不是
+「有没有内容」判「这一组我知道吗」。两端要一起改（JSON 形状不变，所以兼容）。
+改动面较大（还会影响 `needUpload` 判据与上传体积），单独排期。
+现状由第三个用例**如实钉住**，修好之后那条断言要改成 `isNull`。

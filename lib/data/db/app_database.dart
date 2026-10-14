@@ -23,6 +23,7 @@ part 'app_database.g.dart';
     Settings,
     PlaybackPrefs,
     DownloadTasks,
+    SkipSamples,
   ],
 )
 class AppDatabase extends _$AppDatabase {
@@ -98,6 +99,23 @@ class AppDatabase extends _$AppDatabase {
   ///        改成 17，两边列名 / 类型 / 默认值逐字一致。只改一端的话，
   ///        另一端 `restore` 之后 `user_version` 对不上，会直接
   ///        `no such column: followed` —— 而且**没有任何迁移来兜底**。
+  /// v18：新增 `skip_samples` 表 + `media_works` 加 6 列 ——
+  ///     「跳过片头 / 片尾」的自动学习。
+  ///
+  ///     * 新表 `skip_samples`：**原始落点样本**（每次播放都可能写一行），
+  ///       与 v14 / v16 同一种改动 —— 旧库升级后是空的，语义正好是
+  ///       「还没有任何样本」，不需要回填；
+  ///     * 6 列 `learned_intro_start_ms` / `learned_intro_end_ms` /
+  ///       `learned_outro_start_ms` / `learned_outro_end_ms` /
+  ///       `learned_samples` / `learned_at`：**聚合后的结论**。
+  ///       全 nullable（`learned_samples` 默认 0），默认值语义正好是
+  ///       「这部作品还没学过」⇒ 播放器回落到「章节 > 手标」的旧行为，
+  ///       与升级前完全一致，**不需要回填**，也**没法**回填
+  ///       （学习结果是用户看片行为攒出来的，旧库里根本没有）。
+  ///
+  ///     ⛔ 同样**必须两端同时改成 18**。这一版新增的是一张**表**，
+  ///        不是几列 —— 只改一端的话，另一端会少一整张表，
+  ///        而 `SkipSamples` 的写入会直接抛 `no such table: skip_samples`。
   /// 当前 schema 版本号（**静态常量**，供领域层引用）。
   ///
   /// ⛔ 必须是 `static const`：领域层 `LibraryBackupService` 要把它写进备份
@@ -106,7 +124,7 @@ class AppDatabase extends _$AppDatabase {
   ///    默认成 `6`，于是**所有备份清单里写的版本号都是 6**，
   ///    `importBackup` 的「备份来自更高版本」校验（`> schemaVersion`）
   ///    永远为假、形同虚设（2026-10-07 排查恢复报错时发现）。
-  static const int currentSchemaVersion = 17;
+  static const int currentSchemaVersion = 19;
 
   @override
   int get schemaVersion => currentSchemaVersion;
@@ -344,6 +362,39 @@ class AppDatabase extends _$AppDatabase {
             await m.addColumn(mediaWorks, mediaWorks.newItemCount);
             diag.info('数据库', '索引库已升级到 v17（追剧 / 更新提醒）');
           }
+          if (from < 18) {
+            // ⛔ 这一版**不需要回填**，也**没法**回填：学习结果是用户看片
+            //    行为攒出来的，旧库里根本没有这个信息。
+            //
+            //    6 个新列的默认值（`NULL` / `NULL` / `NULL` / `NULL` / `0` /
+            //    `NULL`）语义正好是「这部作品还没学过」⇒ 播放器回落到
+            //    「文件章节 > 手标」的旧行为，与升级前完全一致。
+            //
+            //    ⚠️ 尤其**不要**「顺手把片长前 90 秒当成片头写进去」：
+            //       那会让用户升级后看到一批**编出来的**片头，而播放器会
+            //       照着它自动跳 —— 跳错位置比不跳糟得多，且不可逆。
+            //
+            //    新表 `skip_samples` 与 v14 / v16 同一种改动：旧库升级后是
+            //    空的，语义正好是「还没有任何样本」。
+            //
+            // ⛔⛔ 走 [_ensureSchemaComplete] 而不是直接 `m.createTable` +
+            //     `m.addColumn`：后者**不幂等**，而这条迁移会在一条真实路径上
+            //     被重复触发（见那个方法的文档）。
+            await _ensureSchemaComplete(m);
+            diag.info('数据库', '索引库已升级到 v18（片头 / 片尾自动学习）');
+          }
+          if (from < 19) {
+            // v19：`media_works.outro_offset_ms`（**手标**的片尾偏移）。
+            //
+            // ⛔ 同样**不回填**：`NULL` 的语义正是「用户还没标过片尾」⇒
+            //    播放器回落到「只跳片头」的旧行为，与升级前完全一致。
+            //    编一个片尾出来比不跳糟得多，且不可逆。
+            //
+            // ⛔⛔ 同样走 [_ensureSchemaComplete]（幂等），不直接 `m.addColumn`
+            //     —— 理由与 v18 那条一字不差，见那个方法的文档。
+            await _ensureSchemaComplete(m);
+            diag.info('数据库', '索引库已升级到 v19（手标片尾偏移）');
+          }
           if (to > schemaVersion) {
             // 留一个显式的分支而不是空实现：将来加列时这里就是唯一的落点，
             // 而空的 onUpgrade 会让「忘了写迁移」变成一个静默的数据损坏。
@@ -353,6 +404,27 @@ class AppDatabase extends _$AppDatabase {
         beforeOpen: (details) async {
           // 外键在 SQLite 里默认是关的，必须每个连接显式打开。
           await customStatement('PRAGMA foreign_keys = ON');
+
+          // ⛔⛔ **结构自检**（每次打开都跑，正常情况是零操作）。
+          //
+          // 为什么不能只靠 `onUpgrade`：它只在 `PRAGMA user_version` **小于**
+          // 当前版本时才跑。而 `user_version` 是**可以被写小的** —— Android 端
+          // `LibraryDb.ensureSchema` 每次打开都把 `user_version` 对齐到它自己
+          // 那一版的常量（那是对的，它没有迁移、只补结构）。于是这条真实路径：
+          //
+          //     PC(v18) 导出备份 → 在**还没升级的**电视(v17)上恢复
+          //       → 电视导出备份 → PC 恢复
+          //
+          // 落到 PC 手上的是「`user_version` = 17、但结构已经是 18」的库。
+          // 只靠 `onUpgrade` 的话，这里会跑一遍 v18 迁移，而 SQLite 对
+          // **已存在**的列直接报 `duplicate column name` ⇒ 恢复备份整个失败，
+          // 用户看到的是「备份恢复不了」，而库文件其实已经换掉了。
+          //
+          // 所以这里**不信任 `user_version`**，拿 drift 的表定义当唯一真源
+          // 逐表比对实际结构。将来再加列时自动受益：只要 `tables.dart` 里
+          // 加了列，这里就会补上，不需要再写一遍。
+          await _ensureSchemaComplete(Migrator(this));
+
           // ⚠️ 这里的耗时**不是**「打开数据库花了多久」，而是「从申请打开到
           // 真正打开」—— `NativeDatabase.createInBackground` 是**懒**的，
           // 迁移与 `beforeOpen` 都发生在**第一次查询**时。所以这条记录要
@@ -367,6 +439,74 @@ class AppDatabase extends _$AppDatabase {
           diag.debug('数据库', '索引库已打开（v${details.versionNow}）$extra');
         },
       );
+
+  /// 把库里**缺失的表 / 列**补齐（幂等）。
+  ///
+  /// ## 只做三件事，且都不动数据
+  ///
+  ///   1. **缺表** → 按 `tables.dart` 的定义建（`createTable`）；
+  ///   2. **缺列** → `ALTER TABLE … ADD COLUMN`；
+  ///   3. 其余一律不碰 —— 不删表、不删列、不改类型、不改任何一行数据。
+  ///
+  /// 与 Android 端 `LibraryDb.ensureSchema` 是**同一件事、同一口径**，
+  /// 两端的差异只有一处：那边补列时**故意去掉 `NOT NULL`**（SQLite 的
+  /// `ADD COLUMN` 拒绝「`NOT NULL` 且无默认值」的列），这里则是失败后
+  /// 打日志跳过 —— 结果一样（列名与类型齐了，跨端互操作就成立），
+  /// 而日志更明确地指出是哪一列没能带上约束。
+  ///
+  /// ## 为什么幂等是硬要求
+  ///
+  /// `Migrator.addColumn` **不做存在性检查**（drift 2.31 实测：直接发
+  /// `ALTER TABLE … ADD COLUMN`），列已存在时 SQLite 抛
+  /// `duplicate column name`。而这条路径会被重复触发（见 `beforeOpen` 的
+  /// 文档），所以必须先查 `PRAGMA table_info` 再决定加不加。
+  Future<void> _ensureSchemaComplete(Migrator m) async {
+    final tableRows = await customSelect(
+      "SELECT name FROM sqlite_master WHERE type = 'table'",
+    ).get();
+    final existingTables = {for (final r in tableRows) r.read<String>('name')};
+
+    var created = 0;
+    var added = 0;
+    var failed = 0;
+
+    for (final entity in allSchemaEntities.whereType<TableInfo>()) {
+      final tableName = entity.actualTableName;
+      if (!existingTables.contains(tableName)) {
+        await m.createTable(entity);
+        created++;
+        continue;
+      }
+
+      final columnRows = await customSelect(
+        'PRAGMA table_info("$tableName")',
+      ).get();
+      final existingColumns = {for (final r in columnRows) r.read<String>('name')};
+
+      for (final column in entity.$columns) {
+        if (existingColumns.contains(column.$name)) continue;
+        try {
+          await m.addColumn(entity, column);
+          added++;
+        } on Object catch (e) {
+          // SQLite 拒绝给已有表加「`NOT NULL` 且无默认值」的列
+          // （`first_seen_at` / `updated_at` 这类）。跨端互操作只认
+          // **列名与类型**，少一个 `NOT NULL` 不影响读写 —— 但**不能静默**：
+          // 打出来，将来排查时能看见是哪一列。
+          failed++;
+          diag.warn('数据库', '补列失败：$tableName.${column.$name}：$e');
+        }
+      }
+    }
+
+    if (created > 0 || added > 0 || failed > 0) {
+      diag.info(
+        '数据库',
+        '结构自检：补建 $created 张表、$added 列'
+        '${failed > 0 ? "，$failed 列失败" : ""}',
+      );
+    }
+  }
 
   /// 清空全部索引数据（「重建媒体库」用）。
   ///

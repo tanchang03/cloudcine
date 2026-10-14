@@ -23,6 +23,33 @@ interface ProgressLibrary {
 
     /** 把一份进度书回填进库里三列；返回被更新的行数。 */
     fun applyProgressSnapshot(book: ProgressBook): Int
+
+    /**
+     * 把**作品行**上已有的片头 / 片尾读成一份进度书（只填 `works` 段，播种用）。
+     *
+     * ## 为什么要单独一个方法
+     *
+     * 粒度不同：进度是**每一条媒体项**（`media_items.id` = `provider:fileId`），
+     * 片头 / 片尾是**每一部作品**（`media_works.key` = `provider:groupId`）。
+     * 合成一个的话，书里两段的来源就说不清了，而它们「库里没有这一行怎么办」
+     * 的规则并不一样（见 [applySkipMarkerSnapshot]）。
+     *
+     * ⛔ `manualUpdatedAtSec` 一律 **0**：`media_works` 上没有「手标时刻」这一列
+     *    （只有学习那条路有 `learned_at`）。0 的语义是「有内容、但没有时间
+     *    依据」，合并时必输给任何带时间戳的一组 —— 与 [progressSnapshot] 里
+     *    `updatedAtSec` 用 `played_at` 兜底是同一个道理：进度库才是真源。
+     */
+    fun skipMarkerSnapshot(): ProgressBook
+
+    /**
+     * 把片头 / 片尾回填进 `media_works` 的对应列；返回被更新的行数。
+     *
+     * ⛔ **只写「有内容」的那一组**。与 [applyProgressSnapshot] 最大的区别：
+     *    那里 `null` 就是「没有可续的点」，可以照抄；这里「书里没有手标组」
+     *    可能有两种意思 —— 「用户清除了」和「这台机器根本不知道」—— 而它们在
+     *    书里长得一模一样。照抄会把第二种变成静默清空。
+     */
+    fun applySkipMarkerSnapshot(book: ProgressBook): Int
 }
 
 /**
@@ -142,9 +169,13 @@ class ProgressSync(
 
         // 1. 播种：库里的投影 → 进度库。只有第一次（或恢复备份之后）会真的合进
         //    东西，之后这一步恒为 0。
+        //
+        //    两段分开播：进度是**每一条媒体项**、片头 / 片尾是**每一部作品**，
+        //    来源与「没有这一行怎么办」的规则都不一样（见两个方法各自的文档）。
         var seeded = 0
         try {
             seeded = store.mergeFrom(library.progressSnapshot())
+            seeded += store.mergeFrom(library.skipMarkerSnapshot())
         } catch (e: Exception) {
             Log.w(TAG, "[进度] 从媒体库播种进度失败（继续走远程那一步）：$e")
         }
@@ -184,7 +215,14 @@ class ProgressSync(
         val needUpload: Boolean = if (remoteBytes == null) {
             store.book.isNotEmpty
         } else {
-            val union = ProgressBook(LinkedHashMap(ProgressBook.fromBytes(remoteBytes).items))
+            // ⛔ 两段都要塞进去。只放 `items` 的话，「网盘上那份只有片头标记、
+            //    本机又完全同意」会被算成「远程是空的 ⇒ 我全都要上传」，
+            //    于是每 30 分钟都白传一次（而上传是**有失败风险**的动作）。
+            val remoteBook = ProgressBook.fromBytes(remoteBytes)
+            val union = ProgressBook(
+                LinkedHashMap(remoteBook.items),
+                LinkedHashMap(remoteBook.works),
+            )
             union.mergeFrom(store.book) > 0
         }
 
@@ -208,8 +246,9 @@ class ProgressSync(
 
         Log.i(
             TAG,
-            "[进度] 同步完成：本地 ${store.book.length} 条 ｜ 播种 $seeded、" +
-                "合入 $mergedIn、回填 $applied 条 ｜ ${if (uploaded) "已上传" else "无需上传"}",
+            "[进度] 同步完成：本地 ${store.book.length} 条 + " +
+                "${store.book.workCount} 部作品 ｜ 播种 $seeded、" +
+                "合入 $mergedIn、回填 $applied 行 ｜ ${if (uploaded) "已上传" else "无需上传"}",
         )
         return Outcome(
             ok = true,
@@ -235,6 +274,7 @@ class ProgressSync(
         return try {
             store.load()
             store.mergeFrom(library.progressSnapshot())
+            store.mergeFrom(library.skipMarkerSnapshot())
             store.flush()
             applyToLibrary()
         } catch (t: Throwable) {
@@ -243,12 +283,20 @@ class ProgressSync(
         }
     }
 
-    /** 把进度库回填进媒体库；返回被更新的行数。失败不抛。 */
-    private fun applyToLibrary(): Int = try {
-        library.applyProgressSnapshot(store.book)
-    } catch (e: Exception) {
-        Log.w(TAG, "[进度] 回填媒体库失败（进度已落盘，下次再试）：$e")
-        0
+    /** 把进度库回填进媒体库；返回被更新的行数（媒体项 + 作品）。失败不抛。 */
+    private fun applyToLibrary(): Int {
+        var applied = 0
+        try {
+            applied += library.applyProgressSnapshot(store.book)
+        } catch (e: Exception) {
+            Log.w(TAG, "[进度] 回填媒体库进度失败（进度已落盘，下次再试）：$e")
+        }
+        try {
+            applied += library.applySkipMarkerSnapshot(store.book)
+        } catch (e: Exception) {
+            Log.w(TAG, "[进度] 回填媒体库片头/片尾失败（进度已落盘，下次再试）：$e")
+        }
+        return applied
     }
 
     private companion object {

@@ -12,6 +12,7 @@ import '../entities/scan_cursor.dart';
 import '../entities/work_poster.dart';
 import '../services/follow_plan.dart';
 import '../services/playback_progress.dart';
+import '../services/skip_learning.dart';
 
 /// 媒体库列表的排序方式。
 ///
@@ -197,11 +198,96 @@ abstract class MediaRepository {
   /// 记下这部作品的**片头终点**（毫秒）。起点原样保留。
   Future<void> setWorkIntroEnd(String key, int endMs);
 
-  /// 清除这部作品的片头标记（两列一起清）。
+  /// 记下这部作品的**片尾偏移**（毫秒，距末尾）。片头那两列原样保留。
+  ///
+  /// ## ⛔ 为什么存「距末尾」而不是绝对时间
+  ///
+  /// 用户在第 1 集标「41:30」，第 2 集片长不同（特辑更长、加长版更短），
+  /// 绝对时间搬过去就错了；而「离结尾还有 90 秒」在两集上是同一件事。
+  /// 播放时用 `片长 - 偏移` 现算落点。
+  Future<void> setWorkOutroOffset(String key, int offsetMs);
+
+  /// 清除这部作品的**手标**（片头起点 / 终点、片尾偏移，三列一起清）。
   ///
   /// ⚠️ 不能用 `copyWith(introStartMs: null)` 代替 —— `copyWith` 的 `??`
   /// 把 `null` 当「不改」，那是**清不掉的**（与 `mergedInto` 同一个坑）。
+  ///
+  /// ## ⛔ 三列为什么必须一起清
+  ///
+  /// 它们在进度文件里是**同一组**（[WorkSkipEntry] 的手标组，LWW 按组判胜负）。
+  /// 分成两个入口的话，「清除片头」之后进度文件里还剩一个带 `mu` 的片尾，
+  /// 下一次同步会把它原样铺回库里 —— 界面上看起来是「清不干净」。
+  ///
+  /// ⚠️ **不动学习那一组**：用户可能只是想回到「让它自己学」的状态。
   Future<void> clearWorkIntroRange(String key);
+
+  // -------------------------------------------------------------------
+  // 片头 / 片尾的自动学习（schema v18）
+  // -------------------------------------------------------------------
+  //
+  // 两层数据，分工明确：
+  //
+  //   * `skip_samples` —— **原始落点样本**（每次播放都可能写一行）；
+  //   * `media_works.learned_*` —— **聚合结论**（供播放器一次查询拿到）。
+  //
+  // ⛔ 三条红线：
+  //
+  //   1. **样本表不参与 `libraryModifiedAt()`**。那是每次播放都会写的
+  //      高频数据，算进同步判据会让「看一集」变成「上传一整份 `.ccbak`」，
+  //      而且常开机的设备会永远赢下 LWW 比较（与进度三列被摘掉同一条理由）。
+  //   2. **学习结论写回时也不许动 `updated_at`**。理由同上：它是播放的
+  //      副产品，不是「媒体库内容变了」。
+  //   3. **手标永远压过学习**。取区间时的优先级是 章节 > 手标 > 学习，
+  //      仓储层不负责合并，但**不许**让学习结果写进手标那两列 ——
+  //      那会让「这是你标的还是它学的」变成无法回答的问题。
+
+  /// 记一条**原始落点样本**。
+  ///
+  /// 同一个 id 重复写入时覆盖（见 `SkipSample.idFor`）。
+  Future<void> addSkipSample(SkipSample sample);
+
+  /// 取一部作品的**全部**样本（含负样本）。
+  ///
+  /// 不过滤负样本是有意的：聚合函数（`SkipLearning.learnIntro` /
+  /// `learnOutro`）自己会跳过它们，而「有多少条被否掉了」是 UI 与排查
+  /// 都想知道的信息。多传几条给纯函数，比在这里丢掉信息便宜。
+  Future<List<SkipSample>> skipSamplesForWork(String workKey);
+
+  /// 把学习结论写进作品行。
+  ///
+  /// ## ⛔ [outcome] 为空时**什么都不做**（保留上一次的结论）
+  ///
+  /// 样本是**累积**的：能学出来说明样本已经够了，后来再看几集只会让样本
+  /// 更多。所以「样本够、这次却没学出来」只有一种可能 —— 新样本把散布
+  /// （MAD）撑爆了。那时**清掉已有的好结论**，用户看到的是
+  /// 「本来跳得好好的，看了一集之后突然不跳了」，而且毫无线索。
+  ///
+  /// 想清除只能用 [clearLearnedSkip]（用户的显式动作）。
+  ///
+  /// ## 非空时是**整体写入**
+  ///
+  /// 「这次只学出片尾」必须把上一次学错的片头清掉 —— 所以实现里是逐列写
+  /// （含 `Value(null)`），不能借道 `MediaWork.copyWith`（它的 `??`
+  /// 把 `null` 当「不改」，清不掉）。
+  Future<void> saveLearnedSkip(
+    String key,
+    SkipLearningOutcome outcome, {
+    DateTime? now,
+  });
+
+  /// 清除这部作品的**学习结论**（样本保留）。
+  ///
+  /// ⛔ 刻意**不删样本**：用户点「清除」的意图通常是「学错了，别再用」，
+  ///    而不是「把学习历史抹掉」。留着样本，下一次播放攒够条件时会重新
+  ///    学出结论 —— 如果那时结果还是错的，说明规则本身有问题，
+  ///    而不是数据不够。
+  Future<void> clearLearnedSkip(String key);
+
+  /// 把某条样本标成**负样本**（用户撤销 / 明确否掉）。
+  ///
+  /// 撤销是「你学错了」这个判断的唯一来源，比正样本稀有得多，
+  /// 所以要单独留痕而不是把样本删掉。
+  Future<void> markSkipSampleNegative(String sampleId);
 
   // -------------------------------------------------------------------
   // 追剧 / 更新提醒（schema v17）
@@ -493,6 +579,65 @@ abstract class MediaRepository {
   /// 回填只会把投影**往前推**（最大位置只增不减、已读时间只前进），
   /// 所以「导出 → 回填」这一圈是幂等的，不会来回抖。
   Future<ProgressBook> progressSnapshot();
+
+  /// 从作品行里**导出**片头 / 片尾标记（手标 + 学习两组），只填 `works` 段。
+  ///
+  /// ## 为什么与 [progressSnapshot] 分开
+  ///
+  /// 两者回答的是**不同粒度**的问题：进度是**每一条媒体项**（`media_items.id`
+  /// = `provider:fileId`），片头 / 片尾是**每一部作品**（`media_works.key`
+  /// = `provider:groupId`）。合成一个方法的话，调用方拿到的书里两段的来源
+  /// 就说不清了，而它们各自的「没有这一行怎么办」规则并不一样
+  /// （见 [applySkipMarkerSnapshot]）。
+  ///
+  /// ## 为什么要播种
+  ///
+  /// 与 [progressSnapshot] 同一条理由：`media_works` 上那几列是**后加的**，
+  /// 而且**恢复 `.ccbak` 会把它们带过来、但不会带进度文件**（进度文件刻意
+  /// 不进备份包）。不播种的话，「从另一台机器恢复媒体库」之后，那台机器上
+  /// 标好的片头会停在库里、同步不到进度通道，也就到不了第三台设备。
+  ///
+  /// ## `manualUpdatedAtSec` 的取法（⛔ 记 0）
+  ///
+  /// `media_works` **没有**「手标时刻」这一列（只有学习那条路有 `learned_at`）。
+  /// 所以手标组播种出来时间戳一律 **0**，含义是「没有时间依据」—— 与
+  /// [progressSnapshot] 里 `updatedAtSec ?? 0` 是同一个口径：**让任何带时间
+  /// 戳的远程记录赢下这一组**。学习组则用 `learned_at`（Unix 秒），那是真的
+  /// 学习时刻，可以直接参与 LWW。
+  ///
+  /// 时间戳为 0 的那一组若另一组也空，这条就什么都不是 —— 调用方拿到的是
+  /// 一份**可能比 `media_works` 少**的快照，这是有意的（见上一条）。
+  Future<ProgressBook> skipMarkerSnapshot();
+
+  /// 把片头 / 片尾标记回填进 `media_works` 的对应列；返回被更新的行数。
+  ///
+  /// ## 只写「有内容」的那一组（⛔ 这是与进度回填最大的区别）
+  ///
+  /// 进度回填是「真源说什么就是什么」，因为 `null` 就是「没有可续的点」。
+  /// 片头 / 片尾不一样：一份书里没有某部作品的手标组，**可能**是「用户清除
+  /// 了」，也**可能**是「这台机器根本不知道」—— 两者在书里长得一模一样。
+  ///
+  /// 所以规则是**只在对应组有内容时才写那几列**：
+  ///
+  ///   * `entry.hasManual` 为真 → 写 `intro_start_ms` / `intro_end_ms` /
+  ///     `outro_offset_ms`（该组内部按原样写，含 `null`）；
+  ///   * `entry.hasLearned` 为真 → 写 `learned_intro_start_ms`（恒 `0`）/
+  ///     `learned_intro_end_ms` / `learned_outro_offset_ms` /
+  ///     `learned_samples` / `learned_at`；
+  ///   * 哪一组没内容 → 那几列**一列都不碰**。
+  ///
+  /// 「清除」因此走的是 [ProgressStore.recordManualSkip] 写入空手标组 +
+  /// `mu` 前进，再由这里把三列写成 `null` —— 而不是靠「书里没有这条」。
+  ///
+  /// ## 幂等
+  ///
+  /// 与 [applyProgressSnapshot] 同一条：每次启动、每次同步、每次扫描入库
+  /// 之后都会跑，绝大多数时候应当**只读不写**。所以先读回当前五列、在 Dart
+  /// 侧算差集，一致就跳过。
+  ///
+  /// ⛔ **不碰** `updated_at`：它参与媒体库同步判据（`libraryModifiedAt`），
+  ///    被一次回填扰动会让「看一集」变成「上传一整份备份」。
+  Future<int> applySkipMarkerSnapshot(ProgressBook book);
 
   /// 读某一条的播放偏好（画质 / 音轨 / 字幕 / 字幕开关 / 音效）。
   ///
@@ -797,6 +942,10 @@ class InMemoryMediaRepository implements MediaRepository {
   final Map<String, ScanCursor> _cursors = {};
   final Map<String, DateTime> _played = {};
 
+  /// 跳过片头 / 片尾的**原始落点样本**（按 `SkipSample.id` 去重，与
+  /// drift 实现的主键口径一致）。
+  final Map<String, SkipSample> _skipSamples = {};
+
   /// 续播位置。**没存过的条目不出现在这里**（与真实实现同一口径）。
   final Map<String, Duration> _resume = {};
 
@@ -1008,6 +1157,14 @@ class InMemoryMediaRepository implements MediaRepository {
               // 这两列恒为 `null`。照抄 = 每次重扫都抹掉用户标好的片头。
               introStartMs: existing.introStartMs,
               introEndMs: existing.introEndMs,
+              // 学习结果同理：它是**播放行为的产物**，重扫造出来的行这 5 列
+              // 恒为默认值。照抄 = 每次重扫都把攒了好几集才学出来的片头 /
+              // 片尾抹掉，而用户只看到「它又不会跳了」。
+              learnedIntroStartMs: existing.learnedIntroStartMs,
+              learnedIntroEndMs: existing.learnedIntroEndMs,
+              learnedOutroOffsetMs: existing.learnedOutroOffsetMs,
+              learnedSamples: existing.learnedSamples,
+              learnedAt: existing.learnedAt,
               updatedAt: now ?? w.updatedAt,
             )
           : w.copyWith(
@@ -1019,6 +1176,11 @@ class InMemoryMediaRepository implements MediaRepository {
               mergedInto: existing.mergedInto,
               introStartMs: existing.introStartMs,
               introEndMs: existing.introEndMs,
+              learnedIntroStartMs: existing.learnedIntroStartMs,
+              learnedIntroEndMs: existing.learnedIntroEndMs,
+              learnedOutroOffsetMs: existing.learnedOutroOffsetMs,
+              learnedSamples: existing.learnedSamples,
+              learnedAt: existing.learnedAt,
               updatedAt: now ?? w.updatedAt,
             );
     }
@@ -1265,6 +1427,84 @@ class InMemoryMediaRepository implements MediaRepository {
     return out;
   }
 
+  @override
+  Future<ProgressBook> skipMarkerSnapshot() async {
+    final out = ProgressBook();
+    for (final w in _works.values) {
+      final learnedSec = w.learnedAt?.millisecondsSinceEpoch == null
+          ? 0
+          : w.learnedAt!.millisecondsSinceEpoch ~/ 1000;
+      final entry = WorkSkipEntry(
+        introStartMs: w.introStartMs,
+        introEndMs: w.introEndMs,
+        outroOffsetMs: w.outroOffsetMs,
+        // 手标组没有时刻可依 —— 与真实实现逐字同口径（见接口文档）。
+        manualUpdatedAtSec: 0,
+        learnedIntroEndMs: w.learnedIntroEndMs,
+        learnedOutroOffsetMs: w.learnedOutroOffsetMs,
+        learnedSamples: w.learnedSamples,
+        learnedUpdatedAtSec: learnedSec,
+      );
+      if (entry.isEmpty) continue;
+      out.putSkip(w.key, entry);
+    }
+    return out;
+  }
+
+  @override
+  Future<int> applySkipMarkerSnapshot(ProgressBook book) async {
+    var changed = 0;
+    for (final e in book.works.entries) {
+      final w = _works[e.key];
+      if (w == null) continue;
+      final entry = e.value;
+      final learnedAt = entry.hasLearned
+          ? (entry.learnedUpdatedAtSec > 0
+              ? DateTime.fromMillisecondsSinceEpoch(
+                  entry.learnedUpdatedAtSec * 1000,
+                )
+              : w.learnedAt)
+          : w.learnedAt;
+
+      // 只写「有内容」的那一组（理由见接口文档）。
+      var next = w;
+      if (entry.hasManual) {
+        // ⛔ 先 `clearIntro` 再设值：`copyWith` 的 `??` 把 `null` 当「不改」，
+        //    而「用户只标了片头起点」这种半条标记是合法状态，必须真的写进去。
+        next = next.copyWith(clearIntro: true).copyWith(
+              introStartMs: entry.introStartMs,
+              introEndMs: entry.introEndMs,
+              outroOffsetMs: entry.outroOffsetMs,
+            );
+      }
+      if (entry.hasLearned) {
+        next = next.withLearnedSkip(
+          introStartMs: entry.learnedIntroEndMs == null ? null : 0,
+          introEndMs: entry.learnedIntroEndMs,
+          outroOffsetMs: entry.learnedOutroOffsetMs,
+          samples: entry.learnedSamples,
+          at: learnedAt,
+        );
+      }
+      if (!_sameSkipColumns(w, next)) {
+        _works[e.key] = next;
+        changed++;
+      }
+    }
+    return changed;
+  }
+
+  /// 片头 / 片尾那 8 列有没有变（内存实现里就是比实体字段）。
+  static bool _sameSkipColumns(MediaWork a, MediaWork b) =>
+      a.introStartMs == b.introStartMs &&
+      a.introEndMs == b.introEndMs &&
+      a.outroOffsetMs == b.outroOffsetMs &&
+      a.learnedIntroStartMs == b.learnedIntroStartMs &&
+      a.learnedIntroEndMs == b.learnedIntroEndMs &&
+      a.learnedOutroOffsetMs == b.learnedOutroOffsetMs &&
+      a.learnedSamples == b.learnedSamples &&
+      a.learnedAt == b.learnedAt;
+
   /// 毫秒 → [Duration]；`null` / 非正数一律当「没有」。
   ///
   /// 与 `saveResumePosition` / `saveMaxPosition` 的口径一致：0 不是
@@ -1386,6 +1626,14 @@ class InMemoryMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<void> setWorkOutroOffset(String key, int offsetMs) async {
+    final work = _works[key];
+    if (work == null) return;
+    // 与 drift 实现同一口径：0 秒的片尾没有意义（写 `null` 才是「没标」）。
+    _works[key] = work.copyWith(outroOffsetMs: offsetMs <= 0 ? null : offsetMs);
+  }
+
+  @override
   Future<void> clearWorkIntroRange(String key) async {
     final work = _works[key];
     if (work == null) return;
@@ -1396,6 +1644,69 @@ class InMemoryMediaRepository implements MediaRepository {
     // `mergedInto`，清一次片头就会顺手把跨目录归一拆开；漏了 `followed`，
     // 清一次片头就会顺手取消追剧。
     _works[key] = work.copyWith(clearIntro: true);
+  }
+
+  // -------------------------------------------------------------------
+  // 片头 / 片尾的自动学习（schema v18）
+  // -------------------------------------------------------------------
+
+  @override
+  Future<void> addSkipSample(SkipSample sample) async {
+    _skipSamples[sample.id] = sample;
+  }
+
+  @override
+  Future<List<SkipSample>> skipSamplesForWork(String workKey) async => [
+        for (final s in _skipSamples.values)
+          if (s.workKey == workKey) s,
+      ];
+
+  @override
+  Future<void> saveLearnedSkip(
+    String key,
+    SkipLearningOutcome outcome, {
+    DateTime? now,
+  }) async {
+    final work = _works[key];
+    if (work == null) return;
+    // ⛔ 什么都没学出来时**什么都不做** —— 保留上一次的结论
+    //    （理由见接口文档：样本是累积的，清掉已有的好结论只会让用户
+    //    看到「本来跳得好好的，看了一集之后突然不跳了」）。
+    if (outcome.isEmpty) return;
+    // 与 drift 实现同一口径：整体写入（含清掉没学出来的那一半）。
+    _works[key] = work.withLearnedSkip(
+      introStartMs: outcome.intro == null ? null : 0,
+      introEndMs: outcome.intro?.end.inMilliseconds,
+      outroOffsetMs: outcome.outro?.offset.inMilliseconds,
+      samples: outcome.samples,
+      at: now ?? DateTime.now(),
+    );
+  }
+
+  @override
+  Future<void> clearLearnedSkip(String key) async {
+    final work = _works[key];
+    if (work == null) return;
+    // ⛔ 样本**不删** —— 见接口文档：用户点「清除」的意思是「别再用」，
+    //    不是「把学习历史抹掉」。
+    _works[key] = work.copyWith(clearLearned: true);
+  }
+
+  @override
+  Future<void> markSkipSampleNegative(String sampleId) async {
+    final sample = _skipSamples[sampleId];
+    if (sample == null) return;
+    _skipSamples[sampleId] = SkipSample(
+      id: sample.id,
+      itemId: sample.itemId,
+      workKey: sample.workKey,
+      kind: sample.kind,
+      anchor: sample.anchor,
+      duration: sample.duration,
+      negative: true,
+      device: sample.device,
+      createdAt: sample.createdAt,
+    );
   }
 
   // -------------------------------------------------------------------

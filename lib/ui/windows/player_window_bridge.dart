@@ -151,6 +151,24 @@ abstract final class PlayerBridgeMethod {
   /// 所以「标记片头」这个动作在那边只是**把值报回来**。
   static const String saveIntroRange = 'saveIntroRange';
 
+  /// 播放窗口 → 主窗口：「我在这一集采集到了一个有效落点，拿去学习」。
+  ///
+  /// 参数是 [SkipAnchorReport.toJson]，**不返回值** —— 与 [saveAudioEffect]
+  /// 一样是单向通知：采集发生在播放窗口（只有它贴着播放头），而聚合与落库
+  /// 要读这部作品的**全部**样本、还要写结论列，库在主窗口。
+  ///
+  /// ## ⛔ 为什么不能让它自己算结论
+  ///
+  /// 学习是**跨集聚合**（中位数 + MAD），播放窗口手里只有这一集的两条样本。
+  /// 让它算就等于「这一集说了算」，而单集恰恰是最不可信的那份数据。
+  ///
+  /// ## 为什么失败也不回传
+  ///
+  /// 用户什么都没做（他没点任何按钮，是播放行为自己攒出来的样本）。
+  /// 为一次写库失败弹提示，与他的操作毫无关系；而这条通知丢了，
+  /// 最坏结果只是「这次少一条样本」—— 下一次播放还会再攒。
+  static const String saveSkipAnchor = 'saveSkipAnchor';
+
   /// 播放窗口 → 主窗口：「这一条是不是已经没了？能删到哪一层？」
   ///
   /// 参数是 `{'itemId': …}`，返回 [MissingMediaBrief.toJson]，或 `null`
@@ -316,6 +334,15 @@ Future<String?> Function(int fileId)? onFetchOnlineSubtitle;
 /// 那会被读成「点了没反应」。
 Future<IntroRangeSnapshot?> Function(IntroRangeSaveRequest request)?
     onSaveIntroRange;
+
+/// 播放窗口报回一个「有效落点」样本时，主窗口该做什么。
+///
+/// 与 [onSaveIntroRange] 同样的理由必须由 UI 层装上（要拿仓储）。
+///
+/// **没有返回值**：这是一条单向通知。样本本身在播放窗口那边已经产生了，
+/// 落库只决定「能不能攒够样本学出结论」。为一次写库失败弹提示，
+/// 与用户的操作（他只是在看剧）毫无关系。
+Future<void> Function(SkipAnchorReport report)? onSaveSkipAnchor;
 
 /// 播放窗口把用户选的「音效」预设报回来时，主窗口该做什么。
 ///
@@ -624,6 +651,27 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
         return null;
       }
       return snapshot.toJson();
+
+    case PlayerBridgeMethod.saveSkipAnchor:
+      final report = SkipAnchorReport.fromJson(call.arguments);
+      if (report == null || report.isEmpty) {
+        diag.warn('窗口', '收到解不开的落点样本，忽略');
+        return null;
+      }
+      final anchorHandler = onSaveSkipAnchor;
+      if (anchorHandler == null) {
+        // ⛔ 与其它回调不同，这一条**不当作错误**：落点样本是播放行为自己
+        //    攒出来的，用户什么都没点。没有回调（比如某次构造忘了装）
+        //    只是「这次学不到东西」，不该刷一条 warn 让日志变吵。
+        diag.debug('窗口', '播放窗口报回落点样本，但没有装上处理回调');
+        return null;
+      }
+      diag.info('窗口', '播放窗口报回落点样本：$report');
+      // ⛔ 不 catch、也不回传错误：聚合失败最坏只是这次少一条样本，
+      //    而把它变成一条 PlatformException 会让播放窗口那边多一段
+      //    与用户操作毫无关系的错误提示。
+      await anchorHandler(report);
+      return null;
 
     case PlayerBridgeMethod.queryMissingMedia:
       final itemId = call.arguments is Map

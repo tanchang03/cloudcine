@@ -342,6 +342,200 @@ class WorkDetailFormatTest {
     }
 
     // ==================================================================
+    // 片头 / 片尾那一行（schema v18）
+    // ==================================================================
+
+    /**
+     * ⛔ **什么都没学出来时必须是 `null`**（整行 `GONE`），不能是空串。
+     *    返回空串的话调用方会画出一行「高度还在、内容没有」的空白 ——
+     *    简介页头部本来就挤，这一行空白是纯浪费。
+     */
+    @Test
+    fun `没学出来时不画那一行`() {
+        assertNull(WorkDetailFormat.skipLine(work()))
+    }
+
+    /**
+     * 半条标记（只学到终点、没学到起点）当**没有** —— 判据与
+     * `IntroMarker.fromMilliseconds` 共用一份实现。各写一套的话，症状是
+     * 「手标的能跳、学出来的跳不了」。
+     */
+    @Test
+    fun `半条标记不算学出来`() {
+        assertNull(WorkDetailFormat.skipLine(work(learnedIntroEndMs = 92_000L)))
+    }
+
+    @Test
+    fun `学出来的片头标成自动学习`() {
+        assertEquals(
+            "片头 00:00–01:32（自动学习）",
+            WorkDetailFormat.skipLine(
+                work(learnedIntroStartMs = 0L, learnedIntroEndMs = 92_000L),
+            ),
+        )
+    }
+
+    /**
+     * ⛔ **手标优先**：库里两组列可以同时有值，生效的是手标那一条
+     *    （取值链在 `IntroSession.marker`，这里只如实说出来）。压反了会让
+     *    「我明明标过，它却按自己学的显示」。
+     */
+    @Test
+    fun `手标压过学习`() {
+        assertEquals(
+            "片头 00:00–01:45（手动标注）",
+            WorkDetailFormat.skipLine(
+                work(
+                    introStartMs = 0L,
+                    introEndMs = 105_000L,
+                    learnedIntroStartMs = 0L,
+                    learnedIntroEndMs = 92_000L,
+                ),
+            ),
+        )
+    }
+
+    /**
+     * ⛔ 片尾写「距末尾 X」而不是绝对时间：各集片长不同，绝对时间在同一部剧
+     *    里对不上。这一行上印绝对时间是**没有意义的数**。
+     */
+    @Test
+    fun `片尾写距末尾的偏移`() {
+        assertEquals(
+            "片尾 距末尾 01:20（自动学习）",
+            WorkDetailFormat.skipLine(work(learnedOutroOffsetMs = 80_000L)),
+        )
+    }
+
+    /**
+     * v19：**手标**的片尾优先于学出来的那条 —— 与片头那一半同一条取值链
+     * （手标 > 学习），而括号里必须如实说「手动标注」。
+     *
+     * ⛔ 两条链各判各的：片头手标、片尾学习是完全合法的组合（用户在 PC 上
+     *    只标了片头），不能因为片头是手标就把片尾也写成手标。
+     */
+    @Test
+    fun `手标片尾压过学出来的片尾，且如实地标成手动标注`() {
+        assertEquals(
+            "片尾 距末尾 01:20（手动标注）",
+            WorkDetailFormat.skipLine(
+                work(outroOffsetMs = 80_000L, learnedOutroOffsetMs = 95_000L),
+            ),
+        )
+    }
+
+    @Test
+    fun `片头手标 + 片尾学习：两个括号各说各的来源`() {
+        assertEquals(
+            "片头 00:00–01:00（手动标注） · 片尾 距末尾 01:35（自动学习）",
+            WorkDetailFormat.skipLine(
+                work(
+                    introStartMs = 0L,
+                    introEndMs = 60_000L,
+                    learnedOutroOffsetMs = 95_000L,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `片头与片尾同时有值用间隔号连起来`() {
+        assertEquals(
+            "片头 00:00–01:32（自动学习） · 片尾 距末尾 01:20（自动学习）",
+            WorkDetailFormat.skipLine(
+                work(
+                    learnedIntroStartMs = 0L,
+                    learnedIntroEndMs = 92_000L,
+                    learnedOutroOffsetMs = 80_000L,
+                ),
+            ),
+        )
+    }
+
+    /** 偏移为 0 是「片尾就在最末尾」—— 跳它毫无意义，当没学过。 */
+    @Test
+    fun `片尾偏移为零不算数`() {
+        assertNull(WorkDetailFormat.skipLine(work(learnedOutroOffsetMs = 0L)))
+    }
+
+    /**
+     * ⛔ 「清除学习」只看**学习**结论，不看手标：手标是用户自己在电脑上标的，
+     *    电视既改不了也不该由电视清掉 —— 给一颗点了没反应的菜单项比不给更糟。
+     */
+    @Test
+    fun `只有手标时不提供清除学习的入口`() {
+        assertFalse(
+            WorkDetailFormat.canClearLearnedSkip(work(introStartMs = 0L, introEndMs = 105_000L)),
+        )
+    }
+
+    @Test
+    fun `学过片头或片尾才提供清除学习的入口`() {
+        assertTrue(
+            WorkDetailFormat.canClearLearnedSkip(
+                work(learnedIntroStartMs = 0L, learnedIntroEndMs = 92_000L),
+            ),
+        )
+        assertTrue(WorkDetailFormat.canClearLearnedSkip(work(learnedOutroOffsetMs = 80_000L)))
+        assertFalse(WorkDetailFormat.canClearLearnedSkip(work()))
+    }
+
+    // ==================================================================
+    // 片尾落点（schema v19）—— 手标与学习是两条独立支路
+    // ==================================================================
+    //
+    // ⛔ 这两个方法**读的是两组不同的列**（`outro_offset_ms` vs
+    //    `learned_outro_offset_ms`）。这里防的不是「换算写错」（那在
+    //    `OutroSkipTest` 里），而是**读错列**：把 `outroStart` 实现成读学习那份，
+    //    表现就是「在电脑上标了片尾，电视上不跳」。
+
+    @Test
+    fun `手标片尾落点用这一集的片长现算`() {
+        val duration = 45 * 60_000L
+
+        assertEquals(
+            "存的是「距末尾 90 秒」，不是绝对时间 —— 各集片长不同",
+            duration - 90_000L,
+            work(outroOffsetMs = 90_000L).outroStart(duration),
+        )
+    }
+
+    @Test
+    fun `没标过片尾就没有落点`() {
+        val duration = 45 * 60_000L
+
+        assertNull(work().outroStart(duration))
+        assertNull(work().learnedOutroStart(duration))
+    }
+
+    @Test
+    fun `手标与学习各读各的列`() {
+        val duration = 45 * 60_000L
+        val w = work(outroOffsetMs = 120_000L, learnedOutroOffsetMs = 90_000L)
+
+        assertEquals(
+            "手标那份归 outroStart",
+            duration - 120_000L,
+            w.outroStart(duration),
+        )
+        assertEquals(
+            "学习那份归 learnedOutroStart —— 合成一个方法就把优先级链藏起来了",
+            duration - 90_000L,
+            w.learnedOutroStart(duration),
+        )
+    }
+
+    @Test
+    fun `片长未知或偏移过大时片尾没有落点`() {
+        assertNull(work(outroOffsetMs = 90_000L).outroStart(0L))
+        assertNull(
+            "偏移 ≥ 片长说明数据坏了（比如换了一集更短的），不跳比乱跳好",
+            work(outroOffsetMs = 90_000L).outroStart(60_000L),
+        )
+        assertNull(work(learnedOutroOffsetMs = 90_000L).learnedOutroStart(60_000L))
+    }
+
+    // ==================================================================
 
     /**
      * 造一部作品。
@@ -364,6 +558,12 @@ class WorkDetailFormatTest {
         itemCount: Int = 0,
         seasonCount: Int = 0,
         resumeFraction: Double? = null,
+        introStartMs: Long? = null,
+        introEndMs: Long? = null,
+        outroOffsetMs: Long? = null,
+        learnedIntroStartMs: Long? = null,
+        learnedIntroEndMs: Long? = null,
+        learnedOutroOffsetMs: Long? = null,
     ) = Work(
         key = "quark:abc",
         kind = kind,
@@ -385,5 +585,11 @@ class WorkDetailFormatTest {
         firstSeenAt = null,
         lastPlayedAt = null,
         resumeFraction = resumeFraction,
+        introStartMs = introStartMs,
+        introEndMs = introEndMs,
+        outroOffsetMs = outroOffsetMs,
+        learnedIntroStartMs = learnedIntroStartMs,
+        learnedIntroEndMs = learnedIntroEndMs,
+        learnedOutroOffsetMs = learnedOutroOffsetMs,
     )
 }

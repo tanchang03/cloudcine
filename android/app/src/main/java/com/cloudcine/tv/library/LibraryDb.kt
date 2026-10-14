@@ -17,7 +17,7 @@ import java.io.File
  *
  *   * ⛔ **不写任何迁移**。Android 不实现 v1→v16 那 15 步 —— 那不是它的活。
  *     打开时只做一件事：把缺失的表 / 列**补上**（见 [ensureSchema]），
- *     然后把 `user_version` 对齐到 16。补列只加名字与类型，不加 `NOT NULL`
+ *     然后把 `user_version` 对齐到 [LibrarySchema.VERSION]。补列只加名字与类型，不加 `NOT NULL`
  *     （SQLite 不允许给已有表加 `NOT NULL` 且无默认值的列）。
  *   * ⛔ **不用 WAL**。备份包装的是**单个文件的原始字节**，而 WAL 下最新
  *     的数据可能还在 `-wal` 里 —— 那样导出去的库是**旧的**，而且不会有
@@ -643,6 +643,200 @@ class LibraryDb(
         } finally {
             d.endTransaction()
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 片头 / 片尾的自动学习（schema v18）
+    // ------------------------------------------------------------------
+    //
+    // 与 PC 端 `DriftMediaRepository` 的同名方法一一对应。三条规矩必须两边一致：
+    //
+    //   1. ⛔ **绝不写 `media_works.updated_at`**。学习是播放的副产品，不是
+    //      「媒体库内容变了」；写它会让同步判据 `libraryModifiedAt()` 跟着变，
+    //      于是「看一集」变成「上传一整份 `.ccbak`」（与进度三列被摘掉同一条）。
+    //   2. ⛔ **手标永远压过学习**。学习结果只写 `learned_*` 三列，**不许**碰
+    //      `intro_start_ms` / `intro_end_ms` —— 那会让「这是你标的还是它学的」
+    //      变成无法回答的问题。
+    //   3. ⛔ 结论为空时 [saveLearnedSkip] **什么都不做**（保留上一次的结论）。
+
+    /**
+     * 记一条**原始落点样本**。
+     *
+     * 同一个 id 重复写入时覆盖（见 [SkipSample.idFor]）—— 用 `REPLACE` 而不是
+     * `INSERT`：两端各自生成 id 时不会撞车，但同一台设备重放同一毫秒的样本
+     * 是可能的，那时覆盖比抛异常合适。
+     */
+    fun addSkipSample(sample: SkipSample) {
+        val values = ContentValues().apply {
+            put("id", sample.id)
+            put("item_id", sample.itemId)
+            put("work_key", sample.workKey)
+            put("kind", sample.kind.dbName)
+            put("anchor_ms", sample.anchorMs)
+            put("duration_ms", sample.durationMs)
+            put("offset_ms", sample.offsetMs)
+            put("negative", if (sample.negative) 1 else 0)
+            put("device", sample.device)
+            // ⛔ 时间列一律 Unix **秒**（drift 的 `DateTimeColumn` 默认就是
+            //    `unix`）。写毫秒的话，PC 端会把 1970 年附近的日期当成
+            //    「最近」，按时间排序全乱。
+            put("created_at", sample.createdAtMs / 1000L)
+        }
+        require().insertWithOnConflict(
+            "skip_samples",
+            null,
+            values,
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    /**
+     * 取一部作品的**全部**样本（含负样本），按时间升序。
+     *
+     * 不过滤负样本是有意的：聚合函数（[SkipLearning.learnIntro] /
+     * [SkipLearning.learnOutro]）自己会跳过它们，而「有多少条被否掉了」是排查
+     * 时想知道的信息。多传几条给纯函数，比在这里丢掉信息便宜。
+     *
+     * ⛔ `kind` 认不出来的行**直接跳过**，不要当成片头 —— 猜错会污染整个聚合
+     *    （与 `SkipKind.parse` 返回 `null` 同一条理由）。
+     */
+    fun skipSamplesForWork(workKey: String): List<SkipSample> {
+        val out = ArrayList<SkipSample>(16)
+        require().rawQuery(
+            "SELECT id, item_id, work_key, kind, anchor_ms, duration_ms, " +
+                "negative, device, created_at FROM skip_samples " +
+                "WHERE work_key = ? ORDER BY created_at ASC",
+            arrayOf(workKey),
+        ).use { c ->
+            while (c.moveToNext()) {
+                val kind = SkipKind.parse(c.strOrNull("kind")) ?: continue
+                val anchorMs = c.longOrNull("anchor_ms") ?: continue
+                val durationMs = c.longOrNull("duration_ms") ?: continue
+                out.add(
+                    SkipSample(
+                        id = c.str("id"),
+                        itemId = c.str("item_id"),
+                        workKey = c.str("work_key"),
+                        kind = kind,
+                        anchorMs = anchorMs,
+                        durationMs = durationMs,
+                        negative = c.boolOrFalse("negative"),
+                        device = c.str("device"),
+                        createdAtMs = (c.longOrNull("created_at") ?: 0L) * 1000L,
+                    ),
+                )
+            }
+        }
+        return out
+    }
+
+    /**
+     * 把学习结论写进作品行。
+     *
+     * ## ⛔ [outcome] 为空时**什么都不做**（保留上一次的结论）
+     *
+     * 样本是**累积**的：能学出来说明样本已经够了，后来再看几集只会让样本更多。
+     * 所以「样本够、这次却没学出来」只有一种可能 —— 新样本把散布（MAD）撑爆了。
+     * 那时清掉已有的好结论，用户看到的是「本来跳得好好的，看了一集之后突然
+     * 不跳了」，而且毫无线索。想清除只能用 [clearLearnedSkip]。
+     *
+     * ## 非空时是**整体写入**
+     *
+     * 「这次只学出片尾」必须把上一次学错的片头清掉 —— 所以三列一起写死
+     * （含 `null`），不是「只改这次学到的那一列」。
+     *
+     * @param nowSec 由调用方注入是为了可测。
+     */
+    fun saveLearnedSkip(
+        key: String,
+        outcome: SkipLearningOutcome,
+        nowSec: Long = nowSec(),
+    ) {
+        if (outcome.isEmpty) return
+        val values = ContentValues().apply {
+            // 片头起点恒为 `0`（片头总在开头）。写成 `null` 会让
+            // `IntroMarker.fromMilliseconds` 把整条当没有 —— 于是「学出了片头
+            // 终点」和「什么都没学出来」在库里长得一样。
+            put("learned_intro_start_ms", if (outcome.intro == null) null else 0L)
+            put("learned_intro_end_ms", outcome.intro?.endMs)
+            put("learned_outro_offset_ms", outcome.outro?.offsetMs)
+            put("learned_samples", outcome.samples)
+            put("learned_at", nowSec)
+            // ⛔ 不写 `updated_at`（本节顶部第 1 条）。
+        }
+        require().update("media_works", values, "key = ?", arrayOf(key))
+        // ⛔ 真源是**进度文件**，不是这五列。只写库的话这次学出来的结论
+        //    永远到不了别的设备：`.ccbak` 备份包里没有进度文件，片头 / 片尾
+        //    走的是 `ProgressSync` 那条独立通道（见 `WorkSkipEntry` 的类文档）。
+        progress?.recordLearnedSkip(
+            key,
+            introEndMs = outcome.intro?.endMs,
+            outroOffsetMs = outcome.outro?.offsetMs,
+            samples = outcome.samples,
+        )
+    }
+
+    /**
+     * 清除这部作品的**学习结论**（样本保留）。
+     *
+     * ⛔ 刻意**不删样本**：用户点「清除」的意图通常是「学错了，别再用」，而不是
+     *    「把学习历史抹掉」。留着样本，下一次播放攒够条件时会重新学出结论 ——
+     *    如果那时结果还是错的，说明规则本身有问题，而不是数据不够。
+     *
+     * ⛔ 不写 `updated_at`（同 [saveLearnedSkip]）。
+     */
+    fun clearLearnedSkip(key: String) {
+        val values = ContentValues().apply {
+            putNull("learned_intro_start_ms")
+            putNull("learned_intro_end_ms")
+            putNull("learned_outro_offset_ms")
+            put("learned_samples", 0)
+            putNull("learned_at")
+        }
+        require().update("media_works", values, "key = ?", arrayOf(key))
+        // 进度文件里记一个**空的学习组**：三列都 `null`，但 `lu` 前进了 ——
+        // 这才是「清除」这件事能在 LWW 里赢过旧结论、并同步出去的表达方式
+        // （整组替换，见 `WorkSkipEntry.mergedWith`）。
+        progress?.recordLearnedSkip(key, introEndMs = null, outroOffsetMs = null, samples = 0)
+    }
+
+    /**
+     * 把某条样本标成**负样本**（用户撤销 / 明确否掉）。
+     *
+     * 撤销是「你学错了」这个判断的唯一来源，比正样本稀有得多，所以要单独留痕
+     * 而不是把样本删掉 —— 删掉之后「为什么这部没学出来」就查不出原因了。
+     */
+    fun markSkipSampleNegative(sampleId: String) {
+        require().update(
+            "skip_samples",
+            ContentValues().apply { put("negative", 1) },
+            "id = ?",
+            arrayOf(sampleId),
+        )
+    }
+
+    /**
+     * 每部作品最多留多少条样本。
+     *
+     * ⛔ 留余量而不是「够 `MIN_SAMPLES` 就停」：中位数 + MAD 是**抗离群点**的，
+     *    样本越多越稳（一个 20 分钟的离群点在 4 条里还能被 MAD 挡住，在 50 条里
+     *    更是无足轻重）。而每条样本只有几十字节，40 条远不到值得清的程度。
+     */
+    private val skipSampleCap = 40
+
+    /**
+     * 清掉一部作品**多余**的样本（按时间保留最新的 [skipSampleCap] 条）。
+     *
+     * 不清理的后果不是「学错」，而是这张表会随观看无限增长 —— 一季 24 集、
+     * 每集两条，十年下来也就几千行，但那是**没人会去看**的几千行。
+     */
+    fun pruneSkipSamples(workKey: String) {
+        require().execSQL(
+            "DELETE FROM skip_samples WHERE work_key = ? AND id NOT IN (" +
+                "SELECT id FROM skip_samples WHERE work_key = ? " +
+                "ORDER BY created_at DESC LIMIT ?)",
+            arrayOf<Any?>(workKey, workKey, skipSampleCap),
+        )
     }
 
     /** 全部**在追**的作品 key（只含 `merged_into IS NULL` 的行）。 */
@@ -1585,6 +1779,164 @@ class LibraryDb(
         return out
     }
 
+    /**
+     * 把**作品行**上已有的片头 / 片尾读成一份进度书（只填 `works` 段，播种用）。
+     *
+     * 与 [progressSnapshot] 同一条理由：`.ccbak` 里没有进度文件，所以「从另一台
+     * 机器恢复媒体库」之后，那台机器上标好的片头只会出现在恢复回来的库行里 ——
+     * 不收进进度库的话它们同步不到第三台设备。
+     *
+     * ⛔ [WorkSkipEntry.manualUpdatedAtSec] 一律 **0**：`media_works` 上没有
+     *    「手标时刻」这一列（只有学习那条路有 `learned_at`）。0 的语义是「有内容、
+     *    但没有时间依据」，合并时必输给任何带时间戳的一组 —— 与 [progressSnapshot]
+     *    里 `updatedAtSec` 用 `played_at` 兜底是同一个道理。
+     */
+    override fun skipMarkerSnapshot(): ProgressBook {
+        val out = ProgressBook()
+        // 只取「两组里有任意一列非空」的行 —— 绝大多数作品从没标过也没学过。
+        require().rawQuery(
+            "SELECT key, intro_start_ms, intro_end_ms, outro_offset_ms, " +
+                "learned_intro_end_ms, learned_outro_offset_ms, learned_samples, learned_at " +
+                "FROM media_works WHERE intro_start_ms IS NOT NULL " +
+                "OR intro_end_ms IS NOT NULL OR outro_offset_ms IS NOT NULL " +
+                "OR learned_intro_end_ms IS NOT NULL OR learned_outro_offset_ms IS NOT NULL",
+            null,
+        ).use { c ->
+            while (c.moveToNext()) {
+                val key = c.getString(0) ?: continue
+                val entry = WorkSkipEntry(
+                    introStartMs = if (c.isNull(1)) null else c.getLong(1),
+                    introEndMs = if (c.isNull(2)) null else c.getLong(2),
+                    outroOffsetMs = if (c.isNull(3)) null else c.getLong(3),
+                    manualUpdatedAtSec = 0L,
+                    learnedIntroEndMs = if (c.isNull(4)) null else c.getLong(4),
+                    learnedOutroOffsetMs = if (c.isNull(5)) null else c.getLong(5),
+                    learnedSamples = c.getInt(6),
+                    learnedUpdatedAtSec = if (c.isNull(7)) 0L else c.getLong(7),
+                )
+                if (entry.isEmpty) continue
+                out.putSkip(key, entry)
+            }
+        }
+        return out
+    }
+
+    /**
+     * 把片头 / 片尾回填进 `media_works` 的对应列；返回被更新的行数。
+     *
+     * ⛔ **只写「有内容」的那一组** —— 哪一组没内容就**原样保留**库里的值。
+     *
+     * 与 [applyProgressSnapshot] 最大的区别：那里 `null` 就是「没有可续的点」，
+     * 所以照抄；这里「书里没有手标组」可能有两种意思 —— 「用户清除了」和
+     * 「这台机器根本不知道」。照抄会把第二种变成静默清空。清除动作由
+     * [clearLearnedSkip] / PC 端的 `recordManualSkip` 写一个**空组 + 时间戳前进**
+     * 来表达。
+     *
+     * ⛔ 不写 `updated_at`：它参与媒体库同步判据（`libraryModifiedAt`），被一次
+     *    回填扰动会让「学出个片头」变成「上传一整份备份」。
+     */
+    override fun applySkipMarkerSnapshot(book: ProgressBook): Int {
+        if (book.works.isEmpty()) return 0
+        val d = require()
+
+        // 1. 分批读回当前列值。⛔ 必须分批（SQLite 变量上限 999，见 [SQL_CHUNK]）。
+        val current = HashMap<String, SkipProjection>(book.workCount * 2)
+        for (chunk in book.works.keys.chunked(SQL_CHUNK)) {
+            val placeholders = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT key, intro_start_ms, intro_end_ms, outro_offset_ms, " +
+                    "learned_intro_start_ms, learned_intro_end_ms, learned_outro_offset_ms, " +
+                    "learned_samples, learned_at FROM media_works WHERE key IN ($placeholders)",
+                chunk.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val key = c.getString(0) ?: continue
+                    current[key] = SkipProjection(
+                        introStartMs = if (c.isNull(1)) null else c.getLong(1),
+                        introEndMs = if (c.isNull(2)) null else c.getLong(2),
+                        outroOffsetMs = if (c.isNull(3)) null else c.getLong(3),
+                        learnedIntroStartMs = if (c.isNull(4)) null else c.getLong(4),
+                        learnedIntroEndMs = if (c.isNull(5)) null else c.getLong(5),
+                        learnedOutroOffsetMs = if (c.isNull(6)) null else c.getLong(6),
+                        learnedSamples = c.getInt(7),
+                        learnedAtSec = if (c.isNull(8)) null else c.getLong(8),
+                    )
+                }
+            }
+        }
+
+        var changed = 0
+        val values = ContentValues(8)
+        for ((key, entry) in book.works) {
+            // 库里没有这部作品 → 没有落点。**不新建行**：片头标记不决定一部
+            // 作品存不存在，那是扫描的事。
+            val have = current[key] ?: continue
+            val want = SkipProjection(
+                introStartMs = if (entry.hasManual) entry.introStartMs else have.introStartMs,
+                introEndMs = if (entry.hasManual) entry.introEndMs else have.introEndMs,
+                outroOffsetMs = if (entry.hasManual) entry.outroOffsetMs else have.outroOffsetMs,
+                // 学习出的片头起点恒为 `0`（片头总在开头），与 [saveLearnedSkip]
+                // 逐字同口径。
+                learnedIntroStartMs = if (entry.hasLearned) {
+                    if (entry.learnedIntroEndMs == null) null else 0L
+                } else {
+                    have.learnedIntroStartMs
+                },
+                learnedIntroEndMs = if (entry.hasLearned) {
+                    entry.learnedIntroEndMs
+                } else {
+                    have.learnedIntroEndMs
+                },
+                learnedOutroOffsetMs = if (entry.hasLearned) {
+                    entry.learnedOutroOffsetMs
+                } else {
+                    have.learnedOutroOffsetMs
+                },
+                learnedSamples = if (entry.hasLearned) entry.learnedSamples else have.learnedSamples,
+                // `learned_at` 取进度文件里的 `lu`；它是 0 时（手改的 JSON）保留
+                // 库里原有的时刻 —— 把时刻写没了，下一次播种就再也排不出先后。
+                learnedAtSec = if (entry.hasLearned) {
+                    if (entry.learnedUpdatedAtSec > 0L) {
+                        entry.learnedUpdatedAtSec
+                    } else {
+                        have.learnedAtSec
+                    }
+                } else {
+                    have.learnedAtSec
+                },
+            )
+            if (want == have) continue
+
+            // ⚠️ `ContentValues.put(k, null)` 写的就是 SQL NULL —— 这正是
+            //    「清掉一列」在这里的表达方式（`SkipProjection` 里 `null` 就是
+            //    「这一列清空」）。
+            values.clear()
+            values.put("intro_start_ms", want.introStartMs)
+            values.put("intro_end_ms", want.introEndMs)
+            values.put("outro_offset_ms", want.outroOffsetMs)
+            values.put("learned_intro_start_ms", want.learnedIntroStartMs)
+            values.put("learned_intro_end_ms", want.learnedIntroEndMs)
+            values.put("learned_outro_offset_ms", want.learnedOutroOffsetMs)
+            values.put("learned_samples", want.learnedSamples)
+            values.put("learned_at", want.learnedAtSec)
+            d.update("media_works", values, "key = ?", arrayOf(key))
+            changed++
+        }
+        return changed
+    }
+
+    /** [applySkipMarkerSnapshot] 用的「这一行现在是什么」。 */
+    private data class SkipProjection(
+        val introStartMs: Long?,
+        val introEndMs: Long?,
+        val outroOffsetMs: Long?,
+        val learnedIntroStartMs: Long?,
+        val learnedIntroEndMs: Long?,
+        val learnedOutroOffsetMs: Long?,
+        val learnedSamples: Int,
+        val learnedAtSec: Long?,
+    )
+
     // ------------------------------------------------------------------
     // 写：播放偏好（逐文件）
     // ------------------------------------------------------------------
@@ -2112,6 +2464,17 @@ class LibraryDb(
                         followed = c.boolOrFalse("followed"),
                         followStartedAt = c.longOrNull("follow_started_at"),
                         newItemCount = c.intOrNull("new_item_count") ?: 0,
+                        // 手标片头两列。⛔ 电视上没有界面写它们，但 PC 端标的会随
+                        // 备份包过来 —— 读不到就当「没标」，走学习那条支路。
+                        introStartMs = c.longOrNull("intro_start_ms"),
+                        introEndMs = c.longOrNull("intro_end_ms"),
+                        outroOffsetMs = c.longOrNull("outro_offset_ms"),
+                        // 学习结论三列（schema v18）。读不到就是「还没学出来」——
+                        // 老库刚升级完那一次正是这个状态，与升级前表现一致
+                        // （什么都不跳），不会凭空跳错位置。
+                        learnedIntroStartMs = c.longOrNull("learned_intro_start_ms"),
+                        learnedIntroEndMs = c.longOrNull("learned_intro_end_ms"),
+                        learnedOutroOffsetMs = c.longOrNull("learned_outro_offset_ms"),
                     ),
                 )
             }
@@ -2203,6 +2566,16 @@ class LibraryDb(
                 // 它是检查期的水位线，只出现在 `applyFollowCheck` 的写语句里，
                 // 界面从来不看它 —— 与「不要为了完整把 31 列全搬进来」同一条。
                 "followed, follow_started_at, new_item_count, " +
+                // 手标片头两列（`media_works.intro_start_ms/intro_end_ms`）。
+                // ⛔ 电视上没有界面写它们，但**必须读** —— PC 端标好的会随备份
+                //    包过来，不读就是「电脑上标了片头，电视上不跳」，而两端
+                //    都不报错。与 `learned_intro_*` 是两条独立支路。
+                "intro_start_ms, intro_end_ms, outro_offset_ms, " +
+                // 学习结论三列（schema v18）。⛔ `learned_samples` / `learned_at`
+                // **刻意不在这里**：前者只是「这个结论有多少集撑着」的说明性数字，
+                // 后者是排查用的时间戳 —— 界面一个都不看。
+                // 与「不要为了完整把 31 列全搬进来」同一条规矩。
+                "learned_intro_start_ms, learned_intro_end_ms, learned_outro_offset_ms, " +
                 // ⛔ **这里只查自己名下的**，不许把并集塞进来 —— 实测（真库
                 //    201 部 / 2866 条）：这个相关子查询写等值时 SQLite 会给
                 //    `media_items.group_key` 建**自动索引**，500 行 21ms；一旦

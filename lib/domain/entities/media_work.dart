@@ -60,6 +60,12 @@ class MediaWork {
     this.mergedInto,
     this.introStartMs,
     this.introEndMs,
+    this.outroOffsetMs,
+    this.learnedIntroStartMs,
+    this.learnedIntroEndMs,
+    this.learnedOutroOffsetMs,
+    this.learnedSamples = 0,
+    this.learnedAt,
     this.followed = false,
     this.followStartedAt,
     this.followCheckedAt,
@@ -188,12 +194,121 @@ class MediaWork {
   final int? introStartMs;
   final int? introEndMs;
 
+  /// 用户手标的**片尾起点距末尾的偏移**（毫秒，v19）。`null` = 没标过。
+  ///
+  /// ⛔ 存偏移不存绝对时间：用户在第 1 集标「41:30」，第 2 集片长不同，
+  ///    绝对时间搬过去就错了；而「离结尾还有 90 秒」是同一件事。
+  ///    与 [learnedOutroOffsetMs] 用的是同一种表示，两条路才能互相印证。
+  ///    播放时用 [outroStart] 现算落点。
+  final int? outroOffsetMs;
+
   /// 手标片头区间；半条标记（只标了起点或只标了终点）当没有。
   ///
   /// 用 [IntroMarker.fromMilliseconds] 而不是在这里各判一次：那个函数
   /// 还要挡住「终点早于起点」这类脏数据，规则只能有一份。
   IntroMarker? get introRange =>
       IntroMarker.fromMilliseconds(introStartMs, introEndMs);
+
+  /// 手标的片尾落点 —— **要传这一集的片长**才能算出来。
+  ///
+  /// 与 [learnedOutroStart] 逐字同一条规则（片尾没有终点，终点恒为片长；
+  /// 片长未知 / 偏移比片长还大时返回 `null`）。两个方法刻意不互相调用：
+  /// 它们读的是两组**独立**的列，谁先谁后由播放器的优先级链决定
+  /// （章节 > 手标 > 学习），合在一处会把那条链藏起来。
+  Duration? outroStart(Duration duration) {
+    final ms = outroOffsetMs;
+    return OutroSkip.start(
+      duration: duration,
+      offset: ms == null ? null : Duration(milliseconds: ms),
+    );
+  }
+
+  /// 有没有任何手标结果（片头区间或片尾偏移）。
+  bool get hasManualSkip => introRange != null || outroOffsetMs != null;
+
+  // -------------------------------------------------------------------
+  // 自动学习的片头 / 片尾（v18）
+  // -------------------------------------------------------------------
+  //
+  // 与上面的**手标**是两条独立支路。播放器取区间时的优先级：
+  //
+  //     文件章节  >  手标  >  学习
+  //
+  // ⛔ 为什么学习排在最后：它是**推断**出来的，而手标是用户明确指定的。
+  //    章节更是发布者标的、与这一集的实际内容严格对应。
+  //    推断压过明确指定，会出现「我明明标过，它却按自己学的跳」。
+
+  /// 学习出的片头起点 / 终点（毫秒）。
+  final int? learnedIntroStartMs;
+  final int? learnedIntroEndMs;
+
+  /// 学习出的**片尾起点距末尾的偏移**（毫秒）。
+  ///
+  /// ⛔ 存偏移不存绝对时间：各集片长不同（正片 45 分钟、特辑 60 分钟），
+  ///    绝对时间跨集不可比，而「离结尾还有多久开始是片尾」是稳定的。
+  ///    播放时用 [learnedOutroStart] 现算落点。
+  final int? learnedOutroOffsetMs;
+
+  /// 参与聚合的样本数（片头与片尾取较大者）。UI 用它显示置信度。
+  final int learnedSamples;
+
+  /// 学习结果最后一次更新时间。只用于 UI 展示与排查。
+  final DateTime? learnedAt;
+
+  /// 学习出的片头区间；没学过（或半条标记）时为 `null`。
+  IntroMarker? get learnedIntroRange =>
+      IntroMarker.fromMilliseconds(learnedIntroStartMs, learnedIntroEndMs);
+
+  /// 学习出的片尾落点 —— **要传这一集的片长**才能算出来。
+  ///
+  /// 片尾没有终点：终点恒为片长。所以这里只返回起点。
+  /// 片长未知（`Duration.zero`）时返回 `null`：算不出落点，
+  /// 而拿 0 当片长会让「跳片尾」变成「跳到 0 秒」。
+  ///
+  /// ⛔ 换算走 `OutroSkip.start`（**同一份实现**，与手标那条支路共用）——
+  ///    各写一遍的典型症状是「手标的能跳、学出来的跳不了」。
+  Duration? learnedOutroStart(Duration duration) {
+    final ms = learnedOutroOffsetMs;
+    return OutroSkip.start(
+      duration: duration,
+      offset: ms == null ? null : Duration(milliseconds: ms),
+    );
+  }
+
+  /// 有没有任何学习结果。
+  bool get hasLearnedSkip =>
+      learnedIntroRange != null || learnedOutroOffsetMs != null;
+
+  /// 整体写回一次学习结果。
+  ///
+  /// ## 为什么需要它，而不是让调用方拼 `copyWith`
+  ///
+  /// 学习结果是一组**任意组合**：可能只学出片头、只学出片尾、或两者都有。
+  /// 而 `copyWith` 的 `??` 把 `null` 当「不改」——「这次只学出片尾，
+  /// 所以要清掉上一次的片头」这件事**表达不出来**，而且写错了不会报错：
+  /// 上一次学错的片头会留在库里，播放器继续照着它跳。
+  ///
+  /// 这里用**两次** `copyWith` 绕开：先 `clearLearned` 把 5 列清空，
+  /// 再把非 `null` 的设回去。比引入一个「逐列抄一遍」的整行构造安全 ——
+  /// 那种写法每加一列都要记得同步，漏一列是静默丢数据
+  /// （`clearWorkIntroRange` 的注释里专门警告过这一点）。
+  MediaWork withLearnedSkip({
+    required int? introStartMs,
+    required int? introEndMs,
+    required int? outroOffsetMs,
+    required int samples,
+    required DateTime? at,
+  }) {
+    var next = copyWith(clearLearned: true);
+    next = next.copyWith(
+      learnedIntroStartMs: introStartMs,
+      learnedIntroEndMs: introEndMs,
+      learnedOutroOffsetMs: outroOffsetMs,
+      learnedSamples: samples,
+      learnedAt: at,
+    );
+    return next;
+  }
 
   // -------------------------------------------------------------------
   // 追剧 / 更新提醒（v17）
@@ -331,12 +446,29 @@ class MediaWork {
     String? mergedInto,
     int? introStartMs,
     int? introEndMs,
-    /// 把片头两列一起清成 `null`（与 [clearFollow] 同一个套路、同一条理由）。
+    int? outroOffsetMs,
+    /// 把**手标的三列**（片头起点 / 终点、片尾偏移）一起清成 `null`
+    /// （与 [clearFollow] 同一个套路、同一条理由）。
     ///
     /// 加它之前，内存实现里靠一个逐列抄一遍的 `_withIntro` 重建整行 ——
     /// 那种写法每加一列都要记得同步，漏一列就是静默丢数据（注释里专门
     /// 警告过 `mergedInto` 那一列）。有了这个开关，清空就是一次 `copyWith`。
+    ///
+    /// ⚠️ v19 起 `outro_offset_ms` 也归这个开关管 —— 它是用户在同一次
+    ///    「标片头」动作里标的，分成两个开关会让「清除」只清掉一半。
     bool clearIntro = false,
+    int? learnedIntroStartMs,
+    int? learnedIntroEndMs,
+    int? learnedOutroOffsetMs,
+    int? learnedSamples,
+    DateTime? learnedAt,
+    /// 把学习出来的 5 列一起清回默认（与 [clearIntro] / [clearFollow]
+    /// 同一个套路、同一条理由）。
+    ///
+    /// ⛔ 与 [clearIntro] **刻意分开**：「清除手标」不该顺手把学习结果也
+    ///    抹掉 —— 用户可能只是想回到「让它自己学」的状态。两个开关
+    ///    各管各的。
+    bool clearLearned = false,
     bool? followed,
     DateTime? followStartedAt,
     DateTime? followCheckedAt,
@@ -392,6 +524,19 @@ class MediaWork {
         mergedInto: mergedInto ?? this.mergedInto,
         introStartMs: clearIntro ? null : (introStartMs ?? this.introStartMs),
         introEndMs: clearIntro ? null : (introEndMs ?? this.introEndMs),
+        outroOffsetMs: clearIntro ? null : (outroOffsetMs ?? this.outroOffsetMs),
+        learnedIntroStartMs: clearLearned
+            ? null
+            : (learnedIntroStartMs ?? this.learnedIntroStartMs),
+        learnedIntroEndMs: clearLearned
+            ? null
+            : (learnedIntroEndMs ?? this.learnedIntroEndMs),
+        learnedOutroOffsetMs: clearLearned
+            ? null
+            : (learnedOutroOffsetMs ?? this.learnedOutroOffsetMs),
+        learnedSamples:
+            clearLearned ? 0 : (learnedSamples ?? this.learnedSamples),
+        learnedAt: clearLearned ? null : (learnedAt ?? this.learnedAt),
         // ⚠️ 两个 `DateTime?` 与 [mergedInto] 同一条限制：传 `null` 是「不改」
         // 而不是「清空」。要清空传 `clearFollow: true`
         // （`MediaRepository.setFollowed(key, false)` 走的就是它）。
@@ -523,6 +668,16 @@ class MediaWork {
         // 「点一下自定义，跳片头就再也不生效了」，而且没有任何提示。
         introStartMs: introStartMs,
         introEndMs: introEndMs,
+        // 同理：手标片尾偏移也是**用户标的播放偏好**，与刮削无关。
+        outroOffsetMs: outroOffsetMs,
+        // 同理：学习结果是**播放行为的产物**，与刮削无关。漏抄的表现是
+        // 「点一下自定义，之前学到的片头 / 片尾全没了」—— 而且没有任何提示，
+        // 用户只会觉得「它又不会跳了」，得重新攒好几集样本才能恢复。
+        learnedIntroStartMs: learnedIntroStartMs,
+        learnedIntroEndMs: learnedIntroEndMs,
+        learnedOutroOffsetMs: learnedOutroOffsetMs,
+        learnedSamples: learnedSamples,
+        learnedAt: learnedAt,
         // 同理：追剧四列是**用户的追更状态**，与刮削无关。漏抄的表现是
         // 「点一下自定义，追剧就没了，角标也没了」—— 而且没有任何提示。
         followed: followed,

@@ -309,6 +309,21 @@ class MediaWorks extends Table {
   IntColumn get introStartMs => integer().nullable()();
   IntColumn get introEndMs => integer().nullable()();
 
+  /// **手标**的片尾偏移（毫秒，距末尾）。`null` = 没标（v19）。
+  ///
+  /// ## 为什么是「距末尾」而不是绝对时间
+  ///
+  /// 用户在第 1 集上标「片尾从 41:30 起」，第 2 集片长不一样，绝对时间搬过去
+  /// 就错了；而「离结尾还有 90 秒」在两集上是同一件事。学习那条路
+  /// （[learnedOutroOffsetMs]）用的是同一种表示，两边才能互相印证。
+  ///
+  /// ## 与 [introStartMs] / [introEndMs] 是一组
+  ///
+  /// 三列都由**用户手标**、都由进度文件（`WorkSkipEntry`）同步、都与
+  /// `learned_*` 那组列相互独立（取值链：手标 > 学习）。
+  /// ⛔ 扫描不许清掉它们 —— 同 [introStartMs] 的「旧值优先受保护通道」。
+  IntColumn get outroOffsetMs => integer().nullable()();
+
   // -------------------------------------------------------------------
   // 追剧 / 更新提醒（v17）
   // -------------------------------------------------------------------
@@ -370,8 +385,132 @@ class MediaWorks extends Table {
   /// 每个一次子查询就是几百次全表扫描。
   IntColumn get newItemCount => integer().withDefault(const Constant(0))();
 
+  // -------------------------------------------------------------------
+  // 自动学习的片头 / 片尾区间（v18）
+  // -------------------------------------------------------------------
+  //
+  // 与 [introStartMs] / [introEndMs]（用户**手标**）是两条独立的支路，优先级：
+  //
+  //     文件章节  >  手标  >  学习
+  //
+  // ⛔ **不复用 `intro_start_ms` / `intro_end_ms`**：那两列是「用户自己标的」，
+  //    `mergeWorkForUpsert` 有专门的保护分支，而且 UI 要如实告诉用户
+  //    「这是你标的」还是「这是自动学的」—— 混在一列里这两件事都做不到。
+  //    新增独立列之后，手标那一套**一行都不用改**。
+  //
+  // ⛔ **这几个列不参与 `libraryModifiedAt()`**（同步判据只算
+  //    `media_works.updated_at` ∪ `media_items.first_seen_at`）。学习是
+  //    播放的副产品，把它算进同步判据会让「看一集」变成「上传一整份备份」，
+  //    与进度三列被摘掉是同一条理由。
+
+  /// 学习出的片头区间（毫秒）。两列成对，任一为空 = 没有学习结果。
+  ///
+  /// 存**绝对时间**：片头总在开头，各集位置基本一致。
+  IntColumn get learnedIntroStartMs => integer().nullable()();
+  IntColumn get learnedIntroEndMs => integer().nullable()();
+
+  /// 学习出的**片尾起点距末尾的偏移**（毫秒）。
+  ///
+  /// ⛔ **存偏移，不存绝对时间**。各集片长不同（正片 45 分钟、特辑 60 分钟），
+  ///    绝对时间跨集不可比；而「离结尾还有多久开始是片尾」这个量是稳定的。
+  ///    播放时用 `duration - learnedOutroOffsetMs` 现算落点。
+  ///
+  /// 片尾**没有终点列**：终点恒为片长。单列一列而不是硬凑一对
+  /// `start` / `end`，是因为「终点 = 片长」这件事写进数据里只会
+  /// 变成一处需要同步维护的冗余。
+  IntColumn get learnedOutroOffsetMs => integer().nullable()();
+
+  /// 参与聚合的样本数（片头与片尾取**较大**的那个）。
+  ///
+  /// UI 用它显示置信度（「3 集样本」），也是「要不要相信这个结果」的
+  /// 唯一依据 —— 门槛见 `SkipLearning.minSamples`。
+  IntColumn get learnedSamples => integer().withDefault(const Constant(0))();
+
+  /// 学习结果最后一次更新时间（Unix 秒）。只用于 UI 展示与排查。
+  DateTimeColumn get learnedAt => dateTime().nullable()();
+
   @override
   Set<Column> get primaryKey => {key};
+}
+
+/// 「跳过片头 / 片尾」的**原始样本表**（v18）。
+///
+/// ## 为什么原始样本要落库，而不是当场算完就扔
+///
+/// 学习是**跨集**的：单集的「用户从 0 拖到 92 秒」既可能是跳片头，也可能
+/// 只是随便拖。只有把同一部剧多集的落点放在一起看，才能判断那是一个
+/// **稳定的片头**还是一个**偶然的拖拽**。所以每一集的落点必须先存下来，
+/// 攒够样本（`SkipLearning.minSamples`）才谈得上聚合。
+///
+/// ## 与 `media_works.learned_*` 的分工
+///
+///   * 这张表是**输入**（每次播放都可能写一行）；
+///   * `media_works.learned_*` 是**输出**（聚合后的结论，供播放器直接读）。
+///
+/// 结论要能被播放器**一次查询**拿到（播放页热路径），所以不能每次播放都去
+/// 扫样本表重算。
+///
+/// ## ⛔ 它不参与同步判据
+///
+/// 与 `media_items` 的三列进度同一条理由：这是**每次播放都会写**的高频数据，
+/// 算进 `libraryModifiedAt()` 会让「看一集」变成「上传一整份 `.ccbak`」，
+/// 而且常开机的设备会永远赢下 LWW 比较。
+///
+/// ⚠️ 它会随备份包一起走（备份装的是整个库文件的字节）—— 这是**想要的**：
+/// 两端各看几集，样本合起来更容易越过 `minSamples` 门槛。
+@DataClassName('SkipSampleRow')
+class SkipSamples extends Table {
+  /// 主键：`itemId#kind#createdAt`（见 `SkipSample.idFor`）。
+  ///
+  /// 用「媒体项 + 类型 + 时间」而不是自增 id：两端各自生成 id 时不会撞车
+  /// （备份合并之后仍然唯一），而自增 id 在合并两份库时必然冲突。
+  TextColumn get id => text()();
+
+  /// 媒体项 id（`provider:fileId`）。
+  TextColumn get itemId => text()();
+
+  /// 归组键。聚合按它分组 —— **一条样本就带着自己的作品归属**，
+  /// 不依赖 JOIN `media_items`（那张表的行会被扫描删掉）。
+  TextColumn get workKey => text()();
+
+  /// 样本类型（`SkipKind.name`：`intro` / `outro`）。
+  ///
+  /// 存枚举名而不是序号：加一种类型时序号会整体错位，旧数据会**静默**
+  /// 变成另一种类型（与 `media_items.resolution` 存 label 同一条理由）。
+  TextColumn get kind => text()();
+
+  /// 落点（毫秒）。
+  ///
+  ///   * 片头：用户从开头跳到的位置（`[0, anchor]` 即候选片头区间）；
+  ///   * 片尾：用户「不想再看」的位置。
+  IntColumn get anchorMs => integer()();
+
+  /// 这次播放的总时长（毫秒）。片尾聚合必须用它换算偏移 ——
+  /// 各集片长不同，绝对时间跨集不可比。
+  IntColumn get durationMs => integer()();
+
+  /// `durationMs - anchorMs`（毫秒）。**只有片尾样本有值**。
+  ///
+  /// 冗余存一列而不是聚合时现算：它同时是「跨集可比的量」，
+  /// 也是排查时最该先看的那一个数（「各集的片尾偏移是不是稳定」）。
+  IntColumn get offsetMs => integer().nullable()();
+
+  /// 负样本标记（用户撤销 / 回拖作废的那一次）。
+  ///
+  /// ⛔ 负样本**不参与**聚合，而且会把同作品的结论**降级重算** ——
+  /// 它是「你学错了」这个判断的唯一来源，比正样本稀有得多，所以单列一列。
+  BoolColumn get negative => boolean().withDefault(const Constant(false))();
+
+  /// 产生这条样本的设备标识（`deviceId`）。
+  ///
+  /// 只用于排查（「这些样本是哪台机器产生的」）。**不参与聚合** ——
+  /// 设备差异不是「这个锚点可信不可信」的依据，样本一致性才是。
+  TextColumn get device => text().withDefault(const Constant(''))();
+
+  DateTimeColumn get createdAt => dateTime()();
+
+  @override
+  Set<Column> get primaryKey => {id};
 }
 
 /// 字幕引用表。

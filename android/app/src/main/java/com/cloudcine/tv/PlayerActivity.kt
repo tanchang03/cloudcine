@@ -38,14 +38,24 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultAllocator
+import com.cloudcine.tv.library.DeviceIdentity
 import com.cloudcine.tv.library.EpisodeLabels
 import com.cloudcine.tv.library.EpisodeThumbs
+import com.cloudcine.tv.library.IntroMarker
+import com.cloudcine.tv.library.IntroSession
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.LibrarySchema
+import com.cloudcine.tv.library.OutroSkip
 import com.cloudcine.tv.library.PlaybackResume
 import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.ScanItem
+import com.cloudcine.tv.library.SeekObservation
+import com.cloudcine.tv.library.SkipAnchor
+import com.cloudcine.tv.library.SkipAnchorCollector
+import com.cloudcine.tv.library.SkipLearning
+import com.cloudcine.tv.library.SkipSample
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.PlayInfo
 import com.cloudcine.tv.pan.Quality
@@ -324,6 +334,10 @@ class PlayerActivity : Activity() {
                 // 这道刹车，一口气把缓存灌满。
                 val b = estimatedBytes(p.currentPosition)
                 if (b >= 0L) playheadBytesCache = b
+                // 片头跳过 / 片尾提示 / 落点采集都挂在**这一条 1 秒的心跳**上，
+                // 而不是 10 秒的 `progressTick`：跳过片头要「刚进区间就跳」，
+                // 而 10 秒的粒度会让用户先看十秒片头再被跳走 —— 那还不如不跳。
+                tickSkipLearning(p)
             }
             ui.postDelayed(this, PLAYHEAD_TICK_MS)
         }
@@ -411,6 +425,68 @@ class PlayerActivity : Activity() {
 
     /** 选集列表里那些网盘封面的取用（内存 + 落盘 + 失败标记）。 */
     private var episodeThumbs: EpisodeThumbs? = null
+
+    // ── 片头 / 片尾的自动学习（schema v18）────────────────────────────
+    //
+    // 需求原文：「每次都要点进度条跳过片头、到片尾时手动跳到下一集，但没有
+    // 所有剧集的片头片尾时间点」。
+    //
+    // 规则本体全在 `SkipLearning` / `IntroSession`（纯函数 + 状态机，有单测），
+    // 这一页只做三件事：**喂位置**、**按回答去 seek**、**把样本报回库**。
+    //
+    // ⛔ 采集在**这里**、聚合在 `LibraryDb` 那一侧：判断「拖过去之后有没有
+    //    停下来看」必须贴着播放头，而聚合要读这部作品的**全部**样本。
+
+    /**
+     * 当前作品的 key（`media_works.key`）。空 = 没有库记录
+     * （「直接给 URL」的对照路径），那时**一律不学习** —— 样本挂不到任何
+     * 一行上，攒了也永远不会被聚合。
+     */
+    private var workKey = ""
+
+    /** 片头跳过状态机。一个实例对应**一条流**（换集要 reset）。 */
+    private val introSession = IntroSession()
+
+    /** 有效落点采集器。与 [introSession] 同一生命周期。 */
+    private val anchorCollector = SkipAnchorCollector()
+
+    /** 学习出来的**片尾起点距末尾的偏移**（毫秒）。`null` = 没学过。 */
+    private var learnedOutroOffsetMs: Long? = null
+
+    /**
+     * **手标**的片尾起点距末尾的偏移（毫秒，`media_works.outro_offset_ms`，
+     * schema v19）。`null` = 没标过。
+     *
+     * ⛔ 电视上**没有界面可写**（用户在电脑上标，随进度文件 / 备份包同步过来），
+     *    但播放器**必须读** —— 不读就是「电脑上标了片尾，电视上不跳」，而两端
+     *    都不报错。取值链 **手标 > 学习**，判据只有一份实现（`OutroSkip`）。
+     */
+    private var manualOutroOffsetMs: Long? = null
+
+    /** 这一条流里片尾已经处理过了（上升沿用 —— 提示 / 跳转都不幂等）。 */
+    private var outroHandled = false
+
+    /**
+     * 「自动连播」开关（`auto_play_next`，与 PC 端同一个键）。
+     *
+     * ⛔ 缺省**开**，判据是 `!= "false"` —— 与 PC 端
+     *    `player_page.dart` 的 `values[SettingKeys.autoPlayNext] != 'false'`
+     *    逐字同口径。写成 `== "true"` 的话，新装用户（这一列在库里根本不存在）
+     *    永远读成「关」，而 PC 上它是开着的。
+     *
+     * 它决定「学到片尾之后是自动跳下一集，还是只提示」。
+     */
+    private var autoPlayNext = true
+
+    /**
+     * 这次换集是**我们按学习结论跳的**，不是用户点的。
+     *
+     * ⛔ 换集要跨 Activity 重建（见 [switchEpisode]），所以这个标记只能挂在
+     *    实例上、由 [onNewIntent] 消费。少了它的后果是**自我实现**：采样点
+     *    就是我们跳过去的那个位置，它会变成一条「用户在这儿不想看了」的正
+     *    样本，把结论越喂越靠前 —— 而它看起来完全像「越学越准」。
+     */
+    private var switchFromOutro = false
 
     // ── 播放进度（续播点）──────────────────────────────────────────
     //
@@ -744,8 +820,14 @@ class PlayerActivity : Activity() {
      * 而**测速**那 3 秒不能忍 —— 同一条 WiFi、同一个 CDN，刚量过的带宽没必要
      * 每集重量一遍，所以把上一次的实测值随 intent 带过去
      * （见 [EXTRA_REUSE_BANDWIDTH] 与 [probeThenPlay]）。
+     *
+     * @param fromOutro `true` = 这次换集是**我们按学习结论跳的**，不是用户点的。
+     *   ⛔ 它只影响一件事：`onNewIntent` 里那次「片尾信号」要不要发（见
+     *   [switchFromOutro]）。漏了它的后果是**自我实现** —— 采样点就是我们
+     *   跳过去的那个位置，它会被记成「用户在这儿不想看了」，把结论越喂越靠前，
+     *   而整个过程看起来完全像「越学越准」。
      */
-    private fun switchEpisode(index: Int) {
+    private fun switchEpisode(index: Int, fromOutro: Boolean = false) {
         val item = siblings.getOrNull(index) ?: return
         if (item.fileId == currentFid) {
             Log.i(TAG, "选集：选中的就是正在播的那一条（${item.name}），不重开")
@@ -757,6 +839,9 @@ class PlayerActivity : Activity() {
             "选集 → 第 ${index + 1}/${siblings.size} 条：${item.name}" +
                 (EpisodeLabels.progressLabel(item)?.let { "（历史进度 $it）" } ?: ""),
         )
+        // ⛔ 标记必须在 `startActivity` **之前**挂上：singleTask 下它是**同步**
+        //    走到 [onNewIntent] 的（见下面的注释），之后再设已经晚了。
+        if (fromOutro) switchFromOutro = true
         // 先收菜单：singleTask 下 `startActivity` 会**同步**走到 [onNewIntent]，
         //    那边接手之后这一页的 OSD 数据就已经是上一个文件的了。
         hideOsd()
@@ -790,6 +875,11 @@ class PlayerActivity : Activity() {
      * ⛔ 换之前必须把**上一个文件的全部残留**清干净：轨道 override、外挂
      *    字幕、已扫到的字幕文件、缓存键… 漏掉一条就是「换集后字幕/音轨
      *    还是上一集的」。
+     *
+     * ⛔ 这里也是**片尾信号**的唯一入口之一（另一个是 [onDestroy]）：换集
+     *    ＝「这一集不看了」的终态，比任何 seek 都清楚。顺序必须是
+     *    「先补写进度 → 再发片尾信号 → 最后清状态」，因为两者都要读
+     *    `player.currentPosition`，而再往下走就要 `release()` 了。
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -802,6 +892,17 @@ class PlayerActivity : Activity() {
         //    再往下走就要 release 了 —— 之后 `currentPosition` 就没了。
         reportProgress(flushAtExit = true)
         lastReportedMs = -1L
+
+        // ── 片尾信号（必须还在 `player` 活着、且状态没清的时候发）─────
+        // ⛔ 自动跳片尾引起的换集**绝不记样本** —— 否则采样点就是我们自己
+        //    跳过去的那个位置（见 [switchFromOutro] 的文档）。
+        //    这个标记用完即复位，不能跨到下一次换集。
+        if (switchFromOutro) {
+            switchFromOutro = false
+            Log.i(TAG, "这次换集是跳过片尾引起的，不记片尾样本")
+        } else {
+            reportEpisodeSwitchAnchor()
+        }
 
         // ── 清掉上一集的一切 ──────────────────────────────────────
         ui.removeCallbacks(progressTick)
@@ -842,7 +943,15 @@ class PlayerActivity : Activity() {
         val fid = intent.getStringExtra(EXTRA_FID)?.trim().orEmpty()
         spec = StreamSpec.fromIntent(intent)
         resumeAtMs = intent.getLongExtra(EXTRA_RESUME_MS, 0L)
-        loadSiblings(intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty(), fid)
+        val groupKey = intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty()
+        loadSiblings(groupKey, fid)
+        // 片头 / 片尾的配置与学习结论（异步读库，见 [loadSkipConfig]）。
+        loadSkipConfig(groupKey)
+        // 落点采集器归零，并把**起播位置**记下来。⛔ 用 `resumeAtMs` 而不是
+        // 位置流第一个值：续播（从上次位置继续）时「0 → 落点」这个区间根本
+        // 不成立 —— 用户没看过那段，也就谈不上「跳过片头」。
+        anchorCollector.reset()
+        anchorCollector.notePlayStart(resumeAtMs)
         when {
             fid.isNotEmpty() -> resolveAndPlay(fid)
             spec != null -> {
@@ -921,6 +1030,276 @@ class PlayerActivity : Activity() {
                 "进度：${r.first} @ ${r.second / 1000}s / ${totalMs / 1000}s" +
                     if (r.third) "" else "（已看完或太短 ⇒ 清掉续播点）",
             )
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 片头 / 片尾的自动学习（schema v18）
+    // ------------------------------------------------------------------
+    //
+    // 规则本体在 `SkipLearning` / `IntroSession` / `SkipAnchorCollector`
+    // （全是纯函数 + 一个状态机，有单测）。这一页只做三件事：
+    //
+    //   1. [tickSkipLearning] —— 每秒把播放头喂给状态机与采集器；
+    //   2. 按状态机的回答去 seek（**不算用户 seek**）；
+    //   3. [reportSkipAnchor] —— 把确认出的样本交给 `LibraryDb` 聚合。
+
+    /**
+     * 每秒一次：片头跳过 + 片尾提示 + 落点采集。
+     *
+     * ## ⛔ 为什么挂在 1 秒的 [playheadTick] 而不是 10 秒的 [progressTick]
+     *
+     * 跳过片头要「刚进区间就跳」。10 秒的粒度意味着用户先看十秒片头再被跳走
+     * —— 那还不如不跳。而落点采集的「停留 15 秒」判据也需要秒级的位置采样。
+     *
+     * ## ⛔ 为什么这里没有 `try/catch`
+     *
+     * 全是纯计算 + 一次 `seekTo`，没有 IO。真正会失败的那部分（写库）在
+     * [reportSkipAnchor] 的后台任务里，那条路自己 catch。
+     */
+    private fun tickSkipLearning(p: Player) {
+        val positionMs = p.currentPosition
+        if (positionMs <= 0L) return
+
+        // 片长未知时位置不可信（还在解容器），此刻算出来的偏移没有意义。
+        val d = p.duration
+        val totalMs = if (d == C.TIME_UNSET || d <= 0L) 0L else d
+
+        // ① 片头：进了区间就跳。
+        // ⛔ `user = false` —— 这一跳是**我们自己**发起的。记成用户 seek 的话，
+        //    「跳过片头」会变成一条片头样本，而它恰恰是学习结论自己造出来的，
+        //    会把结论越喂越靠后。
+        introSession.takeSkipTarget(positionMs)?.let { target ->
+            Log.i(TAG, "跳过片头：${positionMs / 1000}s → ${target / 1000}s")
+            showNotice("已跳过片头")
+            seekToPosition(target, "跳片头", user = false)
+        }
+
+        // ② 片头锚点：只有「拖过去之后停下来看了」才确认。
+        if (totalMs > 0L) {
+            anchorCollector.notePosition(positionMs)?.let { reportSkipAnchor(it) }
+        }
+
+        // ③ 片尾：提示 / 自动跳下一集。
+        maybeHandleOutro(positionMs, totalMs)
+    }
+
+    /**
+     * 播放头进入**片尾区间**（取值链 手标 > 学习）。
+     *
+     * ## ⛔ 默认只提示，开着「自动连播」才真的跳
+     *
+     * 片尾的信号天生比片头弱：片头有「起点 = 0」这个强锚，片尾没有 ——
+     * 「跳过片尾」与「快进去看结局」在信号上长得一模一样。误跳的代价是用户
+     * **直接丢掉结局**，不可逆。
+     *
+     * 而开着自动连播说明用户已经明确要过「这一集看完就接下一集」—— 片尾只是
+     * 把这件事提前到他不想看的地方。判据与 PC 端 `player_page.dart` 的
+     * `_onOutroReached` 逐字同形。
+     */
+    private fun maybeHandleOutro(positionMs: Long, totalMs: Long) {
+        if (outroHandled) return
+        // 取值链 **手标 > 学习**（判据只有一份实现：`OutroSkip`，与片头那条链
+        // 同形）。⛔ 手标那一列唯一的来源是 PC 端 —— 不读就是「电脑上标了片尾，
+        // 电视上不跳」，而两端都不报错。
+        val offset = OutroSkip.effectiveOffsetMs(manualOutroOffsetMs, learnedOutroOffsetMs)
+            ?: return
+        val start = OutroSkip.startMs(totalMs, offset) ?: return
+        if (positionMs < start) return
+
+        outroHandled = true
+        Log.i(TAG, "到达片尾：${positionMs / 1000}s（片尾从 ${start / 1000}s 起）")
+
+        if (!autoPlayNext) {
+            showNotice("已到片尾")
+            return
+        }
+        val next = nextEpisodeIndex()
+        if (next < 0) {
+            // 不是错误：最后一集播到片尾就该停（循环重播会让睡着的用户被整夜播放）。
+            showNotice("已到片尾（已是最后一集）")
+            return
+        }
+        showNotice("已跳过片尾 · 播放下一集")
+        // ⛔ `fromOutro = true`：这次换集是**我们自己**跳的，不能记成样本
+        //    （见 [switchFromOutro] 的文档）。
+        switchEpisode(next, fromOutro = true)
+    }
+
+    /**
+     * 下一集的下标；没有下一集时 `-1`。
+     *
+     * 规则与 PC 端 `EpisodeQueue.nextAfter` 的三条一致：**当前项不在列表里
+     * 不从头开始**（`episodeIndex < 0` 直接返回 -1）、**跳过花絮**、
+     * **到尾不循环**。
+     */
+    private fun nextEpisodeIndex(): Int {
+        if (episodeIndex < 0) return -1
+        var i = episodeIndex + 1
+        while (i < siblings.size && siblings[i].isSampleOrExtra) i++
+        return if (i < siblings.size) i else -1
+    }
+
+    /**
+     * 发一次**片尾信号**：用户切到了下一集，或直接退出了播放。
+     *
+     * ## 为什么片尾只有这一个信号
+     *
+     * 判据的完整推导在 [SkipAnchorCollector.noteEpisodeSwitch] 上，这里只强调
+     * 一点：它传的是**切集那一刻**的播放头位置，不是「用户之前拖到哪儿」。
+     * 用户看剧情看到第 43 分钟、按下一集，那 43:00 才是「不想看的那一段」的
+     * 起点；传拖拽落点会把中间看过的内容也算进片尾。
+     *
+     * ## ⛔ 调用时机
+     *
+     * 必须在 `player.release()` **之前**（之后 `currentPosition` 就没了），
+     * 且必须在 `workKey` / `currentFid` 被清空**之前** —— 否则样本挂不到
+     * 任何一行上（[reportSkipAnchor] 拿不到 `workKey` 会直接返回）。
+     * 两处调用点（[onNewIntent] / [onDestroy]）都满足这两条。
+     *
+     * ## 为什么失败要静默
+     *
+     * 它是**纯计算**（采集器 + 分类），没有 IO；真正的写库在
+     * [reportSkipAnchor] 的后台任务里，那条路自己 catch。这里不弹任何东西 ——
+     * 用户正在换集/退出，弹个 toast 只会打断。
+     */
+    private fun reportEpisodeSwitchAnchor() {
+        val p = player ?: return
+        if (workKey.isEmpty()) return
+        val d = p.duration
+        val totalMs = if (d == C.TIME_UNSET || d <= 0L) 0L else d
+        if (totalMs <= 0L) return
+        val positionMs = p.currentPosition
+        if (positionMs <= 0L) return
+
+        anchorCollector.noteEpisodeSwitch(positionMs, totalMs)?.let { reportSkipAnchor(it) }
+    }
+
+    /**
+     * 读这一部作品的「跳过片头 / 片尾」开关、**手标**与**学习结论**。
+     *
+     * ⛔ 必须在后台线程查（要开库）。查完之前 `introSession` 是空的 ——
+     *    也就是「不跳」。这个先后顺序是**安全**的：宁可前几秒不跳，
+     *    也不要拿上一部作品的区间去跳。
+     */
+    private fun loadSkipConfig(groupKey: String) {
+        if (groupKey.isEmpty()) {
+            // 「直接给 URL」的对照路径：没有库记录，不学习也不跳。
+            workKey = ""
+            introSession.reset(enabled = false)
+            manualOutroOffsetMs = null
+            learnedOutroOffsetMs = null
+            outroHandled = false
+            return
+        }
+        workKey = groupKey
+        Bg.run({
+            val db = ensureLib()
+            val work = db.workByKey(groupKey)
+            val skipIntro = db.getSetting(LibrarySchema.KEY_SKIP_INTRO) != "false"
+            val autoNext = db.getSetting(LibrarySchema.KEY_AUTO_PLAY_NEXT) != "false"
+            Triple(work, skipIntro, autoNext)
+        }) { r, err ->
+            if (err != null) {
+                Log.w(TAG, "读跳过配置失败（groupKey=$groupKey），不跳片头片尾", err)
+                return@run
+            }
+            if (r == null) return@run
+            val (work, skipIntro, autoNext) = r
+            // ⛔ 期间可能已经换集（`workKey` 被下一次 [loadSkipConfig] 改掉了）。
+            //    晚到的结果打到新一集上，表现是「刚切过去画面自己跳一下」。
+            if (workKey != groupKey) return@run
+
+            autoPlayNext = autoNext
+            // 片尾两组列分别读，取值链（手标 > 学习）在 `maybeHandleOutro` 里走
+            // `OutroSkip` —— 与片头那条链同形，不在这里合成。
+            manualOutroOffsetMs = work?.outroOffsetMs
+            learnedOutroOffsetMs = work?.learnedOutroOffsetMs
+            outroHandled = false
+            // 手标优先于学习（取值链在 `IntroSession.marker` 里，只有一份实现）。
+            // ⛔ 手标那一列 Android 端**没有界面可写**，但 PC 端标的会随备份过来，
+            //    所以这里必须读 —— 不读的话「电脑上标好的片头，电视上不跳」。
+            introSession.reset(
+                manual = work?.let { IntroMarker.fromMilliseconds(it.introStartMs, it.introEndMs) },
+                learned = work?.learnedIntroRange,
+                enabled = skipIntro,
+            )
+            Log.i(
+                TAG,
+                "跳过配置：手标=${introSession.manualMarker} 学习=${introSession.learnedMarker} " +
+                    "片尾偏移=${OutroSkip.effectiveOffsetMs(manualOutroOffsetMs, learnedOutroOffsetMs)?.let { "${it / 1000}s" } ?: "-"} " +
+                    "(手标=${manualOutroOffsetMs ?: "-"} 学习=${learnedOutroOffsetMs ?: "-"}) " +
+                    "跳片头=$skipIntro 自动连播=$autoNext",
+            )
+        }
+    }
+
+    /**
+     * 把一条**有效落点**样本交给库，并在攒够之后重聚合一次。
+     *
+     * ## 为什么每次都**重聚合全部样本**
+     *
+     * 判据是中位数 + MAD：加一条样本既可能让原本不够的样本数跨过门槛，也可能
+     * 让**已有结论失效**（散布被撑爆）。增量公式算不出这两件事，而样本是
+     * 「每集最多两条」的极小数据量，全量重算的代价可以忽略。
+     */
+    private fun reportSkipAnchor(anchor: SkipAnchor) {
+        val fid = currentFid
+        val key = workKey
+        if (fid.isEmpty() || key.isEmpty()) return
+
+        // 采集器已经按窗口过滤过一遍，这里再判一次是为了拿到 `kind` ——
+        // 判据只有一份实现（`SkipLearning.classify`）。
+        val kind = SkipLearning.classify(anchor) ?: return
+        val itemId = ScanItem.idOf("quark", fid)
+        val nowMs = System.currentTimeMillis()
+        val device = DeviceIdentity.id(this)
+
+        Bg.run({
+            val db = ensureLib()
+            db.addSkipSample(
+                SkipSample(
+                    id = SkipSample.idFor(itemId, kind, nowMs),
+                    itemId = itemId,
+                    workKey = key,
+                    kind = kind,
+                    anchorMs = anchor.anchorMs,
+                    durationMs = anchor.durationMs,
+                    device = device,
+                    createdAtMs = nowMs,
+                ),
+            )
+            val samples = db.skipSamplesForWork(key)
+            val outcome = SkipLearning.learn(samples)
+            if (outcome.isEmpty) return@run null
+            db.saveLearnedSkip(key, outcome)
+            db.pruneSkipSamples(key)
+            outcome
+        }) { outcome, err ->
+            if (err != null) {
+                // 学习失败**不影响播放**，但必须留痕 —— 否则「怎么学不出来」
+                // 会变成一个无从查起的问题。
+                Log.w(TAG, "落点样本处理失败（不影响播放）：${err.message}")
+                return@run
+            }
+            if (outcome == null) {
+                Log.i(TAG, "落点已记录，但还没攒够可用的学习结论")
+                return@run
+            }
+            Log.i(TAG, "学习结论已更新：$key → intro=${outcome.intro} outro=${outcome.outro}")
+            // ⛔ 期间可能已经换集：晚到的结论打到新一集上，表现是「刚切过去
+            //    画面自己跳一下」。与 [loadSkipConfig] 同一条竞态守卫。
+            if (workKey != key) return@run
+            // 「当场学会」：用户第一次拖到片尾切集，样本就够了，结论立刻写回。
+            // 不同步进来的话这一集就再也不会提示 —— 用户会觉得「刚学会的东西
+            // 没生效」，而那正是他第一次手动操作的那一集。
+            introSession.setLearned(
+                outcome.intro?.let { IntroMarker(0L, it.endMs) },
+            )
+            if (outcome.outro != null) {
+                learnedOutroOffsetMs = outcome.outro.offsetMs
+                outroHandled = false
+            }
         }
     }
 
@@ -1862,6 +2241,19 @@ class PlayerActivity : Activity() {
         //    最多是 10 秒前写的 ⇒ 每次退出都丢最多 10 秒。真正致命的是
         //    「看了两分钟就退出」这种情形：一次都没上报过，进度全丢。
         reportProgress(flushAtExit = true)
+        // ── 片尾信号（退出播放 = 「这一集不看了」的另一个终态）────────
+        // ⛔ 必须在 `player.release()` 之前：释放之后 `currentPosition` 就没了。
+        // ⛔ 与 [onNewIntent] 同一条路（[reportEpisodeSwitchAnchor]），别在这里
+        //    另写一份 —— 两份判据漂移的表现是「切集学得出来、退出学不出来」。
+        // ⛔ `switchFromOutro` 在这里几乎总是 `false`：跳片尾引起的换集走的是
+        //    [onNewIntent]（singleTask 复用实例，不 `finish()`），标记在那时
+        //    就被消费掉了。留着这个判断是**防御**：万一哪天真加了 `finish()`，
+        //    少了它就会把自动跳转的位置记成用户样本。
+        if (switchFromOutro) {
+            switchFromOutro = false
+        } else {
+            reportEpisodeSwitchAnchor()
+        }
         ui.removeCallbacks(hideControls)
         ui.removeCallbacks(progressTick)
         // ⛔ 防抖里的跳转也要取消：player 释放后再跑会崩，而且此时跳转
@@ -3064,12 +3456,31 @@ class PlayerActivity : Activity() {
      * @param source 只进日志：`触摸` / `快进`。排查「谁在拖」时这一栏是
      *               分水岭 —— 曾经因为看不出是触摸还是按键，把一个
      *               「松手前就提交」的问题误判成了别的原因。
+     * @param user `true` = 用户发起的（触摸拖拽 / 快进 / 数字键），
+     *   `false` = **我们自己**发起的（跳片头）。⛔ 这个区别只影响一件事：
+     *   用户 seek 会被记成学习样本，自动跳**绝不会** —— 否则学习结论会
+     *   自己喂自己，片头越学越靠后，而它看起来完全像「越学越准」。
      */
-    private fun seekToPosition(targetMs: Long, source: String) {
+    private fun seekToPosition(targetMs: Long, source: String, user: Boolean = true) {
         val p = player ?: return
         val d = p.duration
         val max = if (d == C.TIME_UNSET || d <= 0L) Long.MAX_VALUE else d
         val target = targetMs.coerceIn(0L, max)
+        // 学习样本：**必须在 `seekTo` 之前**读 `currentPosition` ——
+        // `seekTo` 之后它立刻就是新位置了，`from` 会等于 `to`，
+        // 于是「前进」这条判据恒为假，一条样本都攒不到。
+        if (user) {
+            anchorCollector.noteSeek(
+                SeekObservation(
+                    fromMs = p.currentPosition,
+                    toMs = target,
+                    durationMs = if (d == C.TIME_UNSET || d <= 0L) 0L else d,
+                    // 倍速下「位置」的语义变了（用户在扫剧），锚点与其他集不可比。
+                    // 判据在 `SkipAnchorCollector.noteSeek` 里，这里如实报。
+                    rate = p.playbackParameters.speed.toDouble(),
+                ),
+            )
+        }
         // ⛔ `bufferedPosition` 必须在 `seekTo` **之前**读。
         //    拖到未缓冲处时 ExoPlayer 会把 `bufferedPosition` 夹到新位置
         //    （≥ target），于是 `target <= bufferedPosition` **恒为真** ——

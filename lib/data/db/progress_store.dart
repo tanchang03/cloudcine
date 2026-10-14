@@ -146,7 +146,7 @@ class ProgressStore {
         resumeMs: prev?.resumeMs,
         maxMs: prev?.maxMs,
         playedAtSec: sec,
-        updatedAtSec: _nextUpdated(prev),
+        updatedAtSec: _nextUpdated(prev?.updatedAtSec),
       ),
     );
   }
@@ -166,7 +166,7 @@ class ProgressStore {
         resumeMs: value,
         maxMs: prev?.maxMs,
         playedAtSec: prev?.playedAtSec,
-        updatedAtSec: _nextUpdated(prev),
+        updatedAtSec: _nextUpdated(prev?.updatedAtSec),
       ),
     );
   }
@@ -184,7 +184,7 @@ class ProgressStore {
         resumeMs: prev?.resumeMs,
         maxMs: positionMs,
         playedAtSec: prev?.playedAtSec,
-        updatedAtSec: _nextUpdated(prev),
+        updatedAtSec: _nextUpdated(prev?.updatedAtSec),
       ),
     );
   }
@@ -198,6 +198,91 @@ class ProgressStore {
     if (changed > 0) _markDirty();
     return changed;
   }
+
+  // -------------------------------------------------------------------
+  // 作品级的片头 / 片尾（进度文件 v2）
+  // -------------------------------------------------------------------
+  //
+  // ⛔ 这里**只写内存 + 防抖落盘**，回填 `media_works` 由同步那一轮统一做
+  //    （`ProgressSyncService` 的「回填」步骤）。两条路各写一次库的话，
+  //    「谁更新」会有两个答案，而它们会在下一次合并时互相打架。
+
+  /// 取一部作品的片头 / 片尾记录；没有返回 `null`。
+  WorkSkipEntry? skipFor(String workKey) => _book.works[workKey];
+
+  /// 覆盖写**手标**那一组（片头起止 / 片尾偏移）。
+  ///
+  /// ## ⛔ 为什么一次写整组，而不是「只改片头终点」
+  ///
+  /// 手标在库里就是一组列（`intro_start_ms` / `intro_end_ms` /
+  /// `outro_offset_ms`），而 LWW 是**按组**判胜负的。允许逐字段写的话，
+  /// 「清除」只清得掉一个字段，界面上看起来是「清不干净」。
+  /// 调用方要改一个字段时，先把当前这一组读出来（[skipFor]）再整体传进来。
+  ///
+  /// ⚠️ **学习那一组原样保留** —— 手标不该动它（两条独立支路）。
+  ///
+  /// @return 是否真的改了东西（没变就不落盘、也不触发同步）。
+  bool recordManualSkip(
+    String workKey, {
+    int? introStartMs,
+    int? introEndMs,
+    int? outroOffsetMs,
+    DateTime? at,
+  }) {
+    if (workKey.isEmpty) return false;
+    final prev = _book.works[workKey];
+    final next = WorkSkipEntry(
+      // ⛔ `introStartMs` **不做归一化**：`0` 是它的正常值（片头总在开头），
+      //    把它当「没有」会让「起点 0、终点 92 秒」这条合法标记消失。
+      introStartMs: introStartMs,
+      introEndMs: _positive(introEndMs),
+      outroOffsetMs: _positive(outroOffsetMs),
+      manualUpdatedAtSec: _nextUpdated(prev?.manualUpdatedAtSec, at),
+      learnedIntroEndMs: prev?.learnedIntroEndMs,
+      learnedOutroOffsetMs: prev?.learnedOutroOffsetMs,
+      learnedSamples: prev?.learnedSamples ?? 0,
+      learnedUpdatedAtSec: prev?.learnedUpdatedAtSec ?? 0,
+    );
+    if (prev != null && prev.sameAs(next)) return false;
+    _book.putSkip(workKey, next);
+    _markDirty();
+    return true;
+  }
+
+  /// 覆盖写**学习**那一组（片头终点 / 片尾偏移 / 样本数）。
+  ///
+  /// ⚠️ 手标那一组原样保留。写 [samples] 只是为了让界面能说「这个结论有多少
+  /// 集撑着」，它不参与合并判据。
+  ///
+  /// @return 是否真的改了东西。
+  bool recordLearnedSkip(
+    String workKey, {
+    required int? introEndMs,
+    required int? outroOffsetMs,
+    required int samples,
+    DateTime? at,
+  }) {
+    if (workKey.isEmpty) return false;
+    final prev = _book.works[workKey];
+    final next = WorkSkipEntry(
+      introStartMs: prev?.introStartMs,
+      introEndMs: prev?.introEndMs,
+      outroOffsetMs: prev?.outroOffsetMs,
+      manualUpdatedAtSec: prev?.manualUpdatedAtSec ?? 0,
+      learnedIntroEndMs: _positive(introEndMs),
+      learnedOutroOffsetMs: _positive(outroOffsetMs),
+      learnedSamples: samples < 0 ? 0 : samples,
+      learnedUpdatedAtSec: _nextUpdated(prev?.learnedUpdatedAtSec, at),
+    );
+    if (prev != null && prev.sameAs(next)) return false;
+    _book.putSkip(workKey, next);
+    _markDirty();
+    return true;
+  }
+
+  /// `<= 0` 一律当「没有」。⛔ 只用在「0 没有意义」的字段上 ——
+  ///    `introStartMs` 的 `0` 是有意义的，别对它用。
+  static int? _positive(int? v) => (v == null || v <= 0) ? null : v;
 
   // -------------------------------------------------------------------
   // 落盘
@@ -275,9 +360,12 @@ class ProgressStore {
   /// ⛔ 不取 `max` 的话，一次时钟回拨会让新写入的 `u` 小于网盘上那份旧的
   ///    `u`，于是**本地刚看的进度在合并时输给远程的旧进度** —— 表现是
   ///    「看完一集回到电脑上，进度又退回去了」，而且两边都显示同步成功。
-  int _nextUpdated(ProgressEntry? prev) {
-    final now = _clock().millisecondsSinceEpoch ~/ 1000;
-    final old = prev?.updatedAtSec ?? 0;
+  ///
+  /// @param prevSec 旧的 `u`（没有就传 `null` / `0`）。
+  /// @param at 测试注入用的「现在」；生产路径传 `null`（用 [_clock]）。
+  int _nextUpdated(int? prevSec, [DateTime? at]) {
+    final now = (at ?? _clock()).millisecondsSinceEpoch ~/ 1000;
+    final old = prevSec ?? 0;
     return now > old ? now : old;
   }
 }

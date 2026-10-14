@@ -21,6 +21,7 @@ import android.widget.TextView
 import com.cloudcine.tv.library.DoubanScraper
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
+import com.cloudcine.tv.library.LibrarySchema
 import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.LibrarySettings
 import com.cloudcine.tv.library.ScrapeProbe
@@ -92,6 +93,21 @@ class ScrapeSettingsActivity : Activity() {
      *    读出来也是「开」。
      */
     private var autoScrapeOn = true
+
+    /** 「自动跳过片头」（`skip_intro`）的当前值。默认开，判据 `!= "false"`。 */
+    private var skipIntroOn = true
+
+    /**
+     * 「自动连播」（`auto_play_next`）的当前值。默认开，判据 `!= "false"`。
+     *
+     * ⛔ 它不只管「播完接下一集」—— 还是**片尾自动跳转**的开关：关掉时
+     *    播放器学到片尾也**只提示不跳**。理由见 `PlayerActivity.maybeHandleOutro`：
+     *    片尾误跳的代价是丢掉结局，不可逆，所以门槛更高。
+     */
+    private var autoPlayNextOn = true
+
+    private lateinit var skipIntroButton: TextView
+    private lateinit var autoPlayNextButton: TextView
 
     /**
      * ↑↓ 的焦点顺序。
@@ -241,6 +257,62 @@ class ScrapeSettingsActivity : Activity() {
             },
         )
 
+        // ── 播放：跳过片头 / 自动连播 ──
+        //
+        // ⛔ 这两个键（`skip_intro` / `auto_play_next`）与 PC 端 `SettingKeys`
+        //    逐字一致、存在同一个 `settings` 表里、随备份包跨端走。**必须**在
+        //    电视上也有入口：没有这一屏的话，从没在电脑上开过设置页的用户在
+        //    电视上**没有任何办法**关掉自动跳 —— 而自动跳片尾是会丢掉结局的。
+        //
+        // ⛔ 判据一律是「不等于 `"false"`」（缺失即开），与
+        //    `PlayerActivity.loadSkipConfig` 逐字同口径。写成「等于 `"true"`」
+        //    会让这一屏显示「关」而播放器照跳 —— 两边都不报错，用户只会觉得
+        //    「设置没用」。
+        column.addView(
+            TextView(this).apply {
+                text = "播放"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                setPadding(0, dp(26), 0, 0)
+            },
+        )
+
+        skipIntroButton = toggleButton({ toggleSkipIntro() }) { b, focused ->
+            paintToggle(b, "跳过片头", skipIntroOn, focused)
+        }
+        paintToggle(skipIntroButton, "跳过片头", skipIntroOn, false)
+        column.addView(
+            skipIntroButton,
+            LinearLayout.LayoutParams(dp(220), WRAP).apply { topMargin = dp(10) },
+        )
+        column.addView(
+            TextView(this).apply {
+                text = "开（默认）：认得出片头就自动跳过去。片头是**按剧集**学出来的" +
+                    "（同一部剧看几集之后才生效），在电脑上手动标过的片头优先。"
+                setTextColor(FAINT)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, dp(8), 0, 0)
+            },
+        )
+
+        autoPlayNextButton = toggleButton({ toggleAutoPlayNext() }) { b, focused ->
+            paintToggle(b, "自动连播", autoPlayNextOn, focused)
+        }
+        paintToggle(autoPlayNextButton, "自动连播", autoPlayNextOn, false)
+        column.addView(
+            autoPlayNextButton,
+            LinearLayout.LayoutParams(dp(220), WRAP).apply { topMargin = dp(14) },
+        )
+        column.addView(
+            TextView(this).apply {
+                text = "开（默认）：一集播完自动接下一集；学到片尾时也会跳过片尾。\n" +
+                    "关：片尾只提示「已到片尾」，跳不跳由你按 —— 误跳会直接丢掉结局。"
+                setTextColor(FAINT)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, dp(8), 0, 0)
+            },
+        )
+
         status = TextView(this).apply {
             setTextColor(DIM)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -279,6 +351,7 @@ class ScrapeSettingsActivity : Activity() {
             keyBox, apiBox, imageBox, tmdbTestButton,
             cookieBox, doubanTestButton,
             autoScrapeButton,
+            skipIntroButton, autoPlayNextButton,
             saveButton,
         )
         return column
@@ -290,22 +363,47 @@ class ScrapeSettingsActivity : Activity() {
      * ⛔ 文案里带上**当前状态**（「开」/「关」），而不是只靠颜色 —— 颜色还要
      *    表达焦点态，两者混在一起用户分不清「这个按钮被选中了」和
      *    「这个开关是开着的」。
+     *
+     * ⛔ 失焦时**回到状态色**，不能像「测试」按钮那样统一刷成灰 ——
+     *    那样开关的「开 / 关」就看不出来了。
      */
-    private fun paintAutoScrapeButton(button: TextView, focused: Boolean) {
-        button.text = if (autoScrapeOn) "自动刮削：开" else "自动刮削：关"
+    private fun paintToggle(button: TextView, label: String, on: Boolean, focused: Boolean) {
+        button.text = "$label：${if (on) "开" else "关"}"
         button.background = GradientDrawable().apply {
             cornerRadius = dp(18).toFloat()
             setColor(if (focused) BRAND_SOLID else 0x14FFFFFF)
         }
-        // ⛔ 失焦时**回到状态色**，不能像「测试」按钮那样统一刷成灰 ——
-        //    那样开关的「开 / 关」就看不出来了。
         button.setTextColor(
             when {
                 focused -> 0xFF1A1533.toInt()
-                autoScrapeOn -> OK_GREEN
+                on -> OK_GREEN
                 else -> 0xFF9AA3B2.toInt()
             },
         )
+    }
+
+    private fun paintAutoScrapeButton(button: TextView, focused: Boolean) =
+        paintToggle(button, "自动刮削", autoScrapeOn, focused)
+
+    /**
+     * 造一个开关胶囊。
+     *
+     * ⛔ 焦点回调里用的是**传进来的那个 View**（`v`），不是 `lateinit` 字段 ——
+     *    这个页面历史上踩过一次「在赋值用的 `apply` 块里读自己」⇒
+     *    `UninitializedPropertyAccessException` ⇒ 系统直接 `Force finishing`，
+     *    用户看到的是「点进去立刻弹回上一页、一句报错都没有」。
+     */
+    private fun toggleButton(
+        onClick: () -> Unit,
+        paint: (TextView, Boolean) -> Unit,
+    ): TextView = TextView(this).apply {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        gravity = Gravity.CENTER
+        setPadding(dp(22), dp(9), dp(22), dp(9))
+        isFocusable = true
+        isFocusableInTouchMode = true
+        setOnClickListener { onClick() }
+        setOnFocusChangeListener { v, hasFocus -> paint(v as TextView, hasFocus) }
     }
 
     /** 切一下开关。⛔ 只改内存，落库交给「保存」—— 与四个输入框同一趟写。 */
@@ -316,6 +414,28 @@ class ScrapeSettingsActivity : Activity() {
             "扫描后会自动刮削（默认）。记得点「保存」。"
         } else {
             "扫描后不再自动刮削。记得点「保存」。"
+        }
+    }
+
+    /** 切「自动跳过片头」。⛔ 只改内存，落库交给「保存」。 */
+    private fun toggleSkipIntro() {
+        skipIntroOn = !skipIntroOn
+        paintToggle(skipIntroButton, "跳过片头", skipIntroOn, skipIntroButton.hasFocus())
+        status.text = if (skipIntroOn) {
+            "认得出片头就自动跳过（默认）。记得点「保存」。"
+        } else {
+            "不再自动跳过片头。记得点「保存」。"
+        }
+    }
+
+    /** 切「自动连播」。⛔ 只改内存，落库交给「保存」。 */
+    private fun toggleAutoPlayNext() {
+        autoPlayNextOn = !autoPlayNextOn
+        paintToggle(autoPlayNextButton, "自动连播", autoPlayNextOn, autoPlayNextButton.hasFocus())
+        status.text = if (autoPlayNextOn) {
+            "播完自动接下一集，学到片尾也会跳过片尾（默认）。记得点「保存」。"
+        } else {
+            "播完停住；学到片尾也只提示，不自动跳。记得点「保存」。"
         }
     }
 
@@ -525,6 +645,18 @@ class ScrapeSettingsActivity : Activity() {
             //    否则会出现「设置页显示关、实际却在刮」。
             autoScrapeOn = m[LibrarySettings.AUTO_SCRAPE_ON_SCAN] != "false"
             paintAutoScrapeButton(autoScrapeButton, autoScrapeButton.hasFocus())
+            // 播放两项。⛔ 判据与 `PlayerActivity.loadSkipConfig` **逐字同口径**
+            //    （「不等于 `"false"`」）。两处各写一套的话，症状是「这一屏显示
+            //    关、播放器照跳」，而两边都不报错。
+            skipIntroOn = m[LibrarySchema.KEY_SKIP_INTRO] != "false"
+            autoPlayNextOn = m[LibrarySchema.KEY_AUTO_PLAY_NEXT] != "false"
+            paintToggle(skipIntroButton, "跳过片头", skipIntroOn, skipIntroButton.hasFocus())
+            paintToggle(
+                autoPlayNextButton,
+                "自动连播",
+                autoPlayNextOn,
+                autoPlayNextButton.hasFocus(),
+            )
             val configured = LibrarySettings.SCRAPE_KEYS.count { !m[it].isNullOrBlank() }
             status.text = "当前已填 $configured 项 · ↑↓ 切换输入框 · OK 编辑"
             keyBox.requestFocus()
@@ -546,12 +678,18 @@ class ScrapeSettingsActivity : Activity() {
         //    删行的话，从 PC 端同步过来的 `"false"` 会在下次同步时又冒出来，
         //    用户明明在电视上关掉了它。
         val auto = if (autoScrapeOn) "true" else "false"
+        // ⛔ 播放两项与 `auto` 同一趟写、同样「两个值都显式写」：删行的话，
+        //    从 PC 端同步过来的 `"false"` 会在下次同步时又冒出来。
+        val skipIntro = if (skipIntroOn) "true" else "false"
+        val autoNext = if (autoPlayNextOn) "true" else "false"
         Bg.run({
             db.setSetting(LibrarySettings.TMDB_API_KEY, k)
             db.setSetting(LibrarySettings.TMDB_API_BASE, a)
             db.setSetting(LibrarySettings.TMDB_IMAGE_BASE, i)
             db.setSetting(LibrarySettings.DOUBAN_COOKIE, c)
             db.setSetting(LibrarySettings.AUTO_SCRAPE_ON_SCAN, auto)
+            db.setSetting(LibrarySchema.KEY_SKIP_INTRO, skipIntro)
+            db.setSetting(LibrarySchema.KEY_AUTO_PLAY_NEXT, autoNext)
         }) { _, err ->
             saving = false
             if (err != null) {
@@ -566,10 +704,13 @@ class ScrapeSettingsActivity : Activity() {
             }
             status.text = "已保存：${enabled.joinToString(" + ")} 可用。" +
                 (if (autoScrapeOn) "扫描后自动刮削。" else "扫描后不自动刮削。") +
+                (if (skipIntroOn) "自动跳过片头。" else "不自动跳过片头。") +
+                (if (autoPlayNextOn) "自动连播。" else "播完停住。") +
                 "同步一次备份，这些值就会带到其它设备。"
             Log.i(
                 TAG,
-                "刮削设置已保存（TMDB=${k.isNotEmpty()}, 豆瓣=${c.isNotEmpty()}, 自动刮削=$autoScrapeOn）",
+                "刮削设置已保存（TMDB=${k.isNotEmpty()}, 豆瓣=${c.isNotEmpty()}, " +
+                    "自动刮削=$autoScrapeOn, 跳片头=$skipIntroOn, 自动连播=$autoPlayNextOn）",
             )
         }
     }
@@ -628,6 +769,8 @@ class ScrapeSettingsActivity : Activity() {
         tmdbTestButton -> ({ probeTmdb() })
         doubanTestButton -> ({ probeDouban() })
         autoScrapeButton -> ({ toggleAutoScrape() })
+        skipIntroButton -> ({ toggleSkipIntro() })
+        autoPlayNextButton -> ({ toggleAutoPlayNext() })
         saveButton -> ({ save() })
         else -> null
     }

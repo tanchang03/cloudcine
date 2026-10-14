@@ -19,12 +19,24 @@ import 'intro_marker.dart';
 /// 漏了它的后果很隐蔽：`_probed` 留着 true，于是换集之后**永远不再读章节**，
 /// 表现成「只有第一集跳片头」，而第一集恰好是最不需要跳的那一集。
 class IntroSession {
-  IntroSession({IntroMarker? manual, bool enabled = true})
-      : _manual = manual,
+  IntroSession({
+    IntroMarker? manual,
+    IntroMarker? learned,
+    bool enabled = true,
+  })  : _manual = manual,
+        _learned = learned,
         _enabled = enabled;
 
   /// 从**库里 / 请求里**来的手标区间（兜底）。
   IntroMarker? _manual;
+
+  /// 从**自动学习**来的区间（最弱的一级）。
+  ///
+  /// ⛔ 排在最后：它是**推断**出来的，而手标是用户明确指定的、章节更是
+  ///    发布者标的且与这一集的实际内容严格对应。推断压过明确指定，会出现
+  ///    「我明明标过，它却按自己学的跳」—— 而用户完全没有办法知道
+  ///    是哪一层在生效。
+  IntroMarker? _learned;
 
   /// 从**文件章节**里认出来的区间（优先）。
   IntroMarker? _chapter;
@@ -41,24 +53,35 @@ class IntroSession {
   /// 「清除标记」这一项显不显示）。
   IntroMarker? get manual => _manual;
 
-  /// 当前生效的区间：**文件章节优先，手标兜底**。
+  /// 学习出来的那一份（UI 用它显示「这是自动学的」）。
+  IntroMarker? get learned => _learned;
+
+  /// 当前生效的区间：**文件章节优先，手标其次，学习兜底**。
   ///
   /// 顺序不能反。文件章节是压制者标的，与**这一集**的实际内容严格对应；
   /// 手标是「这一部作品」级别的一次性标记（`MediaWork.introStartMs`），
-  /// 各集片长不同时会有偏差。只有在文件里读不到章节时 —— 绝大多数网盘
-  /// 片源都是这样 —— 手标才有意义。
-  IntroMarker? get marker => _chapter ?? _manual;
+  /// 各集片长不同时会有偏差；学习更是推断。只有前两者都没有时 ——
+  /// 绝大多数网盘片源都是这样 —— 学习才有意义。
+  IntroMarker? get marker => _chapter ?? _manual ?? _learned;
 
   /// 生效的那一份是不是来自文件章节。UI 的文案要按它分岔：
   /// 「发布者标的」与「你自己标的」是两件不同的事。
   bool get fromChapters => _chapter != null;
 
+  /// 生效的那一份是不是**学习**出来的。
+  bool get fromLearned => _chapter == null && _manual == null && _learned != null;
+
   /// 本次流是否已经跳过片头。
   bool get skipped => _skipped;
 
   /// 换一条流（换集 / 切清晰度 / 重开）时归零。
-  void reset({IntroMarker? manual, bool enabled = true}) {
+  void reset({
+    IntroMarker? manual,
+    IntroMarker? learned,
+    bool enabled = true,
+  }) {
     _manual = manual;
+    _learned = learned;
     _enabled = enabled;
     _chapter = null;
     _probed = false;
@@ -83,6 +106,17 @@ class IntroSession {
   void setManual(IntroMarker? marker) {
     if (_manual == marker) return;
     _manual = marker;
+    _skipped = false;
+  }
+
+  /// 学习结果变了之后同步进来。
+  ///
+  /// 与 [setManual] 同一条理由：标记变了就**重新给一次机会**
+  /// （`_skipped` 归零）—— 否则用户看到的是「学出来了，但这一集不跳」，
+  /// 而他不知道要退出重进才生效。
+  void setLearned(IntroMarker? marker) {
+    if (_learned == marker) return;
+    _learned = marker;
     _skipped = false;
   }
 

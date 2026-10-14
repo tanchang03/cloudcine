@@ -208,6 +208,60 @@ class ProgressStore(
         )
     }
 
+    // ------------------------------------------------------------------
+    // 作品级的片头 / 片尾（进度文件 v2）
+    // ------------------------------------------------------------------
+    //
+    // ⛔ 这里**只写内存 + 防抖落盘**，回填 `media_works` 由同步那一轮统一做
+    //    （`ProgressSync` 的「回填」步骤）。两条路各写一次库的话，「谁更新」
+    //    会有两个答案，而它们会在下一次合并时互相打架。
+
+    /** 取一部作品的片头 / 片尾记录；没有返回 `null`。 */
+    @Synchronized
+    fun skipFor(workKey: String): WorkSkipEntry? {
+        load()
+        return data.skipFor(workKey)
+    }
+
+    /**
+     * 覆盖写**学习**那一组（片头终点 / 片尾偏移 / 样本数）。
+     *
+     * ⚠️ 手标那一组原样保留 —— 电视上**没有手标入口**（遥控器定位不到某一秒，
+     *    见 `player_tv_panel.dart` 的注释），那组值只可能来自 PC 端的同步。
+     *
+     * 传三个空值 = **清除学习结论**：学习组整组变空、[WorkSkipEntry.learnedUpdatedAtSec]
+     * 前进，于是这条「清除」能在 LWW 里赢过旧的结论并同步出去。
+     * 两组都空时 [ProgressBook.putSkip] 会把这一条整条删掉。
+     *
+     * @return 是否真的改了东西（没变就不落盘、也不触发同步）。
+     */
+    @Synchronized
+    fun recordLearnedSkip(
+        workKey: String,
+        introEndMs: Long?,
+        outroOffsetMs: Long?,
+        samples: Int,
+    ): Boolean {
+        if (workKey.isEmpty()) return false
+        load()
+        val prev = data.skipFor(workKey)
+        val next = WorkSkipEntry(
+            introStartMs = prev?.introStartMs,
+            introEndMs = prev?.introEndMs,
+            outroOffsetMs = prev?.outroOffsetMs,
+            manualUpdatedAtSec = prev?.manualUpdatedAtSec ?: 0L,
+            // ⛔ 非正数一律当「没有」—— 0 秒的片头 / 片尾没有意义。
+            learnedIntroEndMs = positive(introEndMs),
+            learnedOutroOffsetMs = positive(outroOffsetMs),
+            learnedSamples = samples.coerceAtLeast(0),
+            learnedUpdatedAtSec = nextUpdated(prev?.learnedUpdatedAtSec),
+        )
+        if (prev != null && prev.sameAs(next)) return false
+        data.putSkip(workKey, next)
+        markDirty()
+        return true
+    }
+
     /**
      * 把一份**远程**（或从库里导出）的进度合进来。
      *
@@ -313,11 +367,23 @@ class ProgressStore(
      *    于是**本地刚看的进度在合并时输给远程的旧进度** —— 表现是「看完一集
      *    回到电脑上，进度又退回去了」，而且两边都显示同步成功。
      */
-    private fun nextUpdated(prev: ProgressEntry?): Long {
+    private fun nextUpdated(prev: ProgressEntry?): Long = nextUpdated(prev?.updatedAtSec)
+
+    /**
+     * 这一组新的时间戳：取「现在」与「旧值」的较大者。
+     *
+     * ⛔ 不取 `max` 的话，一次时钟回拨会让新写入的时间戳小于网盘上那份旧的，
+     *    于是**本地刚得到的结论在合并时输给远程的旧结论** —— 表现是「电视上
+     *    刚学出来的片头，同步之后又变回旧值」，而且两边都显示同步成功。
+     */
+    private fun nextUpdated(prevSec: Long?): Long {
         val now = clock()
-        val old = prev?.updatedAtSec ?: 0L
+        val old = prevSec ?: 0L
         return if (now > old) now else old
     }
+
+    /** `<= 0` 一律当「没有」。 */
+    private fun positive(v: Long?): Long? = if (v == null || v <= 0L) null else v
 
     companion object {
 

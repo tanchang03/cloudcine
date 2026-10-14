@@ -14,7 +14,7 @@ import org.junit.Test
  * 它们不是「另一个手写的期望值」—— 是 PC 端真的会建出来的那张表。
  *
  * 备份包装的是 **SQLite 文件的原始字节**，PC 端 restore 之后看
- * `user_version == 17` 就**不再跑迁移**，直接拿它当自己的库用。所以：
+ * `user_version == 18` 就**不再跑迁移**，直接拿它当自己的库用。所以：
  *
  *   * 列名少一个 / 多一个 → PC 端 `no such column`，**没有迁移兜底**；
  *   * `DEFAULT` 值不同 → 新插入的行在两端语义不同（最典型的是
@@ -27,9 +27,9 @@ import org.junit.Test
 class LibrarySchemaTest {
 
     @Test
-    fun `user_version 必须是 17`() {
-        // 与 PC 端 AppDatabase.schemaVersion 相等。
-        assertEquals(17, LibrarySchema.VERSION)
+    fun `user_version 必须是 19`() {
+        // 与 PC 端 AppDatabase.currentSchemaVersion 相等。
+        assertEquals(19, LibrarySchema.VERSION)
     }
 
     @Test
@@ -38,7 +38,7 @@ class LibrarySchemaTest {
     }
 
     @Test
-    fun `七张表齐全且顺序与 PC 端 DriftDatabase 声明一致`() {
+    fun `八张表齐全且顺序与 PC 端 DriftDatabase 声明一致`() {
         assertEquals(
             listOf(
                 "media_items",
@@ -48,6 +48,7 @@ class LibrarySchemaTest {
                 "settings",
                 "playback_prefs",
                 "download_tasks",
+                "skip_samples",
             ),
             LibrarySchema.TABLES.map { it.name },
         )
@@ -95,6 +96,12 @@ class LibrarySchemaTest {
     fun `download_tasks 建表语句与 drift 输出逐字一致`() = assertDdl(
         LibrarySchema.downloadTasks,
         EXPECTED_DOWNLOAD_TASKS,
+    )
+
+    @Test
+    fun `skip_samples 建表语句与 drift 输出逐字一致`() = assertDdl(
+        LibrarySchema.skipSamples,
+        EXPECTED_SKIP_SAMPLES,
     )
 
     // ── 补表 / 补列 ──────────────────────────────────────────────────
@@ -186,10 +193,21 @@ class LibrarySchemaTest {
                 "DEFAULT 0, \"season_count\" INTEGER NOT NULL DEFAULT 0, \"last_modified_at\" " +
                 "INTEGER NULL, \"first_seen_at\" INTEGER NULL, \"last_played_at\" INTEGER NULL, " +
                 "\"updated_at\" INTEGER NOT NULL, \"merged_into\" TEXT NULL, \"intro_start_ms\" " +
-                "INTEGER NULL, \"intro_end_ms\" INTEGER NULL, \"followed\" INTEGER NOT NULL " +
+                "INTEGER NULL, \"intro_end_ms\" INTEGER NULL, " +
+                // v19：**手标**的片尾偏移（毫秒，距末尾）。与下面的
+                // `learned_outro_offset_ms`（学习）是两条独立支路，取值链
+                // **手标 > 学习**。⛔ 顺序必须与 PC 端 `tables.dart` 里
+                // `MediaWorks` 的声明顺序一致 —— drift 按声明顺序建列。
+                "\"outro_offset_ms\" INTEGER NULL, \"followed\" INTEGER NOT NULL " +
                 "DEFAULT 0 CHECK (\"followed\" IN (0, 1)), \"follow_started_at\" INTEGER NULL, " +
                 "\"follow_checked_at\" INTEGER NULL, \"new_item_count\" INTEGER NOT NULL " +
-                "DEFAULT 0, PRIMARY KEY (\"key\"))"
+                "DEFAULT 0, " +
+                // v18：自动学习出的片头 / 片尾结论。⛔ 顺序必须与 PC 端
+                // `tables.dart` 里 `MediaWorks` 的声明顺序一致 —— drift 按声明
+                // 顺序建列，错位了 `PRAGMA table_info` 就对不上。
+                "\"learned_intro_start_ms\" INTEGER NULL, \"learned_intro_end_ms\" INTEGER NULL, " +
+                "\"learned_outro_offset_ms\" INTEGER NULL, \"learned_samples\" INTEGER NOT NULL " +
+                "DEFAULT 0, \"learned_at\" INTEGER NULL, PRIMARY KEY (\"key\"))"
 
         const val EXPECTED_SUBTITLE_REFS =
             "CREATE TABLE \"subtitle_refs\" (\"id\" TEXT NOT NULL, \"item_id\" TEXT NOT NULL, " +
@@ -227,5 +245,20 @@ class LibrarySchemaTest {
                 "\"received_bytes\" INTEGER NOT NULL DEFAULT 0, \"status\" TEXT NOT NULL, " +
                 "\"error\" TEXT NULL, \"created_at\" INTEGER NOT NULL, \"updated_at\" INTEGER NOT " +
                 "NULL, PRIMARY KEY (\"id\"))"
+
+        /**
+         * v18 新增的原始样本表。
+         *
+         * ⛔ `negative` 带 `CHECK (... IN (0, 1))`、`device` 带 `DEFAULT ''` ——
+         *    与 PC 端 drift 的输出逐字一致。少一个 CHECK 不会报错，但两端
+         *    `PRAGMA table_info` 就长得不一样了，而备份是**整个文件**互换的。
+         */
+        const val EXPECTED_SKIP_SAMPLES =
+            "CREATE TABLE \"skip_samples\" (\"id\" TEXT NOT NULL, \"item_id\" TEXT NOT NULL, " +
+                "\"work_key\" TEXT NOT NULL, \"kind\" TEXT NOT NULL, \"anchor_ms\" INTEGER NOT " +
+                "NULL, \"duration_ms\" INTEGER NOT NULL, \"offset_ms\" INTEGER NULL, " +
+                "\"negative\" INTEGER NOT NULL DEFAULT 0 CHECK (\"negative\" IN (0, 1)), " +
+                "\"device\" TEXT NOT NULL DEFAULT '', \"created_at\" INTEGER NOT NULL, " +
+                "PRIMARY KEY (\"id\"))"
     }
 }

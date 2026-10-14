@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,6 +13,7 @@ import '../../data/remote/subtitle/opensubtitles_client.dart';
 import '../../domain/entities/playback_preference.dart';
 import '../../domain/services/missing_media.dart';
 import '../../domain/services/playback_resume.dart';
+import '../../domain/services/skip_learning.dart';
 import '../../domain/services/subtitle_query.dart';
 import '../providers/app_providers.dart';
 import '../providers/library_providers.dart';
@@ -354,17 +356,17 @@ final playerBridgeHostProvider = Provider<void>((ref) {
   };
 
   // -------------------------------------------------------------------
-  // 服务六：保存手标的片头区间
+  // 服务六：保存手标的片头 / 片尾标记
   // -------------------------------------------------------------------
   //
-  // 播放窗口在**另一个引擎**里，它的「片头」菜单只能把「标了什么」报回来 ——
-  // 库、仓储、`groupKey` 全都在主窗口这边。所以这里要做的是「把 itemId 翻译成
-  // 作品行，再写那两列」。
+  // 播放窗口在**另一个引擎**里，它的「片头 / 片尾」菜单只能把「标了什么」报
+  // 回来 —— 库、仓储、`groupKey` 全都在主窗口这边。所以这里要做的是「把
+  // itemId 翻译成作品行，再写那几列」。
   //
-  // ⚠️ 三个仓储方法**分开调**，不要试图合成一个：
-  // `setWorkIntroStart` / `setWorkIntroEnd` / `clearWorkIntroRange` 之所以
-  // 是三个而不是一个带可空参数的，正是因为 `copyWith` 的 `??` 把 `null`
-  // 当成「不改」——用一个方法表达不了「清除」。
+  // ⚠️ 几个仓储方法**分开调**，不要试图合成一个：
+  // `setWorkIntroStart` / `setWorkIntroEnd` / `setWorkOutroOffset` /
+  // `clearWorkIntroRange` 之所以是分开的而不是一个带可空参数的，正是因为
+  // `copyWith` 的 `??` 把 `null` 当成「不改」—— 用一个方法表达不了「清除」。
   onSaveIntroRange = (request) async {
     final repo = ref.read(mediaRepositoryProvider);
     final item = await repo.itemById(request.itemId);
@@ -389,6 +391,11 @@ final playerBridgeHostProvider = Provider<void>((ref) {
         if (request.endMs case final ms?) {
           await repo.setWorkIntroEnd(key, ms);
         }
+        // ⚠️ 片尾报上来时已经是**距末尾的偏移**：片长只有播放器知道，
+        // 换算必须在那边做完（见 `IntroRangeSaveRequest.outroOffsetMs`）。
+        if (request.outroOffsetMs case final ms?) {
+          await repo.setWorkOutroOffset(key, ms);
+        }
       }
 
       // 回**落库之后的真实值**，不是一个 bool：播放窗口拿到 true 也仍然不知道
@@ -398,14 +405,97 @@ final playerBridgeHostProvider = Provider<void>((ref) {
       final snapshot = IntroRangeSnapshot(
         startMs: work?.introStartMs,
         endMs: work?.introEndMs,
+        outroOffsetMs: work?.outroOffsetMs,
       );
-      diag.info('窗口', '片头区间已保存：$key → $snapshot');
+      diag.info('窗口', '片头 / 片尾标记已保存：$key → $snapshot');
       return snapshot;
     } catch (e, st) {
       // 不抛：抛出去会变成一条没头没尾的 PlatformException，而播放窗口
       // 能做的也只是提示一句。日志里已经把原因写清楚了。
       diag.error('窗口', '保存片头区间失败：$key', error: e, stackTrace: st);
       return null;
+    }
+  };
+
+  // -------------------------------------------------------------------
+  // 服务七：播放窗口采集到的「有效落点」样本
+  // -------------------------------------------------------------------
+  //
+  // 采集贴着播放头做（只有播放窗口知道「拖过去之后有没有停下来看」），
+  // 而**聚合与落库**要读这部作品的**全部**样本、还要写结论列 —— 库在这边。
+  //
+  // ⛔ 收到一条样本之后**整体重聚合**，不是增量更新：判据是中位数 + MAD，
+  //    加一条样本既可能让样本数跨过门槛，也可能让已有结论失效（散布被撑爆），
+  //    而增量公式表达不了这两件事。
+  //
+  // ⛔ 全程 catch 且**不抛**：用户什么都没点（样本是看剧看出来的），
+  //    为一次写库失败让播放窗口弹提示，与他的操作毫无关系。
+  onSaveSkipAnchor = (report) async {
+    try {
+      final repo = ref.read(mediaRepositoryProvider);
+      final item = await repo.itemById(report.itemId);
+      if (item == null) {
+        // 条目被删、或被重扫换过 id。**不写**：样本挂在一条不存在的条目上，
+        // 永远参与不了聚合，只会让表慢慢变脏。
+        diag.warn('窗口', '落点样本丢弃：库里找不到 ${report.itemId}');
+        return;
+      }
+
+      final kind = SkipKind.parse(report.kind);
+      if (kind == null) {
+        diag.warn('窗口', '落点样本丢弃：认不出类型 ${report.kind}');
+        return;
+      }
+
+      final key = item.groupKey;
+      final now = DateTime.now();
+      final anchor = Duration(milliseconds: report.anchorMs);
+      final duration = Duration(milliseconds: report.durationMs);
+
+      // 主窗口这边**再判一次**窗口是否成立，不无条件相信播放窗口：
+      // 判据（`SkipLearning.classify`）只有一份实现，而两处各判一次必然
+      // 漂移成「内置播放页学得出来、独立窗口学不出来」。
+      if (SkipLearning.classify(
+            SkipAnchor(
+              anchor: anchor,
+              duration: duration,
+              // 起播位置在跨引擎的回报里没有 —— 只有片头判据要用它，而片头
+              // 是**从 0 起播**才成立的。用 `Duration.zero` 表示「不知道」，
+              // 于是片头这一条在这里会被放行；真正的把关留给聚合
+              // （`learnIntro` 还要求 ≥3 条样本、MAD ≤ 8s、落点落在 15s~3min）。
+              playStart: Duration.zero,
+            ),
+          ) !=
+          kind) {
+        diag.info('窗口', '落点不在 ${kind.label} 窗口内，丢弃：$report');
+        return;
+      }
+
+      await repo.addSkipSample(
+        SkipSample(
+          id: SkipSample.idFor(itemId: item.id, kind: kind, at: now),
+          itemId: item.id,
+          workKey: key,
+          kind: kind,
+          anchor: anchor,
+          duration: duration,
+          // 设备只用于排查，不参与聚合。独立窗口与主窗口是同一台机器。
+          device: Platform.localHostname,
+          createdAt: now,
+        ),
+      );
+
+      final samples = await repo.skipSamplesForWork(key);
+      final outcome = SkipLearning.learn(samples);
+      if (outcome.isEmpty) {
+        diag.info('窗口', '$key：样本 ${samples.length} 条，还没学出可用结论');
+        return;
+      }
+
+      await repo.saveLearnedSkip(key, outcome, now: now);
+      diag.info('窗口', '学习结论已更新：$key → $outcome');
+    } catch (e, st) {
+      diag.error('窗口', '落点样本处理失败（不影响播放）', error: e, stackTrace: st);
     }
   };
 
@@ -499,6 +589,7 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     onSearchOnlineSubtitles = null;
     onFetchOnlineSubtitle = null;
     onSaveIntroRange = null;
+    onSaveSkipAnchor = null;
     onQueryMissingMedia = null;
     onRemoveMissingMedia = null;
     onSaveAudioEffect = null;

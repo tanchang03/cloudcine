@@ -20,6 +20,7 @@ import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/scan_cursor.dart';
 import '../../domain/services/follow_plan.dart';
 import '../../domain/services/playback_progress.dart';
+import '../../domain/services/skip_learning.dart';
 import 'app_database.dart';
 import 'progress_store.dart';
 
@@ -545,6 +546,22 @@ class DriftMediaRepository implements MediaRepository {
       // 与播放偏好无关。
       introStartMs: existing.introStartMs,
       introEndMs: existing.introEndMs,
+      // ⚠️ v19 的手标片尾偏移与上面两列**同一条规矩**（它本来就是同一组：
+      // 用户在一次「标片头」动作里标的）。漏抄这一列的表现与漏抄片头一样 ——
+      // 「重扫一次，跳片尾就失效一次」。
+      outroOffsetMs: existing.outroOffsetMs,
+      // ⚠️ 学习出来的 5 列与上面两组**同一条规矩**：本次扫描造出来的行
+      // 这 5 列恒为默认值，照抄新值等于**每次重扫都把攒了好几集才学出来的
+      // 片头 / 片尾抹掉**。而用户看到的是「它又不会跳了」—— 他重扫一次就
+      // 失效一次，根本不会想到这两件事有关（而且重学要再看好几集）。
+      //
+      // 也不能走 `protect`：那是「元数据要不要被刮削覆盖」的开关，
+      // 与播放行为无关。
+      learnedIntroStartMs: existing.learnedIntroStartMs,
+      learnedIntroEndMs: existing.learnedIntroEndMs,
+      learnedOutroOffsetMs: existing.learnedOutroOffsetMs,
+      learnedSamples: existing.learnedSamples,
+      learnedAt: existing.learnedAt,
       // ⚠️ 追剧四列与 `mergedInto` / `introStartMs` **同一条规矩**：本次扫描
       // 造出来的行这四列恒为默认值（`WorkSeed.build` 不填它们），照抄新值
       // 等于**每次重扫都取消追剧、并把角标清零** —— 用户看到的是
@@ -941,6 +958,172 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<ProgressBook> skipMarkerSnapshot() async {
+    final out = ProgressBook();
+    // 只取「两组里有任意一列非空」的行 —— 绝大多数作品从没标过也没学过，
+    // 全读出来等于白物化整张表（与 `progressSnapshot` 同一条）。
+    final rows = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([
+            _db.mediaWorks.key,
+            _db.mediaWorks.introStartMs,
+            _db.mediaWorks.introEndMs,
+            _db.mediaWorks.outroOffsetMs,
+            _db.mediaWorks.learnedIntroEndMs,
+            _db.mediaWorks.learnedOutroOffsetMs,
+            _db.mediaWorks.learnedSamples,
+            _db.mediaWorks.learnedAt,
+          ])
+          ..where(_db.mediaWorks.introStartMs.isNotNull() |
+              _db.mediaWorks.introEndMs.isNotNull() |
+              _db.mediaWorks.outroOffsetMs.isNotNull() |
+              _db.mediaWorks.learnedIntroEndMs.isNotNull() |
+              _db.mediaWorks.learnedOutroOffsetMs.isNotNull()))
+        .get();
+
+    for (final r in rows) {
+      final key = r.read(_db.mediaWorks.key);
+      if (key == null || key.isEmpty) continue;
+      final learnedMs =
+          r.read(_db.mediaWorks.learnedAt)?.millisecondsSinceEpoch;
+      final entry = WorkSkipEntry(
+        introStartMs: r.read(_db.mediaWorks.introStartMs),
+        introEndMs: r.read(_db.mediaWorks.introEndMs),
+        outroOffsetMs: r.read(_db.mediaWorks.outroOffsetMs),
+        // ⛔ 手标组**没有**时刻可依 —— `media_works` 上根本没有「手标时刻」
+        //    这一列（只有学习那条路有 `learned_at`）。记 0 的语义是「有内容、
+        //    但没有时间依据」，合并时必输给任何带时间戳的一组。详见
+        //    `MediaRepository.skipMarkerSnapshot` 与 `WorkSkipEntry.fromJson`。
+        manualUpdatedAtSec: 0,
+        learnedIntroEndMs: r.read(_db.mediaWorks.learnedIntroEndMs),
+        learnedOutroOffsetMs: r.read(_db.mediaWorks.learnedOutroOffsetMs),
+        // `learned_samples` 是 `NOT NULL DEFAULT 0` 的列，但 drift 在
+        // `selectOnly` 上 `read` 回来仍是 `int?` —— 兜成 0，不会丢信息。
+        learnedSamples: r.read(_db.mediaWorks.learnedSamples) ?? 0,
+        // 学习组有真时刻，可以直接参与 LWW（与 `progressSnapshot` 取
+        // `last_played_at` 是同一个道理）。
+        learnedUpdatedAtSec: learnedMs == null ? 0 : learnedMs ~/ 1000,
+      );
+      if (entry.isEmpty) continue;
+      out.putSkip(key, entry);
+    }
+    return out;
+  }
+
+  @override
+  Future<int> applySkipMarkerSnapshot(ProgressBook book) async {
+    if (book.works.isEmpty) return 0;
+
+    // 1. 先读回这些 key 的**当前列值**，在 Dart 侧算差集。
+    //    ⛔ 不能无条件 UPDATE：这个方法每次启动 / 每次同步 / 每次扫描入库
+    //       之后都会跑，而绝大多数时候**没有任何变化**。
+    final keys = book.works.keys.toList(growable: false);
+    final current = <String, List<int?>>{};
+    for (final chunk in _chunkedList(keys, _sqlChunk)) {
+      final rows = await (_db.selectOnly(_db.mediaWorks)
+            ..addColumns([
+              _db.mediaWorks.key,
+              _db.mediaWorks.introStartMs,
+              _db.mediaWorks.introEndMs,
+              _db.mediaWorks.outroOffsetMs,
+              _db.mediaWorks.learnedIntroStartMs,
+              _db.mediaWorks.learnedIntroEndMs,
+              _db.mediaWorks.learnedOutroOffsetMs,
+              _db.mediaWorks.learnedSamples,
+              _db.mediaWorks.learnedAt,
+            ])
+            ..where(_db.mediaWorks.key.isIn(chunk)))
+          .get();
+      for (final r in rows) {
+        final key = r.read(_db.mediaWorks.key);
+        if (key == null) continue;
+        current[key] = [
+          r.read(_db.mediaWorks.introStartMs),
+          r.read(_db.mediaWorks.introEndMs),
+          r.read(_db.mediaWorks.outroOffsetMs),
+          r.read(_db.mediaWorks.learnedIntroStartMs),
+          r.read(_db.mediaWorks.learnedIntroEndMs),
+          r.read(_db.mediaWorks.learnedOutroOffsetMs),
+          r.read(_db.mediaWorks.learnedSamples),
+          // ⚠️ 换算成**毫秒**再比：`DateTimeColumn` 落盘是 Unix **秒**
+          //    （与 `applyProgressSnapshot` 里同一处注意点）。
+          r.read(_db.mediaWorks.learnedAt)?.millisecondsSinceEpoch,
+        ];
+      }
+    }
+
+    var changed = 0;
+    await _db.transaction(() async {
+      for (final e in book.works.entries) {
+        final have = current[e.key];
+        // 库里没有这部作品 → 没有落点。**不新建行**：片头标记不决定
+        // 一部作品存不存在，那是扫描的事。
+        if (have == null) continue;
+        final entry = e.value;
+
+        // 2. ⛔ 只写「有内容」的那一组 —— 哪一组没内容就**原样保留**库里的值。
+        //
+        //    与 `applyProgressSnapshot` 最大的区别：那里 `null` 就是「没有可
+        //    续的点」，所以照抄；这里「书里没有手标组」可能有两种意思 ——
+        //    「用户清除了」和「这台机器根本不知道」。照抄会把第二种变成
+        //    静默清空。清除动作由 `ProgressStore.recordManualSkip` 写一个
+        //    **非空的手标组**（三列都 `null` 但 `mu` 前进）来表达。
+        final want = <int?>[
+          entry.hasManual ? entry.introStartMs : have[0],
+          entry.hasManual ? entry.introEndMs : have[1],
+          entry.hasManual ? entry.outroOffsetMs : have[2],
+          // 学习出的片头起点恒为 `0`（片头总在开头），与 `saveLearnedSkip`
+          // 逐字同口径。
+          entry.hasLearned ? (entry.learnedIntroEndMs == null ? null : 0) : have[3],
+          entry.hasLearned ? entry.learnedIntroEndMs : have[4],
+          entry.hasLearned ? entry.learnedOutroOffsetMs : have[5],
+          entry.hasLearned ? entry.learnedSamples : have[6],
+          // `learned_at` 取进度文件里的 `lu`；它是 0（手改的 JSON）时保留
+          // 库里原有的时刻 —— 把时刻写没了，下一次播种就再也排不出先后。
+          entry.hasLearned
+              ? (entry.learnedUpdatedAtSec > 0
+                  ? entry.learnedUpdatedAtSec * 1000
+                  : have[7])
+              : have[7],
+        ];
+
+        var same = true;
+        for (var i = 0; i < want.length; i++) {
+          if (want[i] != have[i]) {
+            same = false;
+            break;
+          }
+        }
+        if (same) continue; // 本来就一致 —— 不写。
+
+        await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(e.key)))
+            .write(MediaWorksCompanion(
+          introStartMs: Value(want[0]),
+          introEndMs: Value(want[1]),
+          outroOffsetMs: Value(want[2]),
+          learnedIntroStartMs: Value(want[3]),
+          learnedIntroEndMs: Value(want[4]),
+          learnedOutroOffsetMs: Value(want[5]),
+          learnedSamples: Value(want[6] ?? 0),
+          learnedAt: Value(
+            want[7] == null
+                ? null
+                : DateTime.fromMillisecondsSinceEpoch(want[7]!),
+          ),
+          // ⛔ 不写 `updated_at`：它参与媒体库同步判据（`libraryModifiedAt`），
+          //    被一次回填扰动会让「标个片头」变成「上传一整份备份」。
+          //    与 `saveLearnedSkip` / `clearLearnedSkip` 逐字同一条。
+        ));
+        changed++;
+      }
+    });
+
+    if (changed > 0) {
+      diag.info('进度', '片头/片尾回填：更新 $changed 部作品（共 ${book.workCount} 条待查）');
+    }
+    return changed;
+  }
+
+  @override
   Future<PlaybackPreference?> playbackPreferenceFor(
     String itemId, {
     String? groupKey,
@@ -1061,23 +1244,81 @@ class DriftMediaRepository implements MediaRepository {
     );
   }
 
+  /// 读回一部作品当前的**手标三列**。
+  ///
+  /// 「只改片头起点」这类操作必须先把另外两列读回来 —— 手标在进度文件里是
+  /// **一整组**（[WorkSkipEntry] 的手标组，LWW 按组判胜负），只传一半进去
+  /// 等于把另外两列写成 `null`。
+  Future<(int?, int?, int?)> _manualSkip(String key) async {
+    final row = await (_db.selectOnly(_db.mediaWorks)
+          ..addColumns([
+            _db.mediaWorks.introStartMs,
+            _db.mediaWorks.introEndMs,
+            _db.mediaWorks.outroOffsetMs,
+          ])
+          ..where(_db.mediaWorks.key.equals(key))
+          ..limit(1))
+        .getSingleOrNull();
+    if (row == null) return (null, null, null);
+    return (
+      row.read(_db.mediaWorks.introStartMs),
+      row.read(_db.mediaWorks.introEndMs),
+      row.read(_db.mediaWorks.outroOffsetMs),
+    );
+  }
+
   @override
   Future<void> setWorkIntroStart(String key, int startMs) async {
+    final cur = await _manualSkip(key);
     await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
       MediaWorksCompanion(
         introStartMs: Value(startMs),
         updatedAt: Value(DateTime.now()),
       ),
     );
+    // ⛔ 真源是**进度文件**，不是这三列。只写库的话这一次手标永远到不了
+    //    别的设备：`.ccbak` 备份包里没有进度文件，片头 / 片尾走的是
+    //    `ProgressSyncService` 那条独立通道（见 `WorkSkipEntry` 的类文档）。
+    _progress?.recordManualSkip(
+      key,
+      introStartMs: startMs,
+      introEndMs: cur.$2,
+      outroOffsetMs: cur.$3,
+    );
   }
 
   @override
   Future<void> setWorkIntroEnd(String key, int endMs) async {
+    final cur = await _manualSkip(key);
     await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
       MediaWorksCompanion(
         introEndMs: Value(endMs),
         updatedAt: Value(DateTime.now()),
       ),
+    );
+    _progress?.recordManualSkip(
+      key,
+      introStartMs: cur.$1,
+      introEndMs: endMs,
+      outroOffsetMs: cur.$3,
+    );
+  }
+
+  @override
+  Future<void> setWorkOutroOffset(String key, int offsetMs) async {
+    final cur = await _manualSkip(key);
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      MediaWorksCompanion(
+        // ⛔ 与 `ProgressStore._positive` 同一口径：0 秒的片尾没有意义。
+        outroOffsetMs: Value(offsetMs <= 0 ? null : offsetMs),
+        updatedAt: Value(DateTime.now()),
+      ),
+    );
+    _progress?.recordManualSkip(
+      key,
+      introStartMs: cur.$1,
+      introEndMs: cur.$2,
+      outroOffsetMs: offsetMs,
     );
   }
 
@@ -1094,10 +1335,152 @@ class DriftMediaRepository implements MediaRepository {
       const MediaWorksCompanion(
         introStartMs: Value(null),
         introEndMs: Value(null),
+        // v19：片尾偏移是同一组，必须一起清（理由见接口文档）。
+        outroOffsetMs: Value(null),
         // 注意这里没写 `updatedAt`：`const` 构造里塞不了 `DateTime.now()`，
         // 而这一列的语义是「作品元数据变了没有」，清一个播放偏好不算 ——
         // 写它还会把「最近修改」排序搅乱。
       ),
+    );
+    // 进度文件里记一个**空的手标组**：三列都 `null`，但 `mu` 前进了 ——
+    // 这才是「清除」这件事能在 LWW 里赢过旧值的表达方式（整组替换）。
+    _progress?.recordManualSkip(key);
+  }
+
+  // -------------------------------------------------------------------
+  // 片头 / 片尾的自动学习（schema v18）
+  // -------------------------------------------------------------------
+  //
+  // ⛔⛔ 两个写方法**都不写 `media_works.updated_at`**。
+  //
+  // 学习是**播放的副产品**，不是「媒体库内容变了」。写它有两个立刻能撞上的
+  // 后果（与追剧的自动检查、播放进度被摘掉是同一条理由）：
+  //
+  //   1. `libraryModifiedAt()` = `MAX(media_works.updated_at)` ∪
+  //      `MAX(media_items.first_seen_at)` —— 每看一集就把它往前推一次，
+  //      于是本机永远「看起来更新」，下一次同步无条件上传，
+  //      把另一台设备刚扫好的库盖掉；
+  //   2. 「最近修改」排序会被播放行为搅乱：看一集老片子，它就浮到最前面。
+  //
+  // ⛔ 样本表（`skip_samples`）同理**不在 `libraryModifiedAt()` 的算式里**
+  //    （那个算式是显式 SQL，本来就不含它）。
+
+  @override
+  Future<void> addSkipSample(SkipSample sample) async {
+    await _db.into(_db.skipSamples).insertOnConflictUpdate(
+          SkipSamplesCompanion.insert(
+            id: sample.id,
+            itemId: sample.itemId,
+            workKey: sample.workKey,
+            kind: sample.kind.name,
+            anchorMs: sample.anchor.inMilliseconds,
+            durationMs: sample.duration.inMilliseconds,
+            // ⚠️ 只有片尾写 offset：片头样本的 offset 恒等于片长，
+            //    是个没有信息量的数（而且片长各集不同，存了反而误导）。
+            offsetMs: Value(
+              sample.kind == SkipKind.outro
+                  ? sample.offset.inMilliseconds
+                  : null,
+            ),
+            negative: Value(sample.negative),
+            device: Value(sample.device),
+            createdAt: sample.createdAt,
+          ),
+        );
+  }
+
+  @override
+  Future<List<SkipSample>> skipSamplesForWork(String workKey) async {
+    final rows = await (_db.select(_db.skipSamples)
+          ..where((t) => t.workKey.equals(workKey)))
+        .get();
+    final out = <SkipSample>[];
+    for (final row in rows) {
+      final sample = _toSkipSample(row);
+      // 认不出来的 `kind` 当没有 —— 猜一个（比如默认成片头）会污染聚合，
+      // 而聚合的结果会直接驱动自动跳转。
+      if (sample != null) out.add(sample);
+    }
+    return out;
+  }
+
+  @override
+  Future<void> saveLearnedSkip(
+    String key,
+    SkipLearningOutcome outcome, {
+    DateTime? now,
+  }) async {
+    // ⛔ 什么都没学出来时**什么都不做** —— 保留上一次的结论。
+    //    样本是累积的，「样本够、这次却没学出来」只可能是新样本把散布
+    //    撑爆了；那时清掉已有的好结论，用户看到的是「本来跳得好好的，
+    //    看了一集之后突然不跳了」。想清除只能用 `clearLearnedSkip`。
+    if (outcome.isEmpty) return;
+
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      MediaWorksCompanion(
+        // ⚠️ 必须**直接写 `Value(null)`**，不能借道
+        //    `MediaWork.withLearnedSkip`（那个是给内存实现用的）。
+        //    这里逐列写死，「这次只学出片尾」才会真的把上一次学错的片头
+        //    清掉 —— `copyWith` 的 `??` 把 `null` 当「不改」，清不掉。
+        learnedIntroStartMs: Value(outcome.intro == null ? null : 0),
+        learnedIntroEndMs: Value(outcome.intro?.end.inMilliseconds),
+        learnedOutroOffsetMs: Value(outcome.outro?.offset.inMilliseconds),
+        learnedSamples: Value(outcome.samples),
+        learnedAt: Value(now ?? DateTime.now()),
+        // ⛔ 不写 `updatedAt` —— 见本节开头那段。
+      ),
+    );
+  }
+
+  @override
+  Future<void> clearLearnedSkip(String key) async {
+    await (_db.update(_db.mediaWorks)..where((t) => t.key.equals(key))).write(
+      const MediaWorksCompanion(
+        learnedIntroStartMs: Value(null),
+        learnedIntroEndMs: Value(null),
+        learnedOutroOffsetMs: Value(null),
+        learnedSamples: Value(0),
+        learnedAt: Value(null),
+        // 同 `clearWorkIntroRange`：不写 `updatedAt`。
+      ),
+    );
+    // ⛔⛔ 进度文件里也要记一个**空的学习组**（`lu` 前进）。
+    //
+    // 少了这一句的后果不是「清除不彻底」，而是「**清除了又自己回来**」：
+    // 进度库内存里还留着上一轮播种进来的学习结论（`hasLearned == true`），
+    // 而 `applySkipMarkerSnapshot` 只写「有内容」的那一组 —— 于是下一次
+    // 同步（每 30 分钟一次 / 启动时）会把它**原样写回 `media_works`**，
+    // 而界面上刚才明明写着「已清除」。用户看到的是「这个功能清除不掉」。
+    //
+    // 与 Android 端 `LibraryDb.clearLearnedSkip` 逐字同一条（那边一直有）。
+    _progress?.recordLearnedSkip(
+      key,
+      introEndMs: null,
+      outroOffsetMs: null,
+      samples: 0,
+    );
+  }
+
+  @override
+  Future<void> markSkipSampleNegative(String sampleId) async {
+    await (_db.update(_db.skipSamples)..where((t) => t.id.equals(sampleId)))
+        .write(const SkipSamplesCompanion(negative: Value(true)));
+  }
+
+  /// 样本行 → 领域实体。`kind` 认不出来返回 `null`。
+  SkipSample? _toSkipSample(SkipSampleRow row) {
+    final kind = SkipKind.parse(row.kind);
+    if (kind == null) return null;
+    return SkipSample(
+      id: row.id,
+      itemId: row.itemId,
+      workKey: row.workKey,
+      kind: kind,
+      anchor: Duration(milliseconds: row.anchorMs),
+      duration: Duration(milliseconds: row.durationMs),
+      negative: row.negative,
+      device: row.device,
+      createdAt: row.createdAt,
     );
   }
 
@@ -2408,6 +2791,12 @@ class DriftMediaRepository implements MediaRepository {
         mergedInto: row.mergedInto,
         introStartMs: row.introStartMs,
         introEndMs: row.introEndMs,
+        outroOffsetMs: row.outroOffsetMs,
+        learnedIntroStartMs: row.learnedIntroStartMs,
+        learnedIntroEndMs: row.learnedIntroEndMs,
+        learnedOutroOffsetMs: row.learnedOutroOffsetMs,
+        learnedSamples: row.learnedSamples,
+        learnedAt: row.learnedAt,
         followed: row.followed,
         followStartedAt: row.followStartedAt,
         followCheckedAt: row.followCheckedAt,

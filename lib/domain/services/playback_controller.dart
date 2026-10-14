@@ -30,6 +30,7 @@ import 'missing_media.dart';
 import 'playback_engine.dart';
 import 'playback_engine_router.dart';
 import 'playback_restore.dart';
+import 'skip_learning.dart';
 import 'subtitle_service.dart';
 
 /// 播放控制器 —— 本应用「能不能看」这件事的唯一裁决者。
@@ -444,6 +445,118 @@ class PlaybackController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 后台聚合出新的学习结果后同步给控制器。
+  ///
+  /// 与 [applyManualIntro] 同一个套路：**不落库**（写库由 UI 层做）。
+  /// 优先级最低 —— 章节与手标都在它前面（见 [IntroSession.marker]）。
+  void applyLearnedIntro(IntroMarker? marker) {
+    if (_intro.learned == marker) return;
+    _intro.setLearned(marker);
+    notifyListeners();
+  }
+
+  // -------------------------------------------------------------------
+  // 片尾（自动跳过 / 提示）
+  // -------------------------------------------------------------------
+
+  /// 学习出的**片尾起点距末尾的偏移**（这一条流的）。
+  ///
+  /// ⛔ 存偏移不存绝对时间：各集片长不同，绝对时间跨集不可比。
+  ///    落点由 [_outroStart] 现算。
+  Duration? _learnedOutroOffset;
+
+  /// 用户**手标**的片尾偏移（距末尾）。`null` = 没标过。
+  ///
+  /// ⛔ 手标优先于学习（[outroStart] 里先看它）：用户在播放器里指着画面说
+  ///    「从这儿开始是片尾」，这句话比统计出来的结论更该被听。片头那边
+  ///    多一层「文件章节」，片尾没有章节可用（章节只标片头），所以这里是两级。
+  Duration? _manualOutroOffset;
+
+  /// 这一条流里片尾提示已经触发过了（上升沿用）。
+  bool _outroReached = false;
+
+  /// 用户手标的片尾偏移（`null` = 没标过）。UI 用它显示「这一份是手标的」。
+  Duration? get manualOutroOffset => _manualOutroOffset;
+
+  /// 用户手标了片尾（或取消标记）后同步给控制器。
+  ///
+  /// 与 [applyManualIntro] 同一个套路：**不落库**（写库由 UI 层做）。
+  ///
+  /// ⛔ 同样要把 [_outroReached] 归零：刚标完的片尾落点可能就在当前播放头
+  ///    后面一点点，不归零的话这次标记要等下一集才生效 —— 而用户标完立刻
+  ///    就会去看「有没有跳」。
+  void applyManualOutro(Duration? offset) {
+    if (_manualOutroOffset == offset) return;
+    _manualOutroOffset = offset;
+    _outroReached = false;
+    notifyListeners();
+  }
+
+  /// 后台聚合出新的**片尾**结论后同步给控制器。
+  ///
+  /// 与 [applyLearnedIntro] 同一个套路：**不落库**（写库由 UI 层做）。
+  ///
+  /// ⚠️ 这里必须把 [_outroReached] 一起归零，否则会漏掉「当场学会」这一次：
+  ///    用户第一次拖到片尾、切下一集，样本就攒够了，结论会立刻写回 ——
+  ///    如果上升沿还留着 `true`，这一集就再也不会提示片尾了。
+  ///
+  /// 归零的副作用是「同一次播放里可能提示两遍」（旧结论提示过、新结论又
+  /// 越过一次）。这在一集里最多发生一次，且两次提示的内容都是真的，
+  /// 比漏掉一次要好。
+  void applyLearnedOutro(Duration? offset) {
+    if (_learnedOutroOffset == offset) return;
+    _learnedOutroOffset = offset;
+    _outroReached = false;
+    notifyListeners();
+  }
+
+  /// 片尾落点（`duration - offset`）；没有手标也没有学习结果、或片长未知时
+  /// 为 `null`。
+  ///
+  /// ⛔ **手标压过学习**（与片头的「章节 > 手标 > 学习」同一条思路）。
+  ///    链与换算都在 `OutroSkip` 里 —— 只有一份实现，独立播放窗口与
+  ///    `MediaWork.outroStart` 走的也是它。
+  Duration? get outroStart => OutroSkip.start(
+        duration: _duration,
+        offset: OutroSkip.effectiveOffset(
+          manual: _manualOutroOffset,
+          learned: _learnedOutroOffset,
+        ),
+      );
+
+  /// 播放头进入片尾区间时回调一次（**上升沿**）。
+  ///
+  /// ## 为什么是回调，而不是控制器自己跳下一集
+  ///
+  /// 「下一集是哪一条」需要**播放列表**，而两个播放器拿到的列表形状不同
+  /// （与 [onCompleted] 同一条理由）。控制器只播报「片尾到了」这个事实。
+  ///
+  /// ⛔ **片尾默认不自动跳**，只提示 —— 片尾的信号天生比片头弱
+  ///    （没有「起点 = 0」这种强锚），误跳的代价是用户直接丢掉结局。
+  ///    自动跳不跳由 UI 决定。
+  void Function(Duration start)? onOutroReached;
+
+  /// 采集到一个**有效落点**时回调（UI 层负责落库）。
+  ///
+  /// 控制器不认识仓储，所以这里只把「用户确实在这儿停下来看了」这个
+  /// 事实播出去 —— 攒样本、聚合、写回结论都在 UI 层 / 仓储层。
+  void Function(SkipAnchor anchor)? onSkipAnchor;
+
+  /// 有效落点采集器。**一次流一个实例的状态**（见 [SkipAnchorCollector]）。
+  final SkipAnchorCollector _anchorCollector = SkipAnchorCollector();
+
+  /// 用户**切到了下一集 / 退出播放**时调一次。
+  ///
+  /// 这是片尾最强的信号 —— 由 UI 层在切集那一刻调用（控制器不知道
+  /// 切集这件事）。传的是**切集时**的播放头位置。
+  void noteEpisodeSwitch() {
+    final anchor = _anchorCollector.noteEpisodeSwitch(
+      position: _position,
+      duration: _duration,
+    );
+    if (anchor != null) onSkipAnchor?.call(anchor);
+  }
+
   // -------------------------------------------------------------------
   // 打开与取链
   // -------------------------------------------------------------------
@@ -453,6 +566,9 @@ class PlaybackController extends ChangeNotifier {
   /// [subtitles] 是扫描期建立的字幕引用（可为空）。
   /// [preferredQualityId] 是设置里的默认档位（可为空 = 原画优先）。
   /// [introMarker] 是**库里手标**的片头区间（兜底，可为空）。
+  /// [learnedIntroMarker] 是**自动学习**出来的片头区间（优先级最低，可为空）。
+  /// [manualOutroOffset] 是**库里手标**的片尾距末尾偏移（可为空）。
+  /// [learnedOutroOffset] 是学习出来的**片尾起点距末尾的偏移**（可为空）。
   /// [skipIntro] 来自设置；`false` 时连章节也不读（省一次属性查询）。
   /// [preference] 是这一条**上次的播放选择**（音轨 / 字幕 / 字幕开关），
   /// 由调用方从库里读出来；`null` = 没记过，全走默认。画质不在里面 ——
@@ -463,6 +579,9 @@ class PlaybackController extends ChangeNotifier {
     String? preferredQualityId,
     bool autoLoadSubtitles = true,
     IntroMarker? introMarker,
+    IntroMarker? learnedIntroMarker,
+    Duration? manualOutroOffset,
+    Duration? learnedOutroOffset,
     bool skipIntro = true,
     PlaybackPreference? preference,
   }) async {
@@ -501,7 +620,23 @@ class PlaybackController extends ChangeNotifier {
     // 片头状态**每次打开都要归零**。漏了「已探测」标志的后果很隐蔽：
     // 换集之后永远不再读章节，于是「只有第一集跳片头」—— 而第一集恰好
     // 是最不需要跳的那一集（用户是从头开始看的）。
-    _intro.reset(manual: introMarker, enabled: skipIntro);
+    _intro.reset(
+      manual: introMarker,
+      learned: learnedIntroMarker,
+      enabled: skipIntro,
+    );
+    // 片尾状态每次打开都归零（理由同 `_intro.reset`）：漏了的话换集之后
+    // 片尾提示**永远不会再触发**（`_outroReached` 还留着 true）。
+    //
+    // ⛔ 手标与学习**分别赋值**（不在这里合成一条）：控制器里它们是两条独立的
+    //    来源，合成一条会让「手标优先」这条规则在控制器里失效 —— 而 UI 还要
+    //    靠 `manualOutroOffset` 显示「这一份是你手标的」。
+    _manualOutroOffset = manualOutroOffset;
+    _learnedOutroOffset = learnedOutroOffset;
+    _outroReached = false;
+    // 落点采集器同理 —— 它记着「待确认的落点」，留着会让下一集顶着
+    // 这一集的落点算锚点。
+    _anchorCollector.reset();
     _completed = false;
     _subtitleResolver.clear();
     notifyListeners();
@@ -611,6 +746,14 @@ class PlaybackController extends ChangeNotifier {
     // `_prepareSource` 的预热期间**旧流还在播**，位置流上流过的全是旧流的
     // 值 —— 而它们恰好等于目标（目标就是从旧流取的），提前挂会被它们骗过去。
     _restore = startAt > Duration.zero ? RestoreSeek(startAt) : null;
+
+    // 起播位置也要喂给落点采集器 —— 判「这一集是不是从头起播」用的就是它。
+    //
+    // ⛔ **不能**改用位置流的第一个回调值：续播时内核会先报一个 0（此时
+    //    `RestoreSeek` 还没落地），那个 0 会让「从第 20 分钟继续看」被误判成
+    //    「从头起播」，于是记下一条 `0 → 落点` 的假片头样本。
+    _anchorCollector.reset();
+    _anchorCollector.notePlayStart(startAt);
 
     // ⚠️ 这一条是**唯一**记录「内核实际打开了哪个地址」的地方。
     //
@@ -1186,7 +1329,27 @@ class PlaybackController extends ChangeNotifier {
   /// 夹取规则本体在 [clampSeekTarget]：**独立播放窗口也要用同一套**
   /// （它跑在另一个 Flutter 引擎里，够不到本类），两处各写一遍会漂移。
   Future<void> seek(Duration target) async {
-    await _engine.seek(clampSeekTarget(target, _duration));
+    final clamped = clampSeekTarget(target, _duration);
+    _noteUserSeek(clamped);
+    await _engine.seek(clamped);
+  }
+
+  /// 用户主动跳转（进度条拖拽 / 快进）—— 喂给落点采集器。
+  ///
+  /// ⛔ **只有用户发起的 seek 走这里**。自动跳过片头（[_maybeSkipIntro]）与
+  ///    续播补跳（[_maybeRestoreSeek]）都**直接调内核**、不经过 [seek] ——
+  ///    它们不是「用户想去哪儿」的表达，记进去会凭空造出样本：
+  ///    自动跳片头每次都产生一条「0 → 片头终点」，于是片头区间会被自己的
+  ///    跳转行为反复"确认"，永远无法被推翻。
+  void _noteUserSeek(Duration target) {
+    _anchorCollector.noteSeek(
+      SeekObservation(
+        from: _position,
+        to: target,
+        duration: _duration,
+        rate: _rate,
+      ),
+    );
   }
 
   /// 按比例跳转（进度条点击用）。
@@ -1414,6 +1577,11 @@ class PlaybackController extends ChangeNotifier {
     _maybeTickPosition(v);
     _probeChaptersOnce(v);
     _maybeSkipIntro(v);
+    // 落点采集必须**排在自动跳过片头之后**：跳完片头位置会突变成区间终点，
+    // 而采集器只认「用户在哪儿停下来看」，两条流互不干扰（自动跳不经过
+    // `seek()`，不会产生样本）。
+    _collectAnchor(v);
+    _maybeNotifyOutro(v);
     // UI 节流。seek 回退（v 变小）要立即通知，否则进度条停在不该停的位置。
     final delta = (v - _lastPositionNotifyAt).inMilliseconds.abs();
     if (v < _lastPositionNotifyAt || delta >= _positionNotifyMinInterval.inMilliseconds) {
@@ -1484,6 +1652,32 @@ class PlaybackController extends ChangeNotifier {
     // `IntroMarkerDetector` 的时长上界保证落在片内（见 `maxLength`），
     // 再夹一次只是多一层没必要的不透明性。
     unawaited(_engine.seek(target));
+  }
+
+  /// 落点采集：把位置流喂给采集器，确认出的锚点播给 UI 层。
+  ///
+  /// 只有「停下来连续观看」的落点才会被确认（见 [SkipAnchorCollector]）——
+  /// 拖来拖去、回拖、倍速都不算。控制器只负责**播报**，
+  /// 攒样本 / 聚合 / 写回结论都在 UI 层与仓储层。
+  void _collectAnchor(Duration v) {
+    // 片长未知时位置不可信（流还没解析完），此时算出来的偏移没有意义。
+    if (_duration <= Duration.zero) return;
+    final anchor = _anchorCollector.notePosition(v);
+    if (anchor != null) onSkipAnchor?.call(anchor);
+  }
+
+  /// 播放头进入片尾区间时播报一次（**上升沿**）。
+  ///
+  /// 用上升沿而不是「每帧都报」：位置流每 ~100ms 一条，而 UI 收到之后
+  /// 要做的事（弹提示 / 跳下一集）都不是幂等的。
+  void _maybeNotifyOutro(Duration v) {
+    if (_outroReached) return;
+    final start = outroStart;
+    if (start == null) return;
+    if (v < start) return;
+    _outroReached = true;
+    diag.info('片尾', '到达片尾：${v.inSeconds}s（片尾从 ${start.inSeconds}s 起）');
+    onOutroReached?.call(start);
   }
 
   void _onTracksChanged(EngineTracks tracks) {

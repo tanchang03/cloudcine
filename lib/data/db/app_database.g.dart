@@ -2323,6 +2323,17 @@ class $MediaWorksTable extends MediaWorks
     type: DriftSqlType.int,
     requiredDuringInsert: false,
   );
+  static const VerificationMeta _outroOffsetMsMeta = const VerificationMeta(
+    'outroOffsetMs',
+  );
+  @override
+  late final GeneratedColumn<int> outroOffsetMs = GeneratedColumn<int>(
+    'outro_offset_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
   static const VerificationMeta _followedMeta = const VerificationMeta(
     'followed',
   );
@@ -2374,6 +2385,60 @@ class $MediaWorksTable extends MediaWorks
     requiredDuringInsert: false,
     defaultValue: const Constant(0),
   );
+  static const VerificationMeta _learnedIntroStartMsMeta =
+      const VerificationMeta('learnedIntroStartMs');
+  @override
+  late final GeneratedColumn<int> learnedIntroStartMs = GeneratedColumn<int>(
+    'learned_intro_start_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _learnedIntroEndMsMeta = const VerificationMeta(
+    'learnedIntroEndMs',
+  );
+  @override
+  late final GeneratedColumn<int> learnedIntroEndMs = GeneratedColumn<int>(
+    'learned_intro_end_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _learnedOutroOffsetMsMeta =
+      const VerificationMeta('learnedOutroOffsetMs');
+  @override
+  late final GeneratedColumn<int> learnedOutroOffsetMs = GeneratedColumn<int>(
+    'learned_outro_offset_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _learnedSamplesMeta = const VerificationMeta(
+    'learnedSamples',
+  );
+  @override
+  late final GeneratedColumn<int> learnedSamples = GeneratedColumn<int>(
+    'learned_samples',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(0),
+  );
+  static const VerificationMeta _learnedAtMeta = const VerificationMeta(
+    'learnedAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> learnedAt = GeneratedColumn<DateTime>(
+    'learned_at',
+    aliasedName,
+    true,
+    type: DriftSqlType.dateTime,
+    requiredDuringInsert: false,
+  );
   @override
   List<GeneratedColumn> get $columns => [
     key,
@@ -2406,10 +2471,16 @@ class $MediaWorksTable extends MediaWorks
     mergedInto,
     introStartMs,
     introEndMs,
+    outroOffsetMs,
     followed,
     followStartedAt,
     followCheckedAt,
     newItemCount,
+    learnedIntroStartMs,
+    learnedIntroEndMs,
+    learnedOutroOffsetMs,
+    learnedSamples,
+    learnedAt,
   ];
   @override
   String get aliasedName => _alias ?? actualTableName;
@@ -2651,6 +2722,15 @@ class $MediaWorksTable extends MediaWorks
         ),
       );
     }
+    if (data.containsKey('outro_offset_ms')) {
+      context.handle(
+        _outroOffsetMsMeta,
+        outroOffsetMs.isAcceptableOrUnknown(
+          data['outro_offset_ms']!,
+          _outroOffsetMsMeta,
+        ),
+      );
+    }
     if (data.containsKey('followed')) {
       context.handle(
         _followedMeta,
@@ -2682,6 +2762,48 @@ class $MediaWorksTable extends MediaWorks
           data['new_item_count']!,
           _newItemCountMeta,
         ),
+      );
+    }
+    if (data.containsKey('learned_intro_start_ms')) {
+      context.handle(
+        _learnedIntroStartMsMeta,
+        learnedIntroStartMs.isAcceptableOrUnknown(
+          data['learned_intro_start_ms']!,
+          _learnedIntroStartMsMeta,
+        ),
+      );
+    }
+    if (data.containsKey('learned_intro_end_ms')) {
+      context.handle(
+        _learnedIntroEndMsMeta,
+        learnedIntroEndMs.isAcceptableOrUnknown(
+          data['learned_intro_end_ms']!,
+          _learnedIntroEndMsMeta,
+        ),
+      );
+    }
+    if (data.containsKey('learned_outro_offset_ms')) {
+      context.handle(
+        _learnedOutroOffsetMsMeta,
+        learnedOutroOffsetMs.isAcceptableOrUnknown(
+          data['learned_outro_offset_ms']!,
+          _learnedOutroOffsetMsMeta,
+        ),
+      );
+    }
+    if (data.containsKey('learned_samples')) {
+      context.handle(
+        _learnedSamplesMeta,
+        learnedSamples.isAcceptableOrUnknown(
+          data['learned_samples']!,
+          _learnedSamplesMeta,
+        ),
+      );
+    }
+    if (data.containsKey('learned_at')) {
+      context.handle(
+        _learnedAtMeta,
+        learnedAt.isAcceptableOrUnknown(data['learned_at']!, _learnedAtMeta),
       );
     }
     return context;
@@ -2826,6 +2948,10 @@ class $MediaWorksTable extends MediaWorks
         DriftSqlType.int,
         data['${effectivePrefix}intro_end_ms'],
       ),
+      outroOffsetMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}outro_offset_ms'],
+      ),
       followed:
           attachedDatabase.typeMapping.read(
             DriftSqlType.bool,
@@ -2844,6 +2970,27 @@ class $MediaWorksTable extends MediaWorks
             DriftSqlType.int,
             data['${effectivePrefix}new_item_count'],
           )!,
+      learnedIntroStartMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}learned_intro_start_ms'],
+      ),
+      learnedIntroEndMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}learned_intro_end_ms'],
+      ),
+      learnedOutroOffsetMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}learned_outro_offset_ms'],
+      ),
+      learnedSamples:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.int,
+            data['${effectivePrefix}learned_samples'],
+          )!,
+      learnedAt: attachedDatabase.typeMapping.read(
+        DriftSqlType.dateTime,
+        data['${effectivePrefix}learned_at'],
+      ),
     );
   }
 
@@ -2991,6 +3138,21 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   final int? introStartMs;
   final int? introEndMs;
 
+  /// **手标**的片尾偏移（毫秒，距末尾）。`null` = 没标（v19）。
+  ///
+  /// ## 为什么是「距末尾」而不是绝对时间
+  ///
+  /// 用户在第 1 集上标「片尾从 41:30 起」，第 2 集片长不一样，绝对时间搬过去
+  /// 就错了；而「离结尾还有 90 秒」在两集上是同一件事。学习那条路
+  /// （[learnedOutroOffsetMs]）用的是同一种表示，两边才能互相印证。
+  ///
+  /// ## 与 [introStartMs] / [introEndMs] 是一组
+  ///
+  /// 三列都由**用户手标**、都由进度文件（`WorkSkipEntry`）同步、都与
+  /// `learned_*` 那组列相互独立（取值链：手标 > 学习）。
+  /// ⛔ 扫描不许清掉它们 —— 同 [introStartMs] 的「旧值优先受保护通道」。
+  final int? outroOffsetMs;
+
   /// 是否在追剧。
   final bool followed;
 
@@ -3028,6 +3190,32 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
   /// 与 [itemCount] / [seasonCount] 同一条理由，海报墙上几百个格子，
   /// 每个一次子查询就是几百次全表扫描。
   final int newItemCount;
+
+  /// 学习出的片头区间（毫秒）。两列成对，任一为空 = 没有学习结果。
+  ///
+  /// 存**绝对时间**：片头总在开头，各集位置基本一致。
+  final int? learnedIntroStartMs;
+  final int? learnedIntroEndMs;
+
+  /// 学习出的**片尾起点距末尾的偏移**（毫秒）。
+  ///
+  /// ⛔ **存偏移，不存绝对时间**。各集片长不同（正片 45 分钟、特辑 60 分钟），
+  ///    绝对时间跨集不可比；而「离结尾还有多久开始是片尾」这个量是稳定的。
+  ///    播放时用 `duration - learnedOutroOffsetMs` 现算落点。
+  ///
+  /// 片尾**没有终点列**：终点恒为片长。单列一列而不是硬凑一对
+  /// `start` / `end`，是因为「终点 = 片长」这件事写进数据里只会
+  /// 变成一处需要同步维护的冗余。
+  final int? learnedOutroOffsetMs;
+
+  /// 参与聚合的样本数（片头与片尾取**较大**的那个）。
+  ///
+  /// UI 用它显示置信度（「3 集样本」），也是「要不要相信这个结果」的
+  /// 唯一依据 —— 门槛见 `SkipLearning.minSamples`。
+  final int learnedSamples;
+
+  /// 学习结果最后一次更新时间（Unix 秒）。只用于 UI 展示与排查。
+  final DateTime? learnedAt;
   const MediaWorkRow({
     required this.key,
     required this.provider,
@@ -3059,10 +3247,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     this.mergedInto,
     this.introStartMs,
     this.introEndMs,
+    this.outroOffsetMs,
     required this.followed,
     this.followStartedAt,
     this.followCheckedAt,
     required this.newItemCount,
+    this.learnedIntroStartMs,
+    this.learnedIntroEndMs,
+    this.learnedOutroOffsetMs,
+    required this.learnedSamples,
+    this.learnedAt,
   });
   @override
   Map<String, Expression> toColumns(bool nullToAbsent) {
@@ -3131,6 +3325,9 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     if (!nullToAbsent || introEndMs != null) {
       map['intro_end_ms'] = Variable<int>(introEndMs);
     }
+    if (!nullToAbsent || outroOffsetMs != null) {
+      map['outro_offset_ms'] = Variable<int>(outroOffsetMs);
+    }
     map['followed'] = Variable<bool>(followed);
     if (!nullToAbsent || followStartedAt != null) {
       map['follow_started_at'] = Variable<DateTime>(followStartedAt);
@@ -3139,6 +3336,19 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       map['follow_checked_at'] = Variable<DateTime>(followCheckedAt);
     }
     map['new_item_count'] = Variable<int>(newItemCount);
+    if (!nullToAbsent || learnedIntroStartMs != null) {
+      map['learned_intro_start_ms'] = Variable<int>(learnedIntroStartMs);
+    }
+    if (!nullToAbsent || learnedIntroEndMs != null) {
+      map['learned_intro_end_ms'] = Variable<int>(learnedIntroEndMs);
+    }
+    if (!nullToAbsent || learnedOutroOffsetMs != null) {
+      map['learned_outro_offset_ms'] = Variable<int>(learnedOutroOffsetMs);
+    }
+    map['learned_samples'] = Variable<int>(learnedSamples);
+    if (!nullToAbsent || learnedAt != null) {
+      map['learned_at'] = Variable<DateTime>(learnedAt);
+    }
     return map;
   }
 
@@ -3220,6 +3430,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           introEndMs == null && nullToAbsent
               ? const Value.absent()
               : Value(introEndMs),
+      outroOffsetMs:
+          outroOffsetMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(outroOffsetMs),
       followed: Value(followed),
       followStartedAt:
           followStartedAt == null && nullToAbsent
@@ -3230,6 +3444,23 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               ? const Value.absent()
               : Value(followCheckedAt),
       newItemCount: Value(newItemCount),
+      learnedIntroStartMs:
+          learnedIntroStartMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(learnedIntroStartMs),
+      learnedIntroEndMs:
+          learnedIntroEndMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(learnedIntroEndMs),
+      learnedOutroOffsetMs:
+          learnedOutroOffsetMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(learnedOutroOffsetMs),
+      learnedSamples: Value(learnedSamples),
+      learnedAt:
+          learnedAt == null && nullToAbsent
+              ? const Value.absent()
+              : Value(learnedAt),
     );
   }
 
@@ -3269,10 +3500,20 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       mergedInto: serializer.fromJson<String?>(json['mergedInto']),
       introStartMs: serializer.fromJson<int?>(json['introStartMs']),
       introEndMs: serializer.fromJson<int?>(json['introEndMs']),
+      outroOffsetMs: serializer.fromJson<int?>(json['outroOffsetMs']),
       followed: serializer.fromJson<bool>(json['followed']),
       followStartedAt: serializer.fromJson<DateTime?>(json['followStartedAt']),
       followCheckedAt: serializer.fromJson<DateTime?>(json['followCheckedAt']),
       newItemCount: serializer.fromJson<int>(json['newItemCount']),
+      learnedIntroStartMs: serializer.fromJson<int?>(
+        json['learnedIntroStartMs'],
+      ),
+      learnedIntroEndMs: serializer.fromJson<int?>(json['learnedIntroEndMs']),
+      learnedOutroOffsetMs: serializer.fromJson<int?>(
+        json['learnedOutroOffsetMs'],
+      ),
+      learnedSamples: serializer.fromJson<int>(json['learnedSamples']),
+      learnedAt: serializer.fromJson<DateTime?>(json['learnedAt']),
     );
   }
   @override
@@ -3309,10 +3550,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
       'mergedInto': serializer.toJson<String?>(mergedInto),
       'introStartMs': serializer.toJson<int?>(introStartMs),
       'introEndMs': serializer.toJson<int?>(introEndMs),
+      'outroOffsetMs': serializer.toJson<int?>(outroOffsetMs),
       'followed': serializer.toJson<bool>(followed),
       'followStartedAt': serializer.toJson<DateTime?>(followStartedAt),
       'followCheckedAt': serializer.toJson<DateTime?>(followCheckedAt),
       'newItemCount': serializer.toJson<int>(newItemCount),
+      'learnedIntroStartMs': serializer.toJson<int?>(learnedIntroStartMs),
+      'learnedIntroEndMs': serializer.toJson<int?>(learnedIntroEndMs),
+      'learnedOutroOffsetMs': serializer.toJson<int?>(learnedOutroOffsetMs),
+      'learnedSamples': serializer.toJson<int>(learnedSamples),
+      'learnedAt': serializer.toJson<DateTime?>(learnedAt),
     };
   }
 
@@ -3347,10 +3594,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     Value<String?> mergedInto = const Value.absent(),
     Value<int?> introStartMs = const Value.absent(),
     Value<int?> introEndMs = const Value.absent(),
+    Value<int?> outroOffsetMs = const Value.absent(),
     bool? followed,
     Value<DateTime?> followStartedAt = const Value.absent(),
     Value<DateTime?> followCheckedAt = const Value.absent(),
     int? newItemCount,
+    Value<int?> learnedIntroStartMs = const Value.absent(),
+    Value<int?> learnedIntroEndMs = const Value.absent(),
+    Value<int?> learnedOutroOffsetMs = const Value.absent(),
+    int? learnedSamples,
+    Value<DateTime?> learnedAt = const Value.absent(),
   }) => MediaWorkRow(
     key: key ?? this.key,
     provider: provider ?? this.provider,
@@ -3384,12 +3637,28 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     mergedInto: mergedInto.present ? mergedInto.value : this.mergedInto,
     introStartMs: introStartMs.present ? introStartMs.value : this.introStartMs,
     introEndMs: introEndMs.present ? introEndMs.value : this.introEndMs,
+    outroOffsetMs:
+        outroOffsetMs.present ? outroOffsetMs.value : this.outroOffsetMs,
     followed: followed ?? this.followed,
     followStartedAt:
         followStartedAt.present ? followStartedAt.value : this.followStartedAt,
     followCheckedAt:
         followCheckedAt.present ? followCheckedAt.value : this.followCheckedAt,
     newItemCount: newItemCount ?? this.newItemCount,
+    learnedIntroStartMs:
+        learnedIntroStartMs.present
+            ? learnedIntroStartMs.value
+            : this.learnedIntroStartMs,
+    learnedIntroEndMs:
+        learnedIntroEndMs.present
+            ? learnedIntroEndMs.value
+            : this.learnedIntroEndMs,
+    learnedOutroOffsetMs:
+        learnedOutroOffsetMs.present
+            ? learnedOutroOffsetMs.value
+            : this.learnedOutroOffsetMs,
+    learnedSamples: learnedSamples ?? this.learnedSamples,
+    learnedAt: learnedAt.present ? learnedAt.value : this.learnedAt,
   );
   MediaWorkRow copyWithCompanion(MediaWorksCompanion data) {
     return MediaWorkRow(
@@ -3452,6 +3721,10 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
               : this.introStartMs,
       introEndMs:
           data.introEndMs.present ? data.introEndMs.value : this.introEndMs,
+      outroOffsetMs:
+          data.outroOffsetMs.present
+              ? data.outroOffsetMs.value
+              : this.outroOffsetMs,
       followed: data.followed.present ? data.followed.value : this.followed,
       followStartedAt:
           data.followStartedAt.present
@@ -3465,6 +3738,23 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           data.newItemCount.present
               ? data.newItemCount.value
               : this.newItemCount,
+      learnedIntroStartMs:
+          data.learnedIntroStartMs.present
+              ? data.learnedIntroStartMs.value
+              : this.learnedIntroStartMs,
+      learnedIntroEndMs:
+          data.learnedIntroEndMs.present
+              ? data.learnedIntroEndMs.value
+              : this.learnedIntroEndMs,
+      learnedOutroOffsetMs:
+          data.learnedOutroOffsetMs.present
+              ? data.learnedOutroOffsetMs.value
+              : this.learnedOutroOffsetMs,
+      learnedSamples:
+          data.learnedSamples.present
+              ? data.learnedSamples.value
+              : this.learnedSamples,
+      learnedAt: data.learnedAt.present ? data.learnedAt.value : this.learnedAt,
     );
   }
 
@@ -3501,10 +3791,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           ..write('mergedInto: $mergedInto, ')
           ..write('introStartMs: $introStartMs, ')
           ..write('introEndMs: $introEndMs, ')
+          ..write('outroOffsetMs: $outroOffsetMs, ')
           ..write('followed: $followed, ')
           ..write('followStartedAt: $followStartedAt, ')
           ..write('followCheckedAt: $followCheckedAt, ')
-          ..write('newItemCount: $newItemCount')
+          ..write('newItemCount: $newItemCount, ')
+          ..write('learnedIntroStartMs: $learnedIntroStartMs, ')
+          ..write('learnedIntroEndMs: $learnedIntroEndMs, ')
+          ..write('learnedOutroOffsetMs: $learnedOutroOffsetMs, ')
+          ..write('learnedSamples: $learnedSamples, ')
+          ..write('learnedAt: $learnedAt')
           ..write(')'))
         .toString();
   }
@@ -3541,10 +3837,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
     mergedInto,
     introStartMs,
     introEndMs,
+    outroOffsetMs,
     followed,
     followStartedAt,
     followCheckedAt,
     newItemCount,
+    learnedIntroStartMs,
+    learnedIntroEndMs,
+    learnedOutroOffsetMs,
+    learnedSamples,
+    learnedAt,
   ]);
   @override
   bool operator ==(Object other) =>
@@ -3580,10 +3882,16 @@ class MediaWorkRow extends DataClass implements Insertable<MediaWorkRow> {
           other.mergedInto == this.mergedInto &&
           other.introStartMs == this.introStartMs &&
           other.introEndMs == this.introEndMs &&
+          other.outroOffsetMs == this.outroOffsetMs &&
           other.followed == this.followed &&
           other.followStartedAt == this.followStartedAt &&
           other.followCheckedAt == this.followCheckedAt &&
-          other.newItemCount == this.newItemCount);
+          other.newItemCount == this.newItemCount &&
+          other.learnedIntroStartMs == this.learnedIntroStartMs &&
+          other.learnedIntroEndMs == this.learnedIntroEndMs &&
+          other.learnedOutroOffsetMs == this.learnedOutroOffsetMs &&
+          other.learnedSamples == this.learnedSamples &&
+          other.learnedAt == this.learnedAt);
 }
 
 class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
@@ -3617,10 +3925,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
   final Value<String?> mergedInto;
   final Value<int?> introStartMs;
   final Value<int?> introEndMs;
+  final Value<int?> outroOffsetMs;
   final Value<bool> followed;
   final Value<DateTime?> followStartedAt;
   final Value<DateTime?> followCheckedAt;
   final Value<int> newItemCount;
+  final Value<int?> learnedIntroStartMs;
+  final Value<int?> learnedIntroEndMs;
+  final Value<int?> learnedOutroOffsetMs;
+  final Value<int> learnedSamples;
+  final Value<DateTime?> learnedAt;
   final Value<int> rowid;
   const MediaWorksCompanion({
     this.key = const Value.absent(),
@@ -3653,10 +3967,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.mergedInto = const Value.absent(),
     this.introStartMs = const Value.absent(),
     this.introEndMs = const Value.absent(),
+    this.outroOffsetMs = const Value.absent(),
     this.followed = const Value.absent(),
     this.followStartedAt = const Value.absent(),
     this.followCheckedAt = const Value.absent(),
     this.newItemCount = const Value.absent(),
+    this.learnedIntroStartMs = const Value.absent(),
+    this.learnedIntroEndMs = const Value.absent(),
+    this.learnedOutroOffsetMs = const Value.absent(),
+    this.learnedSamples = const Value.absent(),
+    this.learnedAt = const Value.absent(),
     this.rowid = const Value.absent(),
   });
   MediaWorksCompanion.insert({
@@ -3690,10 +4010,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     this.mergedInto = const Value.absent(),
     this.introStartMs = const Value.absent(),
     this.introEndMs = const Value.absent(),
+    this.outroOffsetMs = const Value.absent(),
     this.followed = const Value.absent(),
     this.followStartedAt = const Value.absent(),
     this.followCheckedAt = const Value.absent(),
     this.newItemCount = const Value.absent(),
+    this.learnedIntroStartMs = const Value.absent(),
+    this.learnedIntroEndMs = const Value.absent(),
+    this.learnedOutroOffsetMs = const Value.absent(),
+    this.learnedSamples = const Value.absent(),
+    this.learnedAt = const Value.absent(),
     this.rowid = const Value.absent(),
   }) : key = Value(key),
        provider = Value(provider),
@@ -3732,10 +4058,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Expression<String>? mergedInto,
     Expression<int>? introStartMs,
     Expression<int>? introEndMs,
+    Expression<int>? outroOffsetMs,
     Expression<bool>? followed,
     Expression<DateTime>? followStartedAt,
     Expression<DateTime>? followCheckedAt,
     Expression<int>? newItemCount,
+    Expression<int>? learnedIntroStartMs,
+    Expression<int>? learnedIntroEndMs,
+    Expression<int>? learnedOutroOffsetMs,
+    Expression<int>? learnedSamples,
+    Expression<DateTime>? learnedAt,
     Expression<int>? rowid,
   }) {
     return RawValuesInsertable({
@@ -3769,10 +4101,18 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       if (mergedInto != null) 'merged_into': mergedInto,
       if (introStartMs != null) 'intro_start_ms': introStartMs,
       if (introEndMs != null) 'intro_end_ms': introEndMs,
+      if (outroOffsetMs != null) 'outro_offset_ms': outroOffsetMs,
       if (followed != null) 'followed': followed,
       if (followStartedAt != null) 'follow_started_at': followStartedAt,
       if (followCheckedAt != null) 'follow_checked_at': followCheckedAt,
       if (newItemCount != null) 'new_item_count': newItemCount,
+      if (learnedIntroStartMs != null)
+        'learned_intro_start_ms': learnedIntroStartMs,
+      if (learnedIntroEndMs != null) 'learned_intro_end_ms': learnedIntroEndMs,
+      if (learnedOutroOffsetMs != null)
+        'learned_outro_offset_ms': learnedOutroOffsetMs,
+      if (learnedSamples != null) 'learned_samples': learnedSamples,
+      if (learnedAt != null) 'learned_at': learnedAt,
       if (rowid != null) 'rowid': rowid,
     });
   }
@@ -3808,10 +4148,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     Value<String?>? mergedInto,
     Value<int?>? introStartMs,
     Value<int?>? introEndMs,
+    Value<int?>? outroOffsetMs,
     Value<bool>? followed,
     Value<DateTime?>? followStartedAt,
     Value<DateTime?>? followCheckedAt,
     Value<int>? newItemCount,
+    Value<int?>? learnedIntroStartMs,
+    Value<int?>? learnedIntroEndMs,
+    Value<int?>? learnedOutroOffsetMs,
+    Value<int>? learnedSamples,
+    Value<DateTime?>? learnedAt,
     Value<int>? rowid,
   }) {
     return MediaWorksCompanion(
@@ -3845,10 +4191,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
       mergedInto: mergedInto ?? this.mergedInto,
       introStartMs: introStartMs ?? this.introStartMs,
       introEndMs: introEndMs ?? this.introEndMs,
+      outroOffsetMs: outroOffsetMs ?? this.outroOffsetMs,
       followed: followed ?? this.followed,
       followStartedAt: followStartedAt ?? this.followStartedAt,
       followCheckedAt: followCheckedAt ?? this.followCheckedAt,
       newItemCount: newItemCount ?? this.newItemCount,
+      learnedIntroStartMs: learnedIntroStartMs ?? this.learnedIntroStartMs,
+      learnedIntroEndMs: learnedIntroEndMs ?? this.learnedIntroEndMs,
+      learnedOutroOffsetMs: learnedOutroOffsetMs ?? this.learnedOutroOffsetMs,
+      learnedSamples: learnedSamples ?? this.learnedSamples,
+      learnedAt: learnedAt ?? this.learnedAt,
       rowid: rowid ?? this.rowid,
     );
   }
@@ -3946,6 +4298,9 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     if (introEndMs.present) {
       map['intro_end_ms'] = Variable<int>(introEndMs.value);
     }
+    if (outroOffsetMs.present) {
+      map['outro_offset_ms'] = Variable<int>(outroOffsetMs.value);
+    }
     if (followed.present) {
       map['followed'] = Variable<bool>(followed.value);
     }
@@ -3957,6 +4312,23 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
     }
     if (newItemCount.present) {
       map['new_item_count'] = Variable<int>(newItemCount.value);
+    }
+    if (learnedIntroStartMs.present) {
+      map['learned_intro_start_ms'] = Variable<int>(learnedIntroStartMs.value);
+    }
+    if (learnedIntroEndMs.present) {
+      map['learned_intro_end_ms'] = Variable<int>(learnedIntroEndMs.value);
+    }
+    if (learnedOutroOffsetMs.present) {
+      map['learned_outro_offset_ms'] = Variable<int>(
+        learnedOutroOffsetMs.value,
+      );
+    }
+    if (learnedSamples.present) {
+      map['learned_samples'] = Variable<int>(learnedSamples.value);
+    }
+    if (learnedAt.present) {
+      map['learned_at'] = Variable<DateTime>(learnedAt.value);
     }
     if (rowid.present) {
       map['rowid'] = Variable<int>(rowid.value);
@@ -3997,10 +4369,16 @@ class MediaWorksCompanion extends UpdateCompanion<MediaWorkRow> {
           ..write('mergedInto: $mergedInto, ')
           ..write('introStartMs: $introStartMs, ')
           ..write('introEndMs: $introEndMs, ')
+          ..write('outroOffsetMs: $outroOffsetMs, ')
           ..write('followed: $followed, ')
           ..write('followStartedAt: $followStartedAt, ')
           ..write('followCheckedAt: $followCheckedAt, ')
           ..write('newItemCount: $newItemCount, ')
+          ..write('learnedIntroStartMs: $learnedIntroStartMs, ')
+          ..write('learnedIntroEndMs: $learnedIntroEndMs, ')
+          ..write('learnedOutroOffsetMs: $learnedOutroOffsetMs, ')
+          ..write('learnedSamples: $learnedSamples, ')
+          ..write('learnedAt: $learnedAt, ')
           ..write('rowid: $rowid')
           ..write(')'))
         .toString();
@@ -6956,6 +7334,656 @@ class DownloadTasksCompanion extends UpdateCompanion<DownloadTaskRow> {
   }
 }
 
+class $SkipSamplesTable extends SkipSamples
+    with TableInfo<$SkipSamplesTable, SkipSampleRow> {
+  @override
+  final GeneratedDatabase attachedDatabase;
+  final String? _alias;
+  $SkipSamplesTable(this.attachedDatabase, [this._alias]);
+  static const VerificationMeta _idMeta = const VerificationMeta('id');
+  @override
+  late final GeneratedColumn<String> id = GeneratedColumn<String>(
+    'id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _itemIdMeta = const VerificationMeta('itemId');
+  @override
+  late final GeneratedColumn<String> itemId = GeneratedColumn<String>(
+    'item_id',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _workKeyMeta = const VerificationMeta(
+    'workKey',
+  );
+  @override
+  late final GeneratedColumn<String> workKey = GeneratedColumn<String>(
+    'work_key',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _kindMeta = const VerificationMeta('kind');
+  @override
+  late final GeneratedColumn<String> kind = GeneratedColumn<String>(
+    'kind',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _anchorMsMeta = const VerificationMeta(
+    'anchorMs',
+  );
+  @override
+  late final GeneratedColumn<int> anchorMs = GeneratedColumn<int>(
+    'anchor_ms',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _durationMsMeta = const VerificationMeta(
+    'durationMs',
+  );
+  @override
+  late final GeneratedColumn<int> durationMs = GeneratedColumn<int>(
+    'duration_ms',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: true,
+  );
+  static const VerificationMeta _offsetMsMeta = const VerificationMeta(
+    'offsetMs',
+  );
+  @override
+  late final GeneratedColumn<int> offsetMs = GeneratedColumn<int>(
+    'offset_ms',
+    aliasedName,
+    true,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _negativeMeta = const VerificationMeta(
+    'negative',
+  );
+  @override
+  late final GeneratedColumn<bool> negative = GeneratedColumn<bool>(
+    'negative',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("negative" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
+  static const VerificationMeta _deviceMeta = const VerificationMeta('device');
+  @override
+  late final GeneratedColumn<String> device = GeneratedColumn<String>(
+    'device',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(''),
+  );
+  static const VerificationMeta _createdAtMeta = const VerificationMeta(
+    'createdAt',
+  );
+  @override
+  late final GeneratedColumn<DateTime> createdAt = GeneratedColumn<DateTime>(
+    'created_at',
+    aliasedName,
+    false,
+    type: DriftSqlType.dateTime,
+    requiredDuringInsert: true,
+  );
+  @override
+  List<GeneratedColumn> get $columns => [
+    id,
+    itemId,
+    workKey,
+    kind,
+    anchorMs,
+    durationMs,
+    offsetMs,
+    negative,
+    device,
+    createdAt,
+  ];
+  @override
+  String get aliasedName => _alias ?? actualTableName;
+  @override
+  String get actualTableName => $name;
+  static const String $name = 'skip_samples';
+  @override
+  VerificationContext validateIntegrity(
+    Insertable<SkipSampleRow> instance, {
+    bool isInserting = false,
+  }) {
+    final context = VerificationContext();
+    final data = instance.toColumns(true);
+    if (data.containsKey('id')) {
+      context.handle(_idMeta, id.isAcceptableOrUnknown(data['id']!, _idMeta));
+    } else if (isInserting) {
+      context.missing(_idMeta);
+    }
+    if (data.containsKey('item_id')) {
+      context.handle(
+        _itemIdMeta,
+        itemId.isAcceptableOrUnknown(data['item_id']!, _itemIdMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_itemIdMeta);
+    }
+    if (data.containsKey('work_key')) {
+      context.handle(
+        _workKeyMeta,
+        workKey.isAcceptableOrUnknown(data['work_key']!, _workKeyMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_workKeyMeta);
+    }
+    if (data.containsKey('kind')) {
+      context.handle(
+        _kindMeta,
+        kind.isAcceptableOrUnknown(data['kind']!, _kindMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_kindMeta);
+    }
+    if (data.containsKey('anchor_ms')) {
+      context.handle(
+        _anchorMsMeta,
+        anchorMs.isAcceptableOrUnknown(data['anchor_ms']!, _anchorMsMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_anchorMsMeta);
+    }
+    if (data.containsKey('duration_ms')) {
+      context.handle(
+        _durationMsMeta,
+        durationMs.isAcceptableOrUnknown(data['duration_ms']!, _durationMsMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_durationMsMeta);
+    }
+    if (data.containsKey('offset_ms')) {
+      context.handle(
+        _offsetMsMeta,
+        offsetMs.isAcceptableOrUnknown(data['offset_ms']!, _offsetMsMeta),
+      );
+    }
+    if (data.containsKey('negative')) {
+      context.handle(
+        _negativeMeta,
+        negative.isAcceptableOrUnknown(data['negative']!, _negativeMeta),
+      );
+    }
+    if (data.containsKey('device')) {
+      context.handle(
+        _deviceMeta,
+        device.isAcceptableOrUnknown(data['device']!, _deviceMeta),
+      );
+    }
+    if (data.containsKey('created_at')) {
+      context.handle(
+        _createdAtMeta,
+        createdAt.isAcceptableOrUnknown(data['created_at']!, _createdAtMeta),
+      );
+    } else if (isInserting) {
+      context.missing(_createdAtMeta);
+    }
+    return context;
+  }
+
+  @override
+  Set<GeneratedColumn> get $primaryKey => {id};
+  @override
+  SkipSampleRow map(Map<String, dynamic> data, {String? tablePrefix}) {
+    final effectivePrefix = tablePrefix != null ? '$tablePrefix.' : '';
+    return SkipSampleRow(
+      id:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}id'],
+          )!,
+      itemId:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}item_id'],
+          )!,
+      workKey:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}work_key'],
+          )!,
+      kind:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}kind'],
+          )!,
+      anchorMs:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.int,
+            data['${effectivePrefix}anchor_ms'],
+          )!,
+      durationMs:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.int,
+            data['${effectivePrefix}duration_ms'],
+          )!,
+      offsetMs: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}offset_ms'],
+      ),
+      negative:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.bool,
+            data['${effectivePrefix}negative'],
+          )!,
+      device:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.string,
+            data['${effectivePrefix}device'],
+          )!,
+      createdAt:
+          attachedDatabase.typeMapping.read(
+            DriftSqlType.dateTime,
+            data['${effectivePrefix}created_at'],
+          )!,
+    );
+  }
+
+  @override
+  $SkipSamplesTable createAlias(String alias) {
+    return $SkipSamplesTable(attachedDatabase, alias);
+  }
+}
+
+class SkipSampleRow extends DataClass implements Insertable<SkipSampleRow> {
+  /// 主键：`itemId#kind#createdAt`（见 `SkipSample.idFor`）。
+  ///
+  /// 用「媒体项 + 类型 + 时间」而不是自增 id：两端各自生成 id 时不会撞车
+  /// （备份合并之后仍然唯一），而自增 id 在合并两份库时必然冲突。
+  final String id;
+
+  /// 媒体项 id（`provider:fileId`）。
+  final String itemId;
+
+  /// 归组键。聚合按它分组 —— **一条样本就带着自己的作品归属**，
+  /// 不依赖 JOIN `media_items`（那张表的行会被扫描删掉）。
+  final String workKey;
+
+  /// 样本类型（`SkipKind.name`：`intro` / `outro`）。
+  ///
+  /// 存枚举名而不是序号：加一种类型时序号会整体错位，旧数据会**静默**
+  /// 变成另一种类型（与 `media_items.resolution` 存 label 同一条理由）。
+  final String kind;
+
+  /// 落点（毫秒）。
+  ///
+  ///   * 片头：用户从开头跳到的位置（`[0, anchor]` 即候选片头区间）；
+  ///   * 片尾：用户「不想再看」的位置。
+  final int anchorMs;
+
+  /// 这次播放的总时长（毫秒）。片尾聚合必须用它换算偏移 ——
+  /// 各集片长不同，绝对时间跨集不可比。
+  final int durationMs;
+
+  /// `durationMs - anchorMs`（毫秒）。**只有片尾样本有值**。
+  ///
+  /// 冗余存一列而不是聚合时现算：它同时是「跨集可比的量」，
+  /// 也是排查时最该先看的那一个数（「各集的片尾偏移是不是稳定」）。
+  final int? offsetMs;
+
+  /// 负样本标记（用户撤销 / 回拖作废的那一次）。
+  ///
+  /// ⛔ 负样本**不参与**聚合，而且会把同作品的结论**降级重算** ——
+  /// 它是「你学错了」这个判断的唯一来源，比正样本稀有得多，所以单列一列。
+  final bool negative;
+
+  /// 产生这条样本的设备标识（`deviceId`）。
+  ///
+  /// 只用于排查（「这些样本是哪台机器产生的」）。**不参与聚合** ——
+  /// 设备差异不是「这个锚点可信不可信」的依据，样本一致性才是。
+  final String device;
+  final DateTime createdAt;
+  const SkipSampleRow({
+    required this.id,
+    required this.itemId,
+    required this.workKey,
+    required this.kind,
+    required this.anchorMs,
+    required this.durationMs,
+    this.offsetMs,
+    required this.negative,
+    required this.device,
+    required this.createdAt,
+  });
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    map['id'] = Variable<String>(id);
+    map['item_id'] = Variable<String>(itemId);
+    map['work_key'] = Variable<String>(workKey);
+    map['kind'] = Variable<String>(kind);
+    map['anchor_ms'] = Variable<int>(anchorMs);
+    map['duration_ms'] = Variable<int>(durationMs);
+    if (!nullToAbsent || offsetMs != null) {
+      map['offset_ms'] = Variable<int>(offsetMs);
+    }
+    map['negative'] = Variable<bool>(negative);
+    map['device'] = Variable<String>(device);
+    map['created_at'] = Variable<DateTime>(createdAt);
+    return map;
+  }
+
+  SkipSamplesCompanion toCompanion(bool nullToAbsent) {
+    return SkipSamplesCompanion(
+      id: Value(id),
+      itemId: Value(itemId),
+      workKey: Value(workKey),
+      kind: Value(kind),
+      anchorMs: Value(anchorMs),
+      durationMs: Value(durationMs),
+      offsetMs:
+          offsetMs == null && nullToAbsent
+              ? const Value.absent()
+              : Value(offsetMs),
+      negative: Value(negative),
+      device: Value(device),
+      createdAt: Value(createdAt),
+    );
+  }
+
+  factory SkipSampleRow.fromJson(
+    Map<String, dynamic> json, {
+    ValueSerializer? serializer,
+  }) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return SkipSampleRow(
+      id: serializer.fromJson<String>(json['id']),
+      itemId: serializer.fromJson<String>(json['itemId']),
+      workKey: serializer.fromJson<String>(json['workKey']),
+      kind: serializer.fromJson<String>(json['kind']),
+      anchorMs: serializer.fromJson<int>(json['anchorMs']),
+      durationMs: serializer.fromJson<int>(json['durationMs']),
+      offsetMs: serializer.fromJson<int?>(json['offsetMs']),
+      negative: serializer.fromJson<bool>(json['negative']),
+      device: serializer.fromJson<String>(json['device']),
+      createdAt: serializer.fromJson<DateTime>(json['createdAt']),
+    );
+  }
+  @override
+  Map<String, dynamic> toJson({ValueSerializer? serializer}) {
+    serializer ??= driftRuntimeOptions.defaultSerializer;
+    return <String, dynamic>{
+      'id': serializer.toJson<String>(id),
+      'itemId': serializer.toJson<String>(itemId),
+      'workKey': serializer.toJson<String>(workKey),
+      'kind': serializer.toJson<String>(kind),
+      'anchorMs': serializer.toJson<int>(anchorMs),
+      'durationMs': serializer.toJson<int>(durationMs),
+      'offsetMs': serializer.toJson<int?>(offsetMs),
+      'negative': serializer.toJson<bool>(negative),
+      'device': serializer.toJson<String>(device),
+      'createdAt': serializer.toJson<DateTime>(createdAt),
+    };
+  }
+
+  SkipSampleRow copyWith({
+    String? id,
+    String? itemId,
+    String? workKey,
+    String? kind,
+    int? anchorMs,
+    int? durationMs,
+    Value<int?> offsetMs = const Value.absent(),
+    bool? negative,
+    String? device,
+    DateTime? createdAt,
+  }) => SkipSampleRow(
+    id: id ?? this.id,
+    itemId: itemId ?? this.itemId,
+    workKey: workKey ?? this.workKey,
+    kind: kind ?? this.kind,
+    anchorMs: anchorMs ?? this.anchorMs,
+    durationMs: durationMs ?? this.durationMs,
+    offsetMs: offsetMs.present ? offsetMs.value : this.offsetMs,
+    negative: negative ?? this.negative,
+    device: device ?? this.device,
+    createdAt: createdAt ?? this.createdAt,
+  );
+  SkipSampleRow copyWithCompanion(SkipSamplesCompanion data) {
+    return SkipSampleRow(
+      id: data.id.present ? data.id.value : this.id,
+      itemId: data.itemId.present ? data.itemId.value : this.itemId,
+      workKey: data.workKey.present ? data.workKey.value : this.workKey,
+      kind: data.kind.present ? data.kind.value : this.kind,
+      anchorMs: data.anchorMs.present ? data.anchorMs.value : this.anchorMs,
+      durationMs:
+          data.durationMs.present ? data.durationMs.value : this.durationMs,
+      offsetMs: data.offsetMs.present ? data.offsetMs.value : this.offsetMs,
+      negative: data.negative.present ? data.negative.value : this.negative,
+      device: data.device.present ? data.device.value : this.device,
+      createdAt: data.createdAt.present ? data.createdAt.value : this.createdAt,
+    );
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('SkipSampleRow(')
+          ..write('id: $id, ')
+          ..write('itemId: $itemId, ')
+          ..write('workKey: $workKey, ')
+          ..write('kind: $kind, ')
+          ..write('anchorMs: $anchorMs, ')
+          ..write('durationMs: $durationMs, ')
+          ..write('offsetMs: $offsetMs, ')
+          ..write('negative: $negative, ')
+          ..write('device: $device, ')
+          ..write('createdAt: $createdAt')
+          ..write(')'))
+        .toString();
+  }
+
+  @override
+  int get hashCode => Object.hash(
+    id,
+    itemId,
+    workKey,
+    kind,
+    anchorMs,
+    durationMs,
+    offsetMs,
+    negative,
+    device,
+    createdAt,
+  );
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is SkipSampleRow &&
+          other.id == this.id &&
+          other.itemId == this.itemId &&
+          other.workKey == this.workKey &&
+          other.kind == this.kind &&
+          other.anchorMs == this.anchorMs &&
+          other.durationMs == this.durationMs &&
+          other.offsetMs == this.offsetMs &&
+          other.negative == this.negative &&
+          other.device == this.device &&
+          other.createdAt == this.createdAt);
+}
+
+class SkipSamplesCompanion extends UpdateCompanion<SkipSampleRow> {
+  final Value<String> id;
+  final Value<String> itemId;
+  final Value<String> workKey;
+  final Value<String> kind;
+  final Value<int> anchorMs;
+  final Value<int> durationMs;
+  final Value<int?> offsetMs;
+  final Value<bool> negative;
+  final Value<String> device;
+  final Value<DateTime> createdAt;
+  final Value<int> rowid;
+  const SkipSamplesCompanion({
+    this.id = const Value.absent(),
+    this.itemId = const Value.absent(),
+    this.workKey = const Value.absent(),
+    this.kind = const Value.absent(),
+    this.anchorMs = const Value.absent(),
+    this.durationMs = const Value.absent(),
+    this.offsetMs = const Value.absent(),
+    this.negative = const Value.absent(),
+    this.device = const Value.absent(),
+    this.createdAt = const Value.absent(),
+    this.rowid = const Value.absent(),
+  });
+  SkipSamplesCompanion.insert({
+    required String id,
+    required String itemId,
+    required String workKey,
+    required String kind,
+    required int anchorMs,
+    required int durationMs,
+    this.offsetMs = const Value.absent(),
+    this.negative = const Value.absent(),
+    this.device = const Value.absent(),
+    required DateTime createdAt,
+    this.rowid = const Value.absent(),
+  }) : id = Value(id),
+       itemId = Value(itemId),
+       workKey = Value(workKey),
+       kind = Value(kind),
+       anchorMs = Value(anchorMs),
+       durationMs = Value(durationMs),
+       createdAt = Value(createdAt);
+  static Insertable<SkipSampleRow> custom({
+    Expression<String>? id,
+    Expression<String>? itemId,
+    Expression<String>? workKey,
+    Expression<String>? kind,
+    Expression<int>? anchorMs,
+    Expression<int>? durationMs,
+    Expression<int>? offsetMs,
+    Expression<bool>? negative,
+    Expression<String>? device,
+    Expression<DateTime>? createdAt,
+    Expression<int>? rowid,
+  }) {
+    return RawValuesInsertable({
+      if (id != null) 'id': id,
+      if (itemId != null) 'item_id': itemId,
+      if (workKey != null) 'work_key': workKey,
+      if (kind != null) 'kind': kind,
+      if (anchorMs != null) 'anchor_ms': anchorMs,
+      if (durationMs != null) 'duration_ms': durationMs,
+      if (offsetMs != null) 'offset_ms': offsetMs,
+      if (negative != null) 'negative': negative,
+      if (device != null) 'device': device,
+      if (createdAt != null) 'created_at': createdAt,
+      if (rowid != null) 'rowid': rowid,
+    });
+  }
+
+  SkipSamplesCompanion copyWith({
+    Value<String>? id,
+    Value<String>? itemId,
+    Value<String>? workKey,
+    Value<String>? kind,
+    Value<int>? anchorMs,
+    Value<int>? durationMs,
+    Value<int?>? offsetMs,
+    Value<bool>? negative,
+    Value<String>? device,
+    Value<DateTime>? createdAt,
+    Value<int>? rowid,
+  }) {
+    return SkipSamplesCompanion(
+      id: id ?? this.id,
+      itemId: itemId ?? this.itemId,
+      workKey: workKey ?? this.workKey,
+      kind: kind ?? this.kind,
+      anchorMs: anchorMs ?? this.anchorMs,
+      durationMs: durationMs ?? this.durationMs,
+      offsetMs: offsetMs ?? this.offsetMs,
+      negative: negative ?? this.negative,
+      device: device ?? this.device,
+      createdAt: createdAt ?? this.createdAt,
+      rowid: rowid ?? this.rowid,
+    );
+  }
+
+  @override
+  Map<String, Expression> toColumns(bool nullToAbsent) {
+    final map = <String, Expression>{};
+    if (id.present) {
+      map['id'] = Variable<String>(id.value);
+    }
+    if (itemId.present) {
+      map['item_id'] = Variable<String>(itemId.value);
+    }
+    if (workKey.present) {
+      map['work_key'] = Variable<String>(workKey.value);
+    }
+    if (kind.present) {
+      map['kind'] = Variable<String>(kind.value);
+    }
+    if (anchorMs.present) {
+      map['anchor_ms'] = Variable<int>(anchorMs.value);
+    }
+    if (durationMs.present) {
+      map['duration_ms'] = Variable<int>(durationMs.value);
+    }
+    if (offsetMs.present) {
+      map['offset_ms'] = Variable<int>(offsetMs.value);
+    }
+    if (negative.present) {
+      map['negative'] = Variable<bool>(negative.value);
+    }
+    if (device.present) {
+      map['device'] = Variable<String>(device.value);
+    }
+    if (createdAt.present) {
+      map['created_at'] = Variable<DateTime>(createdAt.value);
+    }
+    if (rowid.present) {
+      map['rowid'] = Variable<int>(rowid.value);
+    }
+    return map;
+  }
+
+  @override
+  String toString() {
+    return (StringBuffer('SkipSamplesCompanion(')
+          ..write('id: $id, ')
+          ..write('itemId: $itemId, ')
+          ..write('workKey: $workKey, ')
+          ..write('kind: $kind, ')
+          ..write('anchorMs: $anchorMs, ')
+          ..write('durationMs: $durationMs, ')
+          ..write('offsetMs: $offsetMs, ')
+          ..write('negative: $negative, ')
+          ..write('device: $device, ')
+          ..write('createdAt: $createdAt, ')
+          ..write('rowid: $rowid')
+          ..write(')'))
+        .toString();
+  }
+}
+
 abstract class _$AppDatabase extends GeneratedDatabase {
   _$AppDatabase(QueryExecutor e) : super(e);
   $AppDatabaseManager get managers => $AppDatabaseManager(this);
@@ -6966,6 +7994,7 @@ abstract class _$AppDatabase extends GeneratedDatabase {
   late final $SettingsTable settings = $SettingsTable(this);
   late final $PlaybackPrefsTable playbackPrefs = $PlaybackPrefsTable(this);
   late final $DownloadTasksTable downloadTasks = $DownloadTasksTable(this);
+  late final $SkipSamplesTable skipSamples = $SkipSamplesTable(this);
   @override
   Iterable<TableInfo<Table, Object?>> get allTables =>
       allSchemaEntities.whereType<TableInfo<Table, Object?>>();
@@ -6978,6 +8007,7 @@ abstract class _$AppDatabase extends GeneratedDatabase {
     settings,
     playbackPrefs,
     downloadTasks,
+    skipSamples,
   ];
 }
 
@@ -7820,10 +8850,16 @@ typedef $$MediaWorksTableCreateCompanionBuilder =
       Value<String?> mergedInto,
       Value<int?> introStartMs,
       Value<int?> introEndMs,
+      Value<int?> outroOffsetMs,
       Value<bool> followed,
       Value<DateTime?> followStartedAt,
       Value<DateTime?> followCheckedAt,
       Value<int> newItemCount,
+      Value<int?> learnedIntroStartMs,
+      Value<int?> learnedIntroEndMs,
+      Value<int?> learnedOutroOffsetMs,
+      Value<int> learnedSamples,
+      Value<DateTime?> learnedAt,
       Value<int> rowid,
     });
 typedef $$MediaWorksTableUpdateCompanionBuilder =
@@ -7858,10 +8894,16 @@ typedef $$MediaWorksTableUpdateCompanionBuilder =
       Value<String?> mergedInto,
       Value<int?> introStartMs,
       Value<int?> introEndMs,
+      Value<int?> outroOffsetMs,
       Value<bool> followed,
       Value<DateTime?> followStartedAt,
       Value<DateTime?> followCheckedAt,
       Value<int> newItemCount,
+      Value<int?> learnedIntroStartMs,
+      Value<int?> learnedIntroEndMs,
+      Value<int?> learnedOutroOffsetMs,
+      Value<int> learnedSamples,
+      Value<DateTime?> learnedAt,
       Value<int> rowid,
     });
 
@@ -8024,6 +9066,11 @@ class $$MediaWorksTableFilterComposer
     builder: (column) => ColumnFilters(column),
   );
 
+  ColumnFilters<int> get outroOffsetMs => $composableBuilder(
+    column: $table.outroOffsetMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
   ColumnFilters<bool> get followed => $composableBuilder(
     column: $table.followed,
     builder: (column) => ColumnFilters(column),
@@ -8041,6 +9088,31 @@ class $$MediaWorksTableFilterComposer
 
   ColumnFilters<int> get newItemCount => $composableBuilder(
     column: $table.newItemCount,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get learnedIntroStartMs => $composableBuilder(
+    column: $table.learnedIntroStartMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get learnedIntroEndMs => $composableBuilder(
+    column: $table.learnedIntroEndMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get learnedOutroOffsetMs => $composableBuilder(
+    column: $table.learnedOutroOffsetMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get learnedSamples => $composableBuilder(
+    column: $table.learnedSamples,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get learnedAt => $composableBuilder(
+    column: $table.learnedAt,
     builder: (column) => ColumnFilters(column),
   );
 }
@@ -8204,6 +9276,11 @@ class $$MediaWorksTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<int> get outroOffsetMs => $composableBuilder(
+    column: $table.outroOffsetMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<bool> get followed => $composableBuilder(
     column: $table.followed,
     builder: (column) => ColumnOrderings(column),
@@ -8221,6 +9298,31 @@ class $$MediaWorksTableOrderingComposer
 
   ColumnOrderings<int> get newItemCount => $composableBuilder(
     column: $table.newItemCount,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get learnedIntroStartMs => $composableBuilder(
+    column: $table.learnedIntroStartMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get learnedIntroEndMs => $composableBuilder(
+    column: $table.learnedIntroEndMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get learnedOutroOffsetMs => $composableBuilder(
+    column: $table.learnedOutroOffsetMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get learnedSamples => $composableBuilder(
+    column: $table.learnedSamples,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get learnedAt => $composableBuilder(
+    column: $table.learnedAt,
     builder: (column) => ColumnOrderings(column),
   );
 }
@@ -8354,6 +9456,11 @@ class $$MediaWorksTableAnnotationComposer
     builder: (column) => column,
   );
 
+  GeneratedColumn<int> get outroOffsetMs => $composableBuilder(
+    column: $table.outroOffsetMs,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<bool> get followed =>
       $composableBuilder(column: $table.followed, builder: (column) => column);
 
@@ -8371,6 +9478,29 @@ class $$MediaWorksTableAnnotationComposer
     column: $table.newItemCount,
     builder: (column) => column,
   );
+
+  GeneratedColumn<int> get learnedIntroStartMs => $composableBuilder(
+    column: $table.learnedIntroStartMs,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get learnedIntroEndMs => $composableBuilder(
+    column: $table.learnedIntroEndMs,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get learnedOutroOffsetMs => $composableBuilder(
+    column: $table.learnedOutroOffsetMs,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get learnedSamples => $composableBuilder(
+    column: $table.learnedSamples,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<DateTime> get learnedAt =>
+      $composableBuilder(column: $table.learnedAt, builder: (column) => column);
 }
 
 class $$MediaWorksTableTableManager
@@ -8434,10 +9564,16 @@ class $$MediaWorksTableTableManager
                 Value<String?> mergedInto = const Value.absent(),
                 Value<int?> introStartMs = const Value.absent(),
                 Value<int?> introEndMs = const Value.absent(),
+                Value<int?> outroOffsetMs = const Value.absent(),
                 Value<bool> followed = const Value.absent(),
                 Value<DateTime?> followStartedAt = const Value.absent(),
                 Value<DateTime?> followCheckedAt = const Value.absent(),
                 Value<int> newItemCount = const Value.absent(),
+                Value<int?> learnedIntroStartMs = const Value.absent(),
+                Value<int?> learnedIntroEndMs = const Value.absent(),
+                Value<int?> learnedOutroOffsetMs = const Value.absent(),
+                Value<int> learnedSamples = const Value.absent(),
+                Value<DateTime?> learnedAt = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaWorksCompanion(
                 key: key,
@@ -8470,10 +9606,16 @@ class $$MediaWorksTableTableManager
                 mergedInto: mergedInto,
                 introStartMs: introStartMs,
                 introEndMs: introEndMs,
+                outroOffsetMs: outroOffsetMs,
                 followed: followed,
                 followStartedAt: followStartedAt,
                 followCheckedAt: followCheckedAt,
                 newItemCount: newItemCount,
+                learnedIntroStartMs: learnedIntroStartMs,
+                learnedIntroEndMs: learnedIntroEndMs,
+                learnedOutroOffsetMs: learnedOutroOffsetMs,
+                learnedSamples: learnedSamples,
+                learnedAt: learnedAt,
                 rowid: rowid,
               ),
           createCompanionCallback:
@@ -8508,10 +9650,16 @@ class $$MediaWorksTableTableManager
                 Value<String?> mergedInto = const Value.absent(),
                 Value<int?> introStartMs = const Value.absent(),
                 Value<int?> introEndMs = const Value.absent(),
+                Value<int?> outroOffsetMs = const Value.absent(),
                 Value<bool> followed = const Value.absent(),
                 Value<DateTime?> followStartedAt = const Value.absent(),
                 Value<DateTime?> followCheckedAt = const Value.absent(),
                 Value<int> newItemCount = const Value.absent(),
+                Value<int?> learnedIntroStartMs = const Value.absent(),
+                Value<int?> learnedIntroEndMs = const Value.absent(),
+                Value<int?> learnedOutroOffsetMs = const Value.absent(),
+                Value<int> learnedSamples = const Value.absent(),
+                Value<DateTime?> learnedAt = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => MediaWorksCompanion.insert(
                 key: key,
@@ -8544,10 +9692,16 @@ class $$MediaWorksTableTableManager
                 mergedInto: mergedInto,
                 introStartMs: introStartMs,
                 introEndMs: introEndMs,
+                outroOffsetMs: outroOffsetMs,
                 followed: followed,
                 followStartedAt: followStartedAt,
                 followCheckedAt: followCheckedAt,
                 newItemCount: newItemCount,
+                learnedIntroStartMs: learnedIntroStartMs,
+                learnedIntroEndMs: learnedIntroEndMs,
+                learnedOutroOffsetMs: learnedOutroOffsetMs,
+                learnedSamples: learnedSamples,
+                learnedAt: learnedAt,
                 rowid: rowid,
               ),
           withReferenceMapper:
@@ -10043,6 +11197,311 @@ typedef $$DownloadTasksTableProcessedTableManager =
       DownloadTaskRow,
       PrefetchHooks Function()
     >;
+typedef $$SkipSamplesTableCreateCompanionBuilder =
+    SkipSamplesCompanion Function({
+      required String id,
+      required String itemId,
+      required String workKey,
+      required String kind,
+      required int anchorMs,
+      required int durationMs,
+      Value<int?> offsetMs,
+      Value<bool> negative,
+      Value<String> device,
+      required DateTime createdAt,
+      Value<int> rowid,
+    });
+typedef $$SkipSamplesTableUpdateCompanionBuilder =
+    SkipSamplesCompanion Function({
+      Value<String> id,
+      Value<String> itemId,
+      Value<String> workKey,
+      Value<String> kind,
+      Value<int> anchorMs,
+      Value<int> durationMs,
+      Value<int?> offsetMs,
+      Value<bool> negative,
+      Value<String> device,
+      Value<DateTime> createdAt,
+      Value<int> rowid,
+    });
+
+class $$SkipSamplesTableFilterComposer
+    extends Composer<_$AppDatabase, $SkipSamplesTable> {
+  $$SkipSamplesTableFilterComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnFilters<String> get id => $composableBuilder(
+    column: $table.id,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get itemId => $composableBuilder(
+    column: $table.itemId,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get workKey => $composableBuilder(
+    column: $table.workKey,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get kind => $composableBuilder(
+    column: $table.kind,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get anchorMs => $composableBuilder(
+    column: $table.anchorMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get durationMs => $composableBuilder(
+    column: $table.durationMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get offsetMs => $composableBuilder(
+    column: $table.offsetMs,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get negative => $composableBuilder(
+    column: $table.negative,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get device => $composableBuilder(
+    column: $table.device,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<DateTime> get createdAt => $composableBuilder(
+    column: $table.createdAt,
+    builder: (column) => ColumnFilters(column),
+  );
+}
+
+class $$SkipSamplesTableOrderingComposer
+    extends Composer<_$AppDatabase, $SkipSamplesTable> {
+  $$SkipSamplesTableOrderingComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  ColumnOrderings<String> get id => $composableBuilder(
+    column: $table.id,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get itemId => $composableBuilder(
+    column: $table.itemId,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get workKey => $composableBuilder(
+    column: $table.workKey,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get kind => $composableBuilder(
+    column: $table.kind,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get anchorMs => $composableBuilder(
+    column: $table.anchorMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get durationMs => $composableBuilder(
+    column: $table.durationMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<int> get offsetMs => $composableBuilder(
+    column: $table.offsetMs,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<bool> get negative => $composableBuilder(
+    column: $table.negative,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get device => $composableBuilder(
+    column: $table.device,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<DateTime> get createdAt => $composableBuilder(
+    column: $table.createdAt,
+    builder: (column) => ColumnOrderings(column),
+  );
+}
+
+class $$SkipSamplesTableAnnotationComposer
+    extends Composer<_$AppDatabase, $SkipSamplesTable> {
+  $$SkipSamplesTableAnnotationComposer({
+    required super.$db,
+    required super.$table,
+    super.joinBuilder,
+    super.$addJoinBuilderToRootComposer,
+    super.$removeJoinBuilderFromRootComposer,
+  });
+  GeneratedColumn<String> get id =>
+      $composableBuilder(column: $table.id, builder: (column) => column);
+
+  GeneratedColumn<String> get itemId =>
+      $composableBuilder(column: $table.itemId, builder: (column) => column);
+
+  GeneratedColumn<String> get workKey =>
+      $composableBuilder(column: $table.workKey, builder: (column) => column);
+
+  GeneratedColumn<String> get kind =>
+      $composableBuilder(column: $table.kind, builder: (column) => column);
+
+  GeneratedColumn<int> get anchorMs =>
+      $composableBuilder(column: $table.anchorMs, builder: (column) => column);
+
+  GeneratedColumn<int> get durationMs => $composableBuilder(
+    column: $table.durationMs,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<int> get offsetMs =>
+      $composableBuilder(column: $table.offsetMs, builder: (column) => column);
+
+  GeneratedColumn<bool> get negative =>
+      $composableBuilder(column: $table.negative, builder: (column) => column);
+
+  GeneratedColumn<String> get device =>
+      $composableBuilder(column: $table.device, builder: (column) => column);
+
+  GeneratedColumn<DateTime> get createdAt =>
+      $composableBuilder(column: $table.createdAt, builder: (column) => column);
+}
+
+class $$SkipSamplesTableTableManager
+    extends
+        RootTableManager<
+          _$AppDatabase,
+          $SkipSamplesTable,
+          SkipSampleRow,
+          $$SkipSamplesTableFilterComposer,
+          $$SkipSamplesTableOrderingComposer,
+          $$SkipSamplesTableAnnotationComposer,
+          $$SkipSamplesTableCreateCompanionBuilder,
+          $$SkipSamplesTableUpdateCompanionBuilder,
+          (
+            SkipSampleRow,
+            BaseReferences<_$AppDatabase, $SkipSamplesTable, SkipSampleRow>,
+          ),
+          SkipSampleRow,
+          PrefetchHooks Function()
+        > {
+  $$SkipSamplesTableTableManager(_$AppDatabase db, $SkipSamplesTable table)
+    : super(
+        TableManagerState(
+          db: db,
+          table: table,
+          createFilteringComposer:
+              () => $$SkipSamplesTableFilterComposer($db: db, $table: table),
+          createOrderingComposer:
+              () => $$SkipSamplesTableOrderingComposer($db: db, $table: table),
+          createComputedFieldComposer:
+              () =>
+                  $$SkipSamplesTableAnnotationComposer($db: db, $table: table),
+          updateCompanionCallback:
+              ({
+                Value<String> id = const Value.absent(),
+                Value<String> itemId = const Value.absent(),
+                Value<String> workKey = const Value.absent(),
+                Value<String> kind = const Value.absent(),
+                Value<int> anchorMs = const Value.absent(),
+                Value<int> durationMs = const Value.absent(),
+                Value<int?> offsetMs = const Value.absent(),
+                Value<bool> negative = const Value.absent(),
+                Value<String> device = const Value.absent(),
+                Value<DateTime> createdAt = const Value.absent(),
+                Value<int> rowid = const Value.absent(),
+              }) => SkipSamplesCompanion(
+                id: id,
+                itemId: itemId,
+                workKey: workKey,
+                kind: kind,
+                anchorMs: anchorMs,
+                durationMs: durationMs,
+                offsetMs: offsetMs,
+                negative: negative,
+                device: device,
+                createdAt: createdAt,
+                rowid: rowid,
+              ),
+          createCompanionCallback:
+              ({
+                required String id,
+                required String itemId,
+                required String workKey,
+                required String kind,
+                required int anchorMs,
+                required int durationMs,
+                Value<int?> offsetMs = const Value.absent(),
+                Value<bool> negative = const Value.absent(),
+                Value<String> device = const Value.absent(),
+                required DateTime createdAt,
+                Value<int> rowid = const Value.absent(),
+              }) => SkipSamplesCompanion.insert(
+                id: id,
+                itemId: itemId,
+                workKey: workKey,
+                kind: kind,
+                anchorMs: anchorMs,
+                durationMs: durationMs,
+                offsetMs: offsetMs,
+                negative: negative,
+                device: device,
+                createdAt: createdAt,
+                rowid: rowid,
+              ),
+          withReferenceMapper:
+              (p0) =>
+                  p0
+                      .map(
+                        (e) => (
+                          e.readTable(table),
+                          BaseReferences(db, table, e),
+                        ),
+                      )
+                      .toList(),
+          prefetchHooksCallback: null,
+        ),
+      );
+}
+
+typedef $$SkipSamplesTableProcessedTableManager =
+    ProcessedTableManager<
+      _$AppDatabase,
+      $SkipSamplesTable,
+      SkipSampleRow,
+      $$SkipSamplesTableFilterComposer,
+      $$SkipSamplesTableOrderingComposer,
+      $$SkipSamplesTableAnnotationComposer,
+      $$SkipSamplesTableCreateCompanionBuilder,
+      $$SkipSamplesTableUpdateCompanionBuilder,
+      (
+        SkipSampleRow,
+        BaseReferences<_$AppDatabase, $SkipSamplesTable, SkipSampleRow>,
+      ),
+      SkipSampleRow,
+      PrefetchHooks Function()
+    >;
 
 class $AppDatabaseManager {
   final _$AppDatabase _db;
@@ -10061,4 +11520,6 @@ class $AppDatabaseManager {
       $$PlaybackPrefsTableTableManager(_db, _db.playbackPrefs);
   $$DownloadTasksTableTableManager get downloadTasks =>
       $$DownloadTasksTableTableManager(_db, _db.downloadTasks);
+  $$SkipSamplesTableTableManager get skipSamples =>
+      $$SkipSamplesTableTableManager(_db, _db.skipSamples);
 }

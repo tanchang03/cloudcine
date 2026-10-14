@@ -400,3 +400,48 @@ abstract final class IntroSkip {
     return true;
   }
 }
+
+/// **片尾偏移**的取值链与落点换算（纯函数）。
+///
+/// ## 为什么单独抽出来
+///
+/// 片头把「手标 > 学习」这条链放在 [IntroSession.marker] 里，因为片头还有
+/// 「跳过」这个状态要一起管。片尾没有区间、只有一个偏移，也不需要那种状态 ——
+/// 但链本身必须存在，而且**必须和片头同形**（都是 `手标 ?? 学习`）。
+/// 各写各的迟早漂移成「片头认手标、片尾只认学习」，而用户完全看不出是哪一层
+/// 在生效。
+///
+/// 抽成纯函数的第二个理由是它要在**三个**地方用：内置播放页
+/// （`PlaybackController`）、独立播放窗口（`PlayerWindowApp`，跑在另一个引擎
+/// 里、够不到前者的代码）、以及作品简介页的展示口径。散成三份就是三次漂移机会。
+///
+/// ⛔ 与 Android 端 `OutroSkip`（`library/IntroSkip.kt`）**逐字同源**：那边用
+///    毫秒 `Long`、这边用 `Duration`，但三条守卫完全一致 ——
+///    ① 非正数当没标；② 片长未知不跳；③ 落点 ≤ 0 不跳。
+abstract final class OutroSkip {
+  const OutroSkip._();
+
+  /// 生效的片尾偏移：**手标优先，学习兜底**。
+  ///
+  /// 非正数一律当「没标 / 没学过」：偏移 ≤ 0 意味着片尾从片长那一刻才开始，
+  /// 也就是「没有片尾」。与 [IntroMarker.fromMilliseconds] 对非正数的口径一致。
+  static Duration? effectiveOffset({Duration? manual, Duration? learned}) {
+    if (manual != null && manual > Duration.zero) return manual;
+    if (learned != null && learned > Duration.zero) return learned;
+    return null;
+  }
+
+  /// 片尾起点落点（`duration - offset`）。
+  ///
+  /// ⛔ 片长未知（`Duration.zero`）时返回 `null`：那是流还没解析完，拿 0 当片长
+  ///    会让「跳片尾」变成「跳到 0 秒」。
+  /// ⛔ 落点 ≤ 0 时也返回 `null`：说明偏移比片长还大 —— 数据坏了（比如换了一集
+  ///    更短的）。**不跳比乱跳好**：误跳的代价是用户直接丢掉结局，不可逆。
+  static Duration? start({required Duration duration, Duration? offset}) {
+    if (offset == null || offset <= Duration.zero) return null;
+    if (duration <= Duration.zero) return null;
+    final start = duration - offset;
+    if (start <= Duration.zero) return null;
+    return start;
+  }
+}
