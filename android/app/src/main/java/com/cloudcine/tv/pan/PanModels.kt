@@ -104,6 +104,21 @@ data class Quality(
     val url: String,
     val isOriginal: Boolean,
     val durationMs: Long,
+    /**
+     * 这条流**自带的请求头**（百度用；夸克为空 = 沿用播放页那套 CDN 头）。
+     *
+     * ⛔ 百度各通道的请求头不一样：`dlna` 直链的第二跳 `sign` 按 UA 签的
+     * （必须是 `netdisk`），普通通道直链靠 `Cookie` 认领用户。所以请求头
+     * **跟着档位走**，不能由播放页按厂家写死一份。
+     */
+    val headers: Map<String, String> = emptyMap(),
+    /**
+     * 这条流允许的并行连接数。`0` = 用全局设置（夸克）。
+     *
+     * ⛔ 百度普通通道的限速是**账号级**的：加连接不加吞吐，8 条还会被掐断。
+     * 所以百度一律钉 1，不跟「并行连接数」那个设置走。
+     */
+    val maxConnections: Int = 0,
 ) {
     /**
      * 这条流要「实时播」需要多少 MB/s。

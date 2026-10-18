@@ -478,6 +478,131 @@ void main() {
       );
     });
 
+    test('向后 seek 落回已缓存区间不得清空中继缓存（缓冲范围内拖拽不能整段重缓冲）',
+        () async {
+      // 根因回归：2026-10-17 用户报「在缓冲进度范围内拖进度条，拖完缓冲全没了、
+      // 重新缓冲」。直接原因就是 `_onAnchorJumped` 里那句 `cache.clear()` ——
+      // 只要拖动离当前播放头超过一个预取窗口（默认 256 MiB），整张 `ChunkCache`
+      // 被清空，于是 mpv 回读那些本来还在 `demuxer-cache-time` 标出的「已缓冲」
+      // 区间里的字节时，中继手里已经没有、只能重新向上游网盘取 ⇒ 重缓冲。
+      //
+      // 修复后这里断言：把播放头推过窗口、让旧块入缓存，再**向后**拖回旧块所在
+      // 位置（跨度 > 预取窗口 ⇒ 必然触发 `_onAnchorJumped`），从那一段重新整条读，
+      // **旧区间对应的上游请求数不得增加** —— 即旧块是命中中继缓存、没有重取。
+      // 旧实现会在这里让旧区间的请求数翻倍（每块都重取一次）。
+      const total = 40 * 1024 * 1024; // 40 MiB → 40 块
+      const chunk = 1024 * 1024; // 1 MiB
+      const prefetchChunks = 8; // 预取窗口 8 MiB（跨度超过它就判定为真 seek）
+      const anchorReadMiB = 16; // 旧读取器把播放头推到 ~16 MiB
+      // 缓存上限取满，避免 LRU 把旧块淘汰掉 —— 这样才能**单纯**隔离
+      // 「cache.clear 有没有发生」，而不是被 LRU 噪声干扰。
+      const cacheBytes = total;
+
+      final source = Uint8List(total);
+      for (var i = 0; i < total; i++) {
+        source[i] = i % 251;
+      }
+
+      final ranges = <ByteRange>[];
+      final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(upstream.close);
+      upstream.listen((request) async {
+        final spec = parseRangeRequest(request.headers.value('Range'), total);
+        final range = spec is SatisfiableRange
+            ? spec.range
+            : const ByteRange(0, total - 1);
+        ranges.add(range);
+        request.response
+          ..statusCode = HttpStatus.partialContent
+          ..headers.set(
+            HttpHeaders.contentRangeHeader,
+            formatContentRange(range, total),
+          )
+          ..headers.set(HttpHeaders.contentLengthHeader, range.length)
+          ..add(Uint8List.sublistView(source, range.start, range.end + 1));
+        await request.response.close();
+      });
+
+      final relay = LocalStreamRelay(
+        chunkSize: chunk,
+        prefetchBytes: prefetchChunks * chunk,
+        maxCacheBytes: cacheBytes,
+        connections: 2,
+      );
+      addTearDown(relay.dispose);
+
+      final endpoint = (await relay.open(
+        StreamTicket(
+          url: Uri.parse('http://127.0.0.1:${upstream.port}/demo.mkv'),
+          contentLength: total,
+          contentType: 'video/x-matroska',
+        ),
+      ))!;
+
+      // —— 旧读取器：开放式 Range，把播放头推过预取窗口，让旧块入缓存 ——
+      // 只消费到 anchorReadMiB 就停住，不继续读，从而把播放头**冻结**在 ~16 MiB，
+      // 而 0..(16+窗口) 的块都已落进中继缓存。
+      final oldClient = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(oldClient.close);
+      final oldRequest = await oldClient.getUrl(endpoint.uri);
+      oldRequest.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+      final oldResponse = await oldRequest.close();
+      var consumed = 0;
+      await for (final piece in oldResponse) {
+        consumed += piece.length;
+        if (consumed >= anchorReadMiB * chunk) break;
+      }
+      // 关掉旧连接（不消费 = 不放行），让播放头停住。
+      oldClient.close(force: true);
+
+      // 等到「旧窗口 + 预取窗口」都进缓存：块 0..(16+8-1)=23 全部取到上游。
+      await _waitFor(
+        () =>
+            (relay.statsOf(endpoint.token)?.downloadedBytes ?? 0) >=
+            (anchorReadMiB + prefetchChunks) * chunk,
+      );
+
+      // 旧区间 = 已经被旧读取器取过的块（0..23）。记下此刻上游为它们各发了多少次。
+      int oldRegionRequests() =>
+          ranges.where((r) => r.start <= (anchorReadMiB + prefetchChunks - 1) * chunk)
+              .length;
+      final requestsBefore = oldRegionRequests();
+      expect(requestsBefore, greaterThan(0));
+
+      // —— 新读取器：向后拖回块 0（跨度 16 > 窗口 8 ⇒ 触发 `_onAnchorJumped`）——
+      // 整条重读，模拟「拖回缓冲范围内、从头播」。
+      final newClient = HttpClient()..findProxy = (Uri _) => 'DIRECT';
+      addTearDown(newClient.close);
+      final newRequest = await newClient.getUrl(endpoint.uri);
+      newRequest.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+      final newResponse = await newRequest.close();
+      final body = <int>[];
+      await for (final piece in newResponse) {
+        body.addAll(piece);
+      }
+      // 字节必须逐一对得上（拖回之后照样能完整播出）。
+      expect(Uint8List.fromList(body), source);
+
+      // ⛔ 核心断言：旧区间的上游请求数**不得增加** —— 旧块是命中中继缓存取出的，
+      // 没有重取。旧实现 `cache.clear()` 会让这里翻倍（每块重取一次）。
+      final requestsAfter = oldRegionRequests();
+      expect(
+        requestsAfter,
+        requestsBefore,
+        reason: '向后 seek 命中已缓存区间后，旧区间的上游请求数从 $requestsBefore 变成 '
+            '$requestsAfter —— 说明中继清了缓存、把本来还在缓冲范围内的字节又向上游重取了，'
+            '正是「拖拽后缓冲全没了 + 重新缓冲」的根因',
+      );
+
+      // 缓存没有被清空：仍持有大量已缓存字节，而不是塌回接近 0。
+      final cached = relay.statsOf(endpoint.token)!.cachedBytes;
+      expect(
+        cached,
+        greaterThanOrEqualTo((anchorReadMiB + prefetchChunks - 1) * chunk),
+        reason: '向后 seek 之后中继缓存只剩 $cached 字节，疑似被整张清空',
+      );
+    });
+
     test('票据 UA 必须熬过 302 —— 否则 dlna 直链第二跳回 403 sign error', () async {
       // 2026-10-09 现场：`/我的资源/VID_20261007_170446.mp4` 播放时
       // **18304 次取块全是 403**，播放器一个字节都没拿到。

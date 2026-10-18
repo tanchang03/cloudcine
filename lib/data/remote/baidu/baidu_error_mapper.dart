@@ -47,6 +47,21 @@ class BaiduErrorCode {
   /// 需要身份验证（风控拦截）。【未验证】
   static const int needVerify = -62;
 
+  /// **账号级风控：需要过人机验证**。
+  ///
+  /// 【实测】2026-10-17：`rest/2.0/xpan/*`（开放平台端点）恒定返回
+  /// `{"errno":9019,"errmsg":"need verify","request_id":…}`（HTTP 200），
+  /// 而**同一份 Cookie** 下 `/api/list`、`/api/filemetas`、
+  /// `/api/batch/streaming` 全部业务成功 —— 所以它是**端点 + 账号维度**
+  /// 的风控，不是凭证失效（`-6`），重新扫码也解不掉。
+  ///
+  /// 解除方式只有用户侧：去 pan.baidu.com 网页版登录该账号、完成弹出的
+  /// 安全验证。在此之前 `xpan/*` 一直 9019，取链只能走 `/api/*` 路由。
+  ///
+  /// ⚠️ 与 [needVerify]（`-62`）是**两个不同的码**：`-62` 来自社区文档
+  /// （未验证），`9019` 来自本机实测。都映射到同一类处置。
+  static const int riskControl = 9019;
+
   /// 该目录下已有同名文件。【未验证】
   static const int sameNameExists = 111;
 
@@ -195,10 +210,12 @@ DriveException baiduExceptionFrom(
       );
 
     case BaiduErrorCode.needVerify:
+    case BaiduErrorCode.riskControl:
     case BaiduErrorCode.qrRiskControl:
       return DriveException(
         type: DriveErrorType.permissionDenied,
-        message: msg('账号触发了安全验证，请先在百度网盘 App 内确认'),
+        message: msg('百度账号触发安全验证（风控），'
+            '请先到 pan.baidu.com 网页版完成验证后再试'),
         providerCode: providerCode,
         httpStatus: result.statusCode,
         rawMessage: message,

@@ -20,8 +20,11 @@ import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
 import com.cloudcine.tv.pan.Bg
+import com.cloudcine.tv.pan.DriveClient
+import com.cloudcine.tv.pan.DriveClients
 import com.cloudcine.tv.pan.DriveEntry
-import com.cloudcine.tv.pan.PanApi
+import com.cloudcine.tv.pan.DriveException
+import com.cloudcine.tv.pan.DriveProviders
 import com.cloudcine.tv.pan.CredStore
 import com.cloudcine.tv.pan.formatSize
 import com.cloudcine.tv.library.FolderSortMode
@@ -29,6 +32,8 @@ import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
 import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.LibraryScanner
+import com.cloudcine.tv.library.dirPathOf
+import com.cloudcine.tv.library.fullPathOf
 import com.cloudcine.tv.library.sortListing
 
 /**
@@ -44,7 +49,18 @@ import com.cloudcine.tv.library.sortListing
 class BrowseActivity : Activity() {
 
     private lateinit var store: CredStore
-    private lateinit var api: PanApi
+
+    /**
+     * 当前操作的网盘客户端（`quark` / `baidu`）。
+     *
+     * ⛔ 类型是 [DriveClient] 而不是 `PanApi`：这个页面的每一件事（列目录、
+     *    取缩略图、发现）都只用到接口里那六个方法，没有任何一处需要夸克
+     *    特有的能力。绑死 `PanApi` 就等于「百度账号进不来」。
+     */
+    private lateinit var api: DriveClient
+
+    /** 本页正在操作哪家网盘 —— 决定 `EXTRA_PROVIDER` 与 Cookie 取哪一份。 */
+    private var provider: String = DriveProviders.QUARK
 
     /**
      * 媒体库索引库 —— **只为「发现」服务**。
@@ -100,14 +116,21 @@ class BrowseActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = CredStore(this)
-        api = PanApi(store)
+        // ⛔ 厂家由 `activeProvider` 决定（两家可以同时登录，页头/菜单里能切）。
+        provider = store.activeProvider
+        api = DriveClients.create(provider, store)
         db = LibraryDb(
             LibraryPaths.dbFile(this),
             progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
         )
-        scanner = LibraryScanner(api = api, db = db)
+        // ⛔ `provider` 必须传下去：条目主键是 `provider:fileId`，扫描器用错了
+        //    厂家就会把百度的文件写成夸克的条目（或反过来），而这是**静默的** ——
+        //    表现为「媒体库里同一部片子出现两格，其中一格点开播不了」。
+        scanner = LibraryScanner(api = api, db = db, provider = provider)
 
-        if (!store.loggedIn) {
+        // ⛔ `anyLoggedIn` 而不是 `loggedIn`：后者只问夸克。只看夸克的话，
+        //    只登录了百度的用户会被直接踢回登录页，永远进不了文件列表。
+        if (!store.anyLoggedIn) {
             startActivity(Intent(this, LoginActivity::class.java))
             finish()
             return
@@ -218,7 +241,9 @@ class BrowseActivity : Activity() {
         )
         setContentView(frame)
 
-        open(PanApi.ROOT, "云影")
+        // ⛔ 根标识**按厂家取**：夸克是 `"0"`、百度是 `"/"`。写死任一个，
+        //    另一家的第一次列目录就会落在一个不存在的目录上。
+        open(api.rootId, "云影")
     }
 
     override fun onDestroy() {
@@ -374,9 +399,22 @@ class BrowseActivity : Activity() {
                 },
             )
         } else {
+            // ⛔ 栈空 = **根目录那一层还没读出来**（最常见的原因是列目录失败，
+            //    比如凭证失效）。此时「本目录」就是网盘根，不能拿空串去
+            //    `doDiscover` —— 那只会得到一句「拿不到这个目录的标识」，
+            //    把真正的失败原因（登录失效）盖掉，而用户此刻唯一能做的
+            //    恰恰是去重新登录。
+            // ⛔ 根的标识两家不同（夸克 `"0"` / 百度 `"/"`）⇒ 取 `api.rootId`。
+            val atRoot = stack.isEmpty()
+            val scopeLabel = if (atRoot) "网盘根目录" else "「$here」"
             actions.add(
-                "发现本目录「$here」（含子目录）" to {
-                    doDiscover(stack.lastOrNull()?.first.orEmpty(), pathOfStack(), true, "本目录")
+                "发现本目录$scopeLabel（含子目录）" to {
+                    doDiscover(
+                        stack.lastOrNull()?.first ?: api.rootId,
+                        if (atRoot) "/" else pathOfStack(),
+                        true,
+                        if (atRoot) "根目录" else "本目录",
+                    )
                 },
             )
         }
@@ -403,9 +441,25 @@ class BrowseActivity : Activity() {
         }
 
         actions.add("媒体库" to { gotoLibrary() })
-        actions.add("重新登录" to { relogin() })
 
-        showOverlay(titleText = "云影", labels = actions.map { it.first }) { index ->
+        // ── 网盘切换 / 重新登录 ──────────────────────────────────────
+        // ⛔ 只在「另一家已登录」时才出现切换项：没登录过的那家点进去也是
+        //    去登录页，而「重新登录」那条已经把路留好了。
+        val other = if (provider == DriveProviders.BAIDU) {
+            DriveProviders.QUARK
+        } else {
+            DriveProviders.BAIDU
+        }
+        if (store.loggedIn(other)) {
+            actions.add("切换到${DriveProviders.displayName(other)}" to { switchProvider(other) })
+        } else {
+            actions.add("登录${DriveProviders.displayName(other)}" to { switchProvider(other) })
+        }
+        actions.add(
+            "重新登录${DriveProviders.displayName(provider)}" to { relogin() },
+        )
+
+        showOverlay(titleText = DriveProviders.displayName(provider), labels = actions.map { it.first }) { index ->
             val act = actions.getOrNull(index) ?: return@showOverlay
             hideOverlay()
             act.second()
@@ -428,11 +482,45 @@ class BrowseActivity : Activity() {
         finish()
     }
 
-    /** 重新登录：清凭证回登录页。本 App 上「退出登录」的唯一入口。 */
+    /** 重新登录：**只**清当前这一家的凭证，回登录页。 */
     private fun relogin() {
-        store.clear()
-        startActivity(Intent(this, LoginActivity::class.java))
+        // ⛔ 不再 `store.clear()`（那是两家一起退）：另一家的凭证没惹事，
+        //    一起清掉等于「换个号把另一个网盘也登出了」。
+        store.clearProvider(provider)
+        startActivity(
+            Intent(this, LoginActivity::class.java)
+                .putExtra(LoginActivity.EXTRA_PROVIDER, provider),
+        )
         finish()
+    }
+
+    /**
+     * 切到另一家网盘（两家可以同时登录，这里只换「现在操作谁」）。
+     *
+     * ⛔ 换的是 `activeProvider` + 本页的 `api` / `scanner`，**不是**只改个标题：
+     *    列表、缩略图、发现全都绑在 `api` 上，只换标题会让「标题写百度、
+     *    列表还是夸克」。
+     */
+    private fun switchProvider(next: String) {
+        if (next == provider) return
+        if (!store.loggedIn(next)) {
+            // 没登录过就先登录 —— 登完 `LoginActivity` 会把它设成 active 并进媒体库。
+            startActivity(
+                Intent(this, LoginActivity::class.java)
+                    .putExtra(LoginActivity.EXTRA_PROVIDER, next),
+            )
+            finish()
+            return
+        }
+        Log.i(TAG, "切换网盘：$provider → $next")
+        provider = next
+        store.activeProvider = next
+        api = DriveClients.create(provider, store)
+        scanner = LibraryScanner(api = api, db = db, provider = provider)
+        stack.clear()
+        entries.clear()
+        adapter.notifyDataSetChanged()
+        open(api.rootId, "云影")
     }
 
     // ------------------------------------------------------------------
@@ -441,7 +529,13 @@ class BrowseActivity : Activity() {
         status.text = "加载中…"
         Bg.run({ api.listDirectory(fid) }) { list, err ->
             if (err != null) {
-                status.text = "加载失败：${err.message}"
+                // ⛔ 凭证失效要给**下一步动作**，不能只回一句 `errno=-6`：
+                //    电视上没有地址栏也没有刷新按钮，用户能做的只有菜单。
+                status.text = if (err is DriveException && err.needsReauth) {
+                    "登录已失效：按「菜单 → 重新登录${DriveProviders.displayName(provider)}」"
+                } else {
+                    "加载失败：${err.message}"
+                }
                 Log.e(TAG, "列目录失败", err)
                 return@run
             }
@@ -455,7 +549,10 @@ class BrowseActivity : Activity() {
             adapter.notifyDataSetChanged()
             buildSortBar()
             title.text = stack.joinToString(" / ") { it.second }
-            status.text = "共 ${entries.size} 项（目录 ${entries.count { it.isDir }}）"
+            // ⛔ 状态行带上厂家短名：两家同时登录时，用户只能靠这一处分辨
+            //    「我现在看的是哪个网盘」。
+            status.text = "${DriveProviders.shortName(provider)} · 共 ${entries.size} 项" +
+                "（目录 ${entries.count { it.isDir }}）"
             listView.setSelection(0)
             listView.requestFocus()
         }
@@ -468,12 +565,25 @@ class BrowseActivity : Activity() {
                 Intent(this, PlayerActivity::class.java)
                     .putExtra(PlayerActivity.EXTRA_FID, e.fid)
                     .putExtra(PlayerActivity.EXTRA_NAME, e.name)
-                    .putExtra(PlayerActivity.EXTRA_HEADERS, store.requestCookie())
+                    // ⛔ Cookie 按**当前厂家**取（夸克要把 `Video-Auth` 拼进去，
+                    //    百度不需要）。取错那一份的表现是「列表能刷、一播 412/-6」。
+                    .putExtra(PlayerActivity.EXTRA_HEADERS, store.requestCookie(provider))
                     // ⛔ 把**当前目录**的 fid 一起带过去 —— 播放页靠它扫同目录的
                     //    外挂字幕。单个文件的 fid 推不出父目录，网盘也没有
                     //    「查父目录」的接口，所以只能在这里给。
                     //    目录栈的栈顶就是当前列表，`onEntry` 只会在它上面被调用。
-                    .putExtra(PlayerActivity.EXTRA_PDIR, stack.lastOrNull()?.first.orEmpty()),
+                    .putExtra(PlayerActivity.EXTRA_PDIR, stack.lastOrNull()?.first.orEmpty())
+                    // ── 厂家 + 两条路径（百度要用）──────────────────────
+                    // 百度没有「fid → 路径」的反查接口，而取链的兜底路由全是
+                    // 按路径来的。这里顺手把「完整文件路径」和「父目录路径」
+                    // 都算好带过去，播放页就不必再打一次 xpan（那正是 `-6`
+                    // 风控最常见的来源）。
+                    .putExtra(PlayerActivity.EXTRA_PROVIDER, provider)
+                    .putExtra(
+                        PlayerActivity.EXTRA_PATH,
+                        fullPathOf(pathOfStack(), e.name),
+                    )
+                    .putExtra(PlayerActivity.EXTRA_PDIR_PATH, dirPathOf(pathOfStack())),
             )
             e.isSubtitle -> status.text = "字幕文件：${e.name}\n（在视频里用「字幕」那一行选）"
             else -> status.text = "不是视频：${e.name}"
@@ -552,8 +662,8 @@ class BrowseActivity : Activity() {
         discovering = true
         status.text = "正在把「${e.name}」加入媒体库…"
         // ⛔ 用**当前目录**的 fid / path：文件自己推不出父目录（与 [onEntry] 里
-        //    给播放页传 `EXTRA_PDIR` 是同一个理由）。
-        val dirId = stack.lastOrNull()?.first.orEmpty()
+        //    给播放页传 `EXTRA_PDIR` 是同一个理由）。栈空 = 根目录，fid 取 `api.rootId`。
+        val dirId = stack.lastOrNull()?.first ?: api.rootId
         val path = pathOfStack()
         Bg.run({ scanner.discoverFile(e, path, dirId) }) { out, err ->
             discovering = false

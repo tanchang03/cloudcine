@@ -64,9 +64,15 @@ import com.cloudcine.tv.library.StartupSync
 import com.cloudcine.tv.library.SyncDecision
 import com.cloudcine.tv.library.Work
 import com.cloudcine.tv.library.WorkDetailFormat
+import com.cloudcine.tv.library.dirPathOf
+import com.cloudcine.tv.library.fullPathOf
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.CredStore
+import com.cloudcine.tv.pan.DriveClient
+import com.cloudcine.tv.pan.DriveClients
+import com.cloudcine.tv.pan.DriveProviders
 import com.cloudcine.tv.pan.PanApi
+import com.cloudcine.tv.pan.baidu.BaiduEndpoints
 import com.cloudcine.tv.pan.formatSize
 import java.io.File
 import java.text.SimpleDateFormat
@@ -148,7 +154,45 @@ class LibraryActivity : Activity() {
 
     // ── 依赖 ────────────────────────────────────────────────────────
     private lateinit var store: CredStore
-    private lateinit var api: PanApi
+
+    /**
+     * 当前**激活网盘**的客户端 —— 扫描 / 发现 / 追更都走它。
+     *
+     * ⛔ 类型是 [DriveClient]：本页对网盘的全部诉求（列目录、取缩略图、
+     *    读文件）都在那个接口里，没有任何一处需要夸克特有的能力。
+     */
+    private lateinit var api: DriveClient
+
+    /** 本页当前在扫哪一家（`store.activeProvider` 的快照）。 */
+    private var provider: String = DriveProviders.QUARK
+
+    /**
+     * 按厂家取客户端（**按需建、建一次**）。
+     *
+     * 为什么需要两个：海报墙上的封面可能来自两家 —— 某部片是夸克扫出来的、
+     * 另一部是百度扫出来的，而两者的缩略图都要带**各自**的 Cookie 才能下
+     * （裸链一律 401）。只留一个 `api` 的话，另一家的封面永远是一块灰。
+     *
+     * ⛔ 用同步包装的 HashMap 而不是普通 `HashMap`：封面下载在后台线程池里
+     *    并发跑，普通 Map 并发写会丢条目甚至死循环。
+     */
+    private val clients: MutableMap<String, DriveClient> =
+        java.util.Collections.synchronizedMap(HashMap())
+
+    /** 取（并按需创建）某个网盘的客户端。见 [clients] 的说明。 */
+    private fun clientOf(p: String): DriveClient =
+        clients[p] ?: DriveClients.create(p, store).also { clients[p] = it }
+
+    /**
+     * 一条图片 / 直链地址属于哪家网盘。
+     *
+     * ⛔ 判据是**域名**而不是库里那行的 `provider`：封面地址是扫描时存下来的，
+     *    而同一个作品完全可能被两家各扫到一次。按域名判永远对得上，按行判
+     *    在「作品合并」之后就可能张冠李戴。
+     */
+    private fun providerOfUrl(url: String): String =
+        if (BaiduEndpoints.ownsUrl(url)) DriveProviders.BAIDU else DriveProviders.QUARK
+
     private lateinit var db: LibraryDb
     private lateinit var service: LibraryBackupService
 
@@ -372,6 +416,21 @@ class LibraryActivity : Activity() {
 
     private var posterOnly = false
 
+    // ── 作品墙的**批量移除**多选态 ────────────────────────────────
+    //
+    // 与 PC 端 `LibrarySelection` 同一套语义（那里把「是否多选」与
+    // 「选了哪些」放在同一个对象里；这里是一个 `selecting` + 一个集合）：
+    //   * `selecting` = 多选模式。开启时 **OK 点卡片 = 勾选/取消**，
+    //     不再进简介页 —— 与 PC 端同一个取舍（「勾了 6 部又点进一部
+    //     片子里」是纯干扰）；
+    //   * 存 `key` 而不是下标：列表会因刷新 / 筛选重建，下标会错位。
+    //
+    // ⚠️ 入口在 MENU（「批量移除（从媒体库）…」）：电视遥控器没有长按，
+    //   PC 端长按卡片那条路在电视上无处安放。退出有三个出口：返回键、
+    //   工具条上的「退出多选」、以及**移除成功之后**（自动退）。
+    private var selecting = false
+    private val selectedKeys = LinkedHashSet<String>()
+
     // ── 状态行工具条（排序 / 筛选 / 只看有海报 / 清空）───────────────
     //
     // ⛔ 状态行**必须能拿焦点**。它上面就写着「排序：最近修改」，用户拿遥控器
@@ -483,15 +542,21 @@ class LibraryActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         store = CredStore(this)
-        api = PanApi(store)
+        provider = store.activeProvider
+        api = clientOf(provider)
         // ⛔ 进度库的实例来自 `ProgressStore.shared`（进程内唯一），**不是**每次
         //    自己 new 一个：本页会被反复重建，各自持一份内存副本的话，后落盘的
         //    那份会把先落盘的整个覆盖掉（两边都显示成功）。
         progressStore = ProgressStore.shared(LibraryPaths.progressFile(this))
         db = LibraryDb(LibraryPaths.dbFile(this), progress = progressStore)
+        // ⛔ 备份 / 恢复**只走夸克**：`.ccbak` 的容器与上传/下载实现都在
+        //    `PanApi` 上，电视端对百度是**只读**的（见 `BaiduApi` 的类文档）。
+        //    所以这里显式给一个夸克客户端，**不**跟着 `activeProvider` 变 ——
+        //    跟着变的话，百度用户一点「备份」就会去调百度的上传接口，而那个
+        //    根本没有实现（`DriveClient` 里没有写方法）。
         service = LibraryBackupService(
             db = db,
-            api = api,
+            api = PanApi(store),
             posterDir = LibraryPaths.posterDir(this),
             deviceId = DeviceIdentity.id(this),
             deviceName = DeviceIdentity.name(),
@@ -505,7 +570,7 @@ class LibraryActivity : Activity() {
             uploadRemote = { service.uploadProgressFile(it) },
         )
         posters = PosterStore(LibraryPaths.posterDir(this), POSTER_CACHE_BYTES)
-        scanner = LibraryScanner(api = api, db = db)
+        scanner = LibraryScanner(api = api, db = db, provider = provider)
         // ⛔ 必须在这里建，且必须**在建 [scanner] 之后**：`checkFollow` 是
         //    `onCreate` 结束后 1.5 秒（`postDelayed`）就会走到的路径。
         //    `lateinit` 忘了赋值**不会崩**，只在日志里留一句
@@ -520,7 +585,9 @@ class LibraryActivity : Activity() {
         //    [PosterFetcher] —— 那个用的是不带网盘凭证的 `ScrapeHttp`。
         cloudCovers = CloudCoverFetcher(
             dir = LibraryPaths.posterDir(this),
-            thumbBytes = { api.thumbBytes(it) },
+            // ⛔ 按**地址归属**选厂家，不是按当前激活网盘：海报墙上同时挂着
+            //    两家的片子，夸克那条裸链用百度 Cookie 去取照样 401。
+            thumbBytes = { url -> clientOf(providerOfUrl(url)).thumbBytes(url) },
         )
         // 简介页剧集列表的封面。与播放页选集列表同一个目录 ⇒ 两边共享磁盘缓存。
         episodeThumbs = EpisodeThumbs(
@@ -1079,9 +1146,17 @@ class LibraryActivity : Activity() {
         //    它会留一条高度为 0 却仍然参与焦点搜索的空壳。
         tabsScroll.visibility = View.VISIBLE
         barScroll.visibility = View.VISIBLE
-        title.text = "媒体库"
+        title.text = if (selecting) "媒体库 · 批量移除" else "媒体库"
         status.text = statusText
-        hintBar.text = "↑↓←→ 选择 · OK 进简介页 · ↑ 到状态行（排序 / 筛选）· 菜单 更多"
+        // ⛔ 多选开着时提示行说的是**多选**那套键（OK = 勾选）：
+        //    `loadWorks` 会在扫描 / 筛选变化时重跑，不跟着换的话用户照着
+        //    提示按 OK，结果点进了一部片子里。
+        hintBar.text =
+            if (selecting) {
+                "多选移除：OK 勾选 / 取消 · ↑ 到工具条（全选 / 移除）· 返回 退出多选"
+            } else {
+                "↑↓←→ 选择 · OK 进简介页 · ↑ 到状态行（排序 / 筛选）· 菜单 更多"
+            }
         paintTabs()
         paintBar()
         worksAdapter.notifyDataSetChanged()
@@ -1768,6 +1843,38 @@ class LibraryActivity : Activity() {
      */
     private fun buildBar() {
         val items = ArrayList<BarItem>(6)
+        // 多选模式下工具条**整行换成多选动作**：排序 / 筛选在这时候没有
+        // 意义（勾完 8 部再去改排序，选择会被列表重建冲得七零八落 ——
+        // 与 PC 端「多选是一个模式，换掉页头」同一个取舍）。留在屏幕上
+        // 用户会去点，然后发现勾选莫名其妙变了。
+        if (selecting) {
+            items.add(
+                BarItem("☑ 全选可见", false, "OK 勾选当前列表里全部 ${works.size} 部") {
+                    selectAllVisible()
+                },
+            )
+            items.add(
+                BarItem("☐ 取消选择", selectedKeys.isNotEmpty(), "OK 清掉已勾选的") {
+                    selectedKeys.clear()
+                    refreshSelectionUi()
+                },
+            )
+            items.add(
+                BarItem(
+                    if (selectedKeys.isEmpty()) "🗑 移除" else "🗑 移除 ${selectedKeys.size} 部",
+                    selectedKeys.isNotEmpty(),
+                    if (selectedKeys.isEmpty()) {
+                        "先勾选要移除的作品（没有勾选时移除不可用）"
+                    } else {
+                        "OK 从媒体库移除这 ${selectedKeys.size} 部（网盘文件不动，可重新扫描找回）"
+                    },
+                ) { confirmRemoveSelected() },
+            )
+            items.add(BarItem("✕ 退出多选", false, "OK 退出批量移除") { exitSelection() })
+            barItems = items
+            barIndex = barIndex.coerceIn(0, items.size - 1)
+            return
+        }
         items.add(
             BarItem("⇅ 排序：${sort.label}", false, "OK 打开排序菜单") { openSortMenu() },
         )
@@ -2201,7 +2308,13 @@ class LibraryActivity : Activity() {
      *    （异步读库），后者直接起播（已经在详情页里，选的就是那一条）。
      */
     private fun onWorkRow(position: Int) {
-        works.getOrNull(position)?.let { openWork(it) }
+        val w = works.getOrNull(position) ?: return
+        // 多选模式下点卡片 = 勾选 / 取消（⛔ 不是进简介页）。
+        if (selecting) {
+            toggleSelected(w.key)
+            return
+        }
+        openWork(w)
     }
 
     private fun playWork(w: Work) {
@@ -2267,8 +2380,18 @@ class LibraryActivity : Activity() {
             Intent(this, PlayerActivity::class.java)
                 .putExtra(PlayerActivity.EXTRA_FID, item.fileId)
                 .putExtra(PlayerActivity.EXTRA_NAME, item.name)
-                .putExtra(PlayerActivity.EXTRA_HEADERS, store.requestCookie())
+                // ⛔ Cookie 按**这一条自己的厂家**取，不是按当前激活网盘：
+                //    库里可能同时有夸克与百度的条目（两家都登录过、都扫过），
+                //    用错那一份的表现是「列表能刷、一点就取链失败」。
+                .putExtra(PlayerActivity.EXTRA_HEADERS, store.requestCookie(item.provider))
                 .putExtra(PlayerActivity.EXTRA_PDIR, item.dirId)
+                // ⛔ 厂家 + 两条路径（百度要用）：百度取链的兜底路由全按**路径**，
+                //    而它没有「fid → 路径」的反查接口。这里从库里已有的
+                //    `dirPath` + 文件名直接算出来，播放页就不必再打一次 xpan
+                //    （那正是 `-6` 风控最常见的来源）。
+                .putExtra(PlayerActivity.EXTRA_PROVIDER, item.provider)
+                .putExtra(PlayerActivity.EXTRA_PATH, fullPathOf(item.dirPath, item.name))
+                .putExtra(PlayerActivity.EXTRA_PDIR_PATH, dirPathOf(item.dirPath))
                 // ⛔ 「选集」的唯一入口：播放页靠它查出同一作品下的其它文件。
                 //    没有它 → 播放中换不了集（网盘没有「查兄弟文件」的接口，
                 //    靠文件名猜同作品必错）。详见 `PlayerActivity.EXTRA_GROUP_KEY`。
@@ -2788,7 +2911,32 @@ class LibraryActivity : Activity() {
             //    目录（通常 1~5 个，秒级），与下面那个要跑几分钟的全盘扫描
             //    放在一起，用户一眼能看出该先试哪个。
             actions.add("⟳ 检查追剧更新（只查在追的剧）" to { checkFollow(force = true) })
-            actions.add("重新扫描媒体库（网盘）" to { doScan() })
+            // ⛔ 切换网盘放在「扫描」**前面**：它决定下面那条扫描扫谁。
+            //    两家都登录时才有「切换」；另一家没登录时是「登录」入口。
+            val other = if (provider == DriveProviders.BAIDU) {
+                DriveProviders.QUARK
+            } else {
+                DriveProviders.BAIDU
+            }
+            if (store.loggedIn(other)) {
+                actions.add(
+                    "当前网盘：${DriveProviders.displayName(provider)}（切换到" +
+                        "${DriveProviders.shortName(other)}）" to { switchProvider(other) },
+                )
+            } else {
+                actions.add(
+                    "登录${DriveProviders.displayName(other)}（当前：${DriveProviders.shortName(provider)}）" to {
+                        switchProvider(other)
+                    },
+                )
+            }
+            actions.add("重新扫描媒体库（${DriveProviders.shortName(provider)}）" to { doScan() })
+            // ⚠️ 「批量移除」删的是**本地索引**（网盘文件不动、可重新扫描
+            //    找回），与右边的「清空媒体库索引…」同类；删网盘文件那条路
+            //    电视端刻意没有（见 `LibraryDb.deleteWorks` 的文档）。
+            // ⛔ 排在「清空」**前面**：它比清空轻得多（可勾选、可取消），
+            //    是更常用的那一个。
+            actions.add("批量移除（从媒体库）…" to { enterSelection() })
             actions.add("清空媒体库索引…" to { confirmWipe() })
             actions.add("同步（本地 ↔ 网盘）" to { doSync() })
             actions.add("上传备份到网盘" to { doUpload() })
@@ -2939,8 +3087,12 @@ class LibraryActivity : Activity() {
 
     /** 三个备份动作共用的前置检查：**只有它们**需要登录态。 */
     private fun requireLogin(): Boolean {
-        if (store.loggedIn) return true
-        status.text = "需要先登录网盘（返回 → 菜单 → 重新登录）"
+        // ⛔ 判的是**夸克**：备份 / 恢复 / 进度同步那套 `.ccbak` 只走夸克
+        //    （电视端对百度只读，见 `BaiduApi` 的类文档）。用 `anyLoggedIn`
+        //    会让只登录了百度的用户点「备份」时一路走到上传，最后报一个
+        //    看不懂的错。
+        if (store.loggedIn(DriveProviders.QUARK)) return true
+        status.text = "需要先登录夸克网盘（备份走夸克）"
         return false
     }
 
@@ -2949,7 +3101,12 @@ class LibraryActivity : Activity() {
             status.text = "正在${busyWhat}，请稍候…"
             return false
         }
-        if (!requireLogin()) return false
+        // ⛔ 这里判的是**当前激活网盘**（扫描 / 发现 / 追更都走它），
+        //    不是夸克。备份那三个动作在各自入口里另调 [requireLogin]。
+        if (!store.loggedIn(provider)) {
+            status.text = "${DriveProviders.displayName(provider)} 未登录（菜单 → 登录）"
+            return false
+        }
         busy = true
         busyWhat = what
         status.text = "$what…"
@@ -2965,6 +3122,38 @@ class LibraryActivity : Activity() {
     // ------------------------------------------------------------------
     // 扫描 / 清空
     // ------------------------------------------------------------------
+
+    /**
+     * 切换「当前操作的网盘」。
+     *
+     * ⛔ 换的不只是一个字段：`scanner` 与 `followUpdater` 都**持有**建好时的那个
+     *    客户端与厂家 —— 只改 `provider` 而不重建它们，下一次扫描仍会把结果
+     *    写成上一家的主键（`provider:fileId`），症状是「切到百度扫了一遍，
+     *    媒体库里一条都没多，反而夸克的条目被改成了百度的」。
+     * ⛔ **不**换 `service`（备份）与 `cloudCovers`：前者只走夸克（电视端对百度
+     *    只读），后者按 URL 归属自己选厂家。
+     */
+    private fun switchProvider(next: String) {
+        if (next == provider) return
+        if (!store.loggedIn(next)) {
+            Log.i(TAG, "媒体库：$next 未登录，去登录页")
+            startActivity(
+                Intent(this, LoginActivity::class.java)
+                    .putExtra(LoginActivity.EXTRA_PROVIDER, next),
+            )
+            return
+        }
+        Log.i(TAG, "媒体库切换网盘：$provider → $next")
+        provider = next
+        store.activeProvider = next
+        api = clientOf(next)
+        scanner = LibraryScanner(api = api, db = db, provider = provider)
+        followUpdater = FollowUpdater(db = db, scanner = scanner)
+        // ⛔ 已入库的条目**不删**：另一家扫出来的东西仍然有效（播放时按
+        //    条目自己的 `provider` 取链）。这里只是提示用户去扫新的那家。
+        status.text = "已切换到 ${DriveProviders.displayName(next)}；" +
+            "点「重新扫描媒体库」把它扫进来"
+    }
 
     /**
      * 重新扫描媒体库（全盘遍历网盘 → 解析 → 归组 → 入库）。
@@ -3026,7 +3215,10 @@ class LibraryActivity : Activity() {
             // ⛔ 扫完**接着**刮 —— 用户的原话是「扫描完毕后需要自动启动刮削」。
             //    排在 `loadWorks` **之后**：先把新扫到的作品画出来再开始刮，
             //    否则用户是对着一面空墙等刮削。
-            startAutoScrape()
+            // ⛔ 但**扫描失败时不刮**：`startAutoScrape` 会立刻把状态行改成
+            //    「没有需要刮削的作品」，把「登录已失效，请重新登录」盖掉 ——
+            //    那是用户此刻唯一需要看见的一句话（2026-10-17 模拟器实测）。
+            if (out?.error == null) startAutoScrape()
         }
     }
 
@@ -3198,7 +3390,122 @@ class LibraryActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------------
+    // 批量移除（作品墙的多选模式）
+    // ------------------------------------------------------------------
+
+    /**
+     * 进入多选模式（MENU → 「批量移除」）。
+     *
+     * ⛔ 焦点必须**回海报墙**：菜单是一个覆盖层，关掉之后焦点归
+     *    [restoreFocus]，进多选时用户下一步要做的就是去勾卡片。
+     * ⛔ 清空上一次的选择再进：多选表达的是「我屏幕上这几个」，留着上次的
+     *    会让用户一进来就看见「已选 5 部」而列表里一个勾都没有。
+     */
+    private fun enterSelection() {
+        selecting = true
+        selectedKeys.clear()
+        worksGrid.requestFocus()
+        refreshSelectionUi()
+        Log.i(TAG, "批量移除：进入多选（${works.size} 部可见）")
+    }
+
+    /** 退出多选并清空选择。三个出口：返回键、工具条、移除成功后。 */
+    private fun exitSelection() {
+        selecting = false
+        selectedKeys.clear()
+        refreshSelectionUi()
+    }
+
+    /** 勾选 / 取消勾选一部作品（多选模式下 OK 点卡片走这里）。 */
+    private fun toggleSelected(key: String) {
+        if (!selectedKeys.add(key)) selectedKeys.remove(key)
+        refreshSelectionUi()
+    }
+
+    /** 「全选」选的是**当前列表里可见的**，不是全库 —— 与 PC 端同口径。 */
+    private fun selectAllVisible() {
+        selectedKeys.addAll(works.map { it.key })
+        refreshSelectionUi()
+    }
+
+    /**
+     * 多选态变化之后的统一重画：卡片勾选、状态行、提示行、状态文案。
+     *
+     * ⛔ 四处必须一起刷：只刷卡片的话，工具条上还写着上一次的「已选 N」；
+     *    只刷工具条的话，刚勾的那张卡没有勾。
+     */
+    private fun refreshSelectionUi() {
+        worksAdapter.notifyDataSetChanged()
+        paintBar()
+        hintBar.text =
+            if (selecting) {
+                "多选移除：OK 勾选 / 取消 · ↑ 到工具条（全选 / 移除）· 返回 退出多选"
+            } else {
+                "↑↓←→ 选择 · OK 进简介页 · ↑ 到状态行（排序 / 筛选）· 菜单 更多"
+            }
+        if (selecting) {
+            status.text =
+                if (selectedKeys.isEmpty()) {
+                    "多选移除：勾选要移除的作品（共 ${works.size} 部可见）"
+                } else {
+                    "多选移除：已选 ${selectedKeys.size} 部"
+                }
+            title.text = "媒体库 · 批量移除"
+        } else {
+            title.text = "媒体库"
+        }
+    }
+
+    /** 工具条上的「移除 N 部」⇒ 先过确认（这条入口不可逆，差一道确认）。 */
+    private fun confirmRemoveSelected() {
+        if (selectedKeys.isEmpty()) return
+        val n = selectedKeys.size
+        showOverlay(
+            titleText = "要从媒体库移除这 $n 部吗？\n" +
+                "只移除这台电视上的索引：作品、集数、播放进度都会没。\n" +
+                "网盘上的文件不受影响，之后「重新扫描」就能找回来。",
+            labels = listOf("取消", "确认移除 $n 部"),
+        ) { index ->
+            hideOverlay()
+            if (index == 1) doRemoveSelected()
+        }
+    }
+
+    /**
+     * 执行移除。
+     *
+     * ⛔ **不需要登录**：这是纯本地动作（与 [doWipe] 同一取舍），只借
+     *    `busy` 防重入。删的是这台设备上的索引，不碰网盘。
+     * ⛔ 成功之后**先退出多选再重列**：留在模式里的话，列表里那几部已经
+     *    没了，而工具条还写着「已选 N 部」—— 一个指向不存在的东西的计数。
+     * ⛔ 结果提示里带上**文件行数**：那是「这批量到底有多大」的唯一诚实的
+     *    回答（`deleteWorks` 的返回值）。
+     */
+    private fun doRemoveSelected() {
+        if (busy) {
+            status.text = "正在${busyWhat}，请稍候…"
+            return
+        }
+        val keys = ArrayList(selectedKeys)
+        busy = true
+        busyWhat = "移除作品"
+        status.text = "正在移除 $keys.size 部…"
+        Bg.run({ db.deleteWorks(keys) }) { removed, err ->
+            if (err != null) {
+                Log.e(TAG, "批量移除失败", err)
+                finishJob("移除失败：${err.message}")
+                return@run
+            }
+            Log.i(TAG, "批量移除：${keys.size} 部 / ${removed ?: 0} 个文件")
+            exitSelection()
+            loadWorks("已移除 ${keys.size} 部（${removed ?: 0} 个文件），网盘文件未动")
+        }
+    }
+
     private fun doSync() {
+        // ⛔ 备份链路只走夸克 ⇒ 先判夸克登录，再进通用闸门。
+        if (!requireLogin()) return
         if (!guard("同步")) return
         Bg.run({
             service.sync(onProgress = { sent, total ->
@@ -3221,6 +3528,7 @@ class LibraryActivity : Activity() {
     }
 
     private fun doUpload() {
+        if (!requireLogin()) return
         if (!guard("打包并上传")) return
         Bg.run({
             val bytes = service.exportBackup(includePosters = true, includeSettings = true)
@@ -3238,6 +3546,7 @@ class LibraryActivity : Activity() {
     }
 
     private fun doRestore() {
+        if (!requireLogin()) return
         if (!guard("从网盘恢复")) return
         Bg.run({ service.restoreLatest() }) { latest, err ->
             if (err != null) {
@@ -3288,8 +3597,8 @@ class LibraryActivity : Activity() {
         if (StartupSync.probedThisLaunch) return
         StartupSync.markProbed()
 
-        if (!store.loggedIn) {
-            Log.i(TAG, "启动探测：未登录，跳过")
+        if (!store.loggedIn(DriveProviders.QUARK)) {
+            Log.i(TAG, "启动探测：夸克未登录，跳过（备份只走夸克）")
             return
         }
         Bg.run({ service.probeRemote() }) { probe, err ->
@@ -3379,8 +3688,8 @@ class LibraryActivity : Activity() {
      *    那次同步被吞掉 —— 而那次恰恰是最该同步的。
      */
     private fun syncProgressSilently(why: String) {
-        if (!store.loggedIn) {
-            Log.i(TAG, "[进度] $why：未登录，跳过")
+        if (!store.loggedIn(DriveProviders.QUARK)) {
+            Log.i(TAG, "[进度] $why：夸克未登录，跳过（进度文件只在夸克）")
             return
         }
         Bg.run({ progressSync.syncSilently() }) { out, err ->
@@ -3436,8 +3745,8 @@ class LibraryActivity : Activity() {
      *    「刚点完别的」上，等于随机失效。
      */
     private fun maybeAutoCheckFollow() {
-        if (!store.loggedIn) {
-            Log.i(TAG, "追剧：未登录，跳过")
+        if (!store.loggedIn(provider)) {
+            Log.i(TAG, "追剧：$provider 未登录，跳过")
             return
         }
         if (scanCancel != null || scrapeCancel != null || filterVisible || overlayVisible) {
@@ -3919,6 +4228,14 @@ class LibraryActivity : Activity() {
                 "分类=${category ?: "全部"} 最近播放=$playedOnly 追剧=$followedOnly " +
                 "只看有海报=$posterOnly 筛选=$selectedFilterCount",
         )
+        // ⓿ 多选模式 → 退出多选（返回键的语义是「退一步」）。
+        //    ⛔ 排在 ① 前面：多选只存在于作品墙，而「退出多选」比「回导航
+        //    栏」更接近用户此刻的意图。没有这一条的话，用户按返回会一路
+        //    退到导航栏，再按一次弹退出确认 —— 而他想的只是「不选了」。
+        if (selecting) {
+            exitSelection()
+            return
+        }
         // ① 作品简介页 → 作品墙（光标还原到进来时那张卡）
         if (level == Level.ITEMS) {
             backToWorks()
@@ -4060,6 +4377,8 @@ class LibraryActivity : Activity() {
             //    中间会让上面那行 `getChildAt(2)` 拿到更新角标，评分就画到它上面
             //    —— 而且不报错（红线 9）。
             val updateBadge = posterBox.getChildAt(3) as TextView
+            // 多选勾选角标是**第 5 个子控件（下标 4）**，同样加在末尾。
+            val tick = posterBox.getChildAt(4) as TextView
             val titleView = card.getChildAt(1) as TextView
             val metaView = card.getChildAt(2) as TextView
 
@@ -4120,6 +4439,11 @@ class LibraryActivity : Activity() {
                 updateBadge.visibility = View.GONE
             }
 
+            // 勾选角标：多选模式下按 [selectedKeys] 显隐。
+            // ⛔ 必须在**每一帧**重设（`convertView` 复用时旧值会留在视图上）。
+            tick.visibility =
+                if (selecting && selectedKeys.contains(w.key)) View.VISIBLE else View.GONE
+
             // ⛔ 不画续播进度条：用户明确说卡片上画进度条不好看，信息要精简
             //    （只留 名称 / 类型 / 年份）。进度只在剧集列表行里表达。
 
@@ -4138,10 +4462,14 @@ class LibraryActivity : Activity() {
             //    有卡片都变暗」，这次所有卡都是亮的。
             val gridFocused = worksGrid.isFocused
             val selected = gridFocused && worksGrid.selectedItemPosition == position
-            image.alpha = 1f
-            placeholder.alpha = 1f
+            // 勾选中的海报轻微变暗：与焦点的「放大 + 描边」是两个维度，
+            // 叠加不会混（焦点环依然是唯一「最亮」的线索）。
+            val dimmed = selecting && selectedKeys.contains(w.key)
+            image.alpha = if (dimmed) 0.82f else 1f
+            placeholder.alpha = if (dimmed) 0.82f else 1f
             badge.alpha = 1f
             updateBadge.alpha = 1f
+            tick.alpha = 1f
             val s = if (selected) 1.1f else 1f
             // ⛔ 卡片整体放大（`scaleX/Y`）；圆角靠 `RoundedPosterDrawable`（drawable
             //    层），不靠 `clipToOutline` —— 后者在缩放态下裁切会失效。
@@ -4476,6 +4804,33 @@ class LibraryActivity : Activity() {
                 leftMargin = dp(6)
             },
         )
+        // 多选勾选角标（「✓」）。⛔ **必须加在最后**：`posterBox` 的子控件
+        // 全是按下标取的（见 [WorksAdapter.getView] 的红线 9），插在中间会
+        // 把评分 / 更新角标顶到别的位置上，而且不报错。
+        //
+        // 四个角的占用：左下 = 评分，左上 = 更新，**右上（END）= 勾选**，
+        // 右下空。选右上与左上（更新）分居两侧，两个实心小方块不会在同一
+        // 只眼睛里打架。
+        posterBox.addView(
+            TextView(this).apply {
+                text = "✓"
+                gravity = Gravity.CENTER
+                setTextColor(0xFF1A1533.toInt())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, BADGE_TEXT_SP)
+                setTypeface(typeface, Typeface.BOLD)
+                background = GradientDrawable().apply {
+                    // ⛔ 圆角给到半宽 = 圆形：勾选角标要像一个「章」，
+                    //    小圆角矩形在沙发距离下像一颗普通标签。
+                    cornerRadius = dp(10).toFloat()
+                    setColor(BRAND_TINT)
+                }
+            },
+            FrameLayout.LayoutParams(dp(20), dp(20)).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = dp(6)
+                rightMargin = dp(6)
+            },
+        )
         card.addView(posterBox)
 
         // ⛔ 不要播放进度条：用户明确说「卡片上画进度条不好看」，且信息要
@@ -4617,7 +4972,11 @@ class LibraryActivity : Activity() {
                     val store = episodeThumbs
                     if (store != null) {
                         val self = this
-                        Bg.run({ store.load(url, api, dp(EP_COVER_W_DP)) }) { _, _ ->
+                        // ⛔ 按**地址归属**选客户端：简介页的剧集可能来自两家网盘
+                        //    （同一个作品被两家各扫到一次），拿错 Cookie 就是 401，
+                        //    那块封面永远空着，而日志里只有一行「拿不到」。
+                        val client = clientOf(providerOfUrl(url))
+                        Bg.run({ store.load(url, client, dp(EP_COVER_W_DP)) }) { _, _ ->
                             // ⛔ **失败也要重画**：`load` 已经把地址记进「拿不到」，
                             //    不重画的话每次 `getView` 都会再排一次下载
                             //    （表现是「滚一格卡一下」）。

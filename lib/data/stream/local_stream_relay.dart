@@ -920,14 +920,18 @@ class _RelaySession {
 
   /// 预取窗口整个换了地方（真 seek，不是顺读）。
   ///
-  /// 三件事必须一起做，否则「换了位置」只是把锚点写对、缓存和队列还在拖后腿：
+  /// 两件事必须一起做，否则「换了位置」只是把锚点写对、队列还在拖后腿：
   ///
   /// 1. **旧位置的排队降级**（不是丢弃）：留在主队列里它们会和正在播的那条流
   ///    一比一抢 worker。丢弃则会让那些 `_ensure` 永远不返回，读取器就那么吊着。
-  /// 2. **清掉缓存**：旧位置的块一行都用不上了，留着只会占满 LRU，把新位置的
-  ///    预取窗口挤成「下了就淘汰、淘汰了再下」。
-  /// 3. **把新窗口里的等待提升回主队列**：跳转后的第一块往往在降级之前就已经
+  /// 2. **把新窗口里的等待提升回主队列**：跳转后的第一块往往在降级之前就已经
   ///    排过队了，不提升的话播放器要等一个「低优先」才拿到起播那块。
+  ///
+  /// ⚠️ **绝不** `cache.clear()`。旧位置的块虽然不再预取，但 mpv 在
+  ///    `demuxer-cache-time` 标出的「已缓冲」区间内随时可能回读它们；清掉整张
+  ///    缓存会让「在缓冲条范围内拖进度条」也变成整段重缓冲。LRU 会自然把用不上的
+  ///    旧块淘汰（上限由 [maxCacheBytes] 卡住），不必手动整清 —— 那样只会把回看
+  ///    命中率打没，正是「拖拽后缓冲全没了 + 重新缓冲」的直接根因。
   void _onAnchorJumped(int index) {
     while (_priority.isNotEmpty) {
       final queued = _priority.removeFirst();
@@ -936,7 +940,6 @@ class _RelaySession {
       _stale.addLast(queued);
       _queuedStale.add(queued);
     }
-    cache.clear();
 
     final windowEnd = math.min(layout.chunkCount, index + prefetchChunks);
     final keep = Queue<int>();
@@ -958,7 +961,7 @@ class _RelaySession {
       '中继',
       '播放位置跳到块 $index'
       '（约 ${(index * layout.chunkSize / 1048576).round()} MiB）：'
-      '预取窗口改锚，旧位置的排队已降级、缓存已清空',
+      '预取窗口改锚，旧位置的排队已降级（缓存保留，交给 LRU 自然淘汰）',
     );
   }
 

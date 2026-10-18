@@ -9,6 +9,7 @@ import '../../core/utils/media_category.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_work.dart';
 import '../../domain/services/follow_service.dart';
+import '../../domain/services/library_batch_delete.dart';
 import '../../domain/services/work_merge_service.dart';
 import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
@@ -21,6 +22,8 @@ import '../providers/settings_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/batch_merge_dialog.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/empty_work_dialog.dart';
+import '../widgets/library_batch_delete_dialog.dart';
 import '../widgets/library_filter_panel.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
@@ -66,12 +69,15 @@ Future<void> playWork({
     );
     if (!context.mounted) return;
     if (item == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          behavior: SnackBarBehavior.floating,
-          content: Text('这部作品下没有可播放的文件'),
-        ),
-      );
+      // 走到这里只有一种原因：这部作品名下**一条文件记录都没有**
+      // （`resolvePlayTarget` 仅在 `itemsForWork` 为空时返回 null）。
+      //
+      // 2026-10-17 现场（《仙逆剧场版：弑仙之战》）：原先这里无条件提示
+      // 「这部作品下没有可播放的文件」，而真实情况是那两个电影文件被
+      // 「目录锚点」归到了上一层目录的剧集《仙逆》名下 —— 文件都在，
+      // 这条作品行却成了空壳。用户照那句话理解成「文件没了」，于是去找
+      // 「从媒体库删除」的入口，而这个分支上从来没有那个入口。
+      await removeEmptyWork(context, ref, work);
       return;
     }
     diag.info('媒体库', '列表直开：${work.title} → ${item.displayTitle}');
@@ -417,7 +423,7 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     final selectButton = TvIconLabel(
       label: '选择',
       child: IconButton(
-        tooltip: '多选（批量合并）',
+        tooltip: '多选（批量合并 / 移除）',
         onPressed: selectAction,
         icon: const Icon(Icons.checklist_rounded, size: 17),
       ),
@@ -2045,6 +2051,31 @@ class _SelectionHeader extends ConsumerWidget {
               style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
             ),
           ),
+          const SizedBox(width: 8),
+          // ⚠️ 移除按钮是**危险色**、且紧跟合并：合并是「整理库」，移除是
+          //    「从库里拿走」。两个按钮并排放时用户必须一眼分得清哪个不可反悔。
+          OutlinedButton.icon(
+            onPressed: selection.isEmpty
+                ? null
+                : () => _removeSelected(context, ref),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppTheme.danger,
+              side: BorderSide(
+                color: selection.isEmpty
+                    ? AppTheme.line
+                    : AppTheme.danger.withValues(alpha: 0.5),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            icon: const Icon(Icons.playlist_remove_rounded, size: 15),
+            label: const Text(
+              '移除',
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+            ),
+          ),
         ],
       ),
     );
@@ -2093,6 +2124,45 @@ class _SelectionHeader extends ConsumerWidget {
             );
           },
         ),
+      ),
+    );
+  }
+
+  /// 把勾选的这批量作品从**媒体库索引**里移除（网盘文件不动）。
+  ///
+  /// 与 [_mergeSelected] 一样，作品对象**重新从库里读**：用户勾完之后列表
+  /// 可能被后台扫描重建过，手上那份可能是旧的 —— 拿旧行算「N 部」，
+  /// 提示里的数字会和实际删掉的对不上。
+  ///
+  /// ⚠️ 这里删的是**本地索引**（重新扫描可找回），不是网盘文件。删网盘
+  ///    文件那条路在侧栏「文件夹」页；文案上的区别见
+  ///    [LibraryBatchDeletePlan.keepFilesWarning]。
+  Future<void> _removeSelected(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final repo = ref.read(mediaRepositoryProvider);
+    final keys = ref.read(librarySelectionProvider).keys;
+
+    final all = await repo.allWorks();
+    final byKey = {for (final w in all) w.key: w};
+    final works = [for (final k in keys) if (byKey[k] != null) byKey[k]!];
+    if (works.isEmpty) return;
+    if (!context.mounted) return;
+
+    final plan = LibraryBatchDeletePlan(works: works);
+    final confirmed = await LibraryBatchDeleteDialog.show(context, plan);
+    if (confirmed != true) return;
+
+    final removedItems =
+        await ref.read(missingMediaControllerProvider).removeWorks(keys);
+    // 移除完立刻退出多选：列表里那几部已经不见了，而顶栏还写着
+    // 「已选 N 部」—— 一个指向不存在的东西的计数。
+    ref.read(librarySelectionProvider.notifier).exit();
+    onRefresh();
+
+    messenger.showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(plan.doneMessage(removedItems: removedItems)),
       ),
     );
   }

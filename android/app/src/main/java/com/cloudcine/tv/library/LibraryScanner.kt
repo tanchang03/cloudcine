@@ -1,8 +1,10 @@
 package com.cloudcine.tv.library
 
 import android.util.Log
+import com.cloudcine.tv.pan.DriveClient
 import com.cloudcine.tv.pan.DriveEntry
-import com.cloudcine.tv.pan.PanApi
+import com.cloudcine.tv.pan.DriveException
+import com.cloudcine.tv.pan.DriveProviders
 
 /**
  * 全盘扫描器：**遍历网盘 → 解析文件名 → 归组 → 入库**。
@@ -35,9 +37,9 @@ import com.cloudcine.tv.pan.PanApi
  * [LibraryDb.insertMissingWorks] 里的说明。
  */
 class LibraryScanner(
-    private val api: PanApi,
+    private val api: DriveClient,
     private val db: LibraryDb,
-    private val provider: String = PROVIDER,
+    private val provider: String = DriveProviders.QUARK,
 ) {
 
     /**
@@ -109,6 +111,8 @@ class LibraryScanner(
         val failedDirs: Int,
         val cancelled: Boolean,
         val error: String?,
+        /** 中止原因是**凭证失效**（不是超时 / 限流）。见 [Discovery.reauth]。 */
+        val reauth: Boolean = false,
     ) {
         /** 给状态行用的一句话。 */
         val message: String
@@ -161,7 +165,9 @@ class LibraryScanner(
         val seen = HashSet<String>(8192)
         val buf = ArrayList<ScanItem>(FLUSH_AT)
         val queue = ArrayDeque<Dir>()
-        queue.add(Dir(PanApi.ROOT, ROOT_PATH))
+        // ⛔ 根标识**按厂家取**（夸克 `"0"` / 百度 `"/"`）—— 写死任一个都会
+        //    让另一家的第一次列目录落在一个不存在的目录上。
+        queue.add(Dir(api.rootId, ROOT_PATH))
 
         var dirs = 0
         var files = 0
@@ -170,6 +176,7 @@ class LibraryScanner(
         var inserted = 0
         var updated = 0
         var error: String? = null
+        var reauth = false
         var cancelled = false
         var lastReport = 0L
 
@@ -278,11 +285,27 @@ class LibraryScanner(
                 val dir = queue.removeFirst()
                 val entries = try {
                     listAll(dir.fid)
-                } catch (e: Throwable) {
+                } catch (e: DriveException) {
+                    // ⛔⛔ 凭证失效**必须中止**，不能当成「这个目录跳过」。
+                    //    当成跳过的话，根目录第一次列就失败、队列随之清空 ⇒
+                    //    扫描「正常完成」，状态行报「媒体 0 · 跳过 1 个目录」，
+                    //    用户对着空墙以为网盘上没有片子（2026-10-17 模拟器实测）。
+                    if (e.needsReauth) {
+                        error = "登录已失效，请重新登录（${e.message}）"
+                        reauth = true
+                        Log.e(TAG, "扫描中止：${e.message}")
+                        break
+                    }
                     failedDirs++
                     Log.w(TAG, "列目录失败，跳过：${dir.path}（${e.message}）")
                     // 失败往往是限流 / 超时，连续失败时退一步再继续，
                     // 别把剩下的几百个目录也一起撞死。
+                    sleepQuietly(FAIL_BACKOFF_MS)
+                    report("遍历", dir.path)
+                    continue
+                } catch (e: Throwable) {
+                    failedDirs++
+                    Log.w(TAG, "列目录失败，跳过：${dir.path}（${e.message}）")
                     sleepQuietly(FAIL_BACKOFF_MS)
                     report("遍历", dir.path)
                     continue
@@ -365,6 +388,7 @@ class LibraryScanner(
             failedDirs = failedDirs,
             cancelled = cancelled,
             error = error,
+            reauth = reauth,
         )
     }
 
@@ -401,6 +425,14 @@ class LibraryScanner(
         val failedDirs: Int,
         val cancelled: Boolean,
         val error: String?,
+        /**
+         * 中止原因是**凭证失效**（不是超时 / 限流）。
+         *
+         * ⛔ 上层据此决定「要不要继续发请求」：凭证废了的时候，剩下的每个目录
+         *    都只会换来一次 `-6`。追更检查就是按这个标记**整次中止**的
+         *    （见 `FollowUpdater.check`），否则 20 个在追目录 = 60 条废请求。
+         */
+        val reauth: Boolean = false,
     ) {
         /** 给状态行用的一句话。 */
         val message: String
@@ -476,6 +508,7 @@ class LibraryScanner(
         var added = 0
         var existing = 0
         var error: String? = null
+        var reauth = false
         var cancelled = false
         var lastReport = 0L
 
@@ -556,6 +589,19 @@ class LibraryScanner(
                 val dir = queue.removeFirst()
                 val entries = try {
                     listAll(dir.fid)
+                } catch (e: DriveException) {
+                    // 与 [scan] 同口径：凭证失效是「整件事做不成」，不是「这个目录跳过」。
+                    if (e.needsReauth) {
+                        error = "登录已失效，请重新登录（${e.message}）"
+                        reauth = true
+                        Log.e(TAG, "发现中止：${e.message}")
+                        break
+                    }
+                    failedDirs++
+                    Log.w(TAG, "发现：列目录失败，跳过：${dir.path}（${e.message}）")
+                    sleepQuietly(FAIL_BACKOFF_MS)
+                    report("发现", dir.path)
+                    continue
                 } catch (e: Throwable) {
                     failedDirs++
                     Log.w(TAG, "发现：列目录失败，跳过：${dir.path}（${e.message}）")
@@ -619,6 +665,7 @@ class LibraryScanner(
             failedDirs = failedDirs,
             cancelled = cancelled,
             error = error,
+            reauth = reauth,
         )
     }
 
@@ -885,7 +932,7 @@ class LibraryScanner(
         private const val TAG = "云影扫描"
 
         /** 与 PC 端 `DriveProvider.quark.id` 必须一致（主键前缀就是它）。 */
-        const val PROVIDER = "quark"
+        const val PROVIDER = DriveProviders.QUARK
 
         private const val ROOT_PATH = "/"
 

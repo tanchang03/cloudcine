@@ -4,7 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
 import android.util.LruCache
-import com.cloudcine.tv.pan.PanApi
+import com.cloudcine.tv.pan.DriveClient
 import java.io.File
 import java.util.Collections
 
@@ -75,7 +75,7 @@ class EpisodeThumbs(
      *
      * @return 拿不到时返回 `null`（并把它记进 [failed]，除非是磁盘/解码出了岔子）。
      */
-    fun load(url: String, api: PanApi, targetPx: Int): Bitmap? {
+    fun load(url: String, api: DriveClient, targetPx: Int): Bitmap? {
         cache.get(url)?.let { return it }
         if (failed.contains(url)) return null
         // 已经有人在下了 —— 直接回 null，让它下完那一趟去通知界面重画。
@@ -87,7 +87,7 @@ class EpisodeThumbs(
         }
     }
 
-    private fun loadLocked(url: String, api: PanApi, targetPx: Int): Bitmap? {
+    private fun loadLocked(url: String, api: DriveClient, targetPx: Int): Bitmap? {
         // ① 磁盘
         val file = fileFor(url)
         if (file.isFile && file.length() > 0) {

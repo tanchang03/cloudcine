@@ -398,8 +398,21 @@ class DriftMediaRepository implements MediaRepository {
     //
     // `incoming.posterUrl == null` 也算「没换」：那种情况下上面保留了旧地址，
     // 缓存文件名自然也该跟着保留（否则两个字段会互相矛盾）。
+    //
+    // ⚠️ **重扫不换封面**：追剧检查 / 文件夹「发现」会周期性重跑发现，
+    //    而封面是「目录下第一条带缩略图的项」派生出来的，受目录列出顺序
+    //    与夸克预览图异步生成影响 —— 同一次重扫挑中的帧可能和上次不同，
+    //    导致 `posterFaceX` 在 null / 非 null 之间反复横跳、比例遮罩时有时无。
+    //    所以：**本次只是文件名解析（`source == local`）且库里已有封面时，
+    //    保留旧封面（地址 + 锚点一起留）**；只在旧封面缺失时才用本次补上
+    //    （夸克后来才生成预览图的情况）。用户主动重刮削（`source == online`）
+    //    或自定义走别的通道，不会进这个分支。
+    final reScanKeepsPoster = !protect &&
+        incoming.source == ScrapeSource.local &&
+        existing.posterUrl != null &&
+        existing.posterUrl!.isNotEmpty;
     final keepPosterFile = protect ||
-        incoming.posterUrl == null ||
+        reScanKeepsPoster ||
         incoming.posterUrl == existing.posterUrl;
     final keepBackdropFile = protect || incoming.backdropUrl == existing.backdropUrl;
 
@@ -427,9 +440,10 @@ class DriftMediaRepository implements MediaRepository {
     // 写 null 会让这张海报从墙上消失 —— 而盘上的缓存文件还在，
     // 只是没人再去引用它。地址本身是稳定的（TMDB 内容寻址；
     // 夸克按 fid 固定），所以「旧的留着」没有任何副作用。
-    final resolvedPosterUrl =
-        _preferOld(protect, existing.posterUrl, incoming.posterUrl) ??
-            existing.posterUrl;
+    final resolvedPosterUrl = reScanKeepsPoster
+        ? existing.posterUrl
+        : (_preferOld(protect, existing.posterUrl, incoming.posterUrl) ??
+            existing.posterUrl);
 
     return MediaWork(
       key: incoming.key,
@@ -500,8 +514,17 @@ class DriftMediaRepository implements MediaRepository {
       // 地址换了就必须取本次的锚点：新图可能是 2:3 的 TMDB 海报，
       // 那种图根本没有锚点，本次算出来就是 null —— 这里的 null 是**结论**，
       // 不是缺失，所以不能回退到旧值（否则会拿剧中帧的人脸位置去裁海报）。
+      // 锚点跟地址走：保留的是哪张图，就沿用那张图的锚点。
+      //   - 旧图（地址没换）→ 用旧锚点；旧库（v5 之前）锚点列为空、且本次仍是
+      //     同一张图时，才用本次解析出的锚点补上。`incoming.posterUrl ==
+      //     existing.posterUrl` 这条闸门确保「补」的一定是**同一张图**的锚点，
+      //     绝不用另一条本地帧的人脸位置去裁旧图（见 `reScanKeepsPoster`）。
+      //   - 新图（地址换了）→ 用新图的锚点。
       posterFaceX: resolvedPosterUrl == existing.posterUrl
-          ? (existing.posterFaceX ?? incoming.posterFaceX)
+          ? (existing.posterFaceX ??
+              (incoming.posterUrl == existing.posterUrl
+                  ? incoming.posterFaceX
+                  : null))
           : incoming.posterFaceX,
       posterFile: keepPosterFile
           ? (existing.posterFile ?? incoming.posterFile)

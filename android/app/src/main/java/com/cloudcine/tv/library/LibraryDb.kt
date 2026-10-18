@@ -2402,6 +2402,95 @@ class LibraryDb(
     }
 
     // ------------------------------------------------------------------
+    // 批量移除（媒体库多选的「移除」）
+    // ------------------------------------------------------------------
+
+    /**
+     * 从索引里移除一整部作品（媒体库多选的「移除」用）。
+     *
+     * ## ⛔ 它删的是**本地索引**，不碰网盘
+     *
+     * 与「清空媒体库索引」（[wipeIndex]）同类：作品行、集数、播放进度会没，
+     * 网盘上的文件原样保留 —— 之后重新扫描就能找回来。删网盘文件那条路在
+     * PC 端的目录视图，**电视端刻意没有**（遥控器上没有「误触撤销」，
+     * 而网盘删除不可逆）。
+     *
+     * 口径与 PC 端 `MediaRepositoryImpl.deleteWork` **逐条一致**：
+     *
+     *   1. **折叠进来的源作品行一起删**：`merged_into` 解析出来的别名行
+     *      与目标行属于同一部（[itemsForWork] 的并集口径）。只删目标自己的
+     *      话，「移除整部剧」会留下一半文件在库里，而**没有任何界面会报错**；
+     *   2. 旁表清 `subtitle_refs`（按 `item_id`）与 `playback_prefs`
+     *      （按 **`group_key`**，不是 item_id：偏好行记着「当时它属于哪部
+     *      作品」，某个 fid 早被重扫换掉时按 id 删会留下孤儿）；
+     *   3. **不动** `settings`（用户凭证）、`scan_cursors`（续扫水位）、
+     *      `download_tasks` 与 `skip_samples`（PC 端同一口径），海报文件
+     *      也不动 —— 重扫之后同名作品的封面会直接回来（见 `PosterNaming`）。
+     *
+     * @return 删掉的**媒体项**行数（提示里「N 部 / M 个文件」的那个 M）。
+     *
+     * ⚠️ 四张表在**同一个事务**里：中途失败会留下半删状态，而界面只会
+     * 显示「移除失败」。
+     */
+    fun deleteWorks(keys: List<String>): Int {
+        if (keys.isEmpty()) return 0
+        val d = require()
+        var removed = 0
+        d.beginTransaction()
+        try {
+            // ① 展开成「目标 + 所有折进来的源作品」。
+            val all = LinkedHashSet(keys)
+            val marks = keys.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT key FROM media_works WHERE merged_into IN ($marks)",
+                keys.toTypedArray(),
+            ).use { c ->
+                while (c.moveToNext()) all.add(c.getString(0))
+            }
+
+            // ② 收集这批量作品名下的全部媒体项 id。
+            val itemIds = ArrayList<String>(256)
+            for (chunk in all.chunked(SQL_CHUNK)) {
+                val m = chunk.joinToString(",") { "?" }
+                d.rawQuery(
+                    "SELECT id FROM media_items WHERE group_key IN ($m)",
+                    chunk.toTypedArray(),
+                ).use { c ->
+                    while (c.moveToNext()) itemIds.add(c.getString(0))
+                }
+            }
+            if (itemIds.isNotEmpty()) {
+                for (chunk in itemIds.chunked(SQL_CHUNK)) {
+                    val m = chunk.joinToString(",") { "?" }
+                    removed += d.delete(
+                        "media_items",
+                        "id IN ($m)",
+                        chunk.toTypedArray(),
+                    )
+                    d.delete("subtitle_refs", "item_id IN ($m)", chunk.toTypedArray())
+                }
+            }
+
+            // ③ 播放偏好按 group_key 删（理由见方法文档第 2 条）。
+            for (chunk in all.chunked(SQL_CHUNK)) {
+                val m = chunk.joinToString(",") { "?" }
+                d.delete("playback_prefs", "group_key IN ($m)", chunk.toTypedArray())
+            }
+
+            // ④ 最后删作品行（含别名行）。
+            for (chunk in all.chunked(SQL_CHUNK)) {
+                val m = chunk.joinToString(",") { "?" }
+                d.delete("media_works", "key IN ($m)", chunk.toTypedArray())
+            }
+
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+        return removed
+    }
+
+    // ------------------------------------------------------------------
     // 清空
     // ------------------------------------------------------------------
 

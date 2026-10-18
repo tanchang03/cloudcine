@@ -224,7 +224,7 @@ void main() {
       expect(before, greaterThan(0), reason: '先确认它真的列过一次');
 
       // 发现 / 扫描写完库会推这个信号。「已入库」标记来自另外两个 provider
-      // （`indexedFileIdsProvider` ← `folderTreeProvider`），它们各自 watch
+      // （`indexedWorkTitlesProvider` ← `folderTreeProvider`），它们各自 watch
       // 这个信号 —— 目录列表**不需要**为它重新请求一次网盘。
       //
       // 做错的表现不是报错，而是：每次「发现本目录」之后，界面都会把整个

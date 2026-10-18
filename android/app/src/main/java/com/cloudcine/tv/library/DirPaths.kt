@@ -29,3 +29,33 @@ internal fun normalizeDirPath(path: String): String {
     if (p.isEmpty() || p == ROOT_PATH) return ROOT_PATH
     return if (p.endsWith("/")) p else "$p/"
 }
+
+/**
+ * 目录路径 → **百度 API 认的形态**（不带尾斜杠，根仍是 `/`）。
+ *
+ * ⛔ 百度的 `dir` 参数与 `dlink` 里的 `path` 都是**不带尾斜杠**的
+ * （`/电影` 而不是 `/电影/`）。带上去不一定报错，但取链兜底那条路由
+ * （`/api/filemetas?target=["/电影/a.mkv"]`）是**逐字匹配**的 ——
+ * 多一个斜杠就匹配不到，响应里没有 `dlink`，表现是「原画取不到、
+ * 只剩转码档」。所以两处都从这里出。
+ *
+ * ⛔ 与 [normalizeDirPath] 是**两个方向**，别互相替代：库里存的是带斜杠的
+ * （`groupKey` 口径），发请求要的是不带斜杠的（百度口径）。
+ */
+internal fun dirPathOf(path: String): String {
+    val p = normalizeDirPath(path).trimEnd('/')
+    return if (p.isEmpty()) ROOT_PATH else p
+}
+
+/**
+ * `dirPath` + `fileName` → 完整路径（`/电影/第一季/a.mkv`）。
+ *
+ * ⛔ 入参 `dirPath` 两种形态都吃（带 / 不带尾斜杠），因为调用方一半来自
+ * 库（带）、一半来自浏览页的目录栈（不带）。拼接本身只有这一份实现，
+ * 免得「多了个双斜杠 `/电影//a.mkv`」这种错落到某一条路径上 —— 它同样
+ * 是逐字匹配，取链会静默失败。
+ */
+internal fun fullPathOf(dirPath: String, fileName: String): String {
+    val dir = dirPathOf(dirPath)
+    return if (dir == ROOT_PATH) "/$fileName" else "$dir/$fileName"
+}

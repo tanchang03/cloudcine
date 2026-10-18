@@ -32,14 +32,19 @@ import org.json.JSONObject
  * 表现是「列表能刷、一播就转圈」。所以本类在每个响应后都回填
  * `Set-Cookie` 里的 `__puus`（[absorbCookies]）。
  */
-class PanApi(private val store: CredStore) {
+class PanApi(private val store: CredStore) : DriveClient {
+
+    override val providerId: String get() = DriveProviders.QUARK
+
+    /** 夸克的根是 `"0"`（与百度的 `"/"` 不同）。 */
+    override val rootId: String get() = ROOT
 
     /** 网盘业务错误。`needsReauth` 时上层应回登录页。 */
     class ApiException(
         val code: Int,
-        override val message: String,
-        val needsReauth: Boolean = false,
-    ) : Exception(message)
+        message: String,
+        needsReauth: Boolean = false,
+    ) : DriveException(message, needsReauth = needsReauth)
 
     // ------------------------------------------------------------------
     // 列目录
@@ -51,7 +56,7 @@ class PanApi(private val store: CredStore) {
      * ⛔ `_size` 别开太大：服务端对每页条数有上限，超了不报错、只是返回条数变少，
      * 表现为「有些文件看不到」。100 是实测稳的值。
      */
-    fun listDirectory(fid: String, page: Int = 1, size: Int = 100): List<DriveEntry> {
+    override fun listDirectory(fid: String, page: Int, size: Int): List<DriveEntry> {
         val res = PanHttp.get(
             url = "$PC$PATH_FILE_SORT",
             query = commonQuery() + mapOf(
@@ -108,8 +113,7 @@ class PanApi(private val store: CredStore) {
      *
      * ⛔ 返回的是**带签名的临时地址**，别缓存、别复用；每次要用现取。
      */
-    fun fileBytesUrl(fid: String): String {
-        val res = PanHttp.get(
+    override fun fileBytesUrl(fid: String): String {        val res = PanHttp.get(
             url = "$PC$PATH_AUDIOPLAY",
             query = commonQuery() + mapOf("fid" to fid),
             cookie = store.requestCookie(),
@@ -129,7 +133,7 @@ class PanApi(private val store: CredStore) {
     }.getOrNull()
 
     /** 最轻量的连通性探测。用来判断「凭证还在不在」。 */
-    fun ping(): Boolean = runCatching {
+    override fun ping(): Boolean = runCatching {
         val res = PanHttp.get("$PC$PATH_CONFIG", commonQuery(), store.requestCookie())
         absorbCookies(res)
         res.isOk
@@ -151,7 +155,9 @@ class PanApi(private val store: CredStore) {
      * 而原画永远排最前，于是默认播了一条**没有视频轨**的流：
      * 有声音、进度条在走、**没有画面、不报任何错**。云影踩过这个坑。
      */
-    fun resolve(fid: String): PlayInfo {
+    override fun resolve(fileId: String, pathHint: String?): PlayInfo {
+        val fid = fileId
+        // ⛔ 夸克不需要路径（`pathHint` 只有百度会用）—— 忽略它是**有意**的。
         val info = fetchPlayInfo(fid)
         val original = fetchOriginal(fid)
 
@@ -652,7 +658,7 @@ class PanApi(private val store: CredStore) {
      *
      * 这个方法**只在后台线程调**（要发网络请求）。
      */
-    fun thumbBytes(url: String, maxBytes: Int = 3 * 1024 * 1024): ByteArray {
+    override fun thumbBytes(url: String, maxBytes: Int): ByteArray {
         val res = PanHttp.getBytesWithCookies(
             url = url,
             cookie = store.requestCookie(),
@@ -662,6 +668,22 @@ class PanApi(private val store: CredStore) {
         )
         absorbSetCookies(res.setCookies)
         return res.bytes
+    }
+
+    /**
+     * 读一个小文件的原始字节（外挂字幕）。
+     *
+     * 两步：`file/audioplay` 现签临时地址 → 带 Cookie 下载。
+     * ⛔ 返回**字节**不是字符串：中文 `.srt` 大量是 GBK，先解成字符串的话
+     * 非法字节已经变成 `�`，编码判定再也做不了。
+     */
+    override fun readFileBytes(fileId: String, maxBytes: Int): ByteArray {
+        val url = fileBytesUrl(fileId)
+        val bytes = PanHttp.getBytes(url, cookie = store.requestCookie(), maxBytes = maxBytes)
+        if (bytes.size > maxBytes) {
+            throw ApiException(-1, "文件实际大小 ${bytes.size} 超过读取上限 $maxBytes")
+        }
+        return bytes
     }
 
     private fun ensureOk(res: PanResponse, what: String) {

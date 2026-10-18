@@ -196,6 +196,18 @@ class BaiduAdapter extends CloudDriveAdapter {
   /// 换账号 / 登出时清空。
   String? _bdstoken;
 
+  /// `xpan/*`（开放平台端点）是否正处于**账号级风控**中。
+  ///
+  /// 【实测】2026-10-17：账号被风控后 `rest/2.0/xpan/multimedia` 恒定
+  /// 返回 `errno 9019 need verify`，而 `/api/*` 全部正常。① 路由与
+  /// [_resolvePath] 都只在 `xpan/*` 上，撞见 9019 之后**同一次会话里
+  /// 再打也是白打**（风控是账号维度的，不会因为多打一次就放行），所以
+  /// 闩起来：后续取链直接跳过 ①，把配额与延迟省给还能用的路由。
+  ///
+  /// 闩是**会话级**的：重新授权 / 恢复会话（换了凭证）时清零 —— 用户
+  /// 去过网页验证后重新扫码，① 应该再给它一次机会。
+  bool _xpanRiskControlled = false;
+
   /// 是否持有会话（不代表仍然有效）。
   bool get hasSession => _cookieHeader.isNotEmpty;
 
@@ -219,6 +231,8 @@ class BaiduAdapter extends CloudDriveAdapter {
 
     _credential = stored;
     _bdstoken = null;
+    // 换了凭证就给 ① 路由一次新机会：风控可能已在网页版被用户解除。
+    _xpanRiskControlled = false;
     diag.info(
       '会话',
       '百度拿到凭证：模式=${stored.mode.name}，'
@@ -261,6 +275,7 @@ class BaiduAdapter extends CloudDriveAdapter {
 
     _credential = credential;
     _bdstoken = null;
+    _xpanRiskControlled = false;
     diag.info(
       '会话',
       '百度提交凭证校验：模式=${credential.mode.name}，'
@@ -291,6 +306,7 @@ class BaiduAdapter extends CloudDriveAdapter {
     _vipType = BaiduVipType.normal;
     // `bdstoken` 是**按会话**签发的，换账号后旧值必然失效。
     _bdstoken = null;
+    _xpanRiskControlled = false;
     _pathByFsId.clear();
     await _store.clear(DriveProvider.baidu);
     diag.info('会话', '百度已退出登录');
@@ -450,6 +466,11 @@ class BaiduAdapter extends CloudDriveAdapter {
   ///
   /// 短路规则：授权失效（`needsReauth`）与文件不存在（`notFound`）
   /// **立即上抛** —— 换接口结果一样，再打只是白费一次取链配额。
+  ///
+  /// 账号风控（[BaiduErrorCode.riskControl]）= `xpan/*` 端点被挡，
+  /// **不影响 `/api/*` 路由**：撞见后闩住 ①（[_xpanRiskControlled]），
+  /// 后续取链直接走 ② ③；三条都失败时把报错换成「去网页版验证」的
+  /// 引导文案，别让兜底消息把真正出路盖掉。
   @override
   Future<StreamTicket> resolveStream(String fileId, {String? qualityId}) async {
     diag.info(
@@ -462,11 +483,24 @@ class BaiduAdapter extends CloudDriveAdapter {
     final failures = <String>[];
 
     // ── ① 原画：fsid 路由（首选，因为它只收我们手里就有的东西）──────────
-    var original = await _attempt(
-      'xpan_filemetas',
-      failures,
-      () => _resolveOriginalViaFsid(fileId),
-    );
+    //
+    // 撞过 9019 风控后**跳过**：风控是账号维度的，重复打不会放行，白费
+    // 一次取链配额加一次网络往返。跳过时 ②（`/api/*`，不收风控影响）
+    // 立即顶上 —— 实测 2026-10-17：同一会话里 ① 恒定 9019 而 ② 全程 200。
+    StreamTicket? original;
+    if (_xpanRiskControlled) {
+      diag.info(
+        '取链',
+        '百度 xpan 端点处于账号风控中（9019），跳过原画 fsid 路由，'
+        '直接走 /api/ 路由',
+      );
+    } else {
+      original = await _attempt(
+        'xpan_filemetas',
+        failures,
+        () => _resolveOriginalViaFsid(fileId),
+      );
+    }
 
     // ── ② 原画兜底：路径路由 ─────────────────────────────────────────
     //
@@ -504,6 +538,16 @@ class BaiduAdapter extends CloudDriveAdapter {
     }
 
     diag.error('取链', '百度全部取链路由失败：${failures.join(" | ")}');
+    // 撞过账号风控时，把「最后一条错误」换成**用户能行动的那条**：
+    // 9019 的出路是去网页版过人机验证，而不是重试。拿兜底文案覆盖它
+    // 会让用户对着一句「响应里没有可用地址」反复点播放。
+    if (_xpanRiskControlled) {
+      throw const DriveException(
+        type: DriveErrorType.permissionDenied,
+        message: '取链失败：百度账号触发安全验证（风控），'
+            '请先到 pan.baidu.com 网页版完成验证后再试',
+      );
+    }
     throw DriveException(
       type: DriveErrorType.unknown,
       message: '取链失败，无法播放该文件。'
@@ -542,6 +586,24 @@ class BaiduAdapter extends CloudDriveAdapter {
       ),
       contentLength: _contentLengthOf(result),
     );
+  }
+
+  /// 把调用方（媒体库记录）给的完整路径垫进路径缓存。
+  ///
+  /// 见 [CloudDriveAdapter.primeFilePath]：解决「重启后从最近播放直点开，
+  /// 路径缓存是空的，而唯一的翻译端点 `xpan/multimedia` 正被账号风控
+  /// （9019）挡着」这条死路。库里持久化的 `dir_path` + `name` 就是权威
+  /// 路径，垫进来之后 ② `/api/filemetas` 与 ③ 转码档立刻可用，一次网络
+  /// 请求都不用多花。
+  ///
+  /// 只接受**绝对路径**（`/` 开头）：夸克那条路也会走到这里（基类默认
+  /// 无操作，只有本类覆盖），而夸克的 `dirId` 是数字 fid，垫进去只会
+  /// 污染缓存。宁可不垫（退回翻译请求），不能垫错。
+  @override
+  void primeFilePath(String fileId, String path) {
+    if (fileId.isEmpty || !path.startsWith('/')) return;
+    _pathByFsId[fileId] = path;
+    diag.debug('取链', '百度路径缓存预热：fs_id=$fileId → $path');
   }
 
   /// ② 原画兜底（路径路由）。
@@ -842,6 +904,11 @@ class BaiduAdapter extends CloudDriveAdapter {
       if (e.needsReauth || e.type == DriveErrorType.notFound) {
         diag.error('取链', '百度 $id 失败且不可降级，直接放弃', error: _describe(e));
         rethrow;
+      }
+      // 账号级风控：① 与 _resolvePath 都只在 xpan/* 上，闩住后本次
+      // 会话不再打它（见 [_xpanRiskControlled]）。
+      if (e.providerCode == BaiduErrorCode.riskControl) {
+        _xpanRiskControlled = true;
       }
       failures.add('$id: ${e.type.name} ${e.message}');
       diag.warn('取链', '百度 $id 失败，其他路由仍可独立工作', error: _describe(e));

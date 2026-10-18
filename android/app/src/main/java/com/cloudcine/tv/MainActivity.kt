@@ -54,10 +54,12 @@ class MainActivity : Activity() {
         ProgressSyncGate.beginLaunch()
 
         val store = CredStore(this)
+        // ⛔ `anyLoggedIn` 而不是 `loggedIn`：后者只问夸克。只登录了百度的用户
+        //    会被直接送进登录页 —— 而他明明已经登录过了。
         startActivity(
             Intent(
                 this,
-                if (store.loggedIn) LibraryActivity::class.java else LoginActivity::class.java,
+                if (store.anyLoggedIn) LibraryActivity::class.java else LoginActivity::class.java,
             ),
         )
         finish()

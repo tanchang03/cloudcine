@@ -724,6 +724,12 @@ class QuarkAdapter implements CloudDriveAdapter {
     return bytes;
   }
 
+  /// 夸克用 `fid` 寻址（目录与取链都直接收 ID），没有「ID→路径」的
+  /// 翻译问题，所以垫路径对它无意义 —— 无操作。见
+  /// [CloudDriveAdapter.primeFilePath]。
+  @override
+  void primeFilePath(String fileId, String path) {}
+
   @override
   Future<void> dispose() async {
     _credential = null;

@@ -8,6 +8,7 @@ import '../../core/utils/file_names.dart';
 import '../../domain/entities/drive_entry.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/services/folder_sort.dart';
+import '../../domain/services/indexed_work_titles.dart';
 import '../../domain/services/media_discovery.dart';
 import '../../domain/services/media_entry_classifier.dart';
 import '../../domain/services/scan_service.dart';
@@ -278,7 +279,7 @@ final driveListingProvider =
     // 当时的注释写「写库之后重列一次：列表本身没变，但『已入库』标记会变」——
     // 后半句是错的：`DriveListing` 里**没有任何字段来自本地库**（子目录、
     // 视频、其他文件全部来自网盘响应）。「已入库」标记来自另外两个
-    // provider —— `_DriveFileRow` 读 `indexedFileIdsProvider`、
+    // provider —— `_DriveFileRow` 读 `indexedWorkTitlesProvider`、
     // `_FolderRow` 读 `folderTreeProvider` —— 而它们各自 watch 那个信号。
     //
     // 所以 watch 它只有一个后果：每次发现/扫描写完库，就把**整个目录重新
@@ -359,13 +360,29 @@ final folderSortModeProvider = Provider<FolderSortMode>(
       FolderSortMode.modifiedTime,
 );
 
-/// **已入库文件**的 id 集合（本地索引的叠加层）。
+/// **已入库文件** → 它在媒体库里属于哪部作品（本地索引的叠加层）。
 ///
-/// 目录视图的数据源是网盘，但「哪些已经在库里」只有本地索引知道。
-/// 分开一个 provider 是为了让「发现」完成后只失效需要失效的东西。
-final indexedFileIdsProvider = FutureProvider<Set<String>>((ref) async {
+/// 目录视图的数据源是网盘，但「哪些已经在库里、在哪一部下面」只有本地
+/// 索引知道。分开一个 provider 是为了让「发现」完成后只失效需要失效的东西。
+///
+/// ## 为什么值不是 `Set<String>`，而是 `id → 作品标题`
+///
+/// 原先只回答「在不在」（集合），于是行上只有一个「已在库」标签。用户
+/// 看到它之后的下一句话是「那我上哪儿找」—— 而 2026-10-17 那类现场里
+/// 答案恰恰不是同名作品：文件被目录锚点归到了上层剧集，海报墙上既没有
+/// 同名卡片、按目录名搜也搜不到。带上标题，行上就能写「已在库 · 仙逆」。
+///
+/// 值是**空串**表示「在索引里、但查不到作品行」—— 那仍然是「在库」，
+/// 理由见 `indexedWorkTitles` 的文档。
+final indexedWorkTitlesProvider =
+    FutureProvider<Map<String, String>>((ref) async {
   final tree = await ref.watch(folderTreeProvider.future);
-  return tree.fileIds;
+  // 作品表与 `media_items` 分两张表，一次全读（200 部量级、几毫秒）。
+  // ⚠️ 必须用 `allWorks()`：`listWorks()` 会滤掉别名行，而归一后的源
+  //    `group_key` 正指向那些别名 —— 用 `listWorks()` 会让一批已归一的
+  //    文件显示成「查不到作品」。
+  final works = await ref.watch(mediaRepositoryProvider).allWorks();
+  return indexedWorkTitles(items: tree.files, works: works);
 });
 
 /// 发现任务的状态快照。

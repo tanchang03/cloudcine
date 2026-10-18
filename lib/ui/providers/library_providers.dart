@@ -492,6 +492,45 @@ class MissingMediaController {
     return removed;
   }
 
+  /// **批量移除整部作品**（媒体库多选的「移除」用）。
+  ///
+  /// ## 为什么不让调用方循环调 [remove]
+  ///
+  /// 与 [removeMany] 同一条理由，只是这里的单位是**作品**：逐条调的话，
+  /// 每删一部都要跑一遍 [_refresh]（7 次 invalidate + 一次写库信号），
+  /// 删 10 部就是 10 遍 —— 而海报墙 / 角标 / 目录叠加层每次都全部重算。
+  ///
+  /// ## 为什么按作品删，而不是先把作品展开成文件再走 [removeMany]
+  ///
+  /// `deleteWork` 的口径是「**这部 + 所有折进来的源作品**」（与
+  /// `itemsForWork` 的并集一致）。展开成文件的话，调用方得自己把
+  /// `merged_into` 那层关系反算一遍 —— 而那正是仓储层已经处理好的事。
+  /// 少折一部，「移除整部剧」就会在库里留下一半文件，且没有任何界面
+  /// 会报错。
+  ///
+  /// 返回真正删掉的文件行数（用于结果提示：「N 部作品 / M 个文件」）。
+  Future<int> removeWorks(Iterable<String> keys) async {
+    final repo = _ref.read(mediaRepositoryProvider);
+    final keyList = keys.toSet();
+    // 空壳作品（名下一条文件都没有）也要能移除，而 [MediaRepository.deleteWork]
+    // 返回的是**文件行**数 —— 空壳时恒为 0。只凭这个返回值判断「要不要刷新」
+    // 的话，用户点完「移除」列表纹丝不动，那张卡片还挂在原位，他会以为按钮
+    // 坏了。2026-10-17 现场就是这个形状：《仙逆剧场版：弑仙之战》的文件被
+    // 目录锚点归到了上一层目录的《仙逆》名下，作品行空着，点哪都不动。
+    //
+    // 所以先确认作品行在不在：**在 = 这次真的动了库**，就该刷新。
+    final existing = <String>{};
+    for (final key in keyList) {
+      if (await repo.workByKey(key) != null) existing.add(key);
+    }
+    var removed = 0;
+    for (final key in keyList) {
+      removed += await repo.deleteWork(key);
+    }
+    if (existing.isNotEmpty) _refreshMany(existing);
+    return removed;
+  }
+
   /// 按 [scope] 移除，并让所有读这张表的 provider 重取。
   ///
   /// 返回是否真的动了库 —— 调用方（播放页）据此决定要不要关掉自己。

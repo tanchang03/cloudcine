@@ -1,3 +1,4 @@
+import 'package:cloudcine/core/utils/filename_parser.dart';
 import 'package:cloudcine/data/db/app_database.dart';
 import 'package:cloudcine/data/db/media_repository_impl.dart';
 import 'package:cloudcine/data/db/settings_store.dart';
@@ -7,6 +8,7 @@ import 'package:cloudcine/domain/entities/cloud_account.dart';
 import 'package:cloudcine/domain/entities/drive_entry.dart';
 import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/media_item.dart';
+import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:cloudcine/domain/services/folder_sort.dart';
 import 'package:cloudcine/domain/services/media_discovery.dart';
 import 'package:cloudcine/ui/providers/app_providers.dart';
@@ -171,10 +173,16 @@ void main() {
   /// 带过去的是哪一条」。
   ///
   /// [seed] 是预先写进媒体库的条目（测「已在库」那一支用）。
+  ///
+  /// [works] 是作品行。**「已在库 · 某某」标签要它**：归属靠
+  /// `media_items.group_key → media_works.title` 现查，只 seed 媒体项时
+  /// 查不到作品行，标签会退回不带名字的「已在库」（那也是一种要守的状态：
+  /// 续扫中间态 / 旧备份恢复，文件在索引里但作品行缺失）。
   Future<ProviderContainer> pumpBrowserWithRouter(
     WidgetTester tester, {
     Size size = const Size(1280, 800),
     List<MediaItem> seed = const <MediaItem>[],
+    List<MediaWork> works = const <MediaWork>[],
   }) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1;
@@ -216,6 +224,9 @@ void main() {
 
     if (seed.isNotEmpty) {
       await container.read(mediaRepositoryProvider).upsertItems(seed);
+    }
+    if (works.isNotEmpty) {
+      await container.read(mediaRepositoryProvider).upsertWorks(works);
     }
 
     final router = GoRouter(
@@ -419,6 +430,72 @@ void main() {
       reason: '已在库时必须用库里那一条：它带着刮削过的片名与归一后的分组，'
           '而内存里现造的那份只有文件名解析结果',
     );
+  });
+
+  testWidgets('已在库的行报出它属于哪部作品', (tester) async {
+    // 现场（2026-10-17）：`/仙逆/弑仙之战/` 里的两个电影文件被目录锚点归到
+    // 上层剧集《仙逆》名下。行上只写「已在库」的话，用户会去海报墙上找一部
+    // 叫《弑仙之战》的作品 —— 找不到，于是认为「库里根本没有这个文件」。
+    // 把归属写在标签上，这一趟白找就没了。
+    final stored = parseTransientMedia(
+      entry: const DriveEntry(id: 'f1', name: 'Show.S01E02.mkv', isDirectory: false),
+      provider: DriveProvider.quark,
+      dirPath: '/',
+    ).item;
+    final work = MediaWork(
+      key: stored.groupKey,
+      provider: DriveProvider.quark,
+      kind: MediaKind.episode,
+      title: '仙逆',
+      updatedAt: DateTime(2026, 10, 17),
+    );
+
+    await pumpBrowserWithRouter(tester, seed: [stored], works: [work]);
+    await tester.pumpAndSettle();
+
+    expect(find.text('已在库 · 仙逆'), findsOneWidget);
+    expect(
+      find.byTooltip('在媒体库《仙逆》下'),
+      findsOneWidget,
+      reason: '标签里的标题会被截断，完整标题必须靠 tooltip 兜底',
+    );
+  });
+
+  testWidgets('很长的作品名被截断，且窄窗下不把这一行挤爆', (tester) async {
+    // 标签与文件名、时间列、三个动作按钮挤在同一行。作品名可以很长
+    // （`完美世界剧场版 九劫焚天` 这类），不截断就会把**文件名**挤成省略号
+    // —— 那是用户在这一屏最需要看清的东西。
+    //
+    // ⚠️ RenderFlex 溢出会以异常形式报出来，所以能画完就说明没溢出。
+    const longTitle = '完美世界剧场版 九劫焚天 特别篇 加长版';
+    final stored = parseTransientMedia(
+      entry: const DriveEntry(id: 'f1', name: 'Show.S01E02.mkv', isDirectory: false),
+      provider: DriveProvider.quark,
+      dirPath: '/',
+    ).item;
+    final work = MediaWork(
+      key: stored.groupKey,
+      provider: DriveProvider.quark,
+      kind: MediaKind.episode,
+      title: longTitle,
+      updatedAt: DateTime(2026, 10, 17),
+    );
+
+    await pumpBrowserWithRouter(
+      tester,
+      size: const Size(480, 800),
+      seed: [stored],
+      works: [work],
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('已在库 · '), findsOneWidget);
+    expect(
+      find.textContaining('…'),
+      findsWidgets,
+      reason: '超长标题要截断（完整标题在 tooltip 里）',
+    );
+    expect(find.byTooltip('在媒体库《$longTitle》下'), findsOneWidget);
   });
 
   testWidgets('窄窗下未入库的行不溢出（这一行比原先多了一个播放按钮）', (tester) async {

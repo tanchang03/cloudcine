@@ -1339,6 +1339,36 @@ class _FolderRow extends ConsumerWidget {
   }
 }
 
+/// 行上那个「已在库」标签的文案。
+///
+/// ## 为什么要把作品标题写进来
+///
+/// 只说「已在库」回答的是**在不在**，而用户的下一个问题永远是
+/// 「那我上哪儿找」。2026-10-17 现场：`/仙逆/弑仙之战/` 里的两个电影文件
+/// 被目录锚点归到了上层剧集《仙逆》名下，海报墙上既没有同名作品、按目录
+/// 名搜也搜不到（搜索只匹配作品标题与文件名，不匹配目录路径），于是
+/// 「已在库」在用户眼里等于「骗人」。把归属直接写出来，那一趟白找就没了。
+///
+/// ## 为什么截断
+///
+/// 标签与文件名、时间列、三个动作按钮挤在同一行，而作品标题可以很长
+/// （`完美世界剧场版 九劫焚天`、`兰z.香z.如z.故 去头去尾版`）。不截断
+/// 会把文件名挤成省略号 —— 那是用户在这一屏最需要看清的东西。完整标题
+/// 由外层的 `Tooltip` 兜底。
+///
+/// [workTitle] 为空 = 在索引里但查不到作品行（续扫中间态 / 旧备份），
+/// 那时只写「已在库」，**不假装**知道它属于谁。
+String _libraryTagLabel(String workTitle) {
+  final t = workTitle.trim();
+  if (t.isEmpty) return '已在库';
+  const max = 10;
+  final chars = t.characters;
+  final shown = chars.length > max
+      ? '${chars.take(max)}…'
+      : t;
+  return '已在库 · $shown';
+}
+
 /// 一行网盘上的视频文件。**整行可点 = 直接播**。
 ///
 /// ## 与作品详情页的 `MediaItemRow` 刻意不共用
@@ -1357,8 +1387,8 @@ class _FolderRow extends ConsumerWidget {
 ///     续播点 / 连播 / 同目录字幕 / 播放偏好 / 片头标记这些库内能力）；
 ///   - **没入库** → 现造一条内存里的，**一行都不落库**（见 [playDriveEntry]）。
 ///
-/// 「已在库」标签与「加入媒体库」按钮都还在，所以「盘上的」和「库里的」
-/// 依然一眼可分 —— 变的只是**不必先入库才能看**。
+/// 「已在库 · 作品名」标签与「加入媒体库」按钮都还在，所以「盘上的」和
+/// 「库里的」依然一眼可分 —— 变的只是**不必先入库才能看**。
 class _DriveFileRow extends ConsumerWidget {
   const _DriveFileRow({
     required this.crumb,
@@ -1374,12 +1404,14 @@ class _DriveFileRow extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final indexedIds = ref.watch(indexedFileIdsProvider).valueOrNull;
+    // id → 作品标题。「在不在库」与「在哪一部下面」是两件事，都从这一份
+    // 叠加层读 —— 见 `indexedWorkTitlesProvider` 的文档。
+    final indexed = ref.watch(indexedWorkTitlesProvider).valueOrNull;
     final discovery = ref.watch(discoveryControllerProvider);
     final scanning = ref.watch(scanControllerProvider).running;
-    final inLibrary = indexedIds
-            ?.contains(MediaItem.idFor(ref.watch(browseProvider), entry.id)) ??
-        false;
+    final itemId = MediaItem.idFor(ref.watch(browseProvider), entry.id);
+    final inLibrary = indexed?.containsKey(itemId) ?? false;
+    final workTitle = indexed?[itemId] ?? '';
     final selected =
         selecting && ref.watch(folderSelectionProvider).contains(entry.id);
 
@@ -1464,14 +1496,26 @@ class _DriveFileRow extends ConsumerWidget {
                 ModifiedTimeColumn(modifiedAt: entry.modifiedAt),
                 const SizedBox(width: 8),
                 if (inLibrary) ...[
-                  const TagChip(label: '已在库', color: AppTheme.dim),
+                  Tooltip(
+                    message: workTitle.isEmpty
+                        ? '这台设备的媒体库里有这个文件'
+                        : '在媒体库《$workTitle》下',
+                    child: TagChip(
+                      label: _libraryTagLabel(workTitle),
+                      color: AppTheme.dim,
+                    ),
+                  ),
                   const SizedBox(width: 6),
                 ],
                 if (!selecting) ...[
                   TvIconLabel(
                     label: '播放',
                     child: IconButton(
-                      tooltip: inLibrary ? '播放' : '直接播放（不加入媒体库）',
+                      tooltip: !inLibrary
+                          ? '直接播放（不加入媒体库）'
+                          : workTitle.isEmpty
+                              ? '播放'
+                              : '播放（媒体库《$workTitle》）',
                       onPressed: () => _play(context, ref, inLibrary: inLibrary),
                       iconSize: 17,
                       visualDensity: VisualDensity.compact,

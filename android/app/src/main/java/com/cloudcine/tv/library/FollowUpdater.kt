@@ -155,6 +155,16 @@ class FollowUpdater(
                     rootPath = dir.dirPath,
                     recursive = true,
                 )
+                // ⛔ 凭证失效要**整次中止**，不能按「这个目录没读完整」处理：
+                //    剩下的每个在追目录都只会再换来一次 `-6`（每个 3 条 HTTP），
+                //    而用户真正需要看到的是「去重新登录」，不是
+                //    「检查完成，但有 20 个目录没读到」——后者听起来像网络抖动。
+                if (discovery.reauth) {
+                    error = "登录已失效，请重新登录"
+                    failed.add(dir.dirId)
+                    Log.e(TAG, "追剧：凭证失效，中止检查：${discovery.error}")
+                    break
+                }
                 // ⛔ 判据是「这一次列目录完整吗」，不是「有没有新东西」。
                 //    `failedDirs > 0` 时结果是不完整的（子目录超时/限流），
                 //    那批新集可能正好在没读到的子目录里 —— 推进水位线等于把

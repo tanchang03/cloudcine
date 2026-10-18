@@ -43,6 +43,8 @@ import com.cloudcine.tv.library.EpisodeLabels
 import com.cloudcine.tv.library.EpisodeThumbs
 import com.cloudcine.tv.library.IntroMarker
 import com.cloudcine.tv.library.IntroSession
+import com.cloudcine.tv.library.dirPathOf
+import com.cloudcine.tv.library.fullPathOf
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
@@ -59,10 +61,13 @@ import com.cloudcine.tv.library.SkipSample
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.PlayInfo
 import com.cloudcine.tv.pan.Quality
-import com.cloudcine.tv.pan.PanApi
+import com.cloudcine.tv.pan.DriveClient
+import com.cloudcine.tv.pan.DriveClients
+import com.cloudcine.tv.pan.DriveProviders
 import com.cloudcine.tv.pan.PanHttp
 import com.cloudcine.tv.pan.SubtitleFile
 import com.cloudcine.tv.pan.CredStore
+import com.cloudcine.tv.pan.baidu.BaiduEndpoints
 import com.cloudcine.tv.pan.formatSize
 import java.util.Locale
 
@@ -206,7 +211,10 @@ class PlayerActivity : Activity() {
      */
     private var cacheRef: Cache? = null
 
-    /** 当前片的夸克 `fid`（来自 `EXTRA_FID`）；空 = 走「直接给 URL」的对照路径。 */
+    /**
+     * 当前片的**网盘文件 id**（来自 `EXTRA_FID`；夸克是 `fid`、百度是 `fs_id`）。
+     * 空 = 走「直接给 URL」的对照路径。
+     */
     private var currentFid = ""
 
     /** 当前档位的 id（`Quality.id`，如 `super` / `4k` / `ORIGIN`）。 */
@@ -238,7 +246,7 @@ class PlayerActivity : Activity() {
      *    见 [cacheKeyFor]。
      */
     private val stableCacheKey: String
-        get() = if (currentFid.isEmpty()) "" else "quark:$currentFid:$currentQualityId"
+        get() = if (currentFid.isEmpty()) "" else "$provider:$currentFid:$currentQualityId"
 
     /**
      * 给数据源用的键工厂。
@@ -345,7 +353,36 @@ class PlayerActivity : Activity() {
 
     /** 全局参数（调试浮层开关等），与登录态分开存。 */
     private lateinit var prefs: AppPrefs
-    private var api: PanApi? = null
+    private var api: DriveClient? = null
+
+    /**
+     * 当前条目属于哪家网盘（`quark` / `baidu`）。
+     *
+     * ⛔ 它决定三件事：取链走哪个客户端、CDN 请求头用哪套方言、并行连接数
+     * 上不上限。缺省夸克 —— 老路径（直接给 URL / 文件列表）的意图里没有它。
+     */
+    private var provider: String = DriveProviders.QUARK
+
+    /**
+     * 按厂家缓存的客户端（选集封面要按**地址归属**选，见 `ThumbSource.fetch`）。
+     *
+     * ⛔ 同步包装：封面下载在后台线程池里并发跑，普通 `HashMap` 并发写会丢条目。
+     */
+    private val clients: MutableMap<String, DriveClient> =
+        java.util.Collections.synchronizedMap(HashMap())
+
+    /** 取（并按需创建）某个网盘的客户端。 */
+    private fun clientOf(p: String): DriveClient =
+        clients[p] ?: DriveClients.create(p, store).also { clients[p] = it }
+
+    /**
+     * 一条图片地址属于哪家网盘 —— **按域名**判，不按当前片。
+     *
+     * ⛔ 与 `LibraryActivity.providerOfUrl` 同一口径：封面地址是扫描时存下来的，
+     *    按域名判永远对得上。
+     */
+    private fun clientFor(url: String): DriveClient =
+        clientOf(if (BaiduEndpoints.ownsUrl(url)) DriveProviders.BAIDU else DriveProviders.QUARK)
     private var info: PlayInfo? = null
     private var current: Quality? = null
 
@@ -675,9 +712,12 @@ class PlayerActivity : Activity() {
                 override fun isKnownBad(url: String) = episodeThumbs?.isKnownBad(url) ?: true
 
                 override fun fetch(url: String, targetPx: Int, onReady: () -> Unit) {
-                    val api = api ?: return
                     val store = episodeThumbs ?: return
-                    Bg.run({ store.load(url, api, targetPx) }) { _, _ ->
+                    // ⛔ 按**地址归属**选厂家，不是按当前片：选集列表里可能混着
+                    //    另一家的文件（同一个作品被两家各扫到一次），拿这一家的
+                    //    Cookie 去下那一家的缩略图，裸链一律 401 ⇒ 那块永远是灰的。
+                    val client = clientFor(url)
+                    Bg.run({ store.load(url, client, targetPx) }) { _, _ ->
                         // 失败也回调：`load` 已经把地址记进「拿不到」，
                         // 重画一次列表它就不会再问了（否则每次 getView 都重试）。
                         onReady()
@@ -723,11 +763,20 @@ class PlayerActivity : Activity() {
     private fun resolveAndPlay(fid: String) {
         val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
         showNotice("正在取链…\n$name")
-        api = PanApi(store)
+        // ⛔ 厂家由**意图**带进来（列表页知道它是从哪家扫出来的）。缺省夸克：
+        //    老路径（文件列表）没有这个 extra。
+        provider = intent.getStringExtra(EXTRA_PROVIDER)
+            ?.takeIf { it.isNotEmpty() }
+            ?: DriveProviders.QUARK
+        api = DriveClients.create(provider, store)
         // ⛔ 记下来源 fid —— 它是**稳定缓存键**的前半段（见 [stableCacheKey]）。
         //    不记的话就只能退回按 URL 做键，磁盘缓存永远跨不了会话。
         currentFid = fid
-        Bg.run({ api!!.resolve(fid) }) { pi, err ->
+        // 百度需要**路径**才能走 `/api/filemetas` / 转码档；列表页已经把
+        // 「dirPath + name」拼好带过来了（省一次 fs_id → path 翻译，也绕开
+        // xpan 的账号风控）。夸克忽略这个参数。
+        val pathHint = intent.getStringExtra(EXTRA_PATH)?.takeIf { it.isNotEmpty() }
+        Bg.run({ api!!.resolve(fid, pathHint) }) { pi, err ->
             if (err != null) {
                 Log.e(TAG, "取链失败", err)
                 showNotice("取链失败\n${err.message}")
@@ -756,8 +805,7 @@ class PlayerActivity : Activity() {
             // `onCreate` 里，是为了不与 `resolve` 抢同一份 Cookie ——
             // `PanApi.absorbCookies` 是「读改写」，两条并发请求会丢一次
             // `__puus` 轮换。这里与下面的测速并行，不占起播的关键路径。
-            intent.getStringExtra(EXTRA_PDIR)?.trim()?.takeIf { it.isNotEmpty() }
-                ?.let { discoverSubtitles(it) }
+            subtitleDirRef()?.let { discoverSubtitles(it) }
         }
     }
 
@@ -851,6 +899,12 @@ class PlayerActivity : Activity() {
                 .putExtra(EXTRA_NAME, item.name)
                 .putExtra(EXTRA_HEADERS, intent.getStringExtra(EXTRA_HEADERS))
                 .putExtra(EXTRA_PDIR, item.dirId)
+                // ⛔ 厂家与路径**逐条跟着库里的那一行走**，不沿用当前这集的：
+                //    同一个作品下完全可能混着两家的文件（跨端同步 / 用户自己
+                //    分开放），沿用旧值就会拿夸克的 Cookie 去开百度的文件。
+                .putExtra(EXTRA_PROVIDER, item.provider)
+                .putExtra(EXTRA_PATH, fullPathOf(item.dirPath, item.name))
+                .putExtra(EXTRA_PDIR_PATH, dirPathOf(item.dirPath))
                 .putExtra(EXTRA_GROUP_KEY, item.groupKey)
                 // ⛔ 换过去那一集**自己的**续播点：列表里可能好几集都看过，
                 //    切到第 5 集就该从第 5 集上次停的地方开始，不是 0，
@@ -1366,8 +1420,17 @@ class PlayerActivity : Activity() {
             return
         }
 
-        val probeTarget = pi.qualities.maxByOrNull { it.height } ?: pi.qualities.first()
-        val conns = prefs.parallelConnections
+        // ⛔ 探**原画**，不是「最高那档」。夸克那边两者恰好是同一条（原画分辨率
+        //    最高、且排在最前），但百度的原画是 `/api/filemetas` 直链、**没有**
+        //    `height`（0），而转码档带 `height=480` —— 按高度挑就会去探一条
+        //    完全不同 CDN 的转码流，测出来的带宽与真正要播的那条无关。
+        val probeTarget = pi.qualities.firstOrNull { it.isOriginal }
+            ?: pi.qualities.maxByOrNull { it.height }
+            ?: pi.qualities.first()
+        // ⛔ 探的是**最高档**，所以头与连接数也必须取**最高档**那一份：
+        //    百度的 `origin=dlna` 快通道与慢通道是两套签名/两套限速，
+        //    拿慢通道的头去探快通道的链会得到 403，读数直接是 0。
+        val conns = effectiveConnections(probeTarget)
         showNotice("正在测速…\n（按最高档 ${probeTarget.label}、$conns 条连接探 3 秒）")
         Bg.run({
             ParallelProbe.measure(
@@ -1375,7 +1438,7 @@ class PlayerActivity : Activity() {
                 // ⛔ 用 [headersForCdn] 而不是裸 cookie：它与播放**同一套判据**
                 //    （缺 `__puus` 就不带 Cookie）。两处各写一份的话，
                 //    很容易只改了一处，于是「播放正常、测速 412」或反过来。
-                headers = headersForCdn(),
+                headers = headersForCdn(probeTarget),
                 connections = conns,
                 // ⛔ 别把窗口缩到 2 秒以内：那样连「每条连接是否都吃上活」都看不出来
                 //    （8 条连接要一点时间才铺开）。3 秒是「能看出连接铺开」与
@@ -1415,17 +1478,25 @@ class PlayerActivity : Activity() {
      * 先按高度从高到低分组；同一分辨率下**取需要带宽最小的那条**
      * （原画与 `4k` 常常同分辨率，但 `4k` 转码档体积小得多 ——
      * 画面都是 4K，能省 5 倍带宽就没必要走原画）。
-     * 一组都扛不住就降一级。全都扛不住时取最省的那条。
+     * 一组都扛不住就降一级。全都扛不住时取服务端默认档。
+     *
+     * ⛔ **成本未知 ≠ 免费**：`requiredMbPerSec == 0` 只表示「体积或时长缺一个」，
+     *    不是「这一档不花带宽」。参与比较时会把它剔掉；一条能算的都没有时
+     *    退回默认档。百度的转码档最容易缺体积，不这么写就会「总是挑 480P」。
      */
     private fun chooseQuality(pi: PlayInfo): Quality {
         if (measuredMbPerSec <= 0.0) return pi.defaultQuality ?: pi.qualities.first()
         val budget = measuredMbPerSec * 0.7
         val groups = pi.qualities.groupBy { it.height }.toSortedMap(compareByDescending { it })
         for (group in groups.values) {
-            val best = group.minByOrNull { it.requiredMbPerSec } ?: continue
+            val best = group
+                .filter { it.requiredMbPerSec > 0.0 }
+                .minByOrNull { it.requiredMbPerSec } ?: continue
             if (best.requiredMbPerSec <= budget) return best
         }
-        return pi.qualities.minByOrNull { it.requiredMbPerSec } ?: pi.qualities.first()
+        return pi.defaultQuality
+            ?: pi.qualities.firstOrNull { it.isOriginal }
+            ?: pi.qualities.first()
     }
 
     /** 切到某一档。同一档重复点不重建播放器。 */
@@ -1464,7 +1535,7 @@ class PlayerActivity : Activity() {
         )
 
         if (player == null) {
-            startPlayer(q.url, headersForCdn())
+            startPlayer(q.url, headersForCdn(q))
         } else {
             // ⛔ 换档**必须把进度带过去**。`setMediaItem` 会把播放位置重置成 0，
             //    而换档是用户「看画质不合适」时最常做的动作 —— 从第 40 分钟
@@ -1551,7 +1622,7 @@ class PlayerActivity : Activity() {
         p.release()
         player = null
 
-        startPlayer(q.url, headersForCdn())
+        startPlayer(q.url, headersForCdn(q))
         if (resumeMs > 0) player?.seekTo(resumeMs)
         player?.setPlaybackSpeed(currentSpeed.toFloat())
         player?.playWhenReady = wasPlaying
@@ -1578,6 +1649,20 @@ class PlayerActivity : Activity() {
     /**
      * 发往 CDN 的请求头。
      *
+     * ## ① 网盘适配器给了逐档方言 ⇒ 直接用
+     *
+     * 百度的直链与夸克**不是一套规矩**（见 `BaiduMapper.dlinkHeaders`）：
+     *
+     * - 第二跳是 `*.baidupcs.com`，它的 `sign` 是**按 User-Agent 签的** ⇒ 必须
+     *   用 `User-Agent: netdisk`，换成浏览器 UA 立刻 `403 31362 sign error`；
+     * - Cookie 必须带 `BDUSS`（不带也能下，但走的是**未登录限速**）。
+     *
+     * 这些差异由 `BaiduApi.resolve` 随 `Quality.headers` 一起带过来 ——
+     * 播放页**不需要知道**哪家网盘有哪些规矩，也就不会出现「加了百度分支、
+     * 忘了改测速那条路」这种半修。
+     *
+     * ## ② 夸克（以及 `-e url` 的对照路径）：实测规则
+     *
      * ⛔ **要么不带 Cookie，要么必须带 `__puus`**（Mac 侧实测四种组合）：
      *
      * | 带的 Cookie | 结果 |
@@ -1589,7 +1674,9 @@ class PlayerActivity : Activity() {
      * 「带一半」是最坏的：服务端认得你是登录用户，却过不了防重放校验。
      * 云影那边的表现正是「列表能刷、一播就转圈」。
      */
-    private fun headersForCdn(): Map<String, String> {
+    private fun headersForCdn(q: Quality? = current): Map<String, String> {
+        // ⛔ 逐档方言优先。空 map 才落到夸克那套 —— `PanApi` 从不填 `headers`。
+        if (q != null && q.headers.isNotEmpty()) return q.headers
         val out = LinkedHashMap<String, String>()
         out["User-Agent"] = BrowserUa
         out["Referer"] = "https://pan.quark.cn/"
@@ -1598,6 +1685,21 @@ class PlayerActivity : Activity() {
             out["Cookie"] = cookie
         }
         return out
+    }
+
+    /**
+     * 实际可用的并行连接数。
+     *
+     * ⛔ 网盘适配器若给了**上限**（`Quality.maxConnections > 0`）就必须服从：
+     *    百度**非 dlna** 直链是按账号限速的（实测 ~80 KB/s），多开连接不会变快，
+     *    只会更容易触发风控；`dlna` 快通道也是单连接最稳。
+     *    用户把 OSD 里的「连接数」调到 8 也不该突破它 —— 那条设置描述的是
+     *    「夸克那种按连接限速的网盘」，不是「无视网盘规矩」。
+     */
+    private fun effectiveConnections(q: Quality? = current): Int {
+        val pref = prefs.parallelConnections
+        val cap = q?.maxConnections ?: 0
+        return if (cap > 0) minOf(pref, cap) else pref
     }
 
     /**
@@ -1610,7 +1712,10 @@ class PlayerActivity : Activity() {
      * @return 可直接塞进 `Cookie` 头的字符串；**空串表示「故意不带 Cookie」**。
      */
     private fun cdnCookie(): String {
-        val cookie = store.requestCookie()
+        // ⛔ 这条分支只服务**夸克**（百度的头由 `Quality.headers` 带过来，不会走到这里）。
+        //    显式指名 quark 而不是用默认值：多网盘之后 `requestCookie()` 的默认值
+        //    是「当前激活网盘」，用它就会在百度激活时把百度 Cookie 发给夸克 CDN。
+        val cookie = store.requestCookie(DriveProviders.QUARK)
         if (cookie.contains("__puus=")) return cookie
         Log.w(TAG, "凭证里没有 __puus —— 按实测规则改为不带 Cookie（带一半必 412）")
         return ""
@@ -1833,7 +1938,9 @@ class PlayerActivity : Activity() {
         //    传取值器 ⇒ 菜单里改完，**下一次 `open()` 立刻生效**，不必重建播放器。
         val parallel = ParallelRangeDataSourceFactory(
             headers = headers,
-            connections = { prefs.parallelConnections },
+            // ⛔ 走 [effectiveConnections] 而不是直接读偏好：网盘给了上限就得服从
+            //    （百度慢通道多连接 = 更快触发风控，且**总带宽不会变**）。
+            connections = { effectiveConnections() },
             chunkBytes = ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES,
             connectTimeoutMs = StreamSpec.DEFAULT_TIMEOUT_MS,
             readTimeoutMs = StreamSpec.DEFAULT_TIMEOUT_MS,
@@ -1870,7 +1977,7 @@ class PlayerActivity : Activity() {
 
         Log.i(
             TAG,
-            "数据源：多连接并行（${prefs.parallelConnections} 条 × " +
+            "数据源：多连接并行（${effectiveConnections()} 条 × " +
                 "${ParallelRangeDataSourceFactory.DEFAULT_CHUNK_BYTES / 1024} KiB/块）· " +
                 "缓存键 ${stableCacheKey.ifEmpty { "（按 URL，对照路径）" }} · " +
                 PrefetchCache.describe(this),
@@ -2290,11 +2397,26 @@ class PlayerActivity : Activity() {
     // ------------------------------------------------------------------
 
     /**
+     * 「同目录」的标识：夸克用 `fid`，百度用**目录路径**。
+     *
+     * ⛔ 不能只给 `fid`：百度没有「fid → 父目录」的现成接口，播放页手里
+     *    只有一个文件 `fs_id`，冷启动时路径缓存是空的，去翻译会撞 xpan
+     *    的账号风控。所以列表页把**路径**一起带过来（`EXTRA_PDIR_PATH`）。
+     */
+    private fun subtitleDirRef(): String? {
+        val dirPath = intent.getStringExtra(EXTRA_PDIR_PATH)?.trim().orEmpty()
+        if (provider == DriveProviders.BAIDU) {
+            return dirPath.takeIf { it.isNotEmpty() }
+        }
+        return intent.getStringExtra(EXTRA_PDIR)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
      * 扫一遍本片所在的网盘目录，挑出能当字幕的文件。
      *
      * ⛔ 在**后台线程**做（[Bg]），主线程只收结果 —— 列目录是一次网络往返，
      *    放在主线程只会让起播那几秒更卡。
-     * ⛔ 父目录 fid **只能由列表页带过来**：单个 `fid` 推不出它的父目录，
+     * ⛔ 父目录标识 **只能由列表页带过来**：单个 `fid` 推不出它的父目录，
      *    而网盘没有「查父目录」的接口（见 `BrowseActivity` 的目录栈）。
      *    没有它就不扫，功能静默降级 —— 播放本身不受影响。
      */
@@ -2355,9 +2477,12 @@ class PlayerActivity : Activity() {
     /**
      * 下载并解析一条外挂字幕，成功后接管上屏。
      *
-     * ⛔ 两步都在后台：`fileBytesUrl` 是一次网盘 API 往返，`getBytes` 是
-     *    一次 CDN 下载。字幕虽然只有几十 KiB，但在电视的 WiFi 上仍可能
-     *    几百毫秒 —— 放在主线程就是一次可见的掉帧。
+     * ⛔ 两步都在后台：`readFileBytes` 内含一次网盘 API 往返 + 一次 CDN 下载。
+     *    字幕虽然只有几十 KiB，但在电视的 WiFi 上仍可能几百毫秒 ——
+     *    放在主线程就是一次可见的掉帧。
+     * ⛔ 请求头**跟着厂家走**：百度的直链必须带 `User-Agent: netdisk` +
+     *    百度 Cookie（见 `BaiduMapper.dlinkHeaders`），所以这里不能自己拼
+     *    `PanHttp.getBytes`，统一交给客户端。
      */
     private fun startExternalSubtitle(file: SubtitleFile) {
         val a = api ?: return
@@ -2366,8 +2491,7 @@ class PlayerActivity : Activity() {
         showNoticeBriefly("正在加载字幕…\n${file.name}", 1_200L)
 
         Bg.run({
-            val url = a.fileBytesUrl(file.fid)
-            val bytes = PanHttp.getBytes(url, cookie = store.requestCookie())
+            val bytes = a.readFileBytes(file.fid, SUBTITLE_MAX_BYTES)
             ExternalSubtitle.parse(file.name, bytes)
         }) { sub, err ->
             // ⛔ 结果可能**已经过期**：用户在这几百毫秒里又换了别的字幕
@@ -2622,13 +2746,18 @@ class PlayerActivity : Activity() {
      *    「卡」与「不卡」肉眼可见，比任何日志都有说服力。
      */
     private fun parallelRow(): TvOsdView.Row {
-        val n = prefs.parallelConnections
+        val pref = prefs.parallelConnections
+        // ⛔ 显示**实际生效**的条数，不是偏好值：百度慢通道被适配器压到 1 条，
+        //    这时还显示「8 条」就是在骗人 —— 用户会以为调了没生效，反复去调。
+        val n = effectiveConnections()
+        val capped = n != pref
         val choices = AppPrefs.PARALLEL_CHOICES
+        val label = { v: Int -> if (v <= 1) "1 条（关）" else "$v 条" }
         return TvOsdView.Row(
             id = ROW_PARALLEL,
             label = "连接数",
-            value = if (n <= 1) "1 条（关）" else "$n 条",
-            options = choices.map { if (it <= 1) "1 条（关）" else "$it 条" },
+            value = label(n) + if (capped) "（网盘限制）" else "",
+            options = choices.map(label),
             // ⛔ `active` 可能为 -1（存量偏好里存了个不在候选里的数）——
             //    OSD 对 -1 的语义就是「这行没有生效态」，不会崩，也不会误高亮。
             active = choices.indexOfFirst { it == n },
@@ -3556,6 +3685,26 @@ class PlayerActivity : Activity() {
         const val EXTRA_HEADERS = "headers"
 
         /**
+         * 本条属于哪家网盘（`quark` / `baidu`）。
+         *
+         * ⛔ 缺省按 `quark` 处理 —— 老的起播路径（`BrowseActivity` / `LibraryActivity`
+         *    在本次改造前发出的 intent）都没有这个 extra，不能因此崩掉。
+         * ⛔ 它决定 `DriveClients.create(provider, store)` 用哪家的 `DriveClient`，
+         *    以及 CDN 请求头走哪套方言（见 `headersForCdn`）。
+         */
+        const val EXTRA_PROVIDER = "provider"
+
+        /**
+         * 百度用的**完整网盘路径**（`父目录路径 + "/" + 文件名`）。
+         *
+         * ⛔ 百度**没有** fid → path 的反查接口，而取链的兜底路由（`/api/filemetas`、
+         *    `/api/batch/streaming`）都要路径。由列表页顺手带过来能省一次翻译，
+         *    更重要的是**避开冷启动时 xpan 接口的风控**（`-6` 的常见来源）。
+         * 夸克忽略这个 extra（它只认 `pdir_fid`）。
+         */
+        const val EXTRA_PATH = "path"
+
+        /**
          * 本片**所在目录**的 fid —— 「自动识别同目录字幕」的唯一依据。
          *
          * ⛔ 单个 `fid` 推不出父目录，网盘也没有「查父目录」的接口，
@@ -3563,6 +3712,15 @@ class PlayerActivity : Activity() {
          *    没有它时外挂字幕功能静默降级，播放不受影响。
          */
         const val EXTRA_PDIR = "pdir"
+
+        /**
+         * 百度用的**父目录路径**（`/剧集/第一季`）—— 与 [EXTRA_PDIR] 同义，只是百度那边
+         * 目录的标识是**路径**而不是 id（`dir` 字段）。
+         *
+         * ⛔ 两者都要传、不能合并：夸克查同目录字幕要 `pdir_fid`，百度要 `dir` 路径。
+         *    传哪个由 [EXTRA_PROVIDER] 决定（见 `subtitleDirRef`）。
+         */
+        const val EXTRA_PDIR_PATH = "pdirPath"
 
         /**
          * 本片**所属作品**的 `group_key` —— 「选集」的唯一入口。
@@ -3593,6 +3751,14 @@ class PlayerActivity : Activity() {
          * ⛔ `0.0` = 没有（正常起播），此时一律实测。
          */
         const val EXTRA_REUSE_BANDWIDTH = "reuseBandwidth"
+
+        /**
+         * 外挂字幕文件的大小上限。
+         *
+         * ⛔ 字幕是几十 KiB 的纯文本，8 MiB 只是防呆（防止把误标成 `.srt` 的
+         *    视频整个读进内存）。读超上限直接当「读不到」处理，播放不受影响。
+         */
+        private const val SUBTITLE_MAX_BYTES = 8 * 1024 * 1024
 
         private const val BrowserUa =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +

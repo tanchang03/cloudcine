@@ -651,6 +651,9 @@ class PlaybackController extends ChangeNotifier {
 
     try {
       final adapter = _registry.requireAdapter(item.provider);
+      // 垫一脚网盘完整路径（持久化在库里）：只有用路径寻址的网盘
+      // （百度）会真的用它，见 [CloudDriveAdapter.primeFilePath]。
+      adapter.primeFilePath(item.fileId, item.netdiskPath);
       final ticket = await adapter.resolveStream(
         item.fileId,
         qualityId: preferredQualityId,

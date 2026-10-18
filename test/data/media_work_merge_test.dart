@@ -496,7 +496,9 @@ void main() {
       // 海报是 2:3 竖版、按 `contain` 画，根本不需要锚点；
       // 此时留着旧锚点会让海报被「剧中某帧的人脸位置」裁一刀。
       final existing = _work(posterUrl: quarkA, posterFaceX: 0.30);
-      final incoming = _work(posterUrl: tmdbPoster);
+      // TMDB 真海报只可能来自刮削（`source == online`），否则就是合成数据；
+      // 只有刮削这条通道才允许「地址换了就换封面」。
+      final incoming = _work(posterUrl: tmdbPoster, source: ScrapeSource.online);
 
       final merged =
           DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
@@ -554,6 +556,39 @@ void main() {
     test('地址从无到有 → 锚点取本次的值', () {
       // 老库没有封面，本次扫描拿到了夸克缩略图与人脸框。
       final existing = _work();
+      final incoming = _work(posterUrl: quarkA, posterFaceX: 0.18);
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterUrl, quarkA);
+      expect(merged.posterFaceX, 0.18);
+    });
+
+    test('重扫（本地派生）不换已有封面：首图项变了也保留旧地址与锚点', () {
+      // 复现「追剧检查后比例遮罩消失」：初次扫描首图是 ep01（无人脸 → 有遮罩），
+      // 追剧重扫时目录顺序或夸克预览图变化让首图变成 ep05（有人脸 → 无遮罩）。
+      // 修复后重扫必须保留旧封面，遮罩不再时有时无。
+      final existing = _work(posterUrl: quarkA, posterFaceX: null);
+      final incoming = _work(
+        posterUrl:
+            'https://drive-pc.quark.cn/1/clouddrive/file/video/preview?fid=b',
+        posterFaceX: 0.42,
+      );
+
+      final merged =
+          DriftMediaRepository.mergeWorkForUpsert(incoming, existing, ts);
+
+      expect(merged.posterUrl, quarkA,
+          reason: '重扫不得把已有封面换成另一条本地帧');
+      expect(merged.posterFaceX, isNull,
+          reason: '地址没变 → 沿用旧锚点（null），遮罩保留');
+    });
+
+    test('重扫仍能在旧封面缺失时补上本次封面', () {
+      // 初次扫描该作品名下还没有任何预览图（夸克还没生成），
+      // 后来重扫时夸克补出了预览图 —— 这种「从无到有」必须能补上。
+      final existing = _work(); // 没有 posterUrl
       final incoming = _work(posterUrl: quarkA, posterFaceX: 0.18);
 
       final merged =

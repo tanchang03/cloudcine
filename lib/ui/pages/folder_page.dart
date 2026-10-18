@@ -97,15 +97,15 @@ class _FolderPageState extends ConsumerState<FolderPage> {
   /// 重新列这一层网盘，并把「已入库」叠加层一起重算。
   ///
   /// 三样都要作废：目录内容本身、本地索引叠出来的目录树（`folderTreeProvider`，
-  /// 行上那个「N 个已入库」的递归计数）、以及由它派生的文件 id 集合
-  /// （视频行上的「已在库」标签）。
+  /// 行上那个「N 个已入库」的递归计数）、以及由它派生的「文件 → 作品」
+  /// 映射（视频行上的「已在库 · 某某」标签）。
   ///
   /// ⚠️ 目录内容**没有**跟着写库信号自动失效（那会让每落库一条就重列一次
   /// 网盘），所以这个按钮是用户唯一的手动出口 —— 少了它，「我刚上传的片子
   /// 怎么没出现」就只能靠切走再切回来。
   void _refresh() {
     ref.invalidate(folderTreeProvider);
-    ref.invalidate(indexedFileIdsProvider);
+    ref.invalidate(indexedWorkTitlesProvider);
     ref.invalidate(driveListingProvider);
     // 容量也要重算 —— 用户按这个按钮的动机里，「我刚传完/删完东西」占一大半，
     // 而容量恰恰是那件事唯一会变的数字。

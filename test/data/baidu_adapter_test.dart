@@ -954,6 +954,185 @@ void main() {
   });
 
   // -------------------------------------------------------------------
+  // 账号风控（9019 need verify）与路径预热
+  //
+  // 2026-10-17 实测：`rest/2.0/xpan/*` 被账号级风控挡住（恒定 9019），
+  // 而 `/api/*` 全程正常。那条日志里「导入时能播、重启后不能播」的完整
+  // 死路是：路径缓存是会话级内存态 ⇒ 重启即空 ⇒ ② 路由的路径翻译只能
+  // 打 xpan/multimedia ⇒ 撞 9019 ⇒ ② 还没摸到 /api/filemetas 就死。
+  // 这一组守两个修法：调用方垫路径（primeFilePath）、撞 9019 后跳过 ①。
+  // -------------------------------------------------------------------
+
+  group('resolveStream：账号风控 9019 与路径预热', () {
+    const originalUrl = 'https://d.pcs.baidu.com/original.mkv?fid=1';
+    const ladderUrl = 'https://cdn.example.com/transcoded.mp4';
+
+    /// ② 路由的正常应答（视频，走 dlna 快通道）。
+    HttpResult pathOriginal() => ok({
+          'errno': 0,
+          'info': [
+            {
+              'fs_id': 1,
+              'path': '/电影/a.mkv',
+              'category': BaiduEndpoints.categoryVideo,
+              'dlink': originalUrl,
+            },
+          ],
+        });
+
+    /// 复刻实测死路的夹具：① 恒定 9019，② 正常，③ 正常。
+    Future<({BaiduAdapter adapter, FakeHttp http, FakeStore store})> risk({
+      HttpResult Function()? filemetas,
+      HttpResult Function()? batchStreaming,
+    }) =>
+        ready(
+          routes: {
+            BaiduEndpoints.xpanMultimedia: (_) =>
+                errno(9019, showMsg: 'need verify'),
+            BaiduEndpoints.filemetas: (_) => filemetas?.call() ?? pathOriginal(),
+            BaiduEndpoints.batchStreaming: (_) =>
+                batchStreaming?.call() ??
+                ok({
+                  'errno': 0,
+                  'list': [
+                    {'dlink': ladderUrl, 'size': 1024 * 1024},
+                  ],
+                }),
+          },
+        );
+
+    test('① 撞 9019 时走 ② 成功 ⇒ 风控只挡 xpan，不挡 /api/', () async {
+      final r = await risk();
+
+      // 路径得在缓存里（真实场景：同会话刚列过目录，或调用方垫过）。
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+      final ticket = await r.adapter.resolveStream('1');
+
+      expect(ticket.url.toString(), originalUrl);
+      expect(
+        r.http.callsTo(BaiduEndpoints.filemetas),
+        hasLength(1),
+        reason: '② 必须被真的走到 —— 这条才是风控期间唯一的路',
+      );
+    });
+
+    test('⛔ primeFilePath 垫路径后，不再打「解析目录路径」那次 xpan', () async {
+      // 这就是 2026-10-17 那次「重启后必失败」的正面修法：调用方把库里
+      // 持久化的完整路径垫进来，② 直接能用，一次翻译请求都不打。
+      final r = await risk();
+
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+      final ticket = await r.adapter.resolveStream('1');
+
+      expect(ticket.url.toString(), originalUrl);
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia),
+        hasLength(1),
+        reason: '只该有 ① 那一次（取原画直链）；「解析目录路径」那次'
+            '是重启后死路的关键，垫了路径就不该再出现',
+      );
+      final q = r.http.callsTo(BaiduEndpoints.filemetas).single.query;
+      expect(jsonDecode(q['target'] as String), ['/电影/a.mkv'],
+          reason: '② 用的必须是垫进来的路径，不是别的');
+    });
+
+    test('primeFilePath 拒收非绝对路径（夸克的 fid 垫进来只会污染缓存）', () async {
+      final r = await risk();
+
+      r.adapter.primeFilePath('1', '100');
+
+      // 缓存没被污染 ⇒ ② 仍要走一次「解析目录路径」（xpan，9019）⇒ 失败，
+      // 最终整条取链失败。这条守的是「宁可不垫，不能垫错」。
+      await expectLater(
+        r.adapter.resolveStream('1'),
+        throwsA(isA<DriveException>()),
+      );
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia)
+            .map((c) => c.query['method']),
+        contains('filemetas'),
+        reason: '缓存没被污染 ⇒ 仍然需要打翻译请求（然后如实失败）',
+      );
+    });
+
+    test('撞过 9019 后，同一会话再次取链**直接跳过 ①**', () async {
+      // 风控是账号维度的：重复打 ① 不会放行，只会白费配额与网络往返。
+      final r = await risk();
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      final first = await r.adapter.resolveStream('1');
+      expect(first.url.toString(), originalUrl);
+      final afterFirst = r.http.callsTo(BaiduEndpoints.xpanMultimedia).length;
+
+      final second = await r.adapter.resolveStream('1');
+
+      expect(second.url.toString(), originalUrl);
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia),
+        hasLength(afterFirst),
+        reason: '第二次取链一条 xpan 请求都不该再多',
+      );
+    });
+
+    test('三条全失败且撞过 9019 ⇒ 报错换成网页验证引导（不是兜底文案）', () async {
+      final r = await risk(
+        filemetas: () => ok({'errno': 0, 'info': []}),
+        batchStreaming: () => ok({'errno': 0, 'list': []}),
+      );
+
+      await expectLater(
+        r.adapter.resolveStream('1'),
+        throwsA(
+          isA<DriveException>()
+              .having((e) => e.type, 'type', DriveErrorType.permissionDenied)
+              .having((e) => e.message, 'message', contains('pan.baidu.com'))
+              .having((e) => e.message, 'message', contains('验证')),
+        ),
+      );
+    });
+
+    test('9019 映射成 permissionDenied（重新扫码解不掉，别误导用户）', () async {
+      final r = await ready(
+        routes: {
+          BaiduEndpoints.list: (_) => errno(9019, showMsg: 'need verify'),
+        },
+      );
+
+      await expectLater(
+        r.adapter.listDirectory(dirId: '/'),
+        throwsA(
+          isA<DriveException>()
+              .having((e) => e.type, 'type', DriveErrorType.permissionDenied)
+              .having((e) => e.needsReauth, 'needsReauth', isFalse)
+              .having((e) => e.providerCode, 'providerCode', 9019)
+              .having((e) => e.rawMessage, 'rawMessage', 'need verify'),
+        ),
+      );
+    });
+
+    test('重新授权后风控闩清零 ⇒ ① 再获得一次机会', () async {
+      final r = await risk();
+      // 路径垫着，让 ② 在 ① 失败后仍能成功 —— 否则整条取链失败，
+      // 断言的是「① 有没有再被打」，不是「取链有没有成功」。
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+      final first = await r.adapter.resolveStream('1');
+      expect(first.url.toString(), originalUrl);
+      final latched = r.http.callsTo(BaiduEndpoints.xpanMultimedia).length;
+
+      // 用户去过网页验证、重新扫码：新凭证进厂，① 该再试。
+      await r.adapter.authorize(baiduCredential());
+      final second = await r.adapter.resolveStream('1');
+
+      expect(second.url.toString(), originalUrl);
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia).length,
+        greaterThan(latched),
+        reason: '重新授权是一条新会话，不能把 9019 的账一直留着',
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------
   // 搜索
   // -------------------------------------------------------------------
 

@@ -215,6 +215,11 @@ Future<PlayRequest> buildPlayRequest(
     '窗口',
     '为独立窗口取链：fid=${item.fileId} 首选档位=${preferred ?? "-"}',
   );
+  // 百度用**路径**寻址（`/api/*` 全收 `path`）。库里持久化了完整路径
+  // （`dir_path` + `name`），先垫进适配器：省掉一次「ID→路径」翻译请求，
+  // 也绕开翻译端点可能踩到的账号风控（9019）。见
+  // [CloudDriveAdapter.primeFilePath]。
+  adapter.primeFilePath(item.fileId, item.netdiskPath);
   final ticket = await adapter.resolveStream(item.fileId, qualityId: preferred);
 
   final activeId = ticket.pickActiveQualityId(preferred);
