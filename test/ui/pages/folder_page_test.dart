@@ -15,6 +15,7 @@ import 'package:cloudcine/ui/widgets/storage_meter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../../support/tooltip_finders.dart';
 
 import '../../support/fake_drive.dart';
 
@@ -203,7 +204,7 @@ void main() {
   group('多选批量删除', () {
     /// 进入多选模式。
     Future<void> enterSelection(WidgetTester tester) async {
-      await tester.tap(find.byTooltip('多选（批量删除）'));
+      await tester.tap(byTooltipPrefix('多选'));
       await tester.pumpAndSettle();
     }
 

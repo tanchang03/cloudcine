@@ -14,6 +14,7 @@ import 'package:cloudcine/ui/providers/scan_providers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../../support/tooltip_finders.dart';
 
 /// 媒体库页的**视图切换**与**多选**。
 ///
@@ -149,7 +150,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byTooltip('排序方式'), findsOneWidget);
-    expect(find.byTooltip('多选（批量合并 / 移除）'), findsOneWidget,
+    expect(byTooltipPrefix('多选'), findsOneWidget,
         reason: '多选是作品级的操作，在列表视图里一样要有入口 —— 而列表恰恰是'
             '库大了之后用户真正会用的那个视图。');
   });
@@ -157,7 +158,7 @@ void main() {
   testWidgets('点「选择」进入多选；点卡片是勾选，不是开播', (tester) async {
     final container = await pumpPage(tester);
 
-    await tester.tap(find.byTooltip('多选（批量合并 / 移除）'));
+    await tester.tap(byTooltipPrefix('多选'));
     await tester.pumpAndSettle();
 
     // 页头整条换掉了 —— 那才是「现在是另一种状态」能讲清楚的唯一方式。
@@ -180,7 +181,7 @@ void main() {
   testWidgets('全选勾的是当前列表里可见的那几部', (tester) async {
     final container = await pumpPage(tester);
 
-    await tester.tap(find.byTooltip('多选（批量合并 / 移除）'));
+    await tester.tap(byTooltipPrefix('多选'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('全选 3 部'));
     await tester.pumpAndSettle();
@@ -192,7 +193,7 @@ void main() {
   testWidgets('「合并到…」打开批量合并对话框', (tester) async {
     await pumpPage(tester);
 
-    await tester.tap(find.byTooltip('多选（批量合并 / 移除）'));
+    await tester.tap(byTooltipPrefix('多选'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('片子甲').first);
     await tester.pumpAndSettle();
@@ -212,7 +213,7 @@ void main() {
   testWidgets('退出多选会清空选择（下次进来不会莫名勾着）', (tester) async {
     final container = await pumpPage(tester);
 
-    await tester.tap(find.byTooltip('多选（批量合并 / 移除）'));
+    await tester.tap(byTooltipPrefix('多选'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('片子甲').first);
     await tester.pumpAndSettle();

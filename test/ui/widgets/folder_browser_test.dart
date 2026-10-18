@@ -22,6 +22,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
+import '../../support/tooltip_finders.dart';
 
 import '../../support/fake_drive.dart';
 
@@ -392,11 +393,11 @@ void main() {
     await pumpBrowserWithRouter(tester);
 
     // 三个视频行都没入库：每行各一个播放按钮 + 一个入库按钮。
-    expect(find.byTooltip('直接播放（不加入媒体库）'), findsNWidgets(3));
+    expect(byTooltipPrefix('直接播放'), findsNWidgets(3));
     expect(find.text('加入媒体库'), findsNWidgets(3));
 
     // 右侧那个按钮也要真的能起播（不只是画着好看）。
-    await tester.tap(find.byTooltip('直接播放（不加入媒体库）').first);
+    await tester.tap(byTooltipPrefix('直接播放').first);
     await tester.pumpAndSettle();
     expect(find.textContaining('播放页：'), findsOneWidget);
   });
@@ -503,7 +504,7 @@ void main() {
     // ⚠️ RenderFlex 溢出会以异常形式报出来，所以这里能画完就说明没溢出。
     await pumpBrowserWithRouter(tester, size: const Size(480, 800));
 
-    expect(find.byTooltip('直接播放（不加入媒体库）'), findsNWidgets(3));
+    expect(byTooltipPrefix('直接播放'), findsNWidgets(3));
     expect(find.text('加入媒体库'), findsNWidgets(3));
   });
 }
