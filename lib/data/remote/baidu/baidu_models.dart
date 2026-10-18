@@ -33,7 +33,8 @@ import 'baidu_endpoints.dart';
 /// | `path` | 完整路径 | 取直链与列目录都要它 |
 /// | `size` | 体积 | 目录为 0 |
 /// | `server_mtime` | 修改时间 | unix **秒** |
-/// | `duration` | 时长（秒） | 单位是秒，与夸克一致 |
+/// | `duration` | 时长（秒） | 单位是秒；**默认不下发**，见下一条 |
+/// | `media_info` | 媒体信息字典 | 带 `needmedia=1` 才有，时长在 `media_info.duration` |
 /// | `thumbs` | 缩略图字典 | `url1/url2/url3` 三档 |
 class BaiduMapper {
   const BaiduMapper._();
@@ -144,7 +145,7 @@ class BaiduMapper {
       // 但契约里 `path` 是「展示用路径（由扫描器按遍历栈拼出）」，
       // 两者含义一致，所以这里照填 —— 有真值就用真值。
       path: _asString(json['path']),
-      durationMs: isDir ? null : parseDurationMs(json['duration']),
+      durationMs: isDir ? null : durationMsOf(json),
       // 【未验证】缩略图三档：url1 最小、url3 最大。
       // 与夸克一样，**必须带 Cookie 才能取到**（走 `imageHeaders()`）。
       thumbnailUrl: isDir ? null : _thumb(thumbs, const ['url1', 'url2']),
@@ -574,6 +575,33 @@ class BaiduMapper {
   // ------------------------------------------------------------------
   // 时间与基础类型
   // ------------------------------------------------------------------
+
+  /// 从一条列表项里取时长（毫秒）。**两个位置都认**。
+  ///
+  /// ## 为什么不能只读顶层 `duration`
+  ///
+  /// 百度的 `/api/list` **默认不下发时长** —— 要带 `needmedia=1` 才会给，
+  /// 而且给的位置是 `media_info.duration`（官方文档「查询文件信息」：
+  /// *「视频是否需要展示时长信息，`needmedia=1` 时返回 `duration`，
+  /// 时间单位为秒」*）。顶层 `duration` 只在个别接口 / 老响应里出现过。
+  ///
+  /// ## 拿不到时长的后果（这就是这条存在的原因）
+  ///
+  /// 进度条的分母是时长。时长缺失 ⇒ `PlaylistEntry.hasProgress` 与
+  /// `itemProgressOf` 一律返回「画不出来」⇒ **看过的剧集在列表里一条
+  /// 进度条都不显示**，看起来像从没播过。2026-10-18 实测本机库：
+  /// 百度 40 条媒体项 `duration_ms` **全空**，而其中 6 条
+  /// `max_position_ms` 有值 —— 进度记下来了，只是没分母可除。
+  ///
+  /// 所以两个位置都要读；都读不到才返回 `null`（此时 UI 按「不知道」处理，
+  /// 不画假进度）。
+  static int? durationMsOf(Map<String, Object?> json) {
+    final top = parseDurationMs(json['duration']);
+    if (top != null) return top;
+    final media = json['media_info'];
+    if (media is Map) return parseDurationMs(media['duration']);
+    return null;
+  }
 
   /// 时长解析：百度的 `duration` **单位是秒**（与夸克一致），转毫秒。
   ///

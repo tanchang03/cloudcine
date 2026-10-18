@@ -186,6 +186,67 @@ void main() {
       expect(e!.durationMs, isNull);
     });
 
+    // ───────────────────────────────────────────────────────────────
+    // 时长：**默认位置是 `media_info.duration`**，不是顶层
+    // ───────────────────────────────────────────────────────────────
+    //
+    // 百度 `/api/list` 默认**根本不下发时长**；带 `needmedia=1` 才给，
+    // 且给在 `media_info` 里（官方文档「查询文件信息」：*「视频是否需要
+    // 展示时长信息，`needmedia=1` 时返回 `duration`，时间单位为秒」*）。
+    //
+    // 只读顶层的话，这条链会在**完全不报错**的情况下断掉：库里
+    // `duration_ms` 恒为 NULL ⇒ 进度条分母为零 ⇒ 看过的剧集一条线都不画
+    // （2026-10-18 实测本机库：百度 40 条媒体项时长全空）。
+
+    test('时长在 media_info.duration 里（needmedia=1 的形状）', () {
+      final e = BaiduMapper.toEntry({
+        'fs_id': 1,
+        'server_filename': 'a.mkv',
+        'media_info': {'duration': 2587, 'width': 3840, 'height': 2160},
+      });
+      expect(e!.durationMs, 2587000);
+    });
+
+    test('顶层与 media_info 都有时以顶层为准（个别接口的老形状）', () {
+      final e = BaiduMapper.toEntry({
+        'fs_id': 1,
+        'server_filename': 'a.mkv',
+        'duration': 60,
+        'media_info': {'duration': 2587},
+      });
+      expect(e!.durationMs, 60000);
+    });
+
+    test('media_info 里没有 duration（或为 0）→ null，不编一个 0', () {
+      expect(
+        BaiduMapper.toEntry({
+          'fs_id': 1,
+          'server_filename': 'a.mkv',
+          'media_info': <String, Object?>{},
+        })!.durationMs,
+        isNull,
+      );
+      expect(
+        BaiduMapper.toEntry({
+          'fs_id': 1,
+          'server_filename': 'a.mkv',
+          'media_info': {'duration': 0},
+        })!.durationMs,
+        isNull,
+      );
+    });
+
+    test('media_info 是脏数据（字符串/数组）→ 不崩，退成 null', () {
+      expect(
+        BaiduMapper.toEntry({
+          'fs_id': 1,
+          'server_filename': 'a.mkv',
+          'media_info': 'nope',
+        })!.durationMs,
+        isNull,
+      );
+    });
+
     test('server_mtime 是 unix **秒**', () {
       final e = BaiduMapper.toEntry({
         'fs_id': 1,

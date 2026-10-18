@@ -65,6 +65,7 @@
 - ⛔⛔ 与夸克**三处结构性差异**：目录标识是**路径**（`dir=/电影`，`rootId='/'`）· 列表在**顶层 `list`** · 目录位 **`isdir:1`**。⛔ 原画哨兵用 `kOriginalQualityId`。
 - ★★ **多网盘并存（无「当前网盘」）**：`AuthState` = `Map<DriveProvider,CloudAccount>`；`CloudDriveAdapter` = 唯一架构边界（新网盘 = 实现 adapter + 加枚举值，须 `extends` 继承四个 `unsupported`）。⛔ 用到网盘处都收**显式** `DriveProvider`。选择器 `browseDriveChoiceProvider`/`scanDriveChoiceProvider`（默认首个已连盘，无则 quark）、`backupDriveProvider` = 首个 `canWrite`。⛔ `QrLoginDriver` 由**工厂**产出（⛔ 不能 `family`）。
 - ★★ **进度存储不认厂家**：键一律 `MediaItem.id` = `provider:fileId`（`baidu:<fs_id>`）⇒ 两家共用同一份 `playback_progress.json`、同一组三列、同一套 LWW，**不加第二套存储**。守卫 `test/data/progress_provider_parity_test.dart`。⛔ 漏传 `provider:` = 静默互相覆盖。⚠️ 进度文件**上传**仍只落夸克（百度只读）。
+- ★★ **进度条的分母是时长**（`hasProgress`/`itemProgressOf` 都要求 `duration>0`）⇒ 时长缺失 = **进度条整条不画**（看起来像没看过）。百度 `/api/list` 默认**不下发时长**，须带 `needmedia=1` 且读 **`media_info.duration`**（秒）；`/api/search` 同理。★ 兜底 = `saveDurationIfMissing`（只在空时写）由两条播放路径按实测时长回填。⛔⛔ `_toCompanion` 更新路径对 `durationMs == null` 必须 `Value.absent()`，否则重扫把回填值抹成 NULL。守卫 `db_duration_backfill_test.dart`。
 
 ## 测试 / 环境
 - 纯函数优先、断言写「为什么」；⛔ **每个需求只跑相关单测，不回归全量**；修 bug **先加测试确认红**。Android 用 `:app:testDebugUnitTest --tests '…library.*'`。⛔ 断言**终态**；终态前夹真 IO ⇒ 轮询（`_settleUntil`）。

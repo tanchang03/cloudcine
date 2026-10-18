@@ -837,6 +837,27 @@ class DriftMediaRepository implements MediaRepository {
   }
 
   @override
+  Future<void> saveDurationIfMissing(String itemId, Duration duration) async {
+    // 零 / 负数是「不知道」，不是「时长 0 秒」。写成 0 会让进度条的分母
+    // 判定从「缺失」变成「有值」，从而画出 `x / 0` 这种越界比例。
+    if (duration <= Duration.zero) return;
+
+    // 「只在还没有时写」必须由**一条**语句保证，理由与 `saveMaxPosition`
+    // 的 `max()` 相同：先读后写会让两次并发回报互相覆盖。
+    //
+    // `duration_ms <= 0` 也要算「还没有」—— 老库里可能有写成 0 的行
+    // （那不是「零长度文件」，而是「当时不知道」）。
+    await _db.customStatement(
+      'UPDATE media_items SET duration_ms = ? '
+      'WHERE id = ? AND (duration_ms IS NULL OR duration_ms <= 0)',
+      <Object?>[duration.inMilliseconds, itemId],
+    );
+
+    // ⛔ 这里**不写进度库**：时长是文件元数据，不是播放进度。
+    //    `playback_progress.json` 的契约里没有它，也不该为它加一项。
+  }
+
+  @override
   Future<int> applyProgressSnapshot(ProgressBook book) async {
     if (book.isEmpty) return 0;
 
@@ -2640,7 +2661,13 @@ class DriftMediaRepository implements MediaRepository {
         resolution: Value(item.resolution?.label),
         sizeBytes: Value(item.sizeBytes),
         modifiedAt: Value(item.modifiedAt),
-        durationMs: Value(item.durationMs),
+        // 更新路径上**只在有新值时写**（与下面 `thumbUrl` 同一条理由）：
+        // 时长会由播放器实测回填（`saveDurationIfMissing`），而**扫描拿不到
+        // 时长时是 `null`**（百度默认不下发）。直接写 null 会把回填的值抹掉，
+        // 现象是「重新扫描一次，进度条又全没了」—— 而扫描本身不报任何错。
+        durationMs: skipFirstSeen && item.durationMs == null
+            ? const Value.absent()
+            : Value(item.durationMs),
         source: Value(item.source),
         videoCodec: Value(item.videoCodec),
         audioCodec: Value(item.audioCodec),

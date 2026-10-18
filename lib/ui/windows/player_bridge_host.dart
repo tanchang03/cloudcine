@@ -122,6 +122,15 @@ final playerBridgeHostProvider = Provider<void>((ref) {
     // 独立一段、独立 try —— 它失败不该让「续播点写失败」这条日志说谎。
     try {
       await repo.saveMaxPosition(report.itemId, report.position);
+      // 顺手把**实测时长**补进库（只在库里没有时写）。
+      //
+      // 有些网盘不返回时长（百度默认不带 `needmedia=1` 就是这样），于是这些
+      // 条目的进度条永远画不出来 —— 分母为零。播放器此刻手里的
+      // `report.duration` 是解封装得到的**权威值**，与网盘元数据无关。
+      //
+      // ⚠️ 必须排在下面那次 `bump()` **之前**：反过来的话详情页收到刷新
+      //    信号时读到的还是没有时长的行，进度条要再等一轮才出现。
+      await repo.saveDurationIfMissing(report.itemId, report.duration);
       // 写完再推刷新信号（理由同 `app_providers.dart`：先推的话详情页会读到
       // 还没落盘的值，进度条永远慢一拍）。只影响详情页，不影响海报墙 ——
       // 那是 `playbackLibraryLinkProvider` 的事，两者分工见那个文件。

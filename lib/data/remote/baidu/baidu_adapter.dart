@@ -359,6 +359,19 @@ class BaiduAdapter extends CloudDriveAdapter {
           'showempty': 0,
           // 让服务端顺带带上缩略图字段（`thumbs`）。
           'web': 1,
+          // ⭐ 让服务端顺带下发**时长**（`media_info.duration`，单位秒）。
+          //
+          // 时长是进度条的分母。不带这个参数时百度**完全不返回时长**，
+          // 于是「看过的剧集」在播放器右侧面板与详情页文件列表里都画不出
+          // 那条历史进度条 —— 而它看起来和「从没播过」一模一样。2026-10-18
+          // 实测本机库：百度 40 条媒体项 `duration_ms` 全空。
+          //
+          // 【未验证】`needmedia` 是官方「查询文件信息」文档里的参数
+          // （*「视频是否需要展示时长信息，`needmedia=1` 时返回 `duration`」*）；
+          // `/api/list` 是否同样认它，本机没有凭证可实测。它只增不减地
+          // 多要一个字段：万一服务端不认，也只是回到「没有时长」的旧行为，
+          // 不会让列表本身失败（`durationMsOf` 两个位置都读，读不到给 null）。
+          'needmedia': 1,
         }),
         context: '列目录',
       ),
@@ -413,6 +426,9 @@ class BaiduAdapter extends CloudDriveAdapter {
           // 的概念，结果会是一个奇怪的子集）。
           'recursion': 1,
           'web': 1,
+          // 与 `listDirectory` 同一条理由：搜索结果也要带时长，
+          // 否则「搜到的文件」入库后同样画不出进度条。
+          'needmedia': 1,
         }),
         context: '搜索',
       ),

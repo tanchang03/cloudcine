@@ -1073,8 +1073,19 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _engineSubs.add(
       engine.duration.listen((d) {
         if (d == _duration) return;
+        final hadDuration = _duration > Duration.zero;
         _duration = d;
         if (d > Duration.zero) _clearAwaitingFrame();
+        // 时长**第一次**拿到时重画一次。
+        //
+        // 面板那一行进度条的分母可以是这个值（有些网盘不下发时长，见
+        // [episodeHasProgress]）。而面板是普通 widget，不订阅 `duration` ——
+        // 不主动重画的话，用户「先开面板、再起播」就看不到当前这一集的
+        // 进度条，得关掉面板再打开一次。
+        //
+        // 只在「从没有到有」那一刻刷：`duration` 后续每次变化都刷的话，
+        // 整窗会跟着 seek 抖动。
+        if (mounted && !hadDuration) setState(() {});
       }),
     );
     _engineSubs.add(
@@ -4153,6 +4164,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 文件名还是集号、动效只画在当前那一行、副标题怎么拼，错了都不会抛异常，
   /// 只会看起来「本来就是这么设计的」。
   Widget _buildEpisodeTile(PlaylistEntry entry, {required bool current}) {
+    // 当前这一集的时长播放器自己最清楚（解封装拿到的权威值）。网盘没下发
+    // 时长时，用它当分母 —— 否则「刚看过的那一集」在面板上一条进度条都没有，
+    // 而它看起来与「从没播过」完全一样。非当前行拿不到这个值，照旧不画。
+    final knownDuration = current ? _duration : null;
     return EpisodeTile(
       // ⚠️ 按**条目**给键，不是按位置。缩略图那一格是有状态的（异步取图），
       // 无键时 `ListView.builder` 会让「第 3 行的 State」跟着**索引**走 ——
@@ -4161,7 +4176,9 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       key: ValueKey(entry.itemId),
       entry: entry,
       current: current,
-      progress: episodeProgressOf(entry),
+      progress: episodeProgressOf(entry, knownDuration: knownDuration),
+      showProgress:
+          episodeHasProgress(entry, knownDuration: knownDuration),
       onTap: () => unawaited(_openEpisode(entry)),
     );
   }
@@ -5529,6 +5546,7 @@ class EpisodeTile extends StatelessWidget {
     required this.entry,
     required this.current,
     required this.progress,
+    this.showProgress,
     this.onTap,
   });
 
@@ -5539,6 +5557,13 @@ class EpisodeTile extends StatelessWidget {
 
   /// 看过多少（0..1）。见 [episodeProgressOf]。
   final double progress;
+
+  /// 要不要画那条细进度条。`null` = 按 [PlaylistEntry.hasProgress] 判。
+  ///
+  /// 为什么需要外部传入：库里没有时长、但播放器实测到了时长时，
+  /// [PlaylistEntry.hasProgress] 会判成「画不出来」，而那条线其实该画
+  /// （分母是现成的）。判据见 [episodeHasProgress]。
+  final bool? showProgress;
 
   final VoidCallback? onTap;
 
@@ -5605,7 +5630,7 @@ class EpisodeTile extends StatelessWidget {
                       ),
                     ),
                   ],
-                  if (entry.hasProgress) ...[
+                  if (showProgress ?? entry.hasProgress) ...[
                     const SizedBox(height: 5),
                     ClipRRect(
                       borderRadius: BorderRadius.circular(2),
@@ -5791,10 +5816,40 @@ Future<String?> fetchEpisodeThumbnail(String itemId, String url) async {
 ///
 /// 时长未知时返回 0 —— 画一条满格或半格的**假**进度比不画更误导。
 /// 抽成顶层纯函数是为了能直接单测「时长未知不画假进度」这条。
-double episodeProgressOf(PlaylistEntry entry) {
-  final total = entry.duration.inMilliseconds;
-  if (total <= 0) return 0;
-  return (entry.maxPosition.inMilliseconds / total).clamp(0.0, 1.0);
+///
+/// [knownDuration] 是**播放器实测到的**时长，只在 `entry.duration` 缺失时
+/// 用作分母（见 [_episodeTotal]）。
+double episodeProgressOf(PlaylistEntry entry, {Duration? knownDuration}) {
+  final total = _episodeTotal(entry, knownDuration);
+  if (total <= Duration.zero) return 0;
+  return (entry.maxPosition.inMilliseconds / total.inMilliseconds)
+      .clamp(0.0, 1.0);
+}
+
+/// 面板该不该画那条细进度条。
+///
+/// 规则与 [PlaylistEntry.hasProgress] 完全一致（看过一点 + 分母已知），
+/// 唯一区别是允许 [knownDuration] 补上缺失的分母。**与
+/// [episodeProgressOf] 共用 [_episodeTotal]** —— 两处各写一份「分母取哪个」
+/// 的话，迟早出现「条画出来了、比例恒为 0」这种自相矛盾的组合。
+bool episodeHasProgress(PlaylistEntry entry, {Duration? knownDuration}) {
+  final total = _episodeTotal(entry, knownDuration);
+  return entry.maxPosition > Duration.zero && total > Duration.zero;
+}
+
+/// 进度条的分母：优先库里存的时长，缺失时用播放器实测的。
+///
+/// ## 为什么要这个兜底
+///
+/// 有些网盘**不下发时长**（百度默认不带 `needmedia=1` 就是这样），库里那一列
+/// 是 NULL。此时 `entry.duration` 为零，进度条被判成「画不出来」—— 于是
+/// **看过的剧集在面板上一条线都没有**，看起来像从没播过。
+///
+/// 而当前正在播的那一集，播放器自己知道时长（解封装拿到的权威值），
+/// 没有理由不用它当分母。
+Duration _episodeTotal(PlaylistEntry entry, Duration? knownDuration) {
+  if (entry.duration > Duration.zero) return entry.duration;
+  return knownDuration ?? Duration.zero;
 }
 
 /// 清晰度选择菜单。

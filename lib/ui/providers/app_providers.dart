@@ -414,9 +414,20 @@ final playbackControllerProvider = Provider<PlaybackController>((ref) {
     // 这一个记「看到哪儿了」（决定进度条）。一个失败不该带走另一个。
     unawaited(
       repo.saveMaxPosition(item.id, position).then((_) {
-        // ⚠️ 写完**再**推刷新信号：反过来的话，详情页收到信号去读库时
-        // 这一笔还没落盘，进度条永远慢一拍（每 10 秒白刷一次）。
-        ref.read(playbackProgressSignalProvider.notifier).bump();
+        // 顺手补**实测时长**（只在库里没有时写）。进度条的比例是
+        // 「历史最大位置 / 时长」，有些网盘不下发时长（百度默认不带
+        // `needmedia=1`），那些条目的分母恒为零 ⇒ 看过的剧集也画不出进度条。
+        // 控制器手里的时长是解封装得到的权威值，与网盘元数据无关。
+        //
+        // ⚠️ 排在 `bump()` **之前**：先推信号的话，详情页读到的还是
+        // 没有时长的行，那条进度条要再等一轮才出现。
+        return repo
+            .saveDurationIfMissing(item.id, controller.duration)
+            .then((_) {
+          // ⚠️ 写完**再**推刷新信号：反过来的话，详情页收到信号去读库时
+          // 这一笔还没落盘，进度条永远慢一拍（每 10 秒白刷一次）。
+          ref.read(playbackProgressSignalProvider.notifier).bump();
+        });
       }).catchError((Object e) {
         diag.error('播放', '历史进度落库失败：$e');
       }),

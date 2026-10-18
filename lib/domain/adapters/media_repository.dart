@@ -520,6 +520,25 @@ abstract class MediaRepository {
   /// 起播那一刻位置就是 0，那时抹掉用户攒下的进度是最坏的结果。
   Future<void> saveMaxPosition(String itemId, Duration position);
 
+  /// 用**播放器实测到的**时长补齐 [itemId] 的 `duration_ms`。
+  ///
+  /// ## 为什么需要它（进度条缺分母）
+  ///
+  /// 进度条的比例是 `历史最大位置 / 时长`。有些网盘**不返回时长**
+  /// （百度默认不带 `needmedia=1` 时就是这样），于是那些条目的
+  /// `duration_ms` 是 NULL ⇒ 分母为零 ⇒ `itemProgressOf` /
+  /// `episodeProgressOf` 判定「画不出来」，**看过的剧集一条进度条都没有**。
+  ///
+  /// 而播放器在起播几秒后必然知道真实时长（解封装拿到的就是权威值），
+  /// 所以这里把它落库 —— 与网盘元数据无关，任何片源都能自愈。
+  ///
+  /// ## 只在「还没有」时写
+  ///
+  /// 已有值一律不动：扫描入库的元数据与实测值通常一致，反复覆盖只会把
+  /// 整张表的页标脏，而收益是零。传零 / 负数同样是**无操作**
+  /// （「不知道」不该被写成 `0`，那会让分母为零的判据悄悄变成「有时长」）。
+  Future<void> saveDurationIfMissing(String itemId, Duration duration);
+
   /// 把**独立进度库**里的进度回填进媒体项行（只动上面那三列）。
   ///
   /// ## 为什么需要它
@@ -1347,6 +1366,18 @@ class InMemoryMediaRepository implements MediaRepository {
     // 只增不减。回拖 / 重看都不该让它倒退。
     if (stored != null && stored >= position) return;
     _maxPositions[itemId] = position;
+  }
+
+  @override
+  Future<void> saveDurationIfMissing(String itemId, Duration duration) async {
+    // 与 drift 实现同一口径：零 / 负数是「不知道」，不写。
+    if (duration <= Duration.zero) return;
+    final item = _items[itemId];
+    // 库里没有这一行 → 没有可回填的落点（进度不决定条目存不存在）。
+    if (item == null) return;
+    final stored = item.durationMs;
+    if (stored != null && stored > 0) return;
+    _items[itemId] = item.copyWith(durationMs: duration.inMilliseconds);
   }
 
   @override

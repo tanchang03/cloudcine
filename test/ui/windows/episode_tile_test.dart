@@ -53,6 +53,8 @@ void main() {
     WidgetTester tester,
     PlaylistEntry e, {
     required bool current,
+    Duration? knownDuration,
+    bool? showProgress,
   }) async {
     await tester.pumpWidget(MaterialApp(
       theme: AppTheme.dark(),
@@ -62,7 +64,8 @@ void main() {
           child: EpisodeTile(
             entry: e,
             current: current,
-            progress: episodeProgressOf(e),
+            progress: episodeProgressOf(e, knownDuration: knownDuration),
+            showProgress: showProgress,
           ),
         ),
       ),
@@ -206,6 +209,80 @@ void main() {
         )),
         closeTo(0.5, 0.001),
       );
+    });
+  });
+
+  /// 库里**没有时长**时，用播放器实测到的时长当分母。
+  ///
+  /// ## 这条守的是百度那种「不下发时长」的网盘
+  ///
+  /// 百度 `/api/list` 默认不带 `needmedia=1` ⇒ 响应里根本没有时长 ⇒
+  /// `media_items.duration_ms` 为 NULL ⇒ 进度条分母为零 ⇒ **看过的剧集
+  /// 一条线都不画**，与「从没播过」长得一模一样（2026-10-18 实测本机库：
+  /// 百度 40 条媒体项时长全空，其中 6 条已有历史进度）。
+  ///
+  /// 而当前正在播的那一集，播放器解封装就知道时长 —— 没有理由不用它。
+  group('库里没有时长时用播放器实测值兜底', () {
+    test('分母缺失时用 knownDuration 算出比例', () {
+      expect(
+        episodeProgressOf(
+          entry(resume: const Duration(minutes: 15), duration: Duration.zero),
+          knownDuration: const Duration(minutes: 60),
+        ),
+        closeTo(0.25, 0.001),
+      );
+    });
+
+    test('库里有值时**优先用库里的**（实测值只是兜底）', () {
+      expect(
+        episodeProgressOf(
+          entry(resume: const Duration(minutes: 15), duration: const Duration(minutes: 30)),
+          knownDuration: const Duration(minutes: 60),
+        ),
+        closeTo(0.5, 0.001),
+      );
+    });
+
+    test('两边都没有分母 → 比例 0、且不该画', () {
+      final e = entry(resume: const Duration(minutes: 15), duration: Duration.zero);
+      expect(episodeProgressOf(e), 0);
+      expect(episodeHasProgress(e), isFalse);
+      expect(episodeHasProgress(e, knownDuration: Duration.zero), isFalse);
+    });
+
+    test('看过一点 + 兜底分母 → 该画', () {
+      final e = entry(resume: const Duration(minutes: 15), duration: Duration.zero);
+      expect(
+        episodeHasProgress(e, knownDuration: const Duration(minutes: 60)),
+        isTrue,
+        reason: '这正是百度剧集缺进度条的那一格：进度有、时长没有。',
+      );
+    });
+
+    testWidgets('渲染出来真有一条进度条，比例按兜底分母算', (tester) async {
+      await render(
+        tester,
+        entry(resume: const Duration(minutes: 15), duration: Duration.zero),
+        current: true,
+        knownDuration: const Duration(minutes: 60),
+        showProgress: true,
+      );
+
+      final bar = tester.widget<LinearProgressIndicator>(
+        find.byType(LinearProgressIndicator),
+      );
+      expect(bar.value, closeTo(0.25, 0.001));
+      await unmount(tester);
+    });
+
+    testWidgets('没传 showProgress 时仍按库里的时长判 —— 不画假进度', (tester) async {
+      await render(
+        tester,
+        entry(resume: const Duration(minutes: 15), duration: Duration.zero),
+        current: true,
+      );
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+      await unmount(tester);
     });
   });
 }
