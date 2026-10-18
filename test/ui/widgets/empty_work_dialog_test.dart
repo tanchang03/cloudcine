@@ -4,7 +4,6 @@ import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:cloudcine/domain/services/empty_work_removal.dart';
 import 'package:cloudcine/ui/providers/app_providers.dart';
-import 'package:cloudcine/ui/providers/library_providers.dart';
 import 'package:cloudcine/ui/theme/app_theme.dart';
 import 'package:cloudcine/ui/widgets/empty_work_dialog.dart';
 import 'package:flutter/material.dart';
