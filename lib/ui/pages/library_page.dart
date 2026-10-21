@@ -15,6 +15,7 @@ import '../providers/app_providers.dart';
 import '../providers/auth_providers.dart';
 import '../providers/follow_providers.dart';
 import '../providers/library_providers.dart';
+import '../providers/library_removal_providers.dart';
 import '../providers/library_selection_providers.dart';
 import '../providers/scan_providers.dart';
 import '../providers/scrape_providers.dart';
@@ -25,6 +26,7 @@ import '../widgets/common_widgets.dart';
 import '../widgets/empty_work_dialog.dart';
 import '../widgets/library_batch_delete_dialog.dart';
 import '../widgets/library_filter_panel.dart';
+import '../widgets/library_removal_progress_dialog.dart';
 import '../widgets/play_action.dart';
 import '../widgets/poster_image.dart';
 import '../widgets/tv_affordance.dart';
@@ -2128,15 +2130,16 @@ class _SelectionHeader extends ConsumerWidget {
     );
   }
 
-  /// 把勾选的这批量作品从**媒体库索引**里移除（网盘文件不动）。
+  /// 把勾选的这批量作品从**媒体库索引**里移除（网盘文件默认不动）。
   ///
   /// 与 [_mergeSelected] 一样，作品对象**重新从库里读**：用户勾完之后列表
   /// 可能被后台扫描重建过，手上那份可能是旧的 —— 拿旧行算「N 部」，
   /// 提示里的数字会和实际删掉的对不上。
   ///
-  /// ⚠️ 这里删的是**本地索引**（重新扫描可找回），不是网盘文件。删网盘
-  ///    文件那条路在侧栏「文件夹」页；文案上的区别见
-  ///    [LibraryBatchDeletePlan.keepFilesWarning]。
+  /// ⚠️ 默认删的是**本地索引**（重新扫描可找回），不是网盘文件。删网盘
+  ///    文件是确认框里那个**默认关闭**的勾选（见
+  ///    [LibraryBatchDeletePlan.alsoDeleteFromDrive]），勾上之后才走
+  ///    [LibraryRemovalController.remove] 的网盘那一段。
   Future<void> _removeSelected(BuildContext context, WidgetRef ref) async {
     final messenger = ScaffoldMessenger.of(context);
     final repo = ref.read(mediaRepositoryProvider);
@@ -2148,12 +2151,37 @@ class _SelectionHeader extends ConsumerWidget {
     if (works.isEmpty) return;
     if (!context.mounted) return;
 
-    final plan = LibraryBatchDeletePlan(works: works);
-    final confirmed = await LibraryBatchDeleteDialog.show(context, plan);
-    if (confirmed != true) return;
+    // 先数清这批作品名下的网盘文件 —— 弹窗上那个「会删 N 个」必须在用户
+    // 勾之前就写出来，而它得与真正去删的集合同一口径（同一个 tally）。
+    final removal = ref.read(libraryRemovalControllerProvider);
+    final tally = await removal.tally(keys);
+    if (!context.mounted) return;
 
-    final removedItems =
-        await ref.read(missingMediaControllerProvider).removeWorks(keys);
+    final plan = LibraryBatchDeletePlan(
+      works: works,
+      driveFileCount: tally.deletable,
+      undeletableFileCount: tally.undeletable,
+    );
+    final choice = await LibraryBatchDeleteDialog.show(context, plan);
+    if (choice == null) return;
+    if (!context.mounted) return;
+
+    // 勾了「一并删网盘」才套进度层：那一步是几百个文件、每批 100 个往
+    // 网盘打请求，几秒到几十秒；而只清索引是本地的，几十毫秒就完，为它
+    // 盖一层模态只会闪一下。
+    final LibraryRemovalOutcome outcome;
+    if (choice.alsoDeleteFromDrive) {
+      outcome = await showRemovalProgress<LibraryRemovalOutcome>(
+        context: context,
+        task: (report) => removal.remove(
+          keys: keys,
+          alsoDeleteFromDrive: true,
+          onProgress: report,
+        ),
+      );
+    } else {
+      outcome = await removal.remove(keys: keys);
+    }
     // 移除完立刻退出多选：列表里那几部已经不见了，而顶栏还写着
     // 「已选 N 部」—— 一个指向不存在的东西的计数。
     ref.read(librarySelectionProvider.notifier).exit();
@@ -2162,7 +2190,12 @@ class _SelectionHeader extends ConsumerWidget {
     messenger.showSnackBar(
       SnackBar(
         behavior: SnackBarBehavior.floating,
-        content: Text(plan.doneMessage(removedItems: removedItems)),
+        content: Text(
+          plan.doneMessage(
+            removedItems: outcome.removedItems,
+            drive: outcome.drive,
+          ),
+        ),
       ),
     );
   }

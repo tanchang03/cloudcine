@@ -177,9 +177,155 @@ class LibraryBatchRemoveGuardTest {
     }
 
     // ------------------------------------------------------------------
-    // 仓储层
+    // 「一并删网盘」那一档（2026-10-21）
     // ------------------------------------------------------------------
 
+    /**
+     * 确认框必须给出**两档**，且「只移除索引」排在前面（光标默认停在它上面）。
+     *
+     * ⛔ 顺序不是排版偏好：`showOverlay` 的 `overlayIndex` 从 0 开始，第一个
+     *    非取消项就是用户按 OK 会直接落到的那一档。把「一并删网盘」排在前面，
+     *    等于让一次顺手确认删掉一季的片子 —— 而那是不可逆的。
+     */
+    @Test
+    fun `确认框给两档且默认是只移除索引`() {
+        val code = codeOnly(readSource(activityFile))
+        val fn = braceBlock(code, "private fun confirmRemoveSelected() {")
+        assertTrue(
+            "没能抽出 `confirmRemoveSelected` 函数体 —— 正则已与源文件脱节，请修正本测试",
+            fn.isNotEmpty(),
+        )
+        assertTrue(
+            "确认框里没有「只移除索引（网盘文件保留）」这一档。\n" +
+                "用户对「移除」的预期是「文件也没了」，这一档必须把「文件还在」说出来。",
+            fn.contains("只移除索引"),
+        )
+        assertTrue(
+            "确认框里没有「一并删除网盘文件（不可撤销）」这一档。\n" +
+                "缺了它，用户想真的清掉片子时只能去目录视图一个个删。",
+            fn.contains("一并删除网盘文件"),
+        )
+        val localOnly = fn.indexOf("alsoDeleteDrive = false")
+        val withDrive = fn.indexOf("alsoDeleteDrive = true")
+        assertTrue(
+            "两档的动作没接上（找不到 `alsoDeleteDrive = false / true` 两个调用）。",
+            localOnly >= 0 && withDrive >= 0,
+        )
+        assertTrue(
+            "「一并删网盘」排在了「只移除索引」前面。\n" +
+                "光标默认停在第一档，顺序反了等于让一次顺手确认就永久删掉网盘上的片子。",
+            localOnly < withDrive,
+        )
+    }
+
+    /**
+     * 勾了「一并删」时必须**先删网盘、再删索引**。
+     *
+     * fid 只存在 `media_items` 里（`provider:fileId`），`deleteWorks` 一跑
+     * 就再也查不到那些 fid 了。顺序反了的表现是「勾了删网盘，网盘上一个都
+     * 没少」，而且日志干净、不报错。
+     */
+    @Test
+    fun `一并删网盘时先删网盘再删索引`() {
+        val code = codeOnly(readSource(activityFile))
+        val fn = braceBlock(code, "private fun doRemoveSelected(alsoDeleteDrive: Boolean) {")
+        assertTrue(
+            "没能抽出 `doRemoveSelected(alsoDeleteDrive: Boolean)` —— 正则已与源文件脱节",
+            fn.isNotEmpty(),
+        )
+        assertTrue(
+            "`doRemoveSelected` 没有调 `deleteFiles(`。\n" +
+                "勾了「一并删网盘」却只删本地索引 —— 网盘上原样还在。",
+            fn.contains("deleteFiles("),
+        )
+        assertTrue(
+            "`deleteFiles(` 必须排在 `db.deleteWorks(` 之前。\n" +
+                "反过来的话 fid 已经随索引行一起没了，网盘上一个都删不掉，且不报错。",
+            fn.indexOf("deleteFiles(") < fn.indexOf("db.deleteWorks("),
+        )
+    }
+
+    /**
+     * 删网盘期间，屏幕上那行字必须**每批都动一次**。
+     *
+     * 几百个文件要打好几批请求（每批 100 个），几十秒都正常。一行不动的
+     * 「正在删除…」在电视上等价于「按了没反应」—— 用户唯一的下一步动作是
+     * 连按返回键（而删除请求早就发出去了，退出去只会让他看不到结果）。
+     *
+     * ⚠️ 分批循环本身在 `library/BatchFileDeleter` 里，由
+     *    `BatchFileDeleterTest` 用假网盘跑（那是这条链路上唯一能在 JVM 里
+     *    跑起来的一段）。这里只管**接线**：Activity 有没有把进度回调接上、
+     *    有没有走那个类。
+     */
+    @Test
+    fun `删网盘期间每批刷新一次进度`() {
+        val code = codeOnly(readSource(activityFile))
+        val fn = braceBlock(code, "private fun doRemoveSelected(alsoDeleteDrive: Boolean) {")
+        assertTrue(
+            "没能抽出 `doRemoveSelected(alsoDeleteDrive: Boolean)` —— 正则已与源文件脱节",
+            fn.isNotEmpty(),
+        )
+        assertTrue(
+            "`doRemoveSelected` 没有走 `BatchFileDeleter.delete(`。\n" +
+                "分批 / 失败计数 / 进度那条逻辑在它里面，绕过去就只剩一份没人测的循环。",
+            fn.contains("BatchFileDeleter.delete("),
+        )
+        assertTrue(
+            "`doRemoveSelected` 里没有「正在删除网盘文件 x/N」这行进度。\n" +
+                "只有开头那一句「正在删除 N 部（含网盘文件）…」的话，接下来几十秒里\n" +
+                "屏幕完全静止 —— 电视用户会以为卡死。",
+            fn.contains("正在删除网盘文件"),
+        )
+        assertTrue(
+            "进度回调没有接给 `BatchFileDeleter`（找不到 `onProgress =`）。\n" +
+                "循环照样跑，只是屏幕上再也不更新。",
+            fn.contains("onProgress ="),
+        )
+        assertTrue(
+            "网盘删完、清索引之前没有换一句话（`正在清理媒体库…`）。\n" +
+                "数字停在满格上不动，用户会以为已经结束、只是界面没反应过来。",
+            fn.contains("正在清理媒体库"),
+        )
+    }
+
+    /**
+     * 退出多选时，右上角那一行必须**贴回常态文案**。
+     *
+     * 多选态借用 `status` 这一行写「多选移除：已选 N 部」。退出时只恢复
+     * 标题、不恢复这一行的话，右上角会一直挂着「已选 N 部」—— 用户以为
+     * 还在多选里，按 OK 却进了简介页。
+     *
+     * ⚠️ 这条是 2026-10-21 **真机**跑出来的：单测、静态分析、守卫测试
+     *    全绿，只有坐到电视前按一遍返回键才看得见。
+     */
+    @Test
+    fun `退出多选会把状态行贴回去`() {
+        val code = codeOnly(readSource(activityFile))
+        val apply = braceBlock(code, "private fun applyWorks(list: List<Work>, statusText: String) {")
+        assertTrue(
+            "没能抽出 `applyWorks` —— 正则已与源文件脱节，请修正本测试",
+            apply.isNotEmpty(),
+        )
+        assertTrue(
+            "`applyWorks` 没有把常态文案记进 `worksStatus`。\n" +
+                "不记下来的话，退出多选时没有任何东西可以贴回去。",
+            apply.contains("worksStatus = statusText"),
+        )
+        val fn = braceBlock(code, "private fun refreshSelectionUi() {")
+        assertTrue(
+            "没能抽出 `refreshSelectionUi` —— 正则已与源文件脱节，请修正本测试",
+            fn.isNotEmpty(),
+        )
+        assertTrue(
+            "`refreshSelectionUi` 的退出分支里没有 `status.text = worksStatus`。\n" +
+                "现象：退出多选后右上角永远停在「多选移除：已选 N 部」。",
+            fn.contains("status.text = worksStatus"),
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // 仓储层
+    // ------------------------------------------------------------------
     /** `deleteWorks` 必须存在，且四张表一起删。 */
     @Test
     fun `deleteWorks 删四张表`() {

@@ -44,6 +44,7 @@ import com.cloudcine.tv.library.EpisodeThumbs
 import com.cloudcine.tv.library.FollowAutoCheck
 import com.cloudcine.tv.library.FollowUpdater
 import com.cloudcine.tv.library.LibraryBackupService
+import com.cloudcine.tv.library.BatchFileDeleter
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
@@ -1118,6 +1119,16 @@ class LibraryActivity : Activity() {
         }
     }
 
+    /**
+     * 作品墙上**非多选态**的状态行文案（右上角那一行）。
+     *
+     * ⛔ 退出多选时必须把它贴回去。多选态借用同一行写「已选 N 部」，
+     *    退出时只恢复标题、不恢复这一行的话，右上角会一直挂着
+     *    「多选移除：已选 1 部」—— 用户以为还在多选里，按 OK 却进了简介页。
+     *    （2026-10-21 真机跑出来的，静态检查看不出来。）
+     */
+    private var worksStatus = ""
+
     private fun defaultStatus(s: Snapshot): String = when {
         // ⛔ 追剧视图空的时候**不能**说「这个分类下没有作品」—— 那会让用户以为
         //    库里没东西。真正的原因是「你还没在追任何剧」，而出口在简介页。
@@ -1148,6 +1159,9 @@ class LibraryActivity : Activity() {
         barScroll.visibility = View.VISIBLE
         title.text = if (selecting) "媒体库 · 批量移除" else "媒体库"
         status.text = statusText
+        // 只在**非多选态**记：多选开着的时候这一行写的是「已选 N 部」，
+        // 记下来就等于把多选文案当成常态文案，退出时又贴回去一遍。
+        if (!selecting) worksStatus = statusText
         // ⛔ 多选开着时提示行说的是**多选**那套键（OK = 勾选）：
         //    `loadWorks` 会在扫描 / 筛选变化时重跑，不跟着换的话用户照着
         //    提示按 OK，结果点进了一部片子里。
@@ -3454,52 +3468,189 @@ class LibraryActivity : Activity() {
             title.text = "媒体库 · 批量移除"
         } else {
             title.text = "媒体库"
-        }
-    }
-
-    /** 工具条上的「移除 N 部」⇒ 先过确认（这条入口不可逆，差一道确认）。 */
-    private fun confirmRemoveSelected() {
-        if (selectedKeys.isEmpty()) return
-        val n = selectedKeys.size
-        showOverlay(
-            titleText = "要从媒体库移除这 $n 部吗？\n" +
-                "只移除这台电视上的索引：作品、集数、播放进度都会没。\n" +
-                "网盘上的文件不受影响，之后「重新扫描」就能找回来。",
-            labels = listOf("取消", "确认移除 $n 部"),
-        ) { index ->
-            hideOverlay()
-            if (index == 1) doRemoveSelected()
+            // ⛔ 这一行不能少：标题回去了、状态行没回去，右上角就永远停在
+            //    「多选移除：已选 N 部」（真机现象，见 [worksStatus]）。
+            if (worksStatus.isNotEmpty()) status.text = worksStatus
         }
     }
 
     /**
+     * 工具条上的「移除 N 部」⇒ 先过确认（这条入口不可逆，差一道确认）。
+     *
+     * ## 2026-10-21 起多一档「一并删网盘」
+     *
+     * 原来只有「只移除索引」一条路，而用户清片时想做的常常是**真的清掉**：
+     * 库里没了、网盘上还占着几十 GB，等于什么都没做。现在确认框给两档，
+     * ⛔ 「只移除索引」必须排在「一并删除网盘文件」**前面** —— 不可逆的那
+     * 一侧永远要用户主动往下按一次。
+     *
+     * ⚠️ 实测（2026-10-21 真机）：`showOverlay` 的光标默认落在**第 0 档**，
+     *    而第 0 档是「取消」⇒ 用户按 OK 什么都不会发生。这比原来注释里写
+     *    的「默认停在只移除索引」更保守，是对的；别为了「少按一下」把
+     *    「取消」挪走。
+     *
+     * ⛔ 「一并删除网盘文件」只在**当前网盘是夸克**时出现：电视端对百度只读
+     *    （`DriveClient` 上根本没有删除方法，`BaiduApi` 也没有实现），给百度
+     *    用户一个按下去必然失败的选项是纯粹的欺骗。
+     */
+    private fun confirmRemoveSelected() {
+        if (selectedKeys.isEmpty()) return
+        val n = selectedKeys.size
+        val canDeleteDrive = provider == DriveProviders.QUARK && api is PanApi
+        val labels = ArrayList<String>(3)
+        labels.add("取消")
+        labels.add("只移除索引（网盘文件保留）")
+        if (canDeleteDrive) labels.add("一并删除网盘文件（不可撤销）")
+
+        val driveNote = if (canDeleteDrive) {
+            "\n选「一并删除网盘文件」会把这批作品在网盘上的片子一起永久删除，" +
+                "不可撤销，本应用也恢复不了。"
+        } else {
+            ""
+        }
+        showOverlay(
+            titleText = "要从媒体库移除这 $n 部吗？\n" +
+                "只移除这台电视上的索引：作品、集数、播放进度都会没。\n" +
+                "网盘上的文件不受影响，之后「重新扫描」就能找回来。" + driveNote,
+            labels = labels,
+        ) { index ->
+            hideOverlay()
+            when (index) {
+                1 -> doRemoveSelected(alsoDeleteDrive = false)
+                2 -> doRemoveSelected(alsoDeleteDrive = true)
+            }
+        }
+    }
+
+    /** `doRemoveSelected` 的结果：文件行数 + 网盘那两个数（没删网盘时都是 0）。 */
+    private data class RemovalResult(
+        val removedItems: Int,
+        val driveDeleted: Int,
+        val driveFailed: Int,
+        val driveError: String?,
+    )
+
+    /**
      * 执行移除。
      *
-     * ⛔ **不需要登录**：这是纯本地动作（与 [doWipe] 同一取舍），只借
-     *    `busy` 防重入。删的是这台设备上的索引，不碰网盘。
+     * ⛔ [alsoDeleteDrive] 为真时**先删网盘、再删索引**：fid 只存在
+     *    `media_items` 里（`provider:fileId`），`deleteWorks` 一跑就再也
+     *    查不到那些 fid 了 —— 顺序反了的表现是「勾了删网盘，网盘上一个都
+     *    没少」，而且没有任何报错。
+     * ⛔ 网盘删失败**照样删索引**：用户点的是「从媒体库移除」，勾「一并删」
+     *    只是加一个动作。让主操作因为附加动作失败而变成空操作，用户只会
+     *    看到「点了没反应」。代价是失败的那些文件下次扫描会再出现 —— 那是
+     *    可以自愈的方向，而结果提示里会把失败数如实说出来。
      * ⛔ 成功之后**先退出多选再重列**：留在模式里的话，列表里那几部已经
      *    没了，而工具条还写着「已选 N 部」—— 一个指向不存在的东西的计数。
-     * ⛔ 结果提示里带上**文件行数**：那是「这批量到底有多大」的唯一诚实的
-     *    回答（`deleteWorks` 的返回值）。
+     * ⛔ 删网盘期间每批都要刷一次 `status`（与 `doSync` 同一个写法）：几百个
+     *    文件要打好几批请求，屏幕上那行字一动不动的话，电视用户唯一的感受
+     *    就是「按了没反应」，然后开始连按返回键。
      */
-    private fun doRemoveSelected() {
+    private fun doRemoveSelected(alsoDeleteDrive: Boolean) {
         if (busy) {
             status.text = "正在${busyWhat}，请稍候…"
             return
         }
+        // 删网盘是真的要连网盘：电视端只有夸克能删（`PanApi.deleteFiles`）。
+        if (alsoDeleteDrive && !store.loggedIn(DriveProviders.QUARK)) {
+            status.text = "需要先登录夸克网盘（删网盘文件走夸克）"
+            return
+        }
         val keys = ArrayList(selectedKeys)
         busy = true
-        busyWhat = "移除作品"
-        status.text = "正在移除 $keys.size 部…"
-        Bg.run({ db.deleteWorks(keys) }) { removed, err ->
+        busyWhat = if (alsoDeleteDrive) "删除网盘文件" else "移除作品"
+        status.text =
+            if (alsoDeleteDrive) {
+                "正在删除 ${keys.size} 部（含网盘文件）…"
+            } else {
+                "正在移除 ${keys.size} 部…"
+            }
+        Bg.run({
+            var driveDeleted = 0
+            var driveFailed = 0
+            var driveError: String? = null
+            if (alsoDeleteDrive) {
+                val pan = api as? PanApi
+                // fid 去重：勾选里同时有别名行和它的目标作品时，同一集会
+                // 被两次 `itemsForWork` 拿到 —— 重复的 fid 会让「删了几个」
+                // 虚高，也会让同一批请求里出现两个相同的 id。
+                val fids = linkedSetOf<String>()
+                for (k in keys) {
+                    for (item in db.itemsForWork(k)) {
+                        if (item.provider == DriveProviders.QUARK) fids.add(item.fileId)
+                    }
+                }
+                // 分批循环抽在 [BatchFileDeleter] 里：那是这条链路上唯一能在
+                // JVM 单测里跑起来的一段（不碰 SQLite、不碰真网盘）。
+                // ⛔ 凭证失效 / 断网会**中止**后面的批次（判据在
+                //    `BatchFileDeleter.abortOn`，与 PC 侧同口径）—— 别在这里
+                //    再套一层 try/catch 把它吞成「继续发」。
+                // ⛔ 分母由它**在第一批之前**就报出来（`onProgress(0, total)`）：
+                //    删到一半才知道总数，屏幕上的数字会先跳一下，看着像数错了。
+                val r = BatchFileDeleter.delete(
+                    fids,
+                    onProgress = { done, total ->
+                        runOnUiThread { status.text = "正在删除网盘文件 $done/$total…" }
+                    },
+                ) { chunk ->
+                    try {
+                        pan?.deleteFiles(chunk)?.size ?: 0
+                    } catch (e: Exception) {
+                        Log.w(TAG, "删网盘一批失败（${chunk.size} 个）", e)
+                        throw e
+                    }
+                }
+                driveDeleted = r.deleted
+                driveFailed = r.failed
+                driveError = r.error
+                // 网盘删完、索引还没清：不说这一句的话，数字停在满格上不动，
+                // 用户会以为已经结束、只是界面没反应过来。
+                if (fids.isNotEmpty()) {
+                    runOnUiThread { status.text = "正在清理媒体库…" }
+                }
+            }
+            val removed = db.deleteWorks(keys)
+            RemovalResult(removed, driveDeleted, driveFailed, driveError)
+        }) { out, err ->
             if (err != null) {
                 Log.e(TAG, "批量移除失败", err)
                 finishJob("移除失败：${err.message}")
                 return@run
             }
-            Log.i(TAG, "批量移除：${keys.size} 部 / ${removed ?: 0} 个文件")
+            val r = out ?: RemovalResult(0, 0, 0, null)
+            Log.i(
+                TAG,
+                "批量移除：${keys.size} 部 / ${r.removedItems} 个文件" +
+                    if (alsoDeleteDrive) "；网盘 ${r.driveDeleted} 成功 / ${r.driveFailed} 失败" else "",
+            )
             exitSelection()
-            loadWorks("已移除 ${keys.size} 部（${removed ?: 0} 个文件），网盘文件未动")
+            loadWorks(removalMessage(keys.size, r, alsoDeleteDrive))
+        }
+    }
+
+    /**
+     * 移除之后的提示文案。
+     *
+     * ⛔ 三个数字缺一不可（部数 / 文件行数 / 网盘成功与失败）：只说成功的话
+     *    用户以为清干净了，而网盘上还占着几十 GB；只说失败的话，又像是一次
+     *    都没动。不删网盘那一支**必须**保留「网盘文件未动」—— 它才是用户对
+     *    「移除」这个词最需要被告知的一件事。
+     */
+    private fun removalMessage(
+        works: Int,
+        r: RemovalResult,
+        alsoDeleteDrive: Boolean,
+    ): String {
+        val base = "已移除 $works 部（${r.removedItems} 个文件）"
+        if (!alsoDeleteDrive) return "$base，网盘文件未动"
+        val why = r.driveError ?: "网盘拒绝了删除请求"
+        return when {
+            r.driveFailed == 0 -> "$base，网盘删除 ${r.driveDeleted} 个文件"
+            r.driveDeleted == 0 ->
+                "$base，但网盘文件一个都没删掉（$why）—— 重新扫描会再出现"
+            else -> "$base，网盘 ${r.driveDeleted} 个成功 / ${r.driveFailed} 个失败" +
+                "（$why，可再试一次）"
         }
     }
 
@@ -5342,6 +5493,20 @@ class LibraryActivity : Activity() {
 
         /** 卡片间距。 */
         const val GRID_GAP_DP = 12
+
+        /**
+         * 一次删除请求最多带多少个 fid。
+         *
+         * 与 PC 端 `driveMaxFidsPerRequest`（`domain/services/drive_batch.dart`）
+         * **同一个数**：夸克的删除与移动是同族接口，100 来自官方 `file/move`
+         * 文档里的 `fid_list` 上限。
+         *
+         * 定成 100 而不是「一次全带上」的理由是**失败时的爆炸半径**：一次带
+         * 三千个 fid 的请求超时或被限流，用户得不到任何信息，只能全部重来；
+         * 分成三十个请求则能如实告诉他「动了 2900 个、100 个失败」。
+         */
+        // 每批 fid 数在 `library/BatchFileDeleter.FIDS_PER_BATCH`（⛔ 别在这里
+        // 再放一份：两处数字迟早会漂开，而漂开之后没有任何测试会红）。
 
         /**
          * 目标卡宽（dp）—— 实际列数由屏幕像素宽度反算，见 `computeGrid`。
