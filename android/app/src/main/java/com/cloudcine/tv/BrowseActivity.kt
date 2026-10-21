@@ -32,6 +32,7 @@ import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
 import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.LibraryScanner
+import com.cloudcine.tv.library.MediaNameParser
 import com.cloudcine.tv.library.dirPathOf
 import com.cloudcine.tv.library.fullPathOf
 import com.cloudcine.tv.library.sortListing
@@ -583,7 +584,18 @@ class BrowseActivity : Activity() {
                         PlayerActivity.EXTRA_PATH,
                         fullPathOf(pathOfStack(), e.name),
                     )
-                    .putExtra(PlayerActivity.EXTRA_PDIR_PATH, dirPathOf(pathOfStack())),
+                    .putExtra(PlayerActivity.EXTRA_PDIR_PATH, dirPathOf(pathOfStack()))
+                    // ⛔ 「选集」的唯一入口（与媒体库播放同口径）：播放页靠它查出
+                    //    同一作品下的其它文件。文件列表本身就是「按目录实时列文件」，
+                    //    没有媒体库的 `work.key` 可用，只能**现算**一个 `group_key`
+                    //    —— 用和扫描器同一支 `MediaNameParser`，从「当前目录 + 文件名」
+                    //    推出来。库里扫过的片子，这里推出来的 key 与库里的 `group_key`
+                    //    逐字一致 ⇒ 选集正常；没扫过的，推出来也查不到兄弟集，
+                    //    只是这一行不出现，播放本身不受影响。
+                    .putExtra(
+                        PlayerActivity.EXTRA_GROUP_KEY,
+                        MediaNameParser.parse(e.name, pathOfStack()).groupKey,
+                    ),
             )
             e.isSubtitle -> status.text = "字幕文件：${e.name}\n（在视频里用「字幕」那一行选）"
             else -> status.text = "不是视频：${e.name}"

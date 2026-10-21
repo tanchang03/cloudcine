@@ -1524,11 +1524,11 @@ class LibraryDb(
     fun itemsForWork(key: String): List<LibraryItem> {
         val owner = ownerKeyOf(key)
         return queryItems(
-            "SELECT $ITEM_COLUMNS FROM media_items WHERE group_key IN (" +
+            "SELECT $ITEM_COLUMNS FROM media_items WHERE group_key = ? OR group_key IN (" +
                 "SELECT key FROM media_works WHERE key = ? OR merged_into = ?) " +
                 "ORDER BY (season IS NULL), season, (part IS NULL), part, " +
                 "(episode IS NULL), episode, name",
-            arrayOf(owner, owner),
+            arrayOf(key, owner, owner),
         )
     }
 
