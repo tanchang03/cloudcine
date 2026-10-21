@@ -7139,3 +7139,189 @@ PC 会算出 `start = duration`（落点 = 片尾）—— 同一条链，两种
 「有没有内容」判「这一组我知道吗」。两端要一起改（JSON 形状不变，所以兼容）。
 改动面较大（还会影响 `needUpload` 判据与上传体积），单独排期。
 现状由第三个用例**如实钉住**，修好之后那条断言要改成 `isNull`。
+
+## 14. 媒体库删除时「一并删网盘」（2026-10-21，两端已落地）
+
+### 14.1 为什么加
+
+媒体库的「移除」从第一天起就只删**本地索引**，正文第一句还特意写着「网盘上的
+文件原样保留，重新扫描就能找回来」。这个取舍本身是对的（索引可重建、文件不可
+逆），但它漏掉了另一半用户：**清片的人想真的清掉**。库里清空了、网盘上还占着
+几十 GB —— 等于什么都没做，而且他还得再去目录视图一集一集删。
+
+所以这次不是改掉默认行为，而是把**不可逆的那一侧**做成一个用户主动勾出来的
+选项：默认仍然是「只移除索引」，文案、按钮、结果提示一字不改。
+
+### 14.2 两端入口不同（刻意的）
+
+| | PC（Flutter） | 电视（Android） |
+|---|---|---|
+| 形态 | 确认弹窗里的**整行勾选**（`_DriveToggle`） | 确认覆盖层的**第三档按钮** |
+| 默认 | 不勾，且**无记忆**（每次打开都从 false 开始） | 光标停「只移除索引」那一档 |
+| 可见条件 | `plan.canDeleteFromDrive`（名下有可删文件） | 当前网盘是**夸克** |
+
+电视上没有鼠标、没有复选框的点击目标，覆盖层是一维行列表 —— 所以那边用「多给
+一档」表达同一件事，而不是硬塞一个勾选框。顺序也重要：`overlayIndex` 从 0 起，
+第一个非取消项就是按 OK 会落到的那一档，**「只移除索引」必须排在前面**，否则
+一次顺手确认就永久删掉一季的片子（`LibraryBatchRemoveGuardTest` 钉住这条）。
+
+### 14.3 ⛔⛔ 顺序：先删网盘，再删索引
+
+`media_items` 是 fid 的**唯一存放处**（`id = provider:fileId`）。`deleteWork` /
+`deleteWorks` 一跑，那些 fid 就再也查不到了 —— 顺序反了的表现是「勾了删网盘，
+网盘上一个都没少」，日志干净、不报错。
+
+两端都有守卫：PC `library_removal_controller_test`（`deletedIds` 断言）、
+Android `LibraryBatchRemoveGuardTest`（`deleteFiles(` 必须在 `db.deleteWorks(`
+之前）。
+
+### 14.4 ⛔ 网盘删失败，索引**照样**清
+
+用户点的是「从媒体库移除」，勾「一并删网盘」只是**加**一个动作。让主操作因为
+附加动作失败而变成空操作，用户只会看到「点了没反应」。
+
+代价：失败的那些文件仍在网盘上，下次扫描会再出现在库里。这是**可自愈**的方向
+（与 `DriveCleanupController._purgeLibrary` 里「宁可清早，不可清晚」同一条思路），
+而结果提示会把失败数如实说出来：
+
+- 全成功：`已移除 1 部作品（24 个文件），网盘上 24 个文件已删除。`
+- 部分失败：`…网盘删除 22 个成功、2 个失败（…，可重新扫描后再试一次）。`
+- 全失败：`…但网盘文件一个都没删掉（登录已失效，剩下的没删）—— 它们还在网盘上，
+  重新扫描会再出现。`
+
+⚠️ 若将来改成「失败就保留库里那几部」，注意 `deleteWork` 是**整部**删除、没有
+「删一部分文件」的入口；要按成功列表清，得走 `removeMany(MediaItem)` 那一条。
+
+### 14.5 ⛔ 只读网盘跳过，且**不算失败**
+
+电视端对百度只读（`DriveClient` 上没有删除方法，`canWrite = false`）。这类文件：
+
+- 弹窗里从「会删 N 个」里摘出去，单独说一句「N 个文件所在的网盘不支持删除，
+  它们只会从媒体库移除」；
+- 执行时跳过，**不计入 failed** —— 算进去会让提示自相矛盾（弹窗刚说过它们删不了）。
+
+PC 的 `LibraryRemovalController.tally()` 与 `_deleteFromDrive()` **共用**
+`_itemsOf()` + `_canDelete()`：界面上的数字与实际会去删的集合必须同一口径，否则
+「说 24 个、删 22 个」而用户没有任何办法发现。
+
+### 14.6 分块：100 个 fid 一批
+
+复用 `driveMaxFidsPerRequest`（`domain/services/drive_batch.dart`）；Android 侧是
+`BatchFileDeleter.FIDS_PER_BATCH`（原 `LibraryActivity.FIDS_PER_DELETE`，见 §14.12），
+**同一个数**。理由见那个常量的文档：一次带三千个 fid 超时，用户什么信息都拿不到；
+分三十批才能如实说「动了 2900、100 失败」。
+
+### 14.7 文案红线（值对象里钉住，不靠肉眼）
+
+`LibraryBatchDeletePlan` 随 `alsoDeleteFromDrive` 切换四处措辞，**两段互斥**：
+
+| | 不勾 | 勾上 |
+|---|---|---|
+| 标题 | 要从媒体库移除这 N 部吗？ | 要从媒体库和网盘删除这 N 部吗？ |
+| 顶部 | 「网盘上的文件原样保留…」（accent 色） | 「N 个文件会一起删掉、不可撤销、本应用恢复不了」（danger 色） |
+| 本地数据 | …（网盘文件本身不受影响）。 | …。（⛔ 括号里那句必须去掉） |
+| 按钮 | 移除 N 部 | 删除 N 部（含网盘文件） |
+
+⛔ 最容易被写漏的是第三行：在一段说「文件会被删」的正文里保留「网盘文件本身不
+受影响」，等于同时给了两个相反的保证。`library_batch_delete_test` 有一条专门
+断言它**不出现**。
+
+### 14.8 验证
+
+- `flutter analyze` 干净；`test/domain/services/library_batch_delete_test.dart`（17）、
+  `test/ui/widgets/library_batch_delete_dialog_test.dart`（10）、
+  `test/ui/widgets/library_removal_progress_dialog_test.dart`（3）、
+  `test/ui/providers/library_removal_controller_test.dart`（9）全过。
+- `:app:testDebugUnitTest --tests 'com.cloudcine.tv.Library*'` 通过（
+  `LibraryBatchRemoveGuardTest` 11 例 + `LibraryActivityWiringTest` 4 例）。
+- ⚠️ **未真机实跑**：两端都只到「编译 + 单测」这一层。
+
+### 14.9 PC 端进度层（2026-10-21 补）
+
+勾了「一并删网盘」之后，几百个文件每批 100 个往网盘打请求，几秒到几十秒。
+原来这段时间**界面全静默**，用户唯一的感受是「点了没反应」，于是再点一次
+「移除」—— 而第二次点击面对的是一个已经开始变的勾选集合。
+
+- `domain/services/library_batch_delete.dart::RemovalProgress`：文案值对象
+  （`label` / `fraction`）。**分母是可删文件总数，不是批数** ——「第 3/7 批」
+  对用户毫无意义（100 一批是内部实现细节）。
+- `ui/widgets/library_removal_progress_dialog.dart::showRemovalProgress<T>()`：
+  模态层，`barrierDismissible: false` + `PopScope(canPop: false)`。⛔ **中途关掉
+  取消不了任何东西**（请求已经发出去了），只会让用户失去唯一的进度来源。
+  任务结束 / 抛异常都在 `finally` 里关窗，并**等它真的从栈上下去**再让调用方
+  弹结果提示（否则两层叠在一起）。结果与异常**原样透传**。
+- `LibraryRemovalController.remove(onProgress:)`：⛔ 分母在**发第一批之前**就
+  报出来；每批（成功或失败）都推进 `done`；⛔ 撞上凭证失效时把 `done` 直接
+  推到 `total`（停在 100/120 上关窗像被掐断）；网盘删完、清索引之前报一次
+  `RemovalPhase.library`（否则进度条满格后突然消失像卡住）。
+  ⛔ **只在 `drive != null` 时报 library 阶段**：没删网盘时整件事是本地的几十
+  毫秒，报这一句会让调用方以为有东西在跑。
+- ⛔ 只清索引那条路**不套**这一层（`_removeSelected` 里按 `alsoDeleteFromDrive`
+  分叉）：为几十毫秒盖一层模态只会闪一下。
+- ⚠️ Android 端**没有模态层**，但也不是静默：`doRemoveSelected` 在 `Bg.run` 里
+  每批删完 `runOnUiThread { status.text = "正在删除网盘文件 $d/$total…" }`
+  （与 `doSync` 的上传进度同一写法），网盘删完再换一句「正在清理媒体库…」。
+  ⛔ 分母 `val total = fids.size` 必须在分批循环**之前**；⛔ 失败的那一批也推进
+  `done`（卡在失败批次上不动 = 屏幕上死机）。电视上不需要遮罩：`busy` 已经
+  挡住重入，也没有鼠标去重复点。守卫 `LibraryBatchRemoveGuardTest`
+  「删网盘期间每批刷新一次进度」。
+
+### 14.10 真机（TV 模拟器）实跑：跑出一个静态检查看不见的 bug
+
+2026-10-21 在 `sdk_google_atv64_arm64` 上装了 debug 包，走了一遍
+MENU → 批量移除 → 勾选 → 移除 → 确认框 → 取消 → 返回。结论与修正：
+
+1. ✅ **门控生效**：模拟器当前是**百度**，确认框只出现「取消 / 只移除索引（网盘
+   文件保留）」两档，**没有**「一并删除网盘文件」——`canDeleteDrive` 判断正确。
+2. ✅ **顺序正确**：光标默认停在**「取消」**（`showOverlay` 的 `overlayIndex` 从 0
+   起，而 `labels[0]` 是取消）。原注释写的是「默认停在只移除索引」，与实际不符，
+   已改注释 —— ⛔ 别为了「少按一下」把「取消」挪走。
+3. ⛔⛔ **退出多选后右上角残留「多选移除：已选 N 部」**。`refreshSelectionUi()`
+   只恢复了 `title`，没恢复 `status`。修法：新增字段 `worksStatus`，`applyWorks`
+   在**非多选态**记下常态文案，`refreshSelectionUi` 的退出分支贴回去。
+   守卫：`LibraryBatchRemoveGuardTest`「退出多选会把状态行贴回去」。
+   ⚠️ 这条**单测 / analyze / 守卫全绿也发现不了**，只有坐到电视前按一遍返回键。
+4. ⚠️ **破坏性那一支没实跑**：真删会永久删掉网盘上的片子，模拟器上也没有可用的
+   夸克凭证。`doRemoveSelected(alsoDeleteDrive = true)` 的进度刷新只有守卫测试
+   覆盖，**没有真机证据**。
+
+### 14.11 整条流程的接线测试（`library_removal_flow_test.dart`）
+
+单测各自钉住了一环（文案 / 确认框 / 执行器），但**它们之间怎么串**没人管，
+而串错的方式全都不报错：`alsoDeleteFromDrive` 忘了传 ⇒ 勾了却一个都没删；
+勾了却没套进度层 ⇒ 几十秒静默；结果提示漏传 `drive` ⇒ 删了却说「网盘文件未动」。
+
+这条测试在**真实 `LibraryPage`** 上从「点选择」一路点到「结果提示」：
+`_GatedDrive`（`deleteFiles` 卡在 `Completer` 上）让进度层停在屏幕上可断言，
+放行后再验提示文案与实际删掉的 fid。
+
+⚠️ 两个坑：
+- 桌面排版下页头是**纯图标**（`TvIconLabel` 的 label 只在电视排版显示）
+  ⇒ 进多选要 `find.byTooltip('多选（批量合并 / 移除）')`，按文字「选择」
+  一个都找不到，而失败信息看起来像「页面没渲染」。
+- `MediaKind` 在 `core/utils/filename_parser.dart`、`AuthMode` 在
+  `domain/entities/capabilities.dart` —— 不在 media_item / cloud_account 里。
+
+### 14.12 分批删除循环抽成 `library/BatchFileDeleter`（可单测）
+
+原来这段循环内联在 `LibraryActivity.doRemoveSelected` 里，而 `LibraryDb` 要真
+SQLite、`PanApi` 要真凭证 —— **整条 Android 删除链路一行可执行测试都没有**，
+只有读源码文本的守卫。抽出来之后它只依赖「给我一批 fid、告诉我删了几个」：
+
+```kotlin
+BatchFileDeleter.delete(fids, onProgress = { done, total -> … }) { chunk -> … }
+```
+
+语义（⛔ 改之前先读类文档）：`onProgress(0, total)` **先于第一批**；**普通失败
+不中止**（限流 / 单个被拒）只算那一批、后面继续发；**凭证失效 / 断网中止**
+（`abortOn`：`DriveException.needsReauth || IOException`），没发出去的那几批
+照样计入 `failed`，进度直接推到满格；失败的那一批也算走完；`error` 只记第一条；
+空列表不发请求也不报进度。`BatchFileDeleterTest` **8 例**覆盖这些。
+
+✅ **两端已统一**：PC 的 `LibraryRemovalController`（`needsReauth || type ==
+network` 中止）与这里的 `abortOn` 同口径。⛔ 改一侧记得改另一侧 —— 否则同一批
+作品在电脑上和电视上的行为会不一样，而没人会同时开着两边数。
+
+⚠️ 抽的时候踩过一个坑：用脚本按「起点/终点」区间替换测试文件内容，把夹在
+中间的「退出多选会把状态行贴回去」那条守卫一起删了 —— **用例数从 12 掉到 11**
+才发现。改测试文件后必须核对 `test-results/*.xml` 里的 `tests=` 数量。
