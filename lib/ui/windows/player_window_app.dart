@@ -403,6 +403,43 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 与 [_awaitingFrame] 同源（见 [_clearAwaitingFrame]）。
   bool _switching = false;
 
+  /// 用户点了另一集、**新流还没开起来**的那一段：要切过去的目标。
+  ///
+  /// ## 为什么需要它（[`_switching`] 不够）
+  ///
+  /// 切集不是「换一条 URL」：要先把这个窗口的进度落库、再向主窗口要一条新直链
+  /// （一次跨窗口 + 一次网盘 API 往返）、再建中继会话、再预热。这条链在路上
+  /// 要几百毫秒到几秒，而 [`_switching`] 是**快到最后**才立的（`open()` 之前
+  /// 那一行）—— 于是在那之前画面上什么都没有，旧一集还在正常播。
+  ///
+  /// 用户点了新一集、画面不动、声音还是上一集的 —— 这就是「点了以后在上一集
+  /// 卡一会儿」。所以点击那一刻就把目标记在这里，罩子立刻压上去（见
+  /// [_beginEpisodeSwitch]），旧流同时被暂停。
+  ///
+  /// ## 它还是「这些『有画面了』信号属于**旧一集**」的判据
+  ///
+  /// 见 [_clearAwaitingFrame] 里那道闸：暂停旧流时内核还会再报一次 position，
+  /// 少了那道闸，刚压上的罩子会被自己这一下立刻收掉。
+  PlaylistEntry? _switchTarget;
+
+  /// [_switchTarget] 那条新流是不是已经 `open()` 了。
+  ///
+  /// `open()` 之前，「有画面了」的信号**全都来自旧一集**（我们只是把它暂停了），
+  /// 必须忽略；`open()` 之后才算数。
+  bool _switchOpened = false;
+
+  /// 切换途中又被点了一集。连点两集时**以最后一次为准**（见 [_openEpisode]）。
+  ///
+  /// 没有它的话，切集那几百毫秒里点第二下会被 [_refreshing] 静默吞掉 ——
+  /// 表现是「点错了想改，点了没反应」，用户只会再点第三下。
+  PlaylistEntry? _queuedEpisode;
+
+  /// 切换开始时旧流是不是在播。
+  ///
+  /// 取链失败要把旧流放回去（停在一帧静止画面上比继续播更糟），但用户自己
+  /// 按过暂停的那一集不该被我们「放起来」。
+  bool _switchResumeOnAbort = false;
+
   /// 网盘字幕正文的预取缓存（fileId → 正文）。见 [_prefetchCloudSubtitles]。
   ///
   /// 换片 / 换集时清空：字幕是**跟着条目**的，留着上一部的正文既没用又占内存。
@@ -1479,12 +1516,23 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// 换流那条路（[_switching]）也由它收：两者的「有画面了」信号是同一批
   /// （见 [_bindEngine] 里 `videoSize` / `duration` / `position` 那三条订阅）。
+  ///
+  /// ## ⛔ 切集时新流还没 `open()`，这些信号全是**旧一集**的
+  ///
+  /// [_beginEpisodeSwitch] 只是把旧流暂停了，它的 `position` / `duration`
+  /// 还会再报几次（暂停本身就会触发一次）。不挡住的话，刚压上的
+  /// 「正在切换到 第 3 集…」会被这一下立刻收掉 —— 而新流一个字节都还没到。
+  /// 判据用 [_switchOpened]：`open()` 之前一律不认。
   void _clearAwaitingFrame() {
     if (!mounted) return;
-    if (!_awaitingFrame && !_switching) return;
+    if (_switchTarget != null && !_switchOpened) return;
+    if (!_awaitingFrame && !_switching && _switchTarget == null) return;
     setState(() {
       _awaitingFrame = false;
       _switching = false;
+      _switchTarget = null;
+      _switchOpened = false;
+      _switchResumeOnAbort = false;
     });
   }
 
@@ -1552,6 +1600,10 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   void _togglePlay() {
     final engine = _engine;
     if (engine == null) return;
+    // 正在切集：旧流是被我们**特意**暂停的（见 [_beginEpisodeSwitch]）。
+    // 这时让它 play 回去，用户会看到「切了一半又冒出一声上一集的声音」——
+    // 而罩子还挂在上面，那一下完全无从解释。
+    if (_switchTarget != null) return;
     setState(() => _playing = !_playing);
     unawaited(engine.playOrPause());
   }
@@ -2130,6 +2182,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     } finally {
       _refreshing = false;
       if (mounted) setState(() => _busy = false);
+      // 刷链期间用户可能点了某一集 —— 那一下被闸挡了下来，在这里补上。
+      await _drainQueuedEpisode();
     }
   }
 
@@ -2305,6 +2359,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       );
     } finally {
       _refreshing = false;
+      // 换档期间点了某一集：补上（见 [_drainQueuedEpisode]）。
+      await _drainQueuedEpisode();
     }
   }
 
@@ -2312,13 +2368,30 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   ///
   /// [reportSwitch] 见 [_reportEpisodeSwitch]：**自动跳过片尾引起的切集必须
   /// 传 `false`**，否则那条切集会变成一条样本，而它恰恰是我们自己跳的。
+  ///
+  /// ## 为什么第一步是「停掉旧流、压上罩子」
+  ///
+  /// 这条链是：进度落库 → 向主窗口要新直链（网络往返）→ 建中继 → 预热 →
+  /// `open()`。串起来几百毫秒到几秒，**旧一集在这期间还在正常播** ——
+  /// 用户点了新一集，画面和声音都还是上一集的，那就是「点了没反应」。
+  ///
+  /// 所以点击那一刻就切：旧流暂停、罩子上写「正在切换到 第 3 集…」。
+  /// 之后的取链 / 预热 / 缓冲全在这层罩子底下进行 —— 用户要等的是「加载」，
+  /// 而不是「怀疑自己点没点中」。
   Future<void> _openEpisode(
     PlaylistEntry entry, {
     bool reportSwitch = true,
   }) async {
     final request = _currentRequest;
-    if (request == null || _refreshing) return;
+    if (request == null) return;
     if (entry.itemId == request.itemId) return;
+
+    // 已经在切另一集：记下这一次，等手上这次切完再追（最后一次为准）。
+    // ⛔ 不能直接 return —— 那等于把用户的第二次点击静默吞掉。
+    if (_refreshing) {
+      _queuedEpisode = entry;
+      return;
+    }
 
     // ⚠️ 必须在**换流之前**报：`_openStream` 会把 `_anchorCollector` 归零、
     //    也会把 `_position` / `_duration` 换成新流的值。报晚了那条样本要么
@@ -2335,19 +2408,94 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     _refreshing = true;
     try {
       diag.info('播放窗口', '切换剧集 → ${entry.title} @ ${start.inSeconds}s');
+      // ① 先让用户看到「已经切了」，再去干那些要几秒的事。
+      _beginEpisodeSwitch(entry);
       final fresh = await _requestFreshTicket(
         itemId: entry.itemId,
         qualityId: request.qualityId,
         position: start,
         reason: '用户切换剧集 → ${entry.title}',
       );
-      if (fresh == null) return;
+      if (fresh == null) {
+        // 取链失败：把旧流放回去。停在静止画面上比继续播更糟 ——
+        // 而「失败」这件事 `_requestFreshTicket` 已经弹过提示了。
+        // 攒下的那次点击一起丢掉：取链都失败了，下一次点击该按它自己的意思来。
+        _queuedEpisode = null;
+        await _abortEpisodeSwitch();
+        return;
+      }
       // 切集：与切档同理 —— 上一集的画面还在，保留它、给半透明提示，
       // 不要「黑一下再重新缓冲」。
       await _adoptRequest(fresh, startAt: start, keepLastFrame: true);
     } finally {
       _refreshing = false;
     }
+
+    // 切的过程中又点了一集：追它。放在 `finally` 之后，免得它的异常被上面
+    // 那层当成「本次切集失败」。
+    await _drainQueuedEpisode();
+  }
+
+  /// 兑现切换途中攒下的那次点击（[_queuedEpisode]）。
+  ///
+  /// 三条「换一条流」的路（切集 / 切画质 / 刷链）都会在收尾时调它 ——
+  /// 否则用户在那几百毫秒里点的那一集会被 [_refreshing] 吃掉，或者更糟：
+  /// 攒着不消费，等到**下一次**切集时才突然生效。
+  Future<void> _drainQueuedEpisode() async {
+    final queued = _queuedEpisode;
+    _queuedEpisode = null;
+    if (queued == null) return;
+    // 攒下的那一集如果已经是现在这一集（用户先点 A、又点回 A），无事可做。
+    if (queued.itemId == _currentRequest?.itemId) return;
+    await _openEpisode(queued);
+  }
+
+  /// 切集的**第一步**：立刻停掉旧流、压上「正在切换到 X…」。
+  ///
+  /// 顺序是「先 setState、再 pause」：罩子要在用户松手那一帧就出现，
+  /// 而 `pause()` 是一次异步下发，晚一帧也无所谓。
+  ///
+  /// ⛔ 暂停**不是**为了省带宽：它是「你点的这一下生效了」的唯一物理证据。
+  /// 旧一集的音轨继续放，用户会以为点击丢了。
+  void _beginEpisodeSwitch(PlaylistEntry entry) {
+    if (!mounted) return;
+    setState(() {
+      _switchTarget = entry;
+      _switchOpened = false;
+    });
+    _switchResumeOnAbort = _playing;
+    final engine = _engine;
+    if (engine != null) unawaited(engine.pause());
+  }
+
+  /// 切集失败：撤掉罩子，把旧流放回它原来的状态。
+  Future<void> _abortEpisodeSwitch() async {
+    if (!mounted) return;
+    final resume = _switchResumeOnAbort;
+    _switchResumeOnAbort = false;
+    setState(() {
+      _switchTarget = null;
+      _switchOpened = false;
+    });
+    // 旧流还在（我们只是暂停了它）—— 用户自己按过暂停就别替他按播放。
+    final engine = _engine;
+    if (engine != null && resume) unawaited(engine.play());
+  }
+
+  /// 主窗口推来一条**全新的**播放请求 / 播一条裸流：把手上的切集状态作废。
+  ///
+  /// ⛔ 不能把这个清理放进 [_adoptRequest]：切集自己也走那条路，而那时
+  ///    `_currentRequest` 还是旧的一集 —— 判据「itemId 变了」会把刚立起来的
+  ///    [_switchTarget] 一起清掉，罩子闪一下就没了。
+  ///
+  /// 不清的后果很具体：`_clearAwaitingFrame` 那道闸会一直挡着（新请求不是
+  /// 切集、`_switchOpened` 永远是 false），于是**加载罩再也收不掉**。
+  void _discardEpisodeSwitch() {
+    _queuedEpisode = null;
+    if (_switchTarget == null && !_switchOpened) return;
+    _switchTarget = null;
+    _switchOpened = false;
+    _switchResumeOnAbort = false;
   }
 
   // -------------------------------------------------------------------
@@ -2358,6 +2506,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 重入保护只在这一条路上：它是「主窗口推来 / 用户点开」的入口，同一时刻
     // 再来一条说明状态已经乱了。刷新与切集各有自己的闸（见 [_refreshTicket]）。
     if (_busy) return;
+    // 主窗口换片了：手上的切集状态作废（见 [_discardEpisodeSwitch]）。
+    _discardEpisodeSwitch();
     await _adoptRequest(request);
   }
 
@@ -2440,6 +2590,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 10 秒时就把进度报成了 102，凭空污染「最近播放」，而且看不出是谁干的。
   Future<void> _playRaw(String uri, String label) async {
     _currentRequest = null;
+    // 没有条目了，也就没有「切到哪一集」这回事（见 [_discardEpisodeSwitch]）。
+    _discardEpisodeSwitch();
     // 与 [_adoptRequest] 同一套清理：在线字幕结果是**跟着条目**的，
     // 条目没了它就没有归属了（再打开菜单会列出上一部片搜出来的东西）。
     _onlineSubtitles = const [];
@@ -2497,19 +2649,27 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       _sawVideoFrame = false;
       // 同一条理由：自检是**按流**做的，换流了就该重新允许抓一次。
       _hlsProbed = false;
-      if (!keepLastFrame) {
-        // 从这一刻到「解出第一帧」之间画面是**黑的**，而 `open()` 不等文件加载
-        // 完成 —— 这段正是「刚打开视频时黑屏」的那几秒，加载指示要盖住它。
-        // 收掉它的信号见 [_clearAwaitingFrame]。
-        _awaitingFrame = true;
-        // 换片源 = 上一次的缓存量与增速全部作废。不清的话缓冲指示会带着
-        // 上一部片子的「已缓存 10 秒」出现，然后突然跳回 0。
+      // 换片源 = 上一次的缓存量与增速全部作废。不清的话缓冲指示会带着
+      // 上一部片子的「已缓存 10 秒」出现，然后突然跳回 0。
+      //
+      // ⚠️ **换集也算换片源**（`_switchTarget != null`），哪怕它是
+      // `keepLastFrame` 那条路：那个标记只说明「画面还在」，而缓存数字
+      // 是**上一集**的 —— 留着它，新一集的加载页上会顶着一行
+      // 「已缓存 12 秒 · 3.4 MB/s」，看起来像已经能播了。
+      // 切清晰度换的是同一个文件，那些数字还有意义，照旧留着。
+      if (!keepLastFrame || _switchTarget != null) {
         _cacheEnd = Duration.zero;
         _cacheRate = null;
         _cacheRateAt = null;
         _cacheFill = null;
         _netBytesPerSecond = null;
         _cacheMeter.reset();
+      }
+      if (!keepLastFrame) {
+        // 从这一刻到「解出第一帧」之间画面是**黑的**，而 `open()` 不等文件加载
+        // 完成 —— 这段正是「刚打开视频时黑屏」的那几秒，加载指示要盖住它。
+        // 收掉它的信号见 [_clearAwaitingFrame]。
+        _awaitingFrame = true;
       }
     });
     // 旧中继会话由 [_prepareSource] 交回来、在这里关（见它的文档：必须等
@@ -2580,8 +2740,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 到这里旧中继会话已经关了（`_prepareSource` 的最后一步），旧流随时会断；
       // 接下来这一句 `open()` 会让内核丢掉当前流。**从这一刻起**才该立
       // 「正在切换…」—— 上一帧还在画面上，所以用半透明罩，别盖掉它。
-      if (keepLastFrame && mounted) {
-        setState(() => _switching = true);
+      //
+      // 切集那条路更早：罩子在点击那一刻就压上了（见 [_beginEpisodeSwitch]），
+      // 这里只把 `_switchOpened` 翻过去 —— 从这一句起，「有画面了」的信号
+      // 才可能来自**新**流，[_clearAwaitingFrame] 那道闸随之放开。
+      if (mounted) {
+        setState(() {
+          if (keepLastFrame) _switching = true;
+          if (_switchTarget != null) _switchOpened = true;
+        });
       }
 
       // ⚠️ 顺序：**先选内核、再下发音效、最后 open**。
@@ -2619,10 +2786,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // 开流失败就永远等不到第一帧了 —— 必须自己收掉加载指示，否则它会一直
       // 挂在画面上，把「播放失败」的提示也盖住。
       // [_switching] 也要一起收：换流失败时它同样等不到「有画面了」的信号。
+      // 切集那几个标记同理：旧流这时已经被 `open()` 换掉了，放不回去 ——
+      // 留着罩子只会让「播放失败」四个字看不见。
       if (mounted) {
         setState(() {
           _awaitingFrame = false;
           _switching = false;
+          _switchTarget = null;
+          _switchOpened = false;
+          _switchResumeOnAbort = false;
         });
       }
       diag.error('播放窗口', 'open 失败：$label', error: e, stackTrace: st);
@@ -2754,12 +2926,30 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       // ⚠️ 超时延长到 2500ms（默认 700ms）：换流时新会话没备够数据就
       // 「直接切换」，播放器可能读到未就绪/损坏的头部字节 → 偶发 Source error。
       // 旧流还在播，多等两秒用户无感。
+      //
+      // ## ⛔ 切集是**例外**：那两秒不再是白赚的
+      //
+      // 上面那句「旧流还在播」只对**切清晰度**成立。切集时旧流已经被我们
+      // 暂停了（见 [_beginEpisodeSwitch]），用户正盯着一层「正在切换到…」——
+      // 这时等预热就是纯粹多等，而预热想省的那点时间本来也会花在播放器
+      // 自己的首读上（中继对未落地的块是**阻塞等待**，不会吐坏字节）。
+      //
+      // 所以切集只留一个很短的窗口让上游连接与首块落地，剩下的交给播放器
+      // 自己的读请求去驱动预取 —— 那还更准（真实 Range 会把窗口摆正）。
+      final switchingEpisode = _switchTarget != null;
       final ready = await warmUpRelay(
         _relay,
         endpoint.token,
-        timeout: const Duration(milliseconds: 2500),
+        timeout: switchingEpisode
+            ? const Duration(milliseconds: 800)
+            : const Duration(milliseconds: 2500),
       );
-      diag.info('播放窗口', ready ? '新中继已预热，关闭旧会话' : '新中继预热超时，直接切换');
+      diag.info(
+        '播放窗口',
+        ready
+            ? '新中继已预热，关闭旧会话'
+            : (switchingEpisode ? '切集不预热，直接开流' : '新中继预热超时，直接切换'),
+      );
     }
 
     // ⚠️ 走本地中继时**不带**原请求头：里面是账号 Cookie，而接收方是本机的
@@ -3296,7 +3486,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
                 // 缓冲 / 加载指示。放在控制栏**之前**（画在它下面）：它不吃
                 // 点击，但如果画在控制栏上面，会把「正在缓冲」盖在按钮上。
-                if (_awaitingFrame || _buffering || _switching)
+                //
+                // `_switchTarget` 那一条让罩子**从点击那一刻**就出现 ——
+                // 而不是等取链、建中继、预热都走完（见 [_beginEpisodeSwitch]）。
+                if (_awaitingFrame ||
+                    _buffering ||
+                    _switching ||
+                    _switchTarget != null)
                   Positioned.fill(child: _buildLoadingVeil()),
 
                 // 剧集面板的入口：贴在画面区右边缘的一条竖长条。
@@ -3482,29 +3678,47 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
 
   /// 加载 / 缓冲指示。
   ///
-  /// 覆盖两段黑屏：
+  /// 覆盖这几段「画面不动」：
   ///   - [_awaitingFrame]：开流到解出第一帧之间。`Player.open()` **不等文件
   ///     加载完成**，这段画面是全黑的，也是最该给反馈的几秒；
   ///   - [_buffering]：播到一半缓存见底，mpv 停下来等数据；
-  ///   - [_switching]：换流（切清晰度 / 切集 / 刷链）。上一帧还在画面上，
-  ///     所以底色与 [_buffering] 同为半透明 —— 只是文案不同，让用户知道
-  ///     这是他自己刚点的操作，而不是网络出问题。
+  ///   - [_switching]：换流（切清晰度 / 刷链）。上一帧还在画面上，所以底色与
+  ///     [_buffering] 同为半透明 —— 只是文案不同，让用户知道这是他自己刚点的
+  ///     操作，而不是网络出问题；
+  ///   - [_switchTarget]：切集，**从点击那一刻**算起（比 [_switching] 早得多，
+  ///     见 [_beginEpisodeSwitch]）。旧流这时已经被暂停了，所以底色用不透明的
+  ///     —— 那一帧是**定格**的，压一层半透明只会让人以为卡住了。
   ///
   /// 两段的底色**不一样**：等首帧时画面本来就是黑的，用不透明底色把它盖掉；
-  /// 中途卡顿 / 换流则只压一层半透明 —— 那一帧画面还在，全盖掉等于把进度也抹了。
+  /// 中途卡顿 / 换档则只压一层半透明 —— 那一帧画面还在，全盖掉等于把进度也抹了。
   Widget _buildLoadingVeil() {
     final fill = _cacheFill;
     // mpv 的填充百分比一旦到 100 就再也不变，那时进度条只会顶在那儿假装
     // 还在加载 —— 退回不确定态（这一层的转圈本来就一直在转）。
     final showBar = fill != null && fill > 0 && fill < 100;
 
+    // 切集：罩子上写清「切到哪一集」。这一句就是**点击生效的回执** ——
+    // 没有它，用户在取链那几秒里看到的是一动不动的旧画面。
+    final target = _switchTarget;
+    final opaque = _awaitingFrame || target != null;
+    final title = target != null
+        ? '正在切换到 ${target.title}…'
+        : _awaitingFrame
+            ? '正在载入片源…'
+            : _switching
+                ? '正在切换…'
+                : '正在缓冲…';
+    // 切集的前半段（还没 `open()`）在等的是**播放地址**，不是缓存 ——
+    // 这时缓存数字已经被清零，照旧印「已缓存 00:00」等于什么都没说。
+    final detail = target != null && !_switchOpened
+        ? '正在获取播放地址…'
+        : _cacheStatusLine();
+
     return IgnorePointer(
       // 吃点击没有意义：这层只是画面上的一个告知，让它透过去，用户照样能
       // 点暂停、点关闭。
       child: ColoredBox(
-        color: _awaitingFrame
-            ? AppTheme.cinema
-            : Colors.black.withValues(alpha: 0.55),
+        color: opaque ? AppTheme.cinema : Colors.black.withValues(alpha: 0.55),
         child: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -3519,16 +3733,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
               ),
               const SizedBox(height: 14),
               Text(
-                _awaitingFrame
-                    ? '正在载入片源…'
-                    : _switching
-                        ? '正在切换…'
-                        : '正在缓冲…',
+                title,
                 style: const TextStyle(fontSize: 13, color: Colors.white),
               ),
               const SizedBox(height: 6),
               Text(
-                _cacheStatusLine(),
+                detail,
                 style: const TextStyle(fontSize: 11.5, color: Colors.white70),
               ),
               if (showBar) ...[
@@ -4147,7 +4357,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
                 final entry = entries[index];
                 return _buildEpisodeTile(
                   entry,
-                  current: entry.itemId == currentId,
+                  // 正在切过去的那一集**也立刻点亮**：面板通常就开在旁边，
+                  // 这一行是用户点完之后的视线落点 —— 它要是过一两秒才变，
+                  // 用户就会以为那一下没点中（见 [_beginEpisodeSwitch]）。
+                  current: entry.itemId == currentId ||
+                      entry.itemId == _switchTarget?.itemId,
                 );
               },
             ),
@@ -4167,6 +4381,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     // 当前这一集的时长播放器自己最清楚（解封装拿到的权威值）。网盘没下发
     // 时长时，用它当分母 —— 否则「刚看过的那一集」在面板上一条进度条都没有，
     // 而它看起来与「从没播过」完全一样。非当前行拿不到这个值，照旧不画。
+    //
+    // ⚠️ 正在切过去的那一行也算 `current`（见 [_buildPlaylistPanel]），此刻
+    //    `_duration` 还是**上一集**的。它只在该行自己没存时长时被当分母
+    //    （见 [_episodeTotal]），最多影响那一秒的进度条比例 —— 换来的是
+    //    「点了就有反应」，值。
     final knownDuration = current ? _duration : null;
     return EpisodeTile(
       // ⚠️ 按**条目**给键，不是按位置。缩略图那一格是有状态的（异步取图），

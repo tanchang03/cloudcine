@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloudcine/ui/widgets/player_keys.dart';
 import 'package:cloudcine/ui/windows/child_window_channel.dart';
 import 'package:cloudcine/ui/windows/player_protocol.dart';
@@ -1192,6 +1194,180 @@ void main() {
         bridgeMethods.where((m) => m == PlayerBridgeMethod.playerClosed).length,
         1,
         reason: '重复通知只会让日志说谎',
+      );
+      await drainTimers(tester);
+    });
+  });
+
+  group('切集：点了就切，别在上一集卡着', () {
+    /// 把「向主窗口要新直链」按住不返回。
+    ///
+    /// 真机上这一段就是一次跨窗口 + 一次网盘 API 往返（几百毫秒到几秒）。
+    /// 测试里按住它，才看得清「点击那一刻画面上有什么」—— 而这正是这次要
+    /// 修的东西：以前这段时间画面上**什么都没有**，旧一集还在播。
+    void hangTicketRefresh() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(multiChannel, (call) async {
+        if (call.method != 'invokeMethod') return null;
+        final args = (call.arguments as Map).cast<Object?, Object?>();
+        final method = args['method'];
+        if (method is String) bridgeMethods.add(method);
+        if (method == PlayerBridgeMethod.refreshTicket) {
+          refreshCalls.add(args);
+          return Completer<Object?>().future;
+        }
+        if (method == PlayerBridgeMethod.ping) return 'pong';
+        return null;
+      });
+    }
+
+    /// 打开右侧剧集面板。与「剧集列表」那组里的同名 helper 同一套节拍
+    /// （展开是分两帧的，只 pump 一拍时列表项尺寸还是 0，点不中）。
+    Future<void> openPlaylist(WidgetTester tester) async {
+      await tester.tap(find.byTooltip('剧集列表'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+
+    testWidgets('点击另一集：罩子**立刻**出现，并写明切到哪一集', (tester) async {
+      // 现场反馈：「点击新集以后，在上一集会卡一会」。
+      //
+      // 卡的不是解码 —— 是「进度落库 → 要新直链 → 建中继 → 预热」这条链，
+      // 而这段时间旧一集照常在播，画面上一点变化都没有。用户只能反复点。
+      await pumpPlayer(tester);
+      await pushPlayRequest(tester, _playRequestWithPlaylist());
+      await drainTimers(tester);
+      await showChrome(tester);
+      await openPlaylist(tester);
+      hangTicketRefresh();
+
+      await tester.tap(find.text('第 1 集'));
+      // ⚠️ 只推一帧：这条断言的全部意义就是「不等取链」。多 pump 几下
+      // 也仍然会过（取链被按住），但那样就验不出「立刻」。
+      await tester.pump();
+
+      expect(
+        find.text('正在切换到 第 1 集…'),
+        findsOneWidget,
+        reason: '点了以后画面上什么都没有 —— 用户会以为没点中',
+      );
+      expect(
+        find.text('正在获取播放地址…'),
+        findsOneWidget,
+        reason: '要让人知道是在等地址，不是卡死了',
+      );
+      // 取链真的发出去了（否则上面那个罩子只是假象）。
+      expect(refreshCalls, isNotEmpty);
+      await drainTimers(tester);
+    });
+
+    testWidgets('连点两集：以**最后一次**为准，前面那一下不能把它吞掉', (tester) async {
+      // 切一集要等取链，那几百毫秒里用户发现点错了、又点了一集 ——
+      // 以前第二次点击被重入闸静默吃掉（表现是「点了没反应」，于是再点第三下）。
+      await pumpPlayer(tester);
+      await pushPlayRequest(tester, _playRequestWithPlaylist());
+      await drainTimers(tester);
+      await showChrome(tester);
+      await openPlaylist(tester);
+
+      // 每次取链都挂住，由用例逐个放行，才能精确控制「第一次还没回来」。
+      final tickets = <Completer<Object?>>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(multiChannel, (call) async {
+        if (call.method != 'invokeMethod') return null;
+        final args = (call.arguments as Map).cast<Object?, Object?>();
+        final method = args['method'];
+        if (method is String) bridgeMethods.add(method);
+        if (method == PlayerBridgeMethod.refreshTicket) {
+          refreshCalls.add(args);
+          final ticket = Completer<Object?>();
+          tickets.add(ticket);
+          return ticket.future;
+        }
+        if (method == PlayerBridgeMethod.ping) return 'pong';
+        return null;
+      });
+
+      await tester.tap(find.text('第 1 集'));
+      await tester.pump();
+      await tester.tap(find.text('第 3 集'));
+      await tester.pump();
+
+      expect(
+        refreshCalls.length,
+        1,
+        reason: '第二次点击不该在第一次还没回来时另起一条取链（会互抢 open）',
+      );
+
+      // 放行第一次取链。它成功与否不重要 —— 重要的是它收尾之后，
+      // 攒下的那次点击要被兑现。
+      tickets.first.complete(
+        const PlayRequest(
+          url: 'https://cdn.example.com/e1.mp4?sig=y',
+          title: '某剧 S01E01',
+          itemId: 'quark:fid-1',
+          qualityId: 'origin',
+          qualityLabel: '原画',
+        ).toJson(),
+      );
+      for (var i = 0; i < 8; i++) {
+        await tester.pump();
+      }
+
+      expect(refreshCalls.length, 2, reason: '第二次点击被吃掉了');
+      // `refreshCalls` 记的是跨窗口那一层的信封，条目 id 在 `arguments` 里。
+      final payload =
+          (refreshCalls.last['arguments'] as Map).cast<Object?, Object?>();
+      expect(
+        payload['itemId'],
+        'quark:fid-3',
+        reason: '应该切到最后点的那一集，而不是先点的那一集',
+      );
+      await drainTimers(tester);
+    });
+
+    testWidgets('取链失败：罩子必须收掉 —— 不能把「正在切换」永远挂在画面上', (tester) async {
+      // 失败时 `_requestFreshTicket` 只弹一句提示就返回 null。罩子如果跟着
+      // 一起留着，用户看到的就是「一个永远转不完的圈」，而底下其实还在放
+      // 上一集。
+      await pumpPlayer(tester);
+      await pushPlayRequest(tester, _playRequestWithPlaylist());
+      await drainTimers(tester);
+      await showChrome(tester);
+      await openPlaylist(tester);
+
+      // 主窗口回一句「拿不出新直链」：`PlayRequest.fromJson(null)` 是 null。
+      //
+      // ⚠️ 用 Completer 而不是直接回 null —— 直接回 null 时整个失败流程
+      // 会在同一帧里跑完，上面那句「罩子出现过」就断言不到了（而它恰恰是
+      // 这条用例的前提：先有罩子，才谈得上收掉）。
+      final ticket = Completer<Object?>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(multiChannel, (call) async {
+        if (call.method != 'invokeMethod') return null;
+        final args = (call.arguments as Map).cast<Object?, Object?>();
+        final method = args['method'];
+        if (method is String) bridgeMethods.add(method);
+        if (method == PlayerBridgeMethod.refreshTicket) return ticket.future;
+        if (method == PlayerBridgeMethod.ping) return 'pong';
+        return null;
+      });
+
+      await tester.tap(find.text('第 1 集'));
+      await tester.pump();
+      expect(find.text('正在切换到 第 1 集…'), findsOneWidget);
+
+      ticket.complete(null);
+      // 取链那一路是异步的，要把它的几个 await 走完。
+      for (var i = 0; i < 4; i++) {
+        await tester.pump();
+      }
+
+      expect(
+        find.text('正在切换到 第 1 集…'),
+        findsNothing,
+        reason: '取链失败还把罩子留着 —— 画面会永远停在「正在切换」',
       );
       await drainTimers(tester);
     });
