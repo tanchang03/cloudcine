@@ -325,10 +325,17 @@ mpv 收下了 `start` 属性却照旧从 0 播，日志里只有一句看着完�
 1. **`network.client` entitlements**：Flutter 模板只给 `app-sandbox` + `network.server`。
    缺 `network.client` 时应用**发不出任何网络请求**，而且报错不会指向权限 ——
    扫码、列目录、取流、海报、TMDB 全废，只能靠人记得这条。
-2. **部署目标 10.15**：硬下限来自 `media_kit_video` → `wakelock_plus` 的 podspec，
-   设 10.14 时 `pod install` 直接失败且报错不提 media_kit。又因 `platform :osx, '10.15'`
-   **只作用于 Runner 目标**，每个 pod 仍按自己 podspec 写的版本编译，所以 `post_install`
-   必须**逐个 target 覆盖** `MACOSX_DEPLOYMENT_TARGET`。不覆盖时
+2. **部署目标 12.0（2026-10-23 从 10.15 抬上来）**：两个下限取高的那个 ——
+   - 插件侧：`media_kit_video` → `wakelock_plus` 的 podspec 要求 ≥ 10.15，设 10.14 时
+     `pod install` 直接失败且报错不提 media_kit；
+   - 工具链侧：**Xcode 27 不再接受 12.0 以下的部署目标**，报
+     `The macOS deployment target 'MACOSX_DEPLOYMENT_TARGET' is set to 10.15,
+     but the range of supported deployment target versions is 12.0 to 27.0.x`
+     —— 而且每个 target（Runner / FlutterMacOS / 每个 pod）各报一遍，看起来像
+     插件集体坏了。三处必须同时改：`Podfile` 的 `platform :osx`、`post_install` 里那句
+     覆盖、`Runner.xcodeproj/project.pbxproj` 的三份 `MACOSX_DEPLOYMENT_TARGET`。
+   又因 `platform :osx` **只作用于 Runner 目标**，每个 pod 仍按自己 podspec 写的版本
+   编译，所以 `post_install` 必须**逐个 target 覆盖** `MACOSX_DEPLOYMENT_TARGET`。不覆盖时
    `flutter_inappwebview_macos` 以 10.14 编译会报
    `protocol 'ASWebAuthenticationPresentationContextProviding' requires
    'presentationAnchor(for:)' …` —— 报错指向 inappwebview，很容易误判成那个插件坏了。
