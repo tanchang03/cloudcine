@@ -4,7 +4,7 @@
 
 | 平台 | 文件 | 系统要求 |
 |---|---|---|
-| macOS | `cloudcine-x.y.z-macos.dmg`（或 `.zip`） | macOS 10.15 (Catalina) 或更高，Apple Silicon / Intel 均可 |
+| macOS | `cloudcine-x.y.z-macos.dmg`（或 `.zip`） | macOS 12.0 (Monterey) 或更高，Apple Silicon / Intel 均可 |
 | Windows | `cloudcine-x.y.z-windows-x64.msi`（或 `.zip`） | Windows 10 (x64) 或更高 |
 | Android | `cloudcine-x.y.z-bN-android.apk` | Android 5.0 (API 21) 或更高；手机 / 平板 |
 

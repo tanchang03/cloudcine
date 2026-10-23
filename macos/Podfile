@@ -1,8 +1,17 @@
-# 10.15 是**下限而不是偏好**：media_kit_video 依赖 wakelock_plus，
-# 而 wakelock_plus 的 podspec 要求 macOS >= 10.15。设成 10.14 会让
-# `pod install` 直接失败（"requires a higher minimum macOS deployment
-# version"），报错信息不会提到 media_kit，容易误判成插件本身有问题。
-platform :osx, '10.15'
+# ⚠️ 这个数字有**两个**来源，取高的那个：
+#
+#   1. 插件硬下限：media_kit_video 依赖 wakelock_plus，而它的 podspec 要求
+#      macOS >= 10.15。设成 10.14 会让 `pod install` 直接失败
+#      （"requires a higher minimum macOS deployment version"），
+#      报错信息不会提到 media_kit，容易误判成插件本身有问题。
+#   2. **工具链下限**：Xcode 27 起不再接受 12.0 以下的部署目标，报
+#      `The macOS deployment target 'MACOSX_DEPLOYMENT_TARGET' is set to
+#      10.15, but the range of supported deployment target versions is
+#      12.0 to 27.0.x` —— 而且这条错误会在**每一个** target 上各报一遍
+#      （Runner、FlutterMacOS、每个 pod），看起来像插件集体坏了。
+#
+# 所以现在是 12.0（Monterey）。要往下调之前先确认 Xcode 还收不收。
+platform :osx, '12.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -83,18 +92,21 @@ post_install do |installer|
 
     # ⚠️ 这一行不是冗余的。
     #
-    # `platform :osx, '10.15'` 只作用于 **Runner** 目标；每个 pod 自己的
-    # 构建配置仍然沿用 podspec 里声明的版本（media_kit 写 10.9、
-    # flutter_inappwebview_macos 写 10.14…）。后果是 pod 的 Swift 代码
-    # 以 10.14 编译，而 `ASWebAuthenticationPresentationContextProviding`
-    # 要求 10.15 才能满足协议，于是报：
-    #   error: protocol 'ASWebAuthenticationPresentationContextProviding'
-    #          requires 'presentationAnchor(for:)' to be available in
-    #          macOS 10.14 and newer
-    # 报错指向的是 inappwebview，很容易误判成那个插件坏了。
-    # 统一抬到 10.15 即可（10.15 是 wakelock_plus 要求的硬下限）。
+    # `platform :osx` 只作用于 **Runner** 目标；每个 pod 自己的构建配置仍然
+    # 沿用 podspec 里声明的版本（media_kit 写 10.9、flutter_inappwebview_macos
+    # 写 10.14…）。两个后果：
+    #
+    #   a) 版本不一致时 `ASWebAuthenticationPresentationContextProviding`
+    #      这类「带可用性标注的协议」会报错，而报错指向的是插件，很容易
+    #      误判成那个插件坏了；
+    #   b) **Xcode 27 起直接拒收 12.0 以下的部署目标** —— pod 只要自己写着
+    #      10.9 / 10.14，就会各自报一遍
+    #      `The macOS deployment target ... is set to 10.15, but the range of
+    #      supported deployment target versions is 12.0 to 27.0.x`。
+    #
+    # 所以这里把**所有** pod 统一拉到与 Podfile 顶部同一个值。
     target.build_configurations.each do |config|
-      config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '10.15'
+      config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '12.0'
     end
   end
 
