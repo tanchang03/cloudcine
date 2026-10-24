@@ -2936,6 +2936,15 @@ class LibraryActivity : Activity() {
                 //    菜单里的顺序与按键习惯保持一致，用户才不会觉得菜单是另一套。
                 actions.add("「${cur.title}」简介页 / 选集" to { openWork(cur) })
                 actions.add("播放「${cur.title}」（续播）" to { playWork(cur) })
+                // ⛔ 光标停在哪一部，就要能直接删那一部 —— 这是**对这一部作品**
+                //    的动作，不该逼用户先按「批量移除」进多选、再勾、再按工具条
+                //    （2026-10-24 现场：用户原话「菜单中只有多选删除，为啥不能
+                //    直接删除当前媒体」）。
+                // ⛔ 走 [confirmRemoveWork] 而不是自己弹框：与简介页那条、
+                //    与批量那一路**同一套确认**（[confirmRemoval]），所以文案 /
+                //    档位 / 「一并删网盘」的判据完全一致 —— 三个入口说三种话
+                //    是这个功能最容易「时灵时不灵」的地方。
+                actions.add("从媒体库移除「${cur.title}」…" to { confirmRemoveWork(cur) })
             }
             // ⛔ 排序**不在菜单里循环切**：六档要按五次才能到头，而每按一次都会
             //    重查库 + 重排整个海报墙。走子菜单，一次选完（状态行上的
@@ -2990,8 +2999,9 @@ class LibraryActivity : Activity() {
             actions.add("重新扫描媒体库（${DriveProviders.shortName(provider)}）" to { doScan() })
             // ⚠️ 「批量移除」进的是多选态，确认框里有**两档**：只移除本地索引
             //    （网盘文件不动、可重新扫描找回），或者连网盘文件一起删
-            //    （不可逆，只在当前网盘是夸克且名下真有可删文件时出现）。
-            //    简介页还有一条**单部**的同类入口（见 `confirmRemoveWork`）。
+            //    （不可逆，只在夸克已登录且名下真有可删文件时出现）。
+            //    ⛔ 单部删除**不在这条路上**：作品墙光标所在的那一部有直接入口
+            //    （上面那一组），简介页也有一条 —— 三个入口共用同一套确认。
             // ⛔ 排在「清空」**前面**：它比清空轻得多（可勾选、可取消），
             //    是更常用的那一个。
             actions.add("批量移除（从媒体库）…" to { enterSelection() })
@@ -3546,11 +3556,17 @@ class LibraryActivity : Activity() {
      *    的「默认停在只移除索引」更保守，是对的；别为了「少按一下」把
      *    「取消」挪走。
      *
-     * ⛔ 「一并删除网盘文件」只在**当前网盘是夸克**、且这批作品名下**真的有
-     *    可删文件**时出现：电视端对百度只读（`DriveClient` 上根本没有删除
-     *    方法，`BaiduApi` 也没有实现），给百度用户一个按下去必然失败的选项
+     * ⛔ 「一并删除网盘文件」只在**夸克已登录**、且这批作品名下**真的有可删
+     *    文件**时出现：电视端对百度只读（`DriveClient` 上根本没有删除方法，
+     *    `BaiduApi` 也没有实现），给只读网盘上的文件一个按下去必然失败的选项
      *    是纯粹的欺骗；而名下没有文件（空壳作品）时勾上它什么都不会发生，
      *    那是一个骗人的开关。
+     *
+     * ⛔ 判据**不是**「当前激活的网盘是不是夸克」：媒体库不按网盘分区（同一部
+     *    作品可能横跨两家），而删除永远走夸克那一侧（`PanApi(store)`）。
+     *    按 `activeProvider` 判的话，用户在文件列表里看的是百度时，回媒体库
+     *    就会被告知「当前网盘不支持删除」—— 而他那批文件全在夸克上、夸克
+     *    也登录着（2026-10-24 现场，用户原话「这不科学啊」）。
      */
     private fun confirmRemoveSelected() {
         if (selectedKeys.isEmpty()) return
@@ -3604,7 +3620,7 @@ class LibraryActivity : Activity() {
             // 统计完把状态行还回去：停在「正在统计网盘文件…」上，用户会以为
             // 还没结束、而屏幕上已经弹着确认框了。
             status.text = prev
-            val canDelete = t.hasDeletable && provider == DriveProviders.QUARK && api is PanApi
+            val canDelete = t.hasDeletable && store.loggedIn(DriveProviders.QUARK)
             showOverlay(
                 titleText = RemovalPlan.title(keys.size, t, canDelete, singleTitle),
                 labels = RemovalPlan.labels(keys.size, t, canDelete),
@@ -3676,7 +3692,14 @@ class LibraryActivity : Activity() {
         Bg.run({
             var drive: DriveRemoval? = null
             if (alsoDeleteDrive) {
-                val pan = api as? PanApi
+                // ⛔ **新建一个夸克客户端**，不用本页那个 `api`：`api` 跟着
+                //    `activeProvider` 变，而媒体库不按网盘分区 —— 用户此刻在
+                //    文件列表里看的是百度时，`api` 就是 `BaiduApi`（没有删除
+                //    方法），于是他会在媒体库里看到「当前网盘不支持删除」，
+                //    尽管这批作品的文件全在夸克上、而且夸克是登录着的
+                //    （2026-10-24 现场）。与上面 [service] 用 `PanApi(store)`
+                //    是同一个理由。
+                val pan = PanApi(store)
                 // fid 去重：勾选里同时有别名行和它的目标作品时，同一集会
                 // 被两次 `itemsForWork` 拿到 —— 重复的 fid 会让「删了几个」
                 // 虚高，也会让同一批请求里出现两个相同的 id。
@@ -3700,7 +3723,7 @@ class LibraryActivity : Activity() {
                     },
                 ) { chunk ->
                     try {
-                        pan?.deleteFiles(chunk)?.size ?: 0
+                        pan.deleteFiles(chunk).size
                     } catch (e: Exception) {
                         Log.w(TAG, "删网盘一批失败（${chunk.size} 个）", e)
                         throw e

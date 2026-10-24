@@ -1,6 +1,8 @@
 package com.cloudcine.tv
 
 import java.io.File
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -323,6 +325,93 @@ class LibraryBatchRemoveGuardTest {
         assertTrue(
             "`confirmRemoveWork` 不该碰 `selectedKeys`（那是作品墙多选的状态）。",
             !fn.contains("selectedKeys"),
+        )
+    }
+
+    /**
+     * 作品墙光标停在哪一部，菜单里就要能直接删**那一部**。
+     *
+     * 2026-10-24 现场：用户在作品墙上选中一部，菜单里只有「批量移除」，得先进
+     * 多选、再勾、再按工具条 —— 删一个东西走了三步。单部删除本来就有
+     * （[confirmRemoveWork]），只是作品墙这一层没接。
+     *
+     * ⛔ 必须走同一个 `confirmRemoveWork`：另写一套确认框，三个入口就会有三种
+     *    措辞、三种范围，而用户只会觉得这个删除功能时灵时不灵。
+     */
+    @Test
+    fun `作品墙选中一部也能直接移除`() {
+        val code = codeOnly(readSource(activityFile))
+        val menu = braceBlock(code, "private fun openMenu() {")
+        assertTrue(
+            "没能抽出 `openMenu` —— 正则已与源文件脱节，请修正本测试",
+            menu.isNotEmpty(),
+        )
+        // 作品墙那一支：光标所在作品（`works.getOrNull(...)`）之后必须出现入口。
+        val wall = menu.substringAfter(
+            "val cur = works.getOrNull(worksGrid.selectedItemPosition)",
+            missingDelimiterValue = "",
+        )
+        assertTrue(
+            "没能定位作品墙那一支（`works.getOrNull(worksGrid.selectedItemPosition)`）。\n" +
+                "正则已与源文件脱节，请修正本测试。",
+            wall.isNotEmpty(),
+        )
+        assertTrue(
+            "作品墙菜单里没有「从媒体库移除「X」…」这一项。\n" +
+                "用户选中一部想删掉它时，只能先按「批量移除」进多选 —— 三步才删掉一个。",
+            wall.contains("从媒体库移除「"),
+        )
+        assertTrue(
+            "作品墙那一项没有调 `confirmRemoveWork(`（动作没接，点了什么都不发生）。",
+            wall.contains("confirmRemoveWork("),
+        )
+        assertEquals(
+            "单部移除入口应该有两处（简介页 + 作品墙），实际 " +
+                "${Regex("confirmRemoveWork\\(").findAll(menu).count()} 处。",
+            2,
+            Regex("confirmRemoveWork\\(").findAll(menu).count(),
+        )
+    }
+
+    /**
+     * 「一并删网盘」的判据是**夸克登录态**，不是「当前激活的网盘」。
+     *
+     * ⛔ 2026-10-24 现场：用户在文件列表里浏览百度时回媒体库删作品，确认框说
+     *    「当前网盘不支持删除（只有夸克能删）」—— 而他那批文件全在夸克上、
+     *    夸克也登录着。媒体库不按网盘分区，删除永远走夸克那一侧，判据就不能
+     *    跟着 `activeProvider` 走。
+     */
+    @Test
+    fun `一并删网盘只看夸克登录态不看当前激活网盘`() {
+        val code = codeOnly(readSource(activityFile))
+        val fn = braceBlock(code, "private fun confirmRemoval(keys: List<String>, singleTitle: String?) {")
+        assertTrue(
+            "没能抽出 `confirmRemoval` —— 正则已与源文件脱节，请修正本测试",
+            fn.isNotEmpty(),
+        )
+        assertTrue(
+            "`canDelete` 没有判「夸克已登录」（`store.loggedIn(DriveProviders.QUARK)`）。",
+            fn.contains("store.loggedIn(DriveProviders.QUARK)"),
+        )
+        assertFalse(
+            "⛔ `canDelete` 又跟着当前激活网盘走了（`provider == DriveProviders.QUARK`）。\n" +
+                "用户在文件列表里看的是百度时，回媒体库就会被误告「当前网盘不支持删除」。",
+            fn.contains("provider == DriveProviders.QUARK"),
+        )
+        val rm = braceBlock(code, "private fun removeWorks(keys: List<String>, alsoDeleteDrive: Boolean) {")
+        assertTrue(
+            "没能抽出 `removeWorks` —— 正则已与源文件脱节，请修正本测试",
+            rm.isNotEmpty(),
+        )
+        assertTrue(
+            "`removeWorks` 没有新建夸克客户端（`PanApi(store)`）。",
+            rm.contains("PanApi(store)"),
+        )
+        assertFalse(
+            "⛔ `removeWorks` 又在用本页那个 `api` 了（`api as? PanApi`）：\n" +
+                "它跟着 `activeProvider` 变，用户在看百度时它就是 `BaiduApi`，" +
+                "而这批文件全在夸克上。",
+            rm.contains("api as? PanApi"),
         )
     }
 

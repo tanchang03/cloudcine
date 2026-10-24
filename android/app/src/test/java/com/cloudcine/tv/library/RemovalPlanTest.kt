@@ -106,18 +106,26 @@ class RemovalPlanTest {
     }
 
     /**
-     * 有文件可删、但当前网盘删不了（百度 / 未登录夸克）。
+     * 有文件可删、但这次删不了（夸克没登录）。
      *
      * ⛔ 不能一声不响：用户会以为「这台电视不支持删网盘」，然后去文件列表里
      *    一个个手删。
+     * ⛔ 也**不能说「当前网盘不支持删除」** —— 媒体库不按网盘分区，能不能删
+     *    只取决于夸克登没登录。说成「当前网盘」的话，用户在夸克的文件列表里
+     *    明明能删、回媒体库却被说成不支持（2026-10-24 现场）。
      */
     @Test
     fun `有文件可删但当前删不了时正文要解释`() {
         val text = RemovalPlan.title(1, RemovalTally(deletable = 4), canDeleteFromDrive = false)
         assertTrue(text.contains("4 个文件"))
-        assertTrue("要说明为什么删不了", text.contains("只有夸克能删"))
-        assertTrue(text.contains("只会移除索引"))
+        assertTrue("要说明是夸克没登录", text.contains("夸克网盘没有登录"))
+        assertTrue("要给出下一步（去登录）", text.contains("登录夸克"))
+        assertTrue(text.contains("只能移除索引"))
         assertTrue("这时候不能说会永久删除", !text.contains("不可撤销"))
+        assertTrue(
+            "⛔ 不能再说「当前网盘不支持删除」：媒体库与 activeProvider 无关。",
+            !text.contains("当前网盘不支持"),
+        )
     }
 
     /** 只读网盘上的那几个**怎么都删不掉**，必须单独说一句。 */
