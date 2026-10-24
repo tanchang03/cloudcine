@@ -27,6 +27,19 @@ import java.util.TimeZone
  *    它永远会显示「成功」，只是可能把其中一边的库换成了另一边的。
  *    所以每个方法都返回一句可以原样上屏的说明。
  *
+ * ## ⛔⛔ 电视端**只读**：备份由 PC 端产生，电视只负责「恢复」
+ *
+ * 用户的原话：「电视上维护 / 刮削不方便，不要自动备份媒体库，只需要支持从
+ * 网盘恢复」。所以 [sync] 里所有「该上传本地」的分支**一律改成不动**：
+ *
+ *   * 电视侧上传只会把电脑上刮削好、标好片头、归一过的库**盖成电视那一份**
+ *     —— 而电视上恰恰是那个「什么都不方便改」的一端；
+ *   * 反过来，电视要的只是「把电脑的成果拉下来」，[restoreLatest] /
+ *     [sync] 的恢复分支一个字都不用改。
+ *
+ * ⛔ 播放进度的静默同步（`ProgressSync` / `playback_progress.json`）**不在此列**：
+ *    那是双向的、每条记录各自 LWW，电视端本来就该写。
+ *
  * ## 线程模型
  *
  * 全部阻塞（网络 + 磁盘）。**调用方负责放到 [com.cloudcine.tv.pan.Bg]**。
@@ -58,8 +71,16 @@ class LibraryBackupService(
         val remoteName: String? = null,
         /** 上传后的 fid；恢复时为 `null`。 */
         val uploadedFileId: String? = null,
+        /**
+         * 覆盖上屏文案。
+         *
+         * ⛔ 电视端把「该上传」的分支改成了**什么都不做**（见类文档「电视端只读」），
+         *    但 [SyncDecision.Action] 的文案是跨端共用的、说的是「已上传」——
+         *    照搬上屏就是在骗用户。跳过时用这个字段说实话。
+         */
+        val note: String? = null,
     ) {
-        val message: String get() = action.message
+        val message: String get() = note ?: action.message
         val restores: Boolean get() = action.restores
         val uploads: Boolean get() = action.uploads
     }
@@ -329,8 +350,11 @@ class LibraryBackupService(
         val action = SyncDecision.decide(local, remote)
         Log.i(
             tag,
+            // ⛔ 两边都按**毫秒**打印：`libraryModifiedAt` 是 Unix **秒**，
+            //    而 `effectiveModifiedAt` 是**毫秒**，并排打成「1792809353s vs
+            //    1792809353000」会让人以为远程新了 1000 倍（现场真误判过一次）。
             "[备份] 启动探测：${action.name}（本地=" +
-                (localSec?.let { "${it}s" } ?: "无（空库）") +
+                (localSec?.let { "${it * 1000L}ms" } ?: "无（空库）") +
                 "，远程=${remote?.effectiveModifiedAt ?: "无"}）" +
                 "，最新备份=「${latest?.name ?: "无"}」",
         )
@@ -419,17 +443,23 @@ class LibraryBackupService(
         )
 
         return when (action) {
-            // 远程没有备份 / 远程是空备份 / 本地更新 → 上传本地
+            // ⛔⛔ 电视端**不上传**：这三个动作原本都要「把本地库推上去」，现在
+            //    一律什么都不做（见类文档「电视端只读」）。电视上既不维护也不
+            //    刮削，它那份库唯一的价值是「能播」；上传只会把电脑上那份
+            //    刮好、标好、归一过的备份盖掉，而且盖完两边都显示「成功」。
             SyncDecision.Action.uploadFirst,
             SyncDecision.Action.uploadRemoteEmpty,
             SyncDecision.Action.uploadLocalNewer,
             -> {
-                val bytes = exportBackup(
-                    includePosters = includePosters,
-                    includeSettings = includeSettings,
+                Log.i(
+                    tag,
+                    "[备份] 决策要上传，但电视端只读 —— 跳过（网盘备份由 PC 端产生）",
                 )
-                val fid = uploadBackup(bytes, dirName = dirName, onProgress = onProgress)
-                SyncOutcome(action, uploadedFileId = fid)
+                SyncOutcome(
+                    action,
+                    remoteName = latest?.name,
+                    note = "电视端不上传备份，网盘那份保持不动（在电脑上备份）",
+                )
             }
 
             // 本地空库 / 远程更新 → 恢复

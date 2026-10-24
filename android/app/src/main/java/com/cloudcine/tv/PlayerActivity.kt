@@ -49,6 +49,8 @@ import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryItem
 import com.cloudcine.tv.library.LibraryPaths
 import com.cloudcine.tv.library.LibrarySchema
+import com.cloudcine.tv.library.MissingReceipt
+import com.cloudcine.tv.library.MissingReceipts
 import com.cloudcine.tv.library.OutroSkip
 import com.cloudcine.tv.library.PlaybackResume
 import com.cloudcine.tv.library.ProgressStore
@@ -63,6 +65,7 @@ import com.cloudcine.tv.pan.PlayInfo
 import com.cloudcine.tv.pan.Quality
 import com.cloudcine.tv.pan.DriveClient
 import com.cloudcine.tv.pan.DriveClients
+import com.cloudcine.tv.pan.DriveException
 import com.cloudcine.tv.pan.DriveProviders
 import com.cloudcine.tv.pan.PanHttp
 import com.cloudcine.tv.pan.SubtitleFile
@@ -460,6 +463,22 @@ class PlayerActivity : Activity() {
     /** 当前正在播的那一条在 [siblings] 里的下标；`-1` = 不在里面。 */
     private var episodeIndex = -1
 
+    /**
+     * 最近一次请求选集时用的 `group_key` / `fid`（空 = 这部片没有作品归属）。
+     *
+     * ⛔ 留着它们是为了**重试**：读库失败（`database is locked`）是瞬时的，
+     *    而一次失败会让「选集」整行在本会话里永久消失 —— 打开菜单时正是
+     *    再试一次的最好时机（见 [showOsd]）。
+     */
+    private var siblingsGroupKey = ""
+    private var siblingsFid = ""
+
+    /** 选集那次读库**成功过**没有。`false` + 有 groupKey ⇒ 值得重试。 */
+    private var siblingsLoaded = false
+
+    /** 读库请求序号：只有最新一次的回调才认，防止旧结果盖掉新的。 */
+    private var siblingsSeq = 0
+
     /** 选集列表里那些网盘封面的取用（内存 + 落盘 + 失败标记）。 */
     private var episodeThumbs: EpisodeThumbs? = null
 
@@ -779,9 +798,36 @@ class PlayerActivity : Activity() {
         Bg.run({ api!!.resolve(fid, pathHint) }) { pi, err ->
             if (err != null) {
                 Log.e(TAG, "取链失败", err)
-                showNotice("取链失败\n${err.message}")
+                if (isMissingFile(err)) {
+                    // 文件**已经不在网盘上** ⇒ 留一张回执，媒体库页回来时问用户。
+                    //
+                    // ⛔ 只留「哪个 fid 没了」，**不问话**：电视上的问话必须发生在
+                    //    用户回到媒体库、眼前就是这部剧的文件列表的时候 —— 在播放页
+                    //    弹一个「要不要移除」，用户根本看不见「还剩几集」，只能盲选。
+                    //    PC 端那个弹窗之所以在播放页上，是因为它还有独立的播放窗口；
+                    //    电视端退回列表就是全部上下文（见 `MissingMediaPlan` 类文档）。
+                    //
+                    // ⛔ 走进程内的槽位（`MissingReceipts`）而**不是** `setResult`：
+                    //    这一页是 `singleTask`，结果协议不保证把 intent 带回来 ——
+                    //    见 `MissingReceipt` 的类文档。
+                    MissingReceipts.put(
+                        MissingReceipt(
+                            fid = fid,
+                            provider = provider,
+                            name = intent.getStringExtra(EXTRA_NAME).orEmpty(),
+                            groupKey = intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty(),
+                        ),
+                    )
+                    showNotice("这个文件已经不在网盘上了\n${err.message}\n按返回键，媒体库会问你要不要移除它")
+                } else {
+                    showNotice("取链失败\n${err.message}")
+                }
                 return@run
             }
+            // 取到了 ⇒ 撤掉上一次失败留下的回执：换集时前一集可能已经报过
+            // 「文件没了」，不撤的话用户会回到媒体库、被问一个**已经能播的**
+            // 文件要不要移除。
+            MissingReceipts.clear()
             if (pi == null || pi.qualities.isEmpty()) {
                 showNotice("服务端没给出任何可用地址")
                 return@run
@@ -809,25 +855,97 @@ class PlayerActivity : Activity() {
         }
     }
 
+    /**
+     * 这次取链失败是不是「文件已经不在网盘上」。
+     *
+     * ## ⛔ 只认 [DriveException.notFound]
+     *
+     * 取链失败有很多种，而它们的后果完全不同：
+     *
+     *   * `needsReauth` / 网络 / 限流 → 文件**还在**，只是这次没取到。
+     *     拿这种失败去问用户「要不要移除这一条」，他一点确认，一条好好的
+     *     索引就没了，而原因只是刚才断了一下网；
+     *   * 直链 4xx（签名过期 / 换 IP）→ 说明的是**这条 URL** 失效，
+     *     重新取一次链就好，与文件在不在是两回事。
+     *
+     * 所以判据与 PC 端 `missing_media.dart` 的 `isMissingFileError` 逐字一致：
+     * 服务端**明确说没有这个 fid**，才允许把「它可能已经被删了」这个推断
+     * 摆到用户面前。
+     */
+    private fun isMissingFile(err: Throwable): Boolean =
+        err is DriveException && err.notFound
+
     // ------------------------------------------------------------------
     // 选集
     // ------------------------------------------------------------------
 
     /**
      * 把同一部作品下的全部条目读进来（为了「选集」那一行）。
-     *
      * ⛔ **必须在后台线程查**：一部剧能有两百多条，主线程查库就是一次可见的卡顿
      *    —— 而且它发生在 `onCreate`，卡的是「起播前那段黑屏」。
      * ⛔ 读不到库（没同步过 / 文件坏了）时**静默降级**：选集行不出现，
      *    播放本身完全不受影响。这条路径不该因为「库没了」而播不了片。
+     *
+     * ## ⛔⛔ 为什么必须**重试**
+     *
+     * 真机现场（2026-10-24，MiTV-MFTP0）：点进播放的那一刻，媒体库页正在写
+     * `last_played_at`（`LibraryActivity.play()` 里的 `markPlayed`），两个句柄
+     * 撞在同一个 `journal_mode=DELETE` 的库上，播放页这边 `LibraryDb.open()`
+     * 当场抛 `SQLITE_BUSY`（`database is locked`）。
+     *
+     * 那时的老代码**一次失败就永久放弃** —— 于是「选集」整行在这个会话里再也
+     * 不出现，用户看到的是「同一个剧集，有时有选集、有时没有；重启后第一次
+     * 总是好的」。锁是**瞬时**的（另一边的写事务毫秒级结束），所以：
+     *
+     *   1. 这里退避重试几次（[SIBLINGS_RETRIES]）；
+     *   2. 仍然失败的话，[showOsd] 打开菜单时还会再试 —— 那是用户的真实动作，
+     *      比任何定时器都靠谱。
      */
     private fun loadSiblings(groupKey: String, fid: String) {
-        if (groupKey.isEmpty()) return
+        siblingsGroupKey = groupKey
+        siblingsFid = fid
+        if (groupKey.isEmpty()) {
+            // ⛔ 这条**要留日志**：以前是静默 return，真机上根本分不清
+            //    「没有 group_key」和「查到了 0 条」。
+            Log.i(TAG, "选集：这条没有 group_key（不是从媒体库进来的？），选集行不可用")
+            return
+        }
+        val seq = ++siblingsSeq
+        loadSiblingsAttempt(groupKey, fid, seq, attempt = 0)
+    }
+
+    /** [loadSiblings] 的一次尝试；失败按 [SIBLINGS_RETRY_DELAY_MS] 线性退避重试。 */
+    private fun loadSiblingsAttempt(groupKey: String, fid: String, seq: Int, attempt: Int) {
         Bg.run({ ensureLib().itemsForWork(groupKey) }) { list, err ->
+            // 期间又发起过一次读库（换集 / 重试）⇒ 这次的结果已经过期。
+            if (seq != siblingsSeq) return@run
             if (err != null) {
-                Log.w(TAG, "读选集失败（groupKey=$groupKey），选集行不可用", err)
+                if (attempt < SIBLINGS_RETRIES) {
+                    Log.w(
+                        TAG,
+                        "读选集失败（groupKey=$groupKey，第 ${attempt + 1} 次），" +
+                            "${SIBLINGS_RETRY_DELAY_MS * (attempt + 1)}ms 后重试",
+                        err,
+                    )
+                    ui.postDelayed(
+                        {
+                            if (seq == siblingsSeq) {
+                                loadSiblingsAttempt(groupKey, fid, seq, attempt + 1)
+                            }
+                        },
+                        SIBLINGS_RETRY_DELAY_MS * (attempt + 1),
+                    )
+                    return@run
+                }
+                Log.w(
+                    TAG,
+                    "读选集失败（groupKey=$groupKey，已重试 $SIBLINGS_RETRIES 次），" +
+                        "选集行暂不可用（打开菜单会再试一次）",
+                    err,
+                )
                 return@run
             }
+            siblingsLoaded = true
             val items = list.orEmpty()
             siblings = items
             episodeIndex = items.indexOfFirst { it.fileId == fid }
@@ -976,6 +1094,9 @@ class PlayerActivity : Activity() {
         currentIsPlaylist = false
         siblings = emptyList()
         episodeIndex = -1
+        // ⛔ 换了集 = 选集这份数据作废；不置回 false 的话，下一次读库失败后
+        //    [showOsd] 就不会再补试（它会以为上一份是好的）。
+        siblingsLoaded = false
         firstFrameRendered = false
         player?.release()
         player = null
@@ -1367,7 +1488,11 @@ class PlayerActivity : Activity() {
      */
     private fun ensureLib(): LibraryDb {
         libDb?.let { return it }
-        val db = LibraryDb(
+        // ⛔ 必须走 `LibraryDb.shared`（进程内唯一）：媒体库页此刻正持着同一个
+        //    库在写 `last_played_at`，这里再 new 一个句柄就是**第二个连接**，
+        //    在 `journal_mode=DELETE` 下会当场抛 `database is locked`，
+        //    表现为「选集」整行消失（见 `LibraryDb.shared` 的类注释）。
+        val db = LibraryDb.shared(
             LibraryPaths.dbFile(this),
             progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
         )
@@ -3466,6 +3591,14 @@ class PlayerActivity : Activity() {
         //    `resetSelectionForTest()` 里的 `currentOptionIndex()` 读的是
         //    **已经绑上去的那份 rows**，顺序反了光标就会落在上一份表上。
         rebindOsd()
+        // ⛔⛔ 上一次读库没成功（撞上另一个句柄的写事务，见 [loadSiblings]）时，
+        //    「选集」行此刻是**缺**的。打开菜单是用户的真实动作，也是最后一次
+        //    自然的补救机会 —— 重试成功后 [rebindOsd] 会把这一行补上。
+        //    不这么做的话，一次瞬时失败 = 整个会话都没有选集。
+        if (!siblingsLoaded && siblingsGroupKey.isNotEmpty()) {
+            Log.i(TAG, "OSD 打开时补一次选集读库（上次没成功）")
+            loadSiblings(siblingsGroupKey, siblingsFid)
+        }
         osd.resetSelectionForTest()
         osd.visibility = View.VISIBLE
         // ⛔ 必须紧跟着抬字幕：菜单卡片占了屏幕下半截，不抬的话字幕正好被压住。
@@ -3734,6 +3867,16 @@ class PlayerActivity : Activity() {
          *    直接点一个文件进来就是这种情形。
          */
         const val EXTRA_GROUP_KEY = "groupKey"
+
+        /**
+         * 「选集」读库失败的重试次数与退避基数（毫秒）。
+         *
+         * ⛔ 撞的是 `SQLITE_BUSY`（另一个句柄正在写 `last_played_at`），而写事务
+         *    是毫秒级的 —— 三次、最多等 150+300+450ms 足够，再多只会让
+         *    「起播后菜单晚一拍才长选集行」变得可感知。
+         */
+        private const val SIBLINGS_RETRIES = 3
+        private const val SIBLINGS_RETRY_DELAY_MS = 150L
 
         /**
          * 起播要跳到的位置（毫秒）；`<= 0` = 从头播。

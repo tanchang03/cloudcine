@@ -142,7 +142,7 @@ class ScrapeActivity : Activity() {
             finish()
             return
         }
-        db = LibraryDb(
+        db = LibraryDb.shared(
             LibraryPaths.dbFile(this),
             progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
         )

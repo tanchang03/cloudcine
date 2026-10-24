@@ -26,7 +26,10 @@ import com.cloudcine.tv.pan.DriveEntry
 import com.cloudcine.tv.pan.DriveException
 import com.cloudcine.tv.pan.DriveProviders
 import com.cloudcine.tv.pan.CredStore
+import com.cloudcine.tv.pan.PanApi
 import com.cloudcine.tv.pan.formatSize
+import com.cloudcine.tv.library.DriveDeletePlan
+import com.cloudcine.tv.library.DriveDeleteTarget
 import com.cloudcine.tv.library.FolderSortMode
 import com.cloudcine.tv.library.LibraryDb
 import com.cloudcine.tv.library.LibraryPaths
@@ -81,6 +84,15 @@ class BrowseActivity : Activity() {
      */
     private var discovering = false
 
+    /**
+     * 是否有删除正在跑。
+     *
+     * ⛔ 与 [discovering] 分开：删除是**不可逆**的，重复触发等于对同一个 fid
+     *    发两次永久删除请求。而 `Busy` 那种全局闸门在这里没有意义 —— 发现
+     *    跑到一半时用户完全可以去删一个不相干的文件。
+     */
+    private var deleting = false
+
     private lateinit var listView: ListView
     private lateinit var title: TextView
     private lateinit var status: TextView
@@ -120,7 +132,7 @@ class BrowseActivity : Activity() {
         // ⛔ 厂家由 `activeProvider` 决定（两家可以同时登录，页头/菜单里能切）。
         provider = store.activeProvider
         api = DriveClients.create(provider, store)
-        db = LibraryDb(
+        db = LibraryDb.shared(
             LibraryPaths.dbFile(this),
             progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
         )
@@ -441,6 +453,15 @@ class BrowseActivity : Activity() {
             actions.add("把「${cur.name}」加入媒体库" to { doDiscoverFile(cur) })
         }
 
+        // ── 删除这一项（网盘 + 媒体库索引）────────────────────────────
+        // ⛔ 只在**夸克**下出现：电视端对百度只读（`BaiduApi` 上根本没有删除
+        //    方法），给百度用户一个按下去必然失败的选项是纯粹的欺骗。
+        // ⛔ 排在「发现」之后、「媒体库」之前：它是**针对光标那一行**的动作，
+        //    与上面三项同类；放到页面级入口后面会被读成全局操作。
+        if (!discovering && cur != null && canDeleteHere) {
+            actions.add("删除「${cur.name}」（网盘，不可撤销）…" to { confirmDeleteEntry(cur) })
+        }
+
         actions.add("媒体库" to { gotoLibrary() })
 
         // ── 网盘切换 / 重新登录 ──────────────────────────────────────
@@ -550,10 +571,7 @@ class BrowseActivity : Activity() {
             adapter.notifyDataSetChanged()
             buildSortBar()
             title.text = stack.joinToString(" / ") { it.second }
-            // ⛔ 状态行带上厂家短名：两家同时登录时，用户只能靠这一处分辨
-            //    「我现在看的是哪个网盘」。
-            status.text = "${DriveProviders.shortName(provider)} · 共 ${entries.size} 项" +
-                "（目录 ${entries.count { it.isDir }}）"
+            paintStatus()
             listView.setSelection(0)
             listView.requestFocus()
         }
@@ -686,6 +704,158 @@ class BrowseActivity : Activity() {
             }
             status.text = out?.message ?: "已加入媒体库"
         }
+    }
+
+    /**
+     * 当前这一层的状态行文案。
+     *
+     * ⛔ 抽出来是因为它有两个写入口（列目录成功、确认框关掉之后要把被借走的
+     *    那一行还回去）。两处各写一遍的话，某一处漏了「目录 N」就再也不会回来，
+     *    而用户只会觉得「这个页面有时候数得不对」。
+     *
+     * ⛔ 带上厂家短名：两家同时登录时，用户只能靠这一处分辨「我现在看的是
+     *    哪个网盘」。
+     */
+    private fun paintStatus() {
+        status.text = "${DriveProviders.shortName(provider)} · 共 ${entries.size} 项" +
+            "（目录 ${entries.count { it.isDir }}）"
+    }
+
+    // ------------------------------------------------------------------
+    // 删除网盘条目（并把媒体库里的索引一起清掉）
+    // ------------------------------------------------------------------
+
+    /** 这家网盘现在能不能删。电视端只有夸克能删（`PanApi.deleteFiles`）。 */
+    private val canDeleteHere: Boolean
+        get() = provider == DriveProviders.QUARK && api is PanApi
+
+    /**
+     * 光标那一行 ⇒ 先数清媒体库里牵连几条，再弹确认。
+     *
+     * ## ⛔ 必须先数、再问
+     *
+     * 「媒体库里有 N 条会一起清掉」是用户判断「这一下会动多少」的唯一依据 ——
+     * 删一个 200 集的目录，库里就是 200 条索引。先弹框后统计的话，那句只能
+     * 省略，而用户按下去之后才发现媒体库里少了一整季。
+     *
+     * ## ⛔ 目录要按**当前这一层的路径**算前缀
+     *
+     * `childPath(name)` 而不是网盘条目自带的路径：列目录拿到的条目里那个字段
+     * 通常是空的，拿它去匹配会**静默地一条都匹配不到**，而那些死索引会留在库里。
+     */
+    private fun confirmDeleteEntry(e: DriveEntry) {
+        if (!canDeleteHere) {
+            status.text = "${DriveProviders.displayName(provider)} 只读，不支持删除"
+            return
+        }
+        if (deleting) {
+            status.text = "正在删除，请稍候…"
+            return
+        }
+        val prefix = if (e.isDir) childPath(e.name) else null
+        status.text = "正在统计「${e.name}」在媒体库里的条目…"
+        Bg.run({ db.countDriveEntry(provider, e.fid, prefix) }) { count, err ->
+            if (err != null) {
+                Log.e(TAG, "统计媒体库条目失败", err)
+                status.text = "统计失败：${err.message}"
+                return@run
+            }
+            // 统计完把状态行还回去：停在「正在统计…」上，而屏幕上已经弹着
+            // 确认框了，用户会以为还有东西在跑。
+            paintStatus()
+            val plan = DriveDeletePlan(
+                target = DriveDeleteTarget(
+                    fid = e.fid,
+                    name = e.name,
+                    isDir = e.isDir,
+                    sizeBytes = e.sizeBytes,
+                ),
+                providerName = DriveProviders.displayName(provider),
+                libraryItems = count ?: 0,
+            )
+            showOverlay(
+                titleText = planText(plan),
+                // ⛔ 「取消」在第一位：`showOverlay` 的光标从 0 开始，用户按 OK
+                //    落在取消上 —— 一次顺手确认不该删掉一季的片子。
+                labels = listOf("取消", plan.confirmLabel),
+            ) { index ->
+                hideOverlay()
+                if (index == 1) doDeleteEntry(plan, prefix)
+            }
+        }
+    }
+
+    /** 确认框正文：按「删什么 → 能不能回来 → 连带什么 → 腾多少 → 库里几条」排。 */
+    private fun planText(plan: DriveDeletePlan): String = listOfNotNull(
+        plan.title,
+        plan.irreversible,
+        plan.folderWarning,
+        plan.freedLabel,
+        plan.libraryLine,
+    ).joinToString("\n")
+
+    /**
+     * 真删：先网盘、后索引。
+     *
+     * ⛔ 顺序不能反：索引一删，`media_items` 里那条 `provider:fileId` 就没了，
+     *    而它正是网盘要删的那个 fid 的唯一来源。
+     * ⛔ 网盘删除**失败时不清索引**：留着索引，用户下次扫描还能看见它；清掉的
+     *    话会变成「文件还在网盘上，媒体库里却没了」—— 要回来得重扫一遍。
+     * ⛔ 只有真的删掉了才重列：失败时重列，列表一动不动，用户会以为界面没反应。
+     */
+    private fun doDeleteEntry(plan: DriveDeletePlan, dirPathPrefix: String?) {
+        if (deleting) return
+        deleting = true
+        status.text = "正在删除「${plan.target.name}」…"
+        Bg.run({
+            val pan = api as? PanApi
+            val ok = pan?.deleteFiles(listOf(plan.target.fid)) ?: emptyList()
+            // ⛔ 只有确认删掉的才清索引（理由见方法文档第二段）。
+            val removed =
+                if (ok.isNotEmpty()) {
+                    db.purgeDriveEntry(provider, plan.target.fid, dirPathPrefix)
+                } else {
+                    0
+                }
+            ok.size to removed
+        }) { out, err ->
+            deleting = false
+            val deleted = out?.first ?: 0
+            val removed = out?.second ?: 0
+            if (err != null) Log.e(TAG, "删除网盘条目失败：${plan.target.name}", err)
+            Log.i(
+                TAG,
+                "删除网盘条目「${plan.target.name}」：deleted=$deleted，" +
+                    "媒体库清掉 $removed 条",
+            )
+            status.text = plan.resultMessage(deleted, removed, err?.let { explainDriveError(it) })
+            if (deleted > 0) reloadHere()
+        }
+    }
+
+    /** 把「再试也没用」的错误翻成用户能照做的一句话。 */
+    private fun explainDriveError(err: Throwable): String = when {
+        err is DriveException && err.needsReauth ->
+            "登录已失效（菜单 → 重新登录${DriveProviders.displayName(provider)}）"
+        else -> err.message ?: err.javaClass.simpleName
+    }
+
+    /**
+     * 重列**当前这一层**（删完一项之后用）。
+     *
+     * ⛔ 不能直接 `open(...)`：那个会往栈里再压一层 —— 删完一项按返回会回到
+     *    同一个目录、再按一次才真的上去。先弹出栈顶再 open，栈深不变。
+     */
+    private fun reloadHere() {
+        val top = if (stack.isNotEmpty()) {
+            stack.removeAt(stack.size - 1)
+        } else {
+            // 栈空 = 根目录还没读出来（列目录失败过）。此时重列根。
+            api.rootId to "云影"
+        }
+        entries.clear()
+        adapter.notifyDataSetChanged()
+        open(top.first, top.second)
     }
 
     /** 返回键弹一层目录栈；已在根目录则退出。 */

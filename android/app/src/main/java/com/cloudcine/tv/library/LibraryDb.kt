@@ -66,15 +66,22 @@ class LibraryDb(
         file.parentFile?.mkdirs()
         val fresh = !exists()
         val opened = SQLiteDatabase.openOrCreateDatabase(file, null)
+        // ⛔⛔ `busy_timeout` 必须是**第一条** PRAGMA —— 它管的是「撞上别人的
+        //    写事务时最多等多久」。放在下面几条之后等于没设：`journal_mode`
+        //    自己就要拿写锁，撞上时**当场**抛
+        //    `SQLiteDatabaseLockedException (code 5 SQLITE_BUSY)`，
+        //    而那一刻 5 秒超时还没生效。
+        //
+        //    真机现场（2026-10-24，MiTV-MFTP0）：播放页与媒体库页各持一个句柄，
+        //    点进播放时媒体库那边正在写 `last_played_at`（`play()` 里的
+        //    `markPlayed`），于是播放页 `open()` 当场抛错 → `itemsForWork`
+        //    拿不到兄弟集 → **OSD 里的「选集」整行消失**，而且这个会话再也不会
+        //    重试。表现正是用户报的「有时有、有时没有；重启后第一次正常」。
+        //    用 PRAGMA 而不是 `setBusyTimeout()`：后者在部分 API 级别上是隐藏接口。
+        opened.rawQuery("PRAGMA busy_timeout=5000", null).use { it.moveToFirst() }
         // ⛔ 必须在任何写入之前设；见类文档「不用 WAL」。
         opened.rawQuery("PRAGMA journal_mode=DELETE", null).use { it.moveToFirst() }
         opened.rawQuery("PRAGMA foreign_keys=ON", null).use { it.moveToFirst() }
-        // ⛔ 忙等超时：扫描（后台写事务）与界面（主线程读）会**同时**碰这个库，
-        //    而默认超时是 0ms —— 撞上一次写事务就直接抛 `database is locked`，
-        //    症状是「扫描到一半，海报墙突然报读取失败」。
-        //    设 5 秒让读等一会儿，而不是立刻失败。用 PRAGMA 而不是
-        //    `setBusyTimeout()`：后者在部分 API 级别上是隐藏接口。
-        opened.rawQuery("PRAGMA busy_timeout=5000", null).use { it.moveToFirst() }
         if (fresh) Log.i(TAG, "索引库不存在，新建：${file.absolutePath}")
         ensureSchema(opened)
         db = opened
@@ -2406,14 +2413,17 @@ class LibraryDb(
     // ------------------------------------------------------------------
 
     /**
-     * 从索引里移除一整部作品（媒体库多选的「移除」用）。
+     * 从索引里移除一整部作品（媒体库多选 / 简介页单部移除用）。
      *
      * ## ⛔ 它删的是**本地索引**，不碰网盘
      *
      * 与「清空媒体库索引」（[wipeIndex]）同类：作品行、集数、播放进度会没，
-     * 网盘上的文件原样保留 —— 之后重新扫描就能找回来。删网盘文件那条路在
-     * PC 端的目录视图，**电视端刻意没有**（遥控器上没有「误触撤销」，
-     * 而网盘删除不可逆）。
+     * 网盘上的文件原样保留 —— 之后重新扫描就能找回来。
+     *
+     * ⚠️ 想**连网盘文件一起删**是调用方的事：`LibraryActivity.removeWorks`
+     * 会先按 `media_items` 里的 fid 调 `PanApi.deleteFiles`，再调这里。
+     * 本方法只管索引 —— 顺序反了的话 fid 已经随索引行一起没了，网盘上一个
+     * 都删不掉，而且不报错（所以那一步必须留在调用方、且在**这之前**）。
      *
      * 口径与 PC 端 `MediaRepositoryImpl.deleteWork` **逐条一致**：
      *
@@ -2488,6 +2498,128 @@ class LibraryDb(
             d.endTransaction()
         }
         return removed
+    }
+
+    /**
+     * 勾选的这几部里有几部是**别名行**（`merged_into` 非空）。
+     *
+     * ## 为什么要单独数一次
+     *
+     * 别名行在作品墙上是**看不见**的（`listWorks` 恒带 `merged_into IS NULL`），
+     * 但 `deleteWorks` 的口径是「目标 + 所有折进来的源作品」。也就是说勾一部
+     * 目标作品，实际会连带删掉几行用户从没见过的别名 —— 那句话必须在确认框里
+     * 说出来，否则用户会以为「库里还剩几条，下次扫描它们又回来了」。
+     *
+     * ⚠️ 反方向（有人折进这一部）从作品行上**看不出来**（要知道得反查全库），
+     *    所以这里只数「勾选的这几行自己是不是别名」，不假装数得出全部牵连 ——
+     *    与 PC 端 `LibraryBatchDeletePlan.mergedInvolvedCount` 同一口径。
+     */
+    fun countMergedAliases(keys: List<String>): Int {
+        if (keys.isEmpty()) return 0
+        val d = require()
+        var n = 0
+        for (chunk in keys.chunked(SQL_CHUNK)) {
+            val marks = chunk.joinToString(",") { "?" }
+            d.rawQuery(
+                "SELECT COUNT(*) FROM media_works " +
+                    "WHERE key IN ($marks) AND merged_into IS NOT NULL",
+                chunk.toTypedArray(),
+            ).use { c -> if (c.moveToFirst()) n += c.getInt(0) }
+        }
+        return n
+    }
+
+    /**
+     * 这个网盘条目在媒体库里有几条索引行（确认框上那句「会一起清掉 N 条」）。
+     *
+     * ## 两条路径，因为「一个目录」在索引里不是一个 id
+     *
+     *   * **文件**：索引行按 `provider:fileId` 建主键，点查即可；
+     *   * **目录**：索引里**没有目录这个概念** —— 它记的是文件在哪个 `dirPath`
+     *     下，所以只能按路径前缀把整棵子树捞出来。漏了这一条，用户删掉一个
+     *     剧集目录之后，那一季几十集会在库里全部变成死索引。
+     *
+     * ⛔ 前缀比较用 `substr(...) = ?` 而**不是 `LIKE '前缀%'`**：目录名里带
+     *    `_` 或 `%` 的并不罕见（`S01E01_1080p`、`100%`），而 `LIKE` 把这两个
+     *    当通配符 —— 少匹配或多匹配都是**静默**的。
+     */
+    fun countDriveEntry(provider: String, fileId: String, dirPathPrefix: String?): Int =
+        driveEntryRows(require(), provider, fileId, dirPathPrefix).size
+
+    /**
+     * 删掉这个网盘条目对应的索引行，并把**因此变空的作品行**一并删掉。
+     *
+     * 返回删掉的文件行数（结果提示里那个数字）。
+     *
+     * ## 与 PC 端 `DriveCleanupController._purgeLibrary` 同口径
+     *
+     *   * 只清**确认删掉**的那些条目 —— 调用方在网盘删除成功之后才调这里；
+     *   * 空作品行要一起删：留着它，海报墙上就是一张点开就报错的死卡片，
+     *     而**没有任何界面会报错**（与 `deleteWorks` 的注释同一条理由）；
+     *   * 只删「因这次操作变空」的作品，**不**顺手清理库里其它空壳作品 ——
+     *     那些可能只是归并错了，用户还有一个专门的出口（`EmptyWorkDialog`
+     *     那条路在 PC 端），静默清掉等于替他做了决定。
+     *
+     * ⛔ 整个过程在一个事务里：中途失败会留下「文件行删了、作品行还在」的
+     *    半删状态，而界面只会说「删除失败」。
+     */
+    fun purgeDriveEntry(provider: String, fileId: String, dirPathPrefix: String?): Int {
+        val d = require()
+        var removed = 0
+        d.beginTransaction()
+        try {
+            val rows = driveEntryRows(d, provider, fileId, dirPathPrefix)
+            if (rows.isEmpty()) {
+                d.setTransactionSuccessful()
+                return 0
+            }
+            val keys = LinkedHashSet<String>()
+            for (row in rows) keys.add(row.second)
+
+            for (chunk in rows.chunked(SQL_CHUNK)) {
+                val ids = chunk.map { it.first }
+                val marks = ids.joinToString(",") { "?" }
+                // 先字幕引用、再媒体项：`subtitle_refs` 按 `item_id` 关联，
+                // 反过来删会留下一批指向不存在条目的孤儿行（没有任何界面读它们）。
+                d.delete("subtitle_refs", "item_id IN ($marks)", ids.toTypedArray())
+                removed += d.delete("media_items", "id IN ($marks)", ids.toTypedArray())
+            }
+
+            // ⛔ 用 `itemsForWork` 判空而不是 `COUNT(*) WHERE group_key = ?`：
+            //    合并过的作品是「一部 + 若干别名行」，按单 key 数会把还有文件的
+            //    作品误判成空，然后连它的作品行一起删掉。
+            for (key in keys) {
+                if (itemsForWork(key).isEmpty()) deleteWorks(listOf(key))
+            }
+            d.setTransactionSuccessful()
+        } finally {
+            d.endTransaction()
+        }
+        return removed
+    }
+
+    /** 这个网盘条目对应的 `(媒体项 id, group_key)` 列表。 */
+    private fun driveEntryRows(
+        d: SQLiteDatabase,
+        provider: String,
+        fileId: String,
+        dirPathPrefix: String?,
+    ): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        val sql: String
+        val args: Array<String>
+        if (dirPathPrefix != null) {
+            sql = "SELECT id, group_key FROM media_items " +
+                "WHERE provider = ? AND substr(dir_path, 1, ?) = ?"
+            args = arrayOf(provider, dirPathPrefix.length.toString(), dirPathPrefix)
+        } else {
+            sql = "SELECT id, group_key FROM media_items WHERE id = ?"
+            args = arrayOf("$provider:$fileId")
+        }
+        d.rawQuery(sql, args).use { c ->
+            while (c.moveToNext()) out.add(c.getString(0) to c.getString(1))
+        }
+        return out
     }
 
     // ------------------------------------------------------------------
@@ -2635,6 +2767,39 @@ class LibraryDb(
 
     companion object {
         private const val TAG = "CloudCine"
+
+        /** 进程内已建好的句柄，按库文件绝对路径缓存。见 [shared]。 */
+        private val instances = HashMap<String, LibraryDb>()
+
+        /**
+         * 进程内**唯一**的库句柄 —— 所有 Activity 都必须走这里。
+         *
+         * ## ⛔⛔ 为什么不能各自 `LibraryDb(file)`
+         *
+         * 本工程每个页面都是一个独立 Activity，各自持一个句柄的话，同一个
+         * `cloudcine.sqlite` 在**同一进程里就有多个 SQLite 连接**。而本工程
+         * 故意不用 WAL（备份包要的是单文件的原始字节，见类注释），
+         * `journal_mode=DELETE` 下**写事务会挡住其它连接的读**。
+         *
+         * 真机现场（2026-10-24，MiTV-MFTP0）：从媒体库点进播放时，
+         * `LibraryActivity.play()` 正在写 `last_played_at`（`markPlayed`），
+         * 播放页同时 `open()` 读库 → `SQLiteDatabaseLockedException`
+         * （`database is locked (code 5 SQLITE_BUSY): retrycount exceeded`）
+         * → `itemsForWork` 拿不到兄弟集 → **OSD 里的「选集」整行消失**。
+         * 而且它**不会自己好**：那一次读失败之后，整个会话都不再有选集。
+         *
+         * ⚠️ 设 `PRAGMA busy_timeout` 救不了这一条 —— 失败发生在**连接池**
+         * 拿不到连接的那一层（"retrycount exceeded"），根本没进 SQLite 的
+         * 忙等循环。唯一可靠的办法是**别开第二个连接**。
+         *
+         * @param progress 只在**第一次**建实例时生效（之后调用方拿到的是同一个
+         *   对象）。本工程所有调用点传的都是 `ProgressStore.shared(...)`，
+         *   也就是同一个实例，所以没有歧义。
+         */
+        @Synchronized
+        fun shared(file: File, progress: ProgressStore? = null): LibraryDb =
+            instances.getOrPut(file.absolutePath) { LibraryDb(file, progress) }
+
 
         /**
          * 作品级列清单。

@@ -52,10 +52,17 @@ import com.cloudcine.tv.library.LibrarySettings
 import com.cloudcine.tv.library.ItemSortMode
 import com.cloudcine.tv.library.LibraryScanner
 import com.cloudcine.tv.library.MediaCategoryNames
+import com.cloudcine.tv.library.MissingMediaPlan
+import com.cloudcine.tv.library.MissingReceipt
+import com.cloudcine.tv.library.MissingReceipts
 import com.cloudcine.tv.library.PlayTarget
 import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.ProgressSync
 import com.cloudcine.tv.library.ProgressSyncGate
+import com.cloudcine.tv.library.DriveRemoval
+import com.cloudcine.tv.library.RemovalOutcome
+import com.cloudcine.tv.library.RemovalPlan
+import com.cloudcine.tv.library.RemovalTally
 import com.cloudcine.tv.library.sortItems
 import com.cloudcine.tv.library.PosterFetcher
 import com.cloudcine.tv.library.PosterStore
@@ -549,7 +556,9 @@ class LibraryActivity : Activity() {
         //    自己 new 一个：本页会被反复重建，各自持一份内存副本的话，后落盘的
         //    那份会把先落盘的整个覆盖掉（两边都显示成功）。
         progressStore = ProgressStore.shared(LibraryPaths.progressFile(this))
-        db = LibraryDb(LibraryPaths.dbFile(this), progress = progressStore)
+        // ⛔ 库句柄走 `LibraryDb.shared`（进程内唯一）：播放页也要读同一个库，
+        //    各自 new 一个会在 `journal_mode=DELETE` 下互相锁死（见 `LibraryDb.shared`）。
+        db = LibraryDb.shared(LibraryPaths.dbFile(this), progress = progressStore)
         // ⛔ 备份 / 恢复**只走夸克**：`.ccbak` 的容器与上传/下载实现都在
         //    `PanApi` 上，电视端对百度是**只读**的（见 `BaiduApi` 的类文档）。
         //    所以这里显式给一个夸克客户端，**不**跟着 `activeProvider` 变 ——
@@ -644,6 +653,26 @@ class LibraryActivity : Activity() {
         //    实例的 Runnable 还在跑，而它持有的是**已经关掉的** `db`。
         root.postDelayed(progressLaunchSync, PROGRESS_SYNC_LAUNCH_DELAY_MS)
         root.postDelayed(progressSyncTick, PROGRESS_SYNC_INTERVAL_MS)
+    }
+
+    /**
+     * 回到这一页 ⇒ 看看播放页有没有留下一张**死索引回执**。
+     *
+     * ## ⛔ 为什么挂在 `onResume` 而不是 `onActivityResult`
+     *
+     * `PlayerActivity` 是 `launchMode="singleTask"`（换集要走 `onNewIntent`）。
+     * `singleTask` 的目标**不保证**把 `startActivityForResult` 的结果留到用户
+     * 退出时才回 —— 系统在部分路径上会当场回 `RESULT_CANCELED`，那一刻用户
+     * 还没开始看片。而 `onResume` 是唯一一个「用户真的回到这一页」的信号，
+     * 与 launchMode 无关（详见 `MissingReceipt` 的类文档）。
+     *
+     * ⛔ 取走即清空（`MissingReceipts.take()`）：不清的话，用户之后每进出一次
+     *    别的页面都会被问一遍同一个文件。
+     * ⛔ 首次 `onCreate` 之后也会走到这里 —— 那时槽位是空的，什么都不做。
+     */
+    override fun onResume() {
+        super.onResume()
+        MissingReceipts.take()?.let { confirmMissingItem(it) }
     }
 
     override fun onDestroy() {
@@ -1880,7 +1909,10 @@ class LibraryActivity : Activity() {
                     if (selectedKeys.isEmpty()) {
                         "先勾选要移除的作品（没有勾选时移除不可用）"
                     } else {
-                        "OK 从媒体库移除这 ${selectedKeys.size} 部（网盘文件不动，可重新扫描找回）"
+                        // ⛔ 不能再说「网盘文件不动」：下一步的确认框里有**两档**，
+                        //    其中一档就是删网盘。把话说死在这里，用户勾了「一并删」
+                        //    之后会觉得自己被骗了。
+                        "OK 从媒体库移除这 ${selectedKeys.size} 部（下一步可选是否连网盘文件一起删）"
                     },
                 ) { confirmRemoveSelected() },
             )
@@ -2878,9 +2910,20 @@ class LibraryActivity : Activity() {
                 if (WorkDetailFormat.canClearLearnedSkip(cur)) {
                     actions.add("清除「${cur.title}」的片头/片尾学习" to { clearLearnedSkip(cur) })
                 }
+                // ⛔ 「移除」必须在这一层有一个入口：作品墙的批量移除要先进多选、
+                //    再勾、再按工具条，而用户看完简介页决定「这部不要了」时，
+                //    让他退回墙上重走三遍方向键是白走。与批量那一路**同一套确认**
+                //    （[confirmRemoval]），所以文案 / 档位 / 结果提示完全一致。
+                // ⛔ 排在「清除学习」之后、全局动作之前：它是**对这一部作品**
+                //    的动作，与上面那三项同类；放到「同步 / 恢复」后面会被读成
+                //    全局操作。
+                actions.add("从媒体库移除「${cur.title}」…" to { confirmRemoveWork(cur) })
             }
-            actions.add("同步（本地 ↔ 网盘）" to { doSync() })
-            actions.add("上传备份到网盘" to { doUpload() })
+            // ⛔ 电视端**只读**：没有「上传备份到网盘」。备份由 PC 端产生，
+            //    电视侧上传只会把电脑上刮好 / 标好 / 归一过的那份盖成电视这份
+            //    （见 `LibraryBackupService` 类文档）。「同步」保留 —— 它现在
+            //    只会走「远程更新 / 本地空库」两个方向，也就是恢复。
+            actions.add("同步（只从网盘恢复）" to { doSync() })
             actions.add("从网盘恢复（覆盖本地）" to { confirmRestore() })
             // ⛔ 设置项放在这里（而不是只在作品墙上）：用户看到「刮不出东西」
             //    的瞬间，想找的就是这一项，让他先退回作品墙是白走一步。
@@ -2945,15 +2988,19 @@ class LibraryActivity : Activity() {
                 )
             }
             actions.add("重新扫描媒体库（${DriveProviders.shortName(provider)}）" to { doScan() })
-            // ⚠️ 「批量移除」删的是**本地索引**（网盘文件不动、可重新扫描
-            //    找回），与右边的「清空媒体库索引…」同类；删网盘文件那条路
-            //    电视端刻意没有（见 `LibraryDb.deleteWorks` 的文档）。
+            // ⚠️ 「批量移除」进的是多选态，确认框里有**两档**：只移除本地索引
+            //    （网盘文件不动、可重新扫描找回），或者连网盘文件一起删
+            //    （不可逆，只在当前网盘是夸克且名下真有可删文件时出现）。
+            //    简介页还有一条**单部**的同类入口（见 `confirmRemoveWork`）。
             // ⛔ 排在「清空」**前面**：它比清空轻得多（可勾选、可取消），
             //    是更常用的那一个。
             actions.add("批量移除（从媒体库）…" to { enterSelection() })
             actions.add("清空媒体库索引…" to { confirmWipe() })
-            actions.add("同步（本地 ↔ 网盘）" to { doSync() })
-            actions.add("上传备份到网盘" to { doUpload() })
+            // ⛔ 电视端**只读**：没有「上传备份到网盘」。备份由 PC 端产生，
+            //    电视侧上传只会把电脑上刮好 / 标好 / 归一过的那份盖成电视这份
+            //    （见 `LibraryBackupService` 类文档）。「同步」保留 —— 它现在
+            //    只会走「远程更新 / 本地空库」两个方向，也就是恢复。
+            actions.add("同步（只从网盘恢复）" to { doSync() })
             actions.add("从网盘恢复（覆盖本地）" to { confirmRestore() })
             // ⛔ 也放在作品墙上：想先配好 TMDB 再刮的人，不该被迫先进一部作品。
             actions.add("刮削设置（TMDB Key / 反代 / 豆瓣 Cookie）" to { openScrapeSettings() })
@@ -3010,6 +3057,9 @@ class LibraryActivity : Activity() {
         // ⛔ 也**不能**只判 `RESULT_OK`：那样这条分支永远不会进。
         if (requestCode == REQ_PLAYER) {
             reloadCurrentItems()
+            // ⛔ 死索引的问话**不在这里**：播放页是 `singleTask`，`startActivityForResult`
+            //    的结果协议不保证在「用户退出」那一刻才回调（见 `MissingReceipt`）。
+            //    那条路走 `onResume` 里的 `MissingReceipts.take()`。
             // 退出播放器 ⇒ 顺手把这一轮进度静默同步出去（用户定的三个时机之一）。
             //
             // ⛔ **延迟 2 秒**：播放页的 `onDestroy` 里那次「退出补写进度」是
@@ -3475,63 +3525,120 @@ class LibraryActivity : Activity() {
     }
 
     /**
-     * 工具条上的「移除 N 部」⇒ 先过确认（这条入口不可逆，差一道确认）。
+     * 工具条上的「移除 N 部」⇒ 先统计、再过确认（这条入口不可逆，差一道确认）。
+     *
+     * ## 两个入口共用这一套
+     *
+     * 作品墙多选（[confirmRemoveSelected]）与简介页单部（[confirmRemoveWork]）
+     * 走的是同一个 [confirmRemoval]：文案、档位、执行、提示完全一致。分成两套
+     * 写的话，用户在两个入口会遇到两种措辞、两种范围，而他只会觉得「这个删除
+     * 功能有时候删得干净、有时候不删」。
      *
      * ## 2026-10-21 起多一档「一并删网盘」
      *
      * 原来只有「只移除索引」一条路，而用户清片时想做的常常是**真的清掉**：
      * 库里没了、网盘上还占着几十 GB，等于什么都没做。现在确认框给两档，
      * ⛔ 「只移除索引」必须排在「一并删除网盘文件」**前面** —— 不可逆的那
-     * 一侧永远要用户主动往下按一次。
+     * 一侧永远要用户主动往下按一次（顺序在 `RemovalPlan.labels` 里）。
      *
      * ⚠️ 实测（2026-10-21 真机）：`showOverlay` 的光标默认落在**第 0 档**，
      *    而第 0 档是「取消」⇒ 用户按 OK 什么都不会发生。这比原来注释里写
      *    的「默认停在只移除索引」更保守，是对的；别为了「少按一下」把
      *    「取消」挪走。
      *
-     * ⛔ 「一并删除网盘文件」只在**当前网盘是夸克**时出现：电视端对百度只读
-     *    （`DriveClient` 上根本没有删除方法，`BaiduApi` 也没有实现），给百度
-     *    用户一个按下去必然失败的选项是纯粹的欺骗。
+     * ⛔ 「一并删除网盘文件」只在**当前网盘是夸克**、且这批作品名下**真的有
+     *    可删文件**时出现：电视端对百度只读（`DriveClient` 上根本没有删除
+     *    方法，`BaiduApi` 也没有实现），给百度用户一个按下去必然失败的选项
+     *    是纯粹的欺骗；而名下没有文件（空壳作品）时勾上它什么都不会发生，
+     *    那是一个骗人的开关。
      */
     private fun confirmRemoveSelected() {
         if (selectedKeys.isEmpty()) return
-        val n = selectedKeys.size
-        val canDeleteDrive = provider == DriveProviders.QUARK && api is PanApi
-        val labels = ArrayList<String>(3)
-        labels.add("取消")
-        labels.add("只移除索引（网盘文件保留）")
-        if (canDeleteDrive) labels.add("一并删除网盘文件（不可撤销）")
+        confirmRemoval(ArrayList(selectedKeys), singleTitle = null)
+    }
 
-        val driveNote = if (canDeleteDrive) {
-            "\n选「一并删除网盘文件」会把这批作品在网盘上的片子一起永久删除，" +
-                "不可撤销，本应用也恢复不了。"
-        } else {
-            ""
+    /**
+     * 简介页 MENU 的「从媒体库移除《X》」⇒ 同一套确认，只是范围是这一部。
+     *
+     * ⛔ **不**借道多选（`selectedKeys`）：多选是作品墙的模式，从简介页进多选
+     *    会把用户扔回墙上、还带着一个他刚才没勾过的勾。这里直接把 key 传下去。
+     */
+    private fun confirmRemoveWork(w: Work) {
+        confirmRemoval(listOf(w.key), singleTitle = w.title)
+    }
+
+    /**
+     * 数清楚这批作品名下的网盘文件，再把确认框弹出来。
+     *
+     * ## ⛔ 必须先数、再弹
+     *
+     * 那一档「一并删除网盘文件（N 个）」里的 N 是用户**唯一**能判断「这一下
+     * 子要动多少」的依据。先弹框、后统计的话，要么写不出 N，要么写一个猜的。
+     *
+     * ## ⛔ 统计是查库，必须在后台
+     *
+     * 一部剧能有两百条媒体项，勾十部就是两千行 —— 主线程读 SQLite 会直接
+     * 卡住一帧以上（本工程的红线：主线程只做 `setText`）。
+     *
+     * ## 统计期间那一行字
+     *
+     * 几百行通常几十毫秒，但库刚被扫描写过时可能要等锁（`journal_mode=DELETE`）。
+     * 什么都不显示的话，用户按了「移除」却什么都不发生，于是再按一次 ——
+     * 而第二次按下去时统计已经在跑，两次回调会各自弹一个确认框。
+     */
+    private fun confirmRemoval(keys: List<String>, singleTitle: String?) {
+        if (keys.isEmpty()) return
+        if (busy) {
+            status.text = "正在${busyWhat}，请稍候…"
+            return
         }
-        showOverlay(
-            titleText = "要从媒体库移除这 $n 部吗？\n" +
-                "只移除这台电视上的索引：作品、集数、播放进度都会没。\n" +
-                "网盘上的文件不受影响，之后「重新扫描」就能找回来。" + driveNote,
-            labels = labels,
-        ) { index ->
-            hideOverlay()
-            when (index) {
-                1 -> doRemoveSelected(alsoDeleteDrive = false)
-                2 -> doRemoveSelected(alsoDeleteDrive = true)
+        val prev = status.text
+        status.text = "正在统计网盘文件…"
+        Bg.run({ tallyFor(keys) }) { tally, err ->
+            if (err != null) {
+                Log.e(TAG, "统计网盘文件失败", err)
+                status.text = "统计失败：${err.message}"
+                return@run
+            }
+            val t = tally ?: RemovalTally()
+            // 统计完把状态行还回去：停在「正在统计网盘文件…」上，用户会以为
+            // 还没结束、而屏幕上已经弹着确认框了。
+            status.text = prev
+            val canDelete = t.hasDeletable && provider == DriveProviders.QUARK && api is PanApi
+            showOverlay(
+                titleText = RemovalPlan.title(keys.size, t, canDelete, singleTitle),
+                labels = RemovalPlan.labels(keys.size, t, canDelete),
+            ) { index ->
+                hideOverlay()
+                when (index) {
+                    1 -> removeWorks(keys, alsoDeleteDrive = false)
+                    2 -> if (canDelete) removeWorks(keys, alsoDeleteDrive = true)
+                }
             }
         }
     }
 
-    /** `doRemoveSelected` 的结果：文件行数 + 网盘那两个数（没删网盘时都是 0）。 */
-    private data class RemovalResult(
-        val removedItems: Int,
-        val driveDeleted: Int,
-        val driveFailed: Int,
-        val driveError: String?,
-    )
+    /**
+     * 数这批作品名下的**全部**媒体项（并集口径，含折叠进来的源作品）。
+     *
+     * ⛔ 在后台线程调用（查库）。口径必须与 [removeWorks] 真正去删的集合
+     *    **完全一致** —— 两处各数一遍的话，弹窗说 24 个、实际删 22 个，
+     *    而用户没有任何办法发现。
+     */
+    private fun tallyFor(keys: List<String>): RemovalTally {
+        val files = ArrayList<Pair<String, String>>()
+        for (key in keys) {
+            for (item in db.itemsForWork(key)) files.add(item.id to item.provider)
+        }
+        return RemovalTally.of(files, aliases = db.countMergedAliases(keys))
+    }
 
     /**
-     * 执行移除。
+     * 真正去删：先网盘、再索引，然后回到作品墙并提示结果。
+     *
+     * 三个入口共用（作品墙多选的「只移除索引」/「一并删除网盘文件」，以及
+     * 简介页单部删除），所以这里**不读** `selectedKeys` —— 勾选是调用方的事，
+     * 从简介页来的那一路根本没有勾选。
      *
      * ⛔ [alsoDeleteDrive] 为真时**先删网盘、再删索引**：fid 只存在
      *    `media_items` 里（`provider:fileId`），`deleteWorks` 一跑就再也
@@ -3547,7 +3654,8 @@ class LibraryActivity : Activity() {
      *    文件要打好几批请求，屏幕上那行字一动不动的话，电视用户唯一的感受
      *    就是「按了没反应」，然后开始连按返回键。
      */
-    private fun doRemoveSelected(alsoDeleteDrive: Boolean) {
+    private fun removeWorks(keys: List<String>, alsoDeleteDrive: Boolean) {
+        if (keys.isEmpty()) return
         if (busy) {
             status.text = "正在${busyWhat}，请稍候…"
             return
@@ -3557,7 +3665,6 @@ class LibraryActivity : Activity() {
             status.text = "需要先登录夸克网盘（删网盘文件走夸克）"
             return
         }
-        val keys = ArrayList(selectedKeys)
         busy = true
         busyWhat = if (alsoDeleteDrive) "删除网盘文件" else "移除作品"
         status.text =
@@ -3567,9 +3674,7 @@ class LibraryActivity : Activity() {
                 "正在移除 ${keys.size} 部…"
             }
         Bg.run({
-            var driveDeleted = 0
-            var driveFailed = 0
-            var driveError: String? = null
+            var drive: DriveRemoval? = null
             if (alsoDeleteDrive) {
                 val pan = api as? PanApi
                 // fid 去重：勾选里同时有别名行和它的目标作品时，同一集会
@@ -3601,9 +3706,7 @@ class LibraryActivity : Activity() {
                         throw e
                     }
                 }
-                driveDeleted = r.deleted
-                driveFailed = r.failed
-                driveError = r.error
+                drive = DriveRemoval(r.deleted, r.failed, r.error)
                 // 网盘删完、索引还没清：不说这一句的话，数字停在满格上不动，
                 // 用户会以为已经结束、只是界面没反应过来。
                 if (fids.isNotEmpty()) {
@@ -3611,46 +3714,138 @@ class LibraryActivity : Activity() {
                 }
             }
             val removed = db.deleteWorks(keys)
-            RemovalResult(removed, driveDeleted, driveFailed, driveError)
+            RemovalOutcome(removed, drive)
         }) { out, err ->
             if (err != null) {
                 Log.e(TAG, "批量移除失败", err)
                 finishJob("移除失败：${err.message}")
                 return@run
             }
-            val r = out ?: RemovalResult(0, 0, 0, null)
+            val outcome = out ?: RemovalOutcome(0, null)
             Log.i(
                 TAG,
-                "批量移除：${keys.size} 部 / ${r.removedItems} 个文件" +
-                    if (alsoDeleteDrive) "；网盘 ${r.driveDeleted} 成功 / ${r.driveFailed} 失败" else "",
+                "移除作品：${keys.size} 部 / ${outcome.removedItems} 个文件" +
+                    (outcome.drive?.let { "；网盘 ${it.deleted} 成功 / ${it.failed} 失败" } ?: ""),
             )
-            exitSelection()
-            loadWorks(removalMessage(keys.size, r, alsoDeleteDrive))
+            // ⛔ 只有多选态才需要退出：从简介页来的那一路没有多选可退，而
+            //    `exitSelection()` 会把标题改成「媒体库」—— 用户会在简介页上
+            //    看见标题跳一下再被 `loadWorks` 换成作品墙。
+            if (selecting) exitSelection()
+            // `loadWorks` 自己会把 `level` 拨回 WORKS 并清掉 `currentWork`，
+            // 所以简介页删完之后是「回到作品墙」，不用另外调 `backToWorks()`。
+            loadWorks(RemovalPlan.message(keys.size, outcome))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 播放页回执：文件已经不在网盘上
+    // ------------------------------------------------------------------
+
+    /**
+     * 播放页说「这个 fid 在网盘上没了」⇒ 问要不要把这条**死索引**清掉。
+     *
+     * ## 与「从媒体库移除」是两条不同的路
+     *
+     * 那条路（[confirmRemoval]）问的是「这一部要不要清」，**默认只清索引**，
+     * 还能勾「一并删网盘」。这一条反过来：网盘那侧**已经**没了（服务端明确
+     * 说没有这个 fid），所以只有一件事可做 —— 清掉库里那一行。
+     * ⛔ 所以这里**不出现**「一并删网盘」：去删一个服务端说不在的文件，
+     *    最好的结果是白打一次请求，最坏的结果是把同名新文件删了。
+     *
+     * ## 为什么要先数、再问
+     *
+     * 「还有 N 条会留在库里」与「这是最后一条，移除后整部从作品墙消失」是
+     * 两种完全不同的后果（[MissingMediaPlan.remainingLine]）。数不出来就只能
+     * 含糊其辞，而含糊的那一句会让用户以为「我只删了一集」。
+     *
+     * ⛔ 这里**不写**「正在核对…」那种过渡文案：回到本页时 `reloadCurrentItems()`
+     *    可能刚发起过一次，它的回调会把状态行改成「N 个文件」。两条写同一行字，
+     *    谁后到谁赢 —— 用户会看见状态行闪一下再变回去。
+     */
+    private fun confirmMissingItem(receipt: MissingReceipt) {
+        val fid = receipt.fid.trim()
+        if (fid.isEmpty()) return
+        val provider = receipt.provider.takeIf { it.isNotEmpty() } ?: DriveProviders.QUARK
+        val name = receipt.name
+        val groupKey = receipt.groupKey.trim()
+        Bg.run({
+            val id = receipt.itemId
+            val siblings = if (groupKey.isEmpty()) emptyList() else db.itemsForWork(groupKey)
+            val workTitle = if (groupKey.isEmpty()) {
+                ""
+            } else {
+                db.workForDetail(groupKey)?.title.orEmpty()
+            }
+            val plan = MissingMediaPlan(
+                // 回执里没带名字时退回库里的显示名，再退回 fid —— 空标题的
+                // 确认框（「「」已经不在网盘上了」）比不弹更糟。
+                fileName = name.ifEmpty {
+                    siblings.firstOrNull { it.id == id }?.displayTitle ?: fid
+                },
+                workTitle = workTitle.ifEmpty { name.ifEmpty { fid } },
+                // 「除它之外还剩几条」：并集口径（含 `merged_into` 别名行），
+                // 与简介页文件列表的长度同一口径。
+                remainingItems = siblings.count { it.id != id },
+            )
+            plan to db.countDriveEntry(provider, fid, null)
+        }) { out, err ->
+            if (err != null) {
+                Log.w(TAG, "核对死索引失败：$provider:$fid", err)
+                status.text = "核对失败：${err.message}"
+                return@run
+            }
+            val pair = out ?: return@run
+            val plan = pair.first
+            if (pair.second <= 0) {
+                // 库里没有这一行（用户在别处删过了 / 这一条不是从媒体库播的）。
+                // ⛔ 照样弹一个「移除这一条」的话，用户按下去什么都不会发生 ——
+                //    那是这个功能最容易被说成「时灵时不灵」的地方。
+                status.text = plan.doneMessage(0)
+                return@run
+            }
+            showOverlay(plan.body, plan.labels()) { index ->
+                hideOverlay()
+                // 0 = 取消（光标默认停在这里），1 = 移除这一条。
+                if (index == 1) removeMissingItem(provider, fid, plan)
+            }
         }
     }
 
     /**
-     * 移除之后的提示文案。
+     * 真去清那一条死索引（`purgeDriveEntry` 只动本地库）。
      *
-     * ⛔ 三个数字缺一不可（部数 / 文件行数 / 网盘成功与失败）：只说成功的话
-     *    用户以为清干净了，而网盘上还占着几十 GB；只说失败的话，又像是一次
-     *    都没动。不删网盘那一支**必须**保留「网盘文件未动」—— 它才是用户对
-     *    「移除」这个词最需要被告知的一件事。
+     * ⛔ 清完必须判断**这部作品还在不在**：`purgeDriveEntry` 会顺手删掉因此
+     *    变空的作品行（否则作品墙上留一张点开就报错的死卡片）。作品没了还
+     *    调 `reloadCurrentItems()` 的话，它拿着一个已经不在库里的 `currentWork`
+     *    去重画简介页 —— 用户会停在一个「0 个文件」的空页面上。
+     * ⛔ 回执交给重列（`statusAfter`）而不是先 `status.text = …` 再重列：
+     *    `reloadCurrentItems` 的回调会把状态行改成「N 个文件」，先写会被盖掉。
      */
-    private fun removalMessage(
-        works: Int,
-        r: RemovalResult,
-        alsoDeleteDrive: Boolean,
-    ): String {
-        val base = "已移除 $works 部（${r.removedItems} 个文件）"
-        if (!alsoDeleteDrive) return "$base，网盘文件未动"
-        val why = r.driveError ?: "网盘拒绝了删除请求"
-        return when {
-            r.driveFailed == 0 -> "$base，网盘删除 ${r.driveDeleted} 个文件"
-            r.driveDeleted == 0 ->
-                "$base，但网盘文件一个都没删掉（$why）—— 重新扫描会再出现"
-            else -> "$base，网盘 ${r.driveDeleted} 个成功 / ${r.driveFailed} 个失败" +
-                "（$why，可再试一次）"
+    private fun removeMissingItem(provider: String, fid: String, plan: MissingMediaPlan) {
+        if (busy) {
+            status.text = "正在${busyWhat}，请稍候…"
+            return
+        }
+        val workKey = currentWork?.key.orEmpty()
+        busy = true
+        busyWhat = "移除这一条"
+        status.text = "正在移除「${plan.fileName}」…"
+        Bg.run({
+            val removed = db.purgeDriveEntry(provider, fid, null)
+            val alive = workKey.isNotEmpty() && db.workForDetail(workKey) != null
+            removed to alive
+        }) { out, err ->
+            if (err != null) {
+                Log.e(TAG, "移除死索引失败：$provider:$fid", err)
+                finishJob("移除失败：${err.message}")
+                return@run
+            }
+            val removed = out?.first ?: 0
+            val alive = out?.second ?: false
+            Log.i(TAG, "移除死索引：$provider:$fid → $removed 条（作品还在=$alive）")
+            val msg = plan.doneMessage(removed)
+            finishJob(msg)
+            if (alive) reloadCurrentItems(msg) else loadWorks(msg)
         }
     }
 
@@ -3659,17 +3854,17 @@ class LibraryActivity : Activity() {
         if (!requireLogin()) return
         if (!guard("同步")) return
         Bg.run({
-            service.sync(onProgress = { sent, total ->
-                runOnUiThread { status.text = "同步：上传 $sent/$total" }
-            })
+            // ⛔ 不再传 `onProgress`：电视端不会上传，那个回调永远不会被调，
+            //    留着只会让状态栏停在「上传 0/0」上。
+            runOnUiThread { status.text = "同步：检查网盘备份…" }
+            service.sync()
         }) { out, err ->
             if (err != null) {
                 Log.e(TAG, "同步失败", err)
                 finishJob("同步失败：${err.message}")
                 return@run
             }
-            // ⛔ 无论上传还是恢复，都要重读列表：恢复会换掉整个库，
-            //    上传虽然不动本地，但「最近修改」的时间戳变了、排序会变。
+            // ⛔ 恢复会换掉整个库，必须重读列表。
             finishJob(out?.message ?: "同步完成")
             loadWorks()
             // ⛔ 恢复是**整份替换** `cloudcine.sqlite`：备份里那份旧进度会把本机
@@ -3678,23 +3873,8 @@ class LibraryActivity : Activity() {
         }
     }
 
-    private fun doUpload() {
-        if (!requireLogin()) return
-        if (!guard("打包并上传")) return
-        Bg.run({
-            val bytes = service.exportBackup(includePosters = true, includeSettings = true)
-            service.uploadBackup(bytes, onProgress = { sent, total ->
-                runOnUiThread { status.text = "上传 $sent/$total 字节" }
-            })
-        }) { fid, err ->
-            if (err != null) {
-                Log.e(TAG, "上传备份失败", err)
-                finishJob("上传失败：${err.message}")
-                return@run
-            }
-            finishJob("已上传到网盘备份目录（fid=$fid）")
-        }
-    }
+    // ⛔ 这里**没有** doUpload()：电视端不上传备份（只读），见 `LibraryBackupService`
+    //    类文档「电视端只读」。备份由 PC 端产生，电视只负责恢复。
 
     private fun doRestore() {
         if (!requireLogin()) return

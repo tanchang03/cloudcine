@@ -125,7 +125,7 @@ class ScrapeSettingsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        db = LibraryDb(
+        db = LibraryDb.shared(
             LibraryPaths.dbFile(this),
             progress = ProgressStore.shared(LibraryPaths.progressFile(this)),
         )

@@ -47,11 +47,22 @@ class ProgressWiringTest {
             // ⛔ 跳过 `LibraryDb.kt` 自己 —— 那里的是**类声明** `class LibraryDb(`。
             if (f.name == "LibraryDb.kt") continue
             val code = codeOnly(f.readText())
-            var from = 0
-            while (true) {
-                val at = code.indexOf("LibraryDb(", from)
-                if (at < 0) break
-                from = at + 1
+            // ⛔ 两种构造写法都要扫：`LibraryDb(...)` 与 `LibraryDb.shared(...)`。
+            //    2026-10-24 起所有页面都改走 `shared`（进程内唯一句柄，见那里的
+            //    文档）。只认前者的话，这条守卫会「一个构造点都没扫到」而假红
+            //    —— 而假红比没有守卫更糟：它会让人以为这条链路上已经没有检查。
+            //    `"LibraryDb("` 不会命中 `"LibraryDb.shared("`，所以不会重复计数。
+            val starts = ArrayList<Int>()
+            for (marker in listOf("LibraryDb(", "LibraryDb.shared(")) {
+                var from = 0
+                while (true) {
+                    val at = code.indexOf(marker, from)
+                    if (at < 0) break
+                    starts.add(at)
+                    from = at + marker.length
+                }
+            }
+            for (at in starts) {
                 val call = balanced(code, at)
                 sites++
                 if (!call.contains("progress =")) {

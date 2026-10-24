@@ -4,7 +4,7 @@ import com.cloudcine.tv.pan.DriveException
 import java.io.IOException
 
 /**
- * 按批删除网盘文件的循环 —— 从 `LibraryActivity.doRemoveSelected` 里抽出来的。
+ * 按批删除网盘文件的循环 —— 从 `LibraryActivity.removeWorks` 里抽出来的。
  *
  * ## 为什么值得单独一个类
  *

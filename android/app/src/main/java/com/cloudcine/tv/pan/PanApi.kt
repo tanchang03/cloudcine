@@ -39,12 +39,21 @@ class PanApi(private val store: CredStore) : DriveClient {
     /** 夸克的根是 `"0"`（与百度的 `"/"` 不同）。 */
     override val rootId: String get() = ROOT
 
-    /** 网盘业务错误。`needsReauth` 时上层应回登录页。 */
+    /**
+     * 网盘业务错误。`needsReauth` 时上层应回登录页。
+     *
+     * ⛔ [notFound] 必须与 PC 端 `quark_error_mapper.dart` **同口径**：那边只把
+     *    `HTTP 404` 映射成 `DriveErrorType.notFound`，本类就只认 404。
+     *    多认几个（比如把「没有可用地址」也算上）会让播放页把**网络抖动**
+     *    报成「文件已不在网盘上」，而媒体库页据此给出的按钮是「移除这一条」——
+     *    一次误报就是一条好索引被清掉。宁可漏报（用户手动去文件列表删）。
+     */
     class ApiException(
         val code: Int,
         message: String,
         needsReauth: Boolean = false,
-    ) : DriveException(message, needsReauth = needsReauth)
+        notFound: Boolean = false,
+    ) : DriveException(message, needsReauth = needsReauth, notFound = notFound)
 
     // ------------------------------------------------------------------
     // 列目录
@@ -690,10 +699,15 @@ class PanApi(private val store: CredStore) : DriveClient {
         if (res.isOk) return
         // 31001 = require login [guest]：缺公共参数或凭证失效。
         val reauth = res.code == 31001 || res.status == 401
+        // ⛔ 只认 HTTP 404（与 PC 端 `quark_error_mapper.dart` 的映射逐条一致）。
+        //    夸克绝大多数失败是「HTTP 200 + 业务码」，而业务码表里**没有**
+        //    一个可靠的「文件不存在」——把 code != 0 一律当 notFound 的话，
+        //    限流、签名失效都会被报成「文件被删了」。
         throw ApiException(
             res.code,
             "$what 失败：HTTP ${res.status} code=${res.code} ${res.message}".trim(),
             needsReauth = reauth,
+            notFound = res.status == 404,
         )
     }
 
