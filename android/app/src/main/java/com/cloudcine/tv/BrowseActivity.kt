@@ -28,6 +28,9 @@ import com.cloudcine.tv.pan.DriveProviders
 import com.cloudcine.tv.pan.CredStore
 import com.cloudcine.tv.pan.PanApi
 import com.cloudcine.tv.pan.formatSize
+import com.cloudcine.tv.library.BatchFileDeleter
+import com.cloudcine.tv.library.DriveBatchDeletePlan
+import com.cloudcine.tv.library.DriveBatchTarget
 import com.cloudcine.tv.library.DriveDeletePlan
 import com.cloudcine.tv.library.DriveDeleteTarget
 import com.cloudcine.tv.library.FolderSortMode
@@ -93,9 +96,35 @@ class BrowseActivity : Activity() {
      */
     private var deleting = false
 
+    /**
+     * 多选删除态。
+     *
+     * ⛔ 与媒体库页（`LibraryActivity.selecting`）同一套交互语言：OK 勾选 /
+     *    取消、菜单 全选与删除、返回 退出。用户在两个页面学到的是同一件事，
+     *    不必再猜一次「这个页面的多选怎么退出」。
+     * ⛔ 按 **fid** 记而不是按下标：删掉几项之后 `entries` 会整体前移，
+     *    按下标记的话「已选 3 项」里可能有两个已经不是原来那两个了。
+     */
+    private var selecting = false
+    private val selectedFids = LinkedHashSet<String>()
+
+    private lateinit var hint: TextView
+
     private lateinit var listView: ListView
     private lateinit var title: TextView
     private lateinit var status: TextView
+
+    /**
+     * 状态行上方那句「上一次操作的结果」。
+     *
+     * ⛔ 存在的理由：删完之后必须重列（[reloadHere] → [open] → [paintStatus]），
+     *    而 `paintStatus` 会把整行改写成本层统计 —— 结果提示就这么被冲掉了。
+     *    实测：删 7 项、2 项失败，用户看到的只有「夸克 · 共 12 项」，失败那两条
+     *    **没有任何地方**再说过一次。
+     * ⛔ 只在**导航**时清（进目录 / 上一层 / 切网盘 / 重新登录），重列时保留
+     *    （[open] 的 `keepNote`）。
+     */
+    private var statusNote: String? = null
 
     private lateinit var overlay: LinearLayout
     private lateinit var overlayTitle: TextView
@@ -227,12 +256,17 @@ class BrowseActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
         ))
 
-        column.addView(TextView(this).apply {
-            text = "↑↓ 选择 · OK 进入/播放 · 返回 上一层 · 菜单 发现/更多"
+        // ⛔ 底部提示行必须是**字段**：多选态下整行字要换（见 [paintHint]）。
+        //    原来它是就地 `addView(TextView(...))`，进多选之后底部还写着
+        //    「OK 进入/播放」，而那时 OK 已经是勾选 —— 屏幕上唯一一处说明
+        //    按键的地方在骗人。
+        hint = TextView(this).apply {
             setTextColor(0xFF6B7280.toInt())
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(dp(48), dp(6), dp(48), dp(20))
-        })
+        }
+        column.addView(hint)
+        paintHint()
 
         // 菜单用覆盖层而不是弹 Dialog：Dialog 会另起一个 Window，遥控器焦点
         // 会跑到新 Window 上，返回键也要多按一次；覆盖层留在本 Window 里，
@@ -400,6 +434,13 @@ class BrowseActivity : Activity() {
      *    编译失败** —— 上一版媒体库页就是这么翻的车。
      */
     private fun openMenu() {
+        // ⛔ 多选态下菜单**整份换掉**：这时候「发现」「切网盘」「重新登录」
+        //    都不该出现 —— 勾完 8 项再去发现一次，列表会重列，勾选全丢，
+        //    而用户以为是自己勾错了。
+        if (selecting) {
+            openSelectionMenu()
+            return
+        }
         val actions = ArrayList<Pair<String, () -> Unit>>()
         val cur = entries.getOrNull(listView.selectedItemPosition)
         val here = stack.lastOrNull()?.second.orEmpty()
@@ -460,6 +501,14 @@ class BrowseActivity : Activity() {
         //    与上面三项同类；放到页面级入口后面会被读成全局操作。
         if (!discovering && cur != null && canDeleteHere) {
             actions.add("删除「${cur.name}」（网盘，不可撤销）…" to { confirmDeleteEntry(cur) })
+        }
+
+        // ── 多选删除（清一整个目录、或一次删几部片子）────────────────────
+        // ⛔ 只在**夸克**下出现，理由同上面那条单选（百度只读）。
+        // ⛔ 排在单选之后：单条是常用动作，批量是「清一层」的重手动作，
+        //    重的那个要往后放，别让它在菜单里抢走第一次按下的位置。
+        if (!discovering && !deleting && canDeleteHere && entries.isNotEmpty()) {
+            actions.add("多选删除（网盘，不可撤销）…" to { enterSelection() })
         }
 
         actions.add("媒体库" to { gotoLibrary() })
@@ -547,7 +596,15 @@ class BrowseActivity : Activity() {
 
     // ------------------------------------------------------------------
 
-    private fun open(fid: String, name: String) {
+    /**
+     * 列目录并接管当前层。
+     *
+     * @param keepNote 重列（[reloadHere]）时传 `true`：这时状态行上那句
+     *   「上一次删除的结果」还要留着。用户主动导航时保持默认 `false` ——
+     *   换了一层还顶着上一层的删除结果，读起来像是这一层刚删过东西。
+     */
+    private fun open(fid: String, name: String, keepNote: Boolean = false) {
+        if (!keepNote) statusNote = null
         status.text = "加载中…"
         Bg.run({ api.listDirectory(fid) }) { list, err ->
             if (err != null) {
@@ -578,6 +635,13 @@ class BrowseActivity : Activity() {
     }
 
     private fun onEntry(e: DriveEntry) {
+        // ⛔ 多选态下点一行 = 勾选 / 取消，**不是**进目录或播放。
+        //    与媒体库页作品墙同一个取舍：勾了 6 项又点进一部片子里是纯干扰，
+        //    而且退回来之后勾选还在、用户已经忘了自己勾到哪。
+        if (selecting) {
+            toggleSelected(e.fid)
+            return
+        }
         when {
             e.isDir -> open(e.fid, e.name)
             e.isVideo -> startActivity(
@@ -715,10 +779,15 @@ class BrowseActivity : Activity() {
      *
      * ⛔ 带上厂家短名：两家同时登录时，用户只能靠这一处分辨「我现在看的是
      *    哪个网盘」。
+     * ⛔ 上面可能还压着一句 [statusNote]（上一次删除的结果）：删完必然重列，
+     *    而重列成功就会走到这里 —— 不把它带上，那句「已删除 7 项 / 2 项失败」
+     *    只会闪一下，失败的那两条再没有任何地方说过。
      */
     private fun paintStatus() {
-        status.text = "${DriveProviders.shortName(provider)} · 共 ${entries.size} 项" +
+        val base = "${DriveProviders.shortName(provider)} · 共 ${entries.size} 项" +
             "（目录 ${entries.count { it.isDir }}）"
+        val note = statusNote
+        status.text = if (note.isNullOrEmpty()) base else "$note\n$base"
     }
 
     // ------------------------------------------------------------------
@@ -753,6 +822,9 @@ class BrowseActivity : Activity() {
             return
         }
         val prefix = if (e.isDir) childPath(e.name) else null
+        // ⛔ 清掉上一次的结果再统计：下面会 `paintStatus()`，留着旧 note 的话
+        //    屏幕上会顶着「上一次删了 N 项」，而这一次还没开始。
+        statusNote = null
         status.text = "正在统计「${e.name}」在媒体库里的条目…"
         Bg.run({ db.countDriveEntry(provider, e.fid, prefix) }) { count, err ->
             if (err != null) {
@@ -828,7 +900,11 @@ class BrowseActivity : Activity() {
                 "删除网盘条目「${plan.target.name}」：deleted=$deleted，" +
                     "媒体库清掉 $removed 条",
             )
-            status.text = plan.resultMessage(deleted, removed, err?.let { explainDriveError(it) })
+            val msg = plan.resultMessage(deleted, removed, err?.let { explainDriveError(it) })
+            // ⛔ 同时写进 [statusNote]：删成功会立刻 reloadHere，而重列走
+            //    `paintStatus` —— 不留在 note 上，这句只闪一下就没了。
+            statusNote = msg
+            status.text = msg
             if (deleted > 0) reloadHere()
         }
     }
@@ -838,6 +914,238 @@ class BrowseActivity : Activity() {
         err is DriveException && err.needsReauth ->
             "登录已失效（菜单 → 重新登录${DriveProviders.displayName(provider)}）"
         else -> err.message ?: err.javaClass.simpleName
+    }
+
+    // ------------------------------------------------------------------
+    // 多选删除（清一整个目录、或一次删几部片子）
+    //
+    // 交互语言与媒体库页的作品墙多选**逐条对齐**：OK 勾选/取消、菜单 全选与
+    // 删除、返回 退出。用户在两个页面学到的是同一件事。
+    //
+    // ⛔ 为什么这个页面需要它：单条删除一次只能删一个，而真实用法是
+    //    「这一层全是预告片，全清了」—— 20 个文件就要按 20 次「删除 → 确认」，
+    //    每一次都是不可逆确认，按到第 5 次就没人再看确认框了。
+    // ------------------------------------------------------------------
+
+    /**
+     * 底部提示行。
+     *
+     * ⛔ 必须跟着 [selecting] 换字：多选态下 OK 是**勾选**，而常态下 OK 是
+     *    「进入/播放」。不换的话，屏幕上唯一一处说明按键的地方在骗人。
+     * ⛔ 「已选 N 项」写在这一行而**不是**状态行：状态行归 [paintStatus] 所有，
+     *    被借用之后退出多选时必须记得还回去 —— 媒体库页就是漏了这一步，
+     *    退出后右上角永远停在「已选 N 部」（那边有专门的注释记着这个坑）。
+     *    这一行没有第二个写入口，借用不存在归还问题。
+     */
+    private fun paintHint() {
+        hint.text = when {
+            selecting && selectedFids.isEmpty() ->
+                "多选删除：OK 勾选 / 取消 · 菜单 全选或删除 · 返回 退出" +
+                    "（本层共 ${entries.size} 项）"
+            selecting ->
+                "多选删除：已选 ${selectedFids.size} 项 · OK 勾选 / 取消 · " +
+                    "菜单 全选或删除 · 返回 退出"
+            else -> "↑↓ 选择 · OK 进入/播放 · 返回 上一层 · 菜单 发现/更多"
+        }
+    }
+
+    /** 进入多选（菜单 → 「多选删除」）。⛔ 清空上一次的选择再进。 */
+    private fun enterSelection() {
+        selecting = true
+        selectedFids.clear()
+        listView.requestFocus()
+        refreshSelectionUi()
+        Log.i(TAG, "多选删除：进入（${entries.size} 项可见）")
+    }
+
+    /** 退出多选并清空选择。三个出口：返回键、菜单里的「退出多选」、删完之后。 */
+    private fun exitSelection() {
+        selecting = false
+        selectedFids.clear()
+        refreshSelectionUi()
+    }
+
+    /** 勾选 / 取消勾选一项（多选态下 OK 点行、或点触摸屏都走这里）。 */
+    private fun toggleSelected(fid: String) {
+        if (!selectedFids.add(fid)) selectedFids.remove(fid)
+        refreshSelectionUi()
+    }
+
+    /** 「全选」选的是**当前这一层可见的**，不是整个网盘 —— 与媒体库页同口径。 */
+    private fun selectAllVisible() {
+        selectedFids.addAll(entries.map { it.fid })
+        refreshSelectionUi()
+    }
+
+    /**
+     * 多选态变化之后的统一重画。
+     *
+     * ⛔ 列表与提示行必须一起刷：只刷列表的话，底部还写着上一次的「已选 N 项」；
+     *    只刷提示行的话，刚勾的那一行没有勾。
+     */
+    private fun refreshSelectionUi() {
+        adapter.notifyDataSetChanged()
+        paintHint()
+    }
+
+    /** 多选态下的菜单（比常态少得多：勾选期间「发现」「切网盘」都不该出现）。 */
+    private fun openSelectionMenu() {
+        val actions = ArrayList<Pair<String, () -> Unit>>()
+        actions.add("全选本层（${entries.size} 项）" to { selectAllVisible() })
+        if (selectedFids.isNotEmpty()) {
+            actions.add("清空已选（${selectedFids.size} 项）" to {
+                selectedFids.clear()
+                refreshSelectionUi()
+            })
+        }
+        // ⛔ 不可逆的那一项**排在最后**：菜单光标从第 0 项开始，一次顺手的
+        //    OK 落在「全选」上无害，落在「删除 30 项」上就是灾难。
+        if (selectedFids.isNotEmpty()) {
+            actions.add("删除已选 ${selectedFids.size} 项（网盘，不可撤销）…" to {
+                confirmBatchDelete()
+            })
+        }
+        actions.add("退出多选" to { exitSelection() })
+
+        showOverlay(titleText = "多选删除", labels = actions.map { it.first }) { index ->
+            val act = actions.getOrNull(index) ?: return@showOverlay
+            hideOverlay()
+            act.second()
+        }
+    }
+
+    /**
+     * 勾选集合 ⇒ 待删目标。
+     *
+     * ⛔ 名字与体积从 [entries] 反查，查不到就用 fid 顶上：勾选之后列表不会
+     *    重列（多选期间没有任何路径会改 `entries`），所以正常情况一定查得到；
+     *    用 fid 兜底是为了「文案里出现一个空名字」这种更难查的故障不发生。
+     */
+    private fun buildBatchPlan(): DriveBatchDeletePlan {
+        val targets = selectedFids.map { fid ->
+            val e = entries.firstOrNull { it.fid == fid }
+            DriveBatchTarget(
+                fid = fid,
+                name = e?.name ?: fid,
+                isDir = e?.isDir ?: false,
+                sizeBytes = e?.sizeBytes ?: 0L,
+            )
+        }
+        return DriveBatchDeletePlan(
+            targets = targets,
+            providerName = DriveProviders.displayName(provider),
+        )
+    }
+
+    /**
+     * 每个目标在媒体库里的**路径前缀**：目录算整棵子树，文件为 `null`。
+     *
+     * ⛔ 必须在**主线程**算（读 [stack]），不能塞进 `Bg.run` 里：目录栈是
+     *    主线程独占的状态，后台线程读它是在赌内存可见性。
+     * ⛔ 用 [childPath] 而不是网盘条目自带的路径（那个字段列目录时通常是空的，
+     *    拿它去匹配会**静默**一条都匹配不到，而死索引会留在库里）。
+     */
+    private fun libraryPrefixes(targets: List<DriveBatchTarget>): Map<String, String?> =
+        targets.associate { it.fid to if (it.isDir) childPath(it.name) else null }
+
+    /**
+     * 「删除已选 N 项」⇒ 先数清媒体库牵连几条，再弹确认。
+     *
+     * ⛔ 顺序不能反：先弹框后统计的话，那句「媒体库里会一起清掉 N 条」只能
+     *    省略或猜一个 —— 而它正是用户判断「这一下动多少」的唯一依据。
+     */
+    private fun confirmBatchDelete() {
+        if (selectedFids.isEmpty()) {
+            status.text = "先勾选要删除的项"
+            return
+        }
+        if (deleting) {
+            status.text = "正在删除，请稍候…"
+            return
+        }
+        val plan = buildBatchPlan()
+        val prefixes = libraryPrefixes(plan.targets)
+        // ⛔ 理由同单条那条：统计完会 `paintStatus()`，旧 note 会跟着回来。
+        statusNote = null
+        status.text = "正在统计这 ${plan.count} 项在媒体库里的条目…"
+        Bg.run({
+            plan.targets.sumOf { t -> db.countDriveEntry(provider, t.fid, prefixes[t.fid]) }
+        }) { count, err ->
+            // 统计完把状态行还回去：停在「正在统计…」上、而屏幕上已经弹着确认框，
+            // 用户会以为还有东西在跑。
+            paintStatus()
+            if (err != null) {
+                Log.e(TAG, "统计媒体库条目失败（批量）", err)
+                status.text = "统计失败：${err.message}"
+                return@run
+            }
+            val full = plan.copy(libraryItems = count ?: 0)
+            showOverlay(
+                titleText = full.body,
+                // ⛔ 「取消」在第一位：光标从 0 开始，顺手一下不该删掉一整个目录。
+                labels = listOf("取消", full.confirmLabel),
+            ) { index ->
+                hideOverlay()
+                if (index == 1) doBatchDelete(full, prefixes)
+            }
+        }
+    }
+
+    /**
+     * 真删：网盘按 100 个一批发，**每一批确认删掉之后**才清对应的索引。
+     *
+     * ⛔ 顺序与单条那条一致（先网盘、后索引），理由也一样：索引一删，
+     *    `provider:fileId` 就没了，而它是网盘要删的那个 fid 的唯一来源。
+     * ⛔ 只清 `onBatch` 回调里给出的那些：`BatchFileDeleter` 只在**整批成功**
+     *    时才回调（网盘只回个数，部分成功时不知道是哪几个），清早了会得到
+     *    「文件还在网盘上、库里却没了」—— 那要重扫一遍才能回来。
+     * ⛔ 清索引失败**不能**算成「网盘删除失败」：文件确实已经没了，报失败会让
+     *    用户以为还在。只记一条日志，留一条死索引让下次扫描自愈。
+     */
+    private fun doBatchDelete(plan: DriveBatchDeletePlan, prefixes: Map<String, String?>) {
+        if (deleting) return
+        deleting = true
+        status.text = "正在删除 ${plan.count} 项…"
+        Bg.run({
+            val pan = PanApi(store)
+            var removed = 0
+            val result = BatchFileDeleter.delete(
+                fids = plan.targets.map { it.fid },
+                onProgress = { done, total ->
+                    runOnUiThread {
+                        if (deleting) status.text = "正在删除 $done / $total 项…"
+                    }
+                },
+                onBatch = { chunk, _ ->
+                    for (fid in chunk) {
+                        runCatching { db.purgeDriveEntry(provider, fid, prefixes[fid]) }
+                            .onSuccess { removed += it }
+                            .onFailure { Log.w(TAG, "清理索引失败：$fid", it) }
+                    }
+                },
+                deleteBatch = { chunk -> pan.deleteFiles(chunk).size },
+            )
+            result to removed
+        }) { out, err ->
+            deleting = false
+            val res = out?.first
+            val removed = out?.second ?: 0
+            val msg = plan.resultMessage(
+                deleted = res?.deleted ?: 0,
+                failed = res?.failed ?: 0,
+                libraryRemoved = removed,
+                error = res?.error ?: err?.let { explainDriveError(it) },
+            )
+            Log.i(TAG, "批量删除 ${plan.count} 项：$msg")
+            statusNote = msg
+            status.text = msg
+            // ⛔ 删完必须退出多选：集合里躺着的是已经不存在的 fid，留着的话
+            //    再按一次「删除已选」会对着一批死 id 发请求。
+            // ⛔ 顺序是「先写 note、再 exitSelection、最后 reloadHere」：
+            //    `exitSelection` 只动提示行与列表（不碰状态行），重列才会覆盖它。
+            exitSelection()
+            if ((res?.deleted ?: 0) > 0) reloadHere()
+        }
     }
 
     /**
@@ -855,7 +1163,9 @@ class BrowseActivity : Activity() {
         }
         entries.clear()
         adapter.notifyDataSetChanged()
-        open(top.first, top.second)
+        // ⛔ `keepNote = true`：调用方（删除路径）刚把结果写进 [statusNote]，
+        //    这里重列之后状态行还要带着它。
+        open(top.first, top.second, keepNote = true)
     }
 
     /** 返回键弹一层目录栈；已在根目录则退出。 */
@@ -1018,6 +1328,29 @@ class BrowseActivity : Activity() {
             return true
         }
 
+        // ── 多选态：返回 退出、菜单 全选/删除、↑ 在首行不再进排序胶囊 ──
+        // ⛔ 必须排在排序胶囊分支**之前**：多选态下 OK 是「勾选」，而胶囊的
+        //    OK 是「重排」。放行的话，用户在首行按 ↑ 会进到一个按 OK 就重排
+        //    列表的地方，而他以为自己在勾第一项。
+        // ⛔ 不接管 OK：那一键交给 `ListView` 的 click → [onEntry] → 勾选，
+        //    自己再判一次就会出现「按一下勾两次」。
+        if (selecting) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_BACK -> {
+                    exitSelection()
+                    return true
+                }
+                KeyEvent.KEYCODE_MENU -> {
+                    openMenu()
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    if (listView.selectedItemPosition == 0) return true
+                }
+            }
+            return super.dispatchKeyEvent(event)
+        }
+
         // ── 排序胶囊拿到光标：←→ 移光标、OK 生效、↓/返回 回列表、↑ 无更上层 ──
         // ⛔ 放在通用分支之前优先吃掉这些键，避免泄漏到底层列表。
         // ⛔ 本函数开头已 `return` 掉非 DOWN 事件，这里只处理按下，不需要 `down` 守卫。
@@ -1071,7 +1404,17 @@ class BrowseActivity : Activity() {
             }
             val e = entries[position]
 
-            val name = row.getChildAt(0) as? TextView ?: TextView(this@BrowseActivity).apply {
+            // ── 勾选角标（第 0 个子 View）──
+            // ⛔ 位置固定在最左、**永远存在**（非多选态用 `INVISIBLE` 而不是
+            //    `GONE`）：`GONE` 会让片名在进/出多选时整体左右跳 30dp，而
+            //    `getChildAt` 的下标也会跟着变（下面三个列都按下标取）。
+            val tick = row.getChildAt(0) as? TextView ?: TextView(this@BrowseActivity).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(dp(30), ViewGroup.LayoutParams.WRAP_CONTENT)
+                row.addView(this)
+            }
+            val name = row.getChildAt(1) as? TextView ?: TextView(this@BrowseActivity).apply {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
                 maxLines = 1
@@ -1079,7 +1422,7 @@ class BrowseActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 row.addView(this)
             }
-            val meta = row.getChildAt(1) as? TextView ?: TextView(this@BrowseActivity).apply {
+            val meta = row.getChildAt(2) as? TextView ?: TextView(this@BrowseActivity).apply {
                 setTextColor(0xFF9AA3B2.toInt())
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 gravity = Gravity.END
@@ -1088,7 +1431,7 @@ class BrowseActivity : Activity() {
             // 修改时间列：与 PC 端 `ModifiedTimeColumn` 同一口径 —— 固定宽度、
             // 右对齐、显示相对时间（`3 天前`），0 / 缺失显示 `—`。`updatedAtMs`
             // 已是毫秒，直接喂 [Fmt.relativeTime]。
-            val time = row.getChildAt(2) as? TextView ?: TextView(this@BrowseActivity).apply {
+            val time = row.getChildAt(3) as? TextView ?: TextView(this@BrowseActivity).apply {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 gravity = Gravity.END
                 maxLines = 1
@@ -1109,13 +1452,24 @@ class BrowseActivity : Activity() {
                     else -> 0xFF6B7280.toInt()
                 },
             )
-            // 选中态：ListView 默认不改行背景（divider=null 时看不出选中），
-            // 这里自己给一层高亮，否则遥控器上「按了没反应」。
+
+            // ⛔ 勾选角标必须在**每一帧**重设：`convertView` 复用时上一行的
+            //    勾会留在这一行上，表现是「没勾的项自己打上了勾」。
+            val picked = selecting && selectedFids.contains(e.fid)
+            tick.text = if (picked) "☑" else "☐"
+            tick.setTextColor(if (picked) BRAND_TINT else 0xFF6B7280.toInt())
+            tick.visibility = if (selecting) View.VISIBLE else View.INVISIBLE
+
+            // 勾中的行给一层暗底：电视上离得远，光靠一个 ☑ 分不清「勾了」和
+            // 「光标停在这」—— 那是两个不同的东西（勾了会删，光标只是位置）。
+            // ⛔ 焦点行仍然优先（用更亮的 BRAND_SELECT），否则光标在勾过的行上
+            //    会看不见。
+            val focusedRow = listView.isFocused && listView.selectedItemPosition == position
             row.setBackgroundColor(
-                if (listView.isFocused && listView.selectedItemPosition == position) {
-                    BRAND_SELECT
-                } else {
-                    Color.TRANSPARENT
+                when {
+                    focusedRow -> BRAND_SELECT
+                    picked -> BRAND_PICKED
+                    else -> Color.TRANSPARENT
                 },
             )
             return row
@@ -1132,5 +1486,8 @@ class BrowseActivity : Activity() {
 
         /** 选中行底色：品牌色的深色调，既要能看出选中、又不能刺眼。 */
         const val BRAND_SELECT = 0xFF332C63.toInt()
+
+        /** 已勾选（但光标不在）的行底色：比 [BRAND_SELECT] 更暗，两者不能混。 */
+        const val BRAND_PICKED = 0xFF232038.toInt()
     }
 }

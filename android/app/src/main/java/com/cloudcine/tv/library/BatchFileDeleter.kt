@@ -60,6 +60,10 @@ object BatchFileDeleter {
      *   分母必须早于第一批请求，否则屏幕上的数字会先跳一下，看着像数错了。
      * @param abortOn 这一批的异常是否意味着「后面的也不用试了」。默认见
      *   [abortOn]（凭证失效 / 断网）。
+     * @param onBatch 每一批**成功之后**的回调：`(这一批的 fid, 确认删掉的个数)`。
+     *   多选删除靠它把「哪几个真的没了」记下来，再去清对应的媒体库索引 ——
+     *   ⛔ 只清**确认删掉**的那些：清早了会得到「文件还在网盘上、库里却没了」，
+     *   而那要重新扫一遍才能回来（见 `BrowseActivity.doBatchDelete`）。
      * @param deleteBatch 真正发请求的那一步，返回**确认删掉**的个数。
      *   抛异常 = 这一批失败（个数按这一批的 size 计入 failed）。
      */
@@ -67,6 +71,7 @@ object BatchFileDeleter {
         fids: Collection<String>,
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
         abortOn: (Exception) -> Boolean = ::abortOn,
+        onBatch: (chunk: List<String>, deletedInBatch: Int) -> Unit = { _, _ -> },
         deleteBatch: (List<String>) -> Int,
     ): Result {
         if (fids.isEmpty()) return Result(deleted = 0, failed = 0, error = null)
@@ -82,7 +87,12 @@ object BatchFileDeleter {
 
         for ((i, chunk) in chunks.withIndex()) {
             try {
-                deleted += deleteBatch(chunk)
+                val n = deleteBatch(chunk)
+                deleted += n
+                // ⛔ 只在**这一批真的走完**时回调：部分成功时我们并不知道是哪几个
+                //    成功了（网盘只回个数），此时宁可让索引留着 —— 留着是自愈的
+                //    （下次扫描会再报一次「文件不在」），清错是不可逆的。
+                onBatch(chunk, n)
             } catch (e: Exception) {
                 failed += chunk.size
                 if (error == null) error = e.message ?: e.javaClass.simpleName
