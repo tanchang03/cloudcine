@@ -39,7 +39,7 @@ import '../widgets/tv_text_field.dart';
 /// 没有引入 `package_info_plus`：它为了一个字符串拖进来一条平台通道，
 /// 而这条通道在单元测试里必须被 mock 掉。多一处 mock 就多一处
 /// 「测试里是好的、真机上是空的」。
-const String _kAppVersion = '0.1.11';
+const String _kAppVersion = '0.1.12';
 
 /// 设置页。
 class SettingsPage extends ConsumerStatefulWidget {
