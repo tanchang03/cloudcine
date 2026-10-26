@@ -30,6 +30,25 @@ lib = ctypes.CDLL(f"{FW}/Mpv.framework/Versions/A/Mpv", mode=ctypes.RTLD_GLOBAL)
   到下一条命令就没了（mpv 报 `Connection refused`）。「起服务」和「跑探针」必须放进
   **同一次** Bash 调用。
 
+## 跑 `flutter test` 前必须 unset proxy
+
+本机 shell 里有 `HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:xxxxx`（工具链注入），而
+`flutter_tester` 起的是**本地 websocket**，请求被代理吃掉后报：
+
+```
+Failed to load "...": Unable to connect to flutter_tester process:
+WebSocketException: Invalid WebSocket upgrade request
+```
+
+**这不是测试失败，是环境问题** —— 看到这句话别去改测试代码。正确跑法：
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY \
+    NO_PROXY=localhost,127.0.0.1 flutter test test/xxx_test.dart
+```
+
+`flutter analyze` 不受影响（它不起 tester 进程）。
+
 ### 用 C 直接调 mpv（2026-10-03，要枚举滤镜/查编译期能力时用）
 
 `avfilter_get_by_name` 这类**链接期**符号 Python ctypes 拿不到，得写 C：
