@@ -2083,19 +2083,30 @@ class DriftMediaRepository implements MediaRepository {
     // 内层别名与下面搜索那段同一个理由：不起别名时内层会把自己那一行
     // 解析成外层，生成 `merged_into = key` 这种恒假条件，**且不报错**。
     if (providers != null && providers.isNotEmpty) {
-      final src = _db.mediaWorks.createAlias('provider_src');
-      final owners = _db.selectOnly(src)
-        ..addColumns([src.key])
-        ..where(src.mergedInto.equalsExp(t.key));
+      final providerIds =
+          providers.map((p) => p.id).toList(growable: false);
 
-      final sub = _db.selectOnly(_db.mediaItems)
-        ..addColumns([_db.mediaItems.id])
-        ..where((_db.mediaItems.groupKey.equalsExp(t.key) |
-                _db.mediaItems.groupKey.isInQuery(owners)) &
-            _db.mediaItems.provider.isIn(
-              providers.map((p) => p.id).toList(growable: false),
-            ));
-      add(existsQuery(sub));
+      // ⛔ 必须**穿透折叠**（理由见下方注释，与搜索分支同一条）。
+      //
+      // 但这里**不是**「相关子查询 + OR」的旧写法 —— 那正是来源筛选卡到
+      // 几十秒的根因：旧写法对每条作品行都跑一条 `group_key = t.key OR
+      // group_key IN (owners)` 的 EXISTS，SQLite 对相关子查询里的 OR **不**走
+      // 索引，于是每条作品行都把 `media_items` 整表扫一遍（O(作品数 × 文件数)）。
+      //
+      // 改成**非相关**的一次性计算：先把「名下有这些来源文件的 group_key」
+      // 用一条查询算出来（media_items 全程只扫 / 查一遍），作品行再去命中。
+      // 这样耗时与作品数无关，只跟文件总数成一次扫描 —— 加不加索引都稳。
+      final matchingKeys = _db.selectOnly(_db.mediaItems)
+        ..addColumns([_db.mediaItems.groupKey])
+        ..where(_db.mediaItems.provider.isIn(providerIds));
+
+      // 这些 group_key 对应的「目标作品」：某别名（key ∈ matchingKeys）被折进了谁。
+      final foldedTargets = _db.selectOnly(_db.mediaWorks)
+        ..addColumns([_db.mediaWorks.mergedInto])
+        ..where(_db.mediaWorks.mergedInto.isNotNull() &
+            _db.mediaWorks.key.isInQuery(matchingKeys));
+
+      add(t.key.isInQuery(matchingKeys) | t.key.isInQuery(foldedTargets));
     }
 
     final trimmed = query?.trim();
@@ -2105,23 +2116,22 @@ class DriftMediaRepository implements MediaRepository {
       // 「已被折叠进来的那几部名下的」都算。少这一层就会出现
       // 「搜 S02E05 搜不到」，而那一集明明就列在这部剧的详情页里。
       //
-      // ⚠️ 内层子查询**必须给作品表起别名**。
-      //
-      // 内层要引用的是**外层**那一行的 `key`（`media_works.key`），但它自己
-      // 也是从 `media_works` 里查的 —— 不起别名的话 SQLite 会把这个名字
-      // 解析成内层自己的那一行，生成 `merged_into = key` 这种恒假条件，
-      // 于是「搜源作品里的文件名」**永远搜不到**，且不报任何错。
-      final src = _db.mediaWorks.createAlias('merged_src');
-      final owners = _db.selectOnly(src)
-        ..addColumns([src.key])
-        ..where(src.mergedInto.equalsExp(t.key));
+      // 同样用**非相关**的一次性计算（见来源分支的注释）：先把「文件名命中
+      // 搜索词的所有 group_key」算出来，作品行再去命中。这样不会回到「逐作品
+      // 扫 media_items 几十秒」的老路，且与来源筛选共用同一套口径。
+      final matchingKeys = _db.selectOnly(_db.mediaItems)
+        ..addColumns([_db.mediaItems.groupKey])
+        ..where(_db.mediaItems.name.like(like));
 
-      final sub = _db.selectOnly(_db.mediaItems)
-        ..addColumns([_db.mediaItems.id])
-        ..where((_db.mediaItems.groupKey.equalsExp(t.key) |
-                _db.mediaItems.groupKey.isInQuery(owners)) &
-            _db.mediaItems.name.like(like));
-      add(t.title.like(like) | existsQuery(sub));
+      // 这些 group_key 对应的「目标作品」：某别名（key ∈ matchingKeys）被折进了谁。
+      final foldedTargets = _db.selectOnly(_db.mediaWorks)
+        ..addColumns([_db.mediaWorks.mergedInto])
+        ..where(_db.mediaWorks.mergedInto.isNotNull() &
+            _db.mediaWorks.key.isInQuery(matchingKeys));
+
+      add(t.title.like(like) |
+          t.key.isInQuery(matchingKeys) |
+          t.key.isInQuery(foldedTargets));
     }
 
     return cond;

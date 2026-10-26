@@ -428,6 +428,33 @@ class AppDatabase extends _$AppDatabase {
           // 加了列，这里就会补上，不需要再写一遍。
           await _ensureSchemaComplete(Migrator(this));
 
+          // ⚠️ **性能索引（幂等，每次打开都跑，正常是零操作）**。
+          //
+          // 2026-10-26 发现：给媒体库加「按网盘来源筛选」后，勾选来源时
+          // `listWorks` 主查询从 ~10ms 暴涨到 **几十秒**（`countWorksByProvider`
+          // 一次也 13s+）。根因是来源 / 搜索这两类过滤都靠一条**相关子查询**
+          // 判断「这部作品名下（含被折叠进来的源）有没有来自某网盘的文件」，
+          // 而 `media_items.group_key` 上**没有索引** —— 于是每条作品行都要把
+          // `media_items` 整表扫一遍（O(作品数 × 文件数)）。这条索引让那条
+          // 子查询从全扫描变成索引查找。
+          //
+          // 为什么**只**建这一个、不给 `media_works.merged_into` 也建：
+          //   1. `media_works` 很小（几百~几千行），`owners` 子查询（`WHERE
+          //      merged_into = t.key`）哪怕全扫描也 negligible，不是瓶颈；
+          //   2. 更关键 —— 给某列建索引会**锁死该列**：将来若迁移 `DROP` 它，
+          //      SQLite 直接报 `error in index … after drop column`。
+          //      `db_migration_last_modified_test` 正是靠「手动 DROP 一列再验
+          //      迁移补回来」来测迁移的，给 `merged_into` 建索引会让它炸。
+          //      所以只索引 `media_items` 那两个基础列（v1 起就在、永不删除）。
+          //
+          // 这条索引**不改变表结构 / 列 / 数据**，所以不动 `schemaVersion`，
+          // 也不影响 PC↔电视的备份恢复契约（备份只导数据行，不导索引）。
+          // `IF NOT EXISTS` 保证新建库与旧库都只建一次。
+          await customStatement(
+            'CREATE INDEX IF NOT EXISTS idx_items_group_key_provider '
+            'ON media_items(group_key, provider)',
+          );
+
           // ⚠️ 这里的耗时**不是**「打开数据库花了多久」，而是「从申请打开到
           // 真正打开」—— `NativeDatabase.createInBackground` 是**懒**的，
           // 迁移与 `beforeOpen` 都发生在**第一次查询**时。所以这条记录要
