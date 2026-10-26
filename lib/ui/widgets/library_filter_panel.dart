@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../domain/entities/drive_provider.dart';
 import '../providers/library_providers.dart';
 import '../theme/app_theme.dart';
 import 'tv_focus.dart';
@@ -189,6 +190,7 @@ class _FilterPanel extends ConsumerWidget {
     // 用户等一个永远不会来的结果，而日志里什么都没有。
     final years = ref.watch(yearCountsProvider);
     final genres = ref.watch(genreCountsProvider);
+    final sources = ref.watch(sourceCountsProvider);
     final notifier = ref.read(libraryFilterProvider.notifier);
 
     final selected = filter.selectedCount;
@@ -231,8 +233,14 @@ class _FilterPanel extends ConsumerWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   // 放在最上面：它改的是「这一份列表里有哪些作品」，
-                  // 下面两组年份 / 类型是在它筛出来的那批里再分面 ——
+                  // 下面几组年份 / 类型是在它筛出来的那批里再分面 ——
                   // 阅读顺序与作用域顺序一致（理由见 `_facetScope`）。
+                  //
+                  // 来源比「已刮削」更外一层：它决定的是**文件在哪家网盘**，
+                  // 而刮削与否是这些文件被处理到什么程度。
+                  const _SectionTitle('来源'),
+                  _SourceChips(counts: sources, filter: filter),
+                  const SizedBox(height: 15),
                   const _SectionTitle('刮削'),
                   // 只有一颗、也**不给数量角标**：年份 / 类型那些数字的承诺
                   // 是「点下去至少有这么条结果」，而这是个开关 —— 它要么筛
@@ -437,6 +445,75 @@ class _GenreChips extends ConsumerWidget {
             selected: true,
             stale: true,
             onTap: () => notifier.toggleGenre(genre),
+          ),
+      ],
+    );
+  }
+}
+
+/// 来源一组（夸克 / 百度…）。按作品数倒序 —— 片多的那家排在前面。
+///
+/// ## 选项是**数出来的**，不是写死的
+///
+/// 只画「真的有条目」的来源（见 `countWorksByProvider`）。写死一张
+/// 「夸克 / 百度」的表会有两个坏处：只有一家网盘的用户看到一个永远是 0 的
+/// 选项，然后怀疑筛选坏了；将来新接入一家还得回来改 UI。
+///
+/// ## 「已选但当前范围里没有」的项照样画出来
+///
+/// 理由与 [_YearChips] 完全相同，但这一组**尤其**容易发生：勾了「百度」
+/// 之后再切到「动漫」栏，若动漫里一部百度片子都没有，那颗 chip 就会整个
+/// 消失 —— 而它仍然是生效的条件。用户看到按钮上写着「已选 1 项」、列表
+/// 却是空的，却找不到那个条件在哪，唯一出路是「清空筛选」。
+class _SourceChips extends ConsumerWidget {
+  const _SourceChips({required this.counts, required this.filter});
+
+  final AsyncValue<Map<DriveProvider, int>> counts;
+  final LibraryFilter filter;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final c = counts.valueOrNull;
+    if (c == null) {
+      // 与 [_YearChips] 同理：出错不能伪装成「正在统计…」。
+      return counts.hasError
+          ? _Hint('统计来源失败：${counts.error}')
+          : const _Hint('正在统计…');
+    }
+
+    final missing = filter.sources.where((s) => !c.containsKey(s)).toList()
+      ..sort((a, b) => a.index.compareTo(b.index));
+
+    if (c.isEmpty && missing.isEmpty) {
+      // 这一组为空**只有一种成因**：库里一部作品都没有（没有文件，自然
+      // 数不出来源）。所以文案直接指向下一步，而不是含糊地说「暂无数据」。
+      return const _Hint('还没有入库的作品。扫描一次网盘就能按来源筛。');
+    }
+
+    final notifier = ref.read(libraryFilterProvider.notifier);
+    final sorted = c.keys.toList()
+      ..sort((a, b) {
+        final byCount = (c[b] ?? 0).compareTo(c[a] ?? 0);
+        // 同数时按枚举顺序（夸克 → 百度…），保证每次打开面板位置一致。
+        return byCount != 0 ? byCount : a.index.compareTo(b.index);
+      });
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      children: [
+        for (final source in sorted)
+          _FilterChip(
+            label: source.shortName,
+            count: c[source],
+            selected: filter.sources.contains(source),
+            onTap: () => notifier.toggleSource(source),
+          ),
+        for (final source in missing)
+          _FilterChip(
+            label: source.shortName,
+            selected: true,
+            stale: true,
+            onTap: () => notifier.toggleSource(source),
           ),
       ],
     );

@@ -741,6 +741,28 @@ abstract class MediaRepository {
   ///
   /// 两者为 `null` 或空集合都表示「这一维不限」。
   ///
+  /// ## [providers]：按**文件级来源**筛，不是按作品行的 `provider` 列
+  ///
+  /// 判据是「这部作品名下**有**来自该网盘的文件」，多项之间是「或」，
+  /// `null` / 空集合表示不限。
+  ///
+  /// ⛔ **不能用 `media_works.provider`**。那一列记的是「最后扫描到它的
+  /// 是哪家」，而作品的 `key` 是 `groupKey`（由片名算出，**不带网盘前缀**），
+  /// 所以同一部剧同时存在于夸克和百度时只会有一行作品 —— 那一列的值取决于
+  /// 谁的扫描后跑完。拿它筛的结果是「同一部剧有时在夸克栏、有时在百度栏」，
+  /// 而且每次重扫都可能变。
+  ///
+  /// ## 必须**穿透折叠**
+  ///
+  /// 归一（[mergeWorksInto]）把重复作品折叠成一行时**不搬** `media_items.
+  /// group_key`，所以被折走那部的文件仍挂在它自己的键下。只查目标键本身
+  /// 的话，一部在夸克、一部在百度、被归一合成一行的剧，两边都筛不出来 ——
+  /// 而它恰恰是「跨来源」最典型的形状。判据与 `listWorks` 的搜索子查询
+  /// 完全一致（那里也是这个 `OR`：自己的键 **或** 折进来的源键）。
+  ///
+  /// 因此**一部作品可以同时出现在两个来源下** —— 那不是 bug，是事实：
+  /// 它的文件确实分处两家。
+  ///
   /// ## 返回行里的三个计数是**并集**，与库里的存值可能不同
   ///
   /// [MediaWork.itemCount] / `totalBytes` / `seasonCount` 在库里存的是
@@ -779,6 +801,11 @@ abstract class MediaRepository {
     String? query,
     Set<int>? years,
     Set<String>? genres,
+    /// 只看**文件来自这些网盘**的作品。`null` / 空集合 = 不限。
+    ///
+    /// ⛔ 判据是「名下有该网盘的文件」，**不是**作品行的 `provider` 列 ——
+    /// 那一列是「最后扫描到它的是哪家」，见上方文档。
+    Set<DriveProvider>? providers,
     WorkSort sort = WorkSort.recentModified,
     int limit = 200,
     int offset = 0,
@@ -831,19 +858,20 @@ abstract class MediaRepository {
   ///
   /// ## 计数口径：等于「把年份 / 类型清空后，列表里的条数」
   ///
-  /// 所以它跟着 [category] / [playedOnly] / [scrapedOnly] / [query] 收窄，
-  /// 但**不跟着 [years] / [genres] 收窄**（那两维由调用方保证不传进来）。
+  /// 所以它跟着 [category] / [playedOnly] / [scrapedOnly] / [query] /
+  /// [providers] 收窄，但**不跟着 [years] / [genres] 收窄**（那两维由调用方
+  /// 保证不传进来）。
   /// 这条规则只有一个目的：**面板上出现的每一个选项，点下去至少有一条结果**。
   /// 整库统计做不到这一点 —— 用户切到「综艺」栏再打开面板，会看到一堆
   /// 综艺里根本不存在的类型，点下去是空列表。
   ///
-  /// [scrapedOnly] 进这一组而 [years] / [genres] 不进，是因为它们**不是
-  /// 同一类条件**：前者是面板顶部那个开关，改的是「这一份列表里有哪些
-  /// 作品」，年份 / 类型正是在它筛出来的这批作品里再分面；而 [years] /
-  /// [genres] 是分面本身 —— 让分面互相收窄，用户每勾一个类型，剩下的类型
+  /// [scrapedOnly] / [providers] 进这一组而 [years] / [genres] 不进，是因为
+  /// 它们**不是同一类条件**：前两者改的是「这一份列表里有哪些作品」，
+  /// 年份 / 类型正是在它筛出来的这批作品里再分面；而 [years] / [genres]
+  /// 是分面本身 —— 让分面互相收窄，用户每勾一个类型，剩下的类型
   /// 角标就跟着变，勾到第二个时列表已经空了。
   ///
-  /// 副作用是切换分类 / 搜索时面板上的数字会变（标准的分面筛选行为）。
+  /// 副作用是切换分类 / 搜索 / 来源时面板上的数字会变（标准的分面筛选行为）。
   ///
   /// `year` 为空的作品不进这个表（它们归不进任何年份），
   /// 所以各年份之和**可能小于**作品总数。
@@ -853,6 +881,7 @@ abstract class MediaRepository {
     bool scrapedOnly = false,
     bool followedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   });
 
   /// 各类型的作品数（筛选面板「类型」那一组的选项与角标）。
@@ -865,6 +894,33 @@ abstract class MediaRepository {
   ///
   /// 没有任何类型的作品（没刮过）不进这个表。
   Future<Map<String, int>> countWorksByGenre({
+    MediaCategory? category,
+    bool playedOnly = false,
+    bool scrapedOnly = false,
+    bool followedOnly = false,
+    String? query,
+    Set<DriveProvider>? providers,
+  });
+
+  /// 各**来源**的作品数（筛选面板「来源」那一组的选项与角标）。
+  ///
+  /// ## 计数口径：与 [listWorks] 的 `providers` 逐字同一套判据
+  ///
+  /// 每个来源的数字 = 「只勾这一个来源时，列表里会有几部」。实现里是拿
+  /// 同一个条件构造器对每个来源各数一次（见 drift 实现），**不另写一份
+  /// SQL** —— 两份判据迟早会漂移，而漂移的表现是「角标写 5、点下去 3 条」，
+  /// 用户看得见却完全猜不出哪一处错了。
+  ///
+  /// ## 为什么**不**接受 [providers]
+  ///
+  /// 它就是分面本身。让它按自己收窄的话，勾了「夸克」之后「百度」的角标会
+  /// 变成 0（甚至整个消失），用户就再也点不到它了 —— 与 [countWorksByYear]
+  /// 不收 [years] 是同一条理由。
+  ///
+  /// 只返回**真的有条目**的来源：写死一张「夸克 / 百度」的表会让只有一家
+  /// 网盘的用户看到一个永远是 0 的选项，然后怀疑筛选坏了。也顺带让将来
+  /// 新接入的网盘自动出现在面板上，不必改 UI。
+  Future<Map<DriveProvider, int>> countWorksByProvider({
     MediaCategory? category,
     bool playedOnly = false,
     bool scrapedOnly = false,
@@ -1882,6 +1938,7 @@ class InMemoryMediaRepository implements MediaRepository {
     String? query,
     Set<int>? years,
     Set<String>? genres,
+    Set<DriveProvider>? providers,
     // ⚠️ 默认值必须与接口声明、drift 实现三处一致：接口默认值只是个
     // 「文档」，真正生效的是**实现**上的默认值。这里漏改的话，调用方
     // 不显式传 sort 时两个实现会给出不同顺序，而这类差异在单测里
@@ -1929,6 +1986,20 @@ class InMemoryMediaRepository implements MediaRepository {
     // 字符串精确比较，不需要额外处理。
     if (genres != null && genres.isNotEmpty) {
       list = list.where((w) => w.genres.any(genres.contains)).toList();
+    }
+    // 来源：判据是「名下有该网盘的文件」，**穿透折叠** —— 与上面搜索那段
+    // 完全同一套 owner 判断（自己的键 **或** 折进来的源键）。
+    //
+    // ⛔ 不看 `w.provider`：那是「最后扫描到它的是哪家」，同一部剧在两家的
+    // 情况下取决于谁的扫描后跑完。完整理由见接口上 `listWorks` 的文档。
+    if (providers != null && providers.isNotEmpty) {
+      list = list.where((w) {
+        return _items.values.any(
+          (i) =>
+              (i.groupKey == w.key || _works[i.groupKey]?.mergedInto == w.key) &&
+              providers.contains(i.provider),
+        );
+      }).toList();
     }
     final q = query?.trim().toLowerCase();
     if (q != null && q.isNotEmpty) {
@@ -2090,6 +2161,7 @@ class InMemoryMediaRepository implements MediaRepository {
     bool scrapedOnly = false,
     bool followedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) async {
     // 直接复用 [listWorks] 的筛选，而不是把条件再抄一遍：口径要严格等于
     // 「清空年份 / 类型后列表里的条数」，抄一遍就迟早会漂移。
@@ -2099,6 +2171,7 @@ class InMemoryMediaRepository implements MediaRepository {
       scrapedOnly: scrapedOnly,
       followedOnly: followedOnly,
       query: query,
+      providers: providers,
       limit: _noLimit,
     );
     final out = <int, int>{};
@@ -2119,6 +2192,7 @@ class InMemoryMediaRepository implements MediaRepository {
     bool scrapedOnly = false,
     bool followedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) async {
     final works = await listWorks(
       category: category,
@@ -2126,6 +2200,7 @@ class InMemoryMediaRepository implements MediaRepository {
       scrapedOnly: scrapedOnly,
       followedOnly: followedOnly,
       query: query,
+      providers: providers,
       limit: _noLimit,
     );
     final out = <String, int>{};
@@ -2135,6 +2210,37 @@ class InMemoryMediaRepository implements MediaRepository {
       for (final g in w.genres.toSet()) {
         out[g] = (out[g] ?? 0) + 1;
       }
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<DriveProvider, int>> countWorksByProvider({
+    MediaCategory? category,
+    bool playedOnly = false,
+    bool scrapedOnly = false,
+    bool followedOnly = false,
+    String? query,
+  }) async {
+    // 逐个来源各数一次，走的是 [listWorks] 的同一个 `providers` 判据 ——
+    // 角标因此天然等于「只勾这一个来源时列表里有几部」。
+    //
+    // 也可以在这里扫一遍 `_items` 直接分组，但那样就多出一份「什么算
+    // 属于某来源」的判断，而它与列表的判据一旦分家，角标和列表就会
+    // 各说各话（drift 侧同理，见那里的注释）。
+    final out = <DriveProvider, int>{};
+    for (final p in DriveProvider.values) {
+      final works = await listWorks(
+        category: category,
+        playedOnly: playedOnly,
+        scrapedOnly: scrapedOnly,
+        followedOnly: followedOnly,
+        query: query,
+        providers: {p},
+        limit: _noLimit,
+      );
+      // 0 条的来源不进表：面板据此不画那颗 chip（见接口文档）。
+      if (works.isNotEmpty) out[p] = works.length;
     }
     return out;
   }

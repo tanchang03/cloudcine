@@ -6,6 +6,7 @@ import '../../core/utils/media_category.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/media_item.dart';
 import '../../domain/entities/media_work.dart';
+import '../../domain/entities/drive_provider.dart';
 import '../../domain/entities/subtitle_track.dart';
 import '../../domain/services/follow_read.dart';
 import '../../domain/services/item_sort.dart';
@@ -68,6 +69,7 @@ class LibraryFilter {
     this.query = '',
     this.years = const <int>{},
     this.genres = const <String>{},
+    this.sources = const <DriveProvider>{},
   });
 
   /// `null` 表示全部（不分栏）
@@ -150,21 +152,44 @@ class LibraryFilter {
   /// 取交集几乎永远筛不出东西。与 [years] 之间是「与」。
   final Set<String> genres;
 
+  /// 来源多选（网盘）。空集合 = 这一维不限。
+  ///
+  /// ## 它筛的是「文件在哪家」，不是「作品行记着哪家」
+  ///
+  /// 判据是「这部作品名下有来自该网盘的文件」（仓储层用 EXISTS 子查询
+  /// 表达，并穿透归一折叠）。**不能**用 `media_works.provider` 那一列 ——
+  /// 它记的是「最后扫描到它的是哪家」，而作品的 key 由片名算出、不带
+  /// 网盘前缀，所以同一部剧同时存在于两家时只有一行作品，那一列的值
+  /// 取决于谁的扫描后跑完。完整理由见 `MediaRepository.listWorks`。
+  ///
+  /// ## 因此一部作品可能同时出现在两个来源下
+  ///
+  /// 那不是 bug：它的文件确实分处两家。用户点「百度」想知道的正是
+  /// 「哪些片子在百度上」，而这部片子**在**。
+  ///
+  /// ## 为什么它进 [hasExtra] 而不进分类栏
+  ///
+  /// 它和 [scrapedOnly] 同类：改的是「这一份列表里有哪些作品」，年份 /
+  /// 类型是在它筛出来的那批里再分面（见 `_facetScope`）。所以它放面板里、
+  /// 跟着「清空筛选」一起清。
+  final Set<DriveProvider> sources;
+
   /// 筛选面板里是否有生效的条件（决定「筛选」按钮要不要亮标记）。
   ///
-  /// 三组：年份 / 类型 / 已刮削。[scrapedOnly] 也算在内 —— 它同样只在面板里
-  /// 有入口，不跟着「清空筛选」一起清的话，用户点完那个按钮列表还是空的，
-  /// 而面板上已经看不出是哪儿在筛（空态提示里那句「清掉年份 / 类型再看看」
-  /// 也会变成假话）。
-  bool get hasExtra => years.isNotEmpty || genres.isNotEmpty || scrapedOnly;
+  /// 四组：年份 / 类型 / 已刮削 / 来源。[scrapedOnly] 与 [sources] 也算在内
+  /// —— 它们同样只在面板里有入口，不跟着「清空筛选」一起清的话，用户点完
+  /// 那个按钮列表还是空的，而面板上已经看不出是哪儿在筛（空态提示里那句
+  /// 「清掉年份 / 类型再看看」也会变成假话）。
+  bool get hasExtra =>
+      years.isNotEmpty || genres.isNotEmpty || scrapedOnly || sources.isNotEmpty;
 
   /// 面板里**勾着的**条件项数（「筛选」按钮上的那个数字 / 底部的「已选 N 项」）。
   ///
-  /// 年份与类型按**个数**算（勾两个年份就是 2），[scrapedOnly] 是一个开关、
-  /// 算 1 项。两处调用必须共用这一份口径 —— 各算一遍的话，会出现
+  /// 年份、类型、来源按**个数**算（勾两个年份就是 2），[scrapedOnly] 是一个
+  /// 开关、算 1 项。两处调用必须共用这一份口径 —— 各算一遍的话，会出现
   /// 「按钮上写 3、面板底部写 2」这种自相矛盾的样子。
   int get selectedCount =>
-      years.length + genres.length + (scrapedOnly ? 1 : 0);
+      years.length + genres.length + sources.length + (scrapedOnly ? 1 : 0);
 
   /// 「一个内容筛选都没设」。
   ///
@@ -195,6 +220,7 @@ class LibraryFilter {
     String? query,
     Set<int>? years,
     Set<String>? genres,
+    Set<DriveProvider>? sources,
     bool clearCategory = false,
   }) {
     return LibraryFilter(
@@ -208,6 +234,7 @@ class LibraryFilter {
       // 用 null 表达「清空」—— 传 `const <int>{}` 就是要清空。
       years: years ?? this.years,
       genres: genres ?? this.genres,
+      sources: sources ?? this.sources,
     );
   }
 
@@ -223,7 +250,8 @@ class LibraryFilter {
       // Set 没重写 `==`（默认是**引用**相等），直接比会漏掉
       // 「内容一样但不是同一个对象」的更新，让 Riverpod 误判成「没变」。
       setEquals(other.years, years) &&
-      setEquals(other.genres, genres);
+      setEquals(other.genres, genres) &&
+      setEquals(other.sources, sources);
 
   @override
   int get hashCode => Object.hash(
@@ -236,12 +264,14 @@ class LibraryFilter {
         // 与顺序无关：`{2023, 2010}` 和 `{2010, 2023}` 是同一份条件。
         Object.hashAllUnordered(years),
         Object.hashAllUnordered(genres),
+        Object.hashAllUnordered(sources),
       );
 
   @override
   String toString() {
     final extra = [
       if (scrapedOnly) '已刮削',
+      if (sources.isNotEmpty) sources.map((s) => s.shortName).join("/"),
       if (years.isNotEmpty) '年份 ${(years.toList()..sort()).join("/")}',
       if (genres.isNotEmpty) genres.join("/"),
     ];
@@ -332,6 +362,17 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
     state = state.copyWith(genres: next);
   }
 
+  /// 切换一个来源的选中状态。语义与 [toggleYear] 一致。
+  ///
+  /// 两个都勾上等于「不限」（这部片子可能同时挂在两家），但**不做**自动
+  /// 归一化成空集合：用户勾了两下又取消一下，看到的是自己那一下的结果，
+  /// 而不是「怎么全都不高亮了」。与年份多选同一个取舍。
+  void toggleSource(DriveProvider source) {
+    final next = Set<DriveProvider>.of(state.sources);
+    if (!next.remove(source)) next.add(source);
+    state = state.copyWith(sources: next);
+  }
+
   /// 切换「只看已刮削」。
   ///
   /// 与年份 / 类型同属面板里那一组条件 —— 它没有别的清除入口，所以
@@ -339,15 +380,16 @@ class LibraryFilterController extends Notifier<LibraryFilter> {
   void toggleScrapedOnly() =>
       state = state.copyWith(scrapedOnly: !state.scrapedOnly);
 
-  /// 清空筛选面板里的三组条件（年份 + 类型 + 已刮削）。
+  /// 清空筛选面板里的四组条件（年份 + 类型 + 已刮削 + 来源）。
   ///
-  /// **只清这三组**：分类栏与搜索框在面板之外、各有自己的清除入口，
+  /// **只清这四组**：分类栏与搜索框在面板之外、各有自己的清除入口，
   /// 面板上的「清空筛选」把它们一起抹掉会让用户莫名其妙地丢掉搜索词。
   void clearExtra() {
     state = state.copyWith(
       years: const <int>{},
       genres: const <String>{},
       scrapedOnly: false,
+      sources: const <DriveProvider>{},
     );
   }
 
@@ -596,6 +638,8 @@ class MissingMediaController {
     _ref.invalidate(categoryCountsProvider);
     _ref.invalidate(yearCountsProvider);
     _ref.invalidate(genreCountsProvider);
+    // 来源角标数的是「名下有该网盘的文件」，删掉文件就会变 —— 必须一起作废。
+    _ref.invalidate(sourceCountsProvider);
     _ref.invalidate(playedCountProvider);
     _ref.invalidate(libraryStatsProvider);
     _ref.read(libraryWriteSignalProvider.notifier).bump();
@@ -666,6 +710,7 @@ final workListProvider = FutureProvider<List<MediaWork>>((ref) async {
         // 但显式传 `null` 让 SQL 侧连条件都不用拼。
         years: filter.years.isEmpty ? null : filter.years,
         genres: filter.genres.isEmpty ? null : filter.genres,
+        providers: filter.sources.isEmpty ? null : filter.sources,
         sort: filter.sort,
         limit: 500,
       );
@@ -748,34 +793,53 @@ final followedUpdateCountProvider = FutureProvider<int>((ref) {
   );
 });
 
-/// 筛选面板两组选项的**共同作用域**：分类 / 「最近播放」/「已刮削」/ 搜索词。
+/// 筛选面板各组选项的**共同作用域**：分类 / 「最近播放」/「已刮削」/ 来源 / 搜索词。
 ///
-/// ## 为什么是这四个
+/// ## 为什么是这五个
 ///
 /// 面板上的角标要严格等于「**把年份 / 类型清空后**列表里的条数」——
-/// 这样每一个选项点下去都至少有结果。所以它跟着这四个条件收窄，
+/// 这样每一个选项点下去都至少有结果。所以它跟着这五个条件收窄，
 /// 却**不能**跟着 `years` / `genres` 收窄：否则用户每勾一个类型，
 /// 剩下的类型角标就会跟着变，勾到第二个时列表已经空了。
 ///
-/// `scrapedOnly` 进这一组、`years` / `genres` 不进，是因为它们不是同一类
-/// 条件：前者是面板顶部那个开关，改的是「这一份列表里有哪些作品」——
-/// 年份 / 类型正是在它筛出来的那批作品里再分面。把它排除在外的话，
-/// 用户打开「已刮削」后会看到一堆只在**没刮过**的作品里存在的年份，
+/// `scrapedOnly` / `sources` 进这一组、`years` / `genres` 不进，是因为它们
+/// 不是同一类条件：前两者是面板顶部那两组「改的是这一份列表里有哪些作品」——
+/// 年份 / 类型正是在它们筛出来的那批作品里再分面。把它们排除在外的话，
+/// 用户勾了「百度」后会看到一堆只在**夸克**作品里存在的年份，
 /// 点下去是空列表，而面板的全部承诺就是「点下去至少有一条」。
+///
+/// ## ⛔ 来源自己的角标**不在**这里
+///
+/// `sourceCountsProvider` 刻意不吃这一份作用域（它自己就是分面）：勾了
+/// 「夸克」之后「百度」的角标若跟着变，用户就再也点不到它了。
 ///
 /// 用 `select` 而不是直接 `watch(libraryFilterProvider)` 是必须的：
 /// 后者会让「勾一个年份」也触发一次统计查询（白跑两遍全表扫描）。
-/// 记录（record）有结构相等，所以只有这四个值真的变了才会重算。
+/// 记录（record）有结构相等，所以只有这几个值真的变了才会重算。
 ///
 /// ⛔ 「追剧」**在**这一组里：它的角标口径是「在追的作品里有哪些年份 /
 ///    类型」，与「最近播放」完全对称。放出去的话，用户打开追剧栏会看到
 ///    一堆只在**没在追**的作品里存在的年份，点下去是空列表 ——
 ///    而面板的全部承诺就是「点下去至少有一条」。
-({MediaCategory? category, bool playedOnly, bool followedOnly, bool scrapedOnly, String query})
-    _facetScope(Ref ref) {
-  final (category, playedOnly, followedOnly, scrapedOnly, query) = ref.watch(
+({
+  MediaCategory? category,
+  bool playedOnly,
+  bool followedOnly,
+  bool scrapedOnly,
+  Set<DriveProvider> sources,
+  String query,
+}) _facetScope(Ref ref) {
+  final (category, playedOnly, followedOnly, scrapedOnly, sources, query) =
+      ref.watch(
     libraryFilterProvider.select(
-      (f) => (f.category, f.playedOnly, f.followedOnly, f.scrapedOnly, f.query),
+      (f) => (
+        f.category,
+        f.playedOnly,
+        f.followedOnly,
+        f.scrapedOnly,
+        f.sources,
+        f.query,
+      ),
     ),
   );
   return (
@@ -783,6 +847,7 @@ final followedUpdateCountProvider = FutureProvider<int>((ref) {
     playedOnly: playedOnly,
     followedOnly: followedOnly,
     scrapedOnly: scrapedOnly,
+    sources: sources,
     query: query.trim().isEmpty ? '' : query.trim(),
   );
 }
@@ -808,6 +873,7 @@ final yearCountsProvider = FutureProvider<Map<int, int>>((ref) async {
           followedOnly: scope.followedOnly,
           scrapedOnly: scope.scrapedOnly,
           query: scope.query.isEmpty ? null : scope.query,
+          providers: scope.sources.isEmpty ? null : scope.sources,
         ),
   );
 });
@@ -829,6 +895,41 @@ final genreCountsProvider = FutureProvider<Map<String, int>>((ref) async {
           followedOnly: scope.followedOnly,
           scrapedOnly: scope.scrapedOnly,
           query: scope.query.isEmpty ? null : scope.query,
+          providers: scope.sources.isEmpty ? null : scope.sources,
+        ),
+  );
+});
+
+/// 各**来源**的作品数（筛选面板「来源」那一组的选项与角标）。
+///
+/// ## ⛔ 刻意**不**吃 `_facetScope`
+///
+/// 它就是分面本身：勾了「夸克」之后「百度」的角标若跟着收窄，用户会看到
+/// 一个 0（甚至整个消失），于是再也点不到它 —— 与年份 / 类型不收自己
+/// 是同一类理由（见 `_facetScope` 的文档）。
+///
+/// 但它仍然跟着**分类 / 最近播放 / 追剧 / 已刮削 / 搜索词**收窄：那些是
+/// 「这一份列表里有哪些作品」的范围，来源选项必须在这个范围内数，
+/// 否则会出现「百度 8」而点下去只有 2 部。
+///
+/// 等回填的理由与 [yearCountsProvider] 相同。
+final sourceCountsProvider = FutureProvider<Map<DriveProvider, int>>((ref) async {
+  await ref.watch(categoryBackfillProvider.future);
+  // 只取作用域里**除来源之外**的那几项 —— 自己那一维必须排除。
+  final (category, playedOnly, followedOnly, scrapedOnly, query) = ref.watch(
+    libraryFilterProvider.select(
+      (f) => (f.category, f.playedOnly, f.followedOnly, f.scrapedOnly, f.query),
+    ),
+  );
+  final trimmed = query.trim();
+  return _timedQuery(
+    '来源角标（${category?.label ?? "全部"}）',
+    () => ref.watch(mediaRepositoryProvider).countWorksByProvider(
+          category: category,
+          playedOnly: playedOnly,
+          followedOnly: followedOnly,
+          scrapedOnly: scrapedOnly,
+          query: trimmed.isEmpty ? null : trimmed,
         ),
   );
 });

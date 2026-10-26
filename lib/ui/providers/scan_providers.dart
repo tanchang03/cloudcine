@@ -227,12 +227,13 @@ class ScanController extends Notifier<ScanState> {
         // 「最近播放」的角标也要跟着重取：清理陈旧条目会删掉一些播过的
         // 作品行（网盘侧已删除的文件）。
         ref.invalidate(playedCountProvider);
-        // 三个筛选角标同样会变：新扫进来的作品带着新的分类 / 年份 / 类型。
-        // 少一个的话，用户扫完 100 部电影，筛选面板上「电影」还是旧数字，
-        // 看起来像「筛选没生效」。
+        // 筛选面板的角标同样会变：新扫进来的作品带着新的分类 / 年份 /
+        // 类型 / 来源。少一个的话，用户扫完 100 部电影，筛选面板上「电影」
+        // 还是旧数字，看起来像「筛选没生效」。
         ref.invalidate(categoryCountsProvider);
         ref.invalidate(yearCountsProvider);
         ref.invalidate(genreCountsProvider);
+        ref.invalidate(sourceCountsProvider);
       }
     }
   }

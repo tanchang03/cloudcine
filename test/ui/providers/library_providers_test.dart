@@ -1,5 +1,6 @@
 import 'package:cloudcine/core/utils/media_category.dart';
 import 'package:cloudcine/domain/adapters/media_repository.dart';
+import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/ui/providers/library_providers.dart';
 import 'package:cloudcine/ui/providers/library_refresh_providers.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -117,12 +118,13 @@ void main() {
           reason: '取消类型不该顺手把年份也清掉 —— 两组是两个独立的维度');
     });
 
-    test('clearExtra 只清面板里的三组', () {
+    test('clearExtra 只清面板里的几组（年份 / 类型 / 已刮削 / 来源）', () {
       controller().setCategory(MediaCategory.anime);
       controller().setQuery('魔法');
       controller().toggleYear(2023);
       controller().toggleGenre('动画');
       controller().toggleScrapedOnly();
+      controller().toggleSource(DriveProvider.baidu);
 
       controller().clearExtra();
 
@@ -134,6 +136,8 @@ void main() {
         reason: '它和年份 / 类型一样只在面板里有入口，不清的话用户点完'
             '「清空筛选」列表还是空的',
       );
+      expect(filter().sources, isEmpty,
+          reason: '来源同样只在面板里有入口，必须一并清掉');
       expect(filter().category, MediaCategory.anime,
           reason: '分类栏与搜索框在面板之外、各有自己的清除入口。'
               '面板上的「清空筛选」把它们一起抹掉，用户会莫名其妙地'
@@ -141,7 +145,7 @@ void main() {
       expect(filter().query, '魔法');
     });
 
-    test('hasExtra 只看这两组', () {
+    test('hasExtra 只看面板里的几组（年份 / 类型 / 已刮削 / 来源）', () {
       expect(filter().hasExtra, isFalse);
 
       controller().setCategory(MediaCategory.movie);
@@ -149,6 +153,9 @@ void main() {
 
       controller().toggleYear(2023);
       expect(filter().hasExtra, isTrue);
+
+      controller().toggleSource(DriveProvider.baidu);
+      expect(filter().hasExtra, isTrue, reason: '来源同样只在面板里有入口');
     });
 
     test('「已刮削」算进 hasExtra（否则面板上的「清空筛选」是灰的）', () {
@@ -166,12 +173,35 @@ void main() {
       expect(filter().scrapedOnly, isFalse, reason: '再点一次取消');
     });
 
+    test('「来源」算进 hasExtra（否则面板上的「清空筛选」是灰的）', () {
+      controller().toggleSource(DriveProvider.baidu);
+      expect(filter().sources, {DriveProvider.baidu});
+      expect(
+        filter().hasExtra,
+        isTrue,
+        reason: '它只在面板里有入口，与「已刮削」同理 —— 不算进 hasExtra 的话，'
+            '只勾了来源时「清空筛选」会置灰，而列表正在被它筛着',
+      );
+
+      controller().toggleSource(DriveProvider.baidu);
+      expect(filter().sources, isEmpty, reason: '再点一次取消');
+    });
+
     test('「已刮削」本身就算「有筛选条件」（空态不能指错方向）', () {
       controller().toggleScrapedOnly();
 
       expect(filter().isEmpty, isFalse);
       expect(filter().isDefault, isFalse);
       expect(filter().selectedCount, 1, reason: '一个开关算一项');
+    });
+
+    test('「来源」本身就算「有筛选条件」，且按个数算（空态不能指错方向）', () {
+      controller().toggleSource(DriveProvider.baidu);
+      controller().toggleSource(DriveProvider.quark);
+
+      expect(filter().isEmpty, isFalse);
+      expect(filter().isDefault, isFalse);
+      expect(filter().selectedCount, 2, reason: '勾两家来源就是 2 项');
     });
 
     test('面板里的条件也算「有筛选条件」', () {
@@ -186,12 +216,15 @@ void main() {
     test('copyWith 传空集合能清空（不能像 category 那样用 null 表示不改）', () {
       controller().toggleYear(2023);
       controller().toggleGenre('动画');
+      controller().toggleSource(DriveProvider.baidu);
 
       final cleared = filter().copyWith(years: const <int>{});
 
       expect(cleared.years, isEmpty);
       expect(cleared.genres, {'动画'},
           reason: '只传了 years 就不该动 genres');
+      expect(cleared.sources, {DriveProvider.baidu},
+          reason: '没传 sources 就不该动它');
     });
 
     test('相等性按集合**内容**比，不按引用', () {
@@ -212,11 +245,19 @@ void main() {
             LibraryFilter(years: {2010, 2023}),
         isTrue,
       );
+
+      // sources 也按内容比：勾了同一家来源的两个实例应相等。
+      expect(
+        LibraryFilter(sources: {DriveProvider.baidu}) ==
+            LibraryFilter(sources: {DriveProvider.baidu}),
+        isTrue,
+      );
     });
 
     test('clear() 把面板条件也复位', () {
       controller().toggleYear(2023);
       controller().toggleGenre('动画');
+      controller().toggleSource(DriveProvider.baidu);
       controller().clear();
 
       expect(filter(), const LibraryFilter());
@@ -225,10 +266,13 @@ void main() {
     test('toString 里看得出筛了哪些', () {
       controller().toggleYear(2023);
       controller().toggleGenre('动画');
+      controller().toggleSource(DriveProvider.baidu);
       final text = filter().toString();
 
       expect(text, contains('2023'));
       expect(text, contains('动画'));
+      expect(text, contains('百度'),
+          reason: '来源要用 shortName 写进摘要，否则日志里看不出筛的是哪家');
     });
   });
 

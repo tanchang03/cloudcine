@@ -1810,14 +1810,15 @@ class DriftMediaRepository implements MediaRepository {
     String? query,
     Set<int>? years,
     Set<String>? genres,
+    Set<DriveProvider>? providers,
     WorkSort sort = WorkSort.recentModified,
     int limit = 200,
     int offset = 0,
   }) async {
     final q = _db.select(_db.mediaWorks);
 
-    // 分类 / 搜索 / 「播过没有」/ 「刮过没有」/ 「在追没有」走共用表达式 ——
-    // 两个计数查询要用同一份条件（理由见 `_workConditions`）。
+    // 分类 / 搜索 / 「播过没有」/ 「刮过没有」/ 「在追没有」/ 「来源」走共用
+    // 表达式 —— 两个计数查询要用同一份条件（理由见 `_workConditions`）。
     final base = _workConditions(
       kind: kind,
       category: category,
@@ -1825,6 +1826,7 @@ class DriftMediaRepository implements MediaRepository {
       scrapedOnly: scrapedOnly,
       followedOnly: followedOnly,
       query: query,
+      providers: providers,
     );
     if (base != null) q.where((_) => base);
 
@@ -2018,7 +2020,8 @@ class DriftMediaRepository implements MediaRepository {
   /// 条件，而其中两条判据都很微妙：
   ///
   ///   - **分类**要处理「空串 = 还没判定过」的历史行（见 [_categoryCondition]）；
-  ///   - **搜索**要同时命中标题与**文件名**（EXISTS 子查询）。
+  ///   - **搜索**要同时命中标题与**文件名**（EXISTS 子查询）；
+  ///   - **来源**要问「名下有该网盘的文件」（EXISTS 子查询，且穿透折叠）。
   ///
   /// 三处各写一遍迟早会漂移，而漂移的表现是「列表和面板角标对不上」——
   /// 用户看得见，却完全猜不出是哪一处的问题。
@@ -2029,6 +2032,7 @@ class DriftMediaRepository implements MediaRepository {
     bool scrapedOnly = false,
     bool followedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) {
     final t = _db.mediaWorks;
     Expression<bool>? cond;
@@ -2063,6 +2067,36 @@ class DriftMediaRepository implements MediaRepository {
     if (followedOnly) add(t.followed.equals(true));
 
     if (category != null) add(_categoryCondition(category));
+
+    // 「来源」：判据是「名下有来自这些网盘的文件」。
+    //
+    // ⛔ **不是**作品行的 `provider` 列。那一列记的是「最后扫描到它的
+    // 是哪家」，而作品的 key 是 `groupKey`（由片名算出，不带网盘前缀）——
+    // 同一部剧同时存在于两家时只有一行作品，那一列的值取决于谁的扫描
+    // 后跑完。拿它筛会得到「同一部剧有时在夸克栏、有时在百度栏」，
+    // 而且每次重扫都可能变。
+    //
+    // ⚠️ 必须**穿透折叠**：归一不搬 `media_items.group_key`，被折走那部的
+    // 文件仍挂在它自己的键下。只查目标键的话，「一部在夸克、一部在百度、
+    // 被合成一行」的剧两边都筛不出来 —— 而它恰恰是跨来源最典型的形状。
+    //
+    // 内层别名与下面搜索那段同一个理由：不起别名时内层会把自己那一行
+    // 解析成外层，生成 `merged_into = key` 这种恒假条件，**且不报错**。
+    if (providers != null && providers.isNotEmpty) {
+      final src = _db.mediaWorks.createAlias('provider_src');
+      final owners = _db.selectOnly(src)
+        ..addColumns([src.key])
+        ..where(src.mergedInto.equalsExp(t.key));
+
+      final sub = _db.selectOnly(_db.mediaItems)
+        ..addColumns([_db.mediaItems.id])
+        ..where((_db.mediaItems.groupKey.equalsExp(t.key) |
+                _db.mediaItems.groupKey.isInQuery(owners)) &
+            _db.mediaItems.provider.isIn(
+              providers.map((p) => p.id).toList(growable: false),
+            ));
+      add(existsQuery(sub));
+    }
 
     final trimmed = query?.trim();
     if (trimmed != null && trimmed.isNotEmpty) {
@@ -2303,6 +2337,7 @@ class DriftMediaRepository implements MediaRepository {
     bool scrapedOnly = false,
     bool followedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) async {
     // 只读 `year` 一列：作品表有十几列，为了一组数字把整行物化是浪费。
     //
@@ -2320,6 +2355,7 @@ class DriftMediaRepository implements MediaRepository {
       scrapedOnly: scrapedOnly,
       followedOnly: followedOnly,
       query: query,
+      providers: providers,
     );
     if (cond != null) q.where(cond);
 
@@ -2340,6 +2376,7 @@ class DriftMediaRepository implements MediaRepository {
     bool scrapedOnly = false,
     bool followedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) async {
     // 类型存在 `genres` 列（JSON 数组文本）里，SQL 数不出来 ——
     // 只能读出这一列在 Dart 里拆。好在仍然只读一列、不碰整行。
@@ -2351,6 +2388,7 @@ class DriftMediaRepository implements MediaRepository {
       scrapedOnly: scrapedOnly,
       followedOnly: followedOnly,
       query: query,
+      providers: providers,
     );
     if (cond != null) q.where(cond);
 
@@ -2360,6 +2398,46 @@ class DriftMediaRepository implements MediaRepository {
       for (final g in _stringList(row.read(_db.mediaWorks.genres)).toSet()) {
         out[g] = (out[g] ?? 0) + 1;
       }
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<DriveProvider, int>> countWorksByProvider({
+    MediaCategory? category,
+    bool playedOnly = false,
+    bool scrapedOnly = false,
+    bool followedOnly = false,
+    String? query,
+  }) async {
+    // 逐个来源各数一次，条件用的是 `_workConditions` 里**同一个**
+    // `providers` 分支 —— 所以角标天然等于「只勾这一个来源时列表里有几部」。
+    //
+    // ## 为什么不做成一条 `GROUP BY i.provider`
+    //
+    // 那条 SQL 要自己把「哪些文件算这部作品的」再表达一遍（穿透折叠），
+    // 于是「什么算属于某来源」就有了**第二份**判据。两份判据一旦分家，
+    // 症状是「角标写 5、点下去 3 条」—— 用户看得见，却完全猜不出哪一处
+    // 错了。多跑两三条 COUNT 换一份单一判据，这笔账划算：它只在**打开
+    // 筛选面板**时跑，且 Riverpod 会缓存结果。
+    final out = <DriveProvider, int>{};
+    for (final p in DriveProvider.values) {
+      final q = _db.selectOnly(_db.mediaWorks)
+        ..addColumns([_db.mediaWorks.key.count()]);
+      final cond = _workConditions(
+        category: category,
+        playedOnly: playedOnly,
+        scrapedOnly: scrapedOnly,
+        followedOnly: followedOnly,
+        query: query,
+        providers: {p},
+      );
+      if (cond != null) q.where(cond);
+      final n = await q
+          .map((row) => row.read(_db.mediaWorks.key.count()) ?? 0)
+          .getSingle();
+      // 0 条的来源不进表：面板据此不画那颗 chip（见接口文档）。
+      if (n > 0) out[p] = n;
     }
     return out;
   }

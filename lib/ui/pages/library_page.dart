@@ -137,7 +137,11 @@ Future<void> playWork({
   // 面板里**实际**在筛的那几组。这句话必须点名它们：用户会照着提示去清
   // 「年份 / 类型」，而如果他只开了「已刮削」，那句话就是在让他去清一组
   // 根本没选过的条件 —— 而他点完按钮列表变空的原因也解释不了。
+  //
+  // 顺序与面板里的分组顺序一致（来源 → 刮削 → 年份 / 类型），用户照着
+  // 这句话去面板上找，视线是往下走的，不是来回跳的。
   final facets = [
+    if (filter.sources.isNotEmpty) '「来源」',
     if (filter.scrapedOnly) '「已刮削」',
     if (filter.years.isNotEmpty || filter.genres.isNotEmpty) '年份 / 类型',
   ];
@@ -240,11 +244,12 @@ class _LibraryPageState extends ConsumerState<LibraryPage> {
     ref.invalidate(workListProvider);
     ref.invalidate(categoryCountsProvider);
     ref.invalidate(playedCountProvider);
-    // 筛选面板的两组选项也是从库里数出来的，一起失效 ——
+    // 筛选面板里那几组选项也是从库里数出来的，一起失效 ——
     // 否则手动改了库（比如在设置页清过数据）之后，面板上还列着
-    // 已经一部都不剩的年份 / 类型。
+    // 已经一部都不剩的年份 / 类型 / 来源。
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
+    ref.invalidate(sourceCountsProvider);
     ref.invalidate(libraryStatsProvider);
     // 「还有多少部没刮过」也是从库里数出来的。
     ref.invalidate(unscrapedCountProvider);

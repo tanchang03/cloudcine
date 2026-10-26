@@ -2,6 +2,7 @@ import 'package:cloudcine/core/utils/filename_parser.dart';
 import 'package:cloudcine/core/utils/media_category.dart';
 import 'package:cloudcine/domain/adapters/media_repository.dart';
 import 'package:cloudcine/domain/entities/drive_provider.dart';
+import 'package:cloudcine/domain/entities/media_item.dart';
 import 'package:cloudcine/domain/entities/media_work.dart';
 import 'package:cloudcine/ui/providers/app_providers.dart';
 import 'package:cloudcine/ui/providers/library_providers.dart';
@@ -36,16 +37,33 @@ void main() {
         updatedAt: now,
       );
 
+  /// 一个带 provider 的文件（归到 [groupKey]）。
+  MediaItem item(String groupKey, DriveProvider provider, String fileId) =>
+      MediaItem(
+        provider: provider,
+        fileId: fileId,
+        name: '$groupKey.mkv',
+        dirId: 'd',
+        dirPath: '/',
+        groupKey: groupKey,
+        kind: MediaKind.movie,
+        firstSeenAt: now,
+        updatedAt: now,
+      );
+
   /// 挂一棵最小的树，并返回那个可读状态的 container。
   ///
   /// [repo] 只在需要「仓储坏了」这类用例时传；默认用正常的替身。
+  /// [items] 让来源筛选有东西可数（来源筛的是**文件**，不是作品行）。
   Future<ProviderContainer> pump(
     WidgetTester tester, {
     required List<MediaWork> works,
+    List<MediaItem> items = const [],
     MediaRepository? repo,
   }) async {
     final repository = repo ?? InMemoryMediaRepository();
     await repository.upsertWorks(works, now: now);
+    if (items.isNotEmpty) await repository.upsertItems(items);
 
     final container = ProviderContainer(
       overrides: [mediaRepositoryProvider.overrideWithValue(repository)],
@@ -128,6 +146,96 @@ void main() {
       await open(tester);
 
       expect(find.textContaining('还没有类型信息'), findsOneWidget);
+    });
+
+    testWidgets('库里有夸克和百度的文件 → 来源区各画一颗 chip 带数量',
+        (tester) async {
+      await pump(
+        tester,
+        works: [
+          work('a', year: 2021, genres: ['剧情']),
+          work('b', year: 2023, genres: ['科幻']),
+        ],
+        items: [
+          item('a', DriveProvider.quark, 'a1'),
+          item('b', DriveProvider.baidu, 'b1'),
+        ],
+      );
+
+      await open(tester);
+
+      expect(find.text('来源'), findsOneWidget, reason: '分组标题');
+      // 两家各 1 部。
+      expect(find.text('夸克'), findsOneWidget);
+      expect(find.text('百度'), findsOneWidget);
+      // 数量角标。
+      expect(find.text('1'), findsWidgets);
+    });
+
+    testWidgets('点「百度」→ 筛选状态记录来源，再点取消', (tester) async {
+      final c = await pump(
+        tester,
+        works: [
+          work('a', year: 2021),
+          work('b', year: 2023),
+        ],
+        items: [
+          item('a', DriveProvider.quark, 'a1'),
+          item('b', DriveProvider.baidu, 'b1'),
+        ],
+      );
+
+      await open(tester);
+      await tester.tap(find.text('百度'));
+      await tester.pumpAndSettle();
+
+      expect(state(c).sources, {DriveProvider.baidu},
+          reason: '面板要把「勾了哪家网盘」记进筛选条件');
+      expect(state(c).selectedCount, 1, reason: '勾一家来源算一项');
+
+      await tester.tap(find.text('百度'));
+      await tester.pumpAndSettle();
+      expect(state(c).sources, isEmpty, reason: '再点一次取消');
+    });
+
+    testWidgets('勾了来源但当前分类里没有 → 那颗 chip 仍画出来且可取消',
+        (tester) async {
+      // 电影栏：a 来自百度；动漫栏：c 来自夸克。百度 chip 在动漫栏里没有作品，
+      // 但若用户先在电影栏勾了百度、再切到动漫，它必须仍然可见且能取消。
+      final c = await pump(
+        tester,
+        works: [
+          work('a', year: 2021, category: MediaCategory.movie),
+          work('c', year: 2021, category: MediaCategory.anime),
+        ],
+        items: [
+          item('a', DriveProvider.baidu, 'a1'),
+          item('c', DriveProvider.quark, 'c1'),
+        ],
+      );
+      await open(tester);
+      await tester.tap(find.text('百度'));
+      await tester.pumpAndSettle();
+
+      c.read(libraryFilterProvider.notifier).setCategory(MediaCategory.anime);
+      await tester.pumpAndSettle();
+
+      // chip 仍画着（stale 样式），且仍可点取消。
+      expect(find.text('百度'), findsOneWidget);
+      await tester.tap(find.text('百度'));
+      await tester.pumpAndSettle();
+      expect(state(c).sources, isEmpty,
+          reason: '已选但当前范围里没有的来源，必须能取消，否则用户会被'
+              '「已选 1 项」困住、列表却空着，唯一的出路是清空筛选');
+    });
+
+    testWidgets('库里一部文件都没有 → 来源区提示先扫描', (tester) async {
+      await pump(tester, works: [work('a', year: 2021)]);
+
+      await open(tester);
+
+      expect(find.textContaining('还没有入库的作品'), findsOneWidget,
+          reason: '来源是按文件数出来的，零文件时不能画一堆 0 的 chip');
     });
 
     testWidgets('「已刮削」单独一组列出来', (tester) async {
@@ -349,6 +457,18 @@ void main() {
       expect(find.textContaining('统计类型失败'), findsOneWidget);
       expect(find.textContaining('正在统计'), findsNothing);
     });
+
+    testWidgets('countWorksByProvider 出错 → 面板显示失败', (tester) async {
+      await pump(
+        tester,
+        works: [work('a', year: 2021, genres: ['剧情'])],
+        repo: _BrokenSourceRepo(),
+      );
+      await open(tester);
+
+      expect(find.textContaining('统计来源失败'), findsOneWidget);
+      expect(find.textContaining('正在统计'), findsNothing);
+    });
   });
 
   group('已选条件在切换分类后仍然可取消', () {
@@ -501,6 +621,7 @@ class _BrokenYearRepo extends InMemoryMediaRepository {
     bool followedOnly = false,
     bool scrapedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) async =>
       throw StateError('数据库炸了');
 }
@@ -509,6 +630,21 @@ class _BrokenYearRepo extends InMemoryMediaRepository {
 class _BrokenGenreRepo extends InMemoryMediaRepository {
   @override
   Future<Map<String, int>> countWorksByGenre({
+    MediaCategory? category,
+    bool playedOnly = false,
+    bool followedOnly = false,
+    bool scrapedOnly = false,
+    String? query,
+    Set<DriveProvider>? providers,
+  }) async =>
+      throw StateError('数据库炸了');
+}
+
+/// 来源计数**故意抛出异常**的仓储 —— 与上面两个同理，但这一组是新加的，
+/// 它同样不能把「算错了」伪装成「正在统计…」。
+class _BrokenSourceRepo extends InMemoryMediaRepository {
+  @override
+  Future<Map<DriveProvider, int>> countWorksByProvider({
     MediaCategory? category,
     bool playedOnly = false,
     bool followedOnly = false,

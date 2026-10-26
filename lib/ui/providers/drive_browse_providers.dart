@@ -658,6 +658,8 @@ class DiscoveryController extends Notifier<DiscoveryState> {
     ref.invalidate(categoryCountsProvider);
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
+    // 从文件夹页「发现」进来的新文件会带进新的来源 —— 来源角标一起作废。
+    ref.invalidate(sourceCountsProvider);
   }
 
   void _emit(DiscoveryState next) {

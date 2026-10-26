@@ -1315,11 +1315,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       // 索引库清空后「最近播放」必然是空的 —— 不重取的话角标会一直挂着
       // 一个已经不存在的数字。
       ref.invalidate(playedCountProvider);
-      // 同理，筛选面板上的年份 / 类型也是从库里数出来的：清空之后
+      // 同理，筛选面板上的年份 / 类型 / 来源也是从库里数出来的：清空之后
       // 它们必须变成空列表，否则用户点一个「2020 · 37 部」会发现
       // 一部都没有。
       ref.invalidate(yearCountsProvider);
       ref.invalidate(genreCountsProvider);
+      ref.invalidate(sourceCountsProvider);
       ref.invalidate(categoryCountsProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('索引库已清空')),
@@ -1633,6 +1634,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ref.invalidate(followedUpdateCountProvider);
     ref.invalidate(yearCountsProvider);
     ref.invalidate(genreCountsProvider);
+    ref.invalidate(sourceCountsProvider);
     ref.invalidate(settingsProvider);
   }
 

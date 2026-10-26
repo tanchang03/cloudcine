@@ -287,6 +287,7 @@ class _CountingRepo extends DriftMediaRepository {
     bool followedOnly = false,
     bool scrapedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) {
     yearCalls++;
     return super.countWorksByYear(
@@ -295,6 +296,7 @@ class _CountingRepo extends DriftMediaRepository {
       followedOnly: followedOnly,
       scrapedOnly: scrapedOnly,
       query: query,
+      providers: providers,
     );
   }
 
@@ -305,6 +307,7 @@ class _CountingRepo extends DriftMediaRepository {
     bool followedOnly = false,
     bool scrapedOnly = false,
     String? query,
+    Set<DriveProvider>? providers,
   }) {
     genreCalls++;
     return super.countWorksByGenre(
@@ -313,6 +316,7 @@ class _CountingRepo extends DriftMediaRepository {
       followedOnly: followedOnly,
       scrapedOnly: scrapedOnly,
       query: query,
+      providers: providers,
     );
   }
 }
