@@ -7,6 +7,8 @@ import '../../domain/entities/media_item.dart';
 import '../pages/auth_page.dart';
 import '../pages/auth_qr_login_page.dart';
 import '../pages/diagnostics_page.dart';
+import '../pages/diary_page.dart';
+import '../pages/diary_detail_page.dart';
 import '../pages/downloads_page.dart';
 import '../pages/folder_page.dart';
 import '../pages/library_page.dart';
@@ -104,6 +106,15 @@ final routerProvider = Provider<GoRouter>((ref) {
       // 诊断日志同样是全屏页：它是排查工具，不是产品功能的一级入口。
       GoRoute(path: '/diagnostics', builder: (_, __) => const DiagnosticsPage()),
 
+      // 观影日记详情：从日记列表点进去的一层（返回回到日记页）。
+      // 参数走 query：`id` 是 `DiaryEntry.id`（稳定主键，非 workKey）。
+      GoRoute(
+        path: '/diary/detail',
+        builder: (_, state) => DiaryDetailPage(
+          id: state.uri.queryParameters['id'] ?? '',
+        ),
+      ),
+
       StatefulShellRoute.indexedStack(
         builder: (context, state, navigationShell) =>
             AppShell(shell: navigationShell),
@@ -142,6 +153,13 @@ final routerProvider = Provider<GoRouter>((ref) {
           StatefulShellBranch(
             routes: [
               GoRoute(path: '/settings', builder: (_, __) => const SettingsPage()),
+            ],
+          ),
+          // 第 6 个一级入口「观影日记」：顺序必须紧跟在「设置」之后（index 5），
+          // 与 `app_shell.dart` 里 `_navItems` 的末项一致。
+          StatefulShellBranch(
+            routes: [
+              GoRoute(path: '/diary', builder: (_, __) => const DiaryPage()),
             ],
           ),
         ],

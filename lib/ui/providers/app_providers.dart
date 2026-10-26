@@ -15,6 +15,8 @@ import '../../data/db/app_database.dart';
 import '../../data/db/media_repository_impl.dart';
 import '../../data/db/progress_store.dart';
 import '../../data/db/progress_sync.dart';
+import '../../data/db/diary_store.dart';
+import '../../data/db/diary_sync.dart';
 import '../../data/db/settings_store.dart';
 import '../../data/http/dio_http_client.dart';
 import '../../data/http/http_client.dart';
@@ -32,6 +34,9 @@ import '../../domain/adapters/credential_store.dart';
 import '../../domain/adapters/media_repository.dart';
 import '../../domain/entities/drive_provider.dart';
 import '../../domain/services/library_backup_service.dart';
+import '../../domain/services/watch_diary.dart';
+import '../../domain/services/diary_eligibility.dart';
+import '../widgets/diary_toast.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/qr_login_driver.dart';
 import '../../domain/services/subtitle_service.dart';
@@ -209,6 +214,17 @@ final progressStoreProvider = Provider<ProgressStore>((ref) {
     filePath: '$dir${Platform.pathSeparator}${ProgressStore.fileName}',
   );
   // 退出前把内存里最后那几条落盘（防抖窗口里可能还压着东西）。
+  ref.onDispose(() => unawaited(store.dispose()));
+  return store;
+});
+
+/// 观影日记的**独立落盘存储**。与进度库同一条理由：挂在 `appSupportDirProvider`
+/// 上，与媒体库索引库是两棵互不影响的依赖树（见 `DiaryStore` 类文档）。
+final diaryStoreProvider = Provider<DiaryStore>((ref) {
+  final dir = ref.watch(appSupportDirProvider);
+  final store = DiaryStore(
+    filePath: '$dir${Platform.pathSeparator}${DiaryStore.fileName}',
+  );
   ref.onDispose(() => unawaited(store.dispose()));
   return store;
 });
@@ -630,6 +646,13 @@ final libraryBackupServiceProvider = Provider<LibraryBackupService>(
           // 进度下一轮启动同步时会再铺一次。
           diag.warn('进度', '恢复备份后回填进度失败（下次同步会重试）：$e');
         }
+        // 恢复回来的是一份**新库**：里面可能有一批已看完、但还没进日记的作品。
+        // 日记文件本身不在 `.ccbak` 里、不会被这次恢复覆盖，所以只需补一次捕种。
+        try {
+          await syncDiaryOnce(ref);
+        } catch (e) {
+          diag.warn('日记', '恢复备份后捕种日记失败（下次同步会重试）：$e');
+        }
       },
     );
   },
@@ -652,6 +675,11 @@ final progressSyncServiceProvider = Provider<ProgressSyncService>((ref) {
     uploadRemote: (bytes) => backups.uploadProgressFile(bytes),
   );
 });
+
+// ⚠️ 日记同步服务不在顶层 provider 图里，而是用模块级函数 `syncDiaryOnce(ref)`
+// 在运行时构造（`libraryBackupServiceProvider` 所在的类型推断环在单文件里已接近
+// Dart 上限，塞进来会报 `top_level_cycle`）。`diaryStoreProvider` 只依赖
+// `appSupportDirProvider`，留在下面即可。
 
 /// 「现在同步一次进度」的**触发信号**。
 ///
@@ -707,30 +735,47 @@ final progressSyncTriggerProvider =
 ///    （热重载、恢复备份换了库）时会重新执行本函数体，不取消的话每重建
 ///    一次就多一个永不停止的定时器，最后会同时发起几十次同步。
 final progressSyncSchedulerProvider = Provider<void>((ref) {
-  final service = ref.watch(progressSyncServiceProvider);
+  final progressService = ref.watch(progressSyncServiceProvider);
+  // 一次性组合的「运行中」标记：保证一轮 run() 把两个单元串行跑完，
+  // 避免定时器与「退出播放器」信号叠加成两次并发。各服务内部仍有自己的
+  // isRunning 守卫兜底。
+  var running = false;
 
-  void run(String why) {
-    if (service.isRunning) return;
-    unawaited(
-      service.syncSilently().then((outcome) {
-        if (!outcome.ok) diag.debug('进度', '[$why] 同步未完成：${outcome.message}');
-      }),
-    );
+  Future<void> run(String why) async {
+    if (running) return;
+    running = true;
+    try {
+      // 1) 播放进度（先跑，沿用原顺序）。
+      try {
+        final p = await progressService.syncSilently();
+        if (!p.ok) diag.debug('进度', '[$why] 同步未完成：${p.message}');
+      } catch (e) {
+        diag.debug('进度', '[$why] 同步异常：$e');
+      }
+      // 2) 观影日记（串行、失败隔离：进度出事不影响日记）。
+      try {
+        await syncDiaryOnce(ref);
+      } catch (e) {
+        diag.debug('日记', '[$why] 同步异常：$e');
+      }
+    } finally {
+      running = false;
+    }
   }
 
   // 启动后延迟一次。
-  final launchTimer = Timer(const Duration(seconds: 12), () => run('启动'));
+  final launchTimer = Timer(const Duration(seconds: 12), () => unawaited(run('启动')));
 
   // 每 30 分钟一次。
   final periodic = Timer.periodic(
     const Duration(minutes: 30),
-    (_) => run('定时'),
+    (_) => unawaited(run('定时')),
   );
 
-  // 「退出播放器」。
+  // 「退出播放器」：进度与日记各补跑一轮（共用节流由 Trigger 负责）。
   ref.listen<int>(progressSyncTriggerProvider, (previous, next) {
     if (previous == next) return;
-    run('退出播放器');
+    unawaited(run('退出播放器'));
   });
 
   ref.onDispose(() {
@@ -738,3 +783,73 @@ final progressSyncSchedulerProvider = Provider<void>((ref) {
     periodic.cancel();
   });
 });
+
+/// 跑一轮**观影日记**静默同步。
+///
+/// 写成模块级函数、不在顶层 provider 图里，是为了不把 `libraryBackupServiceProvider`
+/// 所在的类型推断环再扩大（当初把日记同步服务塞进 `app_providers` 顶层时，Dart
+/// 报 `top_level_cycle`）。这里在运行时用 `ref.read` 拿到依赖，构造出
+/// `DiarySyncService` 再跑，等价于一个 provider，但不占顶层推断图的位置。
+///
+/// `syncSilently` 内部自带兜底（绝不抛），所以这里不需要再包一层 try。
+Future<void> syncDiaryOnce(Ref ref) async {
+  diag.debug('日记', 'syncDiaryOnce 开始（触发捕种 + 同步）');
+  final store = ref.read(diaryStoreProvider);
+  final repo = ref.read(mediaRepositoryProvider);
+  final backups = ref.read(libraryBackupServiceProvider);
+
+  /// 捕种：扫描媒体库，把「新达标、且日记里还没有」的作品自动记进去。
+  Future<Map<String, DiaryEntry>> captureEligible() async {
+    await store.load();
+    final works = await repo.allWorks();
+    final progressByFileId = (await repo.progressSnapshot()).items;
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final out = <String, DiaryEntry>{};
+    // 诊断计数：区分「没有作品真正达标」与「有达标但被其它条件拦下」。
+    var scanned = 0;
+    var withFiles = 0;
+    var eligible = 0;
+    for (final w in works) {
+      if (w.mergedInto != null) continue; // 别名作品跳过，避免同一部剧重复捕种
+      final items = await repo.itemsForWork(w.key);
+      scanned++;
+      final files = items.where((i) => !i.isSampleOrExtra).toList();
+      if (files.isNotEmpty) withFiles++;
+      final snap = DiaryEligibility.evaluate(
+        work: w,
+        items: items,
+        progressByFileId: progressByFileId,
+      );
+      if (snap == null) continue;
+      eligible++;
+      final id = DiaryEntry.idFor(
+        provider: snap.provider,
+        title: snap.title,
+        year: snap.year,
+      );
+      final existing = store.getEntry(id);
+      if (existing != null && !existing.isDeleted) continue;
+      out[id] = DiaryEntry.fromSnapshot(snap, atSec: now);
+    }
+    diag.info('日记',
+        '捕种扫描：$scanned 部作品（有正片 $withFiles 部）｜ evaluate 达标 $eligible 部 ｜ 新记入 ${out.length} 部');
+    return out;
+  }
+
+  final service = DiarySyncService(
+    store: store,
+    captureEligible: captureEligible,
+    downloadRemote: backups.downloadDiaryFile,
+    uploadRemote: (bytes) => backups.uploadDiaryFile(bytes),
+  );
+  final outcome = await service.syncSilently();
+  // 本轮捕种到了新达标的作品 → 写一条顶部提示（设计文档 §8.5）。
+  // 多部同时达标时取记入时刻最新的一部，避免一次弹多条。
+  if (outcome.capturedEntries.isNotEmpty) {
+    final latest = outcome.capturedEntries.values.reduce(
+      (a, b) => a.addedAtSec >= b.addedAtSec ? a : b,
+    );
+    ref.read(diaryToastProvider.notifier).state =
+        DiaryToastData(id: latest.id, title: latest.title);
+  }
+}

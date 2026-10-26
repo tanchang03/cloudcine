@@ -613,6 +613,50 @@ class LibraryBackupService {
     );
   }
 
+  /// 观影日记的文件名。与本地那份同名（见 `DiaryStore.fileName`）。
+  ///
+  /// 与 [progressFileName] 同级、同风格：都是「逐条 LWW、只在变化时传」的小通道，
+  /// 不是整库备份。两条通道共用 `云影备份/` 目录，但**各写各的文件**——
+  /// 合并成一个文件反而会把「可再生」的进度和「不可再生」的日记绑在同一段
+  /// 空窗里（覆盖上传是先删后传）。
+  static const String diaryFileName = 'watch_diary.json';
+
+  /// 下载网盘上的日记文件。网盘上还没有 / 目录不存在时返回 `null`。
+  Future<Uint8List?> downloadDiaryFile({
+    String dirName = defaultBackupDir,
+    int maxBytes = 32 * 1024 * 1024,
+  }) async {
+    final dirFid = await _findBackupDir(dirName);
+    if (dirFid == null) {
+      diag.info('日记', '网盘上还没有「$dirName」目录，跳过下载');
+      return null;
+    }
+    final page = await _adapter.listDirectory(dirId: dirFid, pageSize: 200);
+    for (final e in page.entries) {
+      if (e.isDirectory || e.name != diaryFileName) continue;
+      final bytes = await _adapter.readFileBytes(e.id, maxBytes: maxBytes);
+      diag.info('日记', '已下载远程日记文件：${bytes.length} 字节');
+      return bytes;
+    }
+    diag.info('日记', '网盘上没有「$diaryFileName」，跳过');
+    return null;
+  }
+
+  /// 把日记文件覆盖上传到网盘（目录不存在则创建）。返回 fid。
+  Future<String> uploadDiaryFile(
+    Uint8List bytes, {
+    String dirName = defaultBackupDir,
+  }) {
+    diag.info('日记', '上传日记文件（${bytes.length} 字节）');
+    return uploadFileToBackupDir(
+      fileName: diaryFileName,
+      bytes: bytes,
+      dirName: dirName,
+      logTag: '日记',
+      what: '日记文件',
+    );
+  }
+
   /// 在根目录下找一个**已存在**的目录，不存在返回 `null`（不创建）。
   Future<String?> _findBackupDir(String dirName) async {
     final page = await _adapter.listDirectory(

@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>追剧档案 · 交互原型</title>
+<style>
+:root{
+  --bg:#0B0D12; --panel:#141821; --panel2:#1B2130; --panel3:#232B3D; --line:#2A3244;
+  --text:#E9EDF6; --muted:#8B95AC; --dim:#5D6780;
+  --accent:#5B8CFF; --accent2:#A45CFF; --ok:#3DDC97; --warn:#FFB454; --danger:#FF6B6B;
+  --r:10px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{
+  background:#05070B;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro SC","PingFang SC","Helvetica Neue",Arial,sans-serif;
+  color:var(--text);
+  display:flex;align-items:center;justify-content:center;
+  padding:24px;
+  overflow:hidden;
+}
+button{font-family:inherit;color:inherit;border:0;background:none;cursor:pointer}
+
+/* ============ 设备外框 ============ */
+.device{
+  position:relative;display:flex;width:1280px;height:800px;max-width:100%;max-height:100%;
+  background:var(--bg);border:1px solid var(--line);border-radius:14px;overflow:hidden;
+  box-shadow:0 30px 80px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.02);
+  transition:width .35s cubic-bezier(.4,0,.2,1),height .35s cubic-bezier(.4,0,.2,1),border-radius .35s;
+}
+body.mobile .device{width:392px;height:800px;border-radius:34px}
+
+/* ============ 侧栏 ============ */
+.sidebar{
+  width:196px;flex:0 0 196px;border-right:.5px solid var(--line);
+  display:flex;flex-direction:column;background:var(--bg);
+}
+.brand{display:flex;align-items:center;gap:9px;padding:16px 16px 14px;border-bottom:.5px solid var(--line)}
+.brand-mark{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  display:grid;place-items:center;font-size:13px;font-weight:800;color:#fff}
+.brand-name{font-size:14.5px;font-weight:650;letter-spacing:.3px}
+.nav{padding:8px 0;display:flex;flex-direction:column}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 10px;margin:2px 10px;border-radius:8px;
+  font-size:13px;color:var(--muted);transition:.16s;cursor:pointer;position:relative}
+.nav-item:hover{background:rgba(27,33,48,.6)}
+.nav-item.on{background:var(--panel2);color:var(--text);font-weight:600}
+.nav-item .ic{width:17px;height:17px;display:grid;place-items:center;opacity:.9}
+.nav-item .ic svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.nav-badge{margin-left:auto;background:var(--accent);color:var(--bg);font-size:9.5px;font-weight:800;
+  padding:1px 5px;border-radius:6px;line-height:1.5}
+.side-foot{margin-top:auto;border-top:.5px solid var(--line);padding:10px 14px 12px}
+.acct{display:flex;align-items:center;gap:8px}
+.acct-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px rgba(61,220,151,.7)}
+.acct-txt{font-size:12px;color:var(--text);font-weight:500}
+.acct-sub{font-size:10.5px;color:var(--dim);margin-top:1px}
+.sync-line{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:10.5px;color:var(--dim)}
+.sync-line .pulse{width:5px;height:5px;border-radius:50%;background:var(--ok)}
+
+/* ============ 主区 ============ */
+.main{flex:1;min-width:0;display:flex;flex-direction:column;background:
+  radial-gradient(900px 420px at 72% -10%, rgba(91,140,255,.09), transparent 60%), var(--bg);}
+.head{padding:22px 28px 0}
+.head-row{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap}
+h1{margin:0;font-size:23px;font-weight:700;letter-spacing:-.2px}
+.stat{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);padding-bottom:3px;flex-wrap:wrap}
+.stat b{color:var(--text);font-weight:650}
+.stat .sep{color:var(--line)}
+.head-actions{margin-left:auto;display:flex;gap:8px;align-items:center;padding-bottom:2px}
+.search{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:7px 11px;width:196px;transition:.18s}
+.search:focus-within{border-color:rgba(91,140,255,.55);background:var(--panel2)}
+.search svg{width:14px;height:14px;stroke:var(--dim);fill:none;stroke-width:1.8}
+.search input{background:none;border:0;outline:0;color:var(--text);font-size:12.5px;width:100%}
+.search input::placeholder{color:var(--dim)}
+.icon-btn{width:32px;height:32px;border-radius:8px;background:var(--panel);border:1px solid var(--line);
+  display:grid;place-items:center;transition:.16s}
+.icon-btn:hover{background:var(--panel2);border-color:var(--panel3)}
+.icon-btn svg{width:15px;height:15px;stroke:var(--muted);fill:none;stroke-width:1.8;stroke-linecap:round}
+.icon-btn.on{background:rgba(91,140,255,.14);border-color:rgba(91,140,255,.45)}
+.icon-btn.on svg{stroke:var(--accent)}
+
+/* 筛选条 */
+.filters{display:flex;align-items:center;gap:7px;padding:14px 28px 0;flex-wrap:wrap}
+.chip{padding:5px 12px;border-radius:999px;font-size:12px;color:var(--muted);
+  border:1px solid var(--line);background:transparent;transition:.16s;white-space:nowrap}
+.chip:hover{color:var(--text);border-color:var(--panel3);background:var(--panel)}
+.chip.on{background:rgba(91,140,255,.15);border-color:rgba(91,140,255,.5);color:#A9C2FF;font-weight:600}
+.chip .n{opacity:.55;margin-left:4px;font-size:11px}
+.chip.ghost{border-style:dashed;color:var(--dim)}
+.spacer{flex:1}
+.sort{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);padding:5px 10px;
+  border-radius:7px;border:1px solid transparent;transition:.16s}
+.sort:hover{background:var(--panel);border-color:var(--line)}
+
+/* 海报墙 */
+.scroll{flex:1;overflow-y:auto;padding:18px 28px 28px;scrollbar-width:thin}
+.scroll::-webkit-scrollbar{width:9px}
+.scroll::-webkit-scrollbar-thumb{background:#1E2637;border-radius:9px;border:3px solid var(--bg)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(136px,1fr));gap:16px 14px}
+.card{cursor:pointer;transition:transform .18s cubic-bezier(.34,1.4,.64,1)}
+.card:hover{transform:translateY(-4px)}
+.poster{position:relative;aspect-ratio:2/3;border-radius:9px;overflow:hidden;
+  background:var(--panel2);border:1px solid rgba(255,255,255,.06);
+  box-shadow:0 6px 18px rgba(0,0,0,.4);transition:.18s}
+.poster::before{content:"";position:absolute;inset:0;z-index:0;
+  background:radial-gradient(125% 85% at 50% 12%, rgba(255,255,255,.13), transparent 58%)}
+.card:hover .poster{box-shadow:0 12px 30px rgba(0,0,0,.6);border-color:rgba(91,140,255,.3)}
+.poster::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 42%,rgba(0,0,0,.72))}
+.poster-art{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end;
+  align-items:center;padding:14px 10px 46px;text-align:center}
+.poster-title{font-size:15px;font-weight:780;line-height:1.34;letter-spacing:.6px;
+  text-shadow:0 2px 14px rgba(0,0,0,.7);z-index:1}
+.poster-sub{font-size:9.5px;color:rgba(255,255,255,.52);margin-top:7px;letter-spacing:1.4px;z-index:1}
+.poster-year{position:absolute;left:8px;top:8px;font-size:9.5px;font-weight:650;color:rgba(255,255,255,.85);
+  background:rgba(0,0,0,.42);backdrop-filter:blur(6px);padding:2px 6px;border-radius:5px;z-index:2}
+.badge-off{position:absolute;right:8px;top:8px;font-size:9px;font-weight:600;color:#C9D2E4;
+  background:rgba(10,14,22,.72);backdrop-filter:blur(6px);padding:2px 6px;border-radius:5px;z-index:2;
+  border:1px solid rgba(255,255,255,.1)}
+.rate-strip{position:absolute;left:0;right:0;bottom:0;padding:0 9px 9px;z-index:2;
+  display:flex;align-items:center;gap:5px}
+.rate-num{font-size:12.5px;font-weight:800;color:#FFD37A;letter-spacing:-.2px;
+  text-shadow:0 1px 6px rgba(0,0,0,.8)}
+.rate-num.none{color:rgba(255,255,255,.45);font-weight:600;font-size:10.5px;letter-spacing:0}
+.mini-stars{font-size:9px;letter-spacing:-.6px;color:#FFC85C;opacity:.95}
+.mini-stars i{font-style:normal;color:rgba(255,255,255,.22)}
+.card-meta{padding:8px 2px 0}
+.card-name{font-size:12.5px;font-weight:550;color:var(--text);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;line-height:1.35}
+.card-sub{font-size:10.5px;color:var(--dim);margin-top:2px;display:flex;gap:5px;align-items:center}
+.card-sub .ok{color:var(--ok)}
+
+/* 列表视图 */
+.rows{display:none;flex-direction:column;gap:2px}
+.rows.on{display:flex}
+.grid.off{display:none}
+.row{display:flex;align-items:center;gap:13px;padding:9px 10px;border-radius:9px;cursor:pointer;transition:.14s}
+.row:hover{background:var(--panel)}
+.row-thumb{width:40px;height:56px;border-radius:6px;flex:0 0 40px;position:relative;overflow:hidden}
+.row-thumb span{position:absolute;inset:0;display:grid;place-items:center;font-size:9px;font-weight:700;
+  color:rgba(255,255,255,.9);text-align:center;padding:2px;line-height:1.2}
+.row-main{flex:1;min-width:0}
+.row-title{font-size:13px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-sub{font-size:11px;color:var(--dim);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-rate{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.row-date{font-size:11px;color:var(--dim);width:74px;text-align:right;flex:0 0 74px}
+
+/* ============ 详情 ============ */
+.overlay{position:absolute;inset:0;background:rgba(4,6,10,.78);backdrop-filter:blur(10px);
+  z-index:50;display:none;align-items:center;justify-content:center;padding:26px}
+.overlay.on{display:flex;animation:fade .2s ease}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.sheet{width:100%;max-width:720px;max-height:100%;overflow-y:auto;background:var(--panel);
+  border:1px solid var(--line);border-radius:14px;box-shadow:0 30px 80px rgba(0,0,0,.65);
+  animation:rise .26s cubic-bezier(.2,.9,.3,1)}
+@keyframes rise{from{transform:translateY(14px);opacity:0}to{transform:none;opacity:1}}
+.sheet-hero{display:flex;gap:22px;padding:24px 24px 0}
+.sheet-poster{width:132px;flex:0 0 132px;aspect-ratio:2/3;border-radius:10px;position:relative;
+  overflow:hidden;border:1px solid rgba(255,255,255,.06);box-shadow:0 10px 28px rgba(0,0,0,.5)}
+.sheet-info{flex:1;min-width:0;padding-top:2px}
+.sheet-title{font-size:22px;font-weight:750;letter-spacing:-.3px;line-height:1.25}
+.sheet-sub{font-size:12.5px;color:var(--muted);margin-top:7px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.dot-sep{width:3px;height:3px;border-radius:50%;background:var(--dim)}
+.tagline{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.tag{font-size:10.5px;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:2px 7px}
+.prog-line{margin-top:14px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.prog-line .ok{color:var(--ok);font-weight:600}
+.prog-line .lock{color:var(--warn)}
+
+/* 评分区 */
+.rate-box{margin:20px 24px 0;padding:16px 18px;background:var(--panel2);border:1px solid var(--line);border-radius:11px}
+.rate-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px}
+.rate-label{font-size:11.5px;color:var(--muted);letter-spacing:.4px;font-weight:600}
+.save-state{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px}
+.save-state.ok{color:var(--ok)}
+.save-state .d{width:5px;height:5px;border-radius:50%;background:currentColor}
+.stars{display:flex;align-items:center;gap:12px}
+.stars-wrap{position:relative;font-size:0;line-height:1;letter-spacing:2px;user-select:none;cursor:pointer}
+.stars-bg,.stars-fill{font-size:28px;letter-spacing:2px;line-height:1.1;display:block;white-space:nowrap}
+.stars-bg{color:#46516B}
+.stars-fill{position:absolute;left:0;top:0;overflow:hidden;color:#FFC85C;white-space:nowrap;
+  text-shadow:0 0 18px rgba(255,200,92,.28);transition:width .12s}
+.stars-hit{position:absolute;inset:0;display:flex;z-index:3}
+.stars-hit i{flex:1;display:block}
+.rate-val{font-size:24px;font-weight:800;color:#FFC85C;letter-spacing:-.5px;min-width:56px}
+.rate-val.none{font-size:12.5px;color:var(--dim);font-weight:500;letter-spacing:0}
+.rate-hint{font-size:10.5px;color:var(--dim);margin-top:9px}
+
+.review-box{margin:16px 24px 0}
+.review-label{font-size:11.5px;color:var(--muted);font-weight:600;letter-spacing:.4px;margin-bottom:8px}
+.review{width:100%;min-height:74px;background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:11px 13px;color:var(--text);font-size:12.5px;line-height:1.7;resize:vertical;outline:0;
+  font-family:inherit;transition:.16s}
+.review:focus{border-color:rgba(91,140,255,.5);background:#1E2537}
+.review::placeholder{color:var(--dim)}
+
+.mine-tags{margin:14px 24px 0;display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.mine-tags .lbl{font-size:11.5px;color:var(--muted);font-weight:600;margin-right:2px}
+.tag-add{font-size:11px;color:var(--dim);border:1px dashed var(--line);border-radius:5px;padding:3px 9px}
+.tag-add:hover{color:var(--accent);border-color:rgba(91,140,255,.4)}
+.tag.on{color:#A9C2FF;border-color:rgba(91,140,255,.4);background:rgba(91,140,255,.1)}
+
+.sheet-foot{display:flex;gap:9px;padding:20px 24px 22px;align-items:center}
+.btn{padding:9px 16px;border-radius:8px;font-size:12.5px;font-weight:600;transition:.16s;
+  border:1px solid var(--line);color:var(--muted);background:var(--panel2)}
+.btn:hover{border-color:var(--panel3);color:var(--text)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:#6E9BFF}
+.btn.danger:hover{color:var(--danger);border-color:rgba(255,107,107,.4)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.foot-note{font-size:11px;color:var(--dim);margin-left:auto;text-align:right;line-height:1.5}
+
+/* ============ 顶部演示控制 ============ */
+.demo{position:fixed;top:18px;right:18px;z-index:200;display:flex;gap:7px;align-items:center;
+  background:rgba(20,24,33,.9);backdrop-filter:blur(14px);border:1px solid var(--line);
+  border-radius:10px;padding:7px;box-shadow:0 12px 34px rgba(0,0,0,.55)}
+.demo button{font-size:11.5px;color:var(--muted);padding:6px 11px;border-radius:6px;transition:.14s;font-weight:500}
+.demo button:hover{background:var(--panel2);color:var(--text)}
+.demo button.on{background:var(--accent);color:#fff;font-weight:650}
+.demo .divider{width:1px;height:18px;background:var(--line);margin:0 2px}
+
+/* ============ Toast ============ */
+.toast{position:absolute;left:50%;transform:translate(-50%,-14px);bottom:24px;z-index:120;
+  background:var(--panel2);border:1px solid var(--line);border-radius:11px;
+  padding:12px 15px;display:flex;align-items:center;gap:12px;
+  box-shadow:0 16px 44px rgba(0,0,0,.6);opacity:0;pointer-events:none;
+  transition:.28s cubic-bezier(.2,.9,.3,1);max-width:calc(100% - 40px)}
+.toast.on{opacity:1;transform:translate(-50%,0);pointer-events:auto}
+.toast-ic{width:26px;height:26px;border-radius:50%;background:rgba(61,220,151,.14);display:grid;place-items:center;
+  color:var(--ok);font-size:14px;font-weight:800;flex:0 0 26px}
+.toast-txt{font-size:12.5px;line-height:1.45}
+.toast-txt small{display:block;color:var(--dim);font-size:10.5px;margin-top:1px}
+.toast-act{font-size:12px;color:var(--accent);font-weight:650;padding:4px 6px;white-space:nowrap}
+.toast-act.muted{color:var(--dim);font-weight:500}
+
+/* ============ 清理对比面板 ============ */
+.compare{width:100%;max-width:640px;background:var(--panel);border:1px solid var(--line);
+  border-radius:14px;padding:26px;box-shadow:0 30px 80px rgba(0,0,0,.65);animation:rise .26s cubic-bezier(.2,.9,.3,1)}
+.compare h3{margin:0 0 6px;font-size:17px;font-weight:700}
+.compare p.lead{margin:0 0 20px;font-size:12.5px;color:var(--muted);line-height:1.65}
+.cmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.cmp-col{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:15px}
+.cmp-col.bad{border-color:rgba(255,107,107,.25)}
+.cmp-col.good{border-color:rgba(61,220,151,.25)}
+.cmp-h{font-size:11px;color:var(--muted);font-weight:650;letter-spacing:.5px;margin-bottom:12px}
+.bar-row{display:flex;align-items:center;gap:9px;margin-bottom:10px;font-size:11.5px}
+.bar-row .name{width:52px;color:var(--muted);flex:0 0 52px}
+.bar-track{flex:1;height:7px;background:#0E121A;border-radius:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;transition:width .9s cubic-bezier(.3,.9,.3,1)}
+.bar-fill.lib{background:linear-gradient(90deg,#3D4A66,#54648A)}
+.bar-fill.arc{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.bar-num{width:30px;text-align:right;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+.cmp-note{margin-top:14px;padding-top:13px;border-top:.5px solid var(--line);font-size:11.5px;color:var(--dim);line-height:1.7}
+.cmp-note b{color:var(--ok);font-weight:600}
+.cmp-note .warnb{color:var(--warn)}
+
+/* ============ 同步状态 ============ */
+.sync-state{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;margin-bottom:9px}
+.sync-state.ok{color:var(--ok)}
+.sync-state.warn{color:var(--warn)}
+.sync-state.fail{color:var(--danger)}
+.sync-state .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:0 0 6px}
+.sync-meta{font-size:11.5px;color:var(--muted);line-height:1.75}
+.sync-file{font-size:10.5px;color:var(--dim);margin-top:9px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.1px}
+.sync-arrow{display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:14px}
+
+/* ============ 逐部评分模式 ============ */
+.swipe{width:100%;max-width:430px;text-align:center;animation:rise .26s cubic-bezier(.2,.9,.3,1)}
+.swipe-poster{width:190px;aspect-ratio:2/3;margin:0 auto 20px;border-radius:12px;position:relative;overflow:hidden;
+  border:1px solid rgba(255,255,255,.08);box-shadow:0 22px 60px rgba(0,0,0,.7)}
+.swipe-name{font-size:19px;font-weight:700}
+.swipe-sub{font-size:12px;color:var(--dim);margin-top:5px}
+.swipe .stars{justify-content:center;margin:22px 0 8px}
+.swipe-hint{font-size:11px;color:var(--dim);margin-bottom:20px}
+.swipe-nav{display:flex;justify-content:center;gap:10px;align-items:center}
+.swipe-prog{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;margin-top:16px}
+
+/* ============ 同步状态 ============ */
+.sync-state{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;margin-bottom:9px}
+.sync-state.ok{color:var(--ok)}
+.sync-state.warn{color:var(--warn)}
+.sync-state.fail{color:var(--danger)}
+.sync-state .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:0 0 6px}
+.sync-meta{font-size:11.5px;color:var(--muted);line-height:1.75}
+.sync-file{font-size:10.5px;color:var(--dim);margin-top:9px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.1px}
+.sync-run{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--muted);
+  margin-top:14px;padding-top:13px;border-top:.5px solid var(--line)}
+.sync-run .step{padding:3px 9px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);
+  font-family:ui-monospace,Menlo,monospace;font-size:10.5px}
+.sync-run .step.ok{color:var(--ok);border-color:rgba(61,220,151,.3)}
+.sync-run .step.bad{color:var(--danger);border-color:rgba(255,107,107,.3)}
+
+/* ============ 空态 ============ */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  padding:70px 20px;text-align:center;color:var(--dim);gap:12px}
+.empty .big{font-size:34px;opacity:.35}
+
+/* ============ 移动端覆盖 ============ */
+body.mobile .sidebar{position:absolute;left:0;right:0;bottom:0;top:auto;width:auto;flex:none;
+  flex-direction:row;border-right:0;border-top:.5px solid var(--line);background:rgba(11,13,18,.96);
+  backdrop-filter:blur(18px);z-index:40;padding:6px 4px 10px;justify-content:space-around}
+body.mobile .brand,body.mobile .side-foot{display:none}
+body.mobile .nav{flex-direction:row;padding:0;flex:1;justify-content:space-around}
+body.mobile .nav-item{flex-direction:column;gap:3px;margin:0;padding:6px 8px;font-size:9.5px;
+  flex:1;justify-content:center;background:none!important}
+body.mobile .nav-item.on{color:var(--accent)}
+body.mobile .nav-item .ic svg{width:19px;height:19px}
+body.mobile .nav-badge{position:absolute;top:2px;right:12px;margin:0;font-size:8px;padding:0 3px}
+body.mobile .main{padding-bottom:62px}
+body.mobile .head{padding:16px 16px 0}
+body.mobile h1{font-size:19px}
+body.mobile .stat{font-size:11px;padding-bottom:1px}
+body.mobile .head-actions{margin-left:0;width:100%;margin-top:12px}
+body.mobile .search{flex:1;width:auto}
+body.mobile .filters{padding:12px 16px 0;overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}
+body.mobile .filters::-webkit-scrollbar{display:none}
+body.mobile .scroll{padding:14px 16px 20px}
+body.mobile .grid{grid-template-columns:repeat(3,1fr);gap:12px 9px}
+body.mobile .poster-title{font-size:11px}
+body.mobile .poster-sub{display:none}
+body.mobile .rate-num{font-size:11px}
+body.mobile .card-name{font-size:11.5px}
+body.mobile .card-sub{display:none}
+body.mobile .overlay{padding:0;align-items:flex-end}
+body.mobile .sheet{max-width:100%;border-radius:18px 18px 0 0;max-height:92%}
+body.mobile .sheet-hero{padding:18px 16px 0;gap:14px}
+body.mobile .sheet-poster{width:96px;flex:0 0 96px}
+body.mobile .sheet-title{font-size:18px}
+body.mobile .rate-box{margin:16px 16px 0;padding:14px}
+body.mobile .review-box{margin:14px 16px 0}
+body.mobile .mine-tags{margin:12px 16px 0}
+body.mobile .sheet-foot{padding:16px}
+body.mobile .toast{bottom:78px;left:12px;right:12px;transform:translateY(14px);max-width:none}
+body.mobile .toast.on{transform:none}
+body.mobile .cmp-grid{grid-template-columns:1fr}
+body.mobile .demo{top:10px;right:10px;transform:scale(.9);transform-origin:top right}
+body.mobile .rows.on .row-date{display:none}
+</style>
+</head>
+<body>
+
+<!-- ===== 演示控制条 ===== -->
+<div class="demo">
+  <button id="btnPc" class="on" onclick="setDevice('pc')">PC</button>
+  <button id="btnMb" onclick="setDevice('mobile')">移动端</button>
+  <div class="divider"></div>
+  <button onclick="demoArchive()">归档瞬间</button>
+  <button onclick="openCompare()">清理媒体库</button>
+  <button onclick="openSwipe()">逐部评分</button>
+  <button onclick="openSync()">同步状态</button>
+</div>
+
+<!-- ===== 设备 ===== -->
+<div class="device" id="device">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">云</div>
+      <div class="brand-name">云影</div>
+    </div>
+    <div class="nav">
+      <div class="nav-item"><span class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>媒体库</div>
+      <div class="nav-item"><span class="ic"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span>文件夹</div>
+      <div class="nav-item"><span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v9l6 3"/></svg></span>扫描</div>
+      <div class="nav-item"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></span>下载<span class="nav-badge">2</span></div>
+      <div class="nav-item on"><span class="ic"><svg viewBox="0 0 24 24"><path d="m12 3 2.6 5.6 6.1.8-4.5 4.2 1.2 6-5.4-3-5.4 3 1.2-6L3.3 9.4l6.1-.8z"/></svg></span>追剧档案</div>
+      <div class="nav-item"><span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.2 2 2 0 1 1 14 4.2a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4 1.7 1.7 0 0 0-1.6 0z"/></svg></span>设置</div>
+    </div>
+    <div class="side-foot">
+      <div class="acct">
+        <div class="acct-dot"></div>
+        <div>
+          <div class="acct-txt">已连接 2 家网盘</div>
+          <div class="acct-sub">夸克 · 百度</div>
+        </div>
+      </div>
+      <div class="sync-line"><span class="pulse" id="sideDot"></span><span id="sideSync">档案已同步 · 刚刚</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="head">
+      <div class="head-row">
+        <h1>追剧档案</h1>
+        <div class="stat">
+          <span><b id="statCount">9</b> 部</span>
+          <span class="sep">·</span>
+          <span>平均 <b id="statAvg">8.4</b> 分</span>
+          <span class="sep">·</span>
+          <span><b id="statUnrated">2</b> 部待评分</span>
+        </div>
+        <div class="head-actions">
+          <div class="search">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="q" placeholder="搜索片名、标签…" oninput="render()">
+          </div>
+          <button class="icon-btn" id="btnGrid" onclick="setView('grid')" title="封面">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          </button>
+          <button class="icon-btn" id="btnList" onclick="setView('list')" title="列表">
+            <svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="filters" id="filters"></div>
+
+    <div class="scroll">
+      <div class="grid" id="grid"></div>
+      <div class="rows" id="rows"></div>
+    </div>
+  </main>
+
+  <!-- 详情 -->
+  <div class="overlay" id="detail" onclick="if(event.target===this)closeDetail()">
+    <div class="sheet" id="sheet"></div>
+  </div>
+
+  <!-- 对比 -->
+  <div class="overlay" id="compare" onclick="if(event.target===this)closeCompare()">
+    <div class="compare">
+      <h3>清理媒体库，档案不受影响</h3>
+      <p class="lead">下面模拟「批量移除 44 部作品 + 一并删除网盘文件」之后，两类数据各自的变化。<br>
+        档案活在独立的 <code style="color:#A9C2FF;font-size:11.5px">watch_archive.json</code> 里，不参与索引清理。</p>
+      <div class="cmp-grid">
+        <div class="cmp-col bad">
+          <div class="cmp-h">媒体库（cloudcine.sqlite）</div>
+          <div class="bar-row"><span class="name">作品</span><div class="bar-track"><div class="bar-fill lib" id="b1" style="width:100%"></div></div><span class="bar-num" id="n1">47</span></div>
+          <div class="bar-row"><span class="name">文件</span><div class="bar-track"><div class="bar-fill lib" id="b2" style="width:100%"></div></div><span class="bar-num" id="n2">612</span></div>
+          <div class="bar-row"><span class="name">进度</span><div class="bar-track"><div class="bar-fill lib" id="b3" style="width:100%"></div></div><span class="bar-num" id="n3">44</span></div>
+        </div>
+        <div class="cmp-col good">
+          <div class="cmp-h">追剧档案（watch_archive.json）</div>
+          <div class="bar-row"><span class="name">档案</span><div class="bar-track"><div class="bar-fill arc" id="b4" style="width:100%"></div></div><span class="bar-num" id="n4">9</span></div>
+          <div class="bar-row"><span class="name">评分</span><div class="bar-track"><div class="bar-fill arc" id="b5" style="width:100%"></div></div><span class="bar-num" id="n5">7</span></div>
+          <div class="bar-row"><span class="name">短评</span><div class="bar-track"><div class="bar-fill arc" id="b6" style="width:100%"></div></div><span class="bar-num" id="n6">5</span></div>
+        </div>
+      </div>
+      <div class="cmp-note">
+        清理后：媒体库 <span class="warnb">47 → 6 部</span>，档案 <b>9 → 9 部</b>，评分 <b>7 → 7</b>。<br>
+        恢复 <code style="font-size:11px">.ccbak</code> 备份、网盘上删掉资源，走的是另外两条路 —— 同样碰不到这个文件。
+      </div>
+      <div style="display:flex;gap:9px;margin-top:18px">
+        <button class="btn primary" onclick="runCompare()">重新播放动画</button>
+        <button class="btn" onclick="closeCompare()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 同步状态 -->
+  <div class="overlay" id="sync" onclick="if(event.target===this)closeSync()">
+    <div class="compare" style="max-width:720px">
+      <h3>同步状态</h3>
+      <p class="lead">一次 <code style="color:#A9C2FF;font-size:11.5px">run()</code> 同时跑两个单元：<b style="color:var(--text)">串行执行、失败互不影响</b>。<br>
+        两个文件各自合并、各自上传，不合并成一个文件。</p>
+
+      <div class="cmp-grid">
+        <div class="cmp-col">
+          <div class="cmp-h">播放进度</div>
+          <div class="sync-state ok" id="psState"><span class="dot"></span>已同步 · 2 分钟前</div>
+          <div class="sync-meta">1,284 条进度<br>37 部作品有片头标记</div>
+          <div class="sync-file">playback_progress.json · 248 KB</div>
+        </div>
+        <div class="cmp-col">
+          <div class="cmp-h">追剧档案</div>
+          <div class="sync-state ok" id="asState"><span class="dot"></span>已同步 · 刚刚</div>
+          <div class="sync-meta">9 部 · 7 条评分<br>5 条短评 · 12 个标签</div>
+          <div class="sync-file">watch_archive.json · 12 KB</div>
+        </div>
+      </div>
+
+      <div class="sync-run">
+        <span>本轮执行</span>
+        <span class="step ok" id="stepP">① 进度 ✓</span>
+        <span class="step ok" id="stepA">② 档案 ✓</span>
+        <span style="margin-left:auto" id="syncNext">下次自动重试：30 分钟后</span>
+      </div>
+
+      <div class="cmp-note" id="syncNote">
+        两个单元共用同一个调度器与节流窗口，但<b>各写各的文件</b>。任一单元失败，另一个照常走完。
+      </div>
+
+      <div style="display:flex;gap:9px;margin-top:18px">
+        <button class="btn" onclick="toggleSyncFail()" id="failBtn">模拟：档案下载失败</button>
+        <button class="btn primary" onclick="closeSync()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 逐部评分 -->
+  <div class="overlay" id="swipe" onclick="if(event.target===this)closeSwipe()">
+    <div class="swipe" id="swipeBody"></div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast">
+    <div class="toast-ic">✓</div>
+    <div class="toast-txt"><span id="toastTxt">《漫长的季节》已加入追剧档案</span><small id="toastSub">已看完 12/12 集 · 2026-10-24</small></div>
+    <button class="toast-act" onclick="openDetail('mancheng')">去评分</button>
+    <button class="toast-act muted" onclick="hideToast()">撤销</button>
+  </div>
+
+</div>
+
+<script>
+/* ================= 数据 ================= */
+const POSTERS = [
+  'linear-gradient(155deg,#2A3E66 0%,#111B2E 58%,#3A2447 100%)',
+  'linear-gradient(155deg,#54293A 0%,#1D1119 58%,#3E2230 100%)',
+  'linear-gradient(155deg,#235247 0%,#0E1D1A 58%,#1F3A32 100%)',
+  'linear-gradient(155deg,#402F5C 0%,#171020 58%,#4E356F 100%)',
+  'linear-gradient(155deg,#5A3D1C 0%,#1C1208 58%,#42301A 100%)',
+  'linear-gradient(155deg,#1B4356 0%,#0A171D 58%,#154257 100%)',
+  'linear-gradient(155deg,#3B2340 0%,#160D19 58%,#4B2853 100%)',
+  'linear-gradient(155deg,#2C3C54 0%,#111821 58%,#22394C 100%)',
+  'linear-gradient(155deg,#47353B 0%,#1A1214 58%,#50383E 100%)',
+];
+const DATA = [
+  {id:'mancheng', t:'漫长的季节', y:2023, cat:'tv', kind:'剧集 · 12 集', genres:['悬疑','剧情','家庭'], rating:9.0, ep:[12,12], at:'2024-11-03', online:true, tags:['神作','意难平'],
+   review:'东北文艺复兴的顶点。三个时间线咬得死死的，最后那场雪落下来的时候，所有情绪一起落地。'},
+  {id:'sanTi', t:'三体', y:2023, cat:'tv', kind:'剧集 · 30 集', genres:['科幻','剧情'], rating:8.5, ep:[30,30], at:'2024-02-18', online:true, tags:['神作'],
+   review:'古筝行动那一段拍出来了，就已经赢了一半。'},
+  {id:'kuangbiao', t:'狂飙', y:2023, cat:'tv', kind:'剧集 · 39 集', genres:['犯罪','剧情'], rating:8.0, ep:[39,39], at:'2023-09-12', online:false, tags:[],
+   review:''},
+  {id:'yinmi', t:'隐秘的角落', y:2020, cat:'tv', kind:'剧集 · 12 集', genres:['悬疑','犯罪'], rating:9.5, ep:[12,12], at:'2023-06-04', online:true, tags:['神作'],
+   review:'一起去爬山吗。'},
+  {id:'liulang', t:'流浪地球 2', y:2023, cat:'movie', kind:'电影 · 173 分钟', genres:['科幻','灾难'], rating:8.0, ep:[1,1], at:'2023-03-20', online:true, tags:[],
+   review:'比第一部野心大得多。'},
+  {id:'fanhua', t:'繁花', y:2023, cat:'tv', kind:'剧集 · 30 集', genres:['剧情','年代'], rating:8.5, ep:[30,30], at:'2024-04-09', online:false, tags:['意难平'],
+   review:'王家卫拍电视剧，光是那个光影就值了。'},
+  {id:'zhouChu', t:'咒术回战', y:2020, cat:'anime', kind:'动画 · 47 集', genres:['热血','奇幻'], rating:7.5, ep:[47,47], at:'2024-01-22', online:true, tags:[],
+   review:''},
+  {id:'manChang', t:'漫长的告白', y:2022, cat:'movie', kind:'电影 · 114 分钟', genres:['爱情','剧情'], rating:null, ep:[1,1], at:'2026-10-19', online:true, tags:[],
+   review:''},
+  {id:'xingJi', t:'星际穿越', y:2014, cat:'movie', kind:'电影 · 169 分钟', genres:['科幻','冒险'], rating:10, ep:[1,1], at:'2022-08-15', online:true, tags:['神作','二刷预定'],
+   review:'书架后面的那一声 "Daddy"，到现在还是会起鸡皮疙瘩。'},
+];
+const CATS = [
+  {k:'all', label:'全部'},
+  {k:'movie', label:'电影'},
+  {k:'tv', label:'剧集'},
+  {k:'anime', label:'动漫'},
+  {k:'unrated', label:'待评分', ghost:true},
+  {k:'top', label:'神作 9+'},
+];
+let curCat = 'all', curView = 'grid', curQ = '', swipeIdx = 0;
+
+/* ================= 工具 ================= */
+const $ = s => document.querySelector(s);
+const posterOf = i => POSTERS[i % POSTERS.length];
+const starsStr = v => {
+  const n = Math.round((v || 0) * 2) / 2;
+  let s = '';
+  for (let i = 1; i <= 5; i++) s += (n >= i ? '★' : (n >= i - 0.5 ? '⯨' : '☆'));
+  return s;
+};
+const fmt = v => v == null ? null : (Number.isInteger(v) ? v.toFixed(1) : v.toFixed(1));
+
+/* ================= 筛选条 ================= */
+function renderFilters(){
+  const counts = {
+    all: DATA.length,
+    movie: DATA.filter(d=>d.cat==='movie').length,
+    tv: DATA.filter(d=>d.cat==='tv').length,
+    anime: DATA.filter(d=>d.cat==='anime').length,
+    unrated: DATA.filter(d=>d.rating==null).length,
+    top: DATA.filter(d=>d.rating>=9).length,
+  };
+  $('#filters').innerHTML = CATS.map(c=>`
+    <button class="chip ${curCat===c.k?'on':''} ${c.ghost?'ghost':''}" onclick="setCat('${c.k}')">
+      ${c.label}<span class="n">${counts[c.k]}</span>
+    </button>`).join('')
+    + `<div class="spacer"></div>
+       <button class="sort">最近归档
+         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+       </button>`;
+}
+
+/* ================= 渲染 ================= */
+function filtered(){
+  return DATA.filter(d=>{
+    if (curQ && !(d.t.includes(curQ) || d.tags.join('').includes(curQ) || d.genres.join('').includes(curQ))) return false;
+    if (curCat==='unrated') return d.rating==null;
+    if (curCat==='top') return d.rating>=9;
+    if (curCat!=='all') return d.cat===curCat;
+    return true;
+  });
+}
+function render(){
+  renderFilters();
+  const list = filtered();
+  const rated = DATA.filter(d=>d.rating!=null);
+  $('#statCount').textContent = DATA.length;
+  $('#statAvg').textContent = rated.length ? (rated.reduce((a,b)=>a+b.rating,0)/rated.length).toFixed(1) : '—';
+  $('#statUnrated').textContent = DATA.filter(d=>d.rating==null).length;
+
+  $('#grid').innerHTML = list.map((d,i)=>`
+    <div class="card" onclick="openDetail('${d.id}')">
+      <div class="poster" style="background:${posterOf(i)}">
+        <div class="poster-art">
+          <div class="poster-title">${d.t}</div>
+          <div class="poster-sub">${d.y} · ${d.cat==='movie'?'电影':(d.cat==='anime'?'动漫':'剧集')}</div>
+        </div>
+        ${d.online?'':'<div class="badge-off">已离线</div>'}
+        <div class="rate-strip">
+          ${d.rating==null
+            ? '<span class="rate-num none">待评分</span>'
+            : `<span class="rate-num">${fmt(d.rating)}</span><span class="mini-stars">${Array.from({length:5},(_,k)=>Math.round(d.rating/2)>k?'★':'<i>★</i>').join('')}</span>`}
+        </div>
+      </div>
+      <div class="card-meta">
+        <div class="card-name">${d.t}</div>
+        <div class="card-sub">${d.kind.split(' · ')[0]}<span>·</span>${d.ep[0]} 集${d.online?'<span class="ok">· 可播放</span>':''}</div>
+      </div>
+    </div>`).join('') || `<div class="empty" style="grid-column:1/-1"><div class="big">◌</div><div>这个筛选条件下没有档案</div><button class="btn" onclick="setCat('all')">清除筛选</button></div>`;
+
+  $('#rows').innerHTML = list.map((d,i)=>`
+    <div class="row" onclick="openDetail('${d.id}')">
+      <div class="row-thumb" style="background:${posterOf(i)}"><span>${d.t.slice(0,3)}</span></div>
+      <div class="row-main">
+        <div class="row-title">${d.t}</div>
+        <div class="row-sub">${d.y} · ${d.kind} · ${d.genres.join(' / ')}${d.online?'':' · 已离线'}</div>
+      </div>
+      <div class="row-rate">
+        ${d.rating==null?'<span style="font-size:11px;color:var(--dim)">待评分</span>'
+          :`<span class="rate-num">${fmt(d.rating)}</span>`}
+      </div>
+      <div class="row-date">${d.at}</div>
+    </div>`).join('');
+}
+
+/* ================= 详情 ================= */
+function openDetail(id){
+  const d = DATA.find(x=>x.id===id); if(!d) return;
+  _cur = id;
+  const idx = DATA.indexOf(d);
+  $('#sheet').innerHTML = `
+    <div class="sheet-hero">
+      <div class="sheet-poster" style="background:${posterOf(idx)}">
+        <div class="poster-art"><div class="poster-title" style="font-size:13px">${d.t}</div></div>
+      </div>
+      <div class="sheet-info">
+        <div class="sheet-title">${d.t}</div>
+        <div class="sheet-sub"><span>${d.y}</span><span class="dot-sep"></span><span>${d.kind}</span></div>
+        <div class="tagline">${d.genres.map(g=>`<span class="tag">${g}</span>`).join('')}</div>
+        <div class="prog-line">
+          ${d.online
+            ? `<span class="ok">✓</span><span>已看完 ${d.ep[1]}/${d.ep[0]} 集</span>`
+            : `<span class="lock">!</span><span>网盘上已找不到这部剧，档案已保留</span>`}
+          <span class="dot-sep"></span><span>${d.at} 归档</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="rate-box">
+      <div class="rate-head">
+        <span class="rate-label">我的评分</span>
+        <span class="save-state" id="saveState"><span class="d"></span>改动即保存</span>
+      </div>
+      <div class="stars">
+        <div class="stars-wrap" id="starsWrap" onmouseleave="previewStar(null)">
+          <span class="stars-bg">★★★★★</span>
+          <span class="stars-fill" id="starFill" style="width:${(d.rating||0)*10}%">★★★★★</span>
+          <span class="stars-hit">${Array.from({length:10},(_,k)=>`<i onmouseenter="previewStar(${k+1})" onclick="setStar('${d.id}',${k+1})"></i>`).join('')}</span>
+        </div>
+        <span class="rate-val ${d.rating==null?'none':''}" id="rateVal">${d.rating==null?'未评分':fmt(d.rating)}</span>
+      </div>
+      <div class="rate-hint">点星条打分（支持半星）· 再点当前分值可清除 · 遥控器用 ←/→ 调、确认键提交</div>
+    </div>
+
+    <div class="review-box">
+      <div class="review-label">我的短评</div>
+      <textarea class="review" placeholder="写点什么…（只有你自己看得到，会跟着档案同步到其他设备）"
+        oninput="onReview('${d.id}',this.value)">${d.review||''}</textarea>
+    </div>
+
+    <div class="mine-tags">
+      <span class="lbl">标签</span>
+      ${['神作','意难平','二刷预定','弃了'].map(t=>
+        `<button class="tag ${d.tags.includes(t)?'on':''}" onclick="toggleTag('${d.id}','${t}')">${d.tags.includes(t)?'✓ ':''}${t}</button>`).join('')}
+      <button class="tag-add">+ 新建</button>
+    </div>
+
+    <div class="sheet-foot">
+      ${d.online?`<button class="btn primary">▶ 重看第 1 集</button>`:''}
+      <button class="btn">分享卡片</button>
+      <button class="btn danger" style="margin-left:auto" onclick="delArchive('${d.id}')">取消归档</button>
+    </div>`;
+  $('#detail').classList.add('on');
+}
+function closeDetail(){ $('#detail').classList.remove('on'); _cur = null; }
+
+function previewStar(v){
+  const fill = $('#starFill'); if(!fill) return;
+  if (v==null){ const d=DATA.find(x=>x.id===curId()); fill.style.width=((d?.rating||0)*10)+'%'; return; }
+  fill.style.width = (v*10)+'%';
+}
+let _cur = null;
+function curId(){ return _cur; }
+
+function setStar(id, v){
+  const d = DATA.find(x=>x.id===id); if(!d) return;
+  d.rating = (d.rating === v) ? null : v;   // 再点当前分值 = 清除
+  const fill = $('#starFill');
+  fill.style.width = (d.rating||0)*10+'%';
+  const val = $('#rateVal');
+  val.textContent = d.rating==null?'未评分':fmt(d.rating);
+  val.className = 'rate-val'+(d.rating==null?' none':'');
+  const st = $('#saveState');
+  st.className = 'save-state ok'; st.innerHTML = '<span class="d"></span>已保存';
+  setTimeout(()=>{ if($('#saveState')){ const s=$('#saveState'); s.className='save-state ok'; s.innerHTML='<span class="d"></span>已同步到云端'; } }, 1400);
+  render();
+}
+function onReview(id, v){ const d=DATA.find(x=>x.id===id); if(d) d.review=v; }
+function toggleTag(id,t){
+  const d = DATA.find(x=>x.id===id); if(!d) return;
+  const i = d.tags.indexOf(t);
+  i>=0 ? d.tags.splice(i,1) : d.tags.push(t);
+  openDetail(id);
+}
+function delArchive(id){
+  const d = DATA.find(x=>x.id===id); if(!d) return;
+  if(!confirm(`从档案中移除《${d.t}》？\n\n你的评分和短评会一起删除。\n（媒体库和网盘文件都不受影响）`)) return;
+  const i = DATA.indexOf(d); if(i>=0) DATA.splice(i,1);
+  closeDetail(); render();
+}
+
+/* ================= 视图 / 设备 ================= */
+function setView(v){
+  curView = v;
+  $('#grid').classList.toggle('off', v!=='grid');
+  $('#rows').classList.toggle('on', v==='list');
+  $('#btnGrid').classList.toggle('on', v==='grid');
+  $('#btnList').classList.toggle('on', v==='list');
+}
+function setCat(k){ curCat=k; render(); }
+function setDevice(k){
+  document.body.classList.toggle('mobile', k==='mobile');
+  $('#btnPc').classList.toggle('on', k==='pc');
+  $('#btnMb').classList.toggle('on', k==='mobile');
+}
+
+/* ================= Toast ================= */
+let toastTimer=null;
+function showToast(txt, sub){
+  $('#toastTxt').textContent = txt;
+  $('#toastSub').textContent = sub;
+  $('#toast').classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, 5200);
+}
+function hideToast(){ $('#toast').classList.remove('on'); }
+function demoArchive(){
+  showToast('《漫长的季节》已加入追剧档案','已看完 12/12 集 · 2026-10-24');
+  // 归档是本地动作：先落盘（待同步），紧接着同一轮同步把它传出去
+  setSideSync('档案待同步', 'var(--warn)');
+  setTimeout(()=>setSideSync('档案已同步 · 刚刚'), 2200);
+}
+
+/* ================= 同步状态 ================= */
+let syncFail = false;
+function openSync(){ $('#sync').classList.add('on'); renderSync(); }
+function closeSync(){ $('#sync').classList.remove('on'); }
+function toggleSyncFail(){ syncFail = !syncFail; renderSync(); }
+function renderSync(){
+  const as = $('#asState'), note = $('#syncNote'), btn = $('#failBtn');
+  const stepP = $('#stepP'), stepA = $('#stepA'), next = $('#syncNext');
+  if (syncFail) {
+    as.className = 'sync-state fail';
+    as.innerHTML = '<span class="dot"></span>本轮未上传 · 下载失败';
+    stepA.className = 'step bad';
+    stepA.textContent = '② 档案 ✗';
+    stepP.className = 'step ok';
+    stepP.textContent = '① 进度 ✓ 已上传';
+    next.textContent = '档案 30 分钟后重试';
+    note.innerHTML = '档案下载失败 → <b>进度照常上传</b>。档案本地已合并落盘，' +
+      '本轮只是不传 —— 下一轮补上。<b>没有任何数据丢失。</b>';
+    btn.textContent = '恢复：模拟成功';
+  } else {
+    as.className = 'sync-state ok';
+    as.innerHTML = '<span class="dot"></span>已同步 · 刚刚';
+    stepA.className = 'step ok';
+    stepA.textContent = '② 档案 ✓';
+    stepP.className = 'step ok';
+    stepP.textContent = '① 进度 ✓';
+    next.textContent = '下次自动重试：30 分钟后';
+    note.innerHTML = '两个单元共用同一个调度器与节流窗口，但<b>各写各的文件</b>。' +
+      '任一单元失败，另一个照常走完。';
+    btn.textContent = '模拟：档案下载失败';
+  }
+}
+function setSideSync(text, color){
+  const el = $('#sideSync'); if(!el) return;
+  el.textContent = text;
+  const dot = $('#sideDot');
+  if (dot) dot.style.background = color || 'var(--ok)';
+}
+
+/* ================= 对比 ================= */
+function openCompare(){ $('#compare').classList.add('on'); runCompare(); }
+function closeCompare(){ $('#compare').classList.remove('on'); }
+function runCompare(){
+  const map = [
+    ['b1','n1','47','6'],['b2','n2','612','34'],['b3','n3','44','2'],
+  ];  map.forEach(([b,n])=>{ $('#'+b).style.width='100%'; $('#'+n).textContent=map.find(m=>m[0]===b)[2]; });
+  ['b4','b5','b6'].forEach(b=>$('#'+b).style.width='100%');
+  setTimeout(()=>{
+    map.forEach(([b,n,from,to])=>{
+      const pct = (parseInt(to)/parseInt(from)*100).toFixed(0);
+      $('#'+b).style.width = pct+'%';
+      $('#'+n).innerHTML = '<span style="color:var(--danger);font-size:9px;margin-right:2px">▼</span>'+to;
+    });
+  }, 120);
+}
+
+/* ================= 逐部评分 ================= */
+function openSwipe(){ swipeIdx = 0; renderSwipe(); $('#swipe').classList.add('on'); }
+function closeSwipe(){ $('#swipe').classList.remove('on'); render(); }
+function renderSwipe(){
+  const list = DATA;
+  if(!list.length){
+    $('#swipeBody').innerHTML = `<div class="empty"><div class="big">✓</div><div>档案是空的</div>
+      <button class="btn primary" onclick="closeSwipe()">回到档案</button></div>`;
+    return;
+  }
+  const d = list[swipeIdx % list.length];
+  const idx = DATA.indexOf(d);
+  $('#swipeBody').innerHTML = `
+    <div class="swipe-poster" style="background:${posterOf(idx)}">
+      <div class="poster-art" style="padding-bottom:56px">
+        <div class="poster-title" style="font-size:20px">${d.t}</div>
+        <div class="poster-sub">${d.y} · ${d.kind.split(' · ')[0]}</div>
+      </div>
+    </div>
+    <div class="swipe-name">${d.t}</div>
+    <div class="swipe-sub">已看完 ${d.ep[1]}/${d.ep[0]} 集 · ${d.genres.join(' / ')}</div>
+    <div class="stars" style="justify-content:center">
+      <div class="stars-wrap" id="swipeStars">
+        <span class="stars-bg">★★★★★</span>
+        <span class="stars-fill" id="swipeFill" style="width:${(d.rating||0)*10}%">★★★★★</span>
+        <span class="stars-hit">${Array.from({length:10},(_,k)=>`<i onmouseenter="swipePreview(${k+1})" onclick="swipeStar(${k+1})"></i>`).join('')}</span>
+      </div>
+      <span class="rate-val ${d.rating==null?'none':''}" id="swipeVal">${d.rating==null?'未评分':fmt(d.rating)}</span>
+    </div>
+    <div class="swipe-hint">点星打分，选完自动下一部 · 跳过 = 保持原样</div>
+    <div class="swipe-nav">
+      <button class="btn" onclick="swipePrev()">上一部</button>
+      <button class="btn" onclick="swipeNext()">跳过</button>
+      <button class="btn primary" onclick="closeSwipe()">完成</button>
+    </div>
+    <div class="swipe-prog">${(swipeIdx % list.length) + 1} / ${list.length}</div>`;
+}
+function swipePreview(v){
+  const f = $('#swipeFill'); if(f) f.style.width = v*10+'%';
+}
+function swipeStar(v){
+  const list = DATA;
+  const d = list[swipeIdx % list.length];
+  d.rating = v;   // v 是 1~10 的整数（0.5 星粒度）
+  const f = $('#swipeFill'), val = $('#swipeVal');
+  if(f) f.style.width = v*10+'%';
+  if(val){ val.textContent = fmt(d.rating); val.className = 'rate-val'; }
+  setTimeout(()=>{ swipeIdx++; renderSwipe(); }, 320);
+}
+function swipeNext(){ swipeIdx++; renderSwipe(); }
+function swipePrev(){ swipeIdx = Math.max(0, swipeIdx-1); renderSwipe(); }
+
+/* ================= 初始化 ================= */
+render(); setView('grid'); setDevice('pc');
+
+// 直接进入某个场景（方便分享/截图）：?view=detail|compare|swipe|toast&device=mobile
+const _p = new URLSearchParams(location.search);
+if (_p.get('device') === 'mobile') setDevice('mobile');
+const _v = _p.get('view');
+if (_v === 'detail') openDetail(_p.get('id') || 'mancheng');
+if (_v === 'compare') openCompare();
+if (_v === 'swipe') openSwipe();
+if (_v === 'sync') { openSync(); if (_p.get('fail') === '1') toggleSyncFail(); }
+if (_v === 'toast') demoArchive();
+if (_p.get('cat')) setCat(_p.get('cat'));
+
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape'){ closeDetail(); closeCompare(); closeSwipe(); hideToast(); }
+});
+</script>
+</body>
+</html>

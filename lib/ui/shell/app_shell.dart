@@ -425,6 +425,7 @@ const List<({IconData icon, String label, String path})> _navItems = [
   (icon: Icons.radar_rounded, label: '扫描', path: '/scan'),
   (icon: Icons.download_rounded, label: '下载', path: '/downloads'),
   (icon: Icons.settings_rounded, label: '设置', path: '/settings'),
+  (icon: Icons.auto_stories_rounded, label: '观影日记', path: '/diary'),
 ];
 
 /// 下载那一项在 `_navItems` 里的下标。
