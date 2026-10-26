@@ -33,10 +33,13 @@ class LibraryRemovalOutcome {
 class DriveFileTally {
   const DriveFileTally({required this.deletable, required this.undeletable});
 
-  /// 落在**可写**网盘上的文件数 —— 勾「一并删网盘」时会被删掉的正是这些。
+  /// 落在**能删**的网盘上的文件数 —— 勾「一并删网盘」时会被删掉的正是这些。
+  ///
+  /// 判据是 `Capabilities.canDelete`，**不是** `canWrite`：百度能删能移，
+  /// 但不能上传 / 建目录。
   final int deletable;
 
-  /// 落在**只读**网盘（百度）上的文件数 —— 只能从媒体库移除。
+  /// 落在**删不了**的网盘上的文件数 —— 只能从媒体库移除。
   final int undeletable;
 
   @override
@@ -115,7 +118,7 @@ class LibraryRemovalController {
   ///
   /// 弹窗要在**用户勾之前**就把「会删几个」写出来，而那个数字必须与
   /// [_deleteFromDrive] 实际会去删的集合**同一口径**（同一份 `itemsForWork`
-  /// 并集 + 同一条 `canWrite` 判断）。两处各写一遍的话，界面说 24 个、
+  /// 并集 + 同一条 `canDelete` 判断）。两处各写一遍的话，界面说 24 个、
   /// 实际删 22 个，而用户没有任何办法发现 —— 所以两边共用 [_itemsOf]。
   Future<DriveFileTally> tally(Iterable<String> keys) async {
     final items = await _itemsOf(keys.toSet());
@@ -149,12 +152,17 @@ class LibraryRemovalController {
 
   /// 这家网盘的文件**现在**能不能删。
   ///
-  /// 只读网盘（百度）在这里被判掉，**不计入失败**：`LibraryBatchDeletePlan`
+  /// 判据是 `Capabilities.canDelete`，**不是** `canWrite`：百度能删能移，
+  /// 但不能上传 / 建目录（见 `BaiduAdapter` 的类文档）。按 `canWrite` 判
+  /// 会把百度名下的文件整批算进「删不了」，用户勾了「一并删网盘」却看到
+  /// 那些文件原样留在盘上 —— 而那正是他按这个按钮想解决的事。
+  ///
+  /// 不支持删除的网盘在这里被判掉，**不计入失败**：`LibraryBatchDeletePlan`
   /// 在弹窗里已经把它们从「会删的文件数」里摘掉，并单独说过一句
   /// 「只会从媒体库移除」。算进失败数会让提示自相矛盾。
   bool _canDelete(DriveProvider provider) {
     final adapter = _ref.read(adapterRegistryProvider).adapterFor(provider);
-    return adapter != null && adapter.capabilities.canWrite;
+    return adapter != null && adapter.capabilities.canDelete;
   }
 
   /// 删掉这几部作品名下的**全部**网盘文件（并集口径），返回账目。
@@ -171,6 +179,14 @@ class LibraryRemovalController {
         skipped++;
         continue;
       }
+      // 百度按**路径**删除（`filelist` 收的是路径），而 `deleteFiles` 只收
+      // fid —— 把库里那条权威路径垫进适配器的缓存，删除就不必为每个文件
+      // 多打一次路径解析请求（那条请求走的 `xpan` 端点还可能正被账号风控
+      // 挡着，9019）。夸克那条是空操作，垫了无害。
+      registry.adapterFor(item.provider)?.primeFilePath(
+            item.fileId,
+            item.netdiskPath,
+          );
       (byProvider[item.provider] ??= <String>[]).add(item.fileId);
     }
     if (skipped > 0) {
@@ -215,8 +231,15 @@ class LibraryRemovalController {
         try {
           final ok = await adapter.deleteFiles(fileIds: chunks[i]);
           deleted += ok.length;
+          // 返回的比发出去的**少** ⇒ 有几条被服务端逐条拒了（百度的
+          // `info[]` 会这么报，见 `BaiduAdapter.deleteFiles`）。不把它们
+          // 算进失败，提示里就会说「网盘上 N 个文件已删除」，而盘上还留着
+          // 几个 —— 用户正是盯着容量条等它掉数字的那个人。
+          final missed = chunks[i].length - ok.length;
+          if (missed > 0) failed += missed;
           diag.info('媒体库', '批量删除（${entry.key.displayName}）'
-              '第 ${i + 1}/${chunks.length} 批：${ok.length} 个');
+              '第 ${i + 1}/${chunks.length} 批：${ok.length} 个'
+              '${missed > 0 ? "，$missed 个被拒" : ""}');
         } on DriveException catch (e) {
           failed += chunks[i].length;
           diag.warn('媒体库', '批量删除（${entry.key.displayName}）'

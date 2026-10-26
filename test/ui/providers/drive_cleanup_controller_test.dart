@@ -77,12 +77,14 @@ void main() {
     List<DriveEntry> tree = const [],
     DriveException? deleteFailsWith,
     Set<int>? deleteFailsOnBatch,
+    FakeDriveAdapter? adapterOverride,
   }) {
-    final adapter = FakeDriveAdapter(
-      {'root': [...tree]},
-      deleteFailsWith: deleteFailsWith,
-      deleteFailsOnBatch: deleteFailsOnBatch,
-    );
+    final adapter = adapterOverride ??
+        FakeDriveAdapter(
+          {'root': [...tree]},
+          deleteFailsWith: deleteFailsWith,
+          deleteFailsOnBatch: deleteFailsOnBatch,
+        );
     final repo = InMemoryMediaRepository();
     final c = ProviderContainer(
       overrides: [
@@ -119,6 +121,29 @@ void main() {
     expect(after.videos.map((e) => e.id), ['b'],
         reason: '删完不重列的话，用户看到的还是删之前那一层 —— 他会以为'
             '删除没生效，然后再点一次。');
+  });
+
+  test('⛔ 返回的比发出去的少（逐条被拒）⇒ 差额算失败，不谎报删干净', () async {
+    // 百度的删除响应带每条的 `errno`，被拒的那几条不会出现在返回值里。
+    // 只按「返回值长度」记账的话，提示会说「已删除 2 项」，而用户刷新
+    // 列表还看得见 `b` —— 他会以为界面没刷新，然后再点一次删除。
+    final s = setup(
+      adapterOverride: FakeDriveAdapter(
+        {
+          'root': [file('a'), file('b')],
+        },
+        // 服务端逐条拒掉 `b`：不报错，只是不出现在返回值里、树上也还在。
+        // 这个形状来自百度的 `info[].errno`（见 `BaiduAdapter.deleteFiles`）。
+        rejectIds: {'b'},
+      ),
+    );
+
+    final outcome = await run(s.c, entries: [file('a'), file('b')]);
+
+    expect(outcome!.deleted, 1);
+    expect(outcome.failed, 1,
+        reason: '没删掉就要说没删掉 —— 差额是最诚实的那个数');
+    expect(outcome.message, contains('1 项失败'));
   });
 
   test('超过一批上限时切成多批，一条不丢', () async {

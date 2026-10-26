@@ -83,6 +83,7 @@ void main() {
   Future<ProviderContainer> pumpPage(
     WidgetTester tester, {
     CloudAccount? account,
+    Capabilities? capabilities,
   }) async {
     // ⚠️ 必须是桌面宽度（< 960）：`flutter test` 默认平台就是 android，
     // 1280 会走进 TV 布局（`AppTheme.isTvLayout`），而 TV 下搜索框是
@@ -102,7 +103,9 @@ void main() {
       overrides: [
         databaseProvider.overrideWithValue(db),
         adapterRegistryProvider.overrideWithValue(
-          AdapterRegistry([FakeDriveAdapter(tree())]),
+          AdapterRegistry([
+            FakeDriveAdapter(tree(), capabilitiesOverride: capabilities),
+          ]),
         ),
         authControllerProvider.overrideWith(() => _FakeAuth(account: account)),
         scanControllerProvider.overrideWith(_FakeScan.new),
@@ -208,12 +211,12 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    /// 「删除」按钮此刻是不是按不动。
+    /// 某个按钮此刻是不是按不动。
     ///
     /// ⚠️ 不能用 `find.byType(FilledButton)`：`FilledButton.icon` 是它的
     /// **子类**（`_FilledButtonWithIcon`），而 `byType` 比的是运行时的确切
     /// 类型 —— 用它找会得到「No element」，看起来像按钮没渲染出来。
-    bool deleteDisabled(WidgetTester tester, String label) {
+    bool buttonDisabled(WidgetTester tester, String label) {
       final btn = tester.widget<FilledButton>(
         find.ancestor(
           of: find.text(label),
@@ -234,7 +237,7 @@ void main() {
       expect(find.text('根目录'), findsNothing,
           reason: '多选时当前目录是冻结的（换目录会清空勾选），面包屑留着'
               '只会让人以为点它还能跳层 —— 跳了就白勾了。');
-      expect(deleteDisabled(tester, '删除'), isTrue,
+      expect(buttonDisabled(tester, '删除'), isTrue,
           reason: '一个都没勾就能按下去的话，用户会得到一个「删除 0 项」的'
               '空动作，然后怀疑这个功能坏了。');
     });
@@ -247,7 +250,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('已选 1 项'), findsOneWidget);
-      expect(deleteDisabled(tester, '删除 1 项'), isFalse);
+      expect(buttonDisabled(tester, '删除 1 项'), isFalse);
       expect(rowText('第10季'), findsOneWidget,
           reason: '点一行只是勾选，不该钻进「第2季」—— 钻进去的话列表会变成'
               '那个目录的内容（这里是空的），而用户以为自己只是选了一下。');
@@ -315,6 +318,77 @@ void main() {
       expect(find.text('勾选要移动或删除的条目'), findsOneWidget,
           reason: '不清的话，用户下次进多选看到「已选 1 项」，按下删除 —— '
               '删掉的是上一次勾的那个文件，而他以为自己在挑新的。');
+    });
+
+    // ── 按钮由**能力位**决定，不看网盘名 ────────────────────────────
+    //
+    // 这一组守的是「一个位管一件事」。原先只有一个 `canWrite`，把上传 /
+    // 建目录 / 删除 / 移动绑在一起；百度能删能移但不能传，按 `canWrite`
+    // 判就会把它的两个按钮一起灰掉，而界面上看不出任何原因。
+
+    testWidgets('canMove=false：移动按钮按不动，并给一句说明', (tester) async {
+      await pumpPage(
+        tester,
+        capabilities: const Capabilities(
+          provider: DriveProvider.quark,
+          canMove: false,
+        ),
+      );
+      await enterSelection(tester);
+      await tester.tap(rowText('第2季'));
+      await tester.pumpAndSettle();
+
+      expect(buttonDisabled(tester, '移动 1 项'), isTrue,
+          reason: '不支持移动时让按钮可按，用户点下去只会拿到一句 '
+              'unsupported —— 他分不清「功能坏了」和「这家网盘不支持」。');
+      expect(find.byTooltip('该网盘不支持移动文件'), findsOneWidget,
+          reason: '光灰掉不够：灰按钮不解释原因，用户会以为是没勾选或者卡住了。');
+    });
+
+    testWidgets('canDelete=false：删除按钮按不动，并给一句说明', (tester) async {
+      // ⚠️ 这一条与上面那条是**对称**的，而在此之前它并不成立：删除按钮
+      // 只看「有没有勾选」，从不看 `canDelete`。于是一个不能删的网盘上，
+      // 用户勾选 → 点删除 → 读一遍「删除后不可撤销」→ 按下确认 → 什么都
+      // 没发生。一次不可撤销的确认换来零结果，比按钮灰着伤人得多。
+      await pumpPage(
+        tester,
+        capabilities: const Capabilities(
+          provider: DriveProvider.quark,
+          canDelete: false,
+        ),
+      );
+      await enterSelection(tester);
+      await tester.tap(rowText('第2季'));
+      await tester.pumpAndSettle();
+
+      expect(buttonDisabled(tester, '删除 1 项'), isTrue);
+      expect(find.byTooltip('该网盘不支持删除文件'), findsOneWidget);
+    });
+
+    testWidgets('百度的形状（能删能移、不能写）：移动和删除都按得动',
+        (tester) async {
+      // ⛔ 这条是本次修复的回归测试。判据曾经是 `canWrite` —— 百度的
+      // `canWrite` 是 false（它不上传、不建目录），于是「移动」按钮对它
+      // 永远灰着，而它其实能移。
+      await pumpPage(
+        tester,
+        capabilities: const Capabilities(
+          provider: DriveProvider.quark,
+          canWrite: false,
+          canDelete: true,
+          canMove: true,
+        ),
+      );
+      await enterSelection(tester);
+      await tester.tap(rowText('第2季'));
+      await tester.pumpAndSettle();
+
+      expect(buttonDisabled(tester, '移动 1 项'), isFalse,
+          reason: '能移就是能移。按 `canWrite` 判的话这个按钮会永远灰着，'
+              '而百度恰恰是最需要「把片子挪出待删目录」的那一家。');
+      expect(buttonDisabled(tester, '删除 1 项'), isFalse,
+          reason: '同理：删除该按 `canDelete` 判，不该被「不能上传」连坐。');
+      expect(find.byTooltip('该网盘不支持移动文件'), findsNothing);
     });
   });
 }

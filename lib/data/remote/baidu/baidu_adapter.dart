@@ -19,7 +19,7 @@ import 'baidu_endpoints.dart';
 import 'baidu_error_mapper.dart';
 import 'baidu_models.dart';
 
-/// 百度网盘适配器（**只读**：授权 / 遍历 / 取流）。
+/// 百度网盘适配器（授权 / 遍历 / 取流 / **删除** / **移动**）。
 ///
 /// 走 **Web 自用接口**（`pan.baidu.com/api/*`），靠登录态 Cookie（`BDUSS`）
 /// 鉴权。理由与端点证据等级见 [BaiduEndpoints] 的类文档。
@@ -28,15 +28,21 @@ import 'baidu_models.dart';
 /// 用假客户端把分页、错误映射、限流、**取流路由降级**、直链组装全部覆盖到，
 /// 不发一次网络请求。
 ///
-/// ## 本轮范围：只读
+/// ## 本轮范围：读 + 删 + 移（写链路只开了这两格）
 ///
 /// 实现了 `restoreSession` / `authorize` / `signOut` / `refreshAccount` /
-/// `ping` / `listDirectory` / `search` / `resolveStream` / `readFileBytes`。
+/// `ping` / `listDirectory` / `search` / `resolveStream` / `readFileBytes` /
+/// `deleteFiles` / `moveFiles`。
 ///
-/// `createFolder` / `deleteFiles` / `moveFiles` / `uploadFile` **不实现** ——
-/// 它们在基类里默认抛 `unsupported`，上层据此隐藏入口。
-/// 写入链路要等「真实账号验证过取链与遍历」之后再单独做：
-/// 一旦写错就是**用户数据损失**，不该和读链路一起上线。
+/// `createFolder` / `uploadFile` **仍然不实现** —— 它们在基类里默认抛
+/// `unsupported`，上层据此挑备份落点（[Capabilities.canWrite]）。
+///
+/// ⛔ **为什么只开了删除与移动**：文件夹页的「多选 → 删除 / 移动」是用户
+/// 整理网盘空间的全部出口，而百度只读接入时它们必然抛 `unsupported`
+/// （现象是「接进来了却什么都动不了」）。这两件事与另外两个写方法的风险
+/// **不同级**：它们不创建、不覆盖任何用户数据，删错了在回收站里、移错了
+/// 再移回去就行；而上传写错会覆盖文件、建目录写错会造出奇怪的目录。
+/// 所以这两格单独放行，上传与建目录继续关着（备份上传要的就是那两格）。
 ///
 /// ## ⛔ 与夸克最大的三个结构差异（抄代码时会踩）
 ///
@@ -54,9 +60,8 @@ import 'baidu_models.dart';
 ///
 /// 基类的类文档专门写了这一条：`implements` 只继承接口、**不继承实现**，
 /// 于是基类里那些「表达『这个能力可以不支持』的默认实现」
-/// （`createFolder` / `deleteFiles` / `moveFiles` / `uploadFile`，
-/// 默认一律抛 `unsupported`）会全部失效 —— 子类被迫写四个抛异常的空壳。
-/// 那是噪音，不是表达。本轮只读，正是靠这四条默认实现来声明「不写」。
+/// （`createFolder` / `uploadFile`，默认一律抛 `unsupported`）
+/// 会全部失效 —— 子类被迫写两个抛异常的空壳。那是噪音，不是表达。
 class BaiduAdapter extends CloudDriveAdapter {
   BaiduAdapter({
     required HttpClientLike http,
@@ -106,12 +111,23 @@ class BaiduAdapter extends CloudDriveAdapter {
     canListDirectory: true,
     canSearch: true,
     canResolveDirectLink: true,
-    // ⛔ **只读**。本次对接的范围就是「能扫能播」，四个写方法（建目录 /
-    //    删 / 移 / 上传）一律走基类的 `unsupported` 默认实现。
+    // ⛔ 写链路只开了**删除与移动**这两格，上传 / 建目录继续关着。
+    //
+    //    `canWrite: false` 决定的是「备份包能不能落到这家」——备份要建目录 +
+    //    上传，这两件事百度都没实现（见 `BaiduAdapter` 的类文档：只放行
+    //    删除与移动，因为它们不创建、不覆盖任何用户数据）。
     //
     //    显式声明而不是只靠抛异常：备份上传要**先**挑一家能写的网盘
     //    （见 `Capabilities.canWrite`），靠异常表达的话只能挑完再失败。
     canWrite: false,
+    // ✅ 删除是支持的（`/api/filemanager?opera=delete`）。与 `canWrite`
+    //    分开声明，否则媒体库批量删除会把百度的文件算成「删不了」，
+    //    用户勾了「一并删网盘」却看到一批文件原样留在盘上。
+    canDelete: true,
+    // ✅ 移动 / 重命名也是支持的（`/api/filemanager?opera=move`）。
+    //    同样是独立的能力位：文件夹页那条工具条靠它决定「移动」按不按得动，
+    //    而不是让用户点完再读一句 unsupported。
+    canMove: true,
     // 直链必须带 `User-Agent: pan.baidu.com`，否则 `31326 anti hotlinking`。
     directLinkNeedsHeaders: true,
     supportsRangeRequests: true,
@@ -615,9 +631,23 @@ class BaiduAdapter extends CloudDriveAdapter {
   /// 只接受**绝对路径**（`/` 开头）：夸克那条路也会走到这里（基类默认
   /// 无操作，只有本类覆盖），而夸克的 `dirId` 是数字 fid，垫进去只会
   /// 污染缓存。宁可不垫（退回翻译请求），不能垫错。
+  ///
+  /// ## ⛔ 只填空位，**不覆盖**已有条目
+  ///
+  /// 已有的那条可能刚由 [listDirectory] 从服务端拿回来（几秒前的事实），
+  /// 而调用方给的是**库里持久化**的 `dir_path + name`（可能是几天前的扫描）。
+  /// 覆盖的方向反了，就会拿一条陈旧路径去取链或去删：
+  ///
+  ///   - 取链：报「文件不存在」，而文件就在新目录里 —— 用户会以为文件丢了；
+  ///   - 删除：更糟。若那条旧路径上现在**住着另一个文件**，删掉的是它。
+  ///
+  /// 缓存里没有时间戳，所以「谁更新」无从判断；但「不覆盖」至少保证
+  /// **一次都不会把服务端刚说的话改成库里那句旧话**。而这正是常见顺序：
+  /// 用户在文件夹页看过那一层（缓存被填满），再去媒体库删同一个文件。
   @override
   void primeFilePath(String fileId, String path) {
     if (fileId.isEmpty || !path.startsWith('/')) return;
+    if (_pathByFsId.containsKey(fileId)) return;
     _pathByFsId[fileId] = path;
     diag.debug('取链', '百度路径缓存预热：fs_id=$fileId → $path');
   }
@@ -1044,6 +1074,381 @@ class BaiduAdapter extends CloudDriveAdapter {
   }
 
   // -------------------------------------------------------------------
+  // 文件管理：删除
+  // -------------------------------------------------------------------
+
+  /// 删除网盘上的文件 / 文件夹。
+  ///
+  /// ## 与夸克那条的四处结构差异（照抄会踩）
+  ///
+  /// | 维度 | 夸克 | 百度 |
+  /// |---|---|---|
+  /// | 请求方法 | `POST` + JSON 体 | `POST` + **表单**体 |
+  /// | 收什么 | `fid` | **路径** |
+  /// | 逐条结果 | 没有，只有信封 | `info[]` 里带每条的 `errno` |
+  /// | 根目录 | `'0'` | `'/'` |
+  ///
+  /// 前两条各自都会让「一个文件都删不掉」：体类型不对服务端回 `errno=2`
+  /// （参数错误），而把 `fs_id` 当路径发过去只会得到「文件不存在」。
+  ///
+  /// ## 路径从哪来（本方法的全部复杂度都在这里）
+  ///
+  /// 优先 [_pathByFsId]：列过一次父目录就白捡一批子项路径（见那个字段的
+  /// 文档），而用户在文件夹页勾选删除时，这些路径**一定**刚被 `listDirectory`
+  /// 填过。剩下的才走 [_resolvePaths] —— **一次**批量请求，不是逐条问。
+  ///
+  /// ⛔ 翻不出路径的那些**不发进请求**，也不出现在返回值里。拿 fs_id 当
+  /// 路径发过去会让服务端回「文件不存在」—— 那会把一次「路径没解析出来」
+  /// 伪装成「文件已经不在了」，而后者会诱导上层去清本地索引。
+  ///
+  /// ## 逐条 `errno` 是本适配器唯一能如实回报**部分失败**的地方
+  ///
+  /// 【未验证】响应形如 `{"errno":0,"info":[{"errno":0,"path":"/a.mkv"}]}`。
+  /// 只要 `info` 在，就把 `errno != 0` 的那几条从返回值里摘掉；上层据此
+  /// 算失败数（见 `DriveCleanupController` / `LibraryRemovalController`）。
+  /// `async=2` 时服务端也可能只回一个 `taskid`（`info` 缺席），那时只能按
+  /// 「请求已受理」回报全部 —— 这正是基类契约写明的**请求粒度**。
+  ///
+  /// ⚠️ 不在这里「删完重列目录核对」：删除是异步受理的，服务端未必立刻
+  /// 可见，重列只会得到一个「还在」的假象。与夸克那条同一条理由。
+  ///
+  /// ⚠️ 一次别超过 `driveMaxFidsPerRequest` 个（超了服务端可能回 `31066`）。
+  /// **切批次是调用方的责任**（`chunkFids`）：在这里再切一次，返回值与入参
+  /// 的对应关系就变成「几段拼起来」，上层没法如实报「哪一批失败了」。
+  @override
+  Future<List<String>> deleteFiles({required List<String> fileIds}) async {
+    final ids = fileIds.toSet().toList(growable: false);
+    if (ids.isEmpty) return const [];
+
+    // ── ① fid → 路径 ────────────────────────────────────────────────
+    //
+    // **一次**批量解析，不是逐条问：`filemetas` 的 `fsids` 收的就是数组，
+    // 逐条问会变成「删 100 个文件先等 100 次 2 QPS 的配额」（50 秒），
+    // 而删除本身只要一次往返。
+    final resolved = await _resolvePaths(ids);
+    final paths = resolved.paths;
+    final unresolved =
+        ids.where((id) => !paths.containsKey(id)).toList(growable: false);
+    if (unresolved.isNotEmpty) {
+      diag.warn(
+        '文件',
+        '百度删除：${unresolved.length} 个文件翻不出路径，本次跳过'
+            '（${unresolved.join(", ")}）',
+      );
+    }
+    if (paths.isEmpty) {
+      // 一个都翻不出来 ⇒ 把**解析阶段**那个错误上抛。它比一句「没有可删的」
+      // 有用得多：`-6`（要重新登录）与 `9019`（要去网页版过验证）的出路
+      // 完全不同，而这条链路上最容易撞的恰恰是这两个。
+      throw resolved.error ??
+          DriveException(
+            type: DriveErrorType.notFound,
+            message: '删除失败：${ids.length} 个文件都解析不出路径',
+          );
+    }
+
+    // ── ② 取会话令牌，再发一次表单 POST ─────────────────────────────
+    //
+    // 令牌必须在发请求**之前**就位：缺它服务端回 `8001` 而不是 `-6`，
+    // 那条「`-6` 才补令牌」的自愈兜不住（见 [_ensureWriteToken]）。
+    await _ensureWriteToken('删除文件');
+
+    // `filelist` 是**路径数组的 JSON 字符串**，再整体做一次表单编码 ——
+    // 中文目录名在这一步必须被编码，否则服务端拿到的是乱码路径。
+    final fileList = jsonEncode(paths.values.toList(growable: false));
+    final result = await _request(
+      () => _post(
+        BaiduEndpoints.fileManager,
+        {
+          'opera': BaiduEndpoints.operaDelete,
+          'async': BaiduEndpoints.fileManagerAsync,
+          // 子项删失败时**整体报错**而不是「删一半就当成功」：用户勾的是一个
+          // 目录，半删的目录在界面上看起来像「删了」，实际里面还留着东西。
+          'onnest': 'fail',
+        },
+        '${BaiduEndpoints.fileListField}=${Uri.encodeQueryComponent(fileList)}',
+      ),
+      context: '删除文件',
+    );
+
+    // ── ③ 逐条核对（能核就核）──────────────────────────────────────
+    final rejected = _rejectedPaths(result);
+    final deleted = <String>[];
+    for (final entry in paths.entries) {
+      if (rejected.containsKey(entry.value)) continue;
+      deleted.add(entry.key);
+    }
+
+    if (deleted.isEmpty) {
+      final first = rejected.values.first;
+      diag.error('文件', '百度删除全部被拒：${rejected.length} 项 errno=$first');
+      throw DriveException(
+        type: DriveErrorType.permissionDenied,
+        message: '删除失败：${paths.length} 项都被网盘拒绝（errno=$first）',
+        providerCode: first,
+      );
+    }
+    if (rejected.isNotEmpty) {
+      diag.warn(
+        '文件',
+        '百度删除部分被拒：${rejected.length}/${paths.length} 项'
+            '（${rejected.entries.map((e) => "${e.value}:${e.key}").join(", ")}）',
+      );
+    }
+
+    // ── ④ 让路径缓存跟上 ────────────────────────────────────────────
+    //
+    // 删掉的东西不该再留在缓存里：留着的话，同一次会话里再点播放会走
+    // 「路径已知」的分支，拿一条指向已删文件的直链去请求，报错文案是
+    // CDN 的 403，而不是「文件不存在」。
+    //
+    // 目录要连子项一起清：`_pathByFsId` 里那些 `$dirPath/…` 的映射在目录
+    // 被删之后全部失效，而它们不会自己过期。
+    for (final id in deleted) {
+      final path = paths[id];
+      if (path == null || path.isEmpty) continue;
+      _pathByFsId.removeWhere((_, v) => v == path || v.startsWith('$path/'));
+    }
+
+    diag.info('文件', '百度已删除 ${deleted.length} 项'
+        '${unresolved.isEmpty ? "" : "，跳过 ${unresolved.length} 项"}');
+    return deleted;
+  }
+
+  /// 把一批文件 / 目录移动到目标目录。
+  ///
+  /// ## 与删除同一个端点，但 `filelist` 的形状**完全不同**
+  ///
+  /// | `opera` | `filelist` |
+  /// |---|---|
+  /// | `delete` | `["/电影/a.mkv", …]` —— 路径数组 |
+  /// | `move` | `[{"path":"/电影/a.mkv","dest":"/归档","newname":"a.mkv"}]` |
+  ///
+  /// 【未验证】形状的依据是 AList 的 `manage()`（官方 `xpan/file` 那条，
+  /// `opera=move` 时把 `filelist` 拼成 `path / dest / newname` 三个键）。
+  /// 填错时服务端回 `errno=2`（参数错误）—— **不会**误删或误移到别处，
+  /// 所以这个不确定性的代价是「移不动」，不是「移错地方」。
+  ///
+  /// ## `newname` 必须显式给
+  ///
+  /// 不给的话服务端按 `path` 的末段推断，而末段是从**我们缓存的路径**里
+  /// 取出来的 —— 那条路径可能是几小时前扫的。显式带上它，移动结果就与
+  /// 「用户勾的那一行」逐字对齐，不依赖服务端的推断规则。
+  ///
+  /// ## 移完要**改写路径缓存**（这一步漏了比删完不清缓存更隐蔽）
+  ///
+  /// 移动**不改 fid**，但**改路径**。缓存里留着旧路径的话，同一次会话里
+  /// 再点播放会走「路径已知」的分支，拿一条已经不存在的路径去取链 ——
+  /// 报错是「文件不存在」，而文件明明就在目标目录里好好待着。
+  /// 目录要连子项一起改写（`/旧/子/a.mkv` → `/新/子/a.mkv`），理由与
+  /// [deleteFiles] 里那段对称。
+  ///
+  /// ⚠️ 本地索引**不动**（fid 没变，播放照常），`dirPath` 待下次扫描修正
+  /// —— 见 `DriveMoveController` 里那段注释。
+  @override
+  Future<List<String>> moveFiles({
+    required List<String> fileIds,
+    required String targetFolderId,
+  }) async {
+    final ids = fileIds.toSet().toList(growable: false);
+    if (ids.isEmpty) return const [];
+
+    // ── ① 源路径 + 目标目录路径 ─────────────────────────────────────
+    final resolved = await _resolvePaths(ids);
+    final paths = resolved.paths;
+    if (paths.isEmpty) {
+      throw resolved.error ??
+          DriveException(
+            type: DriveErrorType.notFound,
+            message: '移动失败：${ids.length} 个条目都解析不出路径',
+          );
+    }
+    // 翻不出路径的那几条**不发进请求**（拿 fs_id 当路径只会得到「不存在」），
+    // 于是它们也不在返回值里 —— 上层按「发出数 − 返回数」把它们算成失败。
+    // 这里留一条日志，是因为「移动没反应」在界面上只有一句「N 项失败」，
+    // 而真正的原因（缓存过期 / 文件已经被别处删了）只能从这里看。
+    final unresolved =
+        ids.where((id) => !paths.containsKey(id)).toList(growable: false);
+    if (unresolved.isNotEmpty) {
+      diag.warn(
+        '文件',
+        '百度移动：${unresolved.length} 个条目翻不出路径，本次跳过'
+            '（${unresolved.join(", ")}）',
+      );
+    }
+
+    final dest = await _resolvePath(targetFolderId);
+    if (dest.isEmpty) {
+      throw const DriveException(
+        type: DriveErrorType.notFound,
+        message: '移动失败：解析不出目标目录的路径',
+      );
+    }
+
+    // ── ② 取会话令牌，再发一次表单 POST ─────────────────────────────
+    //
+    // 与删除同一条理由：缺令牌服务端回 `8001`，而自愈只认 `-6`。
+    // 见 [_ensureWriteToken]。
+    await _ensureWriteToken('移动文件');
+
+    final fileList = jsonEncode([
+      for (final entry in paths.entries)
+        {
+          'path': entry.value,
+          'dest': dest,
+          'newname': _baseName(entry.value),
+        },
+    ]);
+    final result = await _request(
+      () => _post(
+        BaiduEndpoints.fileManager,
+        {
+          'opera': BaiduEndpoints.operaMove,
+          'async': BaiduEndpoints.fileManagerAsync,
+          'onnest': 'fail',
+        },
+        '${BaiduEndpoints.fileListField}=${Uri.encodeQueryComponent(fileList)}',
+      ),
+      context: '移动文件',
+    );
+
+    // ── ③ 逐条核对 ──────────────────────────────────────────────────
+    final rejected = _rejectedPaths(result);
+    final moved = <String>[];
+    for (final entry in paths.entries) {
+      if (rejected.containsKey(entry.value)) continue;
+      moved.add(entry.key);
+    }
+    if (moved.isEmpty) {
+      final first = rejected.values.first;
+      diag.error('文件', '百度移动全部被拒：${rejected.length} 项 errno=$first');
+      throw DriveException(
+        type: DriveErrorType.permissionDenied,
+        message: '移动失败：${paths.length} 项都被网盘拒绝（errno=$first）',
+        providerCode: first,
+      );
+    }
+
+    // ── ④ 改写路径缓存 ──────────────────────────────────────────────
+    //
+    // 两趟走：先把**旧前缀 → 新前缀**记下来，再统一改写。边遍历边改
+    // `_pathByFsId` 会在「移进自己的子目录」这类情况下把新写的键又当成
+    // 待改写项（`removeWhere` + `addAll` 的经典自噬）。
+    final rewrites = <String, String>{};
+    for (final id in moved) {
+      final oldPath = paths[id];
+      if (oldPath == null || oldPath.isEmpty) continue;
+      final newPath = _joinPath(dest, _baseName(oldPath));
+      rewrites[oldPath] = newPath;
+      _pathByFsId[id] = newPath;
+    }
+    if (rewrites.isNotEmpty) {
+      _pathByFsId.updateAll((key, value) {
+        for (final r in rewrites.entries) {
+          if (value == r.key) return r.value;
+          if (value.startsWith('${r.key}/')) {
+            return '${r.value}${value.substring(r.key.length)}';
+          }
+        }
+        return value;
+      });
+    }
+
+    if (rejected.isNotEmpty) {
+      diag.warn(
+        '文件',
+        '百度移动部分被拒：${rejected.length}/${paths.length} 项'
+            '（${rejected.entries.map((e) => "${e.value}:${e.key}").join(", ")}）',
+      );
+    }
+    diag.info('文件', '百度已移动 ${moved.length} 项 → $dest'
+        '${unresolved.isEmpty ? "" : "，跳过 ${unresolved.length} 项"}');
+    return moved;
+  }
+
+  /// 把一批 `fs_id` 翻译成路径 —— **一次请求**搞定（缓存命中的先摘出来）。
+  ///
+  /// ## 为什么要有它（而不是循环调 [_resolvePath]）
+  ///
+  /// `filemetas` 的 `fsids` 本来就收数组。逐条问的代价是**按条数**增长：
+  /// 删 100 个文件先打 100 次 `xpan`，在 2 QPS 的列目录配额下就是 50 秒 ——
+  /// 而删除本身只要一次往返。用户看到的是「点了删除，转圈快一分钟」。
+  ///
+  /// 返回 `id → path`；翻不出来的那些**不在结果里**（由调用方决定怎么报）。
+  /// [error] 只在**整体失败**（未授权 / 风控 / 断网）时非空：那时连
+  /// 「谁翻不出来」都无从谈起，只能把异常交给调用方。
+  ///
+  /// ⚠️ 缓存里已有的那些**不会再问一次**：文件夹页勾选删除时，路径刚刚被
+  /// `listDirectory` 填满，这条请求根本不会发出去。
+  Future<({Map<String, String> paths, DriveException? error})> _resolvePaths(
+    List<String> ids,
+  ) async {
+    final out = <String, String>{};
+    final missing = <String>[];
+    for (final id in ids) {
+      final cached = _pathByFsId[id];
+      if (cached != null && cached.isNotEmpty) {
+        out[id] = cached;
+      } else {
+        missing.add(id);
+      }
+    }
+    if (missing.isEmpty) return (paths: out, error: null);
+
+    diag.debug('文件', '百度路径缓存未命中 ${missing.length} 个，批量解析');
+    try {
+      final result = await _listBucket.run(
+        () => _request(
+          () => _get(BaiduEndpoints.xpanMultimedia, {
+            'method': 'filemetas',
+            // `fsids` 是**数字**数组，不是字符串数组（与 `_resolvePath`
+            // 单条时同一个形状，只是多几项）。
+            'fsids': '[${missing.join(",")}]',
+            'dlink': 0,
+            'thumb': 0,
+          }),
+          context: '解析删除路径',
+        ),
+      );
+      final index = BaiduMapper.parsePathIndex(result);
+      _pathByFsId.addAll(index);
+      for (final id in missing) {
+        final path = index[id];
+        if (path != null && path.isNotEmpty) out[id] = path;
+      }
+      return (paths: out, error: null);
+    } on DriveException catch (e) {
+      // 逐条翻不出来**不是**错误（可能真的已经被删了），整体失败才是。
+      diag.warn('文件', '百度批量解析路径失败：${_describe(e)}');
+      return (paths: out, error: e);
+    }
+  }
+
+  /// 从删除响应里捞出**被服务端拒绝**的路径 → 该条的 `errno`。
+  ///
+  /// 返回空 Map 有两种含义，都按「全部受理」处理：`info` 缺席
+  /// （`async=2` 只回了 `taskid`），或 `info` 里每条都是 `errno == 0`。
+  ///
+  /// ⚠️ 只认 `path` 这个字段名，认不出就当成功。这个方向是**刻意**选的：
+  /// 契约本来就是请求粒度（见基类 `deleteFiles`），而两种偏差的代价不对称
+  /// —— 多报一条成功，上层多清一条本地索引，下次扫描会重建；多报一条失败，
+  /// 用户会对着一批**其实已经删掉**的文件再删一遍。
+  static Map<String, int> _rejectedPaths(HttpResult result) {
+    final info = result.json?['info'];
+    if (info is! List) return const {};
+    final out = <String, int>{};
+    for (final item in info) {
+      if (item is! Map) continue;
+      final path = item['path'];
+      final errno = _asInt(item['errno']);
+      if (path is String && path.isNotEmpty && errno != null && errno != 0) {
+        out[path] = errno;
+      }
+    }
+    return out;
+  }
+
+  // -------------------------------------------------------------------
   // 图片取用
   // -------------------------------------------------------------------
 
@@ -1163,6 +1568,13 @@ class BaiduAdapter extends CloudDriveAdapter {
   /// 为什么不「登录时就先把 `bdstoken` 取好」：客户端自己也是**先**调
   /// `/api/account/uinfo`（那时还没有 `bdstoken`）、**再**去取它。
   /// 把顺序倒过来会在「取令牌本身失败」时把登录也一起拖垮。
+  ///
+  /// ## ⛔ 这条自愈**只对读接口有效**
+  ///
+  /// 它认的是 `-6`。而写接口（`/api/filemanager`）缺令牌时回的是 `8001`
+  /// —— 2026-10-26 实测，`bdstoken` 一次都没取过的会话里，删除请求
+  /// 稳定回 `{"errno":8001}`，这条重试**一次都没触发过**。
+  /// 写操作走的是「先取后发」，见 [_ensureWriteToken]。
   Future<HttpResult> _request(
     Future<HttpResult> Function() call, {
     String? context,
@@ -1215,8 +1627,30 @@ class BaiduAdapter extends CloudDriveAdapter {
   static void _logBody(String? context, HttpResult result) {
     final body = result.rawBody.trim();
     if (body.isEmpty) return;
-    final shown = body.length > 300 ? '${body.substring(0, 300)}…' : body;
-    diag.debug('接口', '百度${context ?? "请求"}响应体：$shown');
+    diag.debug('接口', '百度${context ?? "请求"}响应体：${_clip(body)}');
+  }
+
+  /// 日志里一条体最多显示多少字符。
+  ///
+  /// 300 这个数不是为了「好看」：一条 100 项的删除请求，`filelist` 能有几 KB，
+  /// 整条打进日志页会让那一页卡住。而前 300 字符已经足够回答排查时真正要问的
+  /// 那两个问题 ——「是路径数组还是对象数组」「字段名对不对」。
+  static const int _logBodyLimit = 300;
+
+  static String _clip(String body) => body.length > _logBodyLimit
+      ? '${body.substring(0, _logBodyLimit)}…'
+      : body;
+
+  /// 把 POST 的查询参数拼成一行日志。
+  ///
+  /// `bdstoken` **只报有/无**，不报值：它是会话令牌，写进日志等于把
+  /// 一份可用凭证留在磁盘上。而排查真正需要的也只是「带没带」。
+  static String _queryForLog(Map<String, Object?> query, String? token) {
+    final parts = <String>[
+      ...query.entries.map((e) => '${e.key}=${e.value}'),
+      'bdstoken=${(token == null || token.isEmpty) ? "缺" : "有"}',
+    ];
+    return parts.join(' & ');
   }
 
   /// 取（并缓存）`bdstoken`。
@@ -1256,6 +1690,43 @@ class BaiduAdapter extends CloudDriveAdapter {
     return null;
   }
 
+  /// 写操作前**主动**把 `bdstoken` 拿到手。
+  ///
+  /// ## 为什么不能等 `-6`
+  ///
+  /// 原先只有 [_request] 里那条「`-6` ⇒ 补令牌再重试」的自愈，前提是
+  /// 「缺令牌会回 `-6`」。这个前提对**读**接口成立（`/api/list` 不带令牌
+  /// 也照常返回），对**写**接口不成立：2026-10-26 实测 `/api/filemanager`
+  /// 缺令牌时回的是 `8001`（见 `BaiduErrorCode.writeRejected`）——
+  /// 自愈逻辑永远等不到它要的那个码，于是每次删除都发一个注定被拒的
+  /// 请求，用户看到的是「未知错误」，重试多少次都一样。
+  ///
+  /// 所以写操作改成**先取后发**：拿到就带上；拿不到也照发（不把
+  /// 「取令牌失败」升级成「功能不可用」—— 那会让一次网络抖动变成
+  /// 「删除按钮永久失效」），但日志里留一句。下次再撞 `8001` 时，
+  /// 那句就是「令牌到底带没带」的答案。
+  Future<String?> _ensureWriteToken(String what) async {
+    // 没有会话时**别**去取令牌：`_get` 会带着空 Cookie 发出两次注定
+    // 被拒的请求，然后才轮到 `_request` 报「尚未授权」。让后者先说话，
+    // 用户拿到的是一句准确的「请重新授权」，而不是两条 401 噪音。
+    if (!hasSession) return null;
+
+    final cached = _bdstoken;
+    if (cached != null && cached.isNotEmpty) return cached;
+
+    diag.info('接口', '百度$what是写操作，先取 bdstoken');
+    final token = await _ensureBdstoken();
+    if (token == null || token.isEmpty) {
+      diag.warn(
+        '接口',
+        '百度$what：取不到 bdstoken，仍按不带令牌发送'
+            '（服务端可能回 errno=8001）',
+      );
+      return null;
+    }
+    return token;
+  }
+
   /// 网盘 API 的公共请求头。
   ///
   /// ⚠️ `Origin` 不能省。它是本适配器与一个**已知能跑通**的社区实现
@@ -1292,6 +1763,58 @@ class BaiduAdapter extends CloudDriveAdapter {
     );
   }
 
+  /// 打一条网盘 API（**表单** POST）。
+  ///
+  /// 百度把删除放在 `POST /api/filemanager` + 表单体里（`filelist` 一个
+  /// 字段），与夸克的 JSON 体不同。三件事都必须显式做：
+  ///
+  ///   1. **`Content-Type`** 写死表单类型。dio 对 `String` 体的默认类型是
+  ///      `text/plain`，而服务端按表单解析 —— 类型不对时回 `errno=2`
+  ///      （参数错误），看起来像「路径写错了」，其实请求体一个字都没被读到；
+  ///   2. **公共参数 + `bdstoken`** 与 [_get] 一致。⚠️ 但**别指望**这里
+  ///      能靠 `-6` 自愈补上它：写接口缺令牌回的是 `8001`
+  ///      （2026-10-26 实测），不是 `-6`。所以调用方必须先用
+  ///      [_ensureWriteToken] 把令牌拿到手 —— 本方法只在它非空时才带上；
+  ///   3. 体里**只放已经编码好的表单串**，不传 `Map`：dio 会把 `Map` 编码成
+  ///      JSON，那又是另一种服务端不认的形状。
+  Future<HttpResult> _post(
+    String path,
+    Map<String, Object?> query,
+    String formBody,
+  ) {
+    final token = _bdstoken;
+    // ⚠️ 把**要发出去的形状**也记一笔。
+    //
+    // 删除与移动是这套代码里唯一没有真机验证过的接口，而形状错了（`filelist`
+    // 是路径数组还是对象数组、字段名、表单类型）服务端只会回一个 `errno=2`。
+    // 只记响应的话，排查时得从代码反推「我们到底发了什么」—— 而这段代码
+    // 随时可能被改，反推出来的结论不可信。两边都留下，`errno=2` 才有对照物。
+    //
+    // 放在 `_post` 而不是两个调用点：它俩共用的就是这个出口，且将来任何新的
+    // POST 都自动带上这条。
+    diag.debug('接口', '百度$path 请求体：${_clip(formBody)}');
+    // ⚠️ **查询参数也要记**。
+    //
+    // 2026-10-26 那次 `errno=8001` 排查里，日志只记了请求体与请求头 ——
+    // 于是「`bdstoken` 到底带没带」成了一个只能从代码反推的问题。而这段
+    // 代码在令牌为空时是**静默省略**该参数的，反推出来的「带了」并不可信。
+    // 一行日志就能省掉整轮猜测。
+    diag.debug('接口', '百度$path 查询参数：${_queryForLog(query, token)}');
+    return _http.post(
+      '$_gateway$path',
+      query: {
+        ...BaiduEndpoints.commonParams,
+        if (token != null && token.isNotEmpty) 'bdstoken': token,
+        ...query,
+      },
+      body: formBody,
+      headers: {
+        ..._headers(),
+        'Content-Type': BaiduEndpoints.formContentType,
+      },
+    );
+  }
+
   // -------------------------------------------------------------------
   // 小工具
   // -------------------------------------------------------------------
@@ -1311,6 +1834,23 @@ class BaiduAdapter extends CloudDriveAdapter {
     final n = int.tryParse(token);
     if (n == null || n < 1) return 1;
     return n;
+  }
+
+  /// 路径的末段（`/电影/a.mkv` → `a.mkv`）。
+  ///
+  /// 移动请求要显式带 `newname`（见 [moveFiles] 的文档），而它是从缓存
+  /// 路径里切出来的 —— 结尾的 `/` 要先去掉，否则目录会拿到空名字。
+  static String _baseName(String path) {
+    final trimmed =
+        path.endsWith('/') ? path.substring(0, path.length - 1) : path;
+    final i = trimmed.lastIndexOf('/');
+    return i < 0 ? trimmed : trimmed.substring(i + 1);
+  }
+
+  /// 把 [name] 拼到 [dir] 后面（`/` 只补一次）。
+  static String _joinPath(String dir, String name) {
+    if (dir.isEmpty) return '/$name';
+    return dir.endsWith('/') ? '$dir$name' : '$dir/$name';
   }
 
   static int? _asInt(Object? v) {

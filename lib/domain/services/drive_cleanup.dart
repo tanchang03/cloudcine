@@ -1,5 +1,6 @@
 import '../../core/utils/format.dart';
 import '../entities/drive_entry.dart';
+import '../entities/drive_provider.dart';
 import 'drive_batch.dart';
 
 /// 一批待删除的网盘条目 —— 批量删除的**计划与文案**。
@@ -16,10 +17,20 @@ import 'drive_batch.dart';
 /// 处理的是「网盘上已经没了、清索引」，这个处理的是「用户要主动删网盘上
 /// 的东西」—— 后者的后果不可逆，所以文案必须更明确。
 class DriveDeletePlan {
-  const DriveDeletePlan({required this.entries});
+  const DriveDeletePlan({required this.entries, this.provider});
 
   /// 用户勾选的那些条目（可能既有目录也有文件）。
   final List<DriveEntry> entries;
+
+  /// 这些条目所在的网盘 —— **只影响措辞**，不影响要发多少请求。
+  ///
+  /// 两家对「删除」的处理不一样：夸克那条是永久删除，百度的网页版删除会
+  /// 先进回收站。而 [irreversibleWarning] 是用户按下删除前读的**最后一段
+  /// 话** —— 在百度上读到的却是「夸克侧按永久删除处理」，是最刺眼的那种
+  /// 错误：它既说错了后果，又暴露了「这段文案是抄来的」。
+  ///
+  /// 可为 `null`：只关心数量、不关心是哪家的调用方（测试）用中性措辞。
+  final DriveProvider? provider;
 
   /// 一次请求最多带多少个 fid。
   ///
@@ -87,8 +98,27 @@ class DriveDeletePlan {
   /// 删掉的东西本应用没有能力恢复（它只是网盘的一个客户端），而用户对
   /// 「删除」这个词的预期常常是「进回收站，还能捞回来」。写成
   /// 「不可撤销」而不是「请确认」，是因为后者读起来像一句客套话。
-  String get irreversibleWarning =>
-      '删除后不可撤销：夸克侧按永久删除处理，本应用无法恢复。';
+  ///
+  /// ## 按网盘分岔，因为两家的后果确实不同
+  ///
+  ///   - **夸克**：`action_type=2` 是**永久删除**（实测过）；
+  ///   - **百度**：走网页版那条 `opera=delete`，网页版删除是进回收站的
+  ///     【未验证：本机没删过】。所以这里说「去回收站看看」，而**不**保证
+  ///     「一定能找回」—— 服务端策略随时会变，承诺一个我们控制不了的
+  ///     恢复路径，比不说更糟。
+  ///   - **[provider] 为 null**：中性措辞，不指名任何一家。
+  String get irreversibleWarning {
+    switch (provider) {
+      case DriveProvider.quark:
+        return '删除后不可撤销：夸克侧按永久删除处理，本应用无法恢复。';
+      case DriveProvider.baidu:
+        return '删除后不可撤销：文件会从百度网盘上移除，本应用无法恢复'
+            '（想找回只能去百度网盘网页版的回收站看看）。';
+      case DriveProvider.aliyun:
+      case null:
+        return '删除后不可撤销：文件会从网盘上移除，本应用无法恢复。';
+    }
+  }
 
   /// 确认按钮的文案。
   ///
@@ -103,8 +133,29 @@ class DriveDeletePlan {
   String deletedMessage({required int deleted, required int failed}) {
     if (failed == 0) return '已删除 $deleted 项，媒体库索引已同步清理。';
     if (deleted == 0) return '删除失败：$failed 项都没删掉，网盘上原样还在。';
-    return '已删除 $deleted 项，$failed 项失败（多半是限流，可以再试一次）。';
+    return '已删除 $deleted 项，$failed 项失败（$_failedHint）。';
   }
+
+  /// 那几项**为什么**没删掉 —— 只说我们真的知道的那部分。
+  ///
+  /// 一句「多半是限流」打天下是错的，两家的失败**形状**不同：
+  ///
+  ///   - **夸克**：整批请求被拒（429 / 凭证过期），所以失败是**按批**来的
+  ///     —— 一批全算失败。那确实基本是限流。
+  ///   - **百度**：`opera=delete` 一次带一批**路径**，响应里逐条 `errno`，
+  ///     所以失败是**按条**来的。常见的是目录里还有删不掉的子项
+  ///     （`onnest=fail` 让整条报错）或文件正被别的客户端占用。这种情况
+  ///     再说「限流」，会把用户支去反复重试 —— 而重试一百次也不会成功。
+  ///
+  /// 两句话都写成「常见原因」而不是断言：errno 我们拿得到，但它对用户
+  /// 没有意义（`-9` / `31066` / `-8` 各不相同），只写进诊断日志
+  /// （见 `BaiduAdapter.deleteFiles` 的 `百度删除部分被拒：… errno:path`）。
+  String get _failedHint => switch (provider) {
+        DriveProvider.baidu => '百度逐条拒了这几项，常见是目录里还有删不掉的'
+            '子项、或文件正被别的客户端占用；反复失败请看诊断日志里的 errno',
+        DriveProvider.quark => '多半是限流，可以再试一次',
+        DriveProvider.aliyun || null => '可以再试一次',
+      };
 
   @override
   String toString() => 'DriveDeletePlan($count 项, '

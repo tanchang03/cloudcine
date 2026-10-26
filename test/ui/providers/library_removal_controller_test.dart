@@ -26,9 +26,11 @@ import '../../support/fake_drive.dart';
 ///   1. **顺序反了**：先删索引就拿不到 fid 了（fid 只存在 `media_items`
 ///      里）—— 用户勾了「一并删」，网盘上却一个都没少；
 ///   2. **失败被吞掉**：提示说「已删除」，网盘上还占着几十 GB；
-///   3. **只读网盘被算成失败**：百度那条只读接入的文件根本删不了，
-///      算进失败数会让「3 个成功 2 个失败」这句话自相矛盾（弹窗已经说过
-///      那 2 个只会从媒体库移除）；
+///   3. **删不了的网盘被算成失败**：判据是 `Capabilities.canDelete`（不是
+///      `canWrite` —— 百度能删不能写）。判错的方向有两个，都很难查：
+///      把删不了的算成失败会让「3 个成功 2 个失败」这句话自相矛盾（弹窗
+///      已经说过那 2 个只会从媒体库移除）；反过来把能删的算成删不了，
+///      就是「百度接进来了却什么都删不掉」。
 ///   4. **不分块**：一百多个 fid 一次发出去，超时之后用户什么都拿不到。
 class _FakeAuth extends AuthController {
   @override
@@ -43,16 +45,38 @@ class _FakeAuth extends AuthController {
       );
 }
 
-/// 百度那一路：只读接入，`canWrite == false`。
-class _ReadOnlyDrive extends FakeDriveAdapter {
-  _ReadOnlyDrive() : super(const {});
+/// 一个**删不了**的网盘：`canDelete == false`。
+///
+/// ⚠️ 判据是 `canDelete` 而**不是** `canWrite`。百度现在正是「能删、不能写」
+/// （见 `BaiduAdapter` 的类文档），按 `canWrite` 判会把它的文件整批算成
+/// 「删不了」—— 那正是「百度接进来了却什么都删不掉」那个 bug 的一半。
+class _NoDeleteDrive extends FakeDriveAdapter {
+  _NoDeleteDrive() : super(const {});
 
   @override
   DriveProvider get provider => DriveProvider.baidu;
 
   @override
-  Capabilities get capabilities =>
-      const Capabilities(provider: DriveProvider.baidu, canWrite: false);
+  Capabilities get capabilities => const Capabilities(
+        provider: DriveProvider.baidu,
+        canWrite: false,
+        canDelete: false,
+      );
+}
+
+/// 一个**能删但不能写**的网盘 —— 百度现在的形状。
+class _DeleteOnlyDrive extends FakeDriveAdapter {
+  _DeleteOnlyDrive() : super(const {});
+
+  @override
+  DriveProvider get provider => DriveProvider.baidu;
+
+  @override
+  Capabilities get capabilities => const Capabilities(
+        provider: DriveProvider.baidu,
+        canWrite: false,
+        canDelete: true,
+      );
 }
 
 void main() {
@@ -178,10 +202,10 @@ void main() {
         reason: '主操作是「从媒体库移除」，不能因为附加动作失败而变成空操作');
   });
 
-  test('只读网盘的文件被跳过，且不算进失败数', () async {
+  test('删不了的网盘（canDelete=false）的文件被跳过，且不算进失败数', () async {
     final s = await setup(
       extra: [item('b1', 'work-a', provider: DriveProvider.baidu)],
-      second: _ReadOnlyDrive(),
+      second: _NoDeleteDrive(),
     );
 
     final tally = await s.c.read(libraryRemovalControllerProvider).tally({'work-a'});
@@ -196,7 +220,33 @@ void main() {
     expect(s.adapter.deletedIds, unorderedEquals(['a1', 'a2', 'a3']));
     expect(out.drive?.deleted, 3);
     expect(out.drive?.failed, 0,
-        reason: '只读网盘的文件不该算失败 —— 弹窗已经单独说过它们删不了');
+        reason: '删不了的网盘的文件不该算失败 —— 弹窗已经单独说过它们删不了');
+  });
+
+  test('⛔ 能删但不能写的网盘（百度现状）的文件**照样删**', () async {
+    // 这就是用户报的那个 bug 的回归测试：百度只读接入时，它的文件被
+    // `canWrite == false` 判成「删不了」，于是文件夹页/媒体库都说删不掉。
+    final s = await setup(
+      extra: [item('b1', 'work-a', provider: DriveProvider.baidu)],
+      second: _DeleteOnlyDrive(),
+    );
+
+    final tally = await s.c.read(libraryRemovalControllerProvider).tally({'work-a'});
+    expect(tally.deletable, 4,
+        reason: '百度能删 —— 判成 3 就等于把它的文件当成「网盘上删不掉」');
+    expect(tally.undeletable, 0);
+
+    final out = await s.c.read(libraryRemovalControllerProvider).remove(
+      keys: {'work-a'},
+      alsoDeleteFromDrive: true,
+    );
+
+    expect(s.adapter.deletedIds, unorderedEquals(['a1', 'a2', 'a3']));
+    expect((s.c.read(adapterRegistryProvider).adapterFor(DriveProvider.baidu)
+            as FakeDriveAdapter)
+        .deletedIds, ['b1'], reason: '百度那一路必须真的收到删除请求');
+    expect(out.drive?.deleted, 4);
+    expect(out.drive?.failed, 0);
   });
 
   test('超过 100 个文件要分批发', () async {

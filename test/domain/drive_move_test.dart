@@ -1,4 +1,5 @@
 import 'package:cloudcine/domain/entities/drive_entry.dart';
+import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/services/drive_batch.dart';
 import 'package:cloudcine/domain/services/drive_cleanup.dart';
 import 'package:cloudcine/domain/services/drive_move.dart';
@@ -39,11 +40,12 @@ void main() {
 
   /// 只关心「目标合不合法」时用这个：源目录固定为根。
   DriveMovePlan planAt(String sourceDirPath, List<DriveEntry> entries,
-          MoveTarget t) =>
+          MoveTarget t, {DriveProvider? provider}) =>
       DriveMovePlan(
         entries: entries,
         sourceDirPath: sourceDirPath,
         target: t,
+        provider: provider,
       );
 
   group('MoveTarget', () {
@@ -438,6 +440,38 @@ void main() {
           reason: '一次都没成功时必须说清「网盘上原样还在」—— 否则用户'
               '不知道东西到底还在不在，可能去目标目录里找、也可能以为'
               '丢了。');
+    });
+
+    group('部分失败的那句「为什么」按网盘分岔', () {
+      // 与 `DriveDeletePlan` 同一条理由：夸克按**批**失败（429），
+      // 百度按**条**失败（`info[].errno`）。说反了会把人支去白试。
+      test('百度：指向「目标目录已有同名文件」，而不是限流', () {
+        final plan = planAt('/电影', [file('a')], target('d2', '/纪录片'),
+            provider: DriveProvider.baidu);
+        final msg = plan.movedMessage(moved: 3, failed: 2);
+
+        expect(msg, isNot(contains('限流')),
+            reason: '百度移动的逐条拒绝最常见是目标已有同名文件 —— '
+                '重试一百次还是同一个结果。说成限流就是让人白试。');
+        expect(msg, contains('同名'));
+        expect(msg, contains('重试也一样'),
+            reason: '必须说清这条**不该**重试，否则用户只会反复点。');
+      });
+
+      test('夸克：说限流，可以再试', () {
+        final plan = planAt('/电影', [file('a')], target('d2', '/纪录片'),
+            provider: DriveProvider.quark);
+        expect(plan.movedMessage(moved: 3, failed: 2), contains('限流'));
+      });
+
+      test('不知道是哪家（null）：中性措辞，不指名任何一家', () {
+        final plan = planAt('/电影', [file('a')], target('d2', '/纪录片'));
+        final msg = plan.movedMessage(moved: 3, failed: 2);
+
+        expect(msg, isNot(contains('限流')));
+        expect(msg, isNot(contains('百度')));
+        expect(msg, isNot(contains('夸克')));
+      });
     });
   });
 }

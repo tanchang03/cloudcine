@@ -28,6 +28,8 @@ class FakeDriveAdapter extends CloudDriveAdapter {
     this.deleteFailsOnBatch,
     this.moveFailsWith,
     this.moveFailsOnBatch,
+    this.rejectIds,
+    this.capabilitiesOverride,
   }) : tree = {
           for (final e in tree.entries) e.key: [...e.value],
         };
@@ -78,6 +80,39 @@ class FakeDriveAdapter extends CloudDriveAdapter {
   /// 只让第几批（从 1 开始）移动失败。理由与 [deleteFailsOnBatch] 相同。
   final Set<int>? moveFailsOnBatch;
 
+  /// 服务端**逐条拒掉**的 fid：不抛异常，只是不出现在返回值里、也没真的动。
+  ///
+  /// ## 为什么这个形状必须能造出来
+  ///
+  /// 百度的删除/移动响应里带**每一条**的 `errno`（见 `BaiduAdapter.deleteFiles`
+  /// 与 `moveFiles` 里的 `info[]` 解析）。一个请求里 100 条，其中 3 条被拒
+  /// （比如正在被别的客户端占用），接口照样返回 `errno: 0` —— 那 3 条只是
+  /// 不出现在成功列表里。于是 `deleteFiles` / `moveFiles` 的返回值**比入参
+  /// 短**，这是夸克那条路径上不存在的形状。
+  ///
+  /// 控制器若只按「返回值长度」记账，提示就是「已删除 100 项」而列表里还
+  /// 剩 3 个 —— 用户会以为界面没刷新，再点一次删除。差额必须算成失败。
+  ///
+  /// ⚠️ 被拒的条目**留在树上**（它确实没动）。这一点与 [deleteFailsOnBatch]
+  /// 不同：那个是整批抛异常、树上一条没少。
+  final Set<String>? rejectIds;
+
+  /// 这一批里真正会被接受（会动、会出现在返回值里）的 fid。
+  List<String> _accepted(List<String> fileIds) {
+    final rejected = rejectIds;
+    if (rejected == null || rejected.isEmpty) return fileIds;
+    return fileIds.where((id) => !rejected.contains(id)).toList(growable: false);
+  }
+
+  /// 顶掉默认的能力声明。
+  ///
+  /// ⚠️ 三个写能力位（`canWrite` / `canDelete` / `canMove`）**默认全 true**，
+  /// 与夸克一致。要测「这家不支持删除 / 移动时界面怎么表现」就必须能单独
+  /// 关掉其中一个 —— 而 UI 读的是**能力位本身**，不是网盘名，所以这里
+  /// 只翻位、不改 `provider`（改了的话 `AdapterRegistry` 按 provider 建索引，
+  /// `browseProvider` 就找不到这个替身了，页面会直接空掉）。
+  final Capabilities? capabilitiesOverride;
+
   /// 按顺序记下每次列目录的目录 id。
   final List<String> listedDirs = [];
 
@@ -112,10 +147,14 @@ class FakeDriveAdapter extends CloudDriveAdapter {
     // 真的从树里抠掉：测试要验「删完之后重列，那些条目确实不见了」，
     // 而只记一笔请求的话，重列还会把同一批条目吐回来 —— 那样测试就会
     // 对「界面有没有刷新」给出错误的信心。
+    //
+    // 只抠**被接受的**那些：`rejectIds` 里的条目服务端没删，树上也就
+    // 不该少（见 [rejectIds]）。
+    final accepted = _accepted(fileIds);
     for (final entries in tree.values) {
-      entries.removeWhere((e) => fileIds.contains(e.id));
+      entries.removeWhere((e) => accepted.contains(e.id));
     }
-    return fileIds;
+    return accepted;
   }
 
   @override
@@ -143,16 +182,17 @@ class FakeDriveAdapter extends CloudDriveAdapter {
     // 遍历中抛 `ConcurrentModificationError`（只在目标目录还没出现在树上
     // 时复现，是个很难看的间歇失败）。
     final moving = <DriveEntry>[];
+    final accepted = _accepted(fileIds);
     for (final entries in tree.values) {
-      moving.addAll(entries.where((e) => fileIds.contains(e.id)));
+      moving.addAll(entries.where((e) => accepted.contains(e.id)));
     }
     for (final entries in tree.values) {
-      entries.removeWhere((e) => fileIds.contains(e.id));
+      entries.removeWhere((e) => accepted.contains(e.id));
     }
     if (moving.isNotEmpty) {
       tree.putIfAbsent(targetFolderId, () => <DriveEntry>[]).addAll(moving);
     }
-    return fileIds;
+    return accepted;
   }
 
   @override
@@ -160,6 +200,7 @@ class FakeDriveAdapter extends CloudDriveAdapter {
 
   @override
   Capabilities get capabilities =>
+      capabilitiesOverride ??
       const Capabilities(provider: DriveProvider.quark, canListDirectory: true);
 
   @override

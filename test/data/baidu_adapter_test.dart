@@ -1,11 +1,13 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:cloudcine/core/diagnostics/diag_log.dart';
 import 'package:cloudcine/core/error/drive_error.dart';
 import 'package:cloudcine/data/http/http_client.dart';
 import 'package:cloudcine/data/http/token_bucket.dart';
 import 'package:cloudcine/data/remote/baidu/baidu_adapter.dart';
 import 'package:cloudcine/data/remote/baidu/baidu_endpoints.dart';
+import 'package:cloudcine/data/remote/baidu/baidu_error_mapper.dart';
 import 'package:cloudcine/domain/adapters/credential_store.dart';
 import 'package:cloudcine/domain/entities/auth_credential.dart';
 import 'package:cloudcine/domain/entities/capabilities.dart';
@@ -13,7 +15,7 @@ import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/quality_option.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// 百度适配器（**只读**：授权 / 遍历 / 取流）。
+/// 百度适配器（授权 / 遍历 / 取流 / **删除**）。
 ///
 /// ## 这一组测试守什么
 ///
@@ -22,10 +24,19 @@ import 'package:flutter_test/flutter_test.dart';
 ///    而服务端对不存在的路径**不报错**，只回一个空列表。
 /// 2. **取链的三条路由各自独立**。任何一条失败都还有别的路可走，
 ///    而「三条都试过才算失败」这件事只能靠请求记录来断言。
-/// 3. **只读边界**。四个写方法必须走基类的 `unsupported` 默认实现 ——
-///    这条一旦破了就是**用户数据损失**。
+/// 3. **写边界**。删除之外的三个写方法必须走基类的 `unsupported` 默认实现，
+///    而删除必须真的发出去 —— 后者是「接进来了却什么都删不掉」那个 bug 的
+///    回归测试。
 /// 一次请求的记录（断言「打了哪个接口、带什么参数」）。
 typedef Call = ({String path, Map<String, Object?> query});
+
+/// 一次 **POST** 的记录（删除走表单 POST，参数在 body 里，不在 query 里）。
+typedef PostCall = ({
+  String path,
+  Map<String, Object?> query,
+  String body,
+  Map<String, String> headers,
+});
 
 /// 按**路径**路由的假 HTTP 客户端。
 ///
@@ -43,7 +54,13 @@ class FakeHttp implements HttpClientLike {
   /// `Origin`」这条 —— 请求头不进 [calls]，只看路径断言不出来。
   final List<Map<String, String>> headerCalls = [];
 
+  /// 每次 `post` 的完整记录。
+  final List<PostCall> postCalls = [];
+
   List<Call> callsTo(String path) => calls.where((c) => c.path == path).toList();
+
+  List<PostCall> postsTo(String path) =>
+      postCalls.where((c) => c.path == path).toList();
 
   /// 按**请求头**路由的处理器（同一个 URL、只有请求头不同时用）。
   ///
@@ -83,8 +100,20 @@ class FakeHttp implements HttpClientLike {
     Map<String, Object?>? query,
     Map<String, String>? headers,
     Duration? timeout,
-  }) =>
-      throw UnimplementedError('百度适配器不该用 POST');
+  }) async {
+    final path = Uri.parse(url).path;
+    postCalls.add((
+      path: path,
+      query: query ?? const {},
+      body: body is String ? body : '$body',
+      headers: headers ?? const <String, String>{},
+    ));
+    final handler = routes[path];
+    if (handler == null) {
+      return const HttpResult(statusCode: 404, rawBody: '');
+    }
+    return handler(query ?? const {});
+  }
 
   @override
   Future<Uint8List?> getBytes(
@@ -1164,16 +1193,133 @@ void main() {
   });
 
   // -------------------------------------------------------------------
-  // 只读边界
+  // 移动：同一个端点，但 filelist 是**对象数组**
   // -------------------------------------------------------------------
 
-  group('⛔ 只读边界：四个写方法必须是 unsupported', () {
-    test('createFolder / deleteFiles / moveFiles / uploadFile 一律抛 unsupported',
+  group('moveFiles', () {
+    /// 把 `filelist=` 那段表单体解回对象数组。
+    List<Map<String, Object?>> moveListOf(PostCall call) {
+      const prefix = '${BaiduEndpoints.fileListField}=';
+      final raw = Uri.decodeQueryComponent(call.body.substring(prefix.length));
+      return (jsonDecode(raw) as List).cast<Map<String, Object?>>();
+    }
+
+    test('发一次对象数组：path / dest / newname 三个键都要给', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+      r.adapter.primeFilePath('99', '/归档');
+
+      final moved =
+          await r.adapter.moveFiles(fileIds: ['1'], targetFolderId: '99');
+
+      expect(moved, ['1']);
+      final post = r.http.postsTo(BaiduEndpoints.fileManager).single;
+      expect(post.query['opera'], BaiduEndpoints.operaMove);
+      expect(
+        moveListOf(post),
+        [
+          {'path': '/电影/a.mkv', 'dest': '/归档', 'newname': 'a.mkv'},
+        ],
+        reason: '移动收的是**对象**数组，与删除那个路径数组不是同一个形状；'
+            'newname 显式给，不靠服务端从旧路径推断',
+      );
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia),
+        isEmpty,
+        reason: '源路径与目标目录都在缓存里，不该为一次移动再解析两次',
+      );
+    });
+
+    test('⛔ 移完要改写路径缓存（否则同一次会话里再播会找不到文件）', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+      r.adapter.primeFilePath('99', '/归档');
+
+      await r.adapter.moveFiles(fileIds: ['1'], targetFolderId: '99');
+      // 再删同一个 fid：路径缓存若没改写，这里会拿**旧**路径发出去。
+      await r.adapter.deleteFiles(fileIds: ['1']);
+
+      final delete = r.http.postsTo(BaiduEndpoints.fileManager).last;
+      expect(
+        Uri.decodeQueryComponent(
+          delete.body.substring('${BaiduEndpoints.fileListField}='.length),
+        ),
+        '["/归档/a.mkv"]',
+        reason: '移动不改 fid 但改路径 —— 缓存留着旧路径的话，播放会去请求'
+            '一条已经不存在的路径，报「文件不存在」而文件就在新目录里',
+      );
+    });
+
+    test('逐条被拒：被拒的不算移动成功', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'errno': 0, 'path': '/a.mkv'},
+                {'errno': -8, 'path': '/b.mkv'},
+              ],
+            }),
+      });
+      r.adapter.primeFilePath('1', '/a.mkv');
+      r.adapter.primeFilePath('2', '/b.mkv');
+      r.adapter.primeFilePath('99', '/归档');
+
+      expect(
+        await r.adapter.moveFiles(fileIds: ['1', '2'], targetFolderId: '99'),
+        ['1'],
+      );
+    });
+
+    test('全部被拒 ⇒ 抛错，不假装移过去了', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'errno': -8, 'path': '/a.mkv'},
+              ],
+            }),
+      });
+      r.adapter.primeFilePath('1', '/a.mkv');
+      r.adapter.primeFilePath('99', '/归档');
+
+      await expectLater(
+        r.adapter.moveFiles(fileIds: ['1'], targetFolderId: '99'),
+        throwsA(
+          isA<DriveException>()
+              .having((e) => e.type, 'type', DriveErrorType.permissionDenied),
+        ),
+      );
+    });
+
+    test('目标目录解析不出来 ⇒ 不发请求（拿空 dest 发出去只会移错地方）',
         () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      await expectLater(
+        r.adapter.moveFiles(fileIds: ['1'], targetFolderId: '999'),
+        throwsA(isA<DriveException>()),
+      );
+      expect(r.http.postsTo(BaiduEndpoints.fileManager), isEmpty);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // 写边界
+  // -------------------------------------------------------------------
+
+  group('⛔ 写边界：删除与移动支持，上传与建目录必须是 unsupported', () {
+    test('createFolder / uploadFile 一律抛 unsupported', () async {
       final r = await ready();
 
       Future<void> expectUnsupported(Future<Object?> Function() call) async {
-        // ⚠️ 必须 `Future.sync` 包一层：基类那四个默认实现**同步**抛
+        // ⚠️ 必须 `Future.sync` 包一层：基类那几个默认实现**同步**抛
         // （它们不是 `async` 函数），直接 `call()` 会在构造 Future 之前就抛，
         // `expectLater` 拿不到 Future，测试会以「抛出了未捕获异常」失败 ——
         // 看起来像「适配器不支持」这件事本身错了。
@@ -1188,10 +1334,6 @@ void main() {
 
       await expectUnsupported(
         () => r.adapter.createFolder(parentId: '/', name: '云影备份'),
-      );
-      await expectUnsupported(() => r.adapter.deleteFiles(fileIds: ['1']));
-      await expectUnsupported(
-        () => r.adapter.moveFiles(fileIds: ['1'], targetFolderId: '/'),
       );
       await expectUnsupported(
         () => r.adapter.uploadFile(
@@ -1214,6 +1356,31 @@ void main() {
       expect(caps.hasFileSizeLimit, isFalse);
     });
 
+    test('⛔ 能力位：能删、能移、不能写（三者必须分开，否则备份会挑中百度）',
+        () async {
+      final r = await ready();
+      final caps = r.adapter.capabilities;
+
+      expect(
+        caps.canDelete,
+        isTrue,
+        reason: '文件夹页的「多选 → 删除」是用户清理网盘空间的唯一出口；'
+            '这里为 false 就等于「百度接进来了却什么都删不掉」',
+      );
+      expect(
+        caps.canMove,
+        isTrue,
+        reason: '移动同理。而且它**不能**跟着 canWrite 走 —— 百度能移不能传，'
+            '按 canWrite 判会把移动按钮白白置灰',
+      );
+      expect(
+        caps.canWrite,
+        isFalse,
+        reason: '上传 / 建目录没实现。为 true 会让备份上传挑中百度，'
+            '然后用户点「备份」只拿到一句 unsupported',
+      );
+    });
+
     test('ownsUrl 按 baidu.com 后缀判（缩略图主机有好几个）', () async {
       final r = await ready();
       expect(r.adapter.ownsUrl('https://thumbnail.baidu.com/a.jpg'), isTrue);
@@ -1225,6 +1392,268 @@ void main() {
     test('根目录 id 是路径 `/`，不是夸克那种 `0`', () async {
       final r = await ready();
       expect(r.adapter.rootId, '/');
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // 删除：百度收的是**路径**，请求体是**表单**
+  // -------------------------------------------------------------------
+
+  group('deleteFiles', () {
+    /// 把 `filelist=` 那段表单体解回路径数组。
+    ///
+    /// 断言必须走**解码后**的值：编码对不对（中文目录名）是这条链路上最
+    /// 容易错的一环，而 `contains('/电影')` 这种断言在编码正确时也会过 ——
+    /// 它同时会放过「编码正确但字段名写错」。
+    List<String> fileListOf(PostCall call) {
+      const prefix = '${BaiduEndpoints.fileListField}=';
+      expect(call.body.startsWith(prefix), isTrue,
+          reason: '体里必须只有 filelist 一个字段，实际=${call.body}');
+      final raw = Uri.decodeQueryComponent(call.body.substring(prefix.length));
+      return (jsonDecode(raw) as List).cast<String>();
+    }
+
+    test('按路径发一次表单 POST，返回删掉的 fid', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'errno': 0, 'path': '/电影/a.mkv'},
+                {'errno': 0, 'path': '/电影/b.mkv'},
+              ],
+            }),
+      });
+      // 文件夹页勾选删除时，这些路径**一定**刚被 listDirectory 填过；
+      // 这里直接预热，等价于那个状态。
+      r.adapter.primeFilePath('101', '/电影/a.mkv');
+      r.adapter.primeFilePath('102', '/电影/b.mkv');
+
+      final deleted = await r.adapter.deleteFiles(fileIds: ['101', '102']);
+
+      expect(deleted, ['101', '102']);
+      final post = r.http.postsTo(BaiduEndpoints.fileManager).single;
+      expect(post.query['opera'], 'delete');
+      expect(post.query['async'], BaiduEndpoints.fileManagerAsync);
+      expect(post.query['onnest'], 'fail',
+          reason: '删目录时子项失败要整体报错，不能「删一半当成功」');
+      expect(
+        post.headers['Content-Type'],
+        BaiduEndpoints.formContentType,
+        reason: 'dio 对 String 体的默认类型是 text/plain，服务端按表单解析 —— '
+            '类型不对会回 errno=2（参数错误），看起来像路径写错了',
+      );
+      expect(
+        fileListOf(post),
+        ['/电影/a.mkv', '/电影/b.mkv'],
+        reason: 'filelist 收的是**路径**数组，不是 fs_id',
+      );
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia),
+        isEmpty,
+        reason: '路径已经在缓存里，不该为一个删除动作再打一次路径解析',
+      );
+    });
+
+    test('多个未命中路径 ⇒ **一次**批量解析，不是逐条问', () async {
+      // 逐条问的代价是**按条数**增长：100 个文件 × 2 QPS = 50 秒，而删除
+      // 本身只要一次往返。用户看到的是「点了删除，转圈快一分钟」。
+      final r = await ready(routes: {
+        BaiduEndpoints.xpanMultimedia: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'fs_id': 1, 'path': '/a.mkv'},
+                {'fs_id': 2, 'path': '/b.mkv'},
+              ],
+            }),
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+
+      await r.adapter.deleteFiles(fileIds: ['1', '2']);
+
+      final resolves = r.http.callsTo(BaiduEndpoints.xpanMultimedia);
+      expect(resolves, hasLength(1), reason: '一次请求就该把两条都解析出来');
+      expect(resolves.single.query['fsids'], '[1,2]',
+          reason: 'fsids 收的是数字数组');
+      expect(fileListOf(r.http.postsTo(BaiduEndpoints.fileManager).single),
+          ['/a.mkv', '/b.mkv']);
+    });
+
+    test('⛔ 部分翻不出路径 ⇒ 只删能解析的那些，返回值比入参短', () async {
+      // 这是「上层要按差额算失败」的**源头**：`deleteFiles` 的返回值可能比
+      // `fileIds` 短，而两个调用方（`DriveCleanupController` /
+      // `LibraryRemovalController`）都得靠 `发出数 − 返回数` 才知道有几个
+      // 没删掉。这里把那个形状钉住，否则哪天有人「顺手」把 unresolved 的
+      // 也塞进返回值，控制器的记账就静默失效了 —— 提示会说「已删除 2 项」，
+      // 而盘上还剩一个。
+      final r = await ready(routes: {
+        BaiduEndpoints.xpanMultimedia: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'fs_id': 1, 'path': '/a.mkv'},
+              ],
+            }),
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+
+      final deleted = await r.adapter.deleteFiles(fileIds: ['1', '2']);
+
+      expect(deleted, ['1']);
+      expect(
+        fileListOf(r.http.postsTo(BaiduEndpoints.fileManager).single),
+        ['/a.mkv'],
+        reason: '翻不出路径的那条**不能**发进请求：拿 fs_id 当路径发过去，'
+            '服务端会回「文件不存在」，把「路径没解析出来」伪装成「文件已经'
+            '不在了」—— 而后者会诱导上层去清本地索引',
+      );
+    });
+
+    test('逐条 errno：被拒的从返回值里摘掉（上层据此算失败数）', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'errno': 0, 'path': '/a.mkv'},
+                {'errno': -9, 'path': '/b.mkv'},
+              ],
+            }),
+      });
+      r.adapter.primeFilePath('1', '/a.mkv');
+      r.adapter.primeFilePath('2', '/b.mkv');
+
+      final deleted = await r.adapter.deleteFiles(fileIds: ['1', '2']);
+
+      expect(deleted, ['1'],
+          reason: '被拒的那条必须从返回值里消失，否则提示会说「已删除 2 项」'
+              '而盘上还留着一个');
+    });
+
+    test('全部被拒 ⇒ 抛错，不假装删掉了', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'errno': -9, 'path': '/a.mkv'},
+              ],
+            }),
+      });
+      r.adapter.primeFilePath('1', '/a.mkv');
+
+      await expectLater(
+        r.adapter.deleteFiles(fileIds: ['1']),
+        throwsA(
+          isA<DriveException>()
+              .having((e) => e.type, 'type', DriveErrorType.permissionDenied)
+              .having((e) => e.providerCode, 'providerCode', -9),
+        ),
+      );
+    });
+
+    test('async 只回 taskid（info 缺席）⇒ 按「请求已受理」回报全部', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0, 'taskid': 42}),
+      });
+      r.adapter.primeFilePath('1', '/a.mkv');
+
+      expect(await r.adapter.deleteFiles(fileIds: ['1']), ['1'],
+          reason: '契约本来就是**请求粒度**：读不到逐条结果时只能如实回报'
+              '「请求成功了」，不能反过来报成失败让用户重删一遍');
+    });
+
+    test('⛔ 翻不出路径 ⇒ 不发请求、不拿 fs_id 冒充路径', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+
+      await expectLater(
+        r.adapter.deleteFiles(fileIds: ['999']),
+        throwsA(isA<DriveException>()),
+      );
+      expect(
+        r.http.postsTo(BaiduEndpoints.fileManager),
+        isEmpty,
+        reason: '拿 fs_id 当路径发过去，服务端会回「文件不存在」—— 那会把'
+            '「路径没解析出来」伪装成「文件已经不在了」',
+      );
+    });
+
+    test('⛔ 库里那条旧路径不许盖掉服务端刚给的路径', () async {
+      // 这是「预热」唯一能造成**误删**的路径，所以必须钉住。
+      //
+      // 顺序是常见的那个：用户在文件夹页看过 `/归档`（缓存被服务端刚给的
+      // 路径填满），然后去媒体库删同一个文件 —— 而库里那条记录是三天前
+      // 扫的，`dir_path` 还停在 `/电影`。要是预热无条件覆盖，删除请求就会
+      // 带一条陈旧路径：轻则 `-9`（文件不存在），重则那条旧路径上现在
+      // **住着另一个文件**，删掉的是它。
+      final r = await ready(routes: {
+        BaiduEndpoints.list: (_) => listing('/归档/'),
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+
+      await r.adapter.listDirectory(dirId: r.adapter.rootId);
+      // 库里那条旧记录（三天前扫的）。
+      r.adapter.primeFilePath('101', '/电影/a.mkv');
+
+      await r.adapter.deleteFiles(fileIds: ['101']);
+
+      expect(
+        fileListOf(r.http.postsTo(BaiduEndpoints.fileManager).single),
+        ['/归档/a.mkv'],
+        reason: '服务端几秒前刚说它在 /归档；库里的 /电影 是三天前的事实。'
+            '预热只该填空位，不该把新的改成旧的。',
+      );
+    });
+
+    test('⛔ 请求体也进日志（形状错了才有对照物）', () async {
+      // 这条接口没有真机验证过，而形状错（数组还是对象、字段名、表单类型）
+      // 服务端只会回一个 `errno=2`。只记响应的话，排查时得从代码反推
+      // 「我们到底发了什么」—— 而代码随时可能被改。两边都留着，才有对照物。
+      diag.clearBuffer();
+      addTearDown(diag.clearBuffer);
+
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      await r.adapter.deleteFiles(fileIds: ['1']);
+
+      expect(diag.lines.join('\n'), contains('请求体：filelist='),
+          reason: '要能一眼看出「发出去的是 filelist=[...]」，'
+              '而不是靠读代码猜');
+    });
+
+    test('删掉之后路径缓存要跟着失效（否则再播会拿到 CDN 403）', () async {
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'errno': 0, 'path': '/剧集/S01'},
+              ],
+            }),
+        BaiduEndpoints.xpanMultimedia: (_) => ok({
+              'errno': 0,
+              'info': [
+                {'fs_id': 7, 'path': '/剧集/S01'},
+              ],
+            }),
+      });
+      r.adapter.primeFilePath('7', '/剧集/S01');
+      // 目录下面那些子项也曾在缓存里（列过目录就白捡一批）。
+      r.adapter.primeFilePath('8', '/剧集/S01/E01.mkv');
+
+      await r.adapter.deleteFiles(fileIds: ['7']);
+
+      // 第二次删同一个 fid：缓存已清 ⇒ 必然回去解析路径。
+      await expectLater(
+        r.adapter.deleteFiles(fileIds: ['7']),
+        completes,
+      );
+      expect(
+        r.http.callsTo(BaiduEndpoints.xpanMultimedia),
+        hasLength(1),
+        reason: '缓存清了才会解析；没清的话这里会是 0 —— 而残留的路径会让'
+            '同一次会话里再点播放去请求一条指向已删文件的直链',
+      );
     });
   });
 
@@ -1333,6 +1762,153 @@ void main() {
         hasLength(1),
         reason: '两条来源各试一次就够 —— 客户端也是「先 A 后 B」的兜底顺序',
       );
+    });
+
+    // -----------------------------------------------------------------
+    // 写操作：缺令牌回的是 8001，不是 -6
+    // -----------------------------------------------------------------
+
+    /// `filemanager` **只在带了 `bdstoken`** 时才受理 —— 复刻实测的
+    /// `8001` 语义（2026-10-26 10:08:27 的日志）。
+    Map<String, HttpResult Function(Map<String, Object?> q)> fmNeedsToken() =>
+        {
+          BaiduEndpoints.fileManager: (q) => q['bdstoken'] == null
+              ? errno(BaiduErrorCode.writeRejected)
+              : ok({'errno': 0}),
+        };
+
+    test('⛔ 写操作缺令牌回 8001（不是 -6）⇒ 令牌必须在**发请求之前**就位',
+        () async {
+      // 这条是那个真机 bug 的回归测试。
+      //
+      // 旧行为：`_ensureBdstoken()` 只在收到 `-6` 时才被调用。而写接口缺
+      // 令牌回的是 `8001` —— 自愈永远等不到它要的码，于是每次删除都发
+      // 一个注定被拒的请求，日志里 `bdstoken` 一次都没取过。
+      final r = await ready(routes: {...tokenRoutes(), ...fmNeedsToken()});
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      expect(await r.adapter.deleteFiles(fileIds: ['1']), ['1'],
+          reason: '不带令牌时服务端回 8001；能删掉就说明令牌真的带上了');
+
+      final post = r.http.postsTo(BaiduEndpoints.fileManager).single;
+      expect(post.query['bdstoken'], 'BDSTOKEN-1',
+          reason: '写操作必须带会话令牌 —— 缺它服务端回 8001，'
+              '而用户看到的是「未知错误」，重试多少次都一样');
+      expect(
+        r.http.callsTo(BaiduEndpoints.gettemplatevariable),
+        hasLength(1),
+        reason: '只在没有令牌时取一次，取到就缓存',
+      );
+    });
+
+    test('⛔ 移动同样要先取令牌（同一个端点、同一道门）', () async {
+      final r = await ready(routes: {
+        ...tokenRoutes(),
+        ...fmNeedsToken(),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+      r.adapter.primeFilePath('99', '/归档');
+
+      await r.adapter.moveFiles(fileIds: ['1'], targetFolderId: '99');
+
+      expect(
+        r.http.postsTo(BaiduEndpoints.fileManager).single.query['bdstoken'],
+        'BDSTOKEN-1',
+        reason: '删除与移动共用 /api/filemanager，令牌要求也一样',
+      );
+    });
+
+    test('⛔ 8001 要报成**可处置**的错误，不是「未知错误」', () async {
+      // 旧行为：8001 落进 `unknown` 兜底，文案是「百度网盘接口返回未知
+      // 错误」—— 用户据此唯一能做的事是「再点一次」，而再点一次必然
+      // 同样失败。错误码没被命名，等于把「去网页版验证」这条出路藏了。
+      final r = await ready(routes: {
+        ...tokenRoutes(),
+        BaiduEndpoints.fileManager: (_) => errno(BaiduErrorCode.writeRejected),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      await expectLater(
+        r.adapter.deleteFiles(fileIds: ['1']),
+        throwsA(
+          isA<DriveException>()
+              .having((e) => e.providerCode, 'providerCode', 8001)
+              .having((e) => e.type, 'type', DriveErrorType.permissionDenied)
+              .having((e) => e.message, 'message', contains('8001'))
+              .having((e) => e.message, 'message', contains('bdstoken')),
+        ),
+      );
+    });
+
+    test('取不到令牌也照发：不把「取令牌失败」升级成「功能不可用」', () async {
+      // 取舍：令牌取不到时**仍然发请求**，而不是就地抛错。
+      //
+      // 就地抛错看起来更「诚实」，代价是一次网络抖动就会让删除按钮永久
+      // 失效（`_ensureBdstoken` 失败不缓存，但用户拿到的仍然是「删不了」）。
+      // 而发出去至少还有成功的可能，失败时 8001 的文案已经把两种出路
+      // 都写了。这条测试钉住的是「不许改成抛错」。
+      final r = await ready(routes: {
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      expect(await r.adapter.deleteFiles(fileIds: ['1']), ['1']);
+
+      final post = r.http.postsTo(BaiduEndpoints.fileManager).single;
+      expect(post.query.containsKey('bdstoken'), isFalse,
+          reason: '没有令牌就不带，不能塞一个空串冒充');
+      expect(
+        r.http.callsTo(BaiduEndpoints.gettemplatevariable),
+        hasLength(1),
+        reason: '两条来源都要试过（这里是 404），才认「取不到」',
+      );
+      expect(r.http.callsTo(BaiduEndpoints.getTemplate), hasLength(1));
+    });
+
+    test('未授权时不去取令牌：别发两条注定被拒的请求', () async {
+      // 路径已在缓存里 ⇒ `_resolvePaths` 不会先去撞未授权，于是流程会走到
+      // 「先取令牌」那一步。此时没有 Cookie，取令牌必然是两次 401 ——
+      // 那两条噪音会让日志看起来像「令牌坏了」，其实是**没登录**。
+      final r = await ready(withSession: false, restore: false);
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      await expectLater(
+        r.adapter.deleteFiles(fileIds: ['1']),
+        throwsA(
+          isA<DriveException>()
+              .having((e) => e.type, 'type', DriveErrorType.unauthorized),
+        ),
+      );
+
+      expect(
+        r.http.callsTo(BaiduEndpoints.gettemplatevariable),
+        isEmpty,
+        reason: '没登录时取令牌毫无意义，只会把「未授权」淹没在 401 里',
+      );
+      expect(r.http.postsTo(BaiduEndpoints.fileManager), isEmpty);
+    });
+
+    test('⛔ 查询参数要进日志：一眼看出令牌带没带', () async {
+      // 这次排查最贵的一步是「令牌到底带没带」—— 日志里只有请求体和
+      // 请求头，而 `_post` 在令牌为空时是**静默省略**该参数的。于是只能
+      // 从代码反推，而代码随时可能被改。这一行日志就是为了不再反推。
+      diag.clearBuffer();
+      addTearDown(diag.clearBuffer);
+
+      final r = await ready(routes: {
+        ...tokenRoutes(),
+        BaiduEndpoints.fileManager: (_) => ok({'errno': 0}),
+      });
+      r.adapter.primeFilePath('1', '/电影/a.mkv');
+
+      await r.adapter.deleteFiles(fileIds: ['1']);
+
+      final log = diag.lines.join('\n');
+      expect(log, contains('查询参数：'), reason: '要有一行专门报查询参数');
+      expect(log, contains('bdstoken=有'),
+          reason: '取到了就报「有」—— 只报有无，不报值（它是凭证）');
+      expect(log, isNot(contains('BDSTOKEN-1')),
+          reason: '令牌的值**不许**落盘');
     });
   });
 }

@@ -2,6 +2,7 @@ import 'package:cloudcine/data/db/app_database.dart';
 import 'package:cloudcine/data/db/settings_store.dart';
 import 'package:cloudcine/data/registry/adapter_registry.dart';
 import 'package:cloudcine/domain/entities/drive_entry.dart';
+import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/services/drive_move.dart';
 import 'package:cloudcine/ui/providers/app_providers.dart';
 import 'package:cloudcine/ui/providers/auth_providers.dart';
@@ -322,6 +323,11 @@ void main() {
         reason: '源目录必须一起带出去 —— 控制器要用它算「目标是不是某个'
             '被移动目录的子目录」。丢了它，那道安全检查会静默失效。');
     expect(popped!.entries.length, 2);
+    expect(popped!.provider, DriveProvider.quark,
+        reason: '「是哪一家」必须跟着计划一起带出去：结果提示里那句「为什么'
+            '没动」按它分岔（夸克说限流，百度说目标已有同名文件）。丢了它，'
+            '提示会**静默**退回中性措辞 —— 而 `drive_move_test` 里的文案用例'
+            '是直接构造计划的，抓不到这条接线。');
   });
 
   testWidgets('列出的条目超过上限时只摊开前几个，并说明总数', (tester) async {

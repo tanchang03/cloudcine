@@ -1,5 +1,6 @@
 import '../../core/utils/drive_paths.dart';
 import '../entities/drive_entry.dart';
+import '../entities/drive_provider.dart';
 import 'drive_batch.dart';
 
 /// 移动的**目标目录** —— 网盘上的一个目录。
@@ -90,10 +91,18 @@ class DriveMovePlan {
     required this.entries,
     required this.sourceDirPath,
     required this.target,
+    this.provider,
   });
 
   /// 用户勾选的那些条目（可能既有目录也有文件）。
   final List<DriveEntry> entries;
+
+  /// 是哪一家网盘。**只影响结果提示里那句「失败原因」**，不参与任何判断。
+  ///
+  /// 与 `DriveDeletePlan.provider` 同一条理由：两家的失败形状不同（夸克
+  /// 按批、百度逐条），说反了会把用户支去反复重试。为 `null` 时用中性
+  /// 措辞 —— 那正是单元测试里构造计划的状态，它们不该被迫关心是哪一家。
+  final DriveProvider? provider;
 
   /// 这些条目**现在**所在目录的展示路径（不带结尾斜杠）。
   ///
@@ -210,8 +219,22 @@ class DriveMovePlan {
     if (failed == 0) return '已移动 $moved 项到「${target.label}」。';
     if (moved == 0) return '移动失败：$failed 项都没动，网盘上原样还在。';
     return '已移动 $moved 项到「${target.label}」，'
-        '$failed 项失败（多半是限流，可以再试一次）。';
+        '$failed 项失败（$_failedHint）。';
   }
+
+  /// 那几项**为什么**没动 —— 与 `DriveDeletePlan._failedHint` 同一条理由：
+  /// 两家的失败形状不同（夸克按批、百度逐条），说反了会把人支去白试。
+  ///
+  /// 百度移动最常见的逐条拒绝是**目标目录里已有同名文件**（`errno=-8`）——
+  /// 这条恰恰不该重试：重试一百次还是同一个结果，得先改名或换个目录。
+  /// 而 `sameNameNote` 已经承认我们不知道服务端遇到同名会覆盖还是改名，
+  /// 所以这里也不能断言「就是同名」。
+  String get _failedHint => switch (provider) {
+        DriveProvider.baidu => '百度逐条拒了这几项，最常见是目标目录里已有同名'
+            '文件（这种情况重试也一样，得先改名或换个目录）；详情看诊断日志',
+        DriveProvider.quark => '多半是限流，可以再试一次',
+        DriveProvider.aliyun || null => '可以再试一次',
+      };
 
   @override
   String toString() => 'DriveMovePlan($count 项, $sourceLabel → ${target.label})';

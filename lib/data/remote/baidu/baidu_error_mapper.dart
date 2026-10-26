@@ -83,6 +83,34 @@ class BaiduErrorCode {
   /// 一次操作文件数超限。【未验证】
   static const int tooManyFiles = 31066;
 
+  /// **写操作被服务端拒收**（`/api/filemanager`）。
+  ///
+  /// 【实测】2026-10-26 10:08:27：`POST /api/filemanager?opera=delete
+  /// &async=2&onnest=fail`，表单体是一条合法的路径数组
+  /// （`filelist=["/我的资源/…"]`，中文已正确百分号编码），HTTP 200，
+  /// 响应只有裸 `{"errno":8001,"request_id":…}` —— **没有** `errmsg`、
+  /// **没有** `show_msg`、**没有** `info[]`。
+  ///
+  /// ## 它为什么不是一个「参数写错了」
+  ///
+  /// 形状错（`filelist` 给成对象数组、`Content-Type` 给成 `text/plain`）
+  /// 时服务端回的是 `errno=2`。这次回的是 `8001`，说明请求**已经被解析**，
+  /// 拒绝发生在业务准入那一层。
+  ///
+  /// ## 已确认的成因：缺 `bdstoken`
+  ///
+  /// 同一次会话里 `bdstoken` **一次都没取过**（`gettemplatevariable` /
+  /// `get/template` 两条来源在日志里零命中），而 [BaiduAdapter._post]
+  /// 在令牌为空时是**静默省略**这个参数的。百度的 `/api/*` 读接口
+  /// （`/api/list`、`/api/account/uinfo`）不带令牌照常工作 —— 这正是
+  /// 这个 bug 能长期潜伏的原因；写接口不行。
+  ///
+  /// ⚠️ `8001` 的**官方定义本机没有拿到**（没有文档、没有 `errmsg`）。
+  /// 上面这条是「有证据的成因」而不是「码表的权威释义」：同一个码也可能
+  /// 覆盖「账号需网页版验证」等相邻情形，所以错误文案把两种出路都写上，
+  /// 而不是断言只有一个原因。
+  static const int writeRejected = 8001;
+
   /// **反盗链**。
   ///
   /// 【实测】2026-10-08：下载旧版客户端 dmg 时直连 CDN 未带
@@ -243,6 +271,21 @@ DriveException baiduExceptionFrom(
       return DriveException(
         type: DriveErrorType.rateLimited,
         message: msg('一次操作的文件数超过服务端上限'),
+        providerCode: providerCode,
+        httpStatus: result.statusCode,
+        rawMessage: message,
+      );
+
+    case BaiduErrorCode.writeRejected:
+      // 两种出路**都写出来**：本机只确认了「缺 bdstoken」这一条，
+      // 而 8001 的定义没有官方来源（见常量文档）。把「去网页版验证」
+      // 一起给出，是因为同一次会话里 `xpan/*` 正被 9019 风控挡着 ——
+      // 那种状态下补令牌也未必放行，用户该做的事不一样。
+      return DriveException(
+        type: DriveErrorType.permissionDenied,
+        message: msg('百度拒绝了这次写操作（errno=8001）：'
+            '会话令牌 bdstoken 缺失，或账号需要在 pan.baidu.com 网页版'
+            '完成安全验证后再试'),
         providerCode: providerCode,
         httpStatus: result.statusCode,
         rawMessage: message,

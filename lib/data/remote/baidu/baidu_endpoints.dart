@@ -68,6 +68,90 @@ class BaiduEndpoints {
   /// 搜索命中的目录要靠调用方自行过滤（契约里已经写明这一点）。
   static const String search = '/api/search';
 
+  /// 文件管理（删除 / 移动 / 重命名）。
+  ///
+  /// 调用形态：`POST /api/filemanager?opera=delete&async=2&onnest=fail`，
+  /// **表单体**里放 `filelist`（**路径**的 JSON 数组，不是 `fs_id`）：
+  ///
+  /// ```
+  /// POST /api/filemanager?opera=delete&async=2&onnest=fail&bdstoken=…
+  /// Content-Type: application/x-www-form-urlencoded
+  ///
+  /// filelist=["\/电影\/a.mkv","\/电影\/b.mkv"]
+  /// ```
+  ///
+  /// ## 【实测 2026-10-26】形状被接受，卡在令牌
+  ///
+  /// 真实账号下发出了一次删除请求：HTTP 200、276ms，响应
+  /// `{"errno":8001,"request_id":…}`。
+  ///
+  /// 这条结果排除了「形状不对」：形状错（`filelist` 给成对象数组、
+  /// `Content-Type` 给成 `text/plain`、`filelist` 不是数组）时服务端回
+  /// `errno=2`。回 `8001` 说明请求体**已经被解析**，拒绝发生在业务准入层。
+  ///
+  /// 同一次会话里 `bdstoken` **从未取过**（`gettemplatevariable` /
+  /// `get/template` 在日志里零命中），而本端点缺令牌时回的是 `8001`
+  /// 而不是 `-6` —— 这正是「等 `-6` 再补令牌」那套自愈失效的原因。
+  /// 修法见 `BaiduAdapter._ensureWriteToken`。
+  ///
+  /// ⚠️ 仍**未**验证的是：带齐令牌之后这条请求是否就成功。下一次真机
+  /// 删除的日志里应当出现 `查询参数：… & bdstoken=有` —— 若它仍然回
+  /// `8001`，下一个嫌疑是 `async=2` 与 `onnest=fail` 的组合（网页版
+  /// 这两个值的来源只是抓包，不是本机实测）。
+  ///
+  /// 形状的依据来自三个来源：
+  ///   - 一篇抓包分析给出的完整 URL（`opera=delete&async=2&onnest=fail&
+  ///     channel=chunlei&web=1&app_id=250528&bdstoken=…&clienttype=0`）；
+  ///   - AList 的 `manage()`：它打的是**官方**那条
+  ///     `/rest/2.0/xpan/file?method=filemanager&opera=delete`，表单里
+  ///     `filelist` 就是**路径的 JSON 数组**（`async=0` / `ondup=fail`）。
+  ///     与网页版这条的差别只在主机、路径与 `async` 取值 —— **`filelist`
+  ///     的形状一致**。这是本适配器敢用「路径数组」的主要依据；
+  ///   - `opera` 的取值集合（`copy / move / rename / delete`）在多个社区
+  ///     实现里一致。
+  ///
+  /// ⛔ **不走官方那条**：官方 `xpan/file` 收 `access_token`，而本产品用的
+  /// 是扫码会话（Cookie），且官方对 2026-06-03 后创建的应用限制在
+  /// `/apps/{appname}/` 内 —— 那正是本适配器全程走 `/api/*` 的原因
+  /// （见本文件的类文档）。
+  ///
+  /// 因此 `BaiduAdapter.deleteFiles` 对响应的处理是**尽力而为**：能读到逐条
+  /// `errno` 就按条回报，读不到就按「请求已受理」回报全部（契约本来就是
+  /// 请求粒度）。真实账号验证后如果发现 `filelist` 只收 `fs_id` 或
+  /// `async=2` 会吞掉逐条结果，改的只是这一个方法与 [fileManagerAsync]。
+  ///
+  /// ⚠️ 与 [list] 一样，它收的是**路径**而不是 `fs_id` —— 适配器必须先用
+  /// 路径缓存把 fid 翻成路径（见 `BaiduAdapter.deleteFiles`）。
+  static const String fileManager = '/api/filemanager';
+
+  /// [fileManager] 的 `opera` 取值：删除。
+  static const String operaDelete = 'delete';
+
+  /// [fileManager] 的 `opera` 取值：移动。
+  ///
+  /// ⚠️ 与删除**不是**同一个 `filelist` 形状：删除收**路径数组**，
+  /// 移动收**对象数组** `[{"path":…,"dest":…,"newname":…}]`。
+  /// 这个差异在 AList 的 `manage()` 里看得很清楚（它把 `filelist` 当
+  /// `any` 传，删除给 `[]string`、移动给 `[]map[string]string`）。
+  /// 形状填错时服务端回 `errno=2`（参数错误），不会误删或误移。
+  static const String operaMove = 'move';
+
+  /// [fileManager] 的表单字段名（值是**路径**的 JSON 数组）。
+  static const String fileListField = 'filelist';
+
+  /// [fileManager] 的 `async` 取值：**异步**受理（服务端立刻回 `taskid`）。
+  ///
+  /// 网页版自己用的就是 2。取 1（同步）意味着一个 200 GB 的目录会让这次
+  /// 请求挂到超时 —— 而超时在用户那里读作「删失败了」，实际却可能已经删了。
+  static const String fileManagerAsync = '2';
+
+  /// 删除请求的 `Content-Type`。
+  ///
+  /// ⛔ 必须显式写：dio 对 `String` 体的默认类型是 `text/plain`，而
+  /// `/api/filemanager` 按**表单**解析。类型不对时服务端回 `errno=2`
+  /// （参数错误），看起来像「路径写错了」，实际上请求体一个字都没被读到。
+  static const String formContentType = 'application/x-www-form-urlencoded';
+
   /// 账号信息（昵称 / uk / 会员档位）。【实测】存活，`-6` 门。
   static const String accountUinfo = '/api/account/uinfo';
 

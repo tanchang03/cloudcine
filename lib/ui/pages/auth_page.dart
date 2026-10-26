@@ -131,8 +131,8 @@ class AuthPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 10),
                 const Text(
-                  '夸克走 PC 端自用接口，百度走 Web 自用接口（当前只读：'
-                  '能扫能播，暂不支持上传/移动/删除）',
+                  '夸克走 PC 端自用接口，百度走 Web 自用接口（能扫能播能删能移，'
+                  '暂不支持上传/建目录）',
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 11, color: AppTheme.dim),
                 ),

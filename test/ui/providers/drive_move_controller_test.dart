@@ -96,12 +96,14 @@ void main() {
     required Map<String, List<DriveEntry>> tree,
     DriveException? moveFailsWith,
     Set<int>? moveFailsOnBatch,
+    FakeDriveAdapter? adapterOverride,
   }) {
-    final adapter = FakeDriveAdapter(
-      tree,
-      moveFailsWith: moveFailsWith,
-      moveFailsOnBatch: moveFailsOnBatch,
-    );
+    final adapter = adapterOverride ??
+        FakeDriveAdapter(
+          tree,
+          moveFailsWith: moveFailsWith,
+          moveFailsOnBatch: moveFailsOnBatch,
+        );
     final repo = InMemoryMediaRepository();
     final c = ProviderContainer(
       overrides: [
@@ -167,6 +169,46 @@ void main() {
         reason: '丢一条 = 用户勾了它却没移走，而界面报「已移动 105 项」。');
     expect(outcome!.moved, entries.length);
     expect(outcome.failed, 0);
+  });
+
+  test('⛔ 返回的比发出去的少（逐条被拒）⇒ 差额算失败，不谎报移干净', () async {
+    // 百度的移动响应里带**每一条**的 `errno`（见 `BaiduAdapter.moveFiles`
+    // 里的 `info[]`），被拒的那几条只是不出现在成功列表里 —— 接口本身
+    // 照样返回 0。所以 `moveFiles` 的返回值可能**比入参短**，这是夸克那条
+    // 路径上不存在的形状。
+    //
+    // 只按「返回值长度」记账的话，提示会说「已移动 2 项」，而用户去目标
+    // 目录里只找到 1 个 —— 他会以为功能坏了，然后再移一次（于是同名的
+    // 来了两份）。差额必须算成失败。
+    final s = setup(
+      tree: const {},
+      adapterOverride: FakeDriveAdapter(
+        {
+          'root': [file('a'), file('b')],
+          'dest': [],
+        },
+        rejectIds: {'b'},
+      ),
+    );
+
+    final outcome = await run(
+      s.c,
+      entries: [file('a'), file('b')],
+      target: target('dest', '/目标'),
+    );
+
+    expect(s.adapter.movedIds, ['a', 'b'],
+        reason: '两条都发出去了 —— 逐条被拒是服务端判的，发之前无从知道。'
+            '要是在客户端先筛掉，就变成了「猜哪条会被拒」。');
+    expect(outcome!.moved, 1);
+    expect(outcome.failed, 1,
+        reason: '没移走就要说没移走 —— 差额是最诚实的那个数。');
+    expect(outcome.message, contains('1 项失败'));
+
+    final after = await s.c.read(driveListingProvider(root).future);
+    expect(after.videos.map((e) => e.id), ['b'],
+        reason: '被拒的那条还在源目录里。报「已移动 2 项」而它原地没动，'
+            '正是这条记账要防的事。');
   });
 
   test('凭证失效：中止后续批次，且把**没发出去的**也算成失败', () async {

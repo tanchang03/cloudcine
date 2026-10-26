@@ -603,6 +603,73 @@ class _SelectionBar extends ConsumerWidget {
     final moving = move.running;
     final busy = deleting || moving;
 
+    // 这一家网盘的两个写能力位，**一次**取出来。
+    //
+    // 分两处各查一遍的话，两边的写法迟早会分叉 —— 而「一个按钮按新判据、
+    // 另一个按旧判据」正是这一页反复出问题的形状。取一次，两个按钮共用。
+    //
+    // ⛔ 判据**不是** `canWrite`：那个位说的是「上传 / 建目录」。百度能删能移
+    //    但不能传 —— 按 `canWrite` 判会把它的两个按钮一起白白置灰，而用户
+    //    正需要它们整理目录。
+    //
+    //    按钮留着但网盘不支持的话，用户点下去只会拿到一句「该网盘不支持…」，
+    //    而「按下去才报错」正是这一页之前的形状。能力位既然已经声明了，
+    //    就该在**按之前**用上。
+    final capabilities = ref
+        .watch(adapterRegistryProvider)
+        .adapterFor(ref.watch(browseProvider))
+        ?.capabilities;
+    // 取不到适配器（账号刚被移除）时按「能」处理：那时整页本来就在报错，
+    // 按钮再灰一层只是多一个谜。
+    final canMove = capabilities?.canMove ?? true;
+    final canDelete = capabilities?.canDelete ?? true;
+
+    final moveButton = FilledButton.icon(
+      onPressed: selection.isEmpty || !canMove ? null : () => _move(context, ref),
+      style: FilledButton.styleFrom(
+        backgroundColor: AppTheme.accent,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+      icon: const Icon(Icons.drive_file_move_outlined, size: 15),
+      label: Text(
+        // 与删除同一条理由：一个都没勾时不写「移动 0 项」——
+        // 灰按钮上写着「移动 0 项」只会让人去猜「为什么是 0」。
+        selection.isEmpty ? '移动' : '移动 ${selection.count} 项',
+        style: const TextStyle(
+          fontSize: 12.5,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+
+    // 删除按钮。单独提出来是为了能像移动那样包一层说明（见下面那个
+    // `Tooltip`）—— 内联在 `children` 里就没法两用。
+    final deleteButton = FilledButton.icon(
+      onPressed:
+          selection.isEmpty || !canDelete ? null : () => _delete(context, ref),
+      style: FilledButton.styleFrom(
+        backgroundColor: AppTheme.danger,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+      icon: const Icon(Icons.delete_forever_rounded, size: 15),
+      label: Text(
+        // 一个都没勾时不写「删除 0 项」：那读起来像一个能按的动作，
+        // 而它此刻是灰的 —— 灰按钮上写着「删除 0 项」只会让人
+        // 去猜「为什么是 0」。
+        selection.isEmpty ? '删除' : '删除 ${selection.count} 项',
+        style: const TextStyle(
+          fontSize: 12.5,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+
     return Container(
       margin: const EdgeInsets.fromLTRB(22, 0, 22, 10),
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
@@ -679,50 +746,22 @@ class _SelectionBar extends ConsumerWidget {
           ] else ...[
             // 移动在左、删除在右。危险的那个放最右是这一条的既有约定
             // （用户伸手够到的最后一个按钮不该是不可逆的那个）。
-            FilledButton.icon(
-              onPressed: selection.isEmpty ? null : () => _move(context, ref),
-              style: FilledButton.styleFrom(
-                backgroundColor: AppTheme.accent,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              icon: const Icon(Icons.drive_file_move_outlined, size: 15),
-              label: Text(
-                // 与删除同一条理由：一个都没勾时不写「移动 0 项」——
-                // 灰按钮上写着「移动 0 项」只会让人去猜「为什么是 0」。
-                selection.isEmpty ? '移动' : '移动 ${selection.count} 项',
-                style: const TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
+            //
+            // 不支持移动的网盘**置灰 + 一句说明**，而不是让他点完再读一句
+            // unsupported。判据是 `canMove` 而不是 `canWrite`：百度能删能移
+            // 但不能上传，两者合用一个位时这个按钮会对它永远灰着。
+            canMove
+                ? moveButton
+                : Tooltip(message: '该网盘不支持移动文件', child: moveButton),
             const SizedBox(width: 8),
-            FilledButton.icon(
-              onPressed: selection.isEmpty ? null : () => _delete(context, ref),
-              style: FilledButton.styleFrom(
-                backgroundColor: AppTheme.danger,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              icon: const Icon(Icons.delete_forever_rounded, size: 15),
-              label: Text(
-                // 一个都没勾时不写「删除 0 项」：那读起来像一个能按的动作，
-                // 而它此刻是灰的 —— 灰按钮上写着「删除 0 项」只会让人
-                // 去猜「为什么是 0」。
-                selection.isEmpty ? '删除' : '删除 ${selection.count} 项',
-                style: const TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
+            // 删除同理：不支持删除时**置灰 + 一句说明**。
+            //
+            // 留一个能按的「删除」比留一个能按的「移动」更糟 —— 它会先弹出
+            // 一个写着「删除后不可撤销」的确认框，用户按下确认，然后什么都
+            // 没发生。一次不可撤销的确认换来零结果，比直接灰着伤人得多。
+            canDelete
+                ? deleteButton
+                : Tooltip(message: '该网盘不支持删除文件', child: deleteButton),
           ],
         ],
       ),
@@ -754,7 +793,12 @@ class _SelectionBar extends ConsumerWidget {
     ];
     if (entries.isEmpty) return;
 
-    final plan = DriveDeletePlan(entries: entries);
+    // 网盘要传下去：确认框里那句「删除后不可撤销」按家分岔（夸克永久删除、
+    // 百度进回收站），而在别人的盘上读到「夸克侧」是最刺眼的那种错。
+    final plan = DriveDeletePlan(
+      entries: entries,
+      provider: ref.read(browseProvider),
+    );
     final confirmed = await DriveDeleteDialog.show(context, plan);
     if (confirmed != true || !context.mounted) return;
 

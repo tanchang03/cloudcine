@@ -135,8 +135,14 @@ class DriveCleanupController extends Notifier<DriveCleanupState> {
       try {
         final ok = await adapter.deleteFiles(fileIds: chunk);
         deletedIds.addAll(ok);
+        // 返回的比发出去的**少** ⇒ 有几条被服务端逐条拒了（百度的
+        // `info[]` 会这么报，见 `BaiduAdapter.deleteFiles`）。不把它们算进
+        // 失败，提示就是「已删除 N 项」而列表刷新后那几行还在 —— 用户会
+        // 以为界面没刷新，然后再点一次删除。
+        final missed = chunk.length - ok.length;
+        if (missed > 0) failed += missed;
         diag.info('文件', '批量删除第 ${i + 1}/${chunks.length} 批：'
-            '${ok.length} 项');
+            '${ok.length} 项${missed > 0 ? "，$missed 项被拒" : ""}');
       } on DriveException catch (e) {
         failed += chunk.length;
         diag.warn('文件', '批量删除第 ${i + 1}/${chunks.length} 批失败：'

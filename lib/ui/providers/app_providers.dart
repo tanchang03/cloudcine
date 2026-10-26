@@ -159,7 +159,8 @@ final credentialStoreProvider = Provider<CredentialStore>(
 
 final httpClientProvider = Provider<HttpClientLike>((ref) => DioHttpClient());
 
-/// 已接入的网盘适配器。夸克（读写全能力）+ 百度（**只读**：授权 / 遍历 / 取流）。
+/// 已接入的网盘适配器。夸克（读写全能力）+ 百度（授权 / 遍历 / 取流 /
+/// **删除 / 移动**；上传 / 建目录未实现，见 `BaiduAdapter` 的类文档）。
 ///
 /// ⛔ 注册表里放的是**全部**适配器，而且是**常驻**的 —— 不存在「只注册
 ///    当前那一家」这种做法。重建注册表会把所有适配器 `dispose` 掉
@@ -276,10 +277,10 @@ final subtitleResolverProvider = Provider<SubtitleResolver>(
 /// ## 为什么需要「挑一家」
 ///
 /// `LibraryBackupService` 是**单个**适配器（备份包只落在一处），而多家网盘
-/// 同时在线时就有得选了。判据是 `Capabilities.canWrite` —— 百度这次对接是
-/// **只读**的（见 `BaiduAdapter.baiduCapabilities`），挑中它的后果是用户点
-/// 「备份」只拿到一句 `unsupported`，而他明明已经登录了夸克，只是不知道
-/// 该选哪个。
+/// 同时在线时就有得选了。判据是 `Capabilities.canWrite` —— 百度没有实现
+/// 上传 / 建目录（见 `BaiduAdapter.baiduCapabilities`；它能删，但备份要的是
+/// **写**，所以 `canWrite == false`），挑中它的后果是用户点「备份」只拿到
+/// 一句 `unsupported`，而他明明已经登录了夸克，只是不知道该选哪个。
 ///
 /// 一家能写的都没有时返回 `null`（调用方据此给提示），**不退回夸克** ——
 /// 退回会让「只登录了百度」的用户看到一串看不懂的错误。
@@ -513,10 +514,11 @@ String _getDeviceName() {
 ///
 /// 备份服务。备份包落在 [backupDriveProvider] 挑出来的那一家。
 ///
-/// ⛔ **百度目前是只读适配器**（`uploadFile` 继承基类默认实现，抛
-///    `unsupported`）。所以 [backupDriveProvider] 只会挑到夸克；
-///    只有百度在线时，备份上传会如实报「不支持」。这是能力如实反映，
-///    不是 bug —— 写入链路要等真实账号验证过读链路之后再单独做。
+/// ⛔ **百度不能写**（`uploadFile` / `createFolder` 继承基类默认实现，抛
+///    `unsupported`；它只实现了删除）。所以 [backupDriveProvider] 只会挑到
+///    夸克；只有百度在线时，备份上传会如实报「不支持」。这是能力如实反映，
+///    不是 bug —— `Capabilities.canWrite` 与 `canDelete` 是两个位，正是为了
+///    让「能删不能传」这种组合表达得出来。
 ///    进度文件的**上传**同理，而**下载**不受影响。
 final libraryBackupServiceProvider = Provider<LibraryBackupService>(
   (ref) {

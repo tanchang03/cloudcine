@@ -6,7 +6,10 @@ import 'drive_provider.dart';
 ///   - 是否展示「搜索」入口；
 ///   - 播放时是否要带自定义请求头；
 ///   - 哪些曲目要打上「超限不可播」标记；
-///   - 扫描 / 取链的节流参数。
+///   - 扫描 / 取链的节流参数；
+///   - 备份包能不能落到这家（[canWrite]）、批量删除时哪些文件删得掉、
+///     哪些只能从媒体库移除（[canDelete]）、多选工具条上「移动」该不该
+///     置灰（[canMove]）。
 ///
 /// 这是「新增网盘零改动」的关键：差异全部收敛到这份声明里。
 class Capabilities {
@@ -23,6 +26,8 @@ class Capabilities {
     this.defaultPageSize = 50,
     this.authModes = const {},
     this.canWrite = true,
+    this.canDelete = true,
+    this.canMove = true,
   });
 
   final DriveProvider provider;
@@ -72,7 +77,7 @@ class Capabilities {
   /// 该网盘支持的授权方式集合
   final Set<AuthMode> authModes;
 
-  /// 这家网盘**能不能写**（上传 / 建目录 / 删除 / 移动）。
+  /// 这家网盘**能不能写**（上传 / 建目录）。
   ///
   /// ## 为什么需要一个显式的能力位，而不是只靠「基类默认抛 unsupported」
   ///
@@ -87,7 +92,37 @@ class Capabilities {
   ///
   /// ⚠️ 它说的是「这家网盘整体上支不支持写」，不是「这个账号有没有权限」
   ///    （会员等级、目录只读这类差异仍然靠运行时异常表达）。
+  ///
+  /// ⛔ **不含删除、不含移动**。那两件事各有一个位（[canDelete] /
+  /// [canMove]），因为一家的能力可以是「能删、不能传」：百度现在就是
+  /// （见 `BaiduAdapter` 的类文档）。合成一个位只有两种错法，而且都很难查：
+  ///   - 按 [canWrite] 判删除 ⇒ 百度明明能删，媒体库批量删除却把它的文件
+  ///     算成「删不了」，用户勾了「一并删网盘」之后看到文件原样留在盘上；
+  ///   - 按 [canWrite] 判上传 ⇒ 百度明明不能传，备份却挑中它然后失败。
   final bool canWrite;
+
+  /// 这家网盘**能不能删文件**（网盘侧删除，对用户是**不可逆**的）。
+  ///
+  /// 用途只有一处判定，但错一次就很伤人：媒体库批量删除里「这几个文件
+  /// 删得掉 / 那几个所在网盘删不了」的分账（见 `LibraryBatchDeletePlan`
+  /// 的 `undeletableFileCount`）。判错的后果是把「删不掉」说成「已删」，
+  /// 而用户此刻正盯着容量条等它掉数字。
+  ///
+  /// ⚠️ 与 [canWrite] 一样，它说的是**网盘整体**支不支持，不保证**这一次**
+  ///    一定成功（目录只读、单文件被锁定、限流都会失败）—— 那些靠运行时
+  ///    异常如实上报。
+  final bool canDelete;
+
+  /// 这家网盘**能不能移动 / 重命名**（把条目挪到另一个目录）。
+  ///
+  /// 判据用在文件夹页那条多选工具条上：不支持时「移动」按钮**置灰**，
+  /// 而不是让用户点完再读一句 `unsupported`。后者是这个页面反复踩过的
+  /// 形状 —— 用户分不清「功能坏了」和「这家网盘不支持」。
+  ///
+  /// ⚠️ 移动**不改 fid**（见基类 `moveFiles` 的文档），所以它与 [canDelete]
+  ///    的风险等级不同：删错了要用户自己去回收站捞，移动错了再移回去就行。
+  ///    两个位分开，正是为了让「能删不能移」或反过来这类组合表达得出来。
+  final bool canMove;
 
   /// 是否声明了**播放取链**的体积上限
   bool get hasFileSizeLimit => maxSingleFileBytes != null;
@@ -114,6 +149,9 @@ class Capabilities {
     double? linkQps,
     int? defaultPageSize,
     Set<AuthMode>? authModes,
+    bool? canWrite,
+    bool? canDelete,
+    bool? canMove,
   }) {
     return Capabilities(
       provider: provider,
@@ -129,12 +167,16 @@ class Capabilities {
       linkQps: linkQps ?? this.linkQps,
       defaultPageSize: defaultPageSize ?? this.defaultPageSize,
       authModes: authModes ?? this.authModes,
+      canWrite: canWrite ?? this.canWrite,
+      canDelete: canDelete ?? this.canDelete,
+      canMove: canMove ?? this.canMove,
     );
   }
 
   @override
   String toString() => 'Capabilities(${provider.id}, '
       'list=$canListDirectory, search=$canSearch, stream=$canResolveDirectLink, '
+      'write=$canWrite, delete=$canDelete, move=$canMove, '
       'maxFile=${maxSingleFileBytes ?? "∞"}, listQps=$listQps, linkQps=$linkQps)';
 }
 

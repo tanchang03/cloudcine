@@ -246,8 +246,14 @@ class DriveMoveController extends Notifier<DriveMoveState> {
           targetFolderId: plan.target.fid,
         );
         movedIds.addAll(ok);
+        // 返回的比发出去的**少** ⇒ 有几条被服务端逐条拒了（百度的
+        // `info[]` 会这么报，见 `BaiduAdapter.moveFiles`）。不把它们算进
+        // 失败，提示就是「已移动 N 项」而目标目录里少几个 —— 用户会以为
+        // 功能坏了，然后再移一次（于是同名的来了两份）。
+        final missed = chunk.length - ok.length;
+        if (missed > 0) failed += missed;
         diag.info('文件', '批量移动第 ${i + 1}/${chunks.length} 批：'
-            '${ok.length} 项');
+            '${ok.length} 项${missed > 0 ? "，$missed 项被拒" : ""}');
       } on DriveException catch (e) {
         failed += chunk.length;
         diag.warn('文件', '批量移动第 ${i + 1}/${chunks.length} 批失败：'

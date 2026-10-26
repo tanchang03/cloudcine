@@ -85,6 +85,9 @@ class _DriveMoveDialogState extends ConsumerState<DriveMoveDialog> {
         entries: widget.entries,
         sourceDirPath: widget.sourceDirPath,
         target: target,
+        // 只为了让「N 项没动」后面那句原因说得对（见 `DriveMovePlan._failedHint`）。
+        // 用 `read` 而不是 `watch`：对话框活着的时候用户切不了网盘。
+        provider: ref.read(browseProvider),
       );
 
   /// 内容区的固定宽度。

@@ -42,10 +42,14 @@ class LibraryBatchDeletePlan {
   /// （空壳作品）时勾上它什么也不会发生，那是一个骗人的开关。
   final int driveFileCount;
 
-  /// 落在**不支持删除的网盘**上的文件数（百度是只读接入）。
+  /// 落在**不支持删除的网盘**上的文件数（判据是 `Capabilities.canDelete`）。
   ///
   /// 与 [driveFileCount] 分开数：勾上「一并删」时它们删不掉，只能从媒体库
   /// 移除。不提前说，用户会以为那几集也被清掉了。
+  ///
+  /// ⚠️ 别把这里的判据写成 `canWrite`：百度能删能移，但不能上传 / 建目录
+  /// （见 `BaiduAdapter` 的类文档），按 `canWrite` 判会把它的文件
+  /// 整批算成「删不了」—— 那正是「百度接进来了却什么都删不掉」的观感。
   final int undeletableFileCount;
 
   /// 用户是否勾了「同时删除网盘文件」。

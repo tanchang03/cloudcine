@@ -1,4 +1,5 @@
 import 'package:cloudcine/domain/entities/drive_entry.dart';
+import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/services/drive_cleanup.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -115,6 +116,32 @@ void main() {
               '只写「请确认」读起来像一句客套话。');
     });
 
+    test('⛔ 不可逆警告按网盘分岔：在百度的盘上不能说「夸克侧」', () {
+      // 两家的后果确实不同：夸克那条 `action_type=2` 是永久删除，
+      // 百度的网页版删除是进回收站。而这句话是用户按下删除前读的
+      // **最后一段话** —— 说错后果、还暴露「文案是抄来的」。
+      final quark = DriveDeletePlan(
+        entries: [file('a')],
+        provider: DriveProvider.quark,
+      ).irreversibleWarning;
+      expect(quark, contains('夸克'));
+
+      final baidu = DriveDeletePlan(
+        entries: [file('a')],
+        provider: DriveProvider.baidu,
+      ).irreversibleWarning;
+      expect(baidu, isNot(contains('夸克')),
+          reason: '在百度网盘的删除弹窗里读到「夸克侧按永久删除处理」，'
+              '是最刺眼的那种错');
+      expect(baidu, contains('百度'));
+      expect(baidu, contains('无法恢复'));
+
+      // 不指名任何一家时用中性措辞，而不是随便挑一家背锅。
+      final unknown = DriveDeletePlan(entries: [file('a')]).irreversibleWarning;
+      expect(unknown, isNot(contains('夸克')));
+      expect(unknown, contains('无法恢复'));
+    });
+
     test('确认按钮带数量（最后一次核对机会）', () {
       final plan = DriveDeletePlan(entries: [file('a'), file('b')]);
       expect(plan.confirmLabel, '删除 2 项');
@@ -148,6 +175,42 @@ void main() {
       final msg = plan.deletedMessage(deleted: 0, failed: 2);
       expect(msg, isNot(contains('已删除')));
       expect(msg, contains('2 项'));
+    });
+
+    group('部分失败的那句「为什么」按网盘分岔', () {
+      // 一句话打天下是错的：夸克按**批**失败（429 → 一批全算失败），
+      // 百度按**条**失败（`info[].errno`）。在百度盘上说「多半是限流」，
+      // 用户会去反复重试，而目录里删不掉的子项重试一百次也不会成功。
+      test('夸克：说限流，可以再试', () {
+        final plan = DriveDeletePlan(
+          entries: [file('a')],
+          provider: DriveProvider.quark,
+        );
+        final msg = plan.deletedMessage(deleted: 3, failed: 2);
+        expect(msg, contains('限流'));
+      });
+
+      test('百度：不说限流，指向「子项 / 占用」与 errno', () {
+        final plan = DriveDeletePlan(
+          entries: [file('a')],
+          provider: DriveProvider.baidu,
+        );
+        final msg = plan.deletedMessage(deleted: 3, failed: 2);
+        expect(msg, isNot(contains('限流')),
+            reason: '百度的部分失败是逐条 errno，不是整批被限流。'
+                '说成限流会把用户支去白试。');
+        expect(msg, contains('errno'),
+            reason: 'errno 对用户没意义，但「去哪儿看」有意义 —— '
+                '诊断日志里那条「百度删除部分被拒：errno:path」是唯一线索。');
+      });
+
+      test('不知道是哪家（null）：中性措辞，不指名任何一家', () {
+        final plan = DriveDeletePlan(entries: [file('a')]);
+        final msg = plan.deletedMessage(deleted: 3, failed: 2);
+        expect(msg, isNot(contains('限流')));
+        expect(msg, isNot(contains('百度')));
+        expect(msg, isNot(contains('夸克')));
+      });
     });
   });
 }
