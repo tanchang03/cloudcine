@@ -238,7 +238,8 @@ class _DiaryDetailPageState extends ConsumerState<DiaryDetailPage> {
             child: OutlinedButton(
               onPressed: () => _confirmRemove(e),
               style: OutlinedButton.styleFrom(
-                side: BorderSide(color: AppTheme.danger.withOpacity(0.5)),
+                side: BorderSide(
+                    color: AppTheme.danger.withValues(alpha: 0.5)),
                 padding: const EdgeInsets.symmetric(vertical: 12),
               ),
               child: Text('移出日记',

@@ -92,12 +92,15 @@ class _DiaryPageState extends ConsumerState<DiaryPage> {
     final list = ref
         .watch(diaryNotifierProvider)
         .where((e) {
-          if (_category != '全部' &&
-              _categoryFor(e) != _category) return false;
+          if (_category != '全部' && _categoryFor(e) != _category) {
+            return false;
+          }
           if (!_ratingMatches(e)) return false;
           if (q.isNotEmpty &&
               !e.title.toLowerCase().contains(q) &&
-              !(e.originalTitle?.toLowerCase() ?? '').contains(q)) return false;
+              !(e.originalTitle?.toLowerCase() ?? '').contains(q)) {
+            return false;
+          }
           return true;
         })
         .toList();
@@ -314,7 +317,7 @@ class _DiaryPageState extends ConsumerState<DiaryPage> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
         decoration: BoxDecoration(
-          color: active ? AppTheme.accent.withOpacity(0.16) : AppTheme.panel,
+          color: active ? AppTheme.accent.withValues(alpha: 0.16) : AppTheme.panel,
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
             color: active ? AppTheme.accent : AppTheme.line,
@@ -503,7 +506,7 @@ class _DiaryPageState extends ConsumerState<DiaryPage> {
                 ],
               ),
             ),
-            ...items.map((e) => _timelineRow(e)).toList(),
+            ...items.map((e) => _timelineRow(e)),
           ],
         );
       },
@@ -572,7 +575,9 @@ class _DiaryPageState extends ConsumerState<DiaryPage> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
       decoration: BoxDecoration(
-        color: ok ? AppTheme.ok.withOpacity(0.14) : AppTheme.dim.withOpacity(0.18),
+        color: ok
+            ? AppTheme.ok.withValues(alpha: 0.14)
+            : AppTheme.dim.withValues(alpha: 0.18),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
