@@ -156,6 +156,12 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 这一条流里片尾提示已经触发过了（上升沿用）。
   bool _outroReached = false;
 
+  /// 「低置信候选」已经提示到哪个样本数了（键 `workKey#kind`）。
+  ///
+  /// 每采到一条样本主窗口都会回传一次候选，不拦的话第 1、2 集会反复弹
+  /// 同一条确认条。样本数变了才值得再问一次。
+  final Map<String, int> _skipSuggestionShown = {};
+
   List<_SelfCheck> _checks = const <_SelfCheck>[];
   String? _nowPlaying;
   bool _busy = false;
@@ -3357,8 +3363,11 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
     if (anchor != null) unawaited(_reportSkipAnchor(anchor));
   }
 
-  /// 把一条有效落点样本报回主窗口。**不落库、不等结果** —— 库在主窗口，
-  /// 而聚合要在那边读这部作品的**全部**样本（见 `SkipAnchorReport`）。
+  /// 把一条有效落点样本报回主窗口。**不落库** —— 库在主窗口，而聚合
+  /// 要在那边读这部作品的**全部**样本（见 `SkipAnchorReport`）。
+  ///
+  /// 主窗口空结论时会回传一张「低置信候选」表，这里据此弹一次可确认的
+  /// 提示：把「还要攒好几集」变成第 1 集就能点一下生效。
   Future<void> _reportSkipAnchor(SkipAnchor anchor) async {
     final itemId = _currentRequest?.itemId ?? '';
     // 没有库记录（自检视频、手输直链）→ 没有行可以挂，报了也是白报。
@@ -3373,7 +3382,7 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       return;
     }
     try {
-      await playerWindowChannel.invokeMethod<void>(
+      final reply = await playerWindowChannel.invokeMethod<Object?>(
         PlayerBridgeMethod.saveSkipAnchor,
         SkipAnchorReport(
           itemId: itemId,
@@ -3384,9 +3393,59 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
           durationMs: anchor.duration.inMilliseconds,
         ).toJson(),
       );
+      if (reply is Map) {
+        _offerSkipSuggestion(Map<String, Object?>.from(reply));
+      }
     } catch (e) {
       // 丢一条样本只影响「还要多攒几集」，不该打断播放。
       diag.debug('播放窗口', '落点样本回报失败：$e');
+    }
+  }
+
+  /// 主窗口回传了「样本不足但落点集中」的候选：弹一次可确认的提示条。
+  ///
+  /// 与内置播放页同一条 P1 原则：**确认之前播放器什么都不会做**，误跳风险
+  /// 为零。文案由主窗口生成，这边只负责显示与回传。
+  void _offerSkipSuggestion(Map<String, Object?> payload) {
+    if (!mounted) return;
+    final message = payload['message'] as String?;
+    if (message == null) return;
+    final key = '${payload['workKey']}#${payload['kind']}';
+    final collected = (payload['samples'] as num?)?.toInt() ?? 0;
+    if (_skipSuggestionShown[key] == collected) return;
+    _skipSuggestionShown[key] = collected;
+
+    final messenger = _messengerKey.currentState;
+    if (messenger == null) return;
+    messenger
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(seconds: 8),
+          behavior: SnackBarBehavior.floating,
+          action: SnackBarAction(
+            label: '自动跳过',
+            onPressed: () => _confirmSkipSuggestion(payload),
+          ),
+        ),
+      );
+  }
+
+  Future<void> _confirmSkipSuggestion(Map<String, Object?> payload) async {
+    try {
+      final ok = await playerWindowChannel.invokeMethod<bool>(
+        PlayerBridgeMethod.confirmSkipSuggestion,
+        payload,
+      );
+      // 结论随下一集的 `PlayRequest` 带过来生效；当前集片头早已过去，
+      // 硬塞进正在播的状态机只会让画面自己跳一下。
+      _toast(
+        ok == true ? '已开启自动跳过 · 下一集起生效' : '没能保存，请稍后再试',
+      );
+    } catch (e) {
+      diag.debug('播放窗口', '确认自动跳过失败：$e');
+      _toast('没能保存，请稍后再试');
     }
   }
 

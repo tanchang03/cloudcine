@@ -169,6 +169,13 @@ abstract final class PlayerBridgeMethod {
   /// 最坏结果只是「这次少一条样本」—— 下一次播放还会再攒。
   static const String saveSkipAnchor = 'saveSkipAnchor';
 
+  /// 播放窗口 → 主窗口：「用户点了『以后自动跳过』，把这条候选固化」。
+  ///
+  /// 参数是 [saveSkipAnchor] 回传的那张候选表原样送回，返回 `bool`（是否
+  /// 真的写进库）。单独开一条方法，是因为**确认是用户主动点的** —— 与落点
+  /// 回报那种「用户什么都没做」的单向通知不同，这一次必须给一句反馈。
+  static const String confirmSkipSuggestion = 'confirmSkipSuggestion';
+
   /// 播放窗口 → 主窗口：「这一条是不是已经没了？能删到哪一层？」
   ///
   /// 参数是 `{'itemId': …}`，返回 [MissingMediaBrief.toJson]，或 `null`
@@ -339,10 +346,21 @@ Future<IntroRangeSnapshot?> Function(IntroRangeSaveRequest request)?
 ///
 /// 与 [onSaveIntroRange] 同样的理由必须由 UI 层装上（要拿仓储）。
 ///
-/// **没有返回值**：这是一条单向通知。样本本身在播放窗口那边已经产生了，
-/// 落库只决定「能不能攒够样本学出结论」。为一次写库失败弹提示，
-/// 与用户的操作（他只是在看剧）毫无关系。
-Future<void> Function(SkipAnchorReport report)? onSaveSkipAnchor;
+/// 返回一张**候选表**（样本不足但落点集中时给播放窗口弹一次「以后自动跳过？」
+/// 的确认条），没有候选时返回 `null`。
+///
+/// ⚠️ 这条仍然**不回传错误**：样本是看剧看出来的，用户什么都没点，为一次
+/// 写库失败弹提示与他的操作毫无关系。回传的只是「要不要问用户一句」，
+/// 拿不到就当作不问，播放照常。
+Future<Map<String, Object?>?> Function(SkipAnchorReport report)?
+    onSaveSkipAnchor;
+
+/// 用户在播放窗口点了「以后自动跳过」时，主窗口该做什么。
+///
+/// 参数是上面那张候选表原样送回；返回 `bool` 表示是否真的写进了库。
+/// 与 [onSaveSkipAnchor] 相反，这条**必须有返回值** —— 确认是用户主动点的，
+/// 得给一句「已开启 / 没保存上」的反馈。
+Future<bool> Function(Map<String, Object?> payload)? onConfirmSkipSuggestion;
 
 /// 播放窗口把用户选的「音效」预设报回来时，主窗口该做什么。
 ///
@@ -670,8 +688,24 @@ Future<Object?> handlePlayerWindowCall(MethodCall call) async {
       // ⛔ 不 catch、也不回传错误：聚合失败最坏只是这次少一条样本，
       //    而把它变成一条 PlatformException 会让播放窗口那边多一段
       //    与用户操作毫无关系的错误提示。
-      await anchorHandler(report);
-      return null;
+      //
+      // 返回值是「样本不足但落点集中」时的候选表，播放窗口据此弹一次
+      // 可确认的提示；没有候选时是 null（什么都不弹）。
+      return await anchorHandler(report);
+
+    case PlayerBridgeMethod.confirmSkipSuggestion:
+      final payload = call.arguments is Map
+          ? Map<String, Object?>.from(call.arguments as Map)
+          : null;
+      if (payload == null) return false;
+      final confirmHandler = onConfirmSkipSuggestion;
+      if (confirmHandler == null) return false;
+      try {
+        return await confirmHandler(payload);
+      } catch (e) {
+        diag.warn('窗口', '确认自动跳过失败：$e');
+        return false;
+      }
 
     case PlayerBridgeMethod.queryMissingMedia:
       final itemId = call.arguments is Map

@@ -7166,6 +7166,70 @@ PC 会算出 `start = duration`（落点 = 片尾）—— 同一条链，两种
 改动面较大（还会影响 `needUpload` 判据与上传体积），单独排期。
 现状由第三个用例**如实钉住**，修好之后那条断言要改成 `isNull`。
 
+## 13.15 ⚠️ 学习期太长：P1「先提示再自动」落地（2026-11-07）
+
+用户反馈「要播到十几集才学到片头片尾」。查下来**硬门槛只有 `minSamples = 3`**，
+「十几集」是「每集样本产出率极低（尤其片尾，信号只有『在距末尾 10s~5min 主动
+切集』）× 片头片尾各自独立计数 × MAD 拒绝 × 空结论静默 × 全程无反馈」相乘的体感。
+
+### 做了什么（第一层 + 第二层，**一个阈值都没改**）
+
+- 新增纯函数 `SkipLearning.progress(samples)`（`SkipLearning.kt` 同源镜像）：
+  把 `learn()` 的判定**摊开** —— 每类的 `collected / needed / negative / spread`、
+  `SkipLearnStatus`（`noSamples / collecting / tooSpread / outOfWindow / learned`），
+  以及样本不足但落点集中、中位数在窗口内时的**低置信候选**。
+  ⛔ `learn*` 与 `progress` 共用 `_cluster` / `Cluster` 一份判定；
+  `status == learned` ⇔ `learn()` 真出了结论，用镜像单测钉住。
+- **P1 落地**：候选不会自己生效。UI 把识别到的**具体时间点**摆出来，用户点一次
+  确认才写进 `learned_*` 结论列（`saveLearnedSkip`，双端现成路径），走正常自动跳
+  链路。**确认前播放器什么都不会做**，仍是「宁可不生效，也不勉强生效」。
+- 进度可见：没结论时不再「整行不显示」，详情页写「自动识别中 · 片头 1/3」，
+  播放页把「为什么没学出来」（落点差异较大 / 超出常见范围）也讲清楚。
+
+### ⛔⛔ 为什么写 `learned_*` 而不是手标列
+
+设计文档 §八 P1 原本写的是「确认后写入手标列」。**Android 端没有手标写入路径**
+（§13.9：电视上没有手标入口，那两列只能靠 PC 同步回填）。写手标会造成两端行为
+不一致；写 `learned_*` 则双端都有 `saveLearnedSkip`，零新增生效路径、零 schema
+改动。`learnedSamples` 如实记 1（诚实：就是 1 条样本撑着的）。
+
+### 三条链路各自的确认方式
+
+| 端 | 路径 | 确认 |
+|---|---|---|
+| PC 内置页 | `player_page._offerSkipSuggestion` | SnackBar + `SnackBarAction('自动跳过')` |
+| PC 独立窗口 | `player_bridge_host` 回传候选 → `player_window_app` 弹同样一条 | 新增 `PlayerBridgeMethod.confirmSkipSuggestion` 回主窗口写库 |
+| Android TV | `PlayerActivity.offerSkipSuggestion` | 居中 `notice` 写「按 OK」，`dispatchKeyEvent` 在候选挂着时把 OK 键截给确认 |
+
+⚠️ `saveSkipAnchor` **从「无返回值」改成「返回候选表」**：`onSaveSkipAnchor` 的
+类型跟着变成 `Future<Map<String, Object?>?>`，`handlePlayerWindowCall` 把返回值
+透传回播放窗口。改这里必须同时看 `player_window_app._reportSkipAnchor`
+（`invokeMethod<Object?>`）。⛔ 仍然**不回传错误**：样本是看剧看出来的，拿不到
+候选就当作不问，播放照常。
+
+⚠️ TV 上候选提示挂着的 8 秒里，OK / ENTER 键归确认（放在退出确认 / OSD
+**之后**，那两层开着时不截按键）。超时用文案比对清 `pendingSkipSuggestion`，
+别让旧超时把新候选一起清掉。
+
+### 已知取舍（不是 bug）
+
+- 确认后自动跳生效 ⇒ 自我实现防护（§13.4）让后续集不再手动拖 ⇒ 样本数停在
+  n=1，结论不会再被校准。这与文档 P1「确认后走现有链路」是同一个取舍；
+  用户可在「片头 / 片尾」里清除或手动改。
+- 每部作品 × 每类 × **每个样本数**只提示一次（`_skipSuggestionShown`），
+  样本数变了（更可信了）才再问一次，否则第 1、2 集会反复弹同一条。
+- 三类「不可信」状态（0 样本 / 散布超标 / 中位数出窗）**不给候选**，
+  连猜一个给用户看的资格都没有。
+- Android 简介页（`detailSkip`）这次**没加**进度行：播放页已覆盖，TV 上读样本
+  要另开后台查库，收益不抵改动面。
+
+### 未落地（按 2026-11-07 分析的建议留到量化之后）
+
+第三层「片尾信号扩容」（把非结论触发的自动连播位置纳入弱信号，要动 §13.4
+自我实现红线）与第四层「阈值 / MAD 微调」（要两端同改 + 更新镜像守卫）都**没做**。
+`player_page` 的 `diag.info` 现在会把 `SkipLearningProgress` 一起打出来，
+先捞真机日志看「样本不足 / MAD 超标 / 片尾零样本」各占多少再决定方向，别拍脑袋改数字。
+
 ## 14. 媒体库删除时「一并删网盘」（2026-10-21，两端已落地）
 
 ### 14.1 为什么加

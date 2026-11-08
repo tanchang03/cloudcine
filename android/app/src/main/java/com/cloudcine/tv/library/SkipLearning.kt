@@ -302,6 +302,85 @@ data class SkipLearningOutcome(
 }
 
 /**
+ * 「为什么还没学出来」—— 把 [SkipLearning.learn] 的拒绝原因摊开给 UI 看。
+ *
+ * 以前 `learn()` 返回空结论时，调用方只知道「没学出来」，不知道是样本不够、
+ * 落点太散、还是中位数跑出了窗口；用户那边就表现为「看了一集又一集，什么
+ * 都没发生」。这一层**不改变任何判定**，只是把判定过程讲清楚。
+ */
+enum class SkipLearnStatus(val label: String) {
+    /** 一条有效正样本都没有。 */
+    NO_SAMPLES("暂无有效样本"),
+    /** 样本还没攒够 [SkipLearning.MIN_SAMPLES]，但落点集中、中位数在窗口内。 */
+    COLLECTING("正在攒样本"),
+    /** 落点散布（MAD）超标，即使攒够样本也会被拒。 */
+    TOO_SPREAD("落点差异较大"),
+    /** 中位数跑出了片头 / 片尾窗口。 */
+    OUT_OF_WINDOW("落点超出常见范围"),
+    /** 三项全过：[SkipLearning.learn] 已学出正式结论。 */
+    LEARNED("已识别"),
+}
+
+/** 某一类（片头 / 片尾）的学习进度。**两类各自独立计数**。 */
+data class SkipKindProgress(
+    val kind: SkipKind,
+    /** 参与聚合的正样本条数（与 `learn*` 完全同口径：排除负样本）。 */
+    val collected: Int,
+    /** 被作废的负样本条数（撤销 / 回拖）。只用于说明，不参与聚合。 */
+    val negative: Int,
+    /** 攒够正式结论需要多少样本，恒等于 [SkipLearning.MIN_SAMPLES]。 */
+    val needed: Int,
+    val status: SkipLearnStatus,
+    /** 这批落点的 MAD。 */
+    val spreadMs: Long,
+    /**
+     * **低置信候选**：样本不足但落点集中、中位数在窗口内时的那个中位数。
+     * 片头 = 终点；片尾 = 距末尾偏移。仅 [status] 为
+     * [SkipLearnStatus.COLLECTING] 时非 `null`。
+     *
+     * ⚠️ 它**不是**正式结论，不会自己生效，要用户在 UI 上点一次确认。
+     * 这是设计文档 §八「先提示，再自动」的 P1 阶段：用一次用户裁决替代
+     * 「攒够 3 集」，把生效从第 4 集提前到第 1 集，而误跳风险为零 ——
+     * 确认之前播放器什么都不会做。
+     */
+    val suggestionMs: Long?,
+) {
+    val hasSuggestion: Boolean get() = suggestionMs != null
+
+    /** 还差几条才能自动生效；已经 LEARNED 时为 0。 */
+    val remaining: Int get() = if (collected >= needed) 0 else needed - collected
+}
+
+/** 一次完整的学习进度（片头 + 片尾）。 */
+data class SkipLearningProgress(
+    val intro: SkipKindProgress,
+    val outro: SkipKindProgress,
+) {
+    fun of(kind: SkipKind): SkipKindProgress =
+        if (kind == SkipKind.INTRO) intro else outro
+
+    val hasSuggestion: Boolean get() = intro.hasSuggestion || outro.hasSuggestion
+
+    /**
+     * 把**某一类**的候选打包成可直接交给 `saveLearnedSkip` 的结论。
+     * 只取 [kind] 那一半：一次落点只可能是片头或片尾，把另一半也写进去
+     * 会把「还没采到样本」的那一类凭空固化成一个结论。
+     */
+    fun outcomeFor(kind: SkipKind): SkipLearningOutcome {
+        val p = of(kind)
+        val value = p.suggestionMs ?: return SkipLearningOutcome()
+        return SkipLearningOutcome(
+            intro = if (kind == SkipKind.INTRO)
+                LearnedIntro(endMs = value, samples = p.collected, spreadMs = p.spreadMs)
+            else null,
+            outro = if (kind == SkipKind.OUTRO)
+                LearnedOutro(offsetMs = value, samples = p.collected, spreadMs = p.spreadMs)
+            else null,
+        )
+    }
+}
+
+/**
  * 「跳过片头 / 片尾」的学习规则。
  *
  * ## ⛔ 与 PC 端必须逐字同源
@@ -430,36 +509,95 @@ object SkipLearning {
             outro = learnOutro(samples),
         )
 
+    /**
+     * 一批样本 → **学习进度**（含低置信候选与「为什么还没学出来」）。
+     *
+     * 与 [learn] 共用同一份判定（[cluster]），所以「进度说已识别」与
+     * 「learn 真的学出结论」永远一致，不会出现两套标准各自漂移。
+     * 它**不改动** [learn] 的任何门槛：候选只是把「还差几集」这段等待
+     * 摊开给用户看，并提供一次「要不要提前生效」的裁决机会。
+     */
+    fun progress(samples: List<SkipSample>): SkipLearningProgress =
+        SkipLearningProgress(
+            intro = kindProgress(
+                samples, SkipKind.INTRO,
+                INTRO_MIN_ANCHOR_MS, INTRO_MAX_ANCHOR_MS, INTRO_MAX_SPREAD_MS,
+            ),
+            outro = kindProgress(
+                samples, SkipKind.OUTRO,
+                OUTRO_MIN_OFFSET_MS, OUTRO_MAX_OFFSET_MS, OUTRO_MAX_SPREAD_MS,
+            ),
+        )
+
     /** 学出片头区间（`[0, end]`）。认不出来返回 `null`。 */
     fun learnIntro(samples: List<SkipSample>): LearnedIntro? {
-        val anchors = samples
-            .filter { it.kind == SkipKind.INTRO && !it.negative }
-            .map { it.anchorMs }
-        if (anchors.size < MIN_SAMPLES) return null
-
-        val center = median(anchors) ?: return null
-        val spread = medianAbsoluteDeviation(anchors, center)
-        if (spread > INTRO_MAX_SPREAD_MS) return null
-        if (center < INTRO_MIN_ANCHOR_MS || center > INTRO_MAX_ANCHOR_MS) return null
-
-        return LearnedIntro(endMs = center, samples = anchors.size, spreadMs = spread)
+        val c = cluster(
+            positiveValues(samples, SkipKind.INTRO, intro = true),
+            INTRO_MIN_ANCHOR_MS, INTRO_MAX_ANCHOR_MS,
+        )
+        if (c.count < MIN_SAMPLES) return null
+        if (c.spreadMs > INTRO_MAX_SPREAD_MS) return null
+        if (!c.withinWindow) return null
+        return LearnedIntro(endMs = c.center!!, samples = c.count, spreadMs = c.spreadMs)
     }
 
     /** 学出片尾偏移。认不出来返回 `null`。 */
     fun learnOutro(samples: List<SkipSample>): LearnedOutro? {
         // ⛔ 用 `offset`（距末尾）而不是 `anchor`（绝对时间）：
         //    各集片长不同，绝对时间跨集不可比。
-        val offsets = samples
-            .filter { it.kind == SkipKind.OUTRO && !it.negative }
-            .map { it.offsetMs }
-        if (offsets.size < MIN_SAMPLES) return null
+        val c = cluster(
+            positiveValues(samples, SkipKind.OUTRO, intro = false),
+            OUTRO_MIN_OFFSET_MS, OUTRO_MAX_OFFSET_MS,
+        )
+        if (c.count < MIN_SAMPLES) return null
+        if (c.spreadMs > OUTRO_MAX_SPREAD_MS) return null
+        if (!c.withinWindow) return null
+        return LearnedOutro(offsetMs = c.center!!, samples = c.count, spreadMs = c.spreadMs)
+    }
 
-        val center = median(offsets) ?: return null
-        val spread = medianAbsoluteDeviation(offsets, center)
-        if (spread > OUTRO_MAX_SPREAD_MS) return null
-        if (center < OUTRO_MIN_OFFSET_MS || center > OUTRO_MAX_OFFSET_MS) return null
+    /** 取出某一类、未被作废的样本值。片头取 `anchorMs`，片尾取 `offsetMs`。 */
+    private fun positiveValues(
+        samples: List<SkipSample>,
+        kind: SkipKind,
+        intro: Boolean,
+    ): List<Long> = samples
+        .filter { it.kind == kind && !it.negative }
+        .map { if (intro) it.anchorMs else it.offsetMs }
 
-        return LearnedOutro(offsetMs = center, samples = offsets.size, spreadMs = spread)
+    private fun kindProgress(
+        samples: List<SkipSample>,
+        kind: SkipKind,
+        lowerMs: Long,
+        upperMs: Long,
+        maxSpreadMs: Long,
+    ): SkipKindProgress {
+        val c = cluster(
+            positiveValues(samples, kind, intro = kind == SkipKind.INTRO),
+            lowerMs, upperMs,
+        )
+        val negative = samples.count { it.kind == kind && it.negative }
+        val status = statusOf(c, maxSpreadMs)
+        // 只有「还在攒样本、且这批落点本身可信」才给候选。
+        // 已经能正式学出结论（LEARNED）时不给 —— 那条路走 learn()，
+        // 不需要用户再点一次；样本数为 0 / 散布超标 / 中位数出窗也不给。
+        val suggestionMs = if (status == SkipLearnStatus.COLLECTING) c.center else null
+        return SkipKindProgress(
+            kind = kind,
+            collected = c.count,
+            negative = negative,
+            needed = MIN_SAMPLES,
+            status = status,
+            spreadMs = c.spreadMs,
+            suggestionMs = suggestionMs,
+        )
+    }
+
+    private fun statusOf(c: Cluster, maxSpreadMs: Long): SkipLearnStatus = when {
+        c.count == 0 -> SkipLearnStatus.NO_SAMPLES
+        c.spreadMs > maxSpreadMs -> SkipLearnStatus.TOO_SPREAD
+        !c.withinWindow -> SkipLearnStatus.OUT_OF_WINDOW
+        c.count >= MIN_SAMPLES -> SkipLearnStatus.LEARNED
+        else -> SkipLearnStatus.COLLECTING
     }
 
     /**
@@ -488,5 +626,20 @@ object SkipLearning {
         if (values.isEmpty()) return 0L
         val deviations = values.map { abs(it - center) }
         return median(deviations) ?: 0L
+    }
+
+    /** [cluster] 的结果：`learn*` 与 [progress] 共用，免得两处各写一遍、日后漂移。 */
+    private data class Cluster(
+        val count: Int,
+        val center: Long?,
+        val spreadMs: Long,
+        val withinWindow: Boolean,
+    )
+
+    /** 一批落点 → 中位数 / MAD / 是否落在窗口内。空列表时 `center` 为 `null`。 */
+    private fun cluster(values: List<Long>, lowerMs: Long, upperMs: Long): Cluster {
+        val center = median(values) ?: return Cluster(0, null, 0L, false)
+        val spread = medianAbsoluteDeviation(values, center)
+        return Cluster(values.size, center, spread, center >= lowerMs && center <= upperMs)
     }
 }

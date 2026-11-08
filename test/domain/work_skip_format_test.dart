@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:cloudcine/core/utils/filename_parser.dart';
 import 'package:cloudcine/domain/entities/drive_provider.dart';
 import 'package:cloudcine/domain/entities/media_work.dart';
+import 'package:cloudcine/domain/services/skip_learning.dart';
 import 'package:cloudcine/domain/services/work_skip_format.dart';
 
 void main() {
@@ -140,6 +141,84 @@ void main() {
       for (final ms in <int>[0, 1000, 92000, 3723000]) {
         expect(WorkSkipFormat.parseClock(WorkSkipFormat.clock(ms)), ms);
       }
+    });
+  });
+
+  group('WorkSkipFormat.progressLine', () {
+    SkipLearningProgress progress({
+      int introCollected = 0,
+      int introNegative = 0,
+      SkipLearnStatus introStatus = SkipLearnStatus.noSamples,
+      int outroCollected = 0,
+      int outroNegative = 0,
+      SkipLearnStatus outroStatus = SkipLearnStatus.noSamples,
+    }) =>
+        SkipLearningProgress(
+          intro: SkipKindProgress(
+            kind: SkipKind.intro,
+            collected: introCollected,
+            negative: introNegative,
+            needed: 3,
+            status: introStatus,
+            spread: Duration.zero,
+          ),
+          outro: SkipKindProgress(
+            kind: SkipKind.outro,
+            collected: outroCollected,
+            negative: outroNegative,
+            needed: 3,
+            status: outroStatus,
+            spread: Duration.zero,
+          ),
+        );
+
+    test('两类都没动静 → 整行不出现', () {
+      expect(WorkSkipFormat.progressLine(progress()), isNull);
+    });
+
+    test('只有片头在攒 → 只报片头，带上 1/3', () {
+      expect(
+        WorkSkipFormat.progressLine(
+          progress(introCollected: 1, introStatus: SkipLearnStatus.collecting),
+        ),
+        '自动识别中 · 片头 1/3',
+      );
+    });
+
+    test('两类都在攒 → 两类都写，各自计数', () {
+      expect(
+        WorkSkipFormat.progressLine(
+          progress(
+            introCollected: 2,
+            introStatus: SkipLearnStatus.collecting,
+            outroCollected: 1,
+            outroStatus: SkipLearnStatus.collecting,
+          ),
+        ),
+        '自动识别中 · 片头 2/3 · 片尾 1/3',
+      );
+    });
+
+    test('落点散 / 出窗 → 带上原因，别让「又白看一集」没有解释', () {
+      expect(
+        WorkSkipFormat.progressLine(
+          progress(introCollected: 2, introStatus: SkipLearnStatus.tooSpread),
+        ),
+        '自动识别中 · 片头 2/3（落点差异较大，暂未识别）',
+      );
+      expect(
+        WorkSkipFormat.progressLine(
+          progress(outroCollected: 2, outroStatus: SkipLearnStatus.outOfWindow),
+        ),
+        '自动识别中 · 片尾 2/3（落点超出常见范围，暂未识别）',
+      );
+    });
+
+    test('只有负样本也要出声（说明「有过但被作废」）', () {
+      expect(
+        WorkSkipFormat.progressLine(progress(introNegative: 1)),
+        '自动识别中 · 片头 0/3',
+      );
     });
   });
 }

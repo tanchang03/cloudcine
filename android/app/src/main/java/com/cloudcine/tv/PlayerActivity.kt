@@ -43,6 +43,8 @@ import com.cloudcine.tv.library.EpisodeLabels
 import com.cloudcine.tv.library.EpisodeThumbs
 import com.cloudcine.tv.library.IntroMarker
 import com.cloudcine.tv.library.IntroSession
+import com.cloudcine.tv.library.LearnedIntro
+import com.cloudcine.tv.library.LearnedOutro
 import com.cloudcine.tv.library.dirPathOf
 import com.cloudcine.tv.library.fullPathOf
 import com.cloudcine.tv.library.LibraryDb
@@ -58,7 +60,9 @@ import com.cloudcine.tv.library.ScanItem
 import com.cloudcine.tv.library.SeekObservation
 import com.cloudcine.tv.library.SkipAnchor
 import com.cloudcine.tv.library.SkipAnchorCollector
+import com.cloudcine.tv.library.SkipKind
 import com.cloudcine.tv.library.SkipLearning
+import com.cloudcine.tv.library.SkipLearningOutcome
 import com.cloudcine.tv.library.SkipSample
 import com.cloudcine.tv.pan.Bg
 import com.cloudcine.tv.pan.PlayInfo
@@ -116,6 +120,29 @@ class PlayerActivity : Activity() {
     private lateinit var notice: TextView
     private lateinit var controls: PlayerControlsView
     private lateinit var confirmExit: ConfirmDialogView
+
+    /** 当前挂着的「以后自动跳过？」候选；`null` = 没有。 */
+    private var pendingSkipSuggestion: SkipSuggestion? = null
+
+    /** 每部作品、每类、每个样本数只提示一次（见 [offerSkipSuggestion]）。 */
+    private val skipSuggestionShown = HashMap<String, Int>()
+
+    /** Bg 线程算完落点样本后送回主线程的那一包。 */
+    private data class SkipLearnReply(
+        val outcome: SkipLearningOutcome? = null,
+        val progressText: String? = null,
+        val suggestion: SkipSuggestion? = null,
+    )
+
+    /** 样本不足但落点集中时的「低置信候选」，等用户在 TV 上按 OK 确认。 */
+    private data class SkipSuggestion(
+        val workKey: String,
+        val kind: SkipKind,
+        val suggestionMs: Long,
+        val samples: Int,
+        val needed: Int,
+        val spreadMs: Long,
+    )
 
     /** 整页根容器。字幕抬高时要读它的高度（见 [updateSubtitleInset]）。 */
     private lateinit var root: FrameLayout
@@ -1446,34 +1473,81 @@ class PlayerActivity : Activity() {
             )
             val samples = db.skipSamplesForWork(key)
             val outcome = SkipLearning.learn(samples)
-            if (outcome.isEmpty) return@run null
-            db.saveLearnedSkip(key, outcome)
-            db.pruneSkipSamples(key)
-            outcome
-        }) { outcome, err ->
+            if (!outcome.isEmpty) {
+                db.saveLearnedSkip(key, outcome)
+                db.pruneSkipSamples(key)
+                return@run SkipLearnReply(outcome = outcome)
+            }
+
+            // ⛔ 以前空结论只打一条日志就完事，用户那边是「看了一集又一集，
+            //    什么都没发生」。现在把进度摊开，并在「样本不足但落点集中」时
+            //    回传一条可确认的候选 —— 第 1 集就能点一下生效（P1）。
+            val progress = SkipLearning.progress(samples)
+            val kp = progress.of(kind)
+            val progressText =
+                "${kind.label} 已采样 ${kp.collected}/${kp.needed} · ${kp.status.label}"
+            val suggestion = if (!kp.hasSuggestion) {
+                null
+            } else {
+                // 这一类已经有结论（手标或自动学习）时不再问：那条路本来就会跳。
+                val work = db.workByKey(key)
+                val hasConclusion = if (kind == SkipKind.INTRO) {
+                    work?.introStartMs != null || work?.introEndMs != null ||
+                        work?.learnedIntroEndMs != null
+                } else {
+                    (work?.outroOffsetMs ?: 0L) > 0L ||
+                        (work?.learnedOutroOffsetMs ?: 0L) > 0L
+                }
+                if (hasConclusion) {
+                    null
+                } else {
+                    SkipSuggestion(
+                        workKey = key,
+                        kind = kind,
+                        suggestionMs = kp.suggestionMs!!,
+                        samples = kp.collected,
+                        needed = kp.needed,
+                        spreadMs = kp.spreadMs,
+                    )
+                }
+            }
+            SkipLearnReply(progressText = progressText, suggestion = suggestion)
+        }) { reply, err ->
             if (err != null) {
                 // 学习失败**不影响播放**，但必须留痕 —— 否则「怎么学不出来」
                 // 会变成一个无从查起的问题。
                 Log.w(TAG, "落点样本处理失败（不影响播放）：${err.message}")
                 return@run
             }
-            if (outcome == null) {
-                Log.i(TAG, "落点已记录，但还没攒够可用的学习结论")
+            if (reply == null) return@run
+            val outcome = reply.outcome
+            if (outcome != null) {
+                Log.i(TAG, "学习结论已更新：$key → intro=${outcome.intro} outro=${outcome.outro}")
+                // ⛔ 期间可能已经换集：晚到的结论打到新一集上，表现是「刚切过去
+                //    画面自己跳一下」。与 [loadSkipConfig] 同一条竞态守卫。
+                if (workKey != key) return@run
+                // 「当场学会」：用户第一次拖到片尾切集，样本就够了，结论立刻写回。
+                // 不同步进来的话这一集就再也不会提示 —— 用户会觉得「刚学会的东西
+                // 没生效」，而那正是他第一次手动操作的那一集。
+                introSession.setLearned(
+                    outcome.intro?.let { IntroMarker(0L, it.endMs) },
+                )
+                if (outcome.outro != null) {
+                    learnedOutroOffsetMs = outcome.outro.offsetMs
+                    outroHandled = false
+                }
                 return@run
             }
-            Log.i(TAG, "学习结论已更新：$key → intro=${outcome.intro} outro=${outcome.outro}")
-            // ⛔ 期间可能已经换集：晚到的结论打到新一集上，表现是「刚切过去
-            //    画面自己跳一下」。与 [loadSkipConfig] 同一条竞态守卫。
+
+            Log.i(TAG, "落点已记录，还没攒够可用的学习结论：${reply.progressText}")
+            // ⛔ 期间可能已经换集：晚到的提示打到新一集上，用户会对着不相干的
+            //    那一集按 OK。与结论同一条竞态守卫。
             if (workKey != key) return@run
-            // 「当场学会」：用户第一次拖到片尾切集，样本就够了，结论立刻写回。
-            // 不同步进来的话这一集就再也不会提示 —— 用户会觉得「刚学会的东西
-            // 没生效」，而那正是他第一次手动操作的那一集。
-            introSession.setLearned(
-                outcome.intro?.let { IntroMarker(0L, it.endMs) },
-            )
-            if (outcome.outro != null) {
-                learnedOutroOffsetMs = outcome.outro.offsetMs
-                outroHandled = false
+            val s = reply.suggestion
+            if (s == null) {
+                showNoticeBriefly("片头 / 片尾自动识别中 · ${reply.progressText}")
+            } else {
+                offerSkipSuggestion(s)
             }
         }
     }
@@ -3387,6 +3461,17 @@ class PlayerActivity : Activity() {
             return true // OSD 开着时别的键也吞掉，避免误触播放控制
         }
 
+        // ── 「以后自动跳过？」候选：提示还挂着时 OK 键先归它 ──────────
+        // TV 上没有可点的按钮，提示文案里明写「按 OK」；按下去就是确认，
+        // 不按就 8 秒后自动收掉。放在退出确认 / OSD **之后**：那两层开着时
+        // 用户看的是菜单，OK 键属于菜单，不能被学习提示截走。
+        if (pendingSkipSuggestion != null &&
+            (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER)
+        ) {
+            stats.markKey()
+            return confirmPendingSkipSuggestion()
+        }
+
         // ── 返回键：两级，必须在 `showControls()` **之前**判 ──────────
         // ① 还有覆盖层（控制栏）→ 先收掉，回到「全屏播放状态」；
         // ② 已经是全屏播放 → 弹「要退出播放吗？」，确认后才 `finish()`。
@@ -3807,6 +3892,87 @@ class PlayerActivity : Activity() {
 
     private fun hideNotice() {
         notice.visibility = View.GONE
+    }
+
+    /**
+     * 样本不足但落点集中：把**具体时间点**摆出来，让用户按一次 OK 决定。
+     *
+     * 这是设计文档 §八「先提示，再自动」的 P1 阶段。TV 上没有可点的按钮，
+     * 所以提示文案里明写「按 OK」，由 [dispatchKeyEvent] 那条分支接住。
+     * ⚠️ 确认之前播放器什么都不会做 —— 误跳风险为零，仍守着「宁可不生效，
+     *    也不勉强生效」那条红线。
+     */
+    private fun offerSkipSuggestion(s: SkipSuggestion) {
+        val dedup = "${s.workKey}#${s.kind.dbName}"
+        if (skipSuggestionShown[dedup] == s.samples) return
+        skipSuggestionShown[dedup] = s.samples
+
+        val clock = EpisodeLabels.clock(s.suggestionMs)
+        val where = if (s.kind == SkipKind.INTRO) {
+            "片头 00:00–$clock"
+        } else {
+            "片尾 距末尾 $clock"
+        }
+        val text = "已识别 $where（${s.kind.label} 已采样 ${s.samples}/${s.needed}）" +
+            " · 按 OK 以后自动跳过"
+        pendingSkipSuggestion = s
+        showNotice(text)
+        ui.postDelayed({
+            // 文案比对：期间被别的提示覆盖了就别把新的候选一起清掉。
+            if (notice.text.toString() == text) {
+                hideNotice()
+                pendingSkipSuggestion = null
+            }
+        }, 8_000L)
+    }
+
+    /** 用户按了 OK：把候选固化成正式结论（写 `learned_*` 列，双端同一条路）。 */
+    private fun confirmPendingSkipSuggestion(): Boolean {
+        val s = pendingSkipSuggestion ?: return false
+        pendingSkipSuggestion = null
+        hideNotice()
+        Bg.run({
+            val db = ensureLib()
+            val outcome = SkipLearningOutcome(
+                intro = if (s.kind == SkipKind.INTRO) {
+                    LearnedIntro(
+                        endMs = s.suggestionMs,
+                        samples = s.samples,
+                        spreadMs = s.spreadMs,
+                    )
+                } else {
+                    null
+                },
+                outro = if (s.kind == SkipKind.OUTRO) {
+                    LearnedOutro(
+                        offsetMs = s.suggestionMs,
+                        samples = s.samples,
+                        spreadMs = s.spreadMs,
+                    )
+                } else {
+                    null
+                },
+            )
+            db.saveLearnedSkip(s.workKey, outcome)
+            outcome
+        }) { outcome, err ->
+            if (err != null) {
+                Log.w(TAG, "确认自动跳过失败：${err.message}")
+                return@run
+            }
+            if (outcome == null) return@run
+            Log.i(TAG, "用户确认低置信候选：${s.workKey} → $outcome")
+            showNoticeBriefly("已开启自动跳过")
+            // 「当场学会」：把结论同步进正在播的状态机，这一集就能提示。
+            if (workKey != s.workKey) return@run
+            if (s.kind == SkipKind.INTRO) {
+                introSession.setLearned(IntroMarker(0L, s.suggestionMs))
+            } else {
+                learnedOutroOffsetMs = s.suggestionMs
+                outroHandled = false
+            }
+        }
+        return true
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

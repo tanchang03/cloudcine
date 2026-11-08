@@ -15,6 +15,7 @@ import '../../domain/services/missing_media.dart';
 import '../../domain/services/playback_resume.dart';
 import '../../domain/services/skip_learning.dart';
 import '../../domain/services/subtitle_query.dart';
+import '../../domain/services/work_skip_format.dart';
 import '../providers/app_providers.dart';
 import '../providers/library_providers.dart';
 import '../providers/library_refresh_providers.dart';
@@ -447,13 +448,13 @@ final playerBridgeHostProvider = Provider<void>((ref) {
         // 条目被删、或被重扫换过 id。**不写**：样本挂在一条不存在的条目上，
         // 永远参与不了聚合，只会让表慢慢变脏。
         diag.warn('窗口', '落点样本丢弃：库里找不到 ${report.itemId}');
-        return;
+        return null;
       }
 
       final kind = SkipKind.parse(report.kind);
       if (kind == null) {
         diag.warn('窗口', '落点样本丢弃：认不出类型 ${report.kind}');
-        return;
+        return null;
       }
 
       final key = item.groupKey;
@@ -477,7 +478,7 @@ final playerBridgeHostProvider = Provider<void>((ref) {
           ) !=
           kind) {
         diag.info('窗口', '落点不在 ${kind.label} 窗口内，丢弃：$report');
-        return;
+        return null;
       }
 
       await repo.addSkipSample(
@@ -494,17 +495,96 @@ final playerBridgeHostProvider = Provider<void>((ref) {
         ),
       );
 
+      // 详情页那行「自动识别中 · 片头 1/3」也要跟着长。
+      ref.invalidate(skipProgressProvider(key));
+
       final samples = await repo.skipSamplesForWork(key);
       final outcome = SkipLearning.learn(samples);
       if (outcome.isEmpty) {
-        diag.info('窗口', '$key：样本 ${samples.length} 条，还没学出可用结论');
-        return;
+        final progress = SkipLearning.progress(samples);
+        diag.info(
+          '窗口',
+          '$key：样本 ${samples.length} 条，还没学出可用结论 → $progress',
+        );
+        final kp = progress.of(kind);
+        if (!kp.hasSuggestion) return null;
+
+        // 这一类已经有结论（手标或自动学习）时不再问：那条路本来就会跳。
+        final work = await repo.workByKey(key);
+        if (work == null) return null;
+        final hasConclusion = kind == SkipKind.intro
+            ? WorkSkipFormat.introLine(work) != null
+            : WorkSkipFormat.outroLine(work) != null;
+        if (hasConclusion) return null;
+
+        // 把候选回传给播放窗口，由那边弹一次「以后自动跳过？」的确认条。
+        // 文案在这边生成，播放窗口不用为了一行字再引入 domain 层的依赖。
+        final clock = WorkSkipFormat.clock(kp.suggestion!.inMilliseconds);
+        final where = kind == SkipKind.intro
+            ? '片头 00:00–$clock'
+            : '片尾 距末尾 $clock';
+        final sampled = '${kind.label} 已采样 ${kp.collected}/${kp.needed}';
+        return <String, Object?>{
+          'message': '已识别 $where（$sampled）· 以后自动跳过？',
+          'workKey': key,
+          'kind': kind.name,
+          'introEndMs':
+              kind == SkipKind.intro ? kp.suggestion!.inMilliseconds : null,
+          'outroOffsetMs':
+              kind == SkipKind.outro ? kp.suggestion!.inMilliseconds : null,
+          'samples': kp.collected,
+          'spreadMs': kp.spread.inMilliseconds,
+        };
       }
 
       await repo.saveLearnedSkip(key, outcome, now: now);
       diag.info('窗口', '学习结论已更新：$key → $outcome');
+      return null;
     } catch (e, st) {
       diag.error('窗口', '落点样本处理失败（不影响播放）', error: e, stackTrace: st);
+      return null;
+    }
+  };
+
+  // 服务七之二：用户在播放窗口点了「以后自动跳过」，把候选固化成正式结论。
+  //
+  // 写的是 `saveLearnedSkip`（与内置播放页同一条现成路径），不是新增生效
+  // 链路，也不碰手标列。确认后下一集起播时 `PlayRequest` 会带上结论生效。
+  onConfirmSkipSuggestion = (payload) async {
+    try {
+      final key = payload['workKey'] as String?;
+      final kind = SkipKind.parse(payload['kind'] as String?);
+      if (key == null || key.isEmpty || kind == null) return false;
+      final introEndMs = (payload['introEndMs'] as num?)?.toInt();
+      final outroOffsetMs = (payload['outroOffsetMs'] as num?)?.toInt();
+      final samples = (payload['samples'] as num?)?.toInt() ?? 0;
+      final spreadMs = (payload['spreadMs'] as num?)?.toInt() ?? 0;
+      final outcome = SkipLearningOutcome(
+        intro: kind == SkipKind.intro && introEndMs != null
+            ? LearnedIntro(
+                end: Duration(milliseconds: introEndMs),
+                samples: samples,
+                spread: Duration(milliseconds: spreadMs),
+              )
+            : null,
+        outro: kind == SkipKind.outro && outroOffsetMs != null
+            ? LearnedOutro(
+                offset: Duration(milliseconds: outroOffsetMs),
+                samples: samples,
+                spread: Duration(milliseconds: spreadMs),
+              )
+            : null,
+      );
+      if (outcome.isEmpty) return false;
+      await ref
+          .read(mediaRepositoryProvider)
+          .saveLearnedSkip(key, outcome, now: DateTime.now());
+      ref.invalidate(skipProgressProvider(key));
+      diag.info('窗口', '$key：用户确认低置信候选 → $outcome');
+      return true;
+    } catch (e, st) {
+      diag.error('窗口', '确认自动跳过失败', error: e, stackTrace: st);
+      return false;
     }
   };
 

@@ -370,6 +370,129 @@ class SkipLearningOutcome {
       'SkipLearningOutcome(intro=$intro, outro=$outro)';
 }
 
+/// 「为什么还没学出来」——把 `learn()` 的拒绝原因摊开给 UI 看。
+///
+/// 以前 `learn()` 返回空结论时,调用方只知道「没学出来」,不知道是样本
+/// 不够、落点太散、还是中位数跑出了窗口;用户那边就表现为「看了一集又
+/// 一集,什么都没发生」。这一层**不改变任何判定**,只是把判定过程讲清楚。
+enum SkipLearnStatus {
+  /// 一条有效正样本都没有。
+  noSamples('暂无有效样本'),
+
+  /// 样本还没攒够 `minSamples`,但落点集中、中位数在窗口内 ——
+  /// 有一个可以交给用户裁决的低置信候选。
+  collecting('正在攒样本'),
+
+  /// 落点散布(MAD)超标,即使攒够样本也会被拒。
+  tooSpread('落点差异较大'),
+
+  /// 中位数跑出了片头 / 片尾窗口。
+  outOfWindow('落点超出常见范围'),
+
+  /// 样本数、散布、窗口三项全过:`learn()` 已学出正式结论。
+  learned('已识别');
+
+  const SkipLearnStatus(this.label);
+
+  final String label;
+}
+
+/// 某一类(片头 / 片尾)的学习进度。**两类各自独立计数**。
+class SkipKindProgress {
+  const SkipKindProgress({
+    required this.kind,
+    required this.collected,
+    required this.negative,
+    required this.needed,
+    required this.status,
+    required this.spread,
+    this.suggestion,
+  });
+
+  final SkipKind kind;
+
+  /// 参与聚合的正样本条数(与 `learn*` 完全同口径:排除负样本)。
+  final int collected;
+
+  /// 被作废的负样本条数(撤销 / 回拖)。只用于说明,不参与聚合。
+  final int negative;
+
+  /// 攒够正式结论需要多少样本,恒等于 [SkipLearning.minSamples]。
+  final int needed;
+
+  final SkipLearnStatus status;
+
+  /// 这批落点的 MAD。
+  final Duration spread;
+
+  /// **低置信候选**:样本不足但落点集中、中位数在窗口内时的那个中位数。
+  /// 片头 = 终点;片尾 = 距末尾偏移。仅 [status] 为
+  /// [SkipLearnStatus.collecting] 时非 `null`。
+  ///
+  /// ⚠️ 它**不是**正式结论,不会自己生效,要用户在 UI 上点一次确认。
+  /// 这是设计文档 §八「先提示,再自动」的 P1 阶段:用一次用户裁决替代
+  /// 「攒够 3 集」,把生效从第 4 集提前到第 1 集,而误跳风险为零 ——
+  /// 确认之前播放器什么都不会做。
+  final Duration? suggestion;
+
+  bool get hasSuggestion => suggestion != null;
+
+  /// 还差几条才能自动生效;已经 learned 时为 0。
+  int get remaining => collected >= needed ? 0 : needed - collected;
+
+  @override
+  String toString() =>
+      '${kind.label}: $collected/$needed 样本, $status'
+      '${suggestion == null ? '' : ', 候选 ${suggestion!.inSeconds}s'}';
+}
+
+/// 一次完整的学习进度(片头 + 片尾)。
+class SkipLearningProgress {
+  const SkipLearningProgress({required this.intro, required this.outro});
+
+  final SkipKindProgress intro;
+  final SkipKindProgress outro;
+
+  SkipKindProgress of(SkipKind kind) =>
+      kind == SkipKind.intro ? intro : outro;
+
+  /// 有没有可以交给用户裁决的候选。
+  bool get hasSuggestion => intro.hasSuggestion || outro.hasSuggestion;
+
+  /// 把**某一类**的候选打包成可直接交给 `saveLearnedSkip` 的结论。
+  ///
+  /// 只取 [kind] 那一半:一次落点只可能是片头或片尾,把另一半也写进去
+  /// 会把「还没采到样本」的那一类凭空固化成一个结论。
+  SkipLearningOutcome outcomeFor(SkipKind kind) {
+    final p = of(kind);
+    final value = p.suggestion;
+    if (value == null) return const SkipLearningOutcome();
+    return SkipLearningOutcome(
+      intro: kind == SkipKind.intro
+          ? LearnedIntro(end: value, samples: p.collected, spread: p.spread)
+          : null,
+      outro: kind == SkipKind.outro
+          ? LearnedOutro(offset: value, samples: p.collected, spread: p.spread)
+          : null,
+    );
+  }
+
+  @override
+  String toString() =>
+      'SkipLearningProgress(intro=$intro, outro=$outro)';
+}
+
+/// [_cluster] 的结果。把「中位数 / MAD / 窗口」一次算完,让 `learn*` 与
+/// `progress` 共用**同一份判定**,免得两处各写一遍、日后各自漂移。
+class _Cluster {
+  const _Cluster(this.count, this.center, this.spread, this.withinWindow);
+
+  final int count;
+  final Duration? center;
+  final Duration spread;
+  final bool withinWindow;
+}
+
 /// 「跳过片头 / 片尾」的学习规则。
 ///
 /// ## 全部是纯函数
@@ -492,23 +615,45 @@ abstract final class SkipLearning {
         outro: learnOutro(samples),
       );
 
+  /// 一批样本 → **学习进度**(含低置信候选与「为什么还没学出来」)。
+  ///
+  /// 与 [learn] 共用同一份判定([_cluster]),所以「进度说已识别」与
+  /// 「learn 真的学出结论」永远一致,不会出现两套标准各自漂移。
+  /// 它**不改动** [learn] 的任何门槛:候选只是把「还差几集」这段等待
+  /// 摊开给用户看,并提供一次「要不要提前生效」的裁决机会。
+  static SkipLearningProgress progress(List<SkipSample> samples) =>
+      SkipLearningProgress(
+        intro: _kindProgress(
+          samples,
+          SkipKind.intro,
+          introMinAnchor,
+          introMaxAnchor,
+          introMaxSpread,
+        ),
+        outro: _kindProgress(
+          samples,
+          SkipKind.outro,
+          outroMinOffset,
+          outroMaxOffset,
+          outroMaxSpread,
+        ),
+      );
+
   /// 学出片头区间（`[0, end]`）。认不出来返回 `null`。
   static LearnedIntro? learnIntro(List<SkipSample> samples) {
-    final anchors = <Duration>[
-      for (final s in samples)
-        if (s.kind == SkipKind.intro && !s.negative) s.anchor,
-    ];
-    if (anchors.length < minSamples) return null;
-
-    final center = median(anchors)!;
-    final spread = medianAbsoluteDeviation(anchors, center);
-    if (spread > introMaxSpread) return null;
-    if (center < introMinAnchor || center > introMaxAnchor) return null;
+    final c = _cluster(
+      _positiveValues(samples, SkipKind.intro, intro: true),
+      introMinAnchor,
+      introMaxAnchor,
+    );
+    if (c.count < minSamples) return null;
+    if (c.spread > introMaxSpread) return null;
+    if (!c.withinWindow) return null;
 
     return LearnedIntro(
-      end: center,
-      samples: anchors.length,
-      spread: spread,
+      end: c.center!,
+      samples: c.count,
+      spread: c.spread,
     );
   }
 
@@ -516,22 +661,72 @@ abstract final class SkipLearning {
   static LearnedOutro? learnOutro(List<SkipSample> samples) {
     // ⛔ 用 `offset`（距末尾）而不是 `anchor`（绝对时间）：
     //    各集片长不同，绝对时间跨集不可比。
-    final offsets = <Duration>[
-      for (final s in samples)
-        if (s.kind == SkipKind.outro && !s.negative) s.offset,
-    ];
-    if (offsets.length < minSamples) return null;
-
-    final center = median(offsets)!;
-    final spread = medianAbsoluteDeviation(offsets, center);
-    if (spread > outroMaxSpread) return null;
-    if (center < outroMinOffset || center > outroMaxOffset) return null;
+    final c = _cluster(
+      _positiveValues(samples, SkipKind.outro, intro: false),
+      outroMinOffset,
+      outroMaxOffset,
+    );
+    if (c.count < minSamples) return null;
+    if (c.spread > outroMaxSpread) return null;
+    if (!c.withinWindow) return null;
 
     return LearnedOutro(
-      offset: center,
-      samples: offsets.length,
-      spread: spread,
+      offset: c.center!,
+      samples: c.count,
+      spread: c.spread,
     );
+  }
+
+  /// 取出某一类、未被作废的样本值。片头取 `anchor`,片尾取 `offset`。
+  static List<Duration> _positiveValues(
+    List<SkipSample> samples,
+    SkipKind kind, {
+    required bool intro,
+  }) => <Duration>[
+        for (final s in samples)
+          if (s.kind == kind && !s.negative) intro ? s.anchor : s.offset,
+      ];
+
+  static SkipKindProgress _kindProgress(
+    List<SkipSample> samples,
+    SkipKind kind,
+    Duration lower,
+    Duration upper,
+    Duration maxSpread,
+  ) {
+    final c = _cluster(
+      _positiveValues(samples, kind, intro: kind == SkipKind.intro),
+      lower,
+      upper,
+    );
+    final negative =
+        samples.where((s) => s.kind == kind && s.negative).length;
+    final status = _statusOf(c, maxSpread);
+
+    // 只有「还在攒样本、且这批落点本身可信」才给候选。
+    // 已经能正式学出结论（status == learned）时不给 —— 那条路走 learn()，
+    // 不需要用户再点一次；样本数为 0 / 散布超标 / 中位数出窗也不给，
+    // 那三种情况连「猜一个给用户看」的资格都没有（宁可不生效）。
+    final Duration? suggestion =
+        status == SkipLearnStatus.collecting ? c.center : null;
+
+    return SkipKindProgress(
+      kind: kind,
+      collected: c.count,
+      negative: negative,
+      needed: minSamples,
+      status: status,
+      spread: c.spread,
+      suggestion: suggestion,
+    );
+  }
+
+  static SkipLearnStatus _statusOf(_Cluster c, Duration maxSpread) {
+    if (c.count == 0) return SkipLearnStatus.noSamples;
+    if (c.spread > maxSpread) return SkipLearnStatus.tooSpread;
+    if (!c.withinWindow) return SkipLearnStatus.outOfWindow;
+    if (c.count >= minSamples) return SkipLearnStatus.learned;
+    return SkipLearnStatus.collecting;
   }
 
   /// 中位数。空列表返回 `null`。
@@ -563,5 +758,28 @@ abstract final class SkipLearning {
         v >= center ? v - center : center - v,
     ];
     return median(deviations) ?? Duration.zero;
+  }
+
+  /// 一批落点 → 中位数 / MAD / 是否落在窗口内。
+  ///
+  /// `learn*` 与 `progress` 都走这里:前者拿它判「能不能正式生效」,
+  /// 后者拿它判「还差几集 / 为什么没成 / 有没有可推荐的候选」。
+  /// 空列表时 `center` 为 `null`,调用方据此走 `noSamples`。
+  static _Cluster _cluster(
+    List<Duration> values,
+    Duration lower,
+    Duration upper,
+  ) {
+    final center = median(values);
+    if (center == null) {
+      return const _Cluster(0, null, Duration.zero, false);
+    }
+    final spread = medianAbsoluteDeviation(values, center);
+    return _Cluster(
+      values.length,
+      center,
+      spread,
+      center >= lower && center <= upper,
+    );
   }
 }

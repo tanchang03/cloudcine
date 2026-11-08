@@ -438,4 +438,161 @@ class SkipLearningTest {
     fun `样本主键在两端可复现`() {
         assertEquals("q:1#intro#1234", SkipSample.idFor("q:1", SkipKind.INTRO, 1234L))
     }
+
+    // ------------------------------------------------------------------
+    // 学习进度与低置信候选（P1：先提示再自动）—— 与 Dart 侧同一批用例
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `只有 1 条样本 ⇒ 正在攒样本，且给出可确认的候选`() {
+        val samples = listOf(sample(SkipKind.INTRO, 92_000L, itemId = "q:1"))
+        val p = SkipLearning.progress(samples)
+
+        assertNull(
+            "正式结论仍然要 3 条 —— 进度不改任何门槛",
+            SkipLearning.learnIntro(samples),
+        )
+        assertEquals(SkipLearnStatus.COLLECTING, p.intro.status)
+        assertEquals(1, p.intro.collected)
+        assertEquals(SkipLearning.MIN_SAMPLES, p.intro.needed)
+        assertEquals(2, p.intro.remaining)
+        assertEquals(92_000L, p.intro.suggestionMs!!)
+        assertTrue(p.hasSuggestion)
+    }
+
+    @Test
+    fun `2 条一致 ⇒ 候选取中位数，还差 1 条`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 90_000L, itemId = "q:1"),
+            sample(SkipKind.INTRO, 92_000L, itemId = "q:2"),
+        )
+        val p = SkipLearning.progress(samples)
+
+        assertEquals(91_000L, p.intro.suggestionMs!!)
+        assertEquals(1, p.intro.remaining)
+        assertEquals(1_000L, p.intro.spreadMs)
+    }
+
+    @Test
+    fun `攒够 3 条 ⇒ LEARNED，不再给候选（正式结论接管）`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 90_000L, itemId = "q:1"),
+            sample(SkipKind.INTRO, 92_000L, itemId = "q:2"),
+            sample(SkipKind.INTRO, 91_000L, itemId = "q:3"),
+        )
+        val p = SkipLearning.progress(samples)
+
+        assertNotNull(SkipLearning.learnIntro(samples))
+        assertEquals(SkipLearnStatus.LEARNED, p.intro.status)
+        assertNull(p.intro.suggestionMs)
+        assertEquals(0, p.intro.remaining)
+    }
+
+    @Test
+    fun `落点散得厉害 ⇒ TOO_SPREAD，不给候选（宁可不生效）`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 20_000L, itemId = "q:1"),
+            sample(SkipKind.INTRO, 160_000L, itemId = "q:2"),
+        )
+        val p = SkipLearning.progress(samples)
+
+        assertEquals(SkipLearnStatus.TOO_SPREAD, p.intro.status)
+        assertNull(p.intro.suggestionMs)
+        assertFalse(p.hasSuggestion)
+    }
+
+    @Test
+    fun `中位数跑出窗口 ⇒ OUT_OF_WINDOW，不给候选`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 4 * 60_000L, itemId = "q:1"),
+            sample(SkipKind.INTRO, 4 * 60_000L, itemId = "q:2"),
+        )
+        val p = SkipLearning.progress(samples)
+
+        assertEquals(SkipLearnStatus.OUT_OF_WINDOW, p.intro.status)
+        assertNull(p.intro.suggestionMs)
+        assertNull(SkipLearning.learnIntro(samples))
+    }
+
+    @Test
+    fun `空样本 ⇒ NO_SAMPLES`() {
+        val p = SkipLearning.progress(emptyList())
+
+        assertEquals(SkipLearnStatus.NO_SAMPLES, p.intro.status)
+        assertEquals(SkipLearnStatus.NO_SAMPLES, p.outro.status)
+        assertFalse(p.hasSuggestion)
+    }
+
+    @Test
+    fun `负样本不计入 collected，但如实记在 negative 上`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 90_000L, itemId = "q:1"),
+            sample(SkipKind.INTRO, 400_000L, itemId = "q:2", negative = true),
+        )
+        val p = SkipLearning.progress(samples)
+
+        assertEquals(1, p.intro.collected)
+        assertEquals(1, p.intro.negative)
+        assertEquals(90_000L, p.intro.suggestionMs!!)
+    }
+
+    @Test
+    fun `片头与片尾各自独立计数，互不拖累`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 92_000L, itemId = "q:1"),
+            sample(SkipKind.OUTRO, episode - 80_000L, itemId = "q:1"),
+            sample(SkipKind.OUTRO, episode - 82_000L, itemId = "q:2"),
+            sample(SkipKind.OUTRO, episode - 81_000L, itemId = "q:3"),
+        )
+        val p = SkipLearning.progress(samples)
+
+        assertEquals(SkipLearnStatus.COLLECTING, p.intro.status)
+        assertEquals(92_000L, p.intro.suggestionMs!!)
+        assertEquals(SkipLearnStatus.LEARNED, p.outro.status)
+        assertNull(p.outro.suggestionMs)
+        assertNotNull(SkipLearning.learnOutro(samples))
+    }
+
+    @Test
+    fun `outcomeFor 只固化请求那一类，可直接交给 saveLearnedSkip`() {
+        val samples = listOf(
+            sample(SkipKind.INTRO, 92_000L, itemId = "q:1"),
+            sample(SkipKind.OUTRO, episode - 80_000L, itemId = "q:1"),
+        )
+        val p = SkipLearning.progress(samples)
+        val introOnly = p.outcomeFor(SkipKind.INTRO)
+        val outroOnly = p.outcomeFor(SkipKind.OUTRO)
+
+        assertFalse(introOnly.isEmpty)
+        assertEquals(92_000L, introOnly.intro!!.endMs)
+        assertEquals(1, introOnly.intro!!.samples)
+        assertNull("片尾那一条还没攒够，不能凭空固化成结论", introOnly.outro)
+        assertNull(outroOnly.intro)
+        assertEquals(80_000L, outroOnly.outro!!.offsetMs)
+    }
+
+    @Test
+    fun `status == LEARNED 与 learn() 出结论永远一致`() {
+        val batches: List<List<SkipSample>> = listOf(
+            emptyList(),
+            listOf(sample(SkipKind.INTRO, 92_000L, itemId = "q:1")),
+            listOf(
+                sample(SkipKind.INTRO, 90_000L, itemId = "q:1"),
+                sample(SkipKind.INTRO, 92_000L, itemId = "q:2"),
+                sample(SkipKind.INTRO, 91_000L, itemId = "q:3"),
+            ),
+            listOf(
+                sample(SkipKind.INTRO, 20_000L, itemId = "q:1"),
+                sample(SkipKind.INTRO, 90_000L, itemId = "q:2"),
+                sample(SkipKind.INTRO, 160_000L, itemId = "q:3"),
+            ),
+        )
+        for (batch in batches) {
+            assertEquals(
+                "进度与 learn() 必须共用同一份判定，不能各自漂移",
+                SkipLearning.learnIntro(batch) != null,
+                SkipLearning.progress(batch).intro.status == SkipLearnStatus.LEARNED,
+            )
+        }
+    }
 }

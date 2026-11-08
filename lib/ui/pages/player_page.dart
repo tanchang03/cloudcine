@@ -27,8 +27,10 @@ import '../../domain/services/intro_marker.dart';
 import '../../domain/services/playback_controller.dart';
 import '../../domain/services/playback_exit_policy.dart';
 import '../../domain/services/skip_learning.dart';
+import '../../domain/services/work_skip_format.dart';
 import '../platform/tv_osd_channel.dart';
 import '../providers/app_providers.dart';
+import '../providers/library_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/anchored_menu.dart';
 import '../widgets/buffered_slider.dart';
@@ -441,6 +443,13 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
 
   /// 设置：有片头标识时是否自动跳过。
   bool _skipIntro = true;
+
+  /// 「低置信候选」已经提示到哪个样本数了。
+  ///
+  /// 每采到一条新样本都会重聚合一次，不拦的话第 1、2 集会反复弹同一条
+  /// 提示。键是 `workKey#kind`，值是**上次提示时的样本数**：样本数变了
+  /// （候选更可信了）才值得再问一次，否则就安静地继续攒。
+  final Map<String, int> _skipSuggestionShown = {};
 
   /// TV 右侧设置面板是否打开。
   ///
@@ -1129,13 +1138,22 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
         ),
       );
 
+      // 详情页那行「自动识别中 · 片头 1/3」也要跟着长。
+      ref.invalidate(skipProgressProvider(work.key));
+
       final samples = await repo.skipSamplesForWork(work.key);
       final outcome = SkipLearning.learn(samples);
       if (outcome.isEmpty) {
+        // ⛔ 以前这里只打一条日志就 return，用户那边是「看了一集又一集，
+        //    什么都没发生」。现在把进度摊开：还差几集、为什么没学出来、
+        //    以及（样本不足但落点集中时）一次可确认的提前生效机会。
+        final progress = SkipLearning.progress(samples);
         diag.info(
           '学习',
-          '${work.key}：样本 ${samples.length} 条，还没学出可用结论（${kind.label}）',
+          '${work.key}：样本 ${samples.length} 条，还没学出可用结论'
+          '（${kind.label}）→ $progress',
         );
+        _offerSkipSuggestion(work, kind, progress);
         return;
       }
 
@@ -1153,6 +1171,92 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       _applyWork(fresh);
     } catch (e) {
       diag.warn('学习', '落点处理失败（不影响播放）：$e');
+    }
+  }
+
+  /// 样本还没攒够时的**进度提示 + 一次提前生效的裁决机会**。
+  ///
+  /// ## 为什么不是「直接自动跳」
+  ///
+  /// `learn()` 要 3 条样本才敢下结论，那是为了挡住「用户拖一下」的多义性。
+  /// 但片头有「起点 = 0」这个强锚，第 1 集用户**主动拖到片头后并稳定看了
+  /// 15 秒**其实已经是很强的信号 —— 只是还不足以让机器替用户做决定。
+  /// 所以这里把决定权交还给用户：把识别到的**具体时间点**摆出来，他点一下
+  /// 才生效。这正是设计文档 §八「先提示，再自动」的 P1 阶段。
+  ///
+  /// ⚠️ 确认之前播放器什么都不会做 —— 误跳风险为零，仍守着「宁可不生效，
+  ///    也不勉强生效」那条红线。确认后写的是已有的 `learned_*` 结论列
+  ///    （不是新增生效路径），走的就是正常自动跳链路。
+  void _offerSkipSuggestion(
+    MediaWork work,
+    SkipKind kind,
+    SkipLearningProgress progress,
+  ) {
+    if (!mounted) return;
+    final p = progress.of(kind);
+
+    // 这一类已经有结论（手标或自动学习）时不再打扰：那条路本来就会跳，
+    // 再问一次只会让人以为「刚才那次没保存上」。
+    final hasConclusion = kind == SkipKind.intro
+        ? WorkSkipFormat.introLine(work) != null
+        : WorkSkipFormat.outroLine(work) != null;
+    if (hasConclusion) return;
+
+    final key = '${work.key}#${kind.name}';
+    if (_skipSuggestionShown[key] == p.collected) return;
+    _skipSuggestionShown[key] = p.collected;
+
+    final sampled = '${kind.label} 已采样 ${p.collected}/${p.needed}';
+    if (!p.hasSuggestion) {
+      // 还在攒、但这批落点不可信：把**原因**讲清楚，而不是让它静默空转。
+      _toast('片头 / 片尾自动识别中 · $sampled · ${p.status.label}');
+      return;
+    }
+
+    final clock = WorkSkipFormat.clock(p.suggestion!.inMilliseconds);
+    final where = kind == SkipKind.intro
+        ? '片头 00:00–$clock'
+        : '片尾 距末尾 $clock';
+    final outcome = progress.outcomeFor(kind);
+    final workKey = work.key;
+
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('已识别 $where（$sampled）· 以后自动跳过？'),
+          duration: const Duration(seconds: 8),
+          behavior: SnackBarBehavior.floating,
+          action: SnackBarAction(
+            label: '自动跳过',
+            onPressed: () => _confirmSkipSuggestion(workKey, kind, outcome),
+          ),
+        ),
+      );
+  }
+
+  /// 用户点了「自动跳过」：把这条低置信候选**固化成正式结论**。
+  ///
+  /// 写的是 `saveLearnedSkip`（双端都有的现成路径），不是新增生效链路，
+  /// 也不碰手标列 —— 电视端没有手标入口，走手标会造成两端不一致。
+  Future<void> _confirmSkipSuggestion(
+    String workKey,
+    SkipKind kind,
+    SkipLearningOutcome outcome,
+  ) async {
+    try {
+      final repo = ref.read(mediaRepositoryProvider);
+      await repo.saveLearnedSkip(workKey, outcome, now: DateTime.now());
+      diag.info('学习', '$workKey：用户确认低置信候选（${kind.label}）→ $outcome');
+      if (!mounted) return;
+      // 与 `_onSkipAnchor` 同一条竞态守卫：期间用户可能已经切到别的作品。
+      if (_work?.key != workKey) return;
+      final fresh = await repo.workByKey(workKey);
+      if (!mounted || fresh == null) return;
+      _applyWork(fresh);
+      _toast('已开启自动跳过 · 可在「片头 / 片尾」里调整或清除');
+    } catch (e) {
+      diag.warn('学习', '确认低置信候选失败（不影响播放）：$e');
     }
   }
 

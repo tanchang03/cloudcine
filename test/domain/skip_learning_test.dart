@@ -464,6 +464,193 @@ void main() {
     });
   });
 
+  group('学习进度与低置信候选（P1：先提示再自动）', () {
+    test('只有 1 条样本 ⇒ 正在攒样本，且给出可确认的候选', () {
+      final samples = [
+        _sample(
+          kind: SkipKind.intro,
+          anchor: const Duration(seconds: 92),
+          itemId: 'q:1',
+        ),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(
+        SkipLearning.learnIntro(samples),
+        isNull,
+        reason: '正式结论仍然要 3 条 —— 进度不改任何门槛',
+      );
+      expect(p.intro.status, SkipLearnStatus.collecting);
+      expect(p.intro.collected, 1);
+      expect(p.intro.needed, SkipLearning.minSamples);
+      expect(p.intro.remaining, 2);
+      expect(p.intro.suggestion, const Duration(seconds: 92));
+      expect(p.hasSuggestion, isTrue);
+    });
+
+    test('2 条一致 ⇒ 候选取中位数，还差 1 条', () {
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 90), itemId: 'q:1'),
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 92), itemId: 'q:2'),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(p.intro.suggestion, const Duration(seconds: 91));
+      expect(p.intro.remaining, 1);
+      expect(p.intro.spread, const Duration(seconds: 1));
+    });
+
+    test('攒够 3 条 ⇒ learned，不再给候选（正式结论接管）', () {
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 90), itemId: 'q:1'),
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 92), itemId: 'q:2'),
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 91), itemId: 'q:3'),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(SkipLearning.learnIntro(samples), isNotNull);
+      expect(p.intro.status, SkipLearnStatus.learned);
+      expect(p.intro.suggestion, isNull);
+      expect(p.intro.remaining, 0);
+    });
+
+    test('落点散得厉害 ⇒ tooSpread，不给候选（宁可不生效）', () {
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 20), itemId: 'q:1'),
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 160), itemId: 'q:2'),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(p.intro.status, SkipLearnStatus.tooSpread);
+      expect(p.intro.suggestion, isNull);
+      expect(p.hasSuggestion, isFalse);
+    });
+
+    test('中位数跑出窗口 ⇒ outOfWindow，不给候选', () {
+      // 两条都落在 3 分钟以外；classify 在采集环节就不会收它们，这里直接
+      // 构造聚合层样本，测的是 `progress` 与 `learn*` 共用判据这件事。
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(minutes: 4), itemId: 'q:1'),
+        _sample(kind: SkipKind.intro, anchor: const Duration(minutes: 4), itemId: 'q:2'),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(p.intro.status, SkipLearnStatus.outOfWindow);
+      expect(p.intro.suggestion, isNull);
+      expect(SkipLearning.learnIntro(samples), isNull);
+    });
+
+    test('空样本 ⇒ noSamples', () {
+      final p = SkipLearning.progress(const <SkipSample>[]);
+
+      expect(p.intro.status, SkipLearnStatus.noSamples);
+      expect(p.outro.status, SkipLearnStatus.noSamples);
+      expect(p.hasSuggestion, isFalse);
+    });
+
+    test('负样本不计入 collected，但如实记在 negative 上', () {
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 90), itemId: 'q:1'),
+        _sample(
+          kind: SkipKind.intro,
+          anchor: const Duration(seconds: 400),
+          itemId: 'q:2',
+          negative: true,
+        ),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(p.intro.collected, 1);
+      expect(p.intro.negative, 1);
+      expect(p.intro.suggestion, const Duration(seconds: 90));
+    });
+
+    test('片头与片尾各自独立计数，互不拖累', () {
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 92), itemId: 'q:1'),
+        _sample(
+          kind: SkipKind.outro,
+          anchor: _episode - const Duration(seconds: 80),
+          itemId: 'q:1',
+        ),
+        _sample(
+          kind: SkipKind.outro,
+          anchor: _episode - const Duration(seconds: 82),
+          itemId: 'q:2',
+        ),
+        _sample(
+          kind: SkipKind.outro,
+          anchor: _episode - const Duration(seconds: 81),
+          itemId: 'q:3',
+        ),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(p.intro.status, SkipLearnStatus.collecting);
+      expect(p.intro.suggestion, const Duration(seconds: 92));
+      expect(p.outro.status, SkipLearnStatus.learned);
+      expect(p.outro.suggestion, isNull);
+      expect(SkipLearning.learnOutro(samples), isNotNull);
+    });
+
+    test('outcomeFor 只固化请求那一类，可直接交给 saveLearnedSkip', () {
+      final samples = [
+        _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 92), itemId: 'q:1'),
+        _sample(
+          kind: SkipKind.outro,
+          anchor: _episode - const Duration(seconds: 80),
+          itemId: 'q:1',
+        ),
+      ];
+
+      final p = SkipLearning.progress(samples);
+
+      expect(p.outcomeFor(SkipKind.intro).isEmpty, isFalse);
+      expect(p.outcomeFor(SkipKind.intro).intro!.end, const Duration(seconds: 92));
+      expect(p.outcomeFor(SkipKind.intro).intro!.samples, 1);
+      expect(
+        p.outcomeFor(SkipKind.intro).outro,
+        isNull,
+        reason: '片尾那一条还没攒够，不能凭空固化成结论',
+      );
+      expect(p.outcomeFor(SkipKind.outro).intro, isNull);
+      expect(p.outcomeFor(SkipKind.outro).outro!.offset, const Duration(seconds: 80));
+    });
+
+    test('status == learned 与 learn() 出结论永远一致', () {
+      // 钉住「进度说已识别」⇔「learn 真的学出结论」：两处共用同一份判定，
+      // 不允许各自漂移（否则 UI 说学会了、播放器却没跳）。
+      final batches = <List<SkipSample>>[
+        <SkipSample>[],
+        [_sample(kind: SkipKind.intro, anchor: const Duration(seconds: 92), itemId: 'q:1')],
+        [
+          _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 90), itemId: 'q:1'),
+          _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 92), itemId: 'q:2'),
+          _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 91), itemId: 'q:3'),
+        ],
+        [
+          _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 20), itemId: 'q:1'),
+          _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 90), itemId: 'q:2'),
+          _sample(kind: SkipKind.intro, anchor: const Duration(seconds: 160), itemId: 'q:3'),
+        ],
+      ];
+      for (final batch in batches) {
+        expect(
+          SkipLearning.progress(batch).intro.status == SkipLearnStatus.learned,
+          SkipLearning.learnIntro(batch) != null,
+          reason: '进度与 learn() 必须共用同一份判定，不能各自漂移',
+        );
+      }
+    });
+  });
+
   group('中位数工具', () {
     test('奇数个取中间', () {
       expect(

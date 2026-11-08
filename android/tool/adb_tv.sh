@@ -223,7 +223,7 @@ cmd_install() {
     exit 1
   fi
   # 打印产物时间 —— 「装的是不是刚构建的那个包」是这个脚本最容易搞错的一件事。
-  echo "安装：$apk（产物时间 $(date -r "$apk" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '未知')）"
+  echo "安装：${apk}（产物时间 $(date -r "$apk" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '未知')）"
   # -r 覆盖安装并保留数据（含磁盘缓存）。想测「首次启动」先跑 uninstall。
   adb -s "$SERIAL" install -r "$apk"
   echo "✓ 已安装。启动：android/tool/adb_tv.sh launch"
@@ -231,7 +231,7 @@ cmd_install() {
 
 cmd_log() {
   require_device
-  echo "跟随 tag=$TAG（Ctrl-C 退出）…"
+  echo "跟随 tag=${TAG}（Ctrl-C 退出）…"
   echo "⛔ 没输出 ≠ 没在播：调试浮层默认关闭，先进 播放页 → 菜单 → 调试 → 开启。"
   echo
   adb -s "$SERIAL" logcat -v time -s "$TAG"
@@ -247,7 +247,7 @@ cmd_app() {
     echo "应用没在跑 —— 先 android/tool/adb_tv.sh launch" >&2
     return 1
   fi
-  echo "跟随 $PKG 的全部日志（PID=$pid，Ctrl-C 退出）…"
+  echo "跟随 $PKG 的全部日志（PID=${pid}，Ctrl-C 退出）…"
   echo
   adb -s "$SERIAL" logcat -v time --pid="$pid"
 }

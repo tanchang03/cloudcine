@@ -1,4 +1,5 @@
 import '../entities/media_work.dart';
+import 'skip_learning.dart';
 
 /// 作品简介页上「片头 / 片尾」那一行的**文案**。
 ///
@@ -74,6 +75,27 @@ class WorkSkipFormat {
 
   /// 有没有任何片头 / 片尾结论（手标或学习任一成立）。
   static bool hasAny(MediaWork w) => introLine(w) != null || outroLine(w) != null;
+
+  /// 还没有任何结论时，简介页上那一行**学习进度**的文案。
+  ///
+  /// 返回 `null` = 不用显示（两类都完全没有样本）。已学出结论时由 [line]
+  /// 负责，这一行不出现 —— 两行同时说「片头」会让人以为是两套数据。
+  /// 完全没动静的那一类不啰嗦，只报「有在攒」的那一类；攒得散 / 出了
+  /// 窗口的那一类把原因带上，免得用户以为「又白看一集」。
+  static String? progressLine(SkipLearningProgress p) {
+    final parts = <String>[];
+    for (final k in <SkipKindProgress>[p.intro, p.outro]) {
+      if (k.collected == 0 && k.negative == 0) continue;
+      var s = '${k.kind.label} ${k.collected}/${k.needed}';
+      if (k.status == SkipLearnStatus.tooSpread ||
+          k.status == SkipLearnStatus.outOfWindow) {
+        s += '（${k.status.label}，暂未识别）';
+      }
+      parts.add(s);
+    }
+    if (parts.isEmpty) return null;
+    return '自动识别中 · ${parts.join(' · ')}';
+  }
 
   /// `ms` → `mm:ss` / `h:mm:ss`。
   ///

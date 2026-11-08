@@ -1019,6 +1019,10 @@ class _InfoColumn extends ConsumerWidget {
         if (WorkSkipFormat.line(work) case final line?) ...[
           const SizedBox(height: 12),
           _SkipLine(text: line, work: work),
+        ] else ...[
+          // 还没学出结论：把「攒到几集了」摊开，别让用户以为白看了几集。
+          const SizedBox(height: 12),
+          _SkipProgressLine(work: work),
         ],
         const SizedBox(height: 18),
         // 用 `Wrap` 而不是 `Row`：这一行现在有七个按钮（播放 / 追剧 / 刮削 /
@@ -1182,6 +1186,48 @@ class _EditGenresChip extends ConsumerWidget {
 ///
 /// 这一行存在的意义就是让人判断「它对不对」，判断完了最自然的下一步就是
 /// 「那我自己填一个」。只给一个小按钮的话，用户得先读、再去找按钮在哪。
+/// 还没有片头 / 片尾结论时，那一行**学习进度**。
+///
+/// 以前 `WorkSkipFormat.line()` 返回 `null` 时整行都不画，用户只知道「还没
+/// 学会」，不知道已经攒了几集、还差几集。这一行只负责把进度摆出来，
+/// 判定在 `SkipLearning.progress`、文案在 `WorkSkipFormat.progressLine`。
+class _SkipProgressLine extends ConsumerWidget {
+  const _SkipProgressLine({required this.work});
+
+  final MediaWork work;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final p = ref.watch(skipProgressProvider(work.key)).valueOrNull;
+    if (p == null) return const SizedBox.shrink();
+    final text = WorkSkipFormat.progressLine(p);
+    if (text == null) return const SizedBox.shrink();
+    return Tooltip(
+      message: '片头 / 片尾正在自动学习，也可以现在手动指定',
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.hourglass_top_rounded,
+              size: 14,
+              color: AppTheme.muted,
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                text,
+                style: const TextStyle(fontSize: 12, color: AppTheme.muted),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _SkipLine extends ConsumerWidget {
   const _SkipLine({required this.text, required this.work});
 

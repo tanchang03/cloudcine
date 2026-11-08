@@ -12,6 +12,7 @@ import '../../domain/services/follow_read.dart';
 import '../../domain/services/item_sort.dart';
 import '../../domain/services/missing_media.dart';
 import '../../domain/services/play_target.dart';
+import '../../domain/services/skip_learning.dart';
 import 'app_providers.dart';
 import 'library_refresh_providers.dart';
 import 'settings_providers.dart';
@@ -1203,6 +1204,21 @@ final itemSortModeProvider = Provider<ItemSortMode>(
 final itemSubtitlesProvider =
     FutureProvider.family<List<SubtitleTrack>, String>((ref, itemId) {
   return ref.watch(mediaRepositoryProvider).subtitlesForItem(itemId);
+});
+
+/// 某部作品的**片头 / 片尾学习进度**。
+///
+/// 详情页用它显示「自动识别中 · 片头 1/3」，让「攒样本」这件事看得见；
+/// 播放页每次采到落点会 `ref.invalidate` 它，重进详情页也不会读到旧缓存。
+/// 判据在 [SkipLearning.progress] 里，这里只负责取样本、不重复判定。
+final skipProgressProvider =
+    FutureProvider.family<SkipLearningProgress, String>((ref, key) async {
+  // 与 `workDetailProvider` 同一条理由：进度信号只在详情页有人监听时才
+  // 触发重取，代价是打开详情页时顺手把样本进度也刷新一遍。
+  ref.watch(playbackProgressSignalProvider);
+  final samples =
+      await ref.watch(mediaRepositoryProvider).skipSamplesForWork(key);
+  return SkipLearning.progress(samples);
 });
 
 /// 媒体库规模统计（设置页 / 空态提示用）。
