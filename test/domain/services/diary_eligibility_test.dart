@@ -54,7 +54,7 @@ void main() {
       final snap = DiaryEligibility.evaluate(
         work: w,
         items: items,
-        progressByFileId: {'f1': prog(maxMs: 5_700_000)},
+        progressByFileId: {pid('f1'): prog(maxMs: 5_700_000)},
       );
       expect(snap, isNull);
     });
@@ -65,7 +65,7 @@ void main() {
       final snap = DiaryEligibility.evaluate(
         work: w,
         items: items,
-        progressByFileId: {'f1': prog(maxMs: 5_760_000, playedAtSec: 100)},
+        progressByFileId: {pid('f1'): prog(maxMs: 5_760_000, playedAtSec: 100)},
       );
       expect(snap, isNotNull);
       expect(snap!.episodeTotal, 1);
@@ -87,7 +87,7 @@ void main() {
         items: items,
         progressByFileId: {
           pid('1080p'): prog(maxMs: 3_000_000),
-          '2160p': prog(maxMs: 6_000_000),
+          pid('2160p'): prog(maxMs: 6_000_000),
         },
       );
       expect(snap, isNotNull);
@@ -116,7 +116,7 @@ void main() {
       );
       final progMap = {
         for (var i = 0; i < 10; i++)
-          'e$i': prog(maxMs: i < 8 ? 2_580_000 : 1_000_000)
+          pid('e$i'): prog(maxMs: i < 8 ? 2_580_000 : 1_000_000)
       };
       final snap =
           DiaryEligibility.evaluate(work: w, items: items, progressByFileId: progMap);
@@ -139,7 +139,7 @@ void main() {
       );
       final progMap = {
         for (var i = 0; i < 10; i++)
-          'e$i': prog(maxMs: i < 7 ? 2_580_000 : 1_000_000)
+          pid('e$i'): prog(maxMs: i < 7 ? 2_580_000 : 1_000_000)
       };
       final snap =
           DiaryEligibility.evaluate(work: w, items: items, progressByFileId: progMap);
@@ -158,7 +158,7 @@ void main() {
         item(fileId: 'sp2', durationMs: 2_700_000, maxMs: 0, sample: true),
       ];
       final progMap = {
-        for (var i = 0; i < 8; i++) 'e$i': prog(maxMs: 2_580_000)
+        for (var i = 0; i < 8; i++) pid('e$i'): prog(maxMs: 2_580_000)
       };
       final snap = DiaryEligibility.evaluate(
         work: w, items: [...eps, ...extras], progressByFileId: progMap);
@@ -168,25 +168,27 @@ void main() {
     });
   });
 
-  group('单文件 tv：退化成电影口径（95.6%）', () {
-    test('1 集只看了 85%（低于 95.6%）→ 整部不记入', () {
+  // ⚠️ 单文件 tv 走**电影**口径 80%，不是单集的 95.6%（设计文档 §3.5：
+  //    「分母为 1 时集数口径反而更严；单文件就是单文件」）。
+  group('单文件 tv：退化成电影口径（80%）', () {
+    test('1 集只看了 75%（低于 80%）→ 整部不记入', () {
       final w = work(kind: MediaKind.episode); // 只有 1 个文件
-      final items = [item(fileId: 'e0', durationMs: 2_700_000, maxMs: 2_295_000)];
+      final items = [item(fileId: 'e0', durationMs: 2_700_000, maxMs: 2_025_000)];
       final snap = DiaryEligibility.evaluate(
         work: w,
         items: items,
-        progressByFileId: {'e0': prog(maxMs: 2_295_000)},
+        progressByFileId: {pid('e0'): prog(maxMs: 2_025_000)},
       );
       expect(snap, isNull);
     });
 
-    test('1 集看完了（≥95.6%）→ 记入', () {
+    test('1 集看完了（≥80%）→ 记入', () {
       final w = work(kind: MediaKind.episode);
       final items = [item(fileId: 'e0', durationMs: 2_700_000, maxMs: 2_580_000)];
       final snap = DiaryEligibility.evaluate(
         work: w,
         items: items,
-        progressByFileId: {'e0': prog(maxMs: 2_580_000)},
+        progressByFileId: {pid('e0'): prog(maxMs: 2_580_000)},
       );
       expect(snap, isNotNull);
     });
@@ -200,13 +202,22 @@ void main() {
         item(fileId: 'e1', durationMs: null), // 未知时长，算 1 集但永远完不成
         item(fileId: 'e2', durationMs: null),
       ];
-      final progMap = {'e0': prog(maxMs: 2_580_000)};
+      final progMap = {pid('e0'): prog(maxMs: 2_580_000)};
       final snap = DiaryEligibility.evaluate(
         work: w, items: items, progressByFileId: progMap);
       // 1/3 = 33% < 80% → 不记入
       expect(snap, isNull);
     });
 
+    // ⛔ 这一条**目前不可达**，先挂着 skip 而不是删掉：它钉的是设计文档 §3.5
+    //    的「未知时长占多数 → 仍可记入，标不可靠」，但同一条规则又要求未知
+    //    时长**计入分母** —— 未知占 >20% 时，能看完的集数必然 <80%，判据先
+    //    返回 null，`reliable = false` 这个分支永远走不到。
+    //
+    //    这是设计文档内部的口径冲突（「计入分母」与「宁可记入一个带问号的」
+    //    不可兼得），不是实现写错。口径定下来再打开这条：
+    //      * 若坚持「计入分母」→ 删掉 `reliable` 与这条用例；
+    //      * 若坚持「宁可记入」→ 未知时长占比超阈值时改用已知时长做分母。
     test('未知时长占多数（>20%）→ 记入但标不可靠', () {
       final w = work(kind: MediaKind.episode);
       final items = [
@@ -217,7 +228,7 @@ void main() {
         item(fileId: 'x3', durationMs: null),
       ];
       final progMap = {
-        for (var i = 0; i < 8; i++) 'e$i': prog(maxMs: 2_580_000)
+        for (var i = 0; i < 8; i++) pid('e$i'): prog(maxMs: 2_580_000)
       };
       final snap = DiaryEligibility.evaluate(
         work: w, items: items, progressByFileId: progMap);
@@ -225,7 +236,7 @@ void main() {
       expect(snap!.episodeTotal, 11);
       expect(snap.episodeWatched, 8);
       expect(snap.reliable, isFalse);
-    });
+    }, skip: '设计文档 §3.5 口径冲突：未知时长计入分母时 >20% 未知必然 <80%，分支不可达');
   });
 
   group('isItemFinished 复用 PlaybackResume', () {

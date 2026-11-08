@@ -24,13 +24,13 @@ import '../../support/focus_reach.dart';
 /// 吃掉 240 + 过扫描 96，只剩 624 给内容；顶栏只吃纵向 60，内容区拿到 864。
 /// 而用户报的「很多区域遥控器无法触达」里，一级导航恰恰是重灾区：它被包在
 /// 壳的过扫描内边距里、每一项的焦点宿主是 `InkWell`（不是 `TvFocusable`），而
-/// `StatefulShellRoute.indexedStack` 又会把 5 个分支**全部**留在 widget 树里。
+/// `StatefulShellRoute.indexedStack` 又会把 6 个分支**全部**留在 widget 树里。
 ///
 /// ## 结论
 ///
 /// | 动作 | 结果 |
 /// |---|---|
-/// | 顶栏**内部** ← / → 走五个入口 | ✅ 正常 |
+/// | 顶栏**内部** ← / → 走六个入口 | ✅ 正常 |
 /// | 焦点在顶栏时按 ↓ 进内容区 | ✅ 正常 |
 /// | OK 键（select）按在导航项上切分支 | ✅ 正常 |
 /// | **焦点在内容区时按 ↑ 进顶栏** | ✅ 正常（**靠兜底**，见下） |
@@ -63,9 +63,9 @@ void main() {
   /// `shell.currentIndex == i` 是按**下标**对的（见 `app_router.dart:112`）。
   const paths = ['/library', '/folders', '/scan', '/downloads', '/settings'];
 
-  /// 顶栏上五个能拿焦点的入口（TvFocusable 包着的 tab），顺序即 `_navItems`。
+  /// 顶栏上六个能拿焦点的入口（TvFocusable 包着的 tab），顺序即 `_navItems`。
   /// 「诊断」是右端 IconButton，不在 TvFocusable 计数里，单独覆盖。
-  const navLabels = ['媒体库', '文件夹', '扫描', '下载', '设置'];
+  const navLabels = ['媒体库', '文件夹', '扫描', '下载', '设置', '观影日记'];
 
   /// 导航上「标签为 [label] 的那一项」。
   Finder navTile(String label) => find.ancestor(
@@ -81,7 +81,7 @@ void main() {
     return null;
   }
 
-  /// 焦点是否落在顶栏那一行里（五个 tab 任一）。
+  /// 焦点是否落在顶栏那一行里（六个 tab 任一）。
   bool inTopNav(WidgetTester tester) => focusedNavLabel(tester) != null;
 
   /// 焦点当前落在哪 —— 只用于**失败时**把轨迹打出来，不参与断言。
@@ -106,7 +106,7 @@ void main() {
   }
 
   /// 铺开**真的 `AppShell`**：真 `GoRouter` + 真 `StatefulShellRoute.indexedStack`，
-  /// 只有五个分支页是占位。view 报电视尺寸（960×540），平台报 android ——
+  /// 只有六个分支页是占位。view 报电视尺寸（960×540），平台报 android ——
   /// 这样 `AppTheme.isTvLayout` 才为真，侧栏才走 240 那条分支。
   ///
   /// [onShell] 把 `StatefulNavigationShell` 交出来，用来断言「真的切了分支」。
@@ -231,7 +231,7 @@ void main() {
       expect(
         find.byType(TvFocusable),
         findsNWidgets(navLabels.length),
-        reason: '顶栏的五项没铺出来（或数量变了），这条用例测了个寂寞',
+        reason: '顶栏的六项没铺出来（或数量变了），这条用例测了个寂寞',
       );
 
       final first = tester.getRect(navTile('媒体库'));
@@ -249,7 +249,7 @@ void main() {
     });
   });
 
-  // 顶栏在 960 宽下的宽度预算：五个 tab + logo + 账号/诊断必须装进
+  // 顶栏在 960 宽下的宽度预算：六个 tab + logo + 账号/诊断必须装进
   // 960 − 过扫描 96 = 864。溢出在 Release 下是静默裁掉 —— 看起来就像
   // 「那个入口本来就没有」，而它还在焦点链里：遥控器按得到、屏幕上看不见。
   testWidgets('顶栏在 960 宽下不溢出，内容区拿到 864 宽', (tester) async {
@@ -265,7 +265,7 @@ void main() {
         isNull,
         reason: '顶栏在 960 宽下溢出了 —— 右端入口会被静默裁掉',
       );
-      final last = tester.getRect(navTile('设置'));
+      final last = tester.getRect(navTile(navLabels.last));
       expect(
         last.right,
         lessThanOrEqualTo(960 - AppTheme.tvSafeHorizontal + 0.5),
@@ -282,7 +282,7 @@ void main() {
 
   // 焦点在内容区时按 ↑ 能不能进顶栏。
   //
-  // 根因不是几何 —— 顶栏那 5 项完全符合 `↑` 的筛选条件
+  // 根因不是几何 —— 顶栏那 6 项完全符合 `↑` 的筛选条件
   // （`node.rect.center.dy <= target.top`）—— 而是 **scope 隔离**：
   // `StatefulShellRoute.indexedStack` 给每个分支一个独立 `Navigator`，于是分支页
   // 有自己的 `FocusScope`；`FocusTraversalPolicy.inDirection` 只在
@@ -371,14 +371,14 @@ void main() {
         );
       }
 
-      // 从最左一路往右：五个入口都要到得了。
+      // 从最左一路往右：六个入口都要到得了。
       await walk('媒体库', LogicalKeyboardKey.arrowRight, expectAll: navLabels);
 
       // 再从最右一路往左回到「媒体库」。
       await walk(
-        '设置',
+        navLabels.last,
         LogicalKeyboardKey.arrowLeft,
-        expectAll: navLabels.where((l) => l != '设置').toList(),
+        expectAll: navLabels.where((l) => l != navLabels.last).toList(),
       );
     });
   });
@@ -446,7 +446,7 @@ void main() {
 /// 分支占位页。
 ///
 /// 给一个真的 `InkWell` 而不是一块纯文字：这样它和真页面一样**能拿焦点**，
-/// 才能模拟「用户正停在内容里」。`StatefulShellRoute.indexedStack` 会把五个
+/// 才能模拟「用户正停在内容里」。`StatefulShellRoute.indexedStack` 会把六个
 /// 分支**全部**留在树里，所以这段在每一条用例里都存在五份。
 ///
 /// ⚠️ 这里**不**包 `TvFocusable`：包了的话 `find.byType(TvFocusable)` 就不再是
