@@ -248,6 +248,77 @@ tmdb_api_key · tmdb_api_base · tmdb_image_base · douban_cookie
 | `TvOsdView` | 原生 OSD（挂在 `android.R.id.content` 之上，与 Dart/主线程彻底解耦） |
 | `StatsOverlay` / `ResourceProbe` | 调试浮层与 CPU / 内存 / 磁盘采样 |
 
+### 播放顶部的标题行
+
+播放页**顶部有一通栏**：「媒体名称 · 第 N 集」（第 2 季起带 `S2 · `，合并集
+写 `第 1-2 集`）；媒体名优先取刮削后的作品名，没读到才退回本地解析片名 /
+文件名。**认不出集数**（电影、花絮、番外、从文件列表直接播没入库的文件、
+媒体库还没读完）就显示**文件全名**（含扩展名）—— 同一部片的 1080p / 2160p
+两个版本只靠文件名分得开；文件名不含媒体名时把媒体名补在最前面（比较忽略
+大小写）。
+
+⛔ 这行字**横贯整屏顶部**（`PlayerActivity.titleBar`），盒子样式照抄控制
+面板（同底色 / 内边距 / 字号），**显隐与控制面板同拍**：面板亮起
+（暂停、缓冲、按键、自动回显）才露头、收面板即收，没有自己独立的显隐——
+数据回调（选集 / 作品名）兜头打来也越不过「面板没亮就不露头」这道闸。
+左上调试浮层（`StatsOverlay`）若同开则**直接叠放、标题压在上面**（标题
+优先级更高）。文字口径唯一生成处是 `library/PlaybackTitle.label`（纯函数），
+由 `PlaybackTitleTest` 钉死；作品名异步从媒体库读（`loadWorkTitle`，按
+groupKey 防跨作品串台）。
+
+### 显示档位钉死（治「按 OK 闪一下」）
+
+控制粒度在 `PlayerActivity.pinDisplayMode`：起播拿到片源帧率后
+（`onVideoInputFormatChanged`），用 `window.attributes.preferredDisplayModeId`
+把整个播放会话的显示档位钉在视频节奏档（25fps 片源 → 50Hz，容差
+±0.5Hz），API 30+ 再给视频 Surface 一个
+`setFrameRate(fps, FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)`。日志实证
+（mt5873/MStar）：固件挂着「自适应刷新率」，每次按 OK 暂停/恢复都会把面
+板在 50Hz↔60Hz 两档间来回切（`Display device changed modeId` +
+`setActivePanelFrequency`），切档即黑/闪一下——钉死后按 OK 不再有模式跳
+变。**fps 未知或没有匹配档时不钉**（宁可让固件自由裁量也不钉错）；
+Surface 重建时帧率提示自动补涂。
+
+### App 启动的默认落点
+
+`LibraryActivity` 首次把作品墙画出来时，光标定位到顶栏「最近播放」胶囊并
+**当场生效该视图**（启动看到的列表就是最近播放、按播放时间排，生效走的与
+亲手按 OK 完全同一条路）；等列表画完，光标最终交给**最近播放列表的第一张
+卡**——启动的最终状态是「最近播放的第一个媒体高亮」（`startupFocusRecents`
++ `startupGridFocusPending`，只做一次）。之后的刷新照旧的焦点规则走，绝不
+把光标拽回导航带或重放该视图。
+
+### 杜比 / DTS 音轨：本机透传失败时自动降级
+
+这批 4K HEVC 片源常带 `DDP2.0`（`audio/eac3`）音轨。本机固件
+`[ro.platform.support.dolby]=false` / `[ro.platform.support.dts]=false`
+（既无硬解也无透传授权），但 media3 从 HDMI `AudioDeviceInfo` 误判支持
+`ENCODING_E_AC3`，会把音轨拿去**透传** ⇒ `AudioTrack` 被 AudioFlinger 拒绝
+（`Error -38/-20`）⇒ 整部片报 `ERROR_CODE_AUDIO_TRACK_INIT_FAILED`
+「播放失败」（2026-11-08 真机实测两次，全是这一个根因）。
+
+`PlayerActivity.onPlayerError` 认出这个错误码 + 当前选中音轨是压缩透传格式
+时，`fallbackToCompatibleAudio` 自动：
+
+1. 片源里还有 AAC / PCM 兼容音轨 ⇒ 强制切到那条，`prepare()` 续播并保留位置
+   （绝大多数 DDP 片源自带第二条 AAC）；
+2. 只有杜比音轨 ⇒ 关掉音轨**只放画面**（比整部片播放失败强）；
+3. 两类都只自动做**一次**（换集重置），仍失败才老实显示错误，防重试转圈。
+
+⛔ 不砍 `AudioCapabilities` 强制 PCM 解码：本机根本没有 `audio/eac3` 解码器，
+那条路只会把「播放失败」换成「解码器初始化失败」（见 `AudioEffect.kt` 类
+文档）。⛔ 也不预先降级：接了功放、真能透传的用户首次播放不受影响，只在
+**实际失败**时兜底。
+
+### 播放页的自动收起（10 秒 + 淡出）
+
+播放中无按键 **10 秒**后，控制面板与顶部标题条一起 **250ms 淡出**消失
+（`CONTROLS_HIDE_MS = 10s`；出现仍是瞬时——按键要的是「按了马上看到」）。
+⛔ **暂停 / 缓冲 / 播完时不自动收**（`keepControlsVisible`）：用户暂停十有
+八九是在盯「已暂停 · 已缓冲 +118s」看还会不会长，10 秒一到不会把它收走；
+返回主动收才即时收（同样走淡出）。淡出到一半被按键叫回时，出现路径会
+`cancel` 动画并把 alpha 复位，不会停在半透明。
+
 ## 三、构建
 
 > ⛔ **本目录是独立原生 Kotlin 工程，`flutter build apk` 在这里没有任何意义。**

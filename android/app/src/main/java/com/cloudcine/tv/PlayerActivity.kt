@@ -4,19 +4,24 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
+import android.view.Display
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.media3.common.C
 import androidx.media3.common.Format
@@ -54,6 +59,7 @@ import com.cloudcine.tv.library.LibrarySchema
 import com.cloudcine.tv.library.MissingReceipt
 import com.cloudcine.tv.library.MissingReceipts
 import com.cloudcine.tv.library.OutroSkip
+import com.cloudcine.tv.library.PlaybackTitle
 import com.cloudcine.tv.library.PlaybackResume
 import com.cloudcine.tv.library.ProgressStore
 import com.cloudcine.tv.library.ScanItem
@@ -123,6 +129,17 @@ class PlayerActivity : Activity() {
 
     /** 右上角的当前时间（常驻，与居中的 [notice] 互不干扰）。 */
     private lateinit var clockView: TextView
+
+    /**
+     * 顶部**通栏**标题条（媒体名 · 第 N 集 / 文件全名）。
+     *
+     * ⛔ 盒子样式**照抄控制面板**（同一底色 / 内边距 / 字号），显隐只跟
+     *    [setControlsShown] 走 —— 面板亮才亮、面板收即收，没有自己独立的
+     *    显隐。文字由 [refreshPausedTitle] 刷新；与左上调试浮层都开着时
+     *    **直接叠放、标题压在上面**（标题优先级更高）。
+     */
+    private lateinit var titleBar: LinearLayout
+    private lateinit var topTitleText: TextView
 
     private lateinit var controls: PlayerControlsView
     private lateinit var confirmExit: ConfirmDialogView
@@ -204,7 +221,7 @@ class PlayerActivity : Activity() {
      *
      * 这两种情况下把控制栏收掉，等于把他正盯着看的读数抢走。暂停态尤其明显：
      * 用户按暂停十有八九**就是为了**确认「暂停后还在不在继续缓冲」，
-     * 4 秒后自己消失正好把答案盖住。
+     * 10 秒后自己消失正好把答案盖住。
      *
      * ⚠️ `isPlaying == false` 在**缓冲中**同样成立（playWhenReady 还是 true，
      * 但状态是 BUFFERING）。这里不需要特意排除：两者都是「要留着」。
@@ -485,6 +502,69 @@ class PlayerActivity : Activity() {
     private class PendingTracks(val audio: String?, val subtitle: String?)
 
     /**
+     * 「透传音轨建不出 AudioTrack」的自动降级**只做一次**（换集由
+     * [startFromIntent] 重置）。切过去还失败就老老实实报错，否则
+     * prepare → 失败 → 切 → prepare 会转圈。
+     */
+    private var audioFallbackDone = false
+
+    /**
+     * 透传失败时把音轨切到片源里的 **PCM 兼容音轨**（AAC 等），重新
+     * `prepare()` 续播并保留播放位置。
+     *
+     * ## 为什么是「切音轨」而不是「禁透传 / 强制解码」
+     *
+     * 本机 `[ro.platform.support.dolby]=false`、`dts=false`，**既没有杜比
+     * 解码器也没有透传授权**；把 `AudioCapabilities` 砍成只支持 PCM
+     * （[AudioEffectRenderersFactory] 类文档警告过的那条路）只会让 media3
+     * 去找一个不存在的 `audio/eac3` 解码器，从「播放失败」变成「解码器
+     * 初始化失败」，并不会有声音。而 DDP 片源普遍自带第二条 AAC 音轨，
+     * 切过去是唯一能真正出声的路。
+     *
+     * ⛔ 判据是「**当前选中的音轨是压缩透传格式**」，不是「凡是音频错误
+     *    都切」：纯 PCM 设备出问题换音轨没用；接了功放、真能透传的用户
+     *    首次播放不受影响（不预先降级，只在实际失败时兜底）。
+     * ⛔ `prepare()` 后 [onTracksChanged] 会再跑一次 [restorePendingTracks]：
+     *    把待还原的音轨标签清掉，免得它把刚降级的轨道拽回 E-AC3。
+     */
+    private fun fallbackToCompatibleAudio(): Boolean {
+        if (audioFallbackDone) return false
+        val choices = trackChoices(C.TRACK_TYPE_AUDIO, withOff = false)
+        val bad = choices.firstOrNull { it.selected && isPassthroughAudio(it) } ?: return false
+        val alt = choices.indexOfFirst { !isPassthroughAudio(it) }
+        val p = player ?: return false
+        audioFallbackDone = true
+        // ⛔ 别让「重建播放器前记住的音轨」在下一轮 onTracksChanged 里翻案。
+        pendingTracks = pendingTracks?.let { PendingTracks(null, it.subtitle) }
+        val pos = p.currentPosition
+        if (alt >= 0) {
+            Log.w(TAG, "音轨透传失败（${mimeOf(bad)}）⇒ 自动切到「${choices[alt].label}」并重试")
+            applyTrackChoice(C.TRACK_TYPE_AUDIO, withOff = false, chip = alt)
+            showNoticeBriefly("音轨不兼容，已自动切换兼容音轨")
+        } else {
+            // 片源**只有**杜比 / DTS 音轨：本机既不能透传也不能解码，
+            // 没有能出声的轨 —— 关掉音轨只放画面，比整部片「播放失败」强。
+            // ⛔ 别去动 `AudioCapabilities` 试图强制解码：本机根本没有
+            //    `audio/eac3` 解码器，那条路只会换成「解码器初始化失败」。
+            Log.w(TAG, "片源只有透传音轨（${mimeOf(bad)}）且本机不支持 ⇒ 静音播放")
+            val b = p.trackSelectionParameters.buildUpon()
+            b.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+            p.trackSelectionParameters = b.build()
+            showNoticeBriefly("本机不支持该杜比音轨，已静音播放")
+        }
+        p.prepare()
+        if (pos > 0L) p.seekTo(pos)
+        return true
+    }
+
+    private fun mimeOf(c: TrackChoice): String =
+        c.group?.getFormat(c.index)?.sampleMimeType.orEmpty()
+
+    /** 只有这些压缩格式会走 HDMI 透传；AAC / raw / opus / flac 都是 PCM 可解码的。 */
+    private fun isPassthroughAudio(c: TrackChoice): Boolean =
+        mimeOf(c) in PASSTHROUGH_AUDIO_MIMES
+
+    /**
      * 当前绑给 OSD 的行。
      *
      * ⛔ 按键回调只回传**行下标**，靠 [TvOsdView.Row.id] 还原语义 ——
@@ -514,6 +594,12 @@ class PlayerActivity : Activity() {
 
     /** 当前正在播的那一条在 [siblings] 里的下标；`-1` = 不在里面。 */
     private var episodeIndex = -1
+
+    /**
+     * 当前作品名（`Work.title`）。**异步**从媒体库读，没读到时为 null ——
+     * 那时 [buildPausedTitle] 会退回条目自己的片名 / 文件名，不会阻塞起播。
+     */
+    private var currentWorkTitle: String? = null
 
     /**
      * 最近一次请求选集时用的 `group_key` / `fid`（空 = 这部片没有作品归属）。
@@ -693,7 +779,19 @@ class PlayerActivity : Activity() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         videoBox = AspectRatioFrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        surfaceView = SurfaceView(this)
+        surfaceView = SurfaceView(this).apply {
+            // ⛔ Surface 生命周期比播放器短（切后台回来、系统回收都会重新建）：
+            //    重建后的 Surface 上没有帧率提示，补一次，钉档才算完整。
+            holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) {
+                    applySurfaceFrameRate()
+                }
+
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+                override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
+            })
+        }
         videoBox.addView(
             surfaceView,
             FrameLayout.LayoutParams(
@@ -780,6 +878,44 @@ class PlayerActivity : Activity() {
             },
         )
         applyClockOverlay()
+
+        // ── 顶部通栏标题行（媒体名 · 第 N 集 / 文件全名）──────────────
+        //
+        // ⛔ 样式**照抄控制面板**（同一底色 / 内边距）：上下两块是同一套
+        //    信息框的上下檐。字号同时间行（17sp）。
+        // ⛔ 显隐只跟控制面板走（见 [setControlsShown]）：面板亮才露头、收
+        //    面板即收 —— 没有自己独立的显隐。
+        // ⛔ 调试浮层（左上 `StatsOverlay`）与它**同位叠放**可以直观打包看到：
+        //    这个 View 加在浮层之后 ⇒ 压在其上（标题优先级更高，2026-11-08
+        //    用户回话定死的取舍）—— 浮层是开发者路径，标题被压没才是 bug。
+        titleBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xE6101216.toInt())
+            setPadding(dp(48), dp(16), dp(48), dp(18))
+            visibility = View.GONE
+        }
+        topTitleText = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            // 通栏宽度全占满，片名过长从**尾端**省略 —— 媒体名在前更易认，
+            // 与底部面板的时间行同宽内缩节奏。
+            setSingleLine(true)
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        titleBar.addView(
+            topTitleText,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        root.addView(
+            titleBar,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { gravity = Gravity.TOP },
+        )
 
         // ── 贴底控制栏（进度条 / 缓冲进度 / 网速）──────────────────
         //
@@ -1042,6 +1178,9 @@ class PlayerActivity : Activity() {
                 "选集：$groupKey 共 ${items.size} 条，当前下标 $episodeIndex" +
                     if (episodeIndex < 0) "（当前文件不在这个作品里）" else "",
             )
+            // 用户可能在库还没读完时就按 OK 暂停了 —— 那时标题行先按「文件全名」
+            // 画出来；现在选集数据到了，补成「媒体名 · 第 N 集」。
+            refreshPausedTitle()
             // ⛔ 只有**真的能选**（两条以上）才重绑：一条时选集行不会出现，
             //    重绑只会白白把用户的菜单光标重置回第一行。
             if (items.size > 1) rebindOsd()
@@ -1175,6 +1314,8 @@ class PlayerActivity : Activity() {
         subtitleFiles = emptyList()
         tracks = null
         pendingTracks = null
+        // 换集 = 允许在新片源上再自动降级一次音轨（见 [fallbackToCompatibleAudio]）。
+        audioFallbackDone = false
         info = null
         current = null
         currentFid = ""
@@ -1207,7 +1348,12 @@ class PlayerActivity : Activity() {
         spec = StreamSpec.fromIntent(intent)
         resumeAtMs = intent.getLongExtra(EXTRA_RESUME_MS, 0L)
         val groupKey = intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty()
+        // 换一集 = 上一集的作品名作废；标题行立刻刷新成新那条的文件全名
+        //（面板还亮着的话），选集 / 作品名的回调到了再补成「媒体名 · 第 N 集」。
+        currentWorkTitle = null
+        refreshPausedTitle()
         loadSiblings(groupKey, fid)
+        loadWorkTitle(groupKey)
         // ⛔ 每条新流先把片尾判定关掉、把「起播第一拍」重新武装：
         //    `loadSkipConfig` 是异步读库，回调回来之前不该拿着上一集的偏移 /
         //    上一集的上升沿状态去判新流。回调里再 `outroHandled = false` 武装。
@@ -2213,6 +2359,97 @@ class PlayerActivity : Activity() {
         return DiskCachePlan.snapshot(ranges, bytesPerSecCache, dur)
     }
 
+    // ------------------------------------------------------------------
+    // 显示档位钉死（治「按 OK 暂停/恢复闪一下」）
+    // ------------------------------------------------------------------
+
+    /** 已钉的片源帧率（0 = 没钉）。Surface 重建时要凭它把帧率提示补回去。 */
+    private var pinnedFps: Float = 0f
+
+    /**
+     * 把显示面板的**档位钉死在视频节奏上**。
+     *
+     * ## 为什么有它
+     *
+     * 全量系统日志实证（2026-11-08，mt5873 / MStar,Android 11）：这台电视
+     * 固件挂着「自适应刷新率」——播放中面板跑在视频节奏的档位（25fps 片源
+     * → 50Hz 档,modeId 2）;一按 OK 暂停,平台判定「视频层不活动」,显示
+     * 管线当场切回 60Hz 档（modeId 1）,恢复播放又切回去。每次按 OK 日志里
+     * 都是一对 `Display device changed modeId 1↔2` + `setActivePanelFrequency`
+     * （各两次跳变 + `MI_DISP_Flip`),而**面板切刷新率就会黑/闪一下**。
+     * 实验（方向键、菜单开关、面板常亮时的暂停）证明闪屏与 UI 面板显隐无关。
+     *
+     * ## 怎么治
+     *
+     * 起播拿到片源帧率时（[onVideoSizeChanged]),用 Android 标准接口把
+     * 整个播放会话钉住：
+     *   1. `window.attributes.preferredDisplayModeId` — 钉面板档位,
+     *      `DisplayModeDirector` 选档时优先尊重它,固件无从来回換档;
+     *   2. API 30+ 再给视频 Surface 一个 `setFrameRate(fps,
+     *      FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)` 显式信号。
+     *
+     * "按 OK"后的暂停/恢复不再触发模式跳变 = 不闪;起播那一刻的模式切换
+     * 也一并消除。
+     *
+     * ## ⛔ 钉错的代价大于不钉
+     *
+     * 只在「能确定视频节奏、且屏幕确有对应档位」时才动手:
+     *   - `fps <= 0`（流没报帧率）: 跳过 —— 宁可沿用平台策略也不猜;
+     *   - 找不到 `refreshRate ≈ 2×fps`（±0.5Hz）的档（如 24fps 片源落在
+     *     只有 60Hz 档的屏上）: 跳过,并留日志指出有哪些档可挑。
+     */
+    private fun pinDisplayMode(fps: Float) {
+        if (fps <= 0f) {
+            Log.i(TAG, "显示档位：流未报帧率（${fps}fps），不钉档（防钉错）")
+            return
+        }
+        if (!::surfaceView.isInitialized) return
+        val display = windowManager.defaultDisplay ?: return
+        // 25/30fps 片源对应 50/60Hz 档 —— 面板跑「整倍数快档」,
+        // 解码输出由去隔行/重复帧机制对齐,与视频服务器选择一致。
+        val target = fps * 2f
+        var best: Display.Mode? = null
+        var bestDiff = Float.MAX_VALUE
+        for (m in display.supportedModes) {
+            val diff = kotlin.math.abs(m.refreshRate - target)
+            if (diff < bestDiff) {
+                bestDiff = diff
+                best = m
+            }
+        }
+        if (best == null || bestDiff > 0.5f) {
+            Log.i(
+                TAG,
+                "显示档位：没有 ≈${target}Hz 的档（片源 $fps fps，" +
+                    "可选 ${display.supportedModes.joinToString { "${it.modeId}:${it.refreshRate}Hz" }}），不钉",
+            )
+            return
+        }
+        if (pinnedFps == fps) return // 同一片源重复回调（换音效重建、CR 状态返回），幂等。
+        pinnedFps = fps
+        // ⛔ 「读→改→写回」一气呵成: attributes是共享对象,重设整组才会生效。
+        val attrs = window.attributes
+        if (attrs.preferredDisplayModeId != best.modeId) {
+            attrs.preferredDisplayModeId = best.modeId
+            window.attributes = attrs
+        }
+        Log.i(
+            TAG,
+            "显示档位：钉在 modeId=${best.modeId}（${best.refreshRate}Hz，" +
+                "片源 $fps fps ⇒ 目标 ≈${target}Hz）",
+        )
+        applySurfaceFrameRate()
+    }
+
+    /** 给视频的 Surface 补上「定帧率片源」的提示（API 30+，Surface 有效才行）。 */
+    private fun applySurfaceFrameRate() {
+        if (pinnedFps <= 0f || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val surface = surfaceView.holder.surface ?: return
+        if (surface.isValid) {
+            surface.setFrameRate(pinnedFps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        }
+    }
+
     private fun startPlayer(url: String, headers: Map<String, String>) {
         // ── 数据源：**多连接并行**（Android 端性能的核心）────────────
         //
@@ -2418,7 +2655,16 @@ class PlayerActivity : Activity() {
              *    控制栏可能已经因为别的原因不可见，这里显式叫一次最稳。
              */
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (isPlaying) return
+                if (isPlaying) {
+                    // ⛔ 恢复播放（含按键取消暂停、片尾自动续播、换集起播）＝
+                    //    正常播放态回来了：**把自动收起补排上** —— 面板 10 秒
+                    //    无按键淡出正是要在这一刻生效。不能什么都不做：OK 键
+                    //    的处理序是「先亮面板再 play()」，亮面板时 `isPlaying`
+                    //    还是 false，`keepControlsVisible` 把那次排程挡掉了，
+                    //    这里不排就是「恢复播放后面板永远不收」（用户实报）。
+                    scheduleHideControls()
+                    return
+                }
                 // ⛔ 缓冲中 `isPlaying` 也是 false（`playWhenReady` 还是 true），
                 //    那不是「用户暂停」—— 缓冲期由 `onPlaybackStateChanged` 管，
                 //    别在这儿重复触发（否则每次缓冲都会多一条「已暂停」日志）。
@@ -2464,6 +2710,16 @@ class PlayerActivity : Activity() {
             override fun onPlayerError(error: PlaybackException) {
                 val msg = "${error.errorCodeName}: ${error.message}"
                 Log.e(TAG, "播放失败 $msg", error)
+                // ⛔ AUDIO_TRACK_INIT_FAILED + 压缩音轨（杜比 / DTS）＝ 本机
+                //    不接受透传：这台电视 `ro.platform.support.dolby=false`、
+                //    `dts=false`（既无硬解也无透传授权），但 media3 从 HDMI
+                //    AudioDeviceInfo 误判支持 ENCODING_E_AC3，AudioTrack 被
+                //    AudioFlinger 拒绝（-38/-20）⇒ 整部片判「播放失败」。
+                //    这类 4K DDP 片源几乎都另带一条 AAC 音轨 —— 自动切过去
+                //    重新 prepare 一次，别让用户对着「播放失败」干瞪眼。
+                if (error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED &&
+                    fallbackToCompatibleAudio()
+                ) return
                 showNotice("播放失败\n$msg")
             }
 
@@ -2563,6 +2819,10 @@ class PlayerActivity : Activity() {
                         format.width, format.height, format.frameRate, format.codecs,
                     ),
                 )
+                // 拿到片源节奏的**第一刻**：把显示面板的档位钉死在视频档上
+                //（治「按 OK 闪一下」，机制见 [pinDisplayMode]）。换一集流、
+                // 帧率变了会在这里以新值重新钉；此前已钉同档时函数内部幂等跳过。
+                pinDisplayMode(format.frameRate)
             }
 
             override fun onRenderedFirstFrame(
@@ -2630,7 +2890,7 @@ class PlayerActivity : Activity() {
         startDiskPrefetch(url, cache, countingParallel, bitrateMibps)
 
         showNotice("正在打开…")
-        // 播放器一建好就把控制栏亮出来（4 秒后自动收），让用户立刻看到
+        // 播放器一建好就把控制栏亮出来（10 秒后自动收），让用户立刻看到
         // 进度条与缓冲进度在长 —— 这是「暂停时也在缓冲」的直接体现。
         showControls()
     }
@@ -3855,7 +4115,7 @@ class PlayerActivity : Activity() {
     /**
      * 亮出控制栏。
      *
-     * @param autoHide 是否 4 秒后自动收起。**缓冲中与暂停时必须传 false** ——
+     * @param autoHide 是否 10 秒后自动收起。**缓冲中与暂停时必须传 false** ——
      *   用户正盯着「缓冲中 · 3.2 MB/s」判断是不是网络问题、盯着
      *   「已暂停 · 已缓冲 +118s」看它还会不会长，收起来等于把读数抢走。
      *   ⛔ 就算传了 true 也不怕：[keepControlsVisible] 会兜底，
@@ -3881,16 +4141,70 @@ class PlayerActivity : Activity() {
     }
 
     /**
-     * 控制栏显隐的**唯一**入口。
+     * 控制栏显隐的**唯一**入口（含顶部标题条 —— 两者永远同拍）。
      *
+     * ## 淡出（2026-11-08 用户定稿）
+     *
+     * 收起走 **250ms 淡出**：标题条与面板 alpha 一路到 0，**动画结束那一拍
+     * 才真正 GONE** —— 立即 GONE 就没有动画；不 GONE 的话淡出结束后两块
+     * 透明视图还占着布局（字幕按面板高度让位、面板还吃触摸），都是错的。
+     * 出现仍走**瞬时**：遥控器按键要的是「按了马上看到」，淡入会拖慢响应
+     * 的观感。
+     *
+     * ⛔ 亮起前必须**取消正在跑的淡出并拉回 alpha=1**：用户在淡出到一半时
+     *    又按键（返回键收起与按键亮起随时会毫秒级撞车），不 cancel 的话
+     *    两块会永远停在半透明。
+     * ⛔ 字幕底距**当下**就按「面板已收」算：淡出那 250ms 里字幕先跳到
+     *    该在的位置，面板化成影子再离开 —— 视觉上一条线，不抖。
      * ⛔ 别退回直接写 `controls.visibility`：字幕的底距要跟着控制栏走
      *    （见 [updateSubtitleInset]），漏掉一处就会出现「控制栏弹出来把字幕
      *    压在底下」—— 而这台电视上字幕看不见，用户第一反应是「字幕又没了」。
      */
     private fun setControlsShown(shown: Boolean) {
         if (!::controls.isInitialized) return
-        controls.visibility = if (shown) View.VISIBLE else View.GONE
+        if (shown) {
+            titleBar.animate().cancel()
+            controls.animate().cancel()
+            titleBar.alpha = 1f
+            controls.alpha = 1f
+            titleBar.visibility = View.VISIBLE
+            controls.visibility = View.VISIBLE
+            // 亮面板的那一拍把标题文字带上；数据回调（选集 / 作品名）兜头
+            // 打来时也越不过权 —— [refreshPausedTitle] 里有「面板没亮就不
+            // 露头」的同道闸。
+            refreshPausedTitle()
+        } else {
+            // ⛔ 已经收起就整段跳过：补排的收起与亮面板时排的收起可能在毫秒
+            //    级连击两次，重跑「VISIBLE→淡出」会让已收的面板重新冒头、
+            //    评论观感上闪一下 —— 没有面板可收就不动。
+            if (controls.visibility != View.VISIBLE) return
+            // ⛔ 逻辑状态先落到「已收」：按键分派读的是 visibility，动画只是
+            //    视觉效果，不能让逻辑等这 250ms。
+            titleBar.visibility = View.GONE
+            controls.visibility = View.GONE
+            fadeOutExit(titleBar)
+            fadeOutExit(controls)
+        }
         updateSubtitleInset()
+    }
+
+    /**
+     * 收起动画：250ms 淡出，把 alpha 推向 0，**结束那一拍把 GONE 落实**并拉
+     * 回 alpha（下一次亮起前保持干净态）。「淡出到一半又被亮起」的撞车由
+     * [setControlsShown] 亮起路径里的 `cancel()` + alpha 复位兜住。
+     */
+    private fun fadeOutExit(v: View) {
+        // ⛔ 先恢复 VISIBLE 再动画：刚把 GONE 写上是为了让逻辑态先落地，
+        //    动要动起来就得回到可见徐徐淡走，否则 alpha 动画根本不画。
+        v.visibility = View.VISIBLE
+        v.animate()
+            .alpha(0f)
+            .setDuration(250L)
+            .withEndAction {
+                v.visibility = View.GONE
+                v.alpha = 1f
+            }
+            .start()
     }
 
     /**
@@ -3917,6 +4231,96 @@ class PlayerActivity : Activity() {
             inset = maxOf(inset, osd.sheetHeightPx() + dp(SUBTITLE_GAP_DP))
         }
         subtitles.bottomInsetPx = inset
+    }
+
+    // ------------------------------------------------------------------
+    // 播放页顶部标题行（媒体名 + 集数 / 文件全名，通栏、与控制面板同拍显隐）
+    // ------------------------------------------------------------------
+
+    /**
+     * 那行字的内容。**唯一**由 [PlaybackTitle.label] 生成 —— 集数口径、
+     * 退回文件全名的判据都收在那个纯函数里，由 JVM 单测钉死。
+     *
+     * [episodeIndex] 是 [loadSiblings] 算好的「当前这一集在 siblings 里的
+     * 下标」；为 -1（没入库 / 库还没读到）时 [siblings.getOrNull] 给 null，
+     * 纯函数自然退回文件全名。
+     */
+    private fun buildPausedTitle(): String =
+        PlaybackTitle.label(
+            currentWorkTitle,
+            siblings.getOrNull(episodeIndex),
+            intent.getStringExtra(EXTRA_NAME).orEmpty(),
+        )
+
+    /**
+     * 把**顶部通栏标题条**刷成最新的值。
+     *
+     * ⛔ **显隐只跟面板走**：[setControlsShown] 亮面板时调本方法把文字带上；
+     *    面板收起时它已把 GONE 打掉。数据回调（选集、作品名）兜头打来时，
+     *    面板没亮就**不露头** —— 这是本方法里的第二道闸，两处必须同。
+     *    （标题样式同面板、通栏挂顶，见 [titleBar] 的注释。）
+     *
+     * ⛔ 数据可能还没到：[siblings] 与 [currentWorkTitle] 都是异步读库，
+     *    没读到时先按文件全名画出来；读到后回调里再来一次本方法，把那行
+     *    补成「媒体名 · 第 N 集」。
+     *
+     * 媒体名没显示出来几乎都出在「退回链」上（作品名没刮到 / 集数没解析出
+     * / 选集还没回来），这里**必须留日志**：真机上拧不出是哪一环断的。
+     */
+    private fun refreshPausedTitle() {
+        if (!::topTitleText.isInitialized) return
+        val item = siblings.getOrNull(episodeIndex)
+        Log.i(
+            TAG,
+            "标题行素材：workTitle=${currentWorkTitle ?: "∅"} · " +
+                "item=${item?.let { "${it.name}（title=${it.title ?: "∅"}，S${it.season}E${it.episode}）" } ?: "∅（episodeIndex=$episodeIndex，siblings.size=${siblings.size}）"}",
+        )
+        val text = buildPausedTitle()
+        if (text.isEmpty()) {
+            titleBar.visibility = View.GONE
+            return
+        }
+        Log.i(TAG, "标题行：$text")
+        topTitleText.text = text
+        // ⛔ 第二道闸：面板没亮就不露头（防止数据回调把标题单独顶出来）。
+        titleBar.visibility =
+            if (::controls.isInitialized && controls.visibility == View.VISIBLE) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+    }
+
+    /**
+     * 异步读作品名（`Work.title`）。
+     *
+     * ⚠️ 与 [loadSiblings] 分开两条后台任务：选集那份有重试 / 序号防过期，
+     *    而作品名读不到只影响「片名用哪个」，降级到条目片名 / 文件名即可，
+     *    不值得把它拖进重试状态机。
+     * ⚠️ 换集后旧任务的回调可能晚到：按当前 intent 的 groupKey 比对，
+     *    跨作品的结果一律丢弃（同作品换集时两者片名相同，覆盖无害）。
+     * ⛔ `workForDetail` 返回空是「媒体名没显示」最常见的断点（这条作品没
+     *    刮削到 / 库里没有该作品行），必须留日志，别静默。
+     */
+    private fun loadWorkTitle(groupKey: String) {
+        if (groupKey.isEmpty()) {
+            Log.i(TAG, "读作品名：intent 没带 groupKey（对照路径？），标题行退回文件名")
+            return
+        }
+        val lib = ensureLib()
+        Bg.run({ lib.workForDetail(groupKey)?.title }) { title, err ->
+            if (err != null) {
+                Log.w(TAG, "读作品名失败（groupKey=$groupKey），标题行退回文件名", err)
+                return@run
+            }
+            if (intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty() != groupKey) return@run
+            if (title.isNullOrBlank()) {
+                Log.i(TAG, "读作品名：库里没有「$groupKey」的作品行或没刮到标题，标题行退回文件名")
+                return@run
+            }
+            currentWorkTitle = title
+            refreshPausedTitle()
+        }
     }
 
     /**
@@ -4132,6 +4536,16 @@ class PlayerActivity : Activity() {
 
     companion object {
         const val TAG = "CloudCine"
+
+        /**
+         * 会走 HDMI 透传的压缩音轨。本机 `ro.platform.support.dolby=false` /
+         * `dts=false` 时 media3 仍可能误判可透传，建不出 AudioTrack ⇒
+         * [onPlayerError] 里据此自动降级到片源自带的 AAC 轨道。
+         */
+        private val PASSTHROUGH_AUDIO_MIMES = setOf(
+            "audio/eac3", "audio/eac3-joc", "audio/ac3", "audio/ac4",
+            "audio/dts", "audio/dts-hd", "audio/dts-express", "audio/truehd",
+        )
         const val EXTRA_FID = "fid"
         const val EXTRA_NAME = "name"
         const val EXTRA_HEADERS = "headers"
@@ -4263,8 +4677,8 @@ class PlayerActivity : Activity() {
          */
         private const val THUMB_CACHE_BYTES = 8 * 1024 * 1024
 
-        /** 没人按键就把控制栏收起来。4 秒够看清缓冲进度在长，又不挡画面。 */
-        private const val CONTROLS_HIDE_MS = 4_000L
+        /** 没人按键就把控制栏收起来再淡出。10 秒是 2026-11-08 用户定的：够从容看完读数。 */
+        private const val CONTROLS_HIDE_MS = 10_000L
 
         /**
          * 方向键步进。10 秒是电视端的通行值：够快（一部长片按 50 下到底），

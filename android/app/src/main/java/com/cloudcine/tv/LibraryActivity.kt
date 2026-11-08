@@ -527,6 +527,18 @@ class LibraryActivity : Activity() {
     /** 导航带上的**光标**位置（`navItems` 的下标）。⛔ 与「已生效的分类」是两个东西。 */
     private var navIndex = 0
 
+    /**
+     * 启动后「把光标定位到『最近播放』」这件事**只做一次**（见
+     * [startupFocusRecents]）。之后任何刷新都照旧的焦点规则走。
+     */
+    private var startupFocusDone = false
+
+    /**
+     * 启动链的**收尾待办**：生效「最近播放」后，等那的列表数据到达并画完
+     * 墙，把光标交给**第一张卡**（见 [applyWorks] 尾部与 [startupFocusRecents]）。
+     */
+    private var startupGridFocusPending = false
+
     // ── 覆盖层状态 ──────────────────────────────────────────────────
     private var overlayVisible = false
     private var overlayIndex = 0
@@ -1210,6 +1222,9 @@ class LibraryActivity : Activity() {
         //    焦点归谁只由 [focusTabs] / [focusBar] / [focusGrid] 决定。
         // ⛔ 筛选面板开着时也不能抢：面板是覆盖层，底下的墙拿焦点会让面板失焦。
         if (!tabsFocused && !barFocused && !filterVisible && !overlayVisible) {
+            // ⛔ App 启动的第一次画墙：直接站在「最近播放」上 —— 光标定位到
+            //    那颗胶囊并**当场生效**该视图（而不是停在「全部」上）。
+            if (startupFocusRecents()) return
             // ⛔ 还原「从简介页返回时那一张卡」（见 [restoreSelectKey]）：只有
             //    [backToWorks] 会填它，其它路径是 null ⇒ 回到第一张。
             // ⛔ 用完**立刻清掉**，否则它会在下一次无关的刷新里再命中一次，
@@ -1222,6 +1237,50 @@ class LibraryActivity : Activity() {
             worksGrid.requestFocus()
             showInfo(works.getOrNull(target))
         }
+
+        // ⛔ App 启动链的**收尾**（待办由 [startupFocusRecents] 挂上）：生效的
+        //    「最近播放」列表已经画出来了，把光标交给**第一张卡** —— 启动的
+        //    最终状态是「最近播放的第一个媒体高亮」，不是停在分类胶囊上。
+        // ⛔ 判据带 [playedOnly]：防止把别的 `loadWorks`（扫描 / 追更检查）误
+        //    当成刚生效的最近播放列表，把光标错交出去。
+        if (startupGridFocusPending && playedOnly && level == Level.WORKS) {
+            startupGridFocusPending = false
+            worksGrid.setSelection(0)
+            focusGrid()
+        }
+    }
+
+    /**
+     * App 启动后**第一次**把作品墙画出来时，定位到「最近播放」胶囊并**当场生效**
+     * ——列表直接就是最近播放视图（用户开 App 十有八九是接着上次的看；
+     * 2026-11-08 真机反馈：只把光标停上去不生效，墙还是「全部」，看着像坏了一样）。
+     *
+     * ⛔ 只做一次（[startupFocusDone]）：[applyWorks] 之后还会因为扫描 /
+     *    筛选 / 追更检查反复重跑，每次都把准时停好的光标拽回导航带并重放这个
+     *    视图，表现就是「用户按了方向键没反应」—— 那是之前不少焦点 bug 的
+     *    病根，这里绝不能再犯。
+     *
+     * ⛔ 次序照 [backToNav] 的说明：先 `buildNav()`（此时 `tabsFocused` 还是
+     *    false，它会把光标同步到当前生效项「全部」=0），点亮导航带**之后**
+     *    再把光标改到「最近播放」—— `buildNav` 在光标态点亮时不会重算，
+     *    顺序反了光标就停在「全部」上。生效靠 [NavItem.onPick]，与用户亲手
+     *    按 OK 走的是**同一条路**（含「切排序到按播放时间」那步）。
+     */
+    private fun startupFocusRecents(): Boolean {
+        if (startupFocusDone) return false
+        startupFocusDone = true
+        buildNav()
+        tabsFocused = true
+        val i = navItems.indexOfFirst { it.label == "最近播放" }.coerceAtLeast(0)
+        navIndex = i
+        focusTabs()
+        navItems.getOrNull(i)?.onPick()
+        // ⛔ 光标的最终落点是**最近播放列表的第一张卡**（2026-11-08 用户：
+        //    「默认选中最近播放的列表中的第一个媒体高亮」）。但列表要等
+        //    [loadWorks] 异步回来才有内容 —— 挂个待办，等 applyWorks 把墙
+        //    画完时交给第一张卡。
+        startupGridFocusPending = true
+        return true
     }
 
     /**

@@ -273,10 +273,17 @@ object AudioMix {
  * 若片源是 AC-3 / DTS 且设备报告支持直通，`DefaultAudioSink.configure()` 收到的
  * 是**压缩格式**（不是 `audio/raw`），处理器链根本不会被配置 ⇒ 下混不发生。
  *
- * ⛔ **不要**在这里「顺手」把 `AudioCapabilities` 砍成只支持 PCM 来强行解码：
- *    那会让**没有 AC-3 解码器**的机器从「有声音」直接变成「没声音」，
- *    而这两个方向都没在电视上实测过。等真机量到「直通下强制立体声无效」
- *    再动，且动之前要能在功放上确认解码器存在。
+ * ⛔ **不要**在这里「顺手」把 `AudioCapabilities` 砍成只支持 PCM 来强行解码。
+ *    2026-11-08 真机（mt5873 / MStar）已把这条路量死：本机
+ *    `[ro.platform.support.dolby]=false`、`[ro.platform.support.dts]=false`，
+ *    **既没有杜比 / DTS 硬解也没有透传授权**；但 media3 从 HDMI
+ *    `AudioDeviceInfo` 误判支持 `ENCODING_E_AC3`，仍把 `audio/eac3` 拿去
+ *    透传 ⇒ `AudioTrack` 被 AudioFlinger 拒绝（-38 / -20）⇒ 整部片
+ *    `ERROR_CODE_AUDIO_TRACK_INIT_FAILED`「播放失败」。砍成只支持 PCM 后
+ *    media3 会去找一个**根本不存在**的 `audio/eac3` 解码器，只是把错误
+ *    换成「解码器初始化失败」，并不会有声音。
+ *    ⇒ 正解在 `PlayerActivity.onPlayerError`：透传失败时自动切到片源自带的
+ *    AAC 音轨（没有则静音放画面）并重试，见 `fallbackToCompatibleAudio`。
  */
 class AudioEffectRenderersFactory(
     context: Context,
