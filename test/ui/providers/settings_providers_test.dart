@@ -185,6 +185,24 @@ void main() {
       expect(off.skipIntro, isFalse);
     });
 
+    test('「播放时显示时间」默认开，只认显式 false 才关', () {
+      // 与 autoPlayNext / skipIntro 同一族：判据写成 `== 'true'` 的话，
+      // 老库升级上来会**静默**关掉，而 OSD 里的开关显示「开启」—— 一个
+      // 没人会想到去查的默认值问题（autoMergeByOnlineId 已经踩过）。
+      final fresh = AppSettings.fromValues(const <String, String?>{});
+      expect(fresh.showClock, isTrue);
+
+      final off = AppSettings.fromValues(const <String, String?>{
+        SettingKeys.showClock: 'false',
+      });
+      expect(off.showClock, isFalse);
+
+      // copyWith 也要带上：播放器 OSD 直接写库不走 copyWith，但设置页走
+      // `settingsProvider.notifier.set()` → `state.copyWith()`。漏了它会
+      // 表现成「在设置页点了开关，界面没变」。
+      expect(off.copyWith(showClock: true).showClock, isTrue);
+    });
+
     test('关掉「记住播放进度」不影响连播', () {
       // 两者在代码里是独立的。绑在一起（`rememberPosition && autoPlayNext`）
       // 看着省事，实际会造出「关了记住进度就再也不连播」这种没人预料得到的

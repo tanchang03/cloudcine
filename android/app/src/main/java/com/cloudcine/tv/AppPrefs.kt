@@ -25,6 +25,20 @@ class AppPrefs(context: Context) {
         set(v) = sp.edit().putBoolean(KEY_DEBUG_OVERLAY, v).apply()
 
     /**
+     * 全屏播放时右上角是否显示当前时间（`HH:mm`）。
+     *
+     * **默认开**：电视没有系统状态栏，播放页又是恒全屏 —— 想知道几点只能退出
+     * 去看，而一小块时间的代价近乎为零。要关的时候 MENU → 显示时间 → 关闭，
+     * **跨影片、跨重启都记得**。
+     *
+     * ⛔ 键名与 PC 端 `SettingKeys.showClock` 逐字一致（`show_clock`）。两端各
+     *    写一套拼写的症状是「电脑上关了、电视上还开着」，而两边都不报错。
+     */
+    var showClock: Boolean
+        get() = sp.getBoolean(KEY_SHOW_CLOCK, true)
+        set(v) = sp.edit().putBoolean(KEY_SHOW_CLOCK, v).apply()
+
+    /**
      * 多连接并行下载的**连接数**（`1` = 关掉并行，退回单连接）。
      *
      * 为什么默认 8：夸克对**单条连接**限速约 1 MiB/s（2026-10-06 实测：单连接
@@ -65,6 +79,7 @@ class AppPrefs(context: Context) {
         val PARALLEL_CHOICES = intArrayOf(1, 2, 4, 8)
 
         private const val KEY_DEBUG_OVERLAY = "debug_overlay"
+        private const val KEY_SHOW_CLOCK = "show_clock"
         private const val KEY_PARALLEL_CONNECTIONS = "parallel_connections"
         private const val KEY_AUDIO_EFFECT = "audio_effect"
     }

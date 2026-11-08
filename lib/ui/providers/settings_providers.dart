@@ -28,6 +28,7 @@ class AppSettings {
     this.rememberPosition = true,
     this.autoPlayNext = true,
     this.skipIntro = true,
+    this.showClock = true,
     this.playerVolume = 100,
     this.playerRate = 1,
     this.scanIntervalMs = 350,
@@ -140,6 +141,13 @@ class AppSettings {
   /// 所以开着它不会误跳。
   final bool skipIntro;
 
+  /// 全屏播放时是否在画面右上角显示当前时间。**默认开**，理由见
+  /// `SettingKeys.showClock`。
+  ///
+  /// 关掉之后播放页连那个 widget 都不创建（定时器也不跑），不是「画一个
+  /// 透明的」—— 每秒一次的 `setState` 在暂停时也是纯粹的浪费。
+  final bool showClock;
+
   final double playerVolume;
   final double playerRate;
 
@@ -231,6 +239,7 @@ class AppSettings {
     bool? rememberPosition,
     bool? autoPlayNext,
     bool? skipIntro,
+    bool? showClock,
     double? playerVolume,
     double? playerRate,
     int? scanIntervalMs,
@@ -260,6 +269,7 @@ class AppSettings {
       rememberPosition: rememberPosition ?? this.rememberPosition,
       autoPlayNext: autoPlayNext ?? this.autoPlayNext,
       skipIntro: skipIntro ?? this.skipIntro,
+      showClock: showClock ?? this.showClock,
       playerVolume: playerVolume ?? this.playerVolume,
       playerRate: playerRate ?? this.playerRate,
       scanIntervalMs: scanIntervalMs ?? this.scanIntervalMs,
@@ -325,6 +335,9 @@ class AppSettings {
       // 这种没人预料得到的联动。
       autoPlayNext: v[SettingKeys.autoPlayNext] != 'false',
       skipIntro: v[SettingKeys.skipIntro] != 'false',
+      // 与上面两项同属「缺失即开」这一族，判据必须也是 `!= 'false'`。
+      // 写反的后果是「新装用户看不到时间，而 OSD 开关显示开启」。
+      showClock: v[SettingKeys.showClock] != 'false',
       playerVolume: double.tryParse(v[SettingKeys.playerVolume] ?? '') ?? 100,
       playerRate: double.tryParse(v[SettingKeys.playerRate] ?? '') ?? 1,
       scanIntervalMs: int.tryParse(v[SettingKeys.scanIntervalMs] ?? '') ?? 350,
@@ -386,6 +399,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
       SettingKeys.rememberPosition,
       SettingKeys.autoPlayNext,
       SettingKeys.skipIntro,
+      SettingKeys.showClock,
       SettingKeys.playerVolume,
       SettingKeys.playerRate,
       SettingKeys.scanIntervalMs,
@@ -420,6 +434,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     bool? rememberPosition,
     bool? autoPlayNext,
     bool? skipIntro,
+    bool? showClock,
     double? playerVolume,
     double? playerRate,
     int? scanIntervalMs,
@@ -489,6 +504,9 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     if (skipIntro != null) {
       await store.writeBool(SettingKeys.skipIntro, skipIntro);
     }
+    if (showClock != null) {
+      await store.writeBool(SettingKeys.showClock, showClock);
+    }
     if (playerVolume != null) {
       await store.write(SettingKeys.playerVolume, '$playerVolume');
     }
@@ -546,6 +564,7 @@ class SettingsController extends AsyncNotifier<AppSettings> {
         rememberPosition: rememberPosition,
         autoPlayNext: autoPlayNext,
         skipIntro: skipIntro,
+        showClock: showClock,
         playerVolume: playerVolume,
         playerRate: playerRate,
         scanIntervalMs: scanIntervalMs,

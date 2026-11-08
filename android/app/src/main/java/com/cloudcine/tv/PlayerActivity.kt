@@ -76,6 +76,8 @@ import com.cloudcine.tv.pan.SubtitleFile
 import com.cloudcine.tv.pan.CredStore
 import com.cloudcine.tv.pan.baidu.BaiduEndpoints
 import com.cloudcine.tv.pan.formatSize
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 /**
@@ -118,6 +120,10 @@ class PlayerActivity : Activity() {
     private lateinit var osd: TvOsdView
     private lateinit var stats: StatsOverlay
     private lateinit var notice: TextView
+
+    /** 右上角的当前时间（常驻，与居中的 [notice] 互不干扰）。 */
+    private lateinit var clockView: TextView
+
     private lateinit var controls: PlayerControlsView
     private lateinit var confirmExit: ConfirmDialogView
 
@@ -157,6 +163,25 @@ class PlayerActivity : Activity() {
     private lateinit var subtitles: SubtitleOverlayView
 
     private val ui = Handler(Looper.getMainLooper())
+
+    /** 右上角时钟的格式。只显示 `HH:mm` —— 播放时不需要秒。 */
+    private val clockFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+
+    /**
+     * 右上角时钟的 1Hz 心跳。
+     *
+     * ⛔ 只在 `visibility == VISIBLE` 时续拍：关掉之后自己停下，不留一条每秒
+     *    跑一次的 Runnable 空转。这与 [applyDebugOverlay]「只切 visibility、
+     *    不 `stop()`」是**刻意相反**的 —— 那边停了就没 `[统计]` 日志了，
+     *    而时钟停了没有任何观察损失。
+     */
+    private val clockTick = object : Runnable {
+        override fun run() {
+            if (clockView.visibility != View.VISIBLE) return
+            clockView.text = clockFormat.format(Date())
+            ui.postDelayed(this, 1000L)
+        }
+    }
 
     /**
      * 「没人按键就把控制栏收起来」的那一拍。
@@ -719,6 +744,33 @@ class PlayerActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { gravity = Gravity.CENTER },
         )
+
+        // ── 右上角当前时间 ──────────────────────────────────────────
+        // ⛔ 与 notice（居中）分开两个 View：notice 是「取链中 / 已跳过片头」
+        //    这类短提示，会被反复改文本、还会自动收掉；时钟是常驻的，不能
+        //    被它盖掉或清掉。
+        // ⚠️ 过扫描：电视会把四边各裁掉一圈，边距给足（dp 28 / 36）。
+        clockView = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            // 白字压在亮画面上会看不清，描一层黑边比铺一整块黑底轻。
+            setShadowLayer(4f, 0f, 1f, Color.BLACK)
+            setBackgroundColor(0x66000000.toInt())
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            visibility = View.GONE
+        }
+        root.addView(
+            clockView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = dp(28)
+                rightMargin = dp(36)
+            },
+        )
+        applyClockOverlay()
 
         // ── 贴底控制栏（进度条 / 缓冲进度 / 网速）──────────────────
         //
@@ -2572,6 +2624,8 @@ class PlayerActivity : Activity() {
         // ⛔ 外挂字幕的心跳也要停：它读 `player.currentPosition`，
         //    player 释放后再跑会崩（与 playheadTick 同一个原因）。
         ui.removeCallbacks(subtitleTick)
+        // 时钟的心跳也停：它不读 player，但 Activity 都销毁了没必要再跑。
+        ui.removeCallbacks(clockTick)
         controls.unbind()
         prefetcher?.cancel()
         prefetcher = null
@@ -2806,7 +2860,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun buildRows(): List<TvOsdView.Row> {
-        val out = ArrayList<TvOsdView.Row>(8)
+        val out = ArrayList<TvOsdView.Row>(9)
         // 「选集」在第一行 —— **照 PC 端**（`buildPlayerTvRows` 里它就是第一项）。
         // 顺序在这里是有意义的：打开菜单时光标停在第一行，而「换一集」是
         // 剧集播放中最常做的事，排第一等于「按一下 OK 就到」。
@@ -2841,6 +2895,10 @@ class PlayerActivity : Activity() {
         out += trackRow(ROW_SUBTITLE, "字幕", C.TRACK_TYPE_TEXT, withOff = true)
         out += rateRow(currentSpeed)
         out += debugRow()
+        // 「显示时间」放最后：它是「设一次就忘掉」的全局偏好，不随片源变化，
+        // 排在最常动的那几行之后，菜单打开时光标仍停在第一行（选集）。
+        // ⛔ 分派一律走 id（见文件末尾那组 ROW_* 常量），加行不会让下标错位。
+        out += clockRow()
         return out
     }
 
@@ -3002,6 +3060,21 @@ class PlayerActivity : Activity() {
         active = if (prefs.debugOverlay) 1 else 0,
     )
 
+    /**
+     * 「显示时间」那一行 —— 开关右上角的时钟。
+     *
+     * ⛔ 与 [debugRow] 同为**全局参数**（`AppPrefs.showClock`），跨影片跨重启
+     *    都记得；不是逐影片的播放偏好。
+     * ⚠️ 判据按 id 分派（[onOsdActivate]），加这一行不影响其它行的下标。
+     */
+    private fun clockRow() = TvOsdView.Row(
+        id = ROW_CLOCK,
+        label = "显示时间",
+        value = if (prefs.showClock) "开启" else "关闭",
+        options = listOf("关闭", "开启"),
+        active = if (prefs.showClock) 1 else 0,
+    )
+
     private fun rateRow(speed: Double) = TvOsdView.Row(
         id = ROW_SPEED,
         label = "倍速",
@@ -3066,6 +3139,7 @@ class PlayerActivity : Activity() {
                 rebindOsd()
             }
             ROW_DEBUG -> setDebugOverlay(chip == 1)
+            ROW_CLOCK -> setClockOverlay(chip == 1)
             else -> {
                 Log.w(TAG, "OSD 回调了未知行下标 $row（osdRows.size=${osdRows.size}）")
                 hideOsd()
@@ -3394,6 +3468,31 @@ class PlayerActivity : Activity() {
         val on = prefs.debugOverlay
         stats.visibility = if (on) View.VISIBLE else View.GONE
         Log.i(TAG, "调试浮层（全局参数）= ${if (on) "开启" else "关闭"}")
+    }
+
+    /**
+     * 应用右上角时钟的开关。
+     *
+     * 关掉时**连心跳一起停**，不只是 `GONE`：一个每秒一次的 Runnable 在暂停、
+     * 在用户已经关掉功能之后还在跑，是纯粹的浪费。
+     */
+    private fun applyClockOverlay() {
+        ui.removeCallbacks(clockTick)
+        if (prefs.showClock) {
+            clockView.visibility = View.VISIBLE
+            clockView.text = clockFormat.format(Date())
+            ui.postDelayed(clockTick, 1000L)
+        } else {
+            clockView.visibility = View.GONE
+        }
+        Log.i(TAG, "右上角时间（全局参数）= ${if (prefs.showClock) "开启" else "关闭"}")
+    }
+
+    /** OSD 里切「显示时间」：落库 → 立刻应用 → 重绑菜单让「开启/关闭」刷新。 */
+    private fun setClockOverlay(on: Boolean) {
+        prefs.showClock = on
+        applyClockOverlay()
+        rebindOsd()
     }
 
     private var currentSpeed = 1.0
@@ -3749,7 +3848,8 @@ class PlayerActivity : Activity() {
      * 三档取值（单位 px，本机 density=320 ⇒ 1 dp = 2 px）：
      *   * 什么都没有 —— [SUBTITLE_BASE_INSET_DP]，正好落在宽银幕片源的下信箱边里；
      *   * 控制栏亮着 —— 抬到控制栏上沿再留一口气；
-     *   * OSD 开着 —— 抬到菜单卡片上沿（卡片是 7×40dp + 28dp，见 `TvOsdView`）。
+     *   * OSD 开着 —— 抬到菜单卡片上沿；高度由 [TvOsdView.sheetHeightPx]
+     *     按**实际行数**算，菜单加减行不用改这里。
      *
      * ⛔ 用 `maxOf` 而不是相加：控制栏与菜单在布局上**互斥**（菜单开着时不画
      *    控制栏），相加只会把字幕顶到屏幕中间去。
@@ -4087,6 +4187,7 @@ class PlayerActivity : Activity() {
         private const val ROW_SUBTITLE = "subtitle"
         private const val ROW_SPEED = "speed"
         private const val ROW_DEBUG = "debug"
+        private const val ROW_CLOCK = "clock"
 
         /** 字幕那一行最前面的「关闭」项。 */
         private const val OFF_LABEL = "关闭"

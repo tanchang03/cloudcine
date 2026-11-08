@@ -994,6 +994,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               ref.read(settingsProvider.notifier).set(skipIntro: v),
             ),
           ),
+          _ToggleRow(
+            label: '播放时显示时间',
+            hint: s.showClock
+                ? '全屏播放时右上角显示当前时间；播放器 OSD 里也能直接开关。'
+                : '已关闭。全屏播放时右上角不显示时间。',
+            value: s.showClock,
+            onChanged: (v) => unawaited(
+              ref.read(settingsProvider.notifier).set(showClock: v),
+            ),
+          ),
           const SizedBox(height: 16),
           const Divider(height: 1, color: AppTheme.line),
           const SizedBox(height: 14),

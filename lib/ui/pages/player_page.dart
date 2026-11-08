@@ -444,6 +444,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
   /// 设置：有片头标识时是否自动跳过。
   bool _skipIntro = true;
 
+  /// 设置：全屏播放时右上角是否显示当前时间。**默认开**（`!= 'false'`）。
+  ///
+  /// 与 `_autoPlayNext` / `_skipIntro` 一样在 `_bootstrap` 里读一次、存进 State：
+  /// 播放页不 watch `settingsProvider`（开关走 OSD 直接写库 + `setState`）。
+  bool _showClock = true;
+
   /// 「低置信候选」已经提示到哪个样本数了。
   ///
   /// 每采到一条新样本都会重聚合一次，不拦的话第 1、2 集会反复弹同一条
@@ -611,6 +617,22 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
           .savePlaybackPreference(item.id, item.groupKey, next);
     } catch (e) {
       diag.warn('播放', '播放偏好没能存下来（本次播放已生效）：$e');
+    }
+  }
+
+  /// 切换「显示时间」：**先改本地、再落库**（与 [_savePref] 同一个顺序）。
+  ///
+  /// 本地那份是右上角那一小块文字立刻要用的，写库只决定下次进播放页还记不
+  /// 记得。关掉时连 widget 都不创建，定时器自然也不跑。
+  Future<void> _setShowClock(bool on) async {
+    if (on == _showClock) return;
+    setState(() => _showClock = on);
+    try {
+      await ref
+          .read(settingsStoreProvider)
+          .writeBool(SettingKeys.showClock, on);
+    } catch (e) {
+      diag.warn('播放', '显示时间设置没能存下来（本次播放已生效）：$e');
     }
   }
 
@@ -840,15 +862,16 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
       return;
     }
 
-    // 设置一次性读齐：清晰度 / 字幕 / 音量 / 倍速 / **连播 / 跳片头**。
-    // 连播与跳片头这两项在切集时不会重读 —— 它们描述的是「这一轮观看」
-    // 的偏好，中途去设置页改的极端情况不值得为它每次切集多打一次库。
+    // 设置一次性读齐：清晰度 / 字幕 / 音量 / 倍速 / **连播 / 跳片头 / 显示时间**。
+    // 这几项在切集时不会重读 —— 它们描述的是「这一轮观看」的偏好，中途去
+    // 设置页改的极端情况不值得为它每次切集多打一次库。
     final settings = ref.read(settingsStoreProvider);
     final values = await settings.readAll(const [
       SettingKeys.playerVolume,
       SettingKeys.playerRate,
       SettingKeys.autoPlayNext,
       SettingKeys.skipIntro,
+      SettingKeys.showClock,
     ]);
     if (!mounted) return;
 
@@ -858,6 +881,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
     setState(() {
       _autoPlayNext = values[SettingKeys.autoPlayNext] != 'false';
       _skipIntro = values[SettingKeys.skipIntro] != 'false';
+      // 缺失即开：与上面两项同族，判据必须也是 `!= 'false'`。
+      _showClock = values[SettingKeys.showClock] != 'false';
     });
 
     final controller = _controller;
@@ -1425,6 +1450,19 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                       onActivity: _scheduleControlsHide,
                     ),
                   ),
+
+                  // 全屏右上角当前时间。**挂在最外层 Stack**、排在顶栏/控制栏
+                  // 之后：画面那一层在 Stack 最底下，而顶栏是浮层 —— 把时钟塞进
+                  // `_buildStage` 会被顶栏的渐变遮罩压暗，还会和「收起控制栏」
+                  // 按钮抢同一块位置（那个按钮已向右让出 72px）。
+                  // ⚠️ IgnorePointer：沉浸模式下有一层 `Positioned.fill` 的手势
+                  //    层吃点击，时钟不能抢走「点画面退出沉浸」这一下。
+                  if (_showClock)
+                    Positioned(
+                      top: 14 + AppTheme.safeAreaInsets(context).top,
+                      right: 14 + AppTheme.safeAreaInsets(context).right,
+                      child: const IgnorePointer(child: _ClockLabel()),
+                    ),
               ],
             ),
           ),
@@ -1803,14 +1841,19 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
               ],
             ),
           ),
-          IconButton(
-            // ⚠️ 语义已经变了：播放器**任何时候都是全屏**（画面恒定铺满），
-            // 这个键现在只是「把 OSD 收起来」。图标沿用全屏符号 ——
-            // 用户认的就是它。
-            onPressed: () => setState(() => _immersive = true),
-            iconSize: 17,
-            tooltip: '收起控制栏',
-            icon: const Icon(Icons.fullscreen_rounded, color: AppTheme.muted),
+          Padding(
+            // 右上角让给时钟（那一小块 + 14px 右边距约 72px）。时钟关掉时
+            // 不必留白，所以按 `_showClock` 条件化。
+            padding: EdgeInsets.only(right: _showClock ? 72 : 0),
+            child: IconButton(
+              // ⚠️ 语义已经变了：播放器**任何时候都是全屏**（画面恒定铺满），
+              // 这个键现在只是「把 OSD 收起来」。图标沿用全屏符号 ——
+              // 用户认的就是它。
+              onPressed: () => setState(() => _immersive = true),
+              iconSize: 17,
+              tooltip: '收起控制栏',
+              icon: const Icon(Icons.fullscreen_rounded, color: AppTheme.muted),
+            ),
           ),
         ],
       ),
@@ -2216,6 +2259,12 @@ class _PlayerPageState extends ConsumerState<PlayerPage> {
                     work: work,
                     onAction: (a) => unawaited(_markIntro(a)),
                   ),
+                // 「显示时间」开关。放最后：它不随片源变化，不像画质 / 音轨
+                // 那样要在切档时来回看，属于「设一次就忘掉」的那类偏好。
+                _ClockMenu(
+                  showClock: _showClock,
+                  onToggle: (on) => unawaited(_setShowClock(on)),
+                ),
               ],
             ],
           ),
@@ -2966,6 +3015,119 @@ class _MenuRow extends StatelessWidget {
             child: Icon(Icons.check_rounded, size: 14, color: AppTheme.accent),
           ),
       ],
+    );
+  }
+}
+
+/// 控制栏上的「显示时间」开关。
+///
+/// 用两项「开启 / 关闭」带勾选，而不是塞一个 `Switch`：控制栏菜单是
+/// `_MenuTile` + `_MenuRow` 这一套（可聚焦、遥控器 OK 可激活），换成 `Switch`
+/// 会绕过焦点链。选完菜单就关，再打开能看到勾选换了边。
+class _ClockMenu extends StatelessWidget {
+  const _ClockMenu({required this.showClock, required this.onToggle});
+
+  final bool showClock;
+  final ValueChanged<bool> onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    return Builder(
+      builder: (buttonContext) => _MenuButton(
+        tooltip: '显示时间',
+        onTap: () => unawaited(_openAnchoredMenu<bool>(
+          buttonContext: buttonContext,
+          title: '显示时间',
+          onSelected: onToggle,
+          rows: (context, select) => [
+            _MenuTile(
+              onTap: () => select(true),
+              child: _MenuRow(
+                label: '开启',
+                detail: '全屏播放时右上角显示当前时间',
+                selected: showClock,
+              ),
+            ),
+            _MenuTile(
+              onTap: () => select(false),
+              child: _MenuRow(
+                label: '关闭',
+                detail: '不占用画面右上角',
+                selected: !showClock,
+              ),
+            ),
+          ],
+        )),
+        child: _BarButton(
+          icon: Icons.schedule_rounded,
+          label: '时间',
+          active: showClock,
+        ),
+      ),
+    );
+  }
+}
+
+/// 右上角的当前时间（`HH:mm`）。
+///
+/// ## 为什么是独立 `StatefulWidget`
+///
+/// 播放页本身随着播放头频繁 rebuild；把「每分钟变一次」的时间塞进那个
+/// `setState` 里，等于整页每分钟白重建一次。独立成一小块 State 之后，
+/// 定时器的 `setState` 只重画这一个数字。
+///
+/// ## 为什么定时器 1 秒、却只在分钟变化时 setState
+///
+/// 1 秒一拍保证跨分钟的延迟不超过 1 秒；而显示的只有 `HH:mm`，同一分钟内
+/// 每秒 `setState` 是纯浪费（暂停时也在跑）。
+class _ClockLabel extends StatefulWidget {
+  const _ClockLabel();
+
+  @override
+  State<_ClockLabel> createState() => _ClockLabelState();
+}
+
+class _ClockLabelState extends State<_ClockLabel> {
+  late DateTime _now;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _now = DateTime.now();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final now = DateTime.now();
+      if (now.hour == _now.hour && now.minute == _now.minute) return;
+      setState(() => _now = now);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final h = _now.hour.toString().padLeft(2, '0');
+    final m = _now.minute.toString().padLeft(2, '0');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        '$h:$m',
+        // 等宽：分钟从 09 跳到 10 时整块不会左右抖一下。
+        style: AppTheme.mono.copyWith(
+          fontSize: 16,
+          fontWeight: FontWeight.w600,
+          color: Colors.white,
+        ),
+      ),
     );
   }
 }

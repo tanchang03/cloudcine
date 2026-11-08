@@ -163,6 +163,20 @@ class SettingKeys {
   /// 默认值问题（`autoMergeByOnlineId` 已经踩过同一个坑）。
   static const String skipIntro = 'skip_intro';
 
+  /// 全屏播放时是否在**画面右上角**显示当前系统时间（`HH:mm`）。
+  ///
+  /// ## 默认**开**，判据与 [autoPlayNext] / [skipIntro] 同族（缺失即开）
+  ///
+  /// 播放页的画面本来就恒铺满整屏，电视上又没有系统状态栏 —— 想知道
+  /// 「现在几点」只能退出播放去看。右上角一小块时间几乎不占地方，
+  /// 默认关的话这个功能对绝大多数人等于不存在。
+  ///
+  /// ⚠️ 判据必须是 `!= 'false'`。写成 `== 'true'` 的后果是「新装用户看不到
+  /// 时间」，而开关在 OSD 里显示「开启」—— 与 `autoMergeByOnlineId` 同一个坑。
+  /// ⛔ 键名与 Android 端 `AppPrefs` 的 `show_clock` 逐字一致：两端各写一套
+  ///    拼写的症状是「电脑上关了、电视上还开着」，而两边都不报错。
+  static const String showClock = 'show_clock';
+
   /// 扫描节流间隔（毫秒）。默认 350ms ≈ 2.9 QPS。
   static const String scanIntervalMs = 'scan_interval_ms';
 

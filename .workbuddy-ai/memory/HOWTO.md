@@ -7415,3 +7415,60 @@ network` 中止）与这里的 `abortOn` 同口径。⛔ 改一侧记得改另�
 ⚠️ 抽的时候踩过一个坑：用脚本按「起点/终点」区间替换测试文件内容，把夹在
 中间的「退出多选会把状态行贴回去」那条守卫一起删了 —— **用例数从 12 掉到 11**
 才发现。改测试文件后必须核对 `test-results/*.xml` 里的 `tests=` 数量。
+
+## 15. 全屏播放右上角时钟（2026-11-08，双端已落地）
+
+需求：播放时想知道现在几点；要有开关，**默认打开**。
+
+### 15.1 「全屏」在这个项目里不是一个状态
+
+`player_page.dart` 的画面**恒铺满整屏**，`_immersive` 只回答「收不收顶栏 /
+控制栏」（那个 `fullscreen_rounded` 按钮的语义早改成「收起控制栏」了）。所以
+时钟不按「进入全屏」触发，而是播放页可见期间常驻，受 `showClock` 门控。
+
+PC 挂在 `build` **最外层 `Stack`**、排在顶栏 / 控制栏 / TV 面板之后：画面层在
+Stack 最底下，塞进 `_buildStage` 会被顶栏渐变遮罩压暗，还会和「收起控制栏」
+按钮抢位置 —— 那个按钮按 `_showClock` 向右让出 72px。时钟是 `IgnorePointer`，
+不能抢走沉浸模式下「点画面退出」那一下点击。
+
+### 15.2 ⛔ 默认开 = `!= 'false'` 族，两端键名逐字同名
+
+- PC：`SettingKeys.showClock = 'show_clock'`，`AppSettings.fromValues` 用
+  `!= 'false'`；TV：`AppPrefs.showClock` 用 `getBoolean(KEY_SHOW_CLOCK, true)`。
+- ⚠️ 写成 `== 'true'` 的后果是「新装用户看不到时间，而 OSD 开关显示『开启』」，
+  与 `autoMergeByOnlineId` 那个坑完全同形。键名两端写岔则是「电脑上关了、
+  电视上还开着」，两边都不报错。
+- 两个开关都写各自的**本机**存储（PC 的 settings 表 / TV 的 `cloudcine_prefs`），
+  刻意**不随 `.ccbak` 跨端同步**：这是本机显示偏好，不是媒体库数据。
+
+### 15.3 项目里没有「鼠标右键菜单」
+
+PC 的 OSD 是控制栏按钮锚定的 `_openAnchoredMenu`，TV 的是 MENU / ↑ 唤起的
+`TvOsdView`。这次按这两处落地，各自加一个开关：
+
+| 端 | 入口 | 落库 |
+|---|---|---|
+| PC 内置播放页 | 控制栏 `_ClockMenu`（`_MenuRow` 的「开启 / 关闭」勾选项） | `_setShowClock`：先 `setState` 再 `settingsStore.writeBool` |
+| Android TV | MENU 键 OSD 新增 `clockRow()`（照 `debugRow()` 的两 chip） | `setClockOverlay` → `AppPrefs` → `applyClockOverlay` + `rebindOsd` |
+
+⛔ TV 的 `onOsdActivate` 一律按 `osdRows[row].id` 分派，`clockRow()` 放
+`buildRows()` **末尾**，加行不会让其它行下标错位。`updateSubtitleInset()` 走
+`osd.sheetHeightPx()`（按实际行数算），加减菜单行不用改字幕让位 —— 顺手把
+那条过时的「卡片是 7×40dp + 28dp」注释更正了。
+
+### 15.4 定时器
+
+- PC：`_ClockLabel` 独立 `StatefulWidget` + `Timer.periodic(1s)`，但**只在分钟
+  变化时 `setState`**（显示只有 `HH:mm`）。独立成一小块 State 是为了不让每分钟
+  一次的 `setState` 重建整个播放页；关掉时 `if (_showClock)` 连 widget 都不创建。
+- TV：`clockTick` 1Hz，`visibility != VISIBLE` 时不续拍；关掉与 `onDestroy` 都
+  `removeCallbacks`。⛔ 与 `applyDebugOverlay()`「只切 visibility、不 stop()」
+  **刻意相反** —— 那边停了就没 `[统计]` 日志了，时钟停了没有观察损失。
+
+### 15.5 范围 / 守卫
+
+- 独立播放窗口（`player_window_app.dart`）**这次没做**：它有自己的一套菜单和
+  设置取值器，要接得动 `PlayRequest` / bridge，收益不抵改动面。
+- `test/core/show_clock_wiring_test.dart` 是源码静态扫描守卫（播放页在
+  `flutter test` 里起不来，见 § 那条 libmpv 字段初始化器的坑）：钉住两端键名、
+  默认值判据、OSD 行与回调、写库与 `IgnorePointer`。
