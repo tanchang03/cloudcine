@@ -116,6 +116,7 @@ void main() {
     VoidCallback? onActivity,
     List<LogicalKeyboardKey>? bubbled,
     FocusNode? focusNode,
+    bool startInList = false,
   }) async {
     final list = rowList ?? rows;
     var index = selectedIndex;
@@ -151,6 +152,7 @@ void main() {
                         focusNode: focusNode,
                         rows: list,
                         selectedIndex: index,
+                        startInList: startInList,
                         onSelectedChanged: (i) {
                           selected?.add(i);
                           setState(() => index = i);
@@ -737,6 +739,147 @@ void main() {
         reason: '菜单没有真的挂在调用方给的节点上 —— 播放页的 requestFocus '
             '打在了空靶子上，遥控器按下去还是没反应',
       );
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // 打开菜单即进「选集」右侧列表（2026-11-08）
+  //
+  // 看剧时换集是最高频的动作，菜单一弹出就该能上下选，而不是先按 →。
+  // 这一段同时守住三条边界：电影/单集不进、选集数据晚到要补、按 ←
+  // 退出后不能再被 rebuild 拽回去。
+  // ------------------------------------------------------------------
+  group('打开菜单即聚焦右侧选集列表', () {
+    /// 第 0 行换成**真·选集列表**（纵向 + 3 集，当前播放第 2 集）。
+    /// ⚠️ 上面那份共用 `rows` 的第 0 行是旧模型（hint「按 OK 打开选集」、
+    /// 没有 options），测不了列表焦点，所以这里单独造一份。
+    final episodeRows = <PlayerTvRowValue>[
+      const PlayerTvRowValue(
+        row: PlayerTvRow.episode,
+        value: '第 2 集',
+        options: [
+          PlayerTvOption('第 1 集'),
+          PlayerTvOption('第 2 集'),
+          PlayerTvOption('第 3 集'),
+        ],
+        vertical: true,
+        selectedOption: 1,
+      ),
+      ...rows.skip(1),
+    ];
+
+    /// 光标所在那一行的文字（认 `_ListRow` 里那颗勾）。
+    String checkedRowLabel(WidgetTester tester) {
+      final check = find.byIcon(Icons.check_rounded);
+      expect(check, findsOneWidget, reason: '列表里必须正好有一行是光标');
+      final row = find.ancestor(of: check, matching: find.byType(Row)).first;
+      final text = find.descendant(of: row, matching: find.byType(Text)).first;
+      return tester.widget<Text>(text).data!;
+    }
+
+    test('shouldStartInEpisodeList 的边界', () {
+      expect(shouldStartInEpisodeList(episodeRows, 0), isTrue);
+      // 电影 / 单集：只有一项，不该进空列表。
+      expect(
+        shouldStartInEpisodeList(
+          const [
+            PlayerTvRowValue(
+              row: PlayerTvRow.episode,
+              value: '第 1 集',
+              options: [PlayerTvOption('第 1 集')],
+              vertical: true,
+            ),
+          ],
+          0,
+        ),
+        isFalse,
+      );
+      // 不是纵向列表（选集读库失败时第一行可能是画质 chips）。
+      expect(shouldStartInEpisodeList(rows, 1), isFalse);
+      expect(shouldStartInEpisodeList(episodeRows, -1), isFalse);
+      expect(shouldStartInEpisodeList(episodeRows, 99), isFalse);
+      expect(shouldStartInEpisodeList(const <PlayerTvRowValue>[], 0), isFalse);
+    });
+
+    testWidgets('打开即在列表：光标落在当前播放集，↓ 在列表里选而不是换行',
+        (tester) async {
+      final selected = <int>[];
+      final activated = <(PlayerTvRow, int)>[];
+      await render(
+        tester,
+        rowList: episodeRows,
+        startInList: true,
+        selected: selected,
+        onActivate: (row, i) => activated.add((row, i)),
+      );
+
+      // 当前播放的是第 2 集 ⇒ 打开就高亮它，不必先按 →。
+      expect(checkedRowLabel(tester), '第 2 集');
+
+      await press(tester, LogicalKeyboardKey.arrowDown);
+
+      expect(checkedRowLabel(tester), '第 3 集',
+          reason: '↑↓ 必须作用在右侧列表里，而不是去换左边的分类');
+      expect(selected, isEmpty, reason: '按 ↓ 不该触发 onSelectedChanged');
+
+      await press(tester, LogicalKeyboardKey.select);
+      expect(activated, [(PlayerTvRow.episode, 2)],
+          reason: 'OK 选中列表里那一集');
+    });
+
+    testWidgets('按 ← 退回左栏：列表收掉光标，之后 ↓ 才切分类', (tester) async {
+      final selected = <int>[];
+      await render(
+        tester,
+        rowList: episodeRows,
+        startInList: true,
+        selected: selected,
+      );
+      expect(checkedRowLabel(tester), '第 2 集');
+
+      await press(tester, LogicalKeyboardKey.arrowLeft);
+
+      expect(find.byIcon(Icons.check_rounded), findsNothing,
+          reason: '退出列表后不能再画列表光标 —— 那就是 2026-10-11 那条'
+              '「看起来在列表、实际在导航菜单」的假象');
+
+      // render() 的 onSelectedChanged 会 setState 换分类，didUpdateWidget
+      // 必须把焦点保持在左栏，不能被「打开即进列表」又拽回去。
+      await press(tester, LogicalKeyboardKey.arrowDown);
+      expect(selected, [1], reason: '退回左栏后 ↑↓ 才重新是切分类');
+    });
+
+    testWidgets('默认两阶段交互仍可用（startInList=false 时先按 → 才进列表）',
+        (tester) async {
+      await render(tester, rowList: episodeRows);
+      expect(find.byIcon(Icons.check_rounded), findsNothing,
+          reason: '没进列表时不画假光标');
+
+      await press(tester, LogicalKeyboardKey.arrowRight);
+      expect(checkedRowLabel(tester), '第 2 集');
+    });
+
+    testWidgets('电影 / 单集不进列表：打开仍是左栏态', (tester) async {
+      final selected = <int>[];
+      final single = <PlayerTvRowValue>[
+        const PlayerTvRowValue(
+          row: PlayerTvRow.episode,
+          value: '第 1 集',
+          options: [PlayerTvOption('第 1 集')],
+          vertical: true,
+        ),
+        ...rows.skip(1),
+      ];
+      await render(
+        tester,
+        rowList: single,
+        startInList: true,
+        selected: selected,
+      );
+      expect(find.byIcon(Icons.check_rounded), findsNothing);
+
+      await press(tester, LogicalKeyboardKey.arrowDown);
+      expect(selected, [1], reason: '没有可选集时，↓ 应该直接切分类');
     });
   });
 }

@@ -137,6 +137,24 @@ int nextTvRowIndex({
   return (current + delta) % total;
 }
 
+/// 打开菜单时，焦点是否直接落进右侧「选集」纵向列表。
+///
+/// ⚠️ 只有选中那一行是纵向列表（选集）、且真的有得选（> 1 集）才进：
+///   * 电影 / 单集没有集可选，进了一个空列表反而挡住别的分类；
+///   * 选集数据还没到时那一行可能还不是列表，推进去会选错行。
+/// 这些情形一律退回默认左栏态（由用户按 → 再进列表）。
+///
+/// ⚠️ 抽成纯函数是因为「边界写成 `>= 1`」「忘了判 [PlayerTvRowValue.vertical]」
+/// 这类错不报错、不崩，只表现成「打开菜单光标停在一个空/错的列表里」。
+bool shouldStartInEpisodeList(
+  List<PlayerTvRowValue> rows,
+  int selectedIndex,
+) {
+  if (selectedIndex < 0 || selectedIndex >= rows.length) return false;
+  final value = rows[selectedIndex];
+  return value.vertical && value.options.length > 1;
+}
+
 // ---------------------------------------------------------------------------
 // 视觉令牌（底部菜单这一块专用）
 //
@@ -439,6 +457,10 @@ class _KeyCap extends StatelessWidget {
 ///   * OK —— 应用选中的那一颗（「片头」这种一次动作行则直接执行）；
 ///   * 菜单 / Esc —— 收起菜单。
 ///
+/// ⚠️ 播放剧集时 [startInList] 会让焦点**打开即在**右侧选集列表里（省掉
+/// 「先按 →」那一下），由 [shouldStartInEpisodeList] 决定何时生效；电影 /
+/// 单集 / 选集数据没到时仍是上面这套两阶段交互。
+///
 /// ## 为什么这样比「单行标题 + 下方选项条」更快
 ///
 /// 上一版每次 ↑ / ↓ 都要把**整张卡片**重建（标题行 + 选项条 + key hints +
@@ -459,6 +481,7 @@ class PlayerTvSheet extends StatefulWidget {
     required this.onClose,
     required this.onActivity,
     this.focusNode,
+    this.startInList = false,
   });
 
   final List<PlayerTvRowValue> rows;
@@ -480,6 +503,13 @@ class PlayerTvSheet extends StatefulWidget {
   final VoidCallback onActivity;
   final FocusNode? focusNode;
 
+  /// 打开菜单时是否把焦点**直接**放进右侧选集列表，而不是等用户按 →。
+  ///
+  /// 只在 [shouldStartInEpisodeList] 判据成立时生效（电影 / 单集 / 选集数据
+  /// 没到时会自动退回左栏态）。默认 `false`：不带选集列表的调用方（旧二级页、
+  /// 测试）保持原来的两阶段交互。
+  final bool startInList;
+
   @override
   State<PlayerTvSheet> createState() => _PlayerTvSheetState();
 }
@@ -499,12 +529,17 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
   /// 只有 [PlayerTvRowValue.vertical] 的分类（选集）会用到：侧边栏按 →
   /// 进入列表，↑/↓ 在列表里选，← / 返回键退回侧边栏。横向 chips 的分类
   /// 恒为 false（←/→ 直接在 chips 里挪，不需要进列表）。
-  bool _inList = false;
+  ///
+  /// ⚠️ 播放剧集时 [PlayerTvSheet.startInList] 会让它在**打开那一帧**就是
+  /// true —— 看剧时换集是最高频的动作，省掉「先按 → 进列表」那一下。
+  late bool _inList;
 
   @override
   void initState() {
     super.initState();
     _chip = _currentOptionIndex();
+    _inList = widget.startInList &&
+        shouldStartInEpisodeList(widget.rows, widget.selectedIndex);
   }
 
   @override
@@ -518,6 +553,16 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
       _inList = false;
       if (_stripScroll.hasClients) _stripScroll.jumpTo(0);
       return;
+    }
+    // ⚠️ 选集数据是异步到的：打开那一刻 rows 里还没有纵向列表，到了之后
+    //    把默认焦点补上。判「旧的那一行还不是列表」保证只补这一次 —— 用户
+    //    自己按 ← 退出列表后，不会被随后的 rebuild 又拽回去。
+    final oldWasListRow = oldWidget.selectedIndex >= 0 &&
+        oldWidget.selectedIndex < oldWidget.rows.length &&
+        oldWidget.rows[oldWidget.selectedIndex].vertical;
+    if (widget.startInList && !_inList && !oldWasListRow &&
+        shouldStartInEpisodeList(widget.rows, widget.selectedIndex)) {
+      _inList = true;
     }
     // 没换分类但选项条变短了（例如字幕轨加载完、可用档位少了）：
     // 把光标夹回范围内，否则下面 `options[_chip]` 会越界。
@@ -631,7 +676,8 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
     }
 
     // 纵向列表（选集）：文件名长，横着铺不下。焦点进入列表后 ↑/↓ 选择，
-    // 当前项高亮（夸克式蓝底）。
+    // 当前项高亮（夸克式蓝底）。播放剧集时焦点**打开即在**列表里，
+    // 不必先按 →（见 [shouldStartInEpisodeList]）。
     if (value.vertical) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -676,7 +722,10 @@ class _PlayerTvSheetState extends State<PlayerTvSheet> {
               itemBuilder: (context, i) => _ListRow(
                 key: _chipKeys.putIfAbsent(i, GlobalKey.new),
                 label: options[i].label,
-                selected: i == _chip,
+                // ⚠️ 没进列表时 ←→ 对列表毫无作用，不能画光标态 —— 否则
+                //    又会变成「看起来焦点在列表、按 ↑↓ 却在挪左栏」。这与原生
+                //    `OsdFocus.listItemIsCursor` 是同一条不变量。
+                selected: _inList && i == _chip,
                 enabled: options[i].enabled,
                 onTap: () {
                   setState(() => _chip = i);

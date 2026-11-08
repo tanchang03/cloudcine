@@ -18,13 +18,21 @@ import org.junit.Test
  *
  * 这类「看起来对、按下去不对」的错，在真机上要按几下才反应得过来，
  * 所以判据落在这里。
+ *
+ * ## 2026-11-08：默认改成「真的进列表」
+ *
+ * 播放剧集时打开菜单 `inList` 默认就是 `true`
+ * （[OsdFocus.shouldFocusEpisodeListOnOpen]），右半边那块亮色是**真光标**
+ * 而不是假象；[OsdFocus.listItemIsCursor] 判据本身一个字没改。下面仍守住
+ * 「用户按 ← 退回左栏后必须收掉高亮」这半边，并新增打开态的判据用例。
  */
 class OsdFocusTest {
 
     /**
-     * ⛔ **本组是这次修复的核心**：默认打开菜单时光标在左栏（`inList == false`），
-     * 纵向列表里那一项**不许**画光标态 —— 否则屏幕上就有两块亮色，
-     * 用户会以为焦点在列表里。
+     * ⛔ 用户按 ← / 返回**退回左栏**（`inList == false`）后，纵向列表里
+     * 那一项**不许**再画光标态 —— 否则屏幕上就有两块亮色，用户会以为
+     * 焦点还在列表里。这是 2026-10-11 修复的核心；现在打开剧集菜单默认
+     * `inList = true`，这一条守的是「退出列表」那半边。
      */
     @Test
     fun `没进列表时纵向列表项不画光标`() {
@@ -63,6 +71,60 @@ class OsdFocusTest {
     fun `退回左栏后原光标项不再发光`() {
         assertFalse(
             OsdFocus.listItemIsCursor(position = 5, cursor = 5, inList = false),
+        )
+    }
+
+    // ==================================================================
+    // 打开菜单时的默认焦点（2026-11-08）
+    // ==================================================================
+
+    /** 剧集（第一行是纵向选集、多集）⇒ 打开菜单直接进列表。 */
+    @Test
+    fun `播放剧集时打开菜单直接进选集列表`() {
+        assertTrue(
+            OsdFocus.shouldFocusEpisodeListOnOpen(
+                firstRowIsVertical = true, firstRowOptionCount = 24,
+            ),
+        )
+    }
+
+    /** 电影 / 单集 ⇒ 没有集可选，退回左栏态。 */
+    @Test
+    fun `只有一集或零集时不进列表`() {
+        assertFalse(
+            OsdFocus.shouldFocusEpisodeListOnOpen(
+                firstRowIsVertical = true, firstRowOptionCount = 1,
+            ),
+        )
+        assertFalse(
+            OsdFocus.shouldFocusEpisodeListOnOpen(
+                firstRowIsVertical = true, firstRowOptionCount = 0,
+            ),
+        )
+    }
+
+    /** 选集读库失败时第一行不是纵向列表（变成画质 chips）⇒ 不能乱进。 */
+    @Test
+    fun `第一行不是选集纵向列表时不进列表`() {
+        assertFalse(
+            OsdFocus.shouldFocusEpisodeListOnOpen(
+                firstRowIsVertical = false, firstRowOptionCount = 5,
+            ),
+        )
+    }
+
+    /**
+     * ⚠️ 把「新默认态」与光标判据接起来：打开即在列表里（`inList = true`），
+     *    当前播放那一集必须**立刻**发光 —— 不然 2026-10-11 那条反馈会以
+     *    另一种形式回来（人已经在列表里，却看不到光标在哪）。
+     */
+    @Test
+    fun `默认进列表后当前播放集画光标`() {
+        assertTrue(
+            OsdFocus.listItemIsCursor(position = 26, cursor = 26, inList = true),
+        )
+        assertFalse(
+            OsdFocus.listItemIsCursor(position = 25, cursor = 26, inList = true),
         )
     }
 

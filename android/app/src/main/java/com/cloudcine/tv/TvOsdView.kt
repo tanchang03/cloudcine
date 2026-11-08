@@ -155,8 +155,21 @@ class TvOsdView(context: Context) : FrameLayout(context) {
      * ⛔ 见 [CARD_LIST_H]：不长的后果不是「不好看」，是**选不到后面几集**
      *    —— 卡片只有 [CARD_H] 那么高时，右侧列表一屏只放得下 4 行，
      *    一部 24 集的剧要按 6 屏方向键。
+     * ⚠️ 打开菜单若是剧集，[focusEpisodeListOnOpen] 会同时把它和 [inList]
+     *    置为 true —— 不一起长高的话，默认进列表也只看得见 4 集。
      */
     private var listMode = false
+
+    /**
+     * 「本次打开菜单」的默认进列表还没兑现 / 还没被用户操作打断。
+     *
+     * ⛔ 选集行可能是**异步**补上的（读库撞上写事务，见
+     *    `PlayerActivity.loadSiblings`）：打开那一刻还没有这一行，稍后
+     *    [bind] 重绑时得把默认焦点补回去，否则菜单会从列表态闪回左栏。
+     * ⛔ 而用户一旦按过键，就不该再抢他的焦点（他可能正在调倍速）——
+     *    所以 [onKey] 会把它清掉，[disarmOpenFocus] 在关菜单时也清。
+     */
+    private var openFocusArmed = false
 
     private val card: LinearLayout
     private val sidebarBox: LinearLayout
@@ -245,6 +258,10 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         applyCardHeight()
         rebuildSidebar()
         rebuildRight()
+        // ⚠️ 打开菜单那一刻选集行可能还没到（读库重试），这次重绑刚好把它
+        //    补上 ⇒ 把「默认进列表」补回来，别让菜单从列表态闪回左栏。
+        //    用户已经按过键时 openFocusArmed=false，这里什么都不会做。
+        applyOpenFocus()
     }
 
     /**
@@ -261,6 +278,35 @@ class TvOsdView(context: Context) : FrameLayout(context) {
         applyCardHeight()
         applySidebarSelection()
         rebuildRight()
+    }
+
+    /**
+     * 「打开菜单」：焦点直接落到右侧选集列表，光标停在**当前播放的那一集**。
+     *
+     * ⚠️ 播放剧集时才生效 —— 电影 / 单集 / 选集读库失败时会退回标准的
+     *    「左栏选中第一行」初始态（判据见 [OsdFocus.shouldFocusEpisodeListOnOpen]）。
+     * ⚠️ 必须先 [resetSelectionForTest]：它把行下标归零、把光标放到当前生效项
+     *    （[Row.active]），这两件事是 `enterList()` 的前提，也保证每次打开的
+     *    测量路径一致。
+     * ⚠️ 同时 armed：若选集行是稍后异步补上的，[bind] 会把默认焦点补回来。
+     */
+    fun focusEpisodeListOnOpen() {
+        resetSelectionForTest()
+        openFocusArmed = true
+        applyOpenFocus()
+    }
+
+    /** 菜单关闭后，别再把「打开时的默认焦点」补到下一次重绑上。 */
+    fun disarmOpenFocus() {
+        openFocusArmed = false
+    }
+
+    private fun applyOpenFocus() {
+        if (!openFocusArmed || inList) return
+        val first = rows.firstOrNull() ?: return
+        if (OsdFocus.shouldFocusEpisodeListOnOpen(first.vertical, first.options.size)) {
+            enterList()
+        }
     }
 
     /**
@@ -321,6 +367,9 @@ class TvOsdView(context: Context) : FrameLayout(context) {
      */
     fun onKey(keyCode: Int): Boolean {
         if (rows.isEmpty()) return false
+        // ⚠️ 用户已经按下第一个键 ⇒ 打开时的「默认进列表」不再需要补，
+        //    后面任何一次重绑都不该把他正在调的那一行抢回选集列表。
+        openFocusArmed = false
         val row = rows[selRow]
 
         if (inList) {
@@ -719,9 +768,10 @@ class TvOsdView(context: Context) : FrameLayout(context) {
             //        否则用户打开菜单就不知道自己在看第几集。
             //      * `selected` 是**光标** —— 必须跟着输入走。它只在真的进了
             //        列表（`inList`）时才算，判据见 [OsdFocus.listItemIsCursor]。
-            //        之前写成 `position == selChip` 的后果：菜单一打开，左栏光标
-            //        在「选集」上，右半边却已经有一块品牌色实心块 —— 用户以为
-            //        焦点在列表里，按 ↑↓ 却发现是在挪左栏（2026-10-11 反馈）。
+            //        之前写成 `position == selChip` 的后果：没进列表时右半边
+            //        已经有一块品牌色实心块 —— 用户以为焦点在列表里，按 ↑↓
+            //        却发现是在挪左栏（2026-10-11 反馈）。现在播放剧集时
+            //        `inList` 打开即为 true，这块亮的是**真光标**，不是假象。
             val selected = OsdFocus.listItemIsCursor(position, selChip, inList)
             val playing = position == row.active
             val enabled = row.isEnabled(position)

@@ -133,6 +133,10 @@ class _PlayerTvOverlayState extends State<PlayerTvOverlay> {
       focusNode: widget.focusNode,
       rows: _rows(),
       selectedIndex: _rowIndex,
+      // 电视上看剧时换集是最高频的动作：菜单一弹出就把焦点放进右侧选集
+      // 列表，光标停在当前播放的那一集。电影 / 单集 / 选集数据没到时，
+      // shouldStartInEpisodeList 会自动退回左栏态。
+      startInList: true,
       onSelectedChanged: (i) => setState(() => _rowIndex = i),
       onAdjust: _adjust,
       onActivate: _activate,

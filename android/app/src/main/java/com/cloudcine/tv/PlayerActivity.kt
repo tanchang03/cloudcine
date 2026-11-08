@@ -2905,8 +2905,8 @@ class PlayerActivity : Activity() {
     private fun buildRows(): List<TvOsdView.Row> {
         val out = ArrayList<TvOsdView.Row>(9)
         // 「选集」在第一行 —— **照 PC 端**（`buildPlayerTvRows` 里它就是第一项）。
-        // 顺序在这里是有意义的：打开菜单时光标停在第一行，而「换一集」是
-        // 剧集播放中最常做的事，排第一等于「按一下 OK 就到」。
+        // 顺序在这里是有意义的：打开菜单时焦点直接落在第一行的右侧选集列表，
+        // 而「换一集」是剧集播放中最常做的事，排第一等于「菜单一开就能选」。
         episodeRow()?.let { out += it }
         // 「画质」只在有 PlayInfo（正常取链路径）时才有。直接给 URL 的对照路径
         // 没有档位概念 ⇒ 少一行 —— 这正是回调要按 id 而不是按下标分派的原因。
@@ -2950,9 +2950,10 @@ class PlayerActivity : Activity() {
      *
      * ## 形态
      *
-     * `vertical = true`：焦点在这一行按 **→**（或 OK）进右侧纵向列表，
-     * 上下选、OK 换集、← / 返回退回侧栏 —— 按键语义与云影/夸克一致，
-     * 由 [TvOsdView] 负责。
+     * `vertical = true`：播放剧集时打开菜单，焦点**默认就在这个右侧纵向列表里**
+     * （见 [TvOsdView.focusEpisodeListOnOpen]，光标停在当前播放集），上下选、
+     * OK 换集、← / 返回退回侧栏 —— 按键语义与云影/夸克一致，由 [TvOsdView]
+     * 负责。退回侧栏之后仍可按 → / OK 再进列表。
      *
      * ## ⛔ 什么时候**不**给这一行
      *
@@ -3815,8 +3816,8 @@ class PlayerActivity : Activity() {
 
     private fun showOsd() {
         // ⛔ 先重绑再定位光标：行是现造的（字幕/音轨的行数随片源变），
-        //    `resetSelectionForTest()` 里的 `currentOptionIndex()` 读的是
-        //    **已经绑上去的那份 rows**，顺序反了光标就会落在上一份表上。
+        //    定位光标时的 `currentOptionIndex()` 读的是**已经绑上去的那份
+        //    rows**，顺序反了光标就会落在上一份表上。
         rebindOsd()
         // ⛔⛔ 上一次读库没成功（撞上另一个句柄的写事务，见 [loadSiblings]）时，
         //    「选集」行此刻是**缺**的。打开菜单是用户的真实动作，也是最后一次
@@ -3826,7 +3827,12 @@ class PlayerActivity : Activity() {
             Log.i(TAG, "OSD 打开时补一次选集读库（上次没成功）")
             loadSiblings(siblingsGroupKey, siblingsFid)
         }
-        osd.resetSelectionForTest()
+        // ⚠️ 打开即把焦点放进右侧选集列表（光标停在当前播放集），不再是
+        //    「左栏选中选集、还得按 → 才进列表」—— 看剧时换集是最高频的动作，
+        //    省掉那一下。电影 / 单集 / 选集行此刻还缺时会自动退回左栏态；
+        //    若选集行是稍后异步补上的，重绑里也会把默认焦点补回来。
+        //    见 [TvOsdView.focusEpisodeListOnOpen]。
+        osd.focusEpisodeListOnOpen()
         osd.visibility = View.VISIBLE
         // ⛔ 必须紧跟着抬字幕：菜单卡片占了屏幕下半截，不抬的话字幕正好被压住。
         updateSubtitleInset()
@@ -3835,6 +3841,8 @@ class PlayerActivity : Activity() {
     }
 
     private fun hideOsd() {
+        // 关掉之后，OSD 不可见期间那些重绑不该再「补打开时的默认焦点」。
+        osd.disarmOpenFocus()
         osd.visibility = View.GONE
         updateSubtitleInset()
         Log.i(TAG, "OSD 关闭")
