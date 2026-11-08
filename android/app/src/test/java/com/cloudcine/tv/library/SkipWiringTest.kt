@@ -101,6 +101,35 @@ class SkipWiringTest {
         )
     }
 
+    @Test
+    fun `起播点落在片尾区间内时不自动跳，且自动跳不写片尾续播点`() {
+        val code = codeOnly(read("PlayerActivity.kt"))
+        val body = functionBody(code, "private fun maybeHandleOutro(")
+        assertTrue("抽不出 maybeHandleOutro 的函数体 —— 正则已脱节", body.isNotEmpty())
+
+        assertTrue(
+            "maybeHandleOutro 里没有 `OutroSkip.shouldAutoAdvance(...)`。" +
+                "少了这个起播例外，用户回头重看上一集时会一起播就被片尾结论" +
+                "弹回下一集 —— OSD 选集永远出不去（2026-11-08 真机）。",
+            body.contains("OutroSkip.shouldAutoAdvance("),
+        )
+        assertTrue(
+            "起播第一拍的标记没在判定后消耗，`shouldAutoAdvance` 会把整条流" +
+                "都当成第一拍，片尾再也不跳。",
+            body.contains("outroFirstSample = false"),
+        )
+        assertTrue(
+            "reportProgress 没把「片尾区间内的位置」排除出续播点。自动跳片尾" +
+                "引起的换集也走这里（switchFromOutro 只挡学习样本、没挡进度写回），" +
+                "不挡就会自己把死循环的种子写进库。",
+            code.contains("val inOutro = outroStart != null && positionMs >= outroStart"),
+        )
+        assertTrue(
+            "每条新流没有重新武装 `outroFirstSample`，换集会沿用上一集的状态。",
+            code.contains("outroFirstSample = true"),
+        )
+    }
+
     // ------------------------------------------------------------------
     // 3. 换算：两条支路共用同一份实现
     // ------------------------------------------------------------------

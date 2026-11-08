@@ -156,6 +156,13 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
   /// 这一条流里片尾提示已经触发过了（上升沿用）。
   bool _outroReached = false;
 
+  /// 本条流是否还没采到「能算出片尾起点的第一条位置样本」。
+  ///
+  /// ⛔ 起播点就落在片尾区间里时（回头重看 / 续播点在片尾），这一条流
+  ///    **不自动跳下一集**，否则选回上一集会被立刻弹走。判据在
+  ///    [OutroSkip.shouldAutoAdvance]，与内置播放页同一份实现。
+  bool _outroFirstSample = true;
+
   /// 「低置信候选」已经提示到哪个样本数了（键 `workKey#kind`）。
   ///
   /// 每采到一条样本主窗口都会回传一次候选，不拦的话第 1、2 集会反复弹
@@ -2707,6 +2714,8 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       _manualOutroOffset = req?.manualOutroOffset;
       _learnedOutroOffset = req?.learnedOutroOffset;
       _outroReached = false;
+      // 起播例外重新武装：换流之后第一条能算出片尾起点的位置样本还没采到。
+      _outroFirstSample = true;
       // 落点采集器同理 —— 它记着「待确认的落点」，留着会让下一集顶着这一集的
       // 落点算锚点。
       _anchorCollector.reset();
@@ -3308,7 +3317,15 @@ class _PlayerWindowAppState extends State<PlayerWindowApp> {
       ),
     );
     if (start == null) return;
-    if (position < start) return;
+    // ⛔ 起播第一拍就在片尾区间里 ⇒ 本条流不自动跳（回头重看 / 续播点在片尾）。
+    //    `start == null` 时不消耗这一位：流还没解析完，谈不上判断起播点。
+    final advance = OutroSkip.shouldAutoAdvance(
+      start: start,
+      firstSample: _outroFirstSample,
+      position: position,
+    );
+    _outroFirstSample = false;
+    if (!advance) return;
     _outroReached = true;
     diag.info(
       '片尾',

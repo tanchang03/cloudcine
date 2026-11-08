@@ -372,5 +372,74 @@ void main() {
         );
       });
     });
+
+    group('shouldAutoAdvance —— 起播点落在片尾区间内时不自动跳', () {
+      // ⛔ 这一组钉的是「OSD 选回上一集 → 又跳回下一集」的死循环：自动跳
+      //    片尾本身会把片尾区间内的位置写成续播点，用户回头选回上一集就
+      //    从这个点起播；片尾判定若只看「位置 >= 落点」，第一拍就会再次跳走。
+      const start = Duration(minutes: 43, seconds: 30);
+
+      test('起播第一拍就在区间内 ⇒ 不跳', () {
+        expect(
+          OutroSkip.shouldAutoAdvance(
+            start: start,
+            firstSample: true,
+            position: start + const Duration(seconds: 5),
+          ),
+          isFalse,
+          reason: '起播点在片尾里（回头重看 / 续播），不能被同一集的片尾结论'
+              '弹回下一集',
+        );
+      });
+
+      test('从区间外播进区间 ⇒ 跳', () {
+        expect(
+          OutroSkip.shouldAutoAdvance(
+            start: start,
+            firstSample: false,
+            position: start + const Duration(seconds: 5),
+          ),
+          isTrue,
+        );
+      });
+
+      test('还没进区间一律不跳', () {
+        expect(
+          OutroSkip.shouldAutoAdvance(
+            start: start,
+            firstSample: false,
+            position: start - const Duration(seconds: 1),
+          ),
+          isFalse,
+        );
+        expect(
+          OutroSkip.shouldAutoAdvance(
+            start: start,
+            firstSample: true,
+            position: start - const Duration(seconds: 1),
+          ),
+          isFalse,
+        );
+      });
+
+      test('片长未知 / 没有结论时不跳', () {
+        expect(
+          OutroSkip.shouldAutoAdvance(
+            start: null,
+            firstSample: true,
+            position: const Duration(minutes: 10),
+          ),
+          isFalse,
+        );
+        expect(
+          OutroSkip.shouldAutoAdvance(
+            start: null,
+            firstSample: false,
+            position: const Duration(minutes: 10),
+          ),
+          isFalse,
+        );
+      });
+    });
   });
 }

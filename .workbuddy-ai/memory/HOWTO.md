@@ -7230,6 +7230,47 @@ PC 会算出 `start = duration`（落点 = 片尾）—— 同一条链，两种
 `player_page` 的 `diag.info` 现在会把 `SkipLearningProgress` 一起打出来，
 先捞真机日志看「样本不足 / MAD 超标 / 片尾零样本」各占多少再决定方向，别拍脑袋改数字。
 
+## 13.16 ⚠️ 回头重看上一集被片尾自动跳弹回下一集（2026-11-08）
+
+真机：已看过的剧集自动跳过片尾到下一集，用户想回头再看上一集，OSD 选集选中
+它，却因为进度条落在「跳过片尾」范围里又跳回下一集，循环出不去。
+
+### 因果链（四层叠加，缺一不会必现）
+
+1. `maybeHandleOutro` 的判据只有 `positionMs >= duration - offset`，**没有
+   「起播点已在片尾区间」的例外**。片尾判定挂在 1 秒的 `playheadTick` 上，
+   而 `startPlayer` 在 `prepare()` 之后才 `seekTo(resumeAtMs)` —— 起播第一拍
+   看到的就是续播点。
+2. 自动跳片尾引起的换集也走 `onNewIntent → reportProgress(flushAtExit=true)`，
+   把「片尾区间内的位置」写成了该集的 `resume_position_ms`。
+   ⛔ §13.4 的 `switchFromOutro` **只挡了 `reportEpisodeSwitchAnchor()`（学习样本），
+   没挡进度写回** —— 自我实现防护漏了这一路。
+3. `PlaybackResume.worthKeeping` 只把 `max(2%, 2min)` 的「看完尾巴」清掉，
+   而片尾偏移上限是 **5 分钟** ⇒ 片尾区间里那段位置被当成合法续播点留下。
+4. `switchEpisode(chip)`（OSD 选集）不带任何抑制标记，`EXTRA_RESUME_MS` 原样
+   带回这个续播点；`loadSkipConfig` 异步回调又无条件 `outroHandled = false`
+   重新武装 ⇒ 第一拍再次跳走。
+
+### 修法（两端同源）
+
+- `OutroSkip.shouldAutoAdvance(start, firstSample, position)`：本条流第一条能
+  算出片尾起点的位置样本若已在区间内 ⇒ **不自动跳**。`firstSample` 由
+  `startFromIntent`（TV）/ `open()` / `_openStream`（PC）每条流归零、判定后消耗。
+  ⚠️ `start == null` 时不消耗（流还没解析完）；「当场学会」复位上升沿时必须
+  **显式** `firstSample = false`，否则会漏掉 §13.5 那一次当场提示。
+- TV `reportProgress`：片尾区间内的位置一律不写续播点（`inOutro`）。清成 NULL
+  后下次打开该集从头播 —— 正是「回头再看一遍」该有的行为，也顺手把已经写脏的
+  数据在下一次退出时清掉。
+- TV `startFromIntent`：每条新流先 `outroHandled = true` 关掉判定，等
+  `loadSkipConfig` 回调再武装，消除异步窗口；回调**不动** `firstSample`。
+
+### 两端守卫
+
+`IntroSkipTest.kt` / `intro_marker_test.dart` 镜像单测（起播在区间内 / 从区间外
+进入 / 未进区间 / 片长未知）；`SkipWiringTest.kt` 与 `outro_wiring_test.dart`
+静态钉住接线。⛔ 之前两端**完全没有**「从片尾区间内起播」这个场景的用例，
+这是能漏到真机的直接原因。
+
 ## 14. 媒体库删除时「一并删网盘」（2026-10-21，两端已落地）
 
 ### 14.1 为什么加

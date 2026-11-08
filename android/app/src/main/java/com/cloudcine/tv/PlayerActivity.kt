@@ -575,6 +575,15 @@ class PlayerActivity : Activity() {
     private var outroHandled = false
 
     /**
+     * 本条流是否还没采到「能算出片尾起点的第一条位置样本」。
+     *
+     * ⛔ 起播点就落在片尾区间里时（回头重看上一集 / 从续播点进来），这一条流
+     *    **不自动跳下一集** —— 否则「OSD 选回上一集 → 又跳回下一集」会死循环。
+     *    判据在 [OutroSkip.shouldAutoAdvance]，这里只负责每条流归零与消耗。
+     */
+    private var outroFirstSample = true
+
+    /**
      * 「自动连播」开关（`auto_play_next`，与 PC 端同一个键）。
      *
      * ⛔ 缺省**开**，判据是 `!= "false"` —— 与 PC 端
@@ -1199,6 +1208,11 @@ class PlayerActivity : Activity() {
         resumeAtMs = intent.getLongExtra(EXTRA_RESUME_MS, 0L)
         val groupKey = intent.getStringExtra(EXTRA_GROUP_KEY)?.trim().orEmpty()
         loadSiblings(groupKey, fid)
+        // ⛔ 每条新流先把片尾判定关掉、把「起播第一拍」重新武装：
+        //    `loadSkipConfig` 是异步读库，回调回来之前不该拿着上一集的偏移 /
+        //    上一集的上升沿状态去判新流。回调里再 `outroHandled = false` 武装。
+        outroHandled = true
+        outroFirstSample = true
         // 片头 / 片尾的配置与学习结论（异步读库，见 [loadSkipConfig]）。
         loadSkipConfig(groupKey)
         // 落点采集器归零，并把**起播位置**记下来。⛔ 用 `resumeAtMs` 而不是
@@ -1265,7 +1279,22 @@ class PlayerActivity : Activity() {
 
         val totalMs = p.duration.takeIf { it > 0 } ?: 0L
         val itemId = ScanItem.idOf("quark", fid)
-        val keep = PlaybackResume.worthKeeping(positionMs, totalMs)
+        // ⛔ 片尾区间内的位置**不能留作续播点**。
+        //
+        // 自动跳片尾引起的换集也走这里（`onNewIntent` → `reportProgress(flush)`），
+        // 而 §13.4 的 `switchFromOutro` 只挡了学习样本、没挡进度写回 —— 于是
+        // 自动跳自己把「片尾区间内的位置」写成了该集的续播点。用户回头选回
+        // 上一集时，这个续播点又让他一起播就被弹回下一集，形成死循环。
+        //
+        // 片尾偏移可到 5 分钟，比 `PlaybackResume` 的「看完尾巴」(2 分钟)长，
+        // 光靠 `worthKeeping` 挡不住这一段。清成 NULL 后下次打开这一集会从头
+        // 播 —— 这也正是「回头再看一遍」该有的行为。
+        val outroStart = OutroSkip.startMs(
+            totalMs,
+            OutroSkip.effectiveOffsetMs(manualOutroOffsetMs, learnedOutroOffsetMs),
+        )
+        val inOutro = outroStart != null && positionMs >= outroStart
+        val keep = PlaybackResume.worthKeeping(positionMs, totalMs) && !inOutro
         Bg.run({
             val db = ensureLib()
             db.markPlayed(itemId)
@@ -1282,7 +1311,7 @@ class PlayerActivity : Activity() {
             Log.i(
                 TAG,
                 "进度：${r.first} @ ${r.second / 1000}s / ${totalMs / 1000}s" +
-                    if (r.third) "" else "（已看完或太短 ⇒ 清掉续播点）",
+                    if (r.third) "" else "（已看完 / 片尾区间内 / 太短 ⇒ 清掉续播点）",
             )
         }
     }
@@ -1359,7 +1388,13 @@ class PlayerActivity : Activity() {
         val offset = OutroSkip.effectiveOffsetMs(manualOutroOffsetMs, learnedOutroOffsetMs)
             ?: return
         val start = OutroSkip.startMs(totalMs, offset) ?: return
-        if (positionMs < start) return
+        // ⛔ 起播第一拍就落在片尾区间里 ⇒ 本条流不自动跳：那是用户回头重看
+        //    上一集 / 从续播点进来，不能被同一集的片尾结论立刻弹回下一集。
+        //    `start == null`（片长未知 / 没结论）时不消耗这一位 —— 上面已经
+        //    `?: return`，下面的赋值因此只在真的算出起点后才发生。
+        val advance = OutroSkip.shouldAutoAdvance(start, outroFirstSample, positionMs)
+        outroFirstSample = false
+        if (!advance) return
 
         outroHandled = true
         Log.i(TAG, "到达片尾：${positionMs / 1000}s（片尾从 ${start / 1000}s 起）")
@@ -1444,6 +1479,7 @@ class PlayerActivity : Activity() {
             manualOutroOffsetMs = null
             learnedOutroOffsetMs = null
             outroHandled = false
+            outroFirstSample = true
             return
         }
         workKey = groupKey
@@ -1469,6 +1505,10 @@ class PlayerActivity : Activity() {
             // `OutroSkip` —— 与片头那条链同形，不在这里合成。
             manualOutroOffsetMs = work?.outroOffsetMs
             learnedOutroOffsetMs = work?.learnedOutroOffsetMs
+            // ⛔ 只重新武装上升沿，**不动** `outroFirstSample`：那一位描述的是
+            //    「这条流采没采过第一拍」，由 [startFromIntent] 起播时归零。读库
+            //    回调可能晚于起播，在这里翻回 true 会把已经采过的第一拍又当成
+            //    起播，白抑制一次片尾。
             outroHandled = false
             // 手标优先于学习（取值链在 `IntroSession.marker` 里，只有一份实现）。
             // ⛔ 手标那一列 Android 端**没有界面可写**，但 PC 端标的会随备份过来，
@@ -1587,6 +1627,9 @@ class PlayerActivity : Activity() {
                 if (outcome.outro != null) {
                     learnedOutroOffsetMs = outcome.outro.offsetMs
                     outroHandled = false
+                    // 「当场学会」发生在播放中途，第一拍早就采过了 —— 明确
+                    // 关掉起播例外，这一集才能立即提示片尾（§13.5）。
+                    outroFirstSample = false
                 }
                 return@run
             }
@@ -4070,6 +4113,8 @@ class PlayerActivity : Activity() {
             } else {
                 learnedOutroOffsetMs = s.suggestionMs
                 outroHandled = false
+                // 同上：确认发生在播放中途，不是起播第一拍，允许立即提示。
+                outroFirstSample = false
             }
         }
         return true

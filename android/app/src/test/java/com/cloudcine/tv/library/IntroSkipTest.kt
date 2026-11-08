@@ -266,4 +266,74 @@ class IntroSkipTest {
         assertNull(OutroSkip.startMs(durationMs = 45 * 60_000L, offsetMs = null))
         assertNull(OutroSkip.startMs(durationMs = 45 * 60_000L, offsetMs = 0L))
     }
+
+    // ------------------------------------------------------------------
+    // OutroSkip.shouldAutoAdvance —— 起播点落在片尾区间内时不自动跳
+    // ------------------------------------------------------------------
+    //
+    // ⛔ 这一组钉的是「OSD 选回上一集 → 又跳回下一集」的死循环：自动跳片尾
+    //    本身会把片尾区间内的位置写成续播点，用户回头选回上一集就从这个点
+    //    起播；片尾判定若只看「位置 >= 落点」，第一拍就会再次跳走。
+
+    @Test
+    fun `片尾：起播第一拍就在区间内 ⇒ 不跳`() {
+        val start = 45 * 60_000L - 90_000L
+        assertFalse(
+            "起播点在片尾里（回头重看 / 续播），不能被同一集的片尾结论弹回下一集",
+            OutroSkip.shouldAutoAdvance(
+                startMs = start,
+                firstSample = true,
+                positionMs = start + 5_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `片尾：从区间外播进区间 ⇒ 跳`() {
+        val start = 45 * 60_000L - 90_000L
+        assertTrue(
+            OutroSkip.shouldAutoAdvance(
+                startMs = start,
+                firstSample = false,
+                positionMs = start + 5_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `片尾：还没进区间一律不跳`() {
+        val start = 45 * 60_000L - 90_000L
+        assertFalse(
+            OutroSkip.shouldAutoAdvance(
+                startMs = start,
+                firstSample = false,
+                positionMs = start - 1_000L,
+            ),
+        )
+        assertFalse(
+            OutroSkip.shouldAutoAdvance(
+                startMs = start,
+                firstSample = true,
+                positionMs = start - 1_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `片尾：片长未知或没有结论时不跳`() {
+        assertFalse(
+            OutroSkip.shouldAutoAdvance(
+                startMs = null,
+                firstSample = true,
+                positionMs = 100_000L,
+            ),
+        )
+        assertFalse(
+            OutroSkip.shouldAutoAdvance(
+                startMs = null,
+                firstSample = false,
+                positionMs = 100_000L,
+            ),
+        )
+    }
 }

@@ -105,6 +105,34 @@ object OutroSkip {
         val start = durationMs - offset
         return if (start > 0L) start else null
     }
+
+    /**
+     * 这一拍要不要触发片尾自动跳。
+     *
+     * ## ⛔ 起播点落在片尾区间内时**不跳**
+     *
+     * [firstSample] 为 `true` 表示这是本条流第一条能算出片尾起点的位置样本。
+     * 如果这一拍就已经在区间里，说明**起播点本身就在片尾** —— 用户回头重看
+     * 上一集、或从续播点进来。此时照常「到达片尾就跳下一集」的话，他会被
+     * 同一集的片尾结论立刻弹回下一集，OSD 选回上一集将**永远出不去**。
+     *
+     * 之后的拍子只要位置在区间内就允许触发（调用方另有 `outroHandled`
+     * 上升沿保证只报一次），所以「从片尾里拖回正片、再看到片尾」仍然会
+     * 正常连播下一集。
+     *
+     * ⚠️ [startMs] 为 `null`（片长未知 / 没有结论）时**不消耗** firstSample：
+     *    那条流还没法判断起播点，调用方也不要把它翻成 false。
+     *
+     * @return `true` = 应当提示 / 自动跳下一集。
+     */
+    fun shouldAutoAdvance(
+        startMs: Long?,
+        firstSample: Boolean,
+        positionMs: Long,
+    ): Boolean {
+        if (startMs == null || positionMs < startMs) return false
+        return !firstSample
+    }
 }
 
 /**

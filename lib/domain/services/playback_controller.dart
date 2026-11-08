@@ -475,6 +475,13 @@ class PlaybackController extends ChangeNotifier {
   /// 这一条流里片尾提示已经触发过了（上升沿用）。
   bool _outroReached = false;
 
+  /// 本条流是否还没采到「能算出片尾起点的第一条位置样本」。
+  ///
+  /// ⛔ 起播点就落在片尾区间里时（回头重看上一集 / 从续播点进来），这一条流
+  ///    **不自动跳下一集** —— 否则「选回上一集 → 又跳回下一集」会死循环。
+  ///    判据在 [OutroSkip.shouldAutoAdvance]，这里只负责每条流归零与消耗。
+  bool _outroFirstSample = true;
+
   /// 用户手标的片尾偏移（`null` = 没标过）。UI 用它显示「这一份是手标的」。
   Duration? get manualOutroOffset => _manualOutroOffset;
 
@@ -489,6 +496,9 @@ class PlaybackController extends ChangeNotifier {
     if (_manualOutroOffset == offset) return;
     _manualOutroOffset = offset;
     _outroReached = false;
+    // 标记发生在播放中途，不是起播第一拍 —— 关掉起播例外，这次标记才能
+    // 立刻生效（用户标完马上就会去看「有没有跳」）。
+    _outroFirstSample = false;
     notifyListeners();
   }
 
@@ -507,6 +517,9 @@ class PlaybackController extends ChangeNotifier {
     if (_learnedOutroOffset == offset) return;
     _learnedOutroOffset = offset;
     _outroReached = false;
+    // 「当场学会」发生在播放中途，第一拍早采过了 —— 关掉起播例外，这一集
+    // 才能立即提示片尾。
+    _outroFirstSample = false;
     notifyListeners();
   }
 
@@ -634,6 +647,10 @@ class PlaybackController extends ChangeNotifier {
     _manualOutroOffset = manualOutroOffset;
     _learnedOutroOffset = learnedOutroOffset;
     _outroReached = false;
+    // 起播例外重新武装：本条流还没采到第一拍。⛔ 起播点就落在片尾区间里时
+    // 不自动跳下一集（回头重看 / 续播点在片尾），判据在
+    // `OutroSkip.shouldAutoAdvance`。
+    _outroFirstSample = true;
     // 落点采集器同理 —— 它记着「待确认的落点」，留着会让下一集顶着
     // 这一集的落点算锚点。
     _anchorCollector.reset();
@@ -1677,7 +1694,15 @@ class PlaybackController extends ChangeNotifier {
     if (_outroReached) return;
     final start = outroStart;
     if (start == null) return;
-    if (v < start) return;
+    // ⛔ 起播第一拍就在片尾区间里 ⇒ 本条流不自动跳（回头重看 / 续播点在片尾）。
+    //    `start == null` 时不消耗这一位：流还没解析完，谈不上判断起播点。
+    final advance = OutroSkip.shouldAutoAdvance(
+      start: start,
+      firstSample: _outroFirstSample,
+      position: v,
+    );
+    _outroFirstSample = false;
+    if (!advance) return;
     _outroReached = true;
     diag.info('片尾', '到达片尾：${v.inSeconds}s（片尾从 ${start.inSeconds}s 起）');
     onOutroReached?.call(start);

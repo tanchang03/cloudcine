@@ -165,4 +165,37 @@ void main() {
           '独立窗口里标的片尾落不了库 —— 关掉窗口就没了，而界面上写着「已保存」。',
     );
   });
+
+  test('片尾判定带「起播例外」：回头重看上一集不会被弹回下一集', () {
+    // ⛔ 这条钉的是 2026-11-08 的真机死循环：自动跳片尾把片尾区间内的
+    //    位置写成了续播点，用户 OSD 选回上一集就从那个点起播，第一拍又被
+    //    「位置 >= 片尾落点」判成到达片尾，再次跳走。
+    final controller =
+        codeOnly(read('lib/domain/services/playback_controller.dart'));
+    final controllerBody = blockBody(controller, 'void _maybeNotifyOutro(');
+    expect(
+      controllerBody.contains('OutroSkip.shouldAutoAdvance('),
+      isTrue,
+      reason: '内置播放页的片尾判定没有走起播例外 —— 续播点落在片尾区间时'
+          '会被立刻弹到下一集。',
+    );
+    expect(
+      controller.contains('_outroFirstSample = true'),
+      isTrue,
+      reason: '`open()` 没有给每条新流重新武装起播例外。',
+    );
+
+    final window = codeOnly(read('lib/ui/windows/player_window_app.dart'));
+    final windowBody = blockBody(window, 'void _maybeNotifyOutro(');
+    expect(
+      windowBody.contains('OutroSkip.shouldAutoAdvance('),
+      isTrue,
+      reason: '独立窗口没有同步这条护栏 —— 与内置页两份判定会各自漂移。',
+    );
+    expect(
+      window.contains('_outroFirstSample = true'),
+      isTrue,
+      reason: '独立窗口换流时没有重置起播例外。',
+    );
+  });
 }
