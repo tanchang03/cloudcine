@@ -266,6 +266,9 @@ final posterCacheProvider = Provider<PosterCache>(
         }
         return const <String, String>{};
       },
+      // 旧版本把豆瓣详情海报改写成了无签名的 qnmob3-sign，那条路径现在
+      // 只返回 12 字节占位图。旧库里的地址不用重刮，下载前换回 img3。
+      normalizeUrl: (url) => DoubanScraper.normalizeImageUrl(url) ?? url,
     );
   },
 );

@@ -111,6 +111,7 @@ Map<String, Object?> _hit({
   String? year,
   double? rating,
   int? ratingCount,
+  bool noCover = false,
 }) =>
     <String, Object?>{
       'layout': 'subject',
@@ -120,9 +121,12 @@ Map<String, Object?> _hit({
         'title': title,
         'year': year,
         // 搜索结果的封面是被套了 `h/120` 的**横条**，不能当海报用。
-        // 这里刻意保留那个参数，好让「有没有误用」能被断言出来。
-        'cover_url': 'https://qnmob3-sign.doubanio.com/view/photo/large/'
-            'public/p$id.jpg?imageView2/0/q/80/w/9999/h/120/format/jpg',
+        // 这里刻意保留签名参数与 `h/120`，好让「有没有误用 / 有没有丢签名」
+        // 都能被断言出来。
+        if (!noCover)
+          'cover_url': 'https://qnmob3-sign.doubanio.com/view/photo/large/'
+              'public/p$id.jpg?sa_cv=abc&sa_ct=def'
+              '&imageView2/0/q/80/w/9999/h/120/format/jpg',
         // 只要有评价人数就要给出 rating 对象 —— 真实响应里两者是一起的，
         // 少了它热度这一档就没法被验证。
         if (rating != null || ratingCount != null)
@@ -652,7 +656,7 @@ void main() {
       expect(md.matchedQuery, '流浪地球2');
     });
 
-    test('海报只取详情接口的 cover_url，搜索里的 h/120 横条不会被用', () async {
+    test('海报优先取详情接口的 cover_url，搜索里的 h/120 横条不会被用', () async {
       final http = _server(
         search: (_) => _searchBody(
           subjects: [
@@ -672,21 +676,20 @@ void main() {
 
       expect(
         md!.posterUrl,
-        'https://qnmob3-sign.doubanio.com/view/photo/m_ratio_poster/public/p2902705337.jpg',
+        'https://img3.doubanio.com/view/photo/m_ratio_poster/public/p2902705337.jpg',
         reason: '搜索结果的 cover_url 被服务端套了 `imageView2/…/h/120/format/jpg`，'
             '是一条 120px 高的横条 —— 拿它当海报会是一道细缝。'
-            '海报只能取自详情接口。详情接口给的 `img*` 子域会被改写成'
-            '`qnmob3-sign`（见类文档坑 #6：img* 子域即使带 Referer 也 403/418）。',
+            '海报优先取自详情接口，并且 `img*` 地址要**原样保留**：'
+            '2026-11-22 实测 img* 带 Referer 返回 200，而改写到无签名的'
+            '`qnmob3-sign` 会拿到 12 字节防盗链占位图。',
       );
       expect(md.posterUrl, isNot(contains('h/120')));
-      expect(md.posterUrl, isNot(contains('img3.doubanio.com')));
+      expect(md.posterUrl, contains('img3.doubanio.com'));
     });
 
-    test('详情 cover_url 的 img* 子域一律改写成 qnmob3-sign', () async {
-      // 2026-10-02 日志：同一张图 p2616542123.jpg，同一个 Referer 头，
-      // qnmob3-sign.doubanio.com → 200，img3.doubanio.com → 403，
-      // img9.doubanio.com → 418。详情接口给的 cover_url 用的正是 img* 子域，
-      // 不改写 → PosterCache 下载失败 → 刮削成功但没封面。
+    test('详情 cover_url 的 img* 子域保持原样 —— 不要改写到 qnmob3-sign', () async {
+      // 2026-11-22 复测：img9 带 Referer → 200；qnmob3-sign 对没有
+      // `sa_cv/sa_ct` 的 m_ratio_poster → 200 + 12 字节占位图（`˙ ͜ʟ˙`）。
       final http = _FakeHttp((call) async {
         if (call.path.endsWith('/search')) {
           return _ok(_searchBody(
@@ -716,18 +719,58 @@ void main() {
       expect(md, isNotNull);
       expect(
         md!.posterUrl,
-        'https://qnmob3-sign.doubanio.com/view/photo/m_ratio_poster/public/p2933465504.jpg',
-        reason: 'img9.doubanio.com 在日志里返回 418。改写成 qnmob3-sign 后'
-            '路径不变（m_ratio_poster），只是域名换了 —— PosterCache 下载时'
-            '带 Referer 就能拿到 200。',
+        'https://img9.doubanio.com/view/photo/m_ratio_poster/public/p2933465504.jpg',
+        reason: '旧代码把 img* 改成 qnmob3-sign，当时是为了绕开 403/418；'
+            '但 2026-11-22 起那条无签名路径返回的是 12 字节占位图。'
+            'PosterCache 拿到它只会显示占位花字，表现为「刮削成功但没封面」。',
       );
     });
 
-    test('详情缺字段时不抛：没有海报就 posterUrl 为 null', () async {
+    test('详情没有海报时，回退到候选里的签名地址并换大图', () async {
       final http = _server(
         search: (_) => _searchBody(
           subjects: [
             _hit(id: '1', title: '流浪地球2', targetType: 'movie', year: '2023'),
+          ],
+        ),
+        detail: (id) => <String, Object?>{
+          'id': id,
+          'type': 'movie',
+          'title': '流浪地球2',
+          'year': '2023',
+          // 详情没有 cover_url
+        },
+      );
+      final scraper = DoubanScraper(
+        http: http,
+        cookie: 'dbcl2=abc',
+        minRequestInterval: Duration.zero,
+      );
+
+      final md = await scraper.scrape(_qMovie);
+
+      expect(md!.posterUrl, contains('sa_cv=abc'));
+      expect(md.posterUrl, contains('sa_ct=def'));
+      expect(md.posterUrl, contains('h/810'));
+      expect(
+        md.posterUrl,
+        isNot(contains('h/120')),
+        reason: '签名地址必须保留，但 h/120 是候选列表的横条；'
+            '落库海报至少换成 h/810 的大图。',
+      );
+    });
+
+    test('详情与候选都没有海报 → posterUrl 为 null，不抛', () async {
+      final http = _server(
+        search: (_) => _searchBody(
+          subjects: [
+            _hit(
+              id: '1',
+              title: '流浪地球2',
+              targetType: 'movie',
+              year: '2023',
+              noCover: true,
+            ),
           ],
         ),
         detail: (id) => <String, Object?>{
@@ -982,7 +1025,14 @@ void main() {
         DoubanScraper.imageHeaders()['Referer'],
         'https://movie.douban.com/',
         reason: '实测豆瓣图片 CDN 缺 Referer 一律返回 418。'
-            '（但 img* 子域带 Referer 仍可能 403，所以落库时还做了域名改写。）',
+            '2026-11-22 复测：img1/2/3/9 带 Referer 都是 200，'
+            '所以海报 URL 不再做域名改写。',
+      );
+      expect(
+        DoubanScraper.imageHeaders()['User-Agent'],
+        isNotEmpty,
+        reason: '2026-11-22 实测 img3 只带 Referer 会 403；'
+            '必须同时带桌面 UA 才是 200。',
       );
     });
 
@@ -1013,6 +1063,30 @@ void main() {
         isFalse,
         reason: '必须按「.doubanio.com 结尾」判，不能用 contains —— '
             '否则一个叫 notdoubanio.com 的域名也会被当成豆瓣。',
+      );
+    });
+
+    test('旧库里的无签名 qnmob3-sign 海报地址归一化回 img3', () {
+      expect(
+        DoubanScraper.normalizeImageUrl(
+          'https://qnmob3-sign.doubanio.com/view/photo/m_ratio_poster/'
+              'public/p2936897680.jpg',
+        ),
+        'https://img3.doubanio.com/view/photo/m_ratio_poster/'
+            'public/p2936897680.jpg',
+      );
+      expect(
+        DoubanScraper.normalizeImageUrl(
+          'https://qnmob3-sign.doubanio.com/view/photo/large/'
+              'public/p2936897680.jpg?sa_cv=1&sa_ct=2'
+              '&imageView2/0/q/85/h/810/format/jpg',
+        ),
+        contains('qnmob3-sign.doubanio.com'),
+        reason: '带签名的是搜索结果缩略图，不能改域名',
+      );
+      expect(
+        DoubanScraper.normalizeImageUrl('https://image.tmdb.org/t/p/w500/x.jpg'),
+        'https://image.tmdb.org/t/p/w500/x.jpg',
       );
     });
   });
@@ -1496,13 +1570,12 @@ void main() {
       );
       expect(
         md.posterUrl,
-        contains('qnmob3-sign.doubanio.com'),
-        reason: '详情接口返回的 `cover_url` 用的是 `img3.doubanio.com` 子域，'
-            '该子域即使带 Referer 也 403/418（2026-10-02 实测）。'
-            '_toMetadata 必须把它改写成 `qnmob3-sign.doubanio.com`，'
-            '否则 PosterCache 下载失败 → 手动刮削成功但没封面。',
+        contains('img3.doubanio.com'),
+        reason: '详情接口返回的 `cover_url` 用 `img3.doubanio.com`，'
+            '2026-11-22 实测带 Referer 就是 200。不要改写到 qnmob3-sign：'
+            '没有签名的 qnmob3-sign 会返回 12 字节占位图。',
       );
-      expect(md.posterUrl, isNot(contains('img3.doubanio.com')));
+      expect(md.posterUrl, isNot(contains('qnmob3-sign.doubanio.com')));
       expect(md.onlineId, 'douban/movie/35000001');
       expect(md.source, ScrapeSource.online);
       expect(http.detailCalls.single.path, contains('/movie/35000001'));

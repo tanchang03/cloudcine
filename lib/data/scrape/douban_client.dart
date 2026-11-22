@@ -40,13 +40,12 @@ import '../http/http_client.dart';
 ///    `{"request":"GET /v2/search","msg":"need_login","code":103}`，
 ///    实测**既见过 200 也见过 403**。所以判成功必须在解析业务码**之后**，
 ///    只看状态码会把 403 那次的 103 当成普通失败而漏掉熔断。
-/// 6. **海报 CDN 的 `img*` 子域会拒绝带 Referer 的请求。** 2026-10-02
-///    实测：同一张图 `p2616542123.jpg`、同一个 `Referer` 头，
-///    `qnmob3-sign.doubanio.com` 返回 200，`img3.doubanio.com` 返回 403，
-///    `img9.doubanio.com` 返回 418。详情接口给的 `cover_url` 恰好用的是
-///    `img*` 子域，所以在 [_toMetadata] 里统一改写成 `qnmob3-sign`（见
-///    [_rewritePosterUrl]）。`Referer` 仍然必带（[imageHeaders]），少了
-///    照样 418 —— 改域名是解决「带了 Referer 还是被拒」，不是替代它。
+/// 6. **海报 CDN 的防盗链策略换过一次。** 2026-10-02 实测 `img*` 子域
+///    即使带 Referer 也 403/418，于是把详情海报改写到 `qnmob3-sign`。
+///    2026-11-22 复测发现这条改写已经**反向失效**：`qnmob3-sign` 对
+///    没有签名的 `m_ratio_poster` 返回 **HTTP 200 + 12 字节占位图**
+///    （内容就是 `˙ ͜ʟ˙`），而 `img*` 带 Referer 是 200。现在详情海报
+///    **原样使用** `img*` 地址，不再换域名。
 ///
 /// ## 额度与节流
 ///
@@ -79,6 +78,15 @@ class DoubanScraper implements MetadataScraper {
 
   /// 必带的 `Referer`。少了它接口直接拒绝。
   static const String referer = 'https://movie.douban.com/';
+
+  /// 请求豆瓣时统一使用的桌面 UA。
+  ///
+  /// 图片 CDN 也认它：2026-11-22 实测 `img3` / `img9` 只带 Referer 会 403，
+  /// 同时带 Referer + 这个 UA 才是 200。缺 UA 的表现与应用里一样 ——
+  /// 海报下载失败，而接口刮削本身完全正常。
+  static const String userAgent =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15';
 
   /// 服务端要求登录的业务码。
   static const int needLoginCode = 103;
@@ -229,7 +237,7 @@ class DoubanScraper implements MetadataScraper {
       final detail = await _detail(best.id);
       if (detail == null) continue;
 
-      final meta = _toMetadata(detail, word);
+      final meta = _toMetadata(detail, word, signedCoverUrl: best.coverUrl);
       if (meta != null) return meta;
     }
     return null;
@@ -309,7 +317,11 @@ class DoubanScraper implements MetadataScraper {
     final detail = await _detail(candidate.sourceId);
     if (detail == null) return null;
 
-    return _toMetadata(detail, candidate.title);
+    return _toMetadata(
+      detail,
+      candidate.title,
+      signedCoverUrl: candidate.posterUrl,
+    );
   }
 
   // -------------------------------------------------------------------
@@ -593,10 +605,13 @@ class DoubanScraper implements MetadataScraper {
   /// 把详情响应映射成元数据。**响应不是一个条目时返回 `null`。**
   ///
   /// [matchedQuery] 是实际用于命中的查询词（排查「刮错了」时看它）。
+  /// [signedCoverUrl] 是搜索候选里带 `sa_cv` / `sa_ct` 签名的缩略图地址，
+  /// 只在详情没有海报时兜底使用。
   ScrapedMetadata? _toMetadata(
     Map<String, Object?> detail,
-    String matchedQuery,
-  ) {
+    String matchedQuery, {
+    String? signedCoverUrl,
+  }) {
     final id = _stringOf(detail['id']);
     // 类型读**响应体**，不是请求路径：`/movie/{id}` 对剧集会跳到 `/tv/{id}`，
     // 按路径判断会把所有剧集都记成电影。
@@ -624,17 +639,15 @@ class DoubanScraper implements MetadataScraper {
       return null;
     }
 
-    final cover = _rewritePosterUrl(_stringOf(detail['cover_url']));
+    final cover = _posterUrl(
+      detailCover: _stringOf(detail['cover_url']),
+      signedSearchCover: signedCoverUrl,
+    );
 
     // 海报直接用详情给的 `cover_url`（`m_ratio_poster`，实测 540×803 = 2:3）。
-    //
-    // ⚠️ 详情接口返回的 `cover_url` 用的是 `img*.doubanio.com` 子域，该子域
-    // 已启用了新的防盗链策略（即使带 Referer 也 403/418）。[_rewritePosterUrl]
-    // 把它改写成 `qnmob3-sign.doubanio.com`（搜索结果缩略图一直用的那个子域，
-    // 实测同图同头返回 200）。路径不变 —— 它是按图 ID 给的，换域名后有效。
-    //
-    // 不改写成 `l_ratio_poster`（1080×1606，但 299KB）：卡片墙的格子约
-    // 170×255 逻辑像素，`m` 在 3 倍屏下也够（510×765），而体积只有三分之一。
+    // 2026-11-22 复测：`img*.doubanio.com` 带 Referer 时返回 200，而之前
+    // 改写过去的 `qnmob3-sign` 对**无签名**地址返回 12 字节占位图。
+    // 所以现在原样使用详情地址，不再换域名。
     return ScrapedMetadata(
       title: title,
       // 国产片的 `original_title` 实测是空串（不是缺失），所以按空处理。
@@ -665,9 +678,7 @@ class DoubanScraper implements MetadataScraper {
         'Referer': referer,
         'Accept': 'application/json',
         // 实测用桌面版 UA 就能通；换成移动 UA 没有额外好处，反而多一个变量。
-        'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'User-Agent': userAgent,
         if (_cookie.isNotEmpty) 'Cookie': _cookie,
       };
 
@@ -788,40 +799,86 @@ class DoubanScraper implements MetadataScraper {
     return host == 'doubanio.com' || host.endsWith('.doubanio.com');
   }
 
-  /// 把 `img*.doubanio.com` 海报地址改写成 `qnmob3-sign.doubanio.com`。
+  /// 把旧版本落库的「无签名 qnmob3-sign 海报地址」修正回 `img*`。
   ///
-  /// 2026-10-02 实测：豆瓣启用了新的 CDN 防盗链策略，`img3` / `img9` 等
-  /// 子域名即使带正确 `Referer` 也返回 403/418；而搜索结果缩略图用的
-  /// `qnmob3-sign.doubanio.com` 同图同头返回 200。详情接口返回的
-  /// `cover_url` 用的正是 `img*` 子域，落库前改写过去，`PosterCache`
-  /// 下载时就能成功。
+  /// 0.1.15 之前的 `_toMetadata` 会把详情接口的 `img3/.../m_ratio_poster/...`
+  /// 改写成 `qnmob3-sign/.../m_ratio_poster/...`。2026-11-22 起这条路径对
+  /// **没有 `sa_cv` / `sa_ct` 的地址**返回 12 字节占位图。旧库里已经存下的
+  /// 地址不会自动重写，所以下载前统一归一化一次：只要没有签名、又是豆瓣的
+  /// 海报路径，就换回 `img3`（带 Referer 时实测 200）。
   ///
-  /// **只换域名，路径不变**：`/view/photo/m_ratio_poster/public/pXXX.jpg`
-  /// 是服务端按图 ID 给的，换到 `qnmob3-sign` 子域后仍然有效（已 curl 验证）。
-  ///
-  /// 已经是目标域名的 URL 原样返回（幂等）。非豆瓣 URL 原样返回（不误伤
-  /// TMDB 等其他刮削器的海报）。
-  static String? _rewritePosterUrl(String? url) {
-    if (url == null) return null;
+  /// 带签名的搜索缩略图、TMDB / 网盘地址都原样返回。
+  static String? normalizeImageUrl(String? url) {
+    if (url == null || url.isEmpty) return url;
     final uri = Uri.tryParse(url);
     if (uri == null || !uri.hasScheme) return url;
-    final host = uri.host;
-    if (host == 'qnmob3-sign.doubanio.com') return url; // 已是目标域名
-    if (host == 'doubanio.com' || host.endsWith('.doubanio.com')) {
-      return uri.replace(host: 'qnmob3-sign.doubanio.com').toString();
+    if (uri.host != 'qnmob3-sign.doubanio.com') return url;
+    if (uri.query.contains('sa_cv=') || uri.query.contains('sa_ct=')) {
+      return url;
     }
-    return url;
+    final path = uri.path;
+    if (!path.contains('/m_ratio_poster/') &&
+        !path.contains('/l_ratio_poster/') &&
+        !path.contains('/s_ratio_poster/')) {
+      return url;
+    }
+    return uri.replace(host: 'img3.doubanio.com').toString();
+  }
+
+  /// 选一个能真正下载到图片的海报地址。
+  ///
+  /// 优先级：
+  ///   1. 详情接口的 `cover_url` —— `m_ratio_poster` 是 2:3，最合适；
+  ///   2. 搜索候选的 `cover_url` —— 它带 `sa_cv` / `sa_ct` 签名，但被套了
+  ///      `h/120`，只能在详情没有海报时把 `imageView2` 换成大图。
+  ///
+  /// ⛔ 不能把详情地址的 `img*` 域名改写成 `qnmob3-sign`：2026-11-22 实测
+  /// 那条无签名路径返回 200 + 12 字节占位图，而 `img*` 带 Referer 是 200。
+  static String? _posterUrl({
+    required String? detailCover,
+    required String? signedSearchCover,
+  }) {
+    final detail = detailCover?.trim();
+    if (detail != null && detail.isNotEmpty) return detail;
+    return _enlargeSignedCover(signedSearchCover);
+  }
+
+  /// 把搜索候选中带签名的 120px 缩略图换成 810px 高的大图。
+  ///
+  /// 签名 `sa_cv` / `sa_ct` 必须原样保留；只替换 `imageView2` 的处理参数。
+  /// 2026-11-22 实测：同一个签名地址
+  /// `large/public/pX.jpg?sa_cv=…&sa_ct=…&imageView2/0/q/85/h/810/format/jpg`
+  /// 返回 170KB / 810×1442 的真图；把 `imageView2` 整个删掉反而会得到
+  /// 12 字节占位图。
+  static String? _enlargeSignedCover(String? url) {
+    if (url == null || url.trim().isEmpty) return null;
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme || !ownsImageUrl(url)) return null;
+    if (!uri.query.contains('sa_cv=') || !uri.query.contains('sa_ct=')) {
+      return null;
+    }
+
+    const marker = 'imageView2/';
+    final q = uri.query;
+    final at = q.indexOf(marker);
+    final signed = at < 0 ? q : q.substring(0, at);
+    final prefix = signed.isEmpty || signed.endsWith('&') ? signed : '$signed&';
+    return uri
+        .replace(query: '${prefix}imageView2/0/q/85/h/810/format/jpg')
+        .toString();
   }
 
   /// 下载豆瓣图片必须带的请求头。
   ///
-  /// 实测豆瓣图片 CDN 缺 `Referer` 一律 **418**。但 `img*` 子域名还会
-  /// 间歇性 403（即使带 Referer），所以海报 URL 在 [_rewritePosterUrl] 里
-  /// 改写到了 `qnmob3-sign` 子域。
+  /// 实测豆瓣图片 CDN 缺 `Referer` 一律 **418**；只有 Referer 也不够 ——
+  /// 2026-11-22 实测 `img3` 只带 Referer 返回 403，加上桌面 UA 后才 200。
   ///
   /// **不带 Cookie**：实测图片 CDN 只看 Referer，而把用户的豆瓣登录凭证
   /// 送到图片域名上没有必要 —— 能少送一处就少送一处。
-  static Map<String, String> imageHeaders() => const {'Referer': referer};
+  static Map<String, String> imageHeaders() => const {
+        'Referer': referer,
+        'User-Agent': userAgent,
+      };
 
   // -------------------------------------------------------------------
   // 解析小工具

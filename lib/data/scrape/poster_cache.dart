@@ -31,9 +31,11 @@ class PosterCache {
     required HttpClientLike http,
     required this.dirPath,
     Map<String, String> Function(String url)? headersFor,
+    String Function(String url)? normalizeUrl,
     Duration timeout = const Duration(seconds: 15),
   })  : _http = http,
         _headersFor = headersFor,
+        _normalizeUrl = normalizeUrl,
         _timeout = timeout;
 
   final HttpClientLike _http;
@@ -59,6 +61,13 @@ class PosterCache {
   /// 最新一轮的 Cookie。
   final Map<String, String> Function(String url)? _headersFor;
 
+  /// 下载前的地址归一化。
+  ///
+  /// 为「旧版本落库、但来源站已经改规则」的地址留一个修正口：磁盘文件名的
+  /// 散列与真正发出的请求都必须基于归一化后的地址，否则旧地址会继续命中
+  /// 一个永远失败的缓存键。具体的域名规则留在刮削器里，缓存层不认识豆瓣。
+  final String Function(String url)? _normalizeUrl;
+
   final Duration _timeout;
 
   /// 已解析过的路径（含**正在下载中**的）。同一张海报被多个 widget 同时
@@ -74,18 +83,25 @@ class PosterCache {
     required String url,
     String? knownFile,
   }) {
-    final memoKey = '$key|$url';
+    final effectiveUrl = _normalizeUrl?.call(url) ?? url;
+    final memoKey = '$key|$effectiveUrl';
 
     if (knownFile != null && knownFile.isNotEmpty) {
       final existing = _absolute(knownFile);
-      if (File(existing).existsSync()) return Future.value(existing);
+      if (_isUsableImageFile(existing)) return Future.value(existing);
     }
 
     final cached = _inflight[memoKey];
     if (cached != null) return cached;
 
-    final future = _download(key: key, url: url);
+    final future = _download(key: key, url: effectiveUrl);
     _inflight[memoKey] = future;
+    // 下载结束后从「进行中」表里摘掉：成功的图由磁盘缓存接管，失败的图
+    // 必须允许下一次重试。否则一次 CDN 抖动会让这张图在本次进程里
+    // 永远命中一个 `null` future。
+    future.whenComplete(() {
+      if (identical(_inflight[memoKey], future)) _inflight.remove(memoKey);
+    });
     return future;
   }
 
@@ -112,7 +128,17 @@ class PosterCache {
       // 用「文件是否存在」当缓存判据是安全的：文件名里带着 URL 的散列，
       // 换了地址自然换文件名；而同一个地址的图片内容不会变
       // （TMDB 的图是内容寻址的，夸克缩略图按 `fid` 固定）。
-      if (File(target).existsSync()) return target;
+      if (_isUsableImageFile(target)) return target;
+      // 盘上有同名文件但不是图片：旧版本可能把豆瓣的 12 字节防盗链占位图
+      // 当成功缓存写了下来。删掉重下，不要让它继续挡住真图。
+      final stale = File(target);
+      if (stale.existsSync()) {
+        try {
+          stale.deleteSync();
+        } catch (_) {
+          // 删不掉就继续走下载；下载改名会覆盖它。
+        }
+      }
 
       // 走到这里说明**盘上确实没有**这张图 —— 只有这一刻才真的发请求。
       //
@@ -128,6 +154,14 @@ class PosterCache {
       );
       if (bytes == null || bytes.isEmpty) {
         diag.warn('海报', '下载失败（空响应）：$url');
+        return null;
+      }
+      if (!looksLikeImage(bytes)) {
+        diag.warn(
+          '海报',
+          '下载内容不是图片（${bytes.length}B）：$url —— '
+              '多半是 CDN 的防盗链占位图，拒绝写入缓存。',
+        );
         return null;
       }
 
@@ -239,7 +273,7 @@ class PosterCache {
     required String url,
     required Uint8List bytes,
   }) async {
-    if (bytes.isEmpty) return null;
+    if (!looksLikeImage(bytes)) return null;
     try {
       final dir = Directory(dirPath);
       if (!dir.existsSync()) dir.createSync(recursive: true);
@@ -250,5 +284,86 @@ class PosterCache {
       diag.warn('海报', '写入缓存失败：$e');
       return null;
     }
+  }
+
+  /// 文件存在，且开头是已知图片格式的魔数。
+  ///
+  /// 只读前 16 字节：校验不能为了「打开媒体库秒出图」反而把整张图读一遍。
+  static bool _isUsableImageFile(String path) {
+    final file = File(path);
+    if (!file.existsSync()) return false;
+    try {
+      final raf = file.openSync();
+      try {
+        final head = raf.readSync(16);
+        return looksLikeImage(Uint8List.fromList(head));
+      } finally {
+        raf.closeSync();
+      }
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 字节开头是不是一张已知格式的图片。
+  ///
+  /// ## 为什么必须校验
+  ///
+  /// 2026-11-22 实测：豆瓣 `qnmob3-sign` 对无签名的详情海报返回
+  /// **HTTP 200、content-type: image/png、12 字节**，内容其实是
+  /// `˙ ͜ʟ˙` 防盗链占位图。只看「字节非空」会把它当成功缓存写盘，
+  /// 之后每次启动都直接命中这个坏文件 —— 表现是「刮削成功但没有封面」，
+  /// 而日志里连一次下载失败都没有。
+  ///
+  /// 支持的格式就是海报实际会遇到的：JPEG / PNG / WebP / GIF / BMP，
+  /// 以及 AVIF / HEIC 这类以 `ftyp` 开头的 ISO BMFF 图片。
+  static bool looksLikeImage(Uint8List bytes) {
+    if (bytes.length < 12) return false;
+
+    // JPEG: FF D8 FF
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+      return true;
+    }
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    const png = <int>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if (_startsWith(bytes, png)) return true;
+    // GIF: GIF87a / GIF89a
+    if (bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46) {
+      return true;
+    }
+    // BMP: BM
+    if (bytes[0] == 0x42 && bytes[1] == 0x4D) return true;
+    // WebP: RIFF....WEBP
+    if (bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46 &&
+        bytes[8] == 0x57 &&
+        bytes[9] == 0x45 &&
+        bytes[10] == 0x42 &&
+        bytes[11] == 0x50) {
+      return true;
+    }
+    // ISO BMFF: ....ftyp + avif / heic / heix / mif1
+    if (bytes[4] == 0x66 &&
+        bytes[5] == 0x74 &&
+        bytes[6] == 0x79 &&
+        bytes[7] == 0x70) {
+      final brand = String.fromCharCodes(bytes.sublist(8, 12));
+      return brand == 'avif' ||
+          brand == 'avis' ||
+          brand == 'heic' ||
+          brand == 'heix' ||
+          brand == 'mif1';
+    }
+    return false;
+  }
+
+  static bool _startsWith(Uint8List bytes, List<int> prefix) {
+    if (bytes.length < prefix.length) return false;
+    for (var i = 0; i < prefix.length; i++) {
+      if (bytes[i] != prefix[i]) return false;
+    }
+    return true;
   }
 }

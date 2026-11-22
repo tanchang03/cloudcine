@@ -98,6 +98,17 @@ class _Call {
 HttpResult _ok(Map<String, Object?> json) =>
     HttpResult(statusCode: 200, json: json, rawBody: '{}');
 
+/// 可拨动的假时钟。冷却结束是纯时间函数，不能用真实的 2 分钟去等。
+class _Clock {
+  _Clock(this.now);
+
+  DateTime now;
+
+  DateTime call() => now;
+
+  void advance(Duration d) => now = now.add(d);
+}
+
 /// 一个「同时应付搜索与类型表」的假服务端。
 ///
 /// 真实 TMDB 一次刮削会打两类端点，测试里必须都给出响应，否则类型表那次
@@ -565,25 +576,79 @@ void main() {
       );
     });
 
-    test('熔断是单向的：判定不可达后网络恢复也不会再试', () async {
-      // 这是刻意的取舍 —— 熔断的收益是「不再为每一部作品白等 12s」，
-      // 代价是本次扫描放弃在线刮削。想恢复得重新扫描（刮削器会重建）。
+    test('冷却到期后会重新尝试：网络恢复即自动解除熔断', () async {
+      // 旧实现把 `_unreachable` 置真后永不复位。2026-11-19 的现场是：
+      // 应用从 10:19 一直开到 11-22，10:21 的三次超时让 TMDB 在整个进程
+      // 生命周期里都不再发请求 —— 设置页测试连接已经是 200，刮削仍然 0 条。
       var down = true;
       final http = _FakeHttp(
         (_) async => down
             ? const HttpResult.networkFailure('timeout')
-            : _ok(<String, Object?>{'results': [_movieJson()]}),
+            : _ok(<String, Object?>{
+                'results': [
+                  _movieJson(
+                    title: '某片',
+                    originalTitle: 'Some Movie',
+                    releaseDate: '2024-01-01',
+                  ),
+                ],
+              }),
       );
-      final scraper = TmdbScraper(http: http, apiKey: 'a' * 32);
+      final clock = _Clock(DateTime(2026, 11, 19, 10, 21));
+      final scraper = TmdbScraper(
+        http: http,
+        apiKey: 'a' * 32,
+        clock: clock.call,
+      );
 
       for (var i = 0; i < 3; i++) {
         await scraper.scrape(q);
       }
       expect(scraper.isUnreachable, isTrue);
+      expect(http.searchCalls.length, 3);
 
-      down = false;
+      // 冷却期内不再发请求。
+      clock.advance(
+        TmdbScraper.unreachableBackoff - const Duration(seconds: 1),
+      );
       expect(await scraper.scrape(q), isNull);
-      expect(http.calls.length, 3);
+      expect(http.searchCalls.length, 3);
+
+      // 冷却结束、网络恢复 → 真的重试，并恢复正常结果。
+      down = false;
+      clock.advance(const Duration(seconds: 2));
+      final md = await scraper.scrape(q);
+      expect(md, isNotNull);
+      expect(http.searchCalls.length, 4);
+      expect(scraper.isUnreachable, isFalse);
+    });
+
+    test('冷却结束后仍不通 → 放行一次请求，失败后重新计数', () async {
+      final http = _FakeHttp(
+        (_) async => const HttpResult.networkFailure('timeout'),
+      );
+      final clock = _Clock(DateTime(2026, 11, 19, 10, 21));
+      final scraper = TmdbScraper(
+        http: http,
+        apiKey: 'a' * 32,
+        clock: clock.call,
+      );
+
+      for (var i = 0; i < 3; i++) {
+        await scraper.scrape(q);
+      }
+      expect(http.searchCalls.length, 3);
+
+      clock.advance(
+        TmdbScraper.unreachableBackoff + const Duration(seconds: 1),
+      );
+      expect(await scraper.scrape(q), isNull);
+      expect(
+        http.searchCalls.length,
+        4,
+        reason: '冷却结束必须放行一次请求，否则「网络修好了也永远不试」',
+      );
+      expect(scraper.isUnreachable, isFalse, reason: '只失败 1 次还不该熔断');
     });
   });
 

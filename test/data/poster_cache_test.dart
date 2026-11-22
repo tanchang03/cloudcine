@@ -5,6 +5,17 @@ import 'package:cloudcine/data/http/http_client.dart';
 import 'package:cloudcine/data/scrape/poster_cache.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+/// 一张「开头像 PNG」的假图。这里只测缓存判定，不真的解码。
+Uint8List _pngBytes([int length = 64]) => Uint8List.fromList(<int>[
+      0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+      ...List<int>.filled(length - 8, 0x42),
+    ]);
+
+/// 豆瓣防盗链实际返回的 12 字节文本占位图（不是 PNG，尽管响应头写 image/png）。
+Uint8List _doubanPlaceholder() =>
+    Uint8List.fromList(<int>[0xCB, 0x99, 0x20, 0xCD, 0x9C, 0xCA, 0x9F, 0xCB,
+      0x99, 0x20, 0x20, 0x20]);
+
 /// 只关心「发了几次字节请求、带了什么头」的假客户端。
 class _FakeHttp implements HttpClientLike {
   _FakeHttp(this.payload);
@@ -13,6 +24,7 @@ class _FakeHttp implements HttpClientLike {
 
   int byteCalls = 0;
   Map<String, String>? lastHeaders;
+  String? lastUrl;
 
   @override
   Future<Uint8List?> getBytes(
@@ -21,6 +33,7 @@ class _FakeHttp implements HttpClientLike {
     Duration? timeout,
   }) async {
     byteCalls++;
+    lastUrl = url;
     lastHeaders = headers;
     return payload;
   }
@@ -145,7 +158,7 @@ void main() {
 
     setUp(() {
       dir = Directory.systemTemp.createTempSync('poster_cache_test');
-      http = _FakeHttp(Uint8List.fromList(List.filled(64, 7)));
+      http = _FakeHttp(_pngBytes());
     });
 
     tearDown(() {
@@ -189,6 +202,80 @@ void main() {
 
       await cache.pathFor(key: 'k', url: 'https://image.tmdb.org/a.jpg');
       expect(http.lastHeaders, isEmpty);
+    });
+
+    test('12 字节防盗链占位图不当成功缓存：返回 null 且下次还会重试', () async {
+      final placeholder = _FakeHttp(_doubanPlaceholder());
+      final cache = PosterCache(http: placeholder, dirPath: dir.path);
+      const url = 'https://qnmob3-sign.doubanio.com/view/photo/'
+          'm_ratio_poster/public/p1.jpg';
+
+      expect(await cache.pathFor(key: '谷雨', url: url), isNull);
+      expect(placeholder.byteCalls, 1);
+      expect(
+        dir.listSync().whereType<File>().where(
+              (f) => f.path.endsWith('.jpg'),
+            ),
+        isEmpty,
+        reason: '豆瓣对无签名地址返回 HTTP 200 + 12 字节文本；'
+            '只看「字节非空」会把它写进缓存，之后每次都直接命中坏图。',
+      );
+
+      expect(await cache.pathFor(key: '谷雨', url: url), isNull);
+      expect(
+        placeholder.byteCalls,
+        2,
+        reason: '坏图没落盘，第二次必须重新请求，而不是命中一个坏缓存',
+      );
+    });
+
+    test('盘上已有的 12 字节坏缓存会被删除并重新下载', () async {
+      const key = '谷雨';
+      const url = 'https://qnmob3-sign.doubanio.com/view/photo/'
+          'm_ratio_poster/public/p1.jpg';
+      final name = PosterCache.fileNameFor(key: key, url: url);
+      final stale = File('${dir.path}${Platform.pathSeparator}$name');
+      stale.writeAsBytesSync(_doubanPlaceholder());
+      expect(stale.existsSync(), isTrue);
+
+      final cache = PosterCache(http: http, dirPath: dir.path);
+      final path = await cache.pathFor(key: key, url: url);
+
+      expect(path, isNotNull);
+      expect(http.byteCalls, 1, reason: '坏缓存不能挡住重新下载');
+      expect(File(path!).lengthSync(), greaterThan(12));
+    });
+
+    test('put 也拒绝伪图片，避免刮削阶段把占位图写进缓存', () async {
+      final cache = PosterCache(http: http, dirPath: dir.path);
+      final path = await cache.put(
+        key: 'k',
+        url: 'https://x/p.jpg',
+        bytes: _doubanPlaceholder(),
+      );
+      expect(path, isNull);
+    });
+
+    test('下载前按回调归一化 URL —— 旧库地址不用重刮', () async {
+      final cache = PosterCache(
+        http: http,
+        dirPath: dir.path,
+        normalizeUrl: (url) =>
+            url.replaceFirst('qnmob3-sign.doubanio.com', 'img3.doubanio.com'),
+      );
+      const oldUrl = 'https://qnmob3-sign.doubanio.com/view/photo/'
+          'm_ratio_poster/public/p1.jpg';
+      const newUrl = 'https://img3.doubanio.com/view/photo/'
+          'm_ratio_poster/public/p1.jpg';
+
+      final path = await cache.pathFor(key: '谷雨', url: oldUrl);
+
+      expect(http.lastUrl, newUrl);
+      expect(
+        path!.split(Platform.pathSeparator).last,
+        PosterCache.fileNameFor(key: '谷雨', url: newUrl),
+        reason: '缓存文件名也必须用归一化后的地址，否则旧地址会继续命中坏键',
+      );
     });
   });
 }

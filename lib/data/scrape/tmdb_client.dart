@@ -33,12 +33,14 @@ class TmdbScraper implements MetadataScraper {
     String imageBaseUrl = defaultImageBaseUrl,
     String language = 'zh-CN',
     Duration timeout = const Duration(seconds: 12),
+    DateTime Function()? clock,
   })  : _http = http,
         _apiKey = apiKey.trim(),
         _baseUrl = baseUrl,
         _imageBaseUrl = imageBaseUrl,
         _language = language,
-        _timeout = timeout;
+        _timeout = timeout,
+        _clock = clock ?? DateTime.now;
 
   static const String defaultBaseUrl = 'https://api.themoviedb.org/3';
   static const String defaultImageBaseUrl = 'https://image.tmdb.org/t/p';
@@ -65,6 +67,7 @@ class TmdbScraper implements MetadataScraper {
   final String _imageBaseUrl;
   final String _language;
   final Duration _timeout;
+  final DateTime Function() _clock;
 
   /// 类型 ID → 中文名。首次需要时拉一次，之后常驻内存。
   ///
@@ -72,7 +75,7 @@ class TmdbScraper implements MetadataScraper {
   /// 为它多花一次请求失败就整条刮削失败是不划算的。
   Map<int, String>? _genreCache;
 
-  /// 连续网络失败次数；达到阈值后 [_unreachable] 置真。
+  /// 连续网络失败次数；达到阈值后进入 [_unreachableUntil] 冷却。
   ///
   /// ## 为什么需要熔断
   ///
@@ -83,16 +86,51 @@ class TmdbScraper implements MetadataScraper {
   ///
   /// 判据只认**网络层失败**（超时 / 连不上）。HTTP 4xx、5xx 之类的**不计入**：
   /// 那说明服务是通的，只是 Key 无效或这个词没结果，熔断反而会掩盖真问题。
+  ///
+  /// ## 为什么必须是**会过期**的冷却，而不是一次性熔断
+  ///
+  /// 早先的实现是见到 3 次网络失败就把 `_unreachable` 置真，且**永不复位**。
+  /// 2026-11-19 现场：应用进程从 10:19 一直开到 11-22，10:21 三次超时之后，
+  /// 即使网络早已恢复、设置页「测试连接」也能返回 200，刮削仍然一次请求
+  /// 都不发 —— 用户看到的是「TMDB 永远刮不到」，只能重启应用。
+  ///
+  /// 熔断的收益是「不再为每一部作品白等 12 秒」，这个收益只需要持续到
+  /// 网络恢复，没有理由绑死整个进程生命周期。
   int _networkFailures = 0;
-  bool _unreachable = false;
+
+  /// 网络层冷却截止时刻。`null` = 当前没有熔断。
+  DateTime? _unreachableUntil;
 
   /// 连续多少次网络失败就熔断。
   static const int _maxConsecutiveFailures = 3;
 
+  /// 判定不可达后的冷却时长。
+  ///
+  /// 与豆瓣的 `unreachableBackoff` 同一量级：网络是用户自己能立刻修好的，
+  /// 冷却只是避免一次扫描里反复白等，不该长达小时级。
+  static const Duration unreachableBackoff = Duration(minutes: 2);
+
   /// 是否已判定「根本连不上」。
   ///
   /// 暴露出来只为诊断（日志/设置页），不参与刮削逻辑。
-  bool get isUnreachable => _unreachable;
+  bool get isUnreachable => _unreachableCooldown > Duration.zero;
+
+  /// 冷却还剩多久。未冷却时返回 [Duration.zero]。纯读，无副作用。
+  Duration get _unreachableCooldown {
+    final until = _unreachableUntil;
+    if (until == null) return Duration.zero;
+    final left = until.difference(_clock());
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  /// 冷却是否仍生效。到点顺手清掉，让下一次调用放行。
+  bool get _unreachableActive {
+    if (_unreachableUntil == null) return false;
+    if (_unreachableCooldown > Duration.zero) return true;
+    _unreachableUntil = null;
+    _networkFailures = 0;
+    return false;
+  }
 
   @override
   String get id => 'tmdb';
@@ -107,7 +145,7 @@ class TmdbScraper implements MetadataScraper {
   Future<ScrapedMetadata?> scrape(ScrapeQuery query) async {
     if (!isEnabled) return null;
     // 已判定连不上：立即返回，不再为每一部作品白等一次超时。
-    if (_unreachable) return null;
+    if (_unreachableActive) return null;
 
     // 中英混排时两个名字都试：中文优先（TMDB 中文条目更可能带中文简介）
     final candidates = <String>{
@@ -130,7 +168,7 @@ class TmdbScraper implements MetadataScraper {
   /// 而 TMDB 的 `year` 是硬过滤，带上错的年份会把正主直接筛掉）。
   @override
   Future<List<ScrapeCandidate>> search(ScrapeQuery query) async {
-    if (!isEnabled || _unreachable) return const [];
+    if (!isEnabled || _unreachableActive) return const [];
     final title = query.title.trim();
     if (title.isEmpty) return const [];
 
@@ -474,9 +512,11 @@ class TmdbScraper implements MetadataScraper {
       return null;
     }
 
-    // 拿到了 HTTP 响应就说明服务可达 —— 无论状态码是几，都清掉失败计数。
-    // 否则「前两次超时、第三次 401」会累积成熔断，把真问题（Key 无效）藏掉。
+    // 拿到了 HTTP 响应就说明服务可达 —— 无论状态码是几，都清掉失败计数
+    // 与冷却。否则「冷却结束后第一次请求拿到 401」会继续被当成不可达，
+    // 而「前两次超时、第三次 401」也会累积成熔断，把真问题藏掉。
     _networkFailures = 0;
+    _unreachableUntil = null;
 
     if (!res.isSuccessStatus) {
       diag.warn('刮削', 'TMDB $path HTTP ${res.statusCode}');
@@ -487,15 +527,18 @@ class TmdbScraper implements MetadataScraper {
 
   /// 记一次网络失败，够了就熔断（只告警一次）。
   void _noteNetworkFailure() {
-    if (_unreachable) return;
+    if (_unreachableActive) return;
     _networkFailures++;
     if (_networkFailures < _maxConsecutiveFailures) return;
 
-    _unreachable = true;
+    _unreachableUntil = _clock().add(unreachableBackoff);
+    // 计数归零，让冷却到期后的下一轮从 0 开始重新数 —— 否则冷却一结束
+    // 就是「已经 3 次」，第一次失败又立刻进冷却。
+    _networkFailures = 0;
     diag.warn(
       '刮削',
       'TMDB 连续 $_maxConsecutiveFailures 次网络失败，判定为不可达，'
-          '本次扫描不再尝试在线刮削（API 地址=$_baseUrl）。'
+          '冷却 ${unreachableBackoff.inMinutes} 分钟后再试（API 地址=$_baseUrl）。'
           '境内直连 api.themoviedb.org 通常会被 DNS 污染，'
           '可在设置里填一个可达的 API 地址与图片地址。',
     );
